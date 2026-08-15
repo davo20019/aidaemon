@@ -57,6 +57,7 @@ impl Channel for NodeChannel {
         _session_id: &str,
         _goal_description: &str,
         _details: &[String],
+        _style: crate::types::GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
         Ok(false)
     }

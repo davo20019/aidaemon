@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-15
+
+### Added
+
+- **Autopilot provides a one-confirmation, hands-off mandate posture.** Owners approve an exact versioned card covering the mission, accounts, operations, targets, limits, and guardrails; the daemon then applies thorough cadence-funded review, routine judgment, safe retry, and restart recovery inside that immutable envelope. Telegram, Slack, and Discord render a distinct Enable Autopilot action, while new authority, destructive work, spending, private-data access, and irreconcilably ambiguous external mutations still require an owner checkpoint.
+- **Proactive mandates use an evidence-backed, value-directed operating graph.** Each review traverses one typed signal/observe/assess/adapt-or-act/verify/schedule graph, records a quiet/active/urgent cadence edge inside confirmed timing bounds, and may revise one durable tactical strategy node from current structured receipts without changing owner authority. New mandates define observable value criteria; every ACT must bind to one exact criterion with current evidence, expected benefit, assessed risk, and invalidation criteria, so literal activity alone cannot authorize intervention. Authenticated content-free external signals are deduplicated and matched by exact account and observation URL scope to wake relevant Autopilot mandates immediately.
+- **Harness execution state has a shared dependency and proof graph.** Completion now requires typed tool-call receipts, plans support branches and joins, dialogue obligations retain stable request/task/question relationships, and task dependencies use normalized durable edges with atomic cycle rejection. Checklist prose is display-only: automatic completion requires explicit effects and exact target evidence.
+- **The in-progress AIDaemon blog publishing workspace is preserved with the release.** The staged site source, static generation tooling, publishing notes, and complete reflection archive—including the latest deployment-evidence entry—are now tracked with the daemon release instead of remaining an uncommitted task worktree.
+
+### Fixed
+
+- **Unavailable CLI agents now fail over without asking for permission.** Authentication and pre-launch failures are carried as typed retryable signals, the unavailable provider is quarantined, and the same untouched task is immediately retried with the next configured CLI. If no provider can start, the daemon reports the concrete credential or installation dependency without offering a routine strategy choice.
+- **Unattended scheduled research no longer waits on expiring navigation approvals.** Runtime-authenticated scheduled runs may open validated public HTTP(S) pages without a second point-in-time prompt, while direct browsing, private targets, scripts, and consequential page actions retain their existing approval boundaries.
+- **Codex stream overloads now use provider retry and fallback recovery.** Typed stream status/code fields—and the provider's legacy overload event when those fields are absent—are classified as infrastructure failures instead of unknown semantic failures, so existing bounded backoff and fallback handling applies.
+- **Owner follow-ups to mandate questions retain their durable mandate binding.** A delivered mandate `ASK` now installs a typed dialogue obligation without copying deliberator text into assistant history; the related owner turn must inspect the exact mandate-local decision before explaining or changing it, while explicit unrelated requests remain independent.
+- **Mandate answers can no longer masquerade as authority updates.** Owner guidance now reports that immutable tools, operations, accounts, URLs, effects, and query scopes are unchanged; approved authority expansions are routed through the separately confirmed policy-update workflow, while internal fence failures cannot repeatedly ask the owner merely for permission to retry.
+- **Mandate searches and non-action review closeout now follow typed state.** Observation scopes can explicitly authorize runtime query values by parameter name without widening the endpoint or mutation envelope. A committed WAIT, ASK, or STOP ends the review immediately and remains authoritative during recovery, so a later token-admission guard cannot overwrite the completed decision with a misleading execution-limit failure.
+- **Mandate resource limits no longer require owners to estimate tokens.** The normal contract now offers efficient, balanced, and thorough review effort; runtime capacity is derived from effort and cadence, usage is reported as health rather than token arithmetic, historical balanced mandates receive safe headroom, and an undecided review that reaches the internal runaway ceiling persists a typed WAIT with a bounded automatic retry instead of demanding owner intervention.
+
 ## [0.12.0] - 2026-08-12
 
 ### Added

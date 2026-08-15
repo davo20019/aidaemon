@@ -1,13 +1,15 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agent::TurnContext;
 use crate::traits::{
-    AgentRole, ToolCallEffect, ToolCallSemantics, ToolCapabilities, ToolTargetHint,
-    ToolTargetHintKind,
+    AgentRole, ToolCallEffect, ToolCallMetadata, ToolCallSemantics, ToolCapabilities,
+    ToolResultPresentation, ToolTargetHint, ToolTargetHintKind,
 };
 
 /// Structured record of a single tool call attempt outcome.
@@ -191,6 +193,14 @@ pub enum ExecutionBudgetLimit {
     WallClock,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionBudgetPressure {
+    pub limit: ExecutionBudgetLimit,
+    pub used: u64,
+    pub maximum: u64,
+    pub pct: u64,
+}
+
 impl ExecutionBudgetLimit {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -288,6 +298,21 @@ pub struct ExecutionState {
     pub tool_calls_used: usize,
     pub validation_rounds_used: usize,
     pub steps_used: usize,
+    /// Distinct outcome-bearing tool results that have earned additional
+    /// execution runway. Persisting the keys prevents a resumed task from
+    /// receiving fresh capacity for replaying evidence it already observed.
+    #[serde(default)]
+    pub progress_credit_keys: BTreeSet<String>,
+    /// Total bounded runway extensions granted for this execution.
+    #[serde(default)]
+    pub progress_extensions_used: usize,
+    /// Observation-only extensions are capped separately so a sequence of
+    /// successful reads cannot crowd out execution and verification work.
+    #[serde(default)]
+    pub observation_extensions_used: usize,
+    /// One-shot guard for the pre-exhaustion resource adaptation directive.
+    #[serde(default)]
+    pub resource_pressure_emitted: bool,
     /// Structured outcome ledger — one entry per tool call attempt.
     #[serde(default)]
     pub outcome_ledger: Vec<OutcomeEntry>,
@@ -315,6 +340,18 @@ pub struct ExecutionState {
     /// (web_fetch/browser with substantive content). Snippets don't count.
     #[serde(skip)]
     pub web_source_domains: std::collections::HashSet<String>,
+    /// Exact successfully-read source URLs. Used to require direct citations
+    /// when the user asks for a concrete number of sources.
+    #[serde(skip)]
+    pub web_source_urls: std::collections::HashSet<String>,
+    /// True when an operational tool result should be communicated at the
+    /// owner's level rather than copied as control-plane bookkeeping.
+    #[serde(skip)]
+    pub natural_outcome_summary_required: bool,
+    /// Exact internal IDs observed during a natural-summary turn. In-memory
+    /// only; durable diagnostic records remain authoritative.
+    #[serde(skip)]
+    pub internal_identifiers: BTreeSet<String>,
 }
 
 impl ExecutionState {
@@ -343,6 +380,10 @@ impl ExecutionState {
             tool_calls_used: 0,
             validation_rounds_used: 0,
             steps_used: 0,
+            progress_credit_keys: BTreeSet::new(),
+            progress_extensions_used: 0,
+            observation_extensions_used: 0,
+            resource_pressure_emitted: false,
             outcome_ledger: Vec::new(),
             active_linear_intent_plan: None,
             provider_timeout_ms: 0,
@@ -350,6 +391,9 @@ impl ExecutionState {
             tool_output_evidence_overflow: false,
             web_search_used: false,
             web_source_domains: std::collections::HashSet::new(),
+            web_source_urls: std::collections::HashSet::new(),
+            natural_outcome_summary_required: false,
+            internal_identifiers: BTreeSet::new(),
         }
     }
 
@@ -377,19 +421,35 @@ impl ExecutionState {
                 {
                     return;
                 }
-                let Some(domain) = serde_json::from_str::<serde_json::Value>(arguments)
+                let Some(mut url) = serde_json::from_str::<serde_json::Value>(arguments)
                     .ok()
                     .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from))
                     .and_then(|u| reqwest::Url::parse(&u).ok())
-                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
                 else {
+                    return;
+                };
+                url.set_fragment(None);
+                let Some(domain) = url.host_str().map(|host| host.to_lowercase()) else {
                     return;
                 };
                 self.web_source_domains
                     .insert(domain.trim_start_matches("www.").to_string());
+                self.web_source_urls.insert(url.to_string());
             }
             _ => {}
         }
+    }
+
+    pub fn cited_web_source_count(&self, reply: &str) -> usize {
+        self.web_source_urls
+            .iter()
+            .filter(|url| {
+                reply.contains(url.as_str())
+                    || url
+                        .strip_suffix('/')
+                        .is_some_and(|without_slash| reply.contains(without_slash))
+            })
+            .count()
     }
 
     /// Accumulate raw tool output for the answer-grounding gate. Bounded:
@@ -407,6 +467,57 @@ impl ExecutionState {
         }
         self.tool_output_evidence.push_str(output);
         self.tool_output_evidence.push('\n');
+    }
+
+    /// Apply a tool's typed presentation policy to this turn. A natural
+    /// summary captures exact UUIDs from both the current result and earlier
+    /// tool evidence, so a preceding lookup cannot leak schedule IDs through
+    /// the final response. An explicit diagnostic result disables this gate.
+    pub fn record_tool_result_presentation(
+        &mut self,
+        metadata: &ToolCallMetadata,
+        current_output: &str,
+    ) {
+        match metadata.presentation {
+            Some(ToolResultPresentation::NaturalSummary) => {
+                self.natural_outcome_summary_required = true;
+                for identifier in metadata.internal_identifiers.iter().cloned().chain(
+                    crate::tools::sanitize::extract_uuid_identifiers(&self.tool_output_evidence),
+                ) {
+                    if self.internal_identifiers.len() >= 128 {
+                        break;
+                    }
+                    self.internal_identifiers
+                        .insert(identifier.to_ascii_lowercase());
+                }
+                for identifier in crate::tools::sanitize::extract_uuid_identifiers(current_output) {
+                    if self.internal_identifiers.len() >= 128 {
+                        break;
+                    }
+                    self.internal_identifiers.insert(identifier);
+                }
+            }
+            Some(ToolResultPresentation::DiagnosticDetail) => {
+                self.natural_outcome_summary_required = false;
+                self.internal_identifiers.clear();
+            }
+            None => {}
+        }
+    }
+
+    pub fn unrequested_internal_identifiers(&self, reply: &str, user_text: &str) -> Vec<String> {
+        if !self.natural_outcome_summary_required {
+            return Vec::new();
+        }
+        let reply = reply.to_ascii_lowercase();
+        let user_text = user_text.to_ascii_lowercase();
+        self.internal_identifiers
+            .iter()
+            .filter(|identifier| {
+                reply.contains(identifier.as_str()) && !user_text.contains(identifier.as_str())
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn promote_persistence(&mut self, persistence: ExecutionPersistence) {
@@ -497,6 +608,12 @@ impl ExecutionState {
     pub fn current_linear_intent_step(&self) -> Option<&LinearIntentStep> {
         let plan = self.active_linear_intent_plan.as_ref()?;
         plan.steps.get(plan.current_step_cursor)
+    }
+
+    pub fn linear_intent_plan_has_remaining_steps(&self) -> bool {
+        self.active_linear_intent_plan
+            .as_ref()
+            .is_some_and(|plan| plan.current_step_cursor < plan.steps.len())
     }
 
     pub fn advance_linear_intent_step_after_external_success(&mut self) {
@@ -835,31 +952,63 @@ impl ExecutionState {
         })
     }
 
-    /// Extend the budget when a tool call completes successfully.
+    /// Extend the budget for a distinct outcome-bearing tool result.
     ///
-    /// This implements the principle "only limit when wasting tokens, not when
-    /// making progress."  Each successful tool execution earns additional
-    /// capacity so productive multi-step runs are never artificially stopped by
-    /// the initial budget ceiling.  Stall detection, repetition guards, and
-    /// wall-clock limits remain the primary defences against genuine waste.
-    pub fn extend_budget_on_progress(&mut self) {
+    /// Successful transport is not enough: administrative calls receive no
+    /// credit, repeated results receive no credit, and observations have a
+    /// smaller independent allowance than mutations/verification. This keeps
+    /// productive work moving without allowing repeated reads to manufacture
+    /// effectively unbounded runway.
+    pub fn extend_budget_on_progress(
+        &mut self,
+        tool_name: &str,
+        semantics: &ToolCallSemantics,
+        result_text: &str,
+    ) -> bool {
         if !self.budget_envelope_active {
-            return;
+            return false;
         }
-        const PROGRESS_EXTENSION: usize = 6;
-        /// Wall-clock extension per successful tool call (30 seconds).
-        /// Slow external APIs, large builds, or chained terminal commands
-        /// can legitimately consume significant wall time while making
-        /// real progress.
-        const WALL_CLOCK_EXTENSION_MS: u64 = 30_000;
-        /// Validation round extension per successful tool call.
-        /// Complex multi-step tasks legitimately trigger multiple
-        /// completion-verification cycles while still making real
-        /// progress (reading files, running builds, deploying).
-        /// Without extending this limit, productive runs are stopped
-        /// by the validation cap even though every other budget
-        /// dimension has headroom.
-        const VALIDATION_EXTENSION: usize = 1;
+        const MAX_PROGRESS_EXTENSIONS: usize = 12;
+        const MAX_OBSERVATION_EXTENSIONS: usize = 4;
+        const PROGRESS_EXTENSION: usize = 2;
+        const WALL_CLOCK_EXTENSION_MS: u64 = 15_000;
+
+        let is_mutation = semantics.mutates_state();
+        let is_verification = semantics.can_verify_with_result_content();
+        let is_observation = semantics.observes_state();
+        if !is_mutation && !is_verification && !is_observation {
+            return false;
+        }
+        if self.progress_extensions_used >= MAX_PROGRESS_EXTENSIONS
+            || (is_observation
+                && !is_mutation
+                && !is_verification
+                && self.observation_extensions_used >= MAX_OBSERVATION_EXTENSIONS)
+        {
+            return false;
+        }
+
+        let normalized = result_text.trim();
+        if normalized.is_empty() {
+            return false;
+        }
+        let kind = if is_mutation {
+            "mutation"
+        } else if is_verification {
+            "verification"
+        } else {
+            "observation"
+        };
+        let digest = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+        let credit_key = format!("{kind}:{tool_name}:{digest}");
+        if !self.progress_credit_keys.insert(credit_key) {
+            return false;
+        }
+
+        self.progress_extensions_used = self.progress_extensions_used.saturating_add(1);
+        if is_observation && !is_mutation && !is_verification {
+            self.observation_extensions_used = self.observation_extensions_used.saturating_add(1);
+        }
         if self.budget.max_llm_calls > 0 {
             self.budget.max_llm_calls =
                 self.budget.max_llm_calls.saturating_add(PROGRESS_EXTENSION);
@@ -879,12 +1028,10 @@ impl ExecutionState {
                 .max_wall_clock_ms
                 .saturating_add(WALL_CLOCK_EXTENSION_MS);
         }
-        if self.budget.max_validation_rounds > 0 {
-            self.budget.max_validation_rounds = self
-                .budget
-                .max_validation_rounds
-                .saturating_add(VALIDATION_EXTENSION);
+        if (is_mutation || is_verification) && self.budget.max_validation_rounds > 0 {
+            self.budget.max_validation_rounds = self.budget.max_validation_rounds.saturating_add(1);
         }
+        true
     }
 
     /// Promote budget if a captured task plan indicates higher complexity
@@ -953,6 +1100,70 @@ impl ExecutionState {
             }
         }
         None
+    }
+
+    /// Return the most constrained execution dimension once it reaches the
+    /// adaptation high-water mark but before hard exhaustion.
+    pub fn resource_pressure(
+        &self,
+        task_tokens_used: u64,
+        elapsed: Duration,
+    ) -> Option<ExecutionBudgetPressure> {
+        if !self.budget_envelope_active || self.resource_pressure_emitted {
+            return None;
+        }
+        const PRESSURE_PCT: u64 = 80;
+        let execution_tokens_used =
+            task_tokens_used.saturating_sub(self.budget_started_task_tokens);
+        let elapsed_ms = (elapsed.as_millis().min(u64::MAX as u128) as u64)
+            .saturating_sub(self.budget_started_elapsed_ms)
+            .saturating_sub(self.provider_timeout_ms);
+        let dimensions = [
+            (
+                ExecutionBudgetLimit::Steps,
+                self.steps_used as u64,
+                self.budget.max_steps as u64,
+            ),
+            (
+                ExecutionBudgetLimit::Tokens,
+                execution_tokens_used,
+                self.budget.max_tokens as u64,
+            ),
+            (
+                ExecutionBudgetLimit::LlmCalls,
+                self.llm_calls_used as u64,
+                self.budget.max_llm_calls as u64,
+            ),
+            (
+                ExecutionBudgetLimit::ToolCalls,
+                self.tool_calls_used as u64,
+                self.budget.max_tool_calls as u64,
+            ),
+            (
+                ExecutionBudgetLimit::ValidationRounds,
+                self.validation_rounds_used as u64,
+                self.budget.max_validation_rounds as u64,
+            ),
+            (
+                ExecutionBudgetLimit::WallClock,
+                elapsed_ms,
+                self.budget.max_wall_clock_ms,
+            ),
+        ];
+        dimensions
+            .into_iter()
+            .filter(|(_, used, maximum)| {
+                *maximum > 0
+                    && *used < *maximum
+                    && used.saturating_mul(100) >= maximum.saturating_mul(PRESSURE_PCT)
+            })
+            .map(|(limit, used, maximum)| ExecutionBudgetPressure {
+                limit,
+                used,
+                maximum,
+                pct: used.saturating_mul(100) / maximum,
+            })
+            .max_by_key(|pressure| pressure.pct)
     }
 }
 

@@ -13,16 +13,27 @@ pub(super) enum ConnectedApiIntent {
 pub(super) enum ConnectedContentMode {
     #[default]
     None,
+    #[cfg(test)]
     DraftOnly,
+    #[cfg(test)]
     DeliverOnly,
+    #[cfg(test)]
     DraftThenDeliver,
 }
 
 impl ConnectedContentMode {
     pub(super) fn is_authoring_only(self) -> bool {
-        matches!(self, Self::DraftOnly)
+        #[cfg(test)]
+        {
+            return matches!(self, Self::DraftOnly);
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn expects_live_delivery(self) -> bool {
         matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
     }
@@ -206,6 +217,7 @@ fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
         || quoted_command_execution
 }
 
+#[cfg(test)]
 fn contains_any_as_words(text: &str, keywords: &[&str]) -> bool {
     keywords
         .iter()
@@ -272,6 +284,7 @@ pub(super) fn user_text_requests_runtime_capability_validation(user_text: &str) 
     has_validation_verb && asks_about_current_access_or_connection
 }
 
+#[cfg(test)]
 fn mentions_connected_api_target(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -326,6 +339,7 @@ fn mentions_connected_api_target(user_text: &str) -> bool {
     contains_any_as_words(&lower, TARGET_MARKERS)
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn mentions_connected_api_resource(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
@@ -399,6 +413,7 @@ fn mentions_connected_api_resource(user_text: &str) -> bool {
     contains_any_as_words(&lower, RESOURCE_MARKERS)
 }
 
+#[cfg(test)]
 fn mentions_connected_api_account_scope(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -460,6 +475,7 @@ fn mentions_connected_api_account_scope(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn mentions_existing_connected_content_payload(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -487,6 +503,7 @@ fn mentions_existing_connected_content_payload(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_content_delivery_resource(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -518,6 +535,7 @@ fn has_content_delivery_resource(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_content_delivery_verb(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -545,6 +563,7 @@ fn has_content_delivery_verb(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn looks_like_direct_reply_format_instruction(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -564,6 +583,7 @@ fn looks_like_direct_reply_format_instruction(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_content_live_delivery_cue(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -596,6 +616,7 @@ fn has_content_live_delivery_cue(user_text: &str) -> bool {
         || contains_any_as_words(&lower, &["connected account", "connected service"])
 }
 
+#[cfg(test)]
 fn has_content_drafting_verb(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() || !has_content_delivery_resource(&lower) {
@@ -623,6 +644,7 @@ fn has_content_drafting_verb(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_content_new_payload_shape(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() || !has_content_delivery_resource(&lower) {
@@ -646,6 +668,7 @@ fn has_content_new_payload_shape(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_content_copywriting_cue(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() || !has_content_delivery_resource(&lower) {
@@ -678,6 +701,7 @@ fn has_content_copywriting_cue(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn has_explicit_do_not_deliver_cue(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -705,6 +729,7 @@ fn has_explicit_do_not_deliver_cue(user_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn classify_connected_content_mode(user_text: &str) -> ConnectedContentMode {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() || !has_content_delivery_resource(&lower) {

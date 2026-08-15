@@ -22,6 +22,12 @@ const UNTRUSTED_EXTERNAL_DATA_SUFFIX: &str = "[END UNTRUSTED EXTERNAL DATA]";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageAnnotation {
+    /// Runtime-generated evidence that re-enters an existing user request.
+    ///
+    /// The content remains visible to the model as a user-role turn because it
+    /// is the immediate input for continuation, but it is not new owner intent
+    /// and must not rotate dialogue state or grant scope from embedded output.
+    InternalContinuation,
     EntireSystemNotice,
     AppendedSystemNotice,
     AppendedDiagnostic,
@@ -190,7 +196,8 @@ fn annotation_appended_marker(annotation: &MessageAnnotation) -> Option<&'static
         MessageAnnotation::AppendedDiagnostic => Some(APPENDED_DIAGNOSTIC_MARKER),
         MessageAnnotation::AppendedToolStats => Some(APPENDED_TOOL_STATS_MARKER),
         MessageAnnotation::AppendedSystemNotice => Some(APPENDED_SYSTEM_MARKER),
-        MessageAnnotation::EntireSystemNotice
+        MessageAnnotation::InternalContinuation
+        | MessageAnnotation::EntireSystemNotice
         | MessageAnnotation::WrappedUntrustedExternalData { .. }
         | MessageAnnotation::InboundFileAttachment { .. } => None,
     }
@@ -688,6 +695,7 @@ mod tests {
     #[test]
     fn annotation_serde_roundtrip() {
         let annotations = vec![
+            MessageAnnotation::InternalContinuation,
             MessageAnnotation::EntireSystemNotice,
             MessageAnnotation::AppendedDiagnostic,
             MessageAnnotation::AppendedToolStats,
@@ -701,5 +709,17 @@ mod tests {
         let json = serde_json::to_string(&annotations).unwrap();
         let deserialized: Vec<MessageAnnotation> = serde_json::from_str(&json).unwrap();
         assert_eq!(annotations, deserialized);
+    }
+
+    #[test]
+    fn internal_continuation_keeps_evidence_visible_as_primary_content() {
+        let annotations = [MessageAnnotation::InternalContinuation];
+        let content = "Worker result: synthetic evidence";
+
+        assert_eq!(
+            extract_primary_message_content(content, &annotations),
+            content
+        );
+        assert!(!message_content_is_structural_only(content, &annotations));
     }
 }

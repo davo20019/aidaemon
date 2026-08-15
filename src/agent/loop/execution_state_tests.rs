@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::agent::{CompletionContract, CompletionTaskKind, FollowupMode, TurnContext};
-use crate::traits::{ToolCallSemantics, ToolTargetHintKind};
+use crate::traits::{
+    ToolCallMetadata, ToolCallSemantics, ToolResultPresentation, ToolTargetHintKind,
+};
 use serde_json::json;
 
 #[test]
@@ -347,32 +349,55 @@ fn extend_budget_on_progress_increases_limits() {
     let original_validation = state.budget.max_validation_rounds;
 
     // No extension when budget envelope is inactive
-    state.extend_budget_on_progress();
+    assert!(!state.extend_budget_on_progress(
+        "write_file",
+        &crate::traits::ToolCallSemantics::mutation(),
+        "created /tmp/result"
+    ));
     assert_eq!(state.budget.max_llm_calls, original_llm);
     assert_eq!(state.budget.max_wall_clock_ms, original_wall);
     assert_eq!(state.budget.max_validation_rounds, original_validation);
 
     // Extension kicks in once the envelope is active
     state.activate_budget_envelope(0, Duration::from_millis(0));
-    state.extend_budget_on_progress();
+    assert!(state.extend_budget_on_progress(
+        "write_file",
+        &crate::traits::ToolCallSemantics::mutation(),
+        "created /tmp/result"
+    ));
     assert!(state.budget.max_llm_calls > original_llm);
     assert!(state.budget.max_tool_calls > original_tools);
     assert!(state.budget.max_steps > original_steps);
     assert!(state.budget.max_wall_clock_ms > original_wall);
     assert!(state.budget.max_validation_rounds > original_validation);
 
-    // Cumulative extensions keep growing
+    // Replaying the same result earns no additional runway.
     let after_first = state.budget.max_llm_calls;
     let after_first_wall = state.budget.max_wall_clock_ms;
     let after_first_validation = state.budget.max_validation_rounds;
-    state.extend_budget_on_progress();
+    assert!(!state.extend_budget_on_progress(
+        "write_file",
+        &crate::traits::ToolCallSemantics::mutation(),
+        "created /tmp/result"
+    ));
+    assert_eq!(state.budget.max_llm_calls, after_first);
+    assert_eq!(state.budget.max_wall_clock_ms, after_first_wall);
+    assert_eq!(state.budget.max_validation_rounds, after_first_validation);
+
+    // A distinct verified outcome can extend the bounded envelope again.
+    assert!(state.extend_budget_on_progress(
+        "terminal",
+        &crate::traits::ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
+        "tests passed"
+    ));
     assert!(state.budget.max_llm_calls > after_first);
     assert!(state.budget.max_wall_clock_ms > after_first_wall);
     assert!(state.budget.max_validation_rounds > after_first_validation);
 }
 
 #[test]
-fn productive_run_never_exhausts_budget() {
+fn progress_extensions_are_bounded_and_observation_credit_is_capped() {
     let mut state = ExecutionState::new(
         BudgetTier::None,
         default_execution_budget(BudgetTier::None),
@@ -380,32 +405,41 @@ fn productive_run_never_exhausts_budget() {
     );
     state.activate_budget_envelope(0, Duration::from_millis(0));
 
-    // Simulate 30 productive iterations: each records an LLM call + tool
-    // call + occasional validation round, but also extends via progress.
-    // Use realistic elapsed time (~10s per iteration → 300s total) to
-    // verify wall-clock extension keeps pace with real-world execution.
+    let observation = crate::traits::ToolCallSemantics::observation();
     for i in 0..30 {
-        state.record_llm_call();
-        state.record_tool_call();
-        // Simulate a validation round every ~10 tool calls (realistic
-        // for complex multi-step tasks).
-        if i % 10 == 9 {
-            state.record_validation_round();
-        }
-        state.extend_budget_on_progress();
+        state.extend_budget_on_progress("read_file", &observation, &format!("evidence {i}"));
     }
+    assert_eq!(state.observation_extensions_used, 4);
+    assert_eq!(state.progress_extensions_used, 4);
 
-    // 30 iterations × ~10s each = 300s of wall time.  The base budget
-    // for None tier is 180s, but 30 progress extensions add 30 × 30s =
-    // 900s, giving a total wall-clock budget of 1080s — well above 300s.
-    // Validation rounds: base 3, used 3, but 30 extensions of +1 each
-    // give 33 total — well above the 3 used.
-    let realistic_elapsed = Duration::from_secs(300);
-    assert_eq!(
-        state.exhausted_limit(0, realistic_elapsed),
-        None,
-        "Productive run should never exhaust budget, even with realistic wall-clock time"
+    let mutation = crate::traits::ToolCallSemantics::mutation();
+    for i in 0..30 {
+        state.extend_budget_on_progress("write_file", &mutation, &format!("artifact {i}"));
+    }
+    assert_eq!(state.progress_extensions_used, 12);
+}
+
+#[test]
+fn resource_pressure_reports_the_most_constrained_dimension_once() {
+    let mut state = ExecutionState::new(
+        BudgetTier::Standard,
+        default_execution_budget(BudgetTier::Standard),
+        ExecutionPersistence::Ephemeral,
     );
+    state.activate_budget_envelope(0, Duration::ZERO);
+    state.budget.max_steps = 10;
+    state.budget.max_tool_calls = 10;
+    state.steps_used = 8;
+    state.tool_calls_used = 9;
+
+    let pressure = state
+        .resource_pressure(0, Duration::from_secs(1))
+        .expect("pressure at 90 percent");
+    assert_eq!(pressure.limit, ExecutionBudgetLimit::ToolCalls);
+    assert_eq!(pressure.pct, 90);
+
+    state.resource_pressure_emitted = true;
+    assert!(state.resource_pressure(0, Duration::from_secs(1)).is_none());
 }
 
 fn test_execution_state() -> ExecutionState {
@@ -781,13 +815,16 @@ fn advance_linear_intent_step_on_success_moves_forward() {
             },
         ],
     );
+    assert!(state.linear_intent_plan_has_remaining_steps());
     // First advance: step 1 → step 2
     state.advance_linear_intent_step_after_external_success();
+    assert!(state.linear_intent_plan_has_remaining_steps());
     let current = state.current_linear_intent_step().unwrap();
     assert_eq!(current.step_index, 2);
 
     // Second advance: step 2 → past end (cursor retires)
     state.advance_linear_intent_step_after_external_success();
+    assert!(!state.linear_intent_plan_has_remaining_steps());
     assert!(
         state.current_linear_intent_step().is_none(),
         "cursor should retire past the last step"
@@ -1125,6 +1162,13 @@ fn web_source_tracking_counts_distinct_successful_domains() {
         false,
     );
     assert_eq!(state.web_source_domains.len(), 2);
+    assert_eq!(state.web_source_urls.len(), 3);
+    assert_eq!(
+        state.cited_web_source_count(
+            "Sources: [X](https://en.wikipedia.org/wiki/X) and https://espn.com/squad"
+        ),
+        2
+    );
 
     // Failures and junk extractions don't count as read sources.
     state.record_web_source(
@@ -1230,4 +1274,62 @@ fn http_cross_class_success_does_not_launder_failed_write() {
         1,
         "a read must never correct a failed write for precisely-classified tools"
     );
+}
+
+#[test]
+fn natural_tool_presentation_tracks_exact_unrequested_internal_ids() {
+    let goal_id = "265636d3-b6e3-424a-839e-daebbf031067";
+    let run_id = "34453851-0ad1-4707-b527-736a497196c5";
+    let mut state = test_execution_state();
+    state.record_tool_output_evidence(&format!("Scheduled goal: {goal_id}"));
+    state.record_tool_result_presentation(
+        &ToolCallMetadata {
+            presentation: Some(ToolResultPresentation::NaturalSummary),
+            internal_identifiers: vec![run_id.to_string()],
+            ..ToolCallMetadata::default()
+        },
+        &format!("Queued run {run_id}"),
+    );
+
+    assert!(state.natural_outcome_summary_required);
+    assert_eq!(
+        state.unrequested_internal_identifiers(
+            &format!("Started it. Goal {goal_id}; run {run_id}."),
+            "Start the existing daily blog run."
+        ),
+        vec![goal_id.to_string(), run_id.to_string()]
+    );
+    assert_eq!(
+        state.unrequested_internal_identifiers(
+            &format!("Run {run_id} is queued."),
+            &format!("Start run {run_id} and show its diagnostics.")
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn explicit_diagnostic_presentation_disables_natural_summary_gate() {
+    let id = "34453851-0ad1-4707-b527-736a497196c5";
+    let mut state = test_execution_state();
+    state.record_tool_result_presentation(
+        &ToolCallMetadata {
+            presentation: Some(ToolResultPresentation::NaturalSummary),
+            internal_identifiers: vec![id.to_string()],
+            ..ToolCallMetadata::default()
+        },
+        "queued",
+    );
+    state.record_tool_result_presentation(
+        &ToolCallMetadata {
+            presentation: Some(ToolResultPresentation::DiagnosticDetail),
+            ..ToolCallMetadata::default()
+        },
+        "diagnostics requested",
+    );
+
+    assert!(!state.natural_outcome_summary_required);
+    assert!(state
+        .unrequested_internal_identifiers(&format!("Run {id}"), "show diagnostics")
+        .is_empty());
 }

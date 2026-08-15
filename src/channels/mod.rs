@@ -14,6 +14,7 @@ mod slack;
 pub(crate) mod telegram;
 mod telegram_bootstrap_signing;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,45 +22,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "discord")]
 pub use discord::{spawn_discord_channel, DiscordChannel};
 pub use hub::{ChannelHub, SessionMap};
-pub(crate) use presentation::{prepare_chat_message, present_notification};
+pub(crate) use presentation::{
+    prepare_chat_message, present_notification, present_scheduled_run_notification,
+};
 #[cfg(feature = "slack")]
 pub use slack::{spawn_slack_channel, SlackChannel};
 pub use telegram::TelegramChannel;
 
-pub(crate) const LIGHTWEIGHT_INTERJECTION_IGNORE_GRACE_SECS: u64 = 120;
-
-/// Lightweight conversational check-ins that should not be queued while work is running.
-pub(crate) fn is_lightweight_interjection(text: &str) -> bool {
-    let cleaned = text
-        .trim()
-        .trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase();
-    if cleaned.is_empty() || cleaned.len() > 24 {
-        return false;
-    }
-    matches!(
-        cleaned.as_str(),
-        "hey"
-            | "hi"
-            | "hello"
-            | "yo"
-            | "ok"
-            | "okay"
-            | "thanks"
-            | "thank you"
-            | "thx"
-            | "got it"
-            | "cool"
-            | "sure"
-            | "yep"
-            | "yes"
-    )
-}
-
-/// Ignore lightweight check-ins while a task is running, but only after daemon startup grace.
-pub(crate) fn should_ignore_lightweight_interjection(text: &str, daemon_uptime: Duration) -> bool {
-    is_lightweight_interjection(text)
-        && daemon_uptime > Duration::from_secs(LIGHTWEIGHT_INTERJECTION_IGNORE_GRACE_SECS)
+/// Shared application services/configuration consumed by every chat transport.
+/// Transport constructors take this named bundle plus protocol-specific values,
+/// so adding an application dependency does not change every constructor.
+#[derive(Clone)]
+pub(crate) struct ChannelRuntimeDeps {
+    pub agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime>,
+    pub config_path: PathBuf,
+    pub session_map: SessionMap,
+    pub task_registry: Arc<crate::tasks::TaskRegistry>,
+    pub files_enabled: bool,
+    pub inbox_dir: PathBuf,
+    pub max_file_size_mb: u64,
+    pub state: Arc<dyn crate::traits::StateStore>,
+    pub watchdog_stale_threshold_secs: u64,
 }
 
 /// Wait until the heartbeat becomes stale and return stale minutes.
@@ -87,10 +70,7 @@ pub(crate) async fn wait_for_stale_heartbeat(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_lightweight_interjection, should_ignore_lightweight_interjection,
-        wait_for_stale_heartbeat, LIGHTWEIGHT_INTERJECTION_IGNORE_GRACE_SECS,
-    };
+    use super::wait_for_stale_heartbeat;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -111,32 +91,5 @@ mod tests {
         .expect("stale heartbeat should resolve quickly");
 
         assert!(mins >= 2);
-    }
-
-    #[test]
-    fn lightweight_interjection_detects_short_checkins() {
-        assert!(is_lightweight_interjection("hey"));
-        assert!(is_lightweight_interjection("Thanks!"));
-        assert!(is_lightweight_interjection("OK"));
-        assert!(is_lightweight_interjection("  got it  "));
-    }
-
-    #[test]
-    fn lightweight_interjection_ignores_substantive_requests() {
-        assert!(!is_lightweight_interjection("can you send me my resume?"));
-        assert!(!is_lightweight_interjection("please run the tests"));
-        assert!(!is_lightweight_interjection("check logs and fix the error"));
-    }
-
-    #[test]
-    fn lightweight_interjection_not_ignored_during_restart_grace_window() {
-        let uptime = Duration::from_secs(30);
-        assert!(!should_ignore_lightweight_interjection("hi", uptime));
-    }
-
-    #[test]
-    fn lightweight_interjection_ignored_after_grace_window() {
-        let uptime = Duration::from_secs(LIGHTWEIGHT_INTERJECTION_IGNORE_GRACE_SECS + 5);
-        assert!(should_ignore_lightweight_interjection("hi", uptime));
     }
 }

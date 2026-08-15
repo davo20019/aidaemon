@@ -12,11 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::skills;
-use crate::types::{ChannelVisibility, UserRole};
-
+#[cfg(test)]
+use super::contains_keyword_as_words;
 use super::execution_state::StepExecutionOutcome;
-use super::{contains_keyword_as_words, StatusUpdate};
+use super::StatusUpdate;
 
 /// Best-effort send — never blocks the agent loop if the receiver is slow/full.
 pub fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
@@ -431,8 +430,8 @@ pub(in crate::agent) fn truncate_for_resume(text: &str, max_chars: usize) -> Str
 }
 
 pub(in crate::agent) fn build_empty_response_fallback(response_note: Option<&str>) -> String {
-    let base = "I wasn't able to process that request.";
-    let generic = format!("{base} Could you try rephrasing?");
+    let base = "I wasn't able to process that request because automatic model recovery returned no usable output.";
+    let generic = base.to_string();
     let Some(note) = response_note.map(str::trim).filter(|s| !s.is_empty()) else {
         return generic;
     };
@@ -445,9 +444,7 @@ pub(in crate::agent) fn build_empty_response_fallback(response_note: Option<&str
     }
 
     let note_preview = truncate_for_resume(trimmed, 180);
-    format!(
-        "{base} The model returned no usable output ({note_preview}). Could you try rephrasing?"
-    )
+    format!("{base} Provider detail: {note_preview}.")
 }
 
 fn normalize_for_resume_intent(text: &str) -> String {
@@ -488,30 +485,12 @@ pub(in crate::agent) fn is_resume_request(text: &str) -> bool {
 }
 
 pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {
-    // Conservative: only treat as a filesystem reference when there's strong evidence the user is
-    // pointing at a local path or a concrete filename.
-    //
-    // This intentionally avoids broad `text.contains('/')` checks which misfire on fractions/dates
-    // (e.g. "3/4", "2/14") and common shorthand like "yes/no" or "w/o".
     let user_text = crate::channels::attachments::user_authored_text(user_text);
     if user_text.trim().is_empty() {
         return false;
     }
 
-    const NON_PATH_SLASH_PHRASES: &[&str] = &["yes/no", "no/yes", "and/or", "w/o", "on/off"];
-    const FILE_EXTS: &[&str] = &[
-        "rs", "py", "js", "ts", "tsx", "json", "toml", "yaml", "yml", "md", "txt", "log", "env",
-        "sql", "csv", "go", "java", "c", "cc", "cpp", "h", "hpp", "sh", "zsh", "bash",
-    ];
-    const COMMON_RELATIVE_DIRS: &[&str] = &[
-        "src", "tests", "test", "target", "crates", "apps", "packages", "scripts", "bin", "lib",
-        "include", "cmd", "internal", "docs",
-    ];
-
     for raw in user_text.as_str().split_whitespace() {
-        // Strip prose delimiters without erasing filesystem anchors. Using
-        // `is_ascii_punctuation` here removed the leading `~/`, `/`, `./`, or
-        // `\\` from directory-only paths before the checks below could see it.
         let token = raw
             .trim_matches(|c: char| {
                 c.is_ascii_whitespace()
@@ -524,88 +503,22 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
         if token.is_empty() {
             continue;
         }
-        let lower = token.to_ascii_lowercase();
-
-        // Obvious URLs are not filesystem paths.
-        if lower.contains("://") {
-            continue;
-        }
-
-        // Windows / UNC
-        if lower.starts_with("\\\\") {
+        if crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some() {
             return true;
-        }
-        if lower.len() >= 3 {
-            let bytes = lower.as_bytes();
-            let drive = bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-            let sep = bytes[2] == b'\\' || bytes[2] == b'/';
-            if drive && sep {
-                return true;
-            }
-        }
-        if lower.contains('\\') {
-            return true;
-        }
-
-        // Unix-ish absolute / relative anchors
-        if lower.starts_with("~/") || lower.starts_with("./") || lower.starts_with("../") {
-            return true;
-        }
-        if lower.starts_with('/') {
-            return true;
-        }
-
-        // Concrete filenames (no slashes required)
-        if let Some((_, ext)) = lower.rsplit_once('.') {
-            if FILE_EXTS.contains(&ext) {
-                return true;
-            }
-        }
-
-        if !lower.contains('/') {
-            continue;
-        }
-
-        // Avoid false positives: fractions/dates and a few common slash phrases.
-        if NON_PATH_SLASH_PHRASES.contains(&lower.as_str()) {
-            continue;
-        }
-        let is_simple_fraction_or_date = {
-            let parts: Vec<&str> = lower.split('/').collect();
-            (parts.len() == 2 || parts.len() == 3)
-                && parts
-                    .iter()
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        };
-        if is_simple_fraction_or_date {
-            continue;
-        }
-
-        // Multi-segment paths are strong evidence.
-        if lower.matches('/').count() >= 2 {
-            return true;
-        }
-
-        // One slash: treat as a path only for common repo directories, or when the token contains a dot.
-        if lower.contains('.') {
-            return true;
-        }
-        if let Some((first, _rest)) = lower.split_once('/') {
-            if COMMON_RELATIVE_DIRS.contains(&first) {
-                return true;
-            }
         }
     }
 
     false
 }
 
+#[cfg(test)]
 fn text_contains_any_phrase_as_words(text: &str, phrases: &[&str]) -> bool {
     phrases
         .iter()
         .any(|phrase| contains_keyword_as_words(text, phrase))
 }
 
+#[cfg(test)]
 pub(in crate::agent) fn text_has_explicit_project_scope_cues(text: &str) -> bool {
     text_contains_any_phrase_as_words(
         text,
@@ -625,50 +538,7 @@ pub(in crate::agent) fn text_has_explicit_project_scope_cues(text: &str) -> bool
     )
 }
 
-fn text_has_local_project_command_cues(text: &str, token: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() || lower.ends_with('?') {
-        return false;
-    }
-
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    let strong_local_verbs = [
-        "run", "build", "deploy", "publish", "restart", "reload", "commit", "push", "lint",
-        "format", "fmt", "compile", "test", "debug", "fix", "refactor", "edit",
-    ];
-    // Allow short adverbial prefixes ("now", "also", "please", "just", "quickly") before the verb
-    // so that "Now deploy blog.aidaemon.ai" is treated the same as "Deploy blog.aidaemon.ai".
-    const COMMAND_PREFIXES: &[&str] = &["now", "also", "please", "just", "quickly", "go"];
-    let starts_like_local_command = words
-        .iter()
-        .take(2)
-        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_'))
-        .enumerate()
-        .any(|(i, word)| {
-            strong_local_verbs
-                .iter()
-                .any(|verb| word.eq_ignore_ascii_case(verb))
-                && (i == 0 || words.first().is_some_and(|w| COMMAND_PREFIXES.contains(w)))
-        });
-    if !starts_like_local_command {
-        return false;
-    }
-
-    let normalized_token = token
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.');
-    !normalized_token.is_empty() && contains_keyword_as_words(&lower, normalized_token)
-}
-
-pub(in crate::agent) fn should_allow_contextual_project_nickname_scope(
-    text: &str,
-    token: &str,
-) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    user_text_references_filesystem_path(text)
-        || text_has_explicit_project_scope_cues(&lower)
-        || text_has_local_project_command_cues(text, token)
-}
-
+#[cfg(test)]
 pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text: &str) -> bool {
     if user_text_references_filesystem_path(user_text) {
         return true;
@@ -700,20 +570,6 @@ pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text
     .any(|kw| contains_keyword_as_words(&lower, kw));
 
     mentions_local_subject && mentions_inspection_verb
-}
-
-pub(in crate::agent) fn matched_untrusted_external_reference_skill_names(
-    skills_snapshot: &[skills::Skill],
-    user_text: &str,
-    user_role: UserRole,
-    visibility: ChannelVisibility,
-) -> Vec<String> {
-    skills::match_skills(skills_snapshot, user_text, user_role, visibility)
-        .skills
-        .into_iter()
-        .filter(|skill| skills::is_untrusted_external_reference_skill(skill))
-        .map(|skill| skill.name.clone())
-        .collect()
 }
 
 pub(in crate::agent) fn is_untrusted_external_reference_blocked_tool(tool_name: &str) -> bool {

@@ -238,13 +238,13 @@ impl Tool for ReadNodeHealthTool {
     }
 
     fn description(&self) -> &str {
-        "Read the latest authenticated heartbeat and bounded Runtime recovery evidence for an enrolled AIdaemon Node."
+        "Read an enrolled AIdaemon Node's latest authenticated heartbeat, reported capabilities, current gateway authorizations, and bounded Runtime recovery evidence."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "read_node_health",
-            "description": "Read stored Node connection freshness, Runtime/firmware versions, bounded resource health and the most recent Runtime recovery report. This is evidence reported during an authenticated Node Session; it cannot contact or restart an offline Device.",
+            "description": "Inspect stored Node connection freshness, Runtime/firmware versions, reported protocol capabilities and limits, current gateway authorizations, bounded resource health, and the most recent Runtime recovery report. Use this before claiming that a Companion control is supported or unavailable. This is evidence reported during an authenticated Node Session; it cannot contact or restart an offline Device.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -302,7 +302,9 @@ impl Tool for ReadNodeHealthTool {
             "largest_internal_allocation": health.largest_internal_allocation,
             "psram_free": health.psram_free,
             "recovery": health.recovery,
-            "interpretation": "This is the latest authenticated Runtime report stored by AIdaemon. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
+            "reported_capabilities": health.capabilities,
+            "current_authorizations": health.authorizations,
+            "interpretation": "This is the latest authenticated Runtime report stored by AIdaemon. Capability absence means the Node did not report that protocol control; it does not prove the physical hardware lacks it. Authorization absence means the gateway has not granted that action. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
         }))?)
     }
 }

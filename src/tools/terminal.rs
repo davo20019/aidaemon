@@ -15,7 +15,6 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::channels::ChannelHub;
 use crate::config::SelfCorrectionConfig;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
@@ -24,9 +23,11 @@ use crate::events::{
 use crate::execution::{
     active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
 };
+use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolOutcomeStatus, ToolVerificationMode,
+    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
+    ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -538,7 +539,7 @@ async fn deliver_attributed_background_file(
     outbox_dirs: &[PathBuf],
     delivered_deliverables: &Arc<Mutex<HashMap<(String, String), DeliverableDeliveryState>>>,
     plan_store: Option<&Arc<crate::plans::PlanStore>>,
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
     goal_id: &str,
     pid: u32,
@@ -674,9 +675,22 @@ async fn deliver_attributed_background_file(
             filename = %ready.filename,
             "Delivered attributed background result file as a document"
         );
-        // Conservative single-item checklist write-back (ignores Ok(false)).
+        // Reconcile only an explicit typed delivery contract for this exact
+        // canonical path. Checklist prose cannot authorize completion.
         if let Some(ps) = plan_store {
-            if let Err(e) = ps.mark_delivery_step_complete(session_id).await {
+            let semantics =
+                ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+                    .with_target_hint(ToolTargetHintKind::Path, canonical.clone());
+            let receipt_id = format!("background-delivery:{pid}");
+            if let Err(e) = ps
+                .reconcile_checklist_after_tool_success(
+                    session_id,
+                    &semantics,
+                    &receipt_id,
+                    "Background file delivered",
+                )
+                .await
+            {
                 warn!(
                     pid,
                     error = %e,
@@ -704,7 +718,7 @@ async fn deliver_attributed_background_file(
 /// The final ANSWER (re-engagement reply) intentionally stays a separate
 /// fresh message — edits do not trigger channel notifications.
 pub(crate) async fn deliver_background_completion_ping(
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
     session_id: &str,
     goal_id: &str,
@@ -741,7 +755,7 @@ pub(crate) async fn deliver_background_completion_ping(
 /// actually been delivered. The completion ping is deliberately nonterminal;
 /// only this post-delivery transition gets a checkmark.
 async fn finalize_background_completion_surface(
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     session_id: &str,
     surface_id: Option<&str>,
     outcome: BackgroundSurfaceOutcome,
@@ -771,7 +785,7 @@ enum BackgroundSurfaceOutcome {
 }
 
 async fn deliver_background_text(
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
     session_id: &str,
     goal_id: &str,
@@ -826,7 +840,7 @@ pub struct TerminalTool {
     pool: Option<SqlitePool>,
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
-    hub: OnceLock<Weak<ChannelHub>>,
+    hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// Weak reference to the agent, used to re-engage the agent loop when
     /// a background terminal command completes so the agent can process the
     /// output and continue working on the original task.
@@ -1711,7 +1725,7 @@ fn format_short_background_result(output_trimmed: &str) -> String {
 
 fn format_background_continuation_failure(unchecked: &[String]) -> String {
     if unchecked.is_empty() {
-        return "⚠️ The background step finished, but I couldn't prepare the final response. Please ask me to continue."
+        return "⚠️ The background step finished, but the automatic continuation could not prepare the final response."
             .to_string();
     }
 
@@ -1919,18 +1933,22 @@ impl TerminalTool {
     }
 
     /// Set channel hub reference for immediate background progress/completion delivery.
-    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
-        let _ = self.hub.set(hub);
+    pub fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
+        self.hub
+            .set(hub)
+            .expect("TerminalTool::set_hub called more than once");
     }
 
-    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+    fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
         self.hub.get().and_then(|w| w.upgrade())
     }
 
     /// Set agent reference so background command completions can re-engage
     /// the agent loop to process the output and continue the original task.
     pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
-        let _ = self.agent.set(agent);
+        self.agent
+            .set(agent)
+            .expect("TerminalTool::set_agent called more than once");
     }
 
     /// Wire the durable plan store so the background completion notifier can read
@@ -1938,6 +1956,12 @@ impl TerminalTool {
     /// conservative delivery-step write-back).
     pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
         let _ = self.plan_store.set(plan_store);
+    }
+
+    pub(crate) fn wiring_ready(&self) -> bool {
+        self.hub.get().and_then(Weak::upgrade).is_some()
+            && self.agent.get().and_then(Weak::upgrade).is_some()
+            && self.plan_store.get().is_some()
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
@@ -3842,14 +3866,14 @@ impl TerminalTool {
                                                         "Re-engaging agent loop for long-running background command"
                                                     );
                                                     match agent
-                                                        .handle_message(
-                                                            &session_for_notify,
-                                                            &followup,
-                                                            None,
-                                                            crate::types::UserRole::Owner,
-                                                            crate::types::ChannelContext::internal(),
-                                                            None,
-                                                        )
+                                                        .continue_conversation(ConversationRequest {
+                                                            session_id: session_for_notify.clone(),
+                                                            user_text: followup,
+                                                            status_tx: None,
+                                                            user_role: crate::types::UserRole::Owner,
+                                                            channel_ctx: crate::types::ChannelContext::internal(),
+                                                            heartbeat: None,
+                                                        })
                                                         .await
                                                     {
                                                         Ok(reply) if !reply.trim().is_empty() => {
@@ -4240,14 +4264,15 @@ impl TerminalTool {
                                             "Re-engaging agent loop to process background command output"
                                         );
                                         match agent
-                                            .handle_message(
-                                                &session_for_notify,
-                                                &followup,
-                                                None,
-                                                crate::types::UserRole::Owner,
-                                                crate::types::ChannelContext::internal(),
-                                                None,
-                                            )
+                                            .continue_conversation(ConversationRequest {
+                                                session_id: session_for_notify.clone(),
+                                                user_text: followup,
+                                                status_tx: None,
+                                                user_role: crate::types::UserRole::Owner,
+                                                channel_ctx: crate::types::ChannelContext::internal(
+                                                ),
+                                                heartbeat: None,
+                                            })
                                             .await
                                         {
                                             Ok(reply) => {

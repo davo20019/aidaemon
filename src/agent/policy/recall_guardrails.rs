@@ -554,6 +554,7 @@ pub(super) fn resolve_reaffirmation_anchor(
     })
 }
 
+#[cfg(test)]
 pub(super) fn user_requests_external_verification(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     contains_keyword_as_words(&lower, "actually check")

@@ -7,7 +7,7 @@ use crate::llm_runtime::ProviderRuntimeTarget;
 use crate::router::Router;
 use crate::traits::ModelProvider;
 
-pub struct ProviderRouterBundle {
+pub(crate) struct ProviderRouterBundle {
     pub provider: Arc<dyn ModelProvider>,
     pub primary_model: String,
     pub router: Option<Router>,
@@ -29,16 +29,16 @@ fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> 
 fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRuntimeTarget> {
     let provider_base_override = provider_specific_base_url_override(config);
 
-    let provider: Arc<dyn crate::traits::ModelProvider> = match config.kind {
+    let provider: Arc<dyn ModelProvider> = match config.kind {
         ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new_with_all_options(
+            super::OpenAiCompatibleProvider::new_with_all_options(
                 &config.base_url,
                 &config.api_key,
                 config.gateway_token.as_deref(),
                 config.extra_headers.clone(),
                 config.max_tokens,
             )
-            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .map_err(|error| anyhow::anyhow!("{error}"))?
             .with_reasoning_effort(config.reasoning_effort.clone())
             .with_llama_cpp_thinking(config.llama_cpp_thinking)
             .with_slot_routing(config.slot_routing.clone())
@@ -46,23 +46,23 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
             .with_structured_answer_models(config.structured_answer_models.clone()),
         ),
         ProviderKind::XaiNative => Arc::new(
-            crate::providers::XaiNativeProvider::new_with_options(
+            super::XaiNativeProvider::new_with_options(
                 &config.api_key,
                 provider_base_override,
                 config.max_tokens,
                 config.extra_headers.clone(),
             )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
         ),
-        ProviderKind::GoogleGenai => Arc::new(
-            crate::providers::GoogleGenAiProvider::new_with_base_url_and_headers(
+        ProviderKind::GoogleGenai => {
+            Arc::new(super::GoogleGenAiProvider::new_with_base_url_and_headers(
                 &config.api_key,
                 provider_base_override,
                 config.extra_headers.clone(),
-            ),
-        ),
+            ))
+        }
         ProviderKind::Anthropic => Arc::new(
-            crate::providers::AnthropicNativeProvider::new_with_options(
+            super::AnthropicNativeProvider::new_with_options(
                 &config.api_key,
                 provider_base_override,
                 config.max_tokens,
@@ -70,10 +70,7 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
             )
             .with_reasoning_effort(config.reasoning_effort.clone()),
         ),
-        // Credentials come from the ChatGPT OAuth store, not `api_key`.
         ProviderKind::OpenaiChatgpt => {
-            // The Codex backend rejects every output-cap parameter, so say so
-            // rather than letting a configured cap look effective.
             if config.max_tokens.is_some() {
                 warn!(
                     "provider.max_tokens is ignored by the ChatGPT subscription provider; \
@@ -81,8 +78,8 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
                 );
             }
             Arc::new(
-                crate::providers::OpenAiChatGptProvider::new(provider_base_override)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
+                super::OpenAiChatGptProvider::new(provider_base_override)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
                     .with_reasoning_effort(config.reasoning_effort.clone()),
             )
         }
@@ -90,11 +87,7 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
 
     let router = Router::new(config.models.clone());
     let primary_model = router.default_model().to_string();
-    let router = if router.is_uniform() {
-        None
-    } else {
-        Some(router)
-    };
+    let router = (!router.is_uniform()).then_some(router);
 
     Ok(ProviderRuntimeTarget::new(
         provider,
@@ -104,7 +97,7 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
     ))
 }
 
-pub fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
+pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
     let primary_target = build_provider_target(&config.provider)?;
     let failover_targets = config
         .provider

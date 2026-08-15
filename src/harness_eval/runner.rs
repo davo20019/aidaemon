@@ -12,7 +12,8 @@ use crate::types::{ChannelContext, UserRole};
 
 pub async fn run_fixture(fixture: &HarnessEvalFixture) -> anyhow::Result<HarnessEvalRunResult> {
     let mock_responses = build_mock_responses(&fixture.mock_responses);
-    let provider = MockProvider::with_responses(mock_responses);
+    let provider = MockProvider::with_responses(mock_responses)
+        .with_task_assessments(build_mock_responses(&fixture.task_assessments));
 
     let harness = if fixture.orchestrator {
         setup_test_agent_orchestrator(provider).await?

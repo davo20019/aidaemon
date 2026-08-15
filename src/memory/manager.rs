@@ -8,7 +8,7 @@ use crate::memory::embedding_index::{
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::scoring::calculate_episode_importance;
-use crate::traits::{BehaviorPattern, Message, Person, StateStore, UserProfile};
+use crate::traits::{BehaviorPattern, Message, MessageAnnotation, Person, StateStore, UserProfile};
 use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -1287,6 +1287,12 @@ impl MemoryManager {
         let mut transcript = String::new();
 
         for msg in messages {
+            if msg
+                .effective_annotations()
+                .contains(&MessageAnnotation::InternalContinuation)
+            {
+                continue;
+            }
             match msg.role.as_str() {
                 "user" => {
                     if let Some(content) = &msg.content {
@@ -2182,6 +2188,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 created_at,
             ) {
                 let mut msg = turn.clone().into_message();
+                if msg
+                    .effective_annotations()
+                    .contains(&MessageAnnotation::InternalContinuation)
+                {
+                    continue;
+                }
                 msg.importance = crate::memory::scoring::score_turn(&turn);
                 messages.push(msg);
             }
@@ -2264,6 +2276,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 created_at,
             ) {
                 let mut msg = turn.clone().into_message();
+                if msg
+                    .effective_annotations()
+                    .contains(&MessageAnnotation::InternalContinuation)
+                {
+                    continue;
+                }
                 msg.importance = crate::memory::scoring::score_turn(&turn);
                 messages.push(msg);
             }
@@ -2326,6 +2344,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 created_at,
             ) {
                 let mut msg = turn.clone().into_message();
+                if msg
+                    .effective_annotations()
+                    .contains(&MessageAnnotation::InternalContinuation)
+                {
+                    continue;
+                }
                 msg.importance = crate::memory::scoring::score_turn(&turn);
                 messages.push(msg);
             }
@@ -2391,6 +2415,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 created_at,
             ) {
                 let mut msg = turn.clone().into_message();
+                if msg
+                    .effective_annotations()
+                    .contains(&MessageAnnotation::InternalContinuation)
+                {
+                    continue;
+                }
                 msg.importance = crate::memory::scoring::score_turn(&turn);
                 messages.push(msg);
             }
@@ -2625,6 +2655,25 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn clean_transcript_excludes_internal_continuation_as_owner_speech() {
+        let messages = vec![
+            Message {
+                content: Some("Find the synthetic product specifications.".to_string()),
+                ..Message::new_runtime("user-1", "session-1", "user")
+            },
+            Message {
+                content: Some("Worker output from an internal retry.".to_string()),
+                annotations: vec![MessageAnnotation::InternalContinuation],
+                ..Message::new_runtime("continuation-1", "session-1", "user")
+            },
+        ];
+
+        let transcript = MemoryManager::get_clean_transcript(&messages);
+        assert!(transcript.contains("Find the synthetic product specifications."));
+        assert!(!transcript.contains("Worker output from an internal retry."));
+    }
 
     async fn setup_memory_manager_with_responses(
         responses: Vec<crate::traits::ProviderResponse>,

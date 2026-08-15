@@ -928,6 +928,7 @@ pub trait GoalStore: Send + Sync {
     }
 
     /// Get scheduled goals awaiting confirmation in a session.
+    #[allow(dead_code)]
     async fn get_pending_confirmation_goals(
         &self,
         _session_id: &str,
@@ -983,6 +984,7 @@ pub trait MandateStore: Send + Sync {
     async fn confirm_mandate(
         &self,
         _mandate_id: &str,
+        _expected_version: i64,
         _activation_duration_secs: Option<i64>,
     ) -> anyhow::Result<bool> {
         Ok(false)
@@ -1102,6 +1104,23 @@ pub trait MandateStore: Send + Sync {
         anyhow::bail!("mandate decisions are not supported by this store")
     }
 
+    async fn record_mandate_decision_with_updates(
+        &self,
+        decision: &super::MandateDecisionCycle,
+        intention: Option<&super::Intention>,
+        operating_updates: Option<&super::MandateOperatingUpdates>,
+        task_attempt_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            operating_updates.is_none_or(|updates| {
+                updates.learning_note.is_none() && updates.strategy_revisions.is_empty()
+            }),
+            "adaptive mandate operating updates are not supported by this store"
+        );
+        self.record_mandate_decision(decision, intention, task_attempt_id)
+            .await
+    }
+
     async fn get_mandate_decision_for_run(
         &self,
         _goal_run_id: &str,
@@ -1127,6 +1146,7 @@ pub trait MandateStore: Send + Sync {
 
     /// Persist one bounded, advisory learning note only after all cited
     /// receipts are proven to belong to this mandate.
+    #[allow(dead_code)]
     async fn record_mandate_learning_note(
         &self,
         _note: &super::MandateLearningNote,
@@ -1139,6 +1159,25 @@ pub trait MandateStore: Send + Sync {
         _mandate_id: &str,
         _limit: i64,
     ) -> anyhow::Result<Vec<super::MandateLearningNote>> {
+        Ok(Vec::new())
+    }
+
+    /// Return the latest adaptive strategy node for each key. Retired nodes
+    /// remain visible for audit but must not be treated as active guidance.
+    async fn list_current_mandate_strategy(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::MandateStrategyRevision>> {
+        Ok(Vec::new())
+    }
+
+    /// Deduplicate and route one content-free external signal to matching
+    /// Autopilot mandates. Matching is structural and cannot widen authority.
+    async fn wake_mandates_for_signal(
+        &self,
+        _signal: &super::MandateWakeSignal,
+    ) -> anyhow::Result<Vec<String>> {
         Ok(Vec::new())
     }
 

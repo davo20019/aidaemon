@@ -63,7 +63,7 @@ impl Agent {
         &self,
         config: &crate::config::AppConfig,
     ) -> anyhow::Result<String> {
-        let bundle = crate::startup::provider_router::build_provider_router(config)?;
+        let bundle = crate::providers::factory::build_provider_router(config)?;
         let new_primary = bundle.primary_model.clone();
         let new_fallback = config
             .provider

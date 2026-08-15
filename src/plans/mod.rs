@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::traits::ToolMutationEffects;
 use crate::utils::truncate_str;
 
 /// A persistent multi-step task plan.
@@ -73,6 +74,11 @@ impl TaskPlan {
             .map(|(index, description)| PlanStep {
                 index,
                 description,
+                depends_on: index.checked_sub(1).into_iter().collect(),
+                required_mutation_effects: ToolMutationEffects::NONE,
+                requires_observation: false,
+                expected_targets: Vec::new(),
+                evidence_receipt_ids: Vec::new(),
                 status: if index == 0 {
                     StepStatus::InProgress
                 } else {
@@ -126,9 +132,9 @@ impl TaskPlan {
         }
 
         if let Some(index) = self
-            .steps
-            .iter()
-            .position(|step| step.status == StepStatus::Pending)
+            .ready_step_indices()
+            .ok()
+            .and_then(|indices| indices.into_iter().next())
         {
             self.current_step = index;
             if self.status == PlanStatus::InProgress {
@@ -160,23 +166,107 @@ impl TaskPlan {
         self.steps.iter().all(|s| {
             matches!(
                 s.status,
-                StepStatus::Completed | StepStatus::Failed | StepStatus::Skipped
+                StepStatus::Completed
+                    | StepStatus::Failed
+                    | StepStatus::Skipped
+                    | StepStatus::Deferred
             )
         })
     }
 
+    /// Validate the persisted step dependency graph.
+    pub fn validate_graph(&self) -> Result<(), String> {
+        self.step_graph().map(|_| ())
+    }
+
+    /// Pending steps whose prerequisites have reached accepted terminal state.
+    /// The current executor selects one deterministically; task-level workers
+    /// can use the same graph shape for actual parallel branches.
+    pub fn ready_step_indices(&self) -> Result<Vec<usize>, String> {
+        let graph = self.step_graph()?;
+        Ok(self
+            .steps
+            .iter()
+            .filter(|step| {
+                step.status == StepStatus::Pending
+                    && graph.dependencies_satisfied(&plan_step_node_id(step.index))
+            })
+            .map(|step| step.index)
+            .collect())
+    }
+
+    fn step_graph(&self) -> Result<crate::execution_graph::ExecutionGraph, String> {
+        use crate::execution_graph::{
+            ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
+        };
+
+        let mut graph = ExecutionGraph::default();
+        for (position, step) in self.steps.iter().enumerate() {
+            if step.index != position {
+                return Err(format!(
+                    "plan step index {} does not match position {}",
+                    step.index, position
+                ));
+            }
+            let state = match step.status {
+                StepStatus::Pending => ExecutionNodeState::Pending,
+                StepStatus::InProgress => ExecutionNodeState::Running,
+                StepStatus::Completed | StepStatus::Skipped | StepStatus::Deferred => {
+                    ExecutionNodeState::Satisfied
+                }
+                StepStatus::Failed => ExecutionNodeState::Failed,
+            };
+            graph.add_node(
+                plan_step_node_id(step.index),
+                ExecutionNodeKind::PlanStep,
+                state,
+            )?;
+        }
+        for step in &self.steps {
+            let mut unique_dependencies = std::collections::BTreeSet::new();
+            for dependency in &step.depends_on {
+                if !unique_dependencies.insert(*dependency) {
+                    return Err(format!(
+                        "plan step {} lists dependency {} more than once",
+                        step.index, dependency
+                    ));
+                }
+                if *dependency >= self.steps.len() {
+                    return Err(format!(
+                        "plan step {} depends on missing step {}",
+                        step.index, dependency
+                    ));
+                }
+                graph.add_edge(
+                    &plan_step_node_id(step.index),
+                    &plan_step_node_id(*dependency),
+                    ExecutionEdgeKind::DependsOn,
+                    None,
+                )?;
+            }
+        }
+        Ok(graph)
+    }
+
     /// Advance to the next step. Returns true if there was a next step.
     pub fn advance_to_next_step(&mut self) -> bool {
-        if self.current_step + 1 < self.steps.len() {
-            self.current_step += 1;
+        if let Some(next_index) = self
+            .ready_step_indices()
+            .ok()
+            .and_then(|indices| indices.into_iter().next())
+        {
+            self.current_step = next_index;
             if let Some(step) = self.steps.get_mut(self.current_step) {
                 step.status = StepStatus::InProgress;
                 step.started_at = Some(Utc::now());
             }
             self.updated_at = Utc::now();
             true
-        } else {
+        } else if self.is_finished() {
             self.status = PlanStatus::Completed;
+            self.updated_at = Utc::now();
+            false
+        } else {
             self.updated_at = Utc::now();
             false
         }
@@ -347,6 +437,24 @@ pub struct PlanStep {
     /// Human-readable description
     pub description: String,
 
+    /// Indices of prerequisite steps. Missing on legacy rows means the steps
+    /// are independent; newly generated plans persist explicit serial edges.
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+
+    /// Typed evidence contract for automatic completion. If empty/false, only
+    /// an explicit checklist update may complete the step.
+    #[serde(default)]
+    pub required_mutation_effects: ToolMutationEffects,
+    #[serde(default)]
+    pub requires_observation: bool,
+    /// Exact canonical targets (path, URL, or resource ID), never prose.
+    #[serde(default)]
+    pub expected_targets: Vec<String>,
+    /// Tool-call receipt IDs that proved this step.
+    #[serde(default)]
+    pub evidence_receipt_ids: Vec<String>,
+
     /// Step status
     pub status: StepStatus,
 
@@ -364,6 +472,20 @@ pub struct PlanStep {
 
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChecklistItem {
+    pub description: String,
+    pub status: StepStatus,
+    pub depends_on: Vec<usize>,
+    pub required_mutation_effects: ToolMutationEffects,
+    pub requires_observation: bool,
+    pub expected_targets: Vec<String>,
+}
+
+fn plan_step_node_id(index: usize) -> String {
+    format!("plan-step:{index}")
 }
 
 impl PlanStep {
@@ -527,6 +649,44 @@ mod tests {
 
         assert_eq!(plan.current_step, 1);
         assert_eq!(plan.steps[1].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn dependency_graph_supports_parallel_branches_and_a_join() {
+        let mut plan = TaskPlan::new(
+            "session_123",
+            "test",
+            "Graph task",
+            vec!["Left".into(), "Right".into(), "Join".into()],
+            "test",
+        );
+        for step in &mut plan.steps {
+            step.status = StepStatus::Pending;
+        }
+        plan.steps[0].depends_on.clear();
+        plan.steps[1].depends_on.clear();
+        plan.steps[2].depends_on = vec![0, 1];
+
+        assert_eq!(plan.ready_step_indices().unwrap(), vec![0, 1]);
+        plan.steps[0].status = StepStatus::Completed;
+        assert_eq!(plan.ready_step_indices().unwrap(), vec![1]);
+        plan.steps[1].status = StepStatus::Completed;
+        assert_eq!(plan.ready_step_indices().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn dependency_graph_rejects_cycles() {
+        let mut plan = TaskPlan::new(
+            "session_123",
+            "test",
+            "Cyclic task",
+            vec!["One".into(), "Two".into()],
+            "test",
+        );
+        plan.steps[0].depends_on = vec![1];
+        plan.steps[1].depends_on = vec![0];
+
+        assert!(plan.validate_graph().unwrap_err().contains("cycle"));
     }
 
     #[test]

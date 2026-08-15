@@ -94,7 +94,7 @@ async fn test_empty_llm_response_retried_then_fallback() {
         .await
         .unwrap();
 
-    let expected = "I wasn't able to process that request. Could you try rephrasing?";
+    let expected = "I wasn't able to process that request because automatic model recovery returned no usable output.";
     assert_eq!(harness.provider.call_count().await, 2);
     assert_eq!(response, expected);
 
@@ -212,6 +212,7 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
         "max_mutating_actions_per_rolling_24h": 4,
         "min_seconds_between_mutations": 900,
         "constraints": ["No fabrication, spam, or engagement bait"],
+        "success_criteria": ["Each intervention provides grounded information that is useful to the audience"],
         "stop_conditions": ["Authentication is revoked"]
     })
     .to_string();
@@ -229,6 +230,7 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
         "max_mutating_actions_per_rolling_24h": 4,
         "min_seconds_between_mutations": 900,
         "constraints": ["No fabrication, spam, or engagement bait"],
+        "success_criteria": ["Each intervention provides grounded information that is useful to the audience"],
         "stop_conditions": ["Authentication is revoked"]
     })
     .to_string();
@@ -356,12 +358,21 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
         "A useful bounded update is warranted",
         mandate.version,
     );
-    let intention = crate::traits::Intention::new(
+    let mut intention = crate::traits::Intention::new(
         &mandate.id,
         &decision.id,
         &run.id,
         "Post one bounded stewardship update",
         "It is within the confirmed target and quota",
+    );
+    intention.value_criterion = Some(mandate.success_criteria[0].clone());
+    intention.expected_benefit = Some(
+        "The grounded update gives the audience useful current information.".to_string(),
+    );
+    intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
+    intention.invalidation_criteria = Some(
+        "Do not post if the supporting information is stale, duplicated, or unverified."
+            .to_string(),
     );
     retry_test_sqlite_busy(|| {
         harness.state.record_mandate_decision(
@@ -610,8 +621,9 @@ async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical
 
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
-    // A simple conversational turn skips the separate planner call. The mock
-    // response reports 10 input / 5 output tokens.
+    // A simple conversational turn records both the task-assessment attempt
+    // and the main response. The mock response reports 10 input / 5 output
+    // tokens; the intercepted empty assessment reports zero.
     let harness = setup_test_agent_with_models(
         MockProvider::new(),
         "gpt-5.6-terra",
@@ -642,9 +654,9 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .await
         .expect("llm stats should compute");
 
-    assert_eq!(stats.total_calls, 1, "expected one response event");
-    assert_eq!(stats.avg_input_tokens, 10);
-    assert_eq!(stats.avg_output_tokens, 5);
+    assert_eq!(stats.total_calls, 2, "expected assessment and response events");
+    assert_eq!(stats.avg_input_tokens, 5);
+    assert_eq!(stats.avg_output_tokens, 2);
     assert_eq!(stats.fell_back_count, 0);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);

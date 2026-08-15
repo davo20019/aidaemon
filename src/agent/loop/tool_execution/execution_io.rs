@@ -86,6 +86,7 @@ pub(super) async fn execute_tool_call_io(
         .find(|tool| tool.name() == tc.name && tool.is_available())
         .is_some_and(|tool| tool.capabilities().idempotent);
     let mut replayed_result: Option<crate::events::ToolResultData> = None;
+    let mut replay_invalidation_reason: Option<String> = None;
     let mut idempotency_block_reason: Option<String> = None;
     if let Some(idempotency_key) = ctx.idempotency_key {
         match agent
@@ -95,7 +96,34 @@ pub(super) async fn execute_tool_call_io(
         {
             Ok(Some(result)) => {
                 if should_replay_durable_result(&result, tool_is_idempotent) {
-                    replayed_result = Some(result);
+                    let receipt_succeeded = result.receipt.as_ref().is_some_and(|receipt| {
+                        receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
+                    });
+                    let replay_decision = if receipt_succeeded {
+                        match agent
+                            .tools
+                            .iter()
+                            .find(|tool| tool.name() == tc.name && tool.is_available())
+                        {
+                            Some(tool) => {
+                                tool.durable_replay_decision(ctx.effective_arguments).await
+                            }
+                            None => crate::traits::DurableReplayDecision::Replay,
+                        }
+                    } else {
+                        crate::traits::DurableReplayDecision::Replay
+                    };
+                    match replay_decision {
+                        crate::traits::DurableReplayDecision::Replay => {
+                            replayed_result = Some(result);
+                        }
+                        crate::traits::DurableReplayDecision::Reexecute { reason } => {
+                            replay_invalidation_reason = Some(reason);
+                        }
+                        crate::traits::DurableReplayDecision::Block { reason } => {
+                            idempotency_block_reason = Some(reason);
+                        }
+                    }
                 }
             }
             Ok(None) => match agent
@@ -183,6 +211,28 @@ pub(super) async fn execute_tool_call_io(
                 ..crate::traits::ToolCallMetadata::default()
             },
         };
+    }
+
+    if let Some(reason) = replay_invalidation_reason {
+        agent
+            .emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::IdempotencyReceiptInvalidated,
+                format!(
+                    "Re-executing {} because its durable effect no longer matches current state",
+                    tc.name
+                ),
+                serde_json::json!({
+                    "condition": "idempotency_receipt_invalidated",
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "idempotency_key": ctx.idempotency_key,
+                    "reason": reason,
+                }),
+            )
+            .await;
     }
 
     if let Some(previous) = replayed_result {

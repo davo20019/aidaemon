@@ -46,7 +46,46 @@ pub enum ProviderErrorKind {
     Unknown,
 }
 
+/// Typed first transition in provider recovery. Retry loops implement bounded
+/// waiting inside a state; this enum decides which state is reachable from a
+/// classified outcome, independent of error-message wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRecoveryRoute {
+    Fail,
+    RetryReducedBudgetThenFallback,
+    AdaptRequestOnce,
+    RetryRateLimitThenFallback,
+    RetryTransientThenFallback,
+    RetryMalformedThenFallback,
+    RetryMalformedThenFail,
+    Fallback,
+}
+
 impl ProviderError {
+    pub(crate) fn recovery_route(&self, single_attempt_fail_closed: bool) -> ProviderRecoveryRoute {
+        use ProviderRecoveryRoute::*;
+
+        if single_attempt_fail_closed {
+            return Fail;
+        }
+        match self.kind {
+            ProviderErrorKind::Auth | ProviderErrorKind::Unknown => Fail,
+            ProviderErrorKind::Billing => RetryReducedBudgetThenFallback,
+            ProviderErrorKind::BadRequest => AdaptRequestOnce,
+            ProviderErrorKind::RateLimit => RetryRateLimitThenFallback,
+            ProviderErrorKind::Timeout
+            | ProviderErrorKind::Network
+            | ProviderErrorKind::ServerError => RetryTransientThenFallback,
+            ProviderErrorKind::MalformedResponse
+                if self.malformed_reason == Some(MalformedResponseReason::Parse) =>
+            {
+                RetryMalformedThenFallback
+            }
+            ProviderErrorKind::MalformedResponse => RetryMalformedThenFail,
+            ProviderErrorKind::NotFound => Fallback,
+        }
+    }
+
     pub fn from_status(status: u16, body: &str) -> Self {
         let kind = match status {
             400 => ProviderErrorKind::BadRequest,
@@ -339,6 +378,27 @@ mod tests {
         assert_eq!(
             err.user_message(),
             "LLM provider is experiencing issues (server error). Will retry."
+        );
+    }
+
+    #[test]
+    fn recovery_routes_are_typed_and_single_attempt_fails_closed() {
+        let transient = ProviderError::from_status(503, "busy");
+        assert_eq!(
+            transient.recovery_route(false),
+            ProviderRecoveryRoute::RetryTransientThenFallback
+        );
+        assert_eq!(transient.recovery_route(true), ProviderRecoveryRoute::Fail);
+
+        let parse = ProviderError::malformed_parse("truncated JSON");
+        let shape = ProviderError::malformed_shape("missing choices");
+        assert_eq!(
+            parse.recovery_route(false),
+            ProviderRecoveryRoute::RetryMalformedThenFallback
+        );
+        assert_eq!(
+            shape.recovery_route(false),
+            ProviderRecoveryRoute::RetryMalformedThenFail
         );
     }
 

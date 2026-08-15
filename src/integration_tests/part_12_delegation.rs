@@ -11,6 +11,57 @@ fn extract_tool_names(defs: &[serde_json::Value]) -> Vec<String> {
 
 struct HighImpactCliAgentMock;
 
+struct StructuredPatchTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for StructuredPatchTool {
+    fn name(&self) -> &str {
+        "synthetic_patch"
+    }
+
+    fn description(&self) -> &str {
+        "Return a typed local-source-write receipt for a synthetic patch"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "synthetic_patch",
+            "description": "Apply a synthetic scoped patch",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(format!("Synthetic patch applied: {arguments}"))
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        let path = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|args| args["path"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
+        )
+        .with_target_hint(crate::traits::ToolTargetHintKind::Path, path)
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::traits::Tool for HighImpactCliAgentMock {
     fn name(&self) -> &str {
@@ -272,10 +323,35 @@ async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
 
 #[tokio::test]
 async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "Updated /tmp/demo/src/main.rs and reran the scoped checks successfully.",
+    let workspace = tempfile::tempdir().expect("synthetic executor workspace");
+    let workspace_root = workspace.path().canonicalize().expect("canonical workspace");
+    let workspace_path = workspace_root.to_string_lossy().to_string();
+    let file_path = workspace_root.join("src/main.rs");
+    let final_summary = format!(
+        "Updated {} and reran the scoped checks successfully.",
+        file_path.display()
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "synthetic_patch",
+            &serde_json::json!({"path": file_path}).to_string(),
+        ),
+        MockProvider::text_response(&final_summary),
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "change",
+        true,
+        true,
+        &["local_source_write"],
+        "new_request",
+        "local_workspace",
     )]);
-    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(StructuredPatchTool) as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
     let agent = Arc::new(harness.agent);
 
     let goal = Goal::new_finite("Patch the regression", "delegation-task-context");
@@ -283,7 +359,7 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
     let task = crate::traits::Task {
         id: "task-structured-001".to_string(),
         goal_id: goal.id.clone(),
-        description: "Patch /tmp/demo/src/main.rs".to_string(),
+        description: format!("Patch {}", file_path.display()),
         status: "claimed".to_string(),
         priority: "high".to_string(),
         task_order: 1,
@@ -305,21 +381,21 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
 
     let response = agent
         .spawn_child(
-            "Patch the scoped regression in /tmp/demo",
-            "Patch /tmp/demo/src/main.rs",
+            &format!("Patch the scoped regression in {workspace_path}"),
+            &format!("Patch {}", file_path.display()),
             None,
             ChannelContext::private("test"),
             UserRole::Owner,
             Some(AgentRole::Executor),
             Some(goal.id.as_str()),
             Some(task.id.as_str()),
-            Some("/tmp/demo"),
+            Some(&workspace_path),
             None,
         )
         .await
         .unwrap();
 
-    assert!(response.contains("Updated /tmp/demo/src/main.rs"));
+    assert!(!response.trim().is_empty(), "executor should return a result");
 
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(updated.status, "completed");
@@ -335,7 +411,7 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
     );
     assert_eq!(
         context["executor_handoff"]["target_scope"]["allowed_targets"][0]["value"].as_str(),
-        Some("/tmp/demo")
+        Some(workspace_path.as_str())
     );
 }
 
@@ -519,7 +595,9 @@ async fn test_spawn_timeout_salvages_persisted_executor_outcome() {
     };
     harness.state.create_task(&task).await.unwrap();
 
-    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&agent), 4000, 0);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    let spawn_tool =
+        crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0);
     let result = crate::traits::Tool::call(
         &spawn_tool,
         &json!({
@@ -581,8 +659,10 @@ async fn test_background_spawn_timeout_salvages_persisted_executor_outcome() {
     };
     harness.state.create_task(&task).await.unwrap();
 
-    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&agent), 4000, 0)
-        .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    let spawn_tool =
+        crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0)
+            .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
     let ack = crate::traits::Tool::call(
         &spawn_tool,
         &json!({
@@ -676,7 +756,7 @@ async fn test_executor_timeout_does_not_clobber_terminal_task_status() {
 async fn test_executor_spawn_persists_needs_approval_blocker_result() {
     let provider = MockProvider::with_responses(vec![MockProvider::tool_call_response(
         "report_blocker",
-        r#"{"reason":"Need approval to rotate the production credentials","blocker_class":"missing_authority","external_effect_state":"none","recovery_attempts":[],"outcome":"needs_approval","partial_work":"Validated the rotation script and staged the rollout notes","exact_need":"Owner approval to rotate the production credentials.","next_step":"Run the approved credential rotation and verify the service health.","target":"production credentials"}"#,
+        r#"{"reason":"Need approval to rotate the production credentials","blocker_class":"missing_authority","external_effect_state":"none","recovery_attempts":[],"outcome":"needs_approval","partial_work":"Validated the rotation script and staged the rollout notes","exact_need":"Owner approval to rotate the production credentials.","next_step":"Run the approved credential rotation and verify the service health.","target":"production credentials","dependency_repair":false}"#,
     )]);
     let harness = setup_full_stack_test_agent(provider).await.unwrap();
     let agent = Arc::new(harness.agent);

@@ -3,7 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -23,6 +23,7 @@ use crate::health::HealthProbeStore;
 use crate::heartbeat::HeartbeatTelemetry;
 use crate::oauth::OAuthGateway;
 use crate::queue_telemetry::QueueTelemetry;
+use crate::traits::{MandateWakeSignal, StateStore};
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const KEYCHAIN_FIELD: &str = "dashboard_token";
@@ -40,6 +41,8 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 900;
 #[derive(Clone)]
 pub struct DashboardState {
     pub pool: SqlitePool,
+    pub mandate_store: Arc<dyn StateStore>,
+    pub heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
     pub event_store: Option<Arc<EventStore>>,
     pub provider_kind: String,
     pub models: ModelsConfig,
@@ -99,6 +102,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/health/probes", get(api_health_probes))
         .route("/api/health/history", get(api_health_history))
         .route("/api/health/summary", get(api_health_summary))
+        .route("/api/mandates/signals", post(api_mandate_signal))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -174,6 +178,35 @@ async fn auth_middleware(
 
 async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+/// Authenticated, content-free webhook ingress for proactive mandate wake-ups.
+/// The store performs exact account/URL-scope matching and durable deduplication.
+async fn api_mandate_signal(
+    State(state): State<DashboardState>,
+    Json(signal): Json<MandateWakeSignal>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    signal
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?;
+    let awakened = state
+        .mandate_store
+        .wake_mandates_for_signal(&signal)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to route mandate wake signal");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "mandate signal routing failed"})),
+            )
+        })?;
+    if !awakened.is_empty() {
+        let _ = state.heartbeat_wake_tx.try_send(());
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"awakened_count": awakened.len(), "mandate_ids": awakened})),
+    ))
 }
 
 #[derive(Deserialize)]

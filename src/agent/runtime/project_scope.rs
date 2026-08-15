@@ -5,9 +5,9 @@
 //! nicknames into normalized project scopes, and choose a primary scope for a
 //! turn.
 
-use super::followup::looks_like_short_command_request;
 use super::*;
 
+#[cfg(test)]
 fn is_generic_non_project_token(token: &str) -> bool {
     matches!(
         token,
@@ -44,6 +44,7 @@ fn is_generic_non_project_token(token: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_likely_filename(token: &str) -> bool {
     let Some((name, ext)) = token.rsplit_once('.') else {
         return false;
@@ -59,84 +60,16 @@ fn is_likely_filename(token: &str) -> bool {
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-pub(super) fn token_looks_like_filesystem_path(token: &str) -> bool {
-    // Reject URL-like tokens without a protocol prefix (e.g., "api.waqi.info/feed/miami").
-    // These contain dots before the first slash, resembling hostnames, not file paths.
-    if let Some(slash_idx) = token.find('/') {
-        let before_slash = &token[..slash_idx];
-        if before_slash.contains('.') && !before_slash.starts_with('.') {
-            return false;
-        }
-        // Also reject tokens containing '?' (query strings) — never valid in file paths.
-        if token.contains('?') {
-            return false;
-        }
-    }
-
-    let bytes = token.as_bytes();
-    let looks_windows_abs = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/');
-    token.starts_with('/')
-        || token.starts_with("~/")
-        || token.starts_with("./")
-        || token.starts_with("../")
-        || token.contains('/')
-        || token.contains('\\')
-        || looks_windows_abs
+#[cfg(test)]
+pub(in crate::agent) fn token_looks_like_filesystem_path(token: &str) -> bool {
+    crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some()
 }
 
 fn token_looks_like_project_scope_path(token: &str, alias_roots: &[String]) -> bool {
-    if !token_looks_like_filesystem_path(token) {
-        return false;
-    }
-
-    // History often contains natural-language slash phrases ("reload/restart")
-    // and markdown emphasis artifacts ("path**"). Those should not become the
-    // sticky project scope for later turns.
-    if token.contains('*') || token.contains('?') {
-        return false;
-    }
-
-    let bytes = token.as_bytes();
-    let looks_windows_abs = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/');
-    if token.starts_with('/')
-        || token.starts_with("~/")
-        || token.starts_with("./")
-        || token.starts_with("../")
-        || looks_windows_abs
-    {
-        return true;
-    }
-
-    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
-        return crate::execution::normalize_active_path_lexically(token).is_ok();
-    }
-
-    let Some(first_segment) = token
-        .split(['/', '\\'])
-        .find(|segment| !segment.trim().is_empty())
-    else {
-        return false;
-    };
-
-    let cwd_has_segment = std::env::current_dir()
-        .ok()
-        .is_some_and(|cwd| cwd.join(first_segment).exists());
-    if cwd_has_segment {
-        return true;
-    }
-
-    alias_roots
-        .iter()
-        .filter_map(|root| crate::tools::fs_utils::validate_path(root).ok())
-        .any(|root| root.join(first_segment).exists())
+    crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots).is_some()
 }
 
+#[cfg(test)]
 fn is_common_path_segment(token: &str) -> bool {
     matches!(
         token,
@@ -166,6 +99,7 @@ fn is_common_path_segment(token: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn normalize_project_component(raw: &str, allow_plain_names: bool) -> Option<String> {
     let token = raw
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
@@ -204,6 +138,7 @@ fn normalize_project_component(raw: &str, allow_plain_names: bool) -> Option<Str
     Some(token)
 }
 
+#[cfg(test)]
 fn extract_project_hint_from_path_like_token(raw_token: &str) -> Option<String> {
     let trimmed = raw_token
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
@@ -245,6 +180,7 @@ fn extract_project_hint_from_path_like_token(raw_token: &str) -> Option<String> 
     None
 }
 
+#[cfg(test)]
 fn normalize_project_hint(raw: &str, path_like: bool) -> Option<String> {
     let uri_like = raw.contains("://");
     if path_like || uri_like {
@@ -258,6 +194,7 @@ fn normalize_project_hint(raw: &str, path_like: bool) -> Option<String> {
     normalize_project_component(raw, false)
 }
 
+#[cfg(test)]
 fn push_project_hint(hints: &mut Vec<String>, hint: String, max_hints: usize) {
     if hints.len() >= max_hints || hints.iter().any(|existing| existing == &hint) {
         return;
@@ -265,6 +202,7 @@ fn push_project_hint(hints: &mut Vec<String>, hint: String, max_hints: usize) {
     hints.push(hint);
 }
 
+#[cfg(test)]
 pub(super) fn extract_project_hints_from_text(
     text: &str,
     hints: &mut Vec<String>,
@@ -277,11 +215,7 @@ pub(super) fn extract_project_hints_from_text(
         }
         let uri_like = raw.contains("://");
         let path_like = uri_like
-            || raw.contains('/')
-            || raw.contains('\\')
-            || raw.starts_with("./")
-            || raw.starts_with("../")
-            || raw.starts_with("~/");
+            || crate::tools::fs_utils::resolve_structural_filesystem_reference(raw, &[]).is_some();
         if path_only && !path_like {
             continue;
         }
@@ -346,7 +280,7 @@ pub(super) fn extract_project_scopes_from_text(
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, false);
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots);
 }
 
 /// Extract only explicit filesystem paths (tokens with `~/`, `/`, `./`, etc.)
@@ -359,70 +293,7 @@ pub(super) fn extract_explicit_path_scopes_from_text(
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, true);
-}
-
-/// Extract explicit paths that are instructions to operate on, excluding paths
-/// mentioned in nearby negative clauses such as "do not write in /repo-a".
-/// This is intentionally used for autonomous dispatch missions, where treating
-/// an excluded repository as the write scope is unsafe.
-pub(super) fn extract_positive_explicit_path_scopes_from_text(
-    text: &str,
-    scopes: &mut Vec<String>,
-    max_scopes: usize,
-    alias_roots: &[String],
-) {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for (index, raw) in words.iter().enumerate() {
-        if scopes.len() >= max_scopes {
-            break;
-        }
-        let token = raw
-            .trim_matches(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '`' | '\''
-                            | '"'
-                            | ','
-                            | ';'
-                            | ':'
-                            | '.'
-                            | '!'
-                            | '?'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                    )
-            })
-            .trim();
-        if token.is_empty()
-            || token.contains("://")
-            || !token_looks_like_project_scope_path(token, alias_roots)
-        {
-            continue;
-        }
-
-        let context_start = index.saturating_sub(5);
-        let preceding = words[context_start..index].join(" ").to_ascii_lowercase();
-        let negative = preceding.split_whitespace().any(|word| {
-            matches!(
-                word.trim_matches(|c: char| !c.is_ascii_alphabetic()),
-                "not" | "never" | "exclude" | "excluding" | "outside" | "avoid"
-            )
-        }) || preceding.contains("don't")
-            || preceding.contains("do not");
-        if negative {
-            continue;
-        }
-
-        if let Some(scope) = normalize_project_scope_path_with_aliases(token, alias_roots) {
-            push_project_scope(scopes, scope, max_scopes);
-        }
-    }
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots);
 }
 
 fn extract_project_scopes_from_text_inner(
@@ -430,7 +301,6 @@ fn extract_project_scopes_from_text_inner(
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
-    paths_only: bool,
 ) {
     for raw in text.split_whitespace() {
         if scopes.len() >= max_scopes {
@@ -463,16 +333,6 @@ fn extract_project_scopes_from_text_inner(
         }
         let scope = if token_looks_like_project_scope_path(token, alias_roots) {
             normalize_project_scope_path_with_aliases(token, alias_roots)
-        } else if !paths_only {
-            super::should_allow_contextual_project_nickname_scope(text, token)
-                .then(|| {
-                    crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
-                        .or_else(|| {
-                            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
-                        })
-                })
-                .flatten()
-                .map(|path| path.to_string_lossy().to_string())
         } else {
             None
         };
@@ -563,58 +423,6 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
     }
 }
 
-pub(super) fn turn_allows_inherited_project_scope(
-    current_user_text: &str,
-    current_user_scopes: &[String],
-) -> bool {
-    if !current_user_scopes.is_empty() {
-        return true;
-    }
-
-    if super::user_explicitly_requests_local_file_inspection(current_user_text) {
-        return true;
-    }
-
-    let lower = current_user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    if super::text_has_explicit_project_scope_cues(&lower)
-        || looks_like_short_command_request(current_user_text)
-    {
-        return true;
-    }
-
-    [
-        "cargo",
-        "npm",
-        "pnpm",
-        "yarn",
-        "pytest",
-        "wrangler",
-        "docker",
-        "kubectl",
-        "build",
-        "compile",
-        "deploy",
-        "lint",
-        "format",
-        "fmt",
-        "commit",
-        "branch",
-        "diff",
-        "logs",
-        "log",
-        "migration",
-        "migrations",
-        "schema",
-        "daemon",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower, kw))
-}
-
 pub(super) fn resolve_primary_project_scope(
     extracted_primary_scope: Option<String>,
     inherited_project_scope: Option<&str>,
@@ -670,7 +478,6 @@ pub(super) fn extract_project_scopes_from_history(
 
 #[cfg(test)]
 mod tests {
-    use super::followup::looks_like_scope_carryover_ack;
     use super::*;
     use chrono::Utc;
 
@@ -801,11 +608,10 @@ mod tests {
         );
     }
     #[test]
-    fn project_scope_extraction_resolves_contextual_nickname_from_prior_user_request() {
+    fn project_scope_extraction_carries_exact_path_from_prior_user_request() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let nickname = format!("scope-nick-{}", uuid::Uuid::new_v4().simple());
-        let project_name = format!("{nickname}.aidaemon.ai");
+        let project_name = format!("scope-project-{}", uuid::Uuid::new_v4().simple());
         let project = alias_root.join(&project_name);
         std::fs::create_dir_all(&project).expect("create project");
         std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
@@ -813,7 +619,7 @@ mod tests {
 
         let history = vec![msg(
             "user",
-            &format!("Please deploy the {} project when you can.", nickname),
+            &format!("Please deploy {} when you can.", project.display()),
         )];
         let scopes =
             extract_project_scopes_from_history(&history, "Yes, do it.", 4, true, &alias_roots);
@@ -883,34 +689,6 @@ mod tests {
         // should handle the case.
         assert_eq!(unify_current_turn_scopes(&scopes), Some("/tmp".to_string()));
     }
-    #[test]
-    fn positive_scope_extraction_ignores_excluded_project_regardless_of_order() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let blog = workspace.path().join("blog");
-        let daemon = workspace.path().join("daemon");
-        std::fs::create_dir_all(&blog).expect("blog dir");
-        std::fs::create_dir_all(&daemon).expect("daemon dir");
-        std::fs::write(blog.join("package.json"), "{}").expect("blog marker");
-        std::fs::write(daemon.join("Cargo.toml"), "[package]\nname = \"daemon\"\n")
-            .expect("daemon marker");
-
-        let blog_text = blog.to_string_lossy();
-        let daemon_text = daemon.to_string_lossy();
-        for prompt in [
-            format!("Do not write in {daemon_text}; only write in {blog_text}"),
-            format!("Write in {blog_text}; never use {daemon_text}"),
-        ] {
-            let mut scopes = Vec::new();
-            extract_positive_explicit_path_scopes_from_text(
-                &prompt,
-                &mut scopes,
-                8,
-                &[workspace.path().to_string_lossy().to_string()],
-            );
-            assert_eq!(scopes, vec![blog_text.to_string()]);
-        }
-    }
-
     #[test]
     fn legitimate_multiple_projects_are_not_arbitrarily_reduced_to_first() {
         let scopes = vec![
@@ -1008,18 +786,6 @@ mod tests {
         assert_eq!(resolved, None);
     }
     #[test]
-    fn inherited_project_scope_allowed_for_workspace_command_turns() {
-        assert!(turn_allows_inherited_project_scope("run cargo test", &[]));
-        assert!(looks_like_scope_carryover_ack("Yes, do it."));
-    }
-    #[test]
-    fn inherited_project_scope_blocked_for_external_followup_without_local_cues() {
-        assert!(!turn_allows_inherited_project_scope(
-            "Give me more details of the ones offered by next oncology.",
-            &[]
-        ));
-    }
-    #[test]
     fn project_scope_extraction_ignores_assistant_paths_for_non_local_followup() {
         let history = vec![msg(
             "assistant",
@@ -1095,7 +861,7 @@ mod tests {
         assert_eq!(normalized, root.to_string_lossy());
     }
     #[test]
-    fn project_scope_extraction_resolves_named_project_roots() {
+    fn project_scope_extraction_resolves_exact_project_paths() {
         let history = vec![];
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
@@ -1106,7 +872,7 @@ mod tests {
 
         let scopes = extract_project_scopes_from_history(
             &history,
-            "Deploy blog.aidaemon.ai",
+            &format!("Deploy {}", project.display()),
             4,
             false,
             &alias_roots,
@@ -1160,7 +926,7 @@ mod tests {
         );
     }
     #[test]
-    fn project_scope_extraction_allows_plain_word_nickname_with_explicit_project_scope_cues() {
+    fn project_scope_words_do_not_turn_plain_nicknames_into_hard_scope() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
         let project = alias_root.join("fairfax-va-site");
@@ -1176,7 +942,11 @@ mod tests {
             &alias_roots,
         );
 
-        assert_eq!(scopes, vec![project.to_string_lossy().to_string()]);
+        assert!(
+            scopes.is_empty(),
+            "semantic project references must arrive through task assessment: {:?}",
+            scopes
+        );
     }
     #[test]
     fn project_scope_extraction_rejects_natural_language_slash_phrases() {

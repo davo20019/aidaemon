@@ -175,6 +175,7 @@ fn interaction_kind(kind: &ApprovalKind) -> &'static str {
         ApprovalKind::Command => "command_approval",
         ApprovalKind::CommandOnce => "command_approval_once",
         ApprovalKind::GoalConfirmation => "goal_confirmation",
+        ApprovalKind::AutopilotConfirmation => "autopilot_confirmation",
     }
 }
 

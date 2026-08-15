@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
@@ -76,6 +77,100 @@ pub struct HistoryCoverage {
     pub oldest_indexed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest_indexed_at: Option<String>,
+}
+
+/// Exact-history projection operations needed by the search tool. The tool
+/// depends on this port rather than SQLite or a raw connection pool.
+#[async_trait]
+pub(crate) trait HistorySearchStore: crate::traits::EpisodeStore {
+    async fn history_snapshot_max_event_id(&self) -> anyhow::Result<i64>;
+    async fn history_coverage(&self) -> anyhow::Result<HistoryCoverage>;
+    async fn repair_history_projection(
+        &self,
+        max_batches: usize,
+    ) -> anyhow::Result<ProjectionStats>;
+    async fn search_history(
+        &self,
+        query: &str,
+        scope: &HistoryScope,
+        limit: usize,
+        semantic_sessions: &HashSet<String>,
+    ) -> anyhow::Result<Vec<HistoryMessage>>;
+    async fn history_context(
+        &self,
+        event_id: i64,
+        radius: usize,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryMessage>>;
+    async fn history_page(
+        &self,
+        anchor: i64,
+        older: bool,
+        scope: &HistoryScope,
+        limit: usize,
+    ) -> anyhow::Result<Vec<HistoryMessage>>;
+    async fn history_task_bookends(
+        &self,
+        task_id: Option<&str>,
+        session_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<TaskBookends>;
+}
+
+#[async_trait]
+impl HistorySearchStore for crate::state::SqliteStateStore {
+    async fn history_snapshot_max_event_id(&self) -> anyhow::Result<i64> {
+        snapshot_max_event_id(&self.pool()).await
+    }
+
+    async fn history_coverage(&self) -> anyhow::Result<HistoryCoverage> {
+        coverage(&self.pool()).await
+    }
+
+    async fn repair_history_projection(
+        &self,
+        max_batches: usize,
+    ) -> anyhow::Result<ProjectionStats> {
+        repair_and_backfill(&self.pool(), max_batches).await
+    }
+
+    async fn search_history(
+        &self,
+        query: &str,
+        scope: &HistoryScope,
+        limit: usize,
+        semantic_sessions: &HashSet<String>,
+    ) -> anyhow::Result<Vec<HistoryMessage>> {
+        search(&self.pool(), query, scope, limit, semantic_sessions).await
+    }
+
+    async fn history_context(
+        &self,
+        event_id: i64,
+        radius: usize,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryMessage>> {
+        context(&self.pool(), event_id, radius, scope).await
+    }
+
+    async fn history_page(
+        &self,
+        anchor: i64,
+        older: bool,
+        scope: &HistoryScope,
+        limit: usize,
+    ) -> anyhow::Result<Vec<HistoryMessage>> {
+        page(&self.pool(), anchor, older, scope, limit).await
+    }
+
+    async fn history_task_bookends(
+        &self,
+        task_id: Option<&str>,
+        session_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<TaskBookends> {
+        task_bookends(&self.pool(), task_id, session_id, scope).await
+    }
 }
 
 pub(crate) async fn migrate_history_search(pool: &SqlitePool) -> anyhow::Result<()> {

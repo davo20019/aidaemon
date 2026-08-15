@@ -1696,6 +1696,8 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             objective TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'paused', 'awaiting_input', 'completed', 'cancelled')),
+            autonomy_mode TEXT NOT NULL DEFAULT 'bounded'
+                CHECK (autonomy_mode IN ('bounded', 'autopilot')),
             authority_json TEXT NOT NULL,
             strategy_json TEXT,
             suspension_json TEXT,
@@ -1706,6 +1708,8 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             max_review_secs INTEGER NOT NULL CHECK (max_review_secs >= min_review_secs),
             default_review_secs INTEGER NOT NULL
                 CHECK (default_review_secs BETWEEN min_review_secs AND max_review_secs),
+            review_effort TEXT NOT NULL DEFAULT 'balanced'
+                CHECK (review_effort IN ('efficient', 'balanced', 'thorough', 'legacy_custom')),
             next_review_at TEXT NOT NULL,
             review_lease_token TEXT,
             review_lease_expires_at TEXT,
@@ -1719,6 +1723,18 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query(
+        "ALTER TABLE mandates ADD COLUMN autonomy_mode TEXT NOT NULL DEFAULT 'bounded'
+         CHECK (autonomy_mode IN ('bounded', 'autopilot'))",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "ALTER TABLE mandates ADD COLUMN review_effort TEXT NOT NULL DEFAULT 'balanced'
+         CHECK (review_effort IN ('efficient', 'balanced', 'thorough', 'legacy_custom'))",
+    )
+    .execute(pool)
+    .await;
 
     // One immutable aggregate budget per autonomous decision cycle. The
     // short-lived call lease serializes lead/executor model calls so they
@@ -1765,6 +1781,8 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             goal_run_id TEXT NOT NULL UNIQUE REFERENCES goal_runs(id) ON DELETE CASCADE,
             mandate_version INTEGER NOT NULL,
             outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
+            activity_level TEXT NOT NULL DEFAULT 'quiet'
+                CHECK (activity_level IN ('quiet', 'active', 'urgent')),
             rationale TEXT NOT NULL,
             belief_snapshot TEXT,
             evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'
@@ -1808,6 +1826,13 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query(
         "ALTER TABLE mandate_decision_cycles
          ADD COLUMN evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "ALTER TABLE mandate_decision_cycles
+         ADD COLUMN activity_level TEXT NOT NULL DEFAULT 'quiet'
+         CHECK (activity_level IN ('quiet', 'active', 'urgent'))",
     )
     .execute(pool)
     .await;
@@ -1885,6 +1910,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
             description TEXT NOT NULL,
             rationale TEXT NOT NULL,
+            value_criterion TEXT,
             expected_benefit TEXT,
             risk TEXT,
             invalidation_criteria TEXT,
@@ -1896,6 +1922,12 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // Existing installations may have the pre-value-contract intentions
+    // table. Historical rows remain nullable and readable; every new
+    // value-contract ACT is validated before insertion.
+    let _ = sqlx::query("ALTER TABLE intentions ADD COLUMN value_criterion TEXT")
+        .execute(pool)
+        .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS mandate_learning_notes (
@@ -1915,6 +1947,62 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_mandate_learning_notes_recent
          ON mandate_learning_notes(mandate_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Append-only adaptive operating-strategy revisions. They are deliberately
+    // separate from the owner-confirmed mandate policy and therefore cannot
+    // grant authority. The latest revision for one key is its current node.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_strategy_revisions (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            decision_cycle_id TEXT NOT NULL
+                REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            strategy_key TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('reinforce', 'explore', 'avoid', 'retire')),
+            guidance TEXT NOT NULL,
+            confidence_bps INTEGER NOT NULL CHECK (confidence_bps BETWEEN 0 AND 10000),
+            evidence_receipt_ids_json TEXT NOT NULL CHECK (json_valid(evidence_receipt_ids_json)),
+            created_at TEXT NOT NULL,
+            UNIQUE(decision_cycle_id, strategy_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_strategy_revisions_latest
+         ON mandate_strategy_revisions(mandate_id, strategy_key, created_at DESC, id DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Content-free, deduplicated wake receipts for structured external signals.
+    // Raw webhook bodies never enter this table or the mandate prompt.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_wake_signals (
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            signal_digest TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN (
+                'mention', 'reply', 'reaction', 'metric_change',
+                'delivery_failure', 'external_change'
+            )),
+            source TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            account_id TEXT,
+            occurred_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            PRIMARY KEY(mandate_id, signal_digest)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_wake_signals_recent
+         ON mandate_wake_signals(mandate_id, received_at DESC)",
     )
     .execute(pool)
     .await?;
@@ -2768,14 +2856,41 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await;
 
-    // Fix: reset obviously inflated goal budgets caused by the historical
-    // auto-extension bug that persisted doubled budgets to DB. Keep legitimate
-    // manual budgets intact by only capping values above the supported tool/API
-    // maximum.
+    // Token arithmetic is an internal runaway guard for mandates. Migrate
+    // historical low defaults to the automatic balanced policy and derive a
+    // daily envelope that can fund every cadence slot. This only raises
+    // capacity; explicit efficient/thorough choices are persisted separately.
     let _ = sqlx::query(
         "UPDATE goals
-         SET budget_daily = 2000000
-         WHERE budget_daily > 2000000
+         SET budget_per_check = MAX(COALESCE(budget_per_check, 0), 250000),
+             budget_daily = MAX(
+                 COALESCE(budget_daily, 0),
+                 2000000,
+                 ((86400 + m.default_review_secs - 1) / m.default_review_secs)
+                    * MAX(COALESCE(budget_per_check, 0), 250000)
+             )
+         FROM mandates AS m
+         WHERE m.goal_id = goals.id
+           AND m.review_effort = 'balanced'
+           AND (
+               COALESCE(goals.budget_per_check, 0) < 250000
+               OR COALESCE(goals.budget_daily, 0) < MAX(
+                   2000000,
+                   ((86400 + m.default_review_secs - 1) / m.default_review_secs)
+                       * MAX(COALESCE(goals.budget_per_check, 0), 250000)
+               )
+           )
+           AND goals.status IN ('active', 'pending', 'pending_confirmation')",
+    )
+    .execute(pool)
+    .await;
+
+    // Bound only obviously runaway historical values. Managed thorough mode
+    // legitimately exceeds the old two-million-token ceiling at fast cadences.
+    let _ = sqlx::query(
+        "UPDATE goals
+         SET budget_daily = 50000000
+         WHERE budget_daily > 50000000
            AND status IN ('active', 'pending', 'pending_confirmation')",
     )
     .execute(pool)
@@ -3087,6 +3202,64 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
+
+    // Normalize task dependency edges. `tasks.depends_on` remains as a JSON
+    // compatibility projection, while schedulers and claims use this table as
+    // their authoritative graph. The join skips invalid legacy references so
+    // migration cannot manufacture an edge to a nonexistent task.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(task_id, depends_on_task_id),
+            CHECK(task_id <> depends_on_task_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_dependencies_prerequisite
+         ON task_dependencies(depends_on_task_id, task_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO task_dependencies(task_id, depends_on_task_id)
+         SELECT t.id, CAST(dep.value AS TEXT)
+         FROM tasks t
+         JOIN json_each(
+            CASE
+                WHEN json_valid(COALESCE(t.depends_on, '[]'))
+                 AND json_type(COALESCE(t.depends_on, '[]')) = 'array'
+                THEN COALESCE(t.depends_on, '[]')
+                ELSE '[]'
+            END
+         ) dep
+         JOIN tasks prerequisite ON prerequisite.id = CAST(dep.value AS TEXT)
+         WHERE CAST(dep.value AS TEXT) <> t.id",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_task_dependencies_no_cycle
+         BEFORE INSERT ON task_dependencies
+         WHEN EXISTS (
+            WITH RECURSIVE prerequisites(id) AS (
+                SELECT NEW.depends_on_task_id
+                UNION
+                SELECT edge.depends_on_task_id
+                FROM task_dependencies edge
+                JOIN prerequisites prior ON edge.task_id = prior.id
+            )
+            SELECT 1 FROM prerequisites WHERE id = NEW.task_id
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'task dependency cycle');
+         END",
+    )
+    .execute(pool)
+    .await?;
 
     // FTS5 is present in standard SQLite and bundled SQLCipher builds. Keep the
     // daemon usable on custom SQLite builds without it; semantic and lexical

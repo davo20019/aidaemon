@@ -653,7 +653,7 @@ impl OpenAiCompatibleProvider {
 
         let content = message
             .get("content")
-            .and_then(crate::agent::vision::content_value_as_text);
+            .and_then(crate::message_content::content_value_as_text);
 
         let mut tool_calls = Vec::new();
         if let Some(tcs) = message["tool_calls"].as_array() {

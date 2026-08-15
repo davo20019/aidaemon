@@ -753,14 +753,6 @@ pub(super) fn tool_target_hint_matches_contract_target(
             | (ToolTargetHintKind::Path, VerificationTargetKind::Path)
             | (
                 ToolTargetHintKind::ProjectScope,
-                VerificationTargetKind::ProjectScope
-            )
-            | (
-                ToolTargetHintKind::Path,
-                VerificationTargetKind::ProjectScope
-            )
-            | (
-                ToolTargetHintKind::ProjectScope,
                 VerificationTargetKind::Path
             )
     );
@@ -772,26 +764,17 @@ pub(super) fn tool_target_hint_matches_contract_target(
         (ToolTargetHintKind::Url, VerificationTargetKind::Url) => {
             normalized_url_value(&target_hint.value) == normalized_url_value(&contract_target.value)
         }
-        (ToolTargetHintKind::Path, VerificationTargetKind::Path)
-        | (ToolTargetHintKind::ProjectScope, VerificationTargetKind::ProjectScope) => {
+        (ToolTargetHintKind::Path, VerificationTargetKind::Path) => {
             normalized_path_value(&target_hint.value)
                 == normalized_path_value(&contract_target.value)
         }
-        (ToolTargetHintKind::Path, VerificationTargetKind::ProjectScope) => {
-            let Some(hint) = normalized_path_value(&target_hint.value) else {
-                return false;
-            };
-            let Some(scope) = normalized_path_value(&contract_target.value) else {
-                return false;
-            };
-            hint == scope
-                || hint
-                    .strip_prefix(&scope)
-                    .is_some_and(|rest| rest.starts_with('/'))
+        // A project-inspection tool may report its exact directory target as a
+        // project scope. It verifies a path target only when the identities are
+        // equal; observing an ancestor project root is still insufficient.
+        (ToolTargetHintKind::ProjectScope, VerificationTargetKind::Path) => {
+            normalized_path_value(&target_hint.value)
+                == normalized_path_value(&contract_target.value)
         }
-        // Observing a project root is not evidence that a particular child
-        // path was observed.
-        (ToolTargetHintKind::ProjectScope, VerificationTargetKind::Path) => false,
         (ToolTargetHintKind::ResourceId, _) => false,
         _ => false,
     }
@@ -804,9 +787,7 @@ pub(super) fn verification_target_matches_haystack(
     let haystack = haystack.replace('\\', "/");
     let needle = match target.kind {
         VerificationTargetKind::Url => normalized_url_value(&target.value),
-        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path => {
-            normalized_path_value(&target.value)
-        }
+        VerificationTargetKind::Path => normalized_path_value(&target.value),
     };
     let Some(needle) = needle else {
         return false;
@@ -823,10 +804,7 @@ pub(super) fn verification_target_matches_haystack(
     // spellings as the same target so a successful command such as
     // `find "$HOME/projects" ...` can satisfy a contract inferred from
     // `~/projects`.
-    if matches!(
-        target.kind,
-        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path
-    ) {
+    if target.kind == VerificationTargetKind::Path {
         let Some(home) = dirs::home_dir() else {
             return false;
         };
@@ -1221,7 +1199,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     fn shell_home_reference_verifies_normalized_home_target() {
         let home = dirs::home_dir().expect("home directory");
         let target = VerificationTarget {
-            kind: VerificationTargetKind::ProjectScope,
+            kind: VerificationTargetKind::Path,
             value: home.join("projects").to_string_lossy().into_owned(),
         };
         let contract = CompletionContract {
@@ -1250,6 +1228,16 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         };
         let hint = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp/project-a").unwrap();
         assert!(!tool_target_hint_matches_contract_target(&hint, &target));
+    }
+
+    #[test]
+    fn exact_project_scope_hint_verifies_the_same_directory_path() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::Path,
+            value: "/tmp/project-a".to_string(),
+        };
+        let hint = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp/project-a").unwrap();
+        assert!(tool_target_hint_matches_contract_target(&hint, &target));
     }
 
     #[test]

@@ -4,16 +4,15 @@
 //! cannot be expressed with plain owning `Arc`s during construction:
 //!
 //! - **Agent ↔ SpawnAgentTool**: the agent owns the spawn tool (via its tool
-//!   list), and the spawn tool needs to spawn sub-agents through the agent.
-//!   The spawn tool therefore holds a `Weak<Agent>`, installed *after* the
-//!   agent is constructed via `set_agent`.
+//!   list), and the spawn tool needs a child-agent runtime. The tool therefore
+//!   holds a weak runtime-port reference, installed *after* the concrete agent
+//!   is constructed.
 //! - **Agent ↔ self**: the agent spawns background tasks that re-enter the
 //!   agent loop, so it keeps a `Weak<Agent>` self-reference (`set_self_ref`).
-//! - **Tools / Agent ↔ ChannelHub**: the `ChannelHub` is built *after* the
-//!   agent and tools (it needs the agent for delivery notes), but the spawn
-//!   tool, terminal tool, CLI-agent tool, and the agent itself all need to
-//!   push notifications/progress through the hub. They each hold a
-//!   `Weak<ChannelHub>`, installed once the hub exists.
+//! - **Tools / Agent ↔ outbound routing**: the concrete `ChannelHub` is built
+//!   after the agent and tools, but those components need to push
+//!   notifications and progress through it. They hold weak `OutboundRouter`
+//!   references installed once the hub exists.
 //!
 //! Using `Weak` references breaks the reference cycles so the graph can be
 //! dropped cleanly, but it forces the wiring to be *deferred* until both
@@ -27,24 +26,34 @@ use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::channels::ChannelHub;
+use crate::runtime_ports::{ChildAgentRuntime, ConversationRuntime, OutboundRouter};
 
 /// Phase 1: wiring that only needs the constructed [`Agent`] (no hub yet).
 ///
 /// Must be called immediately after the agent is constructed, in the same
 /// order as the original inline calls:
-/// 1. give the spawn tool a weak agent reference,
+/// 1. give the spawn tool a weak child-runtime reference,
 /// 2. give the agent a weak self-reference for background task spawning.
 pub async fn wire_agent_cycles(
     agent: &Arc<Agent>,
     spawn_tool: Option<&Arc<crate::tools::SpawnAgentTool>>,
-) {
-    // Close the loop: give the spawn tool a weak reference to the agent.
+) -> anyhow::Result<()> {
+    // Close the loop through the narrow child-agent runtime port.
     if let Some(st) = spawn_tool {
-        st.set_agent(Arc::downgrade(agent));
+        let runtime: Arc<dyn ChildAgentRuntime> = agent.clone();
+        st.set_agent(Arc::downgrade(&runtime));
     }
 
     // Give the agent a weak self-reference for background task spawning.
     agent.set_self_ref(Arc::downgrade(agent)).await;
+
+    validate_components(&[
+        ("agent.self_ref", agent.self_reference_ready().await),
+        (
+            "spawn_agent.agent",
+            spawn_tool.is_none_or(|tool| tool.agent_wired()),
+        ),
+    ])
 }
 
 /// Phase 2: wiring that needs the constructed [`ChannelHub`].
@@ -62,14 +71,16 @@ pub async fn wire_agent_cycles(
 pub async fn wire_hub_cycles(
     agent: &Arc<Agent>,
     hub: &Arc<ChannelHub>,
-    spawn_tool: Option<Arc<crate::tools::SpawnAgentTool>>,
-    terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
-    cli_agent_tool: Option<Arc<crate::tools::CliAgentTool>>,
+    spawn_tool: Option<&Arc<crate::tools::SpawnAgentTool>>,
+    terminal_tool: Option<&Arc<crate::tools::TerminalTool>>,
+    cli_agent_tool: Option<&Arc<crate::tools::CliAgentTool>>,
     plan_store: Arc<crate::plans::PlanStore>,
-) {
+) -> anyhow::Result<()> {
+    let outbound: Arc<dyn OutboundRouter> = hub.clone();
+
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
-        st.set_hub(Arc::downgrade(hub));
+        st.set_hub(Arc::downgrade(&outbound));
     }
 
     // Give terminal a reference to the hub so background command progress/completion
@@ -77,17 +88,66 @@ pub async fn wire_hub_cycles(
     // Also give it a weak agent reference so background completions can re-engage
     // the agent loop to process the output and continue the original task.
     if let Some(tt) = terminal_tool {
-        tt.set_hub(Arc::downgrade(hub));
+        tt.set_hub(Arc::downgrade(&outbound));
         tt.set_agent(Arc::downgrade(agent));
         // Durable plan store for completion-time deliverable attribution and the
         // conservative delivery-step write-back.
         tt.set_plan_store(plan_store);
     }
     if let Some(cat) = cli_agent_tool {
-        cat.set_hub(Arc::downgrade(hub));
-        cat.set_agent(Arc::downgrade(agent));
+        cat.set_hub(Arc::downgrade(&outbound));
+        let runtime: Arc<dyn ConversationRuntime> = agent.clone();
+        cat.set_agent(Arc::downgrade(&runtime));
     }
 
     // Give the agent a reference to the hub for background task notifications.
-    agent.set_hub(Arc::downgrade(hub)).await;
+    agent.set_hub(Arc::downgrade(&outbound)).await;
+
+    validate_components(&[
+        ("agent.runtime", agent.runtime_wiring_ready().await),
+        (
+            "spawn_agent.runtime",
+            spawn_tool.is_none_or(|tool| tool.wiring_ready()),
+        ),
+        (
+            "terminal.runtime",
+            terminal_tool.is_none_or(|tool| tool.wiring_ready()),
+        ),
+        (
+            "cli_agent.runtime",
+            cli_agent_tool.is_none_or(|tool| tool.wiring_ready()),
+        ),
+    ])
+}
+
+fn validate_components(components: &[(&str, bool)]) -> anyhow::Result<()> {
+    let missing: Vec<&str> = components
+        .iter()
+        .filter_map(|(name, ready)| (!ready).then_some(*name))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("incomplete runtime wiring: {}", missing.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_components;
+
+    #[test]
+    fn complete_wiring_is_accepted() {
+        assert!(validate_components(&[("agent", true), ("hub", true)]).is_ok());
+    }
+
+    #[test]
+    fn incomplete_wiring_lists_every_missing_component() {
+        let error = validate_components(&[("agent", false), ("hub", true), ("terminal", false)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent"));
+        assert!(error.contains("terminal"));
+        assert!(!error.contains("hub,"));
+    }
 }

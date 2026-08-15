@@ -31,6 +31,10 @@ pub struct HarnessEvalFixture {
     pub routing_models: bool,
     #[serde(default)]
     pub mock_responses: Vec<MockResponseSpec>,
+    /// Optional semantic task-assessment responses, kept separate from the
+    /// main-loop queue so fixtures never depend on lexical mock inference.
+    #[serde(default)]
+    pub task_assessments: Vec<MockResponseSpec>,
     pub expect: ExpectBlock,
     /// Optional DB seed data applied before handle_message.
     #[serde(default)]
@@ -523,6 +527,7 @@ pub fn build_recorded_fixture(
         orchestrator: false,
         routing_models: false,
         mock_responses: Vec::new(),
+        task_assessments: Vec::new(),
         seed: FixtureSeed::default(),
         expect: ExpectBlock {
             orchestration_route: Some(eval.orchestration_route.clone()),

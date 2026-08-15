@@ -25,24 +25,18 @@ fn courtesy_word_inside_new_request_is_not_outcome_feedback() {
 }
 
 #[test]
-fn risk_scoring_prefers_word_boundary_action_terms() {
+fn policy_bootstrap_does_not_infer_risk_from_request_wording() {
     let caps = std::collections::HashMap::new();
     let direct = build_policy_bundle("please deploy to production", &caps, false).risk_score;
     let morph =
         build_policy_bundle("the deployed artifact is production-like", &caps, false).risk_score;
-    assert!(
-        direct > morph,
-        "expected direct action wording to score higher than morphological variants"
-    );
+    assert_eq!(direct, morph);
 }
 
 #[test]
-fn risk_scoring_does_not_treat_overwritten_as_overwrite_command() {
+fn policy_bootstrap_does_not_infer_destructive_intent_from_prose() {
     let caps = std::collections::HashMap::new();
     let destructive = build_policy_bundle("overwrite the file now", &caps, false).risk_score;
     let descriptive = build_policy_bundle("this is an overwritten file", &caps, false).risk_score;
-    assert!(
-        destructive > descriptive,
-        "expected imperative overwrite command to score higher than descriptive text"
-    );
+    assert_eq!(destructive, descriptive);
 }

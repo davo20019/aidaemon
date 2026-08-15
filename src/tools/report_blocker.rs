@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::agent::{
-    build_needs_approval_request, persist_executor_result_context, ExecutorStepResult,
-    PartialResult, StepValidationOutcome, TaskValidationOutcome,
+    build_needs_approval_request, extract_executor_handoff_context,
+    persist_executor_result_context, ExecutorStepResult, PartialResult, StepValidationOutcome,
+    TaskValidationOutcome,
 };
 use crate::traits::{
     HandoffArtifact, StateStore, TaskAttempt, TaskAttemptPatch, TaskHandoff, Tool,
@@ -46,6 +47,57 @@ impl ReportBlockerTool {
             attempt: Some(attempt),
             mandate_execution,
         }
+    }
+
+    /// Prove that a requested local repair is both inside the executor's
+    /// durable target scope and causally linked to an observed failed tool
+    /// result. This deliberately uses exact paths and typed task state rather
+    /// than interpreting words such as "pre-existing" or "unrelated".
+    async fn causal_local_repair_is_proven(&self, args: &ReportBlockerArgs) -> bool {
+        if args.dependency_repair != Some(true) {
+            return false;
+        }
+        let Some(target) = args.target.as_deref().map(str::trim) else {
+            return false;
+        };
+        let Ok(canonical_target) = std::fs::canonicalize(target) else {
+            return false;
+        };
+        let Ok(Some(task)) = self.state.get_task(&self.task_id).await else {
+            return false;
+        };
+        let Some(handoff) = extract_executor_handoff_context(task.context.as_deref()) else {
+            return false;
+        };
+        let target_is_allowed = handoff
+            .target_scope
+            .allowed_targets
+            .iter()
+            .filter(|allowed| {
+                matches!(
+                    allowed.kind,
+                    crate::traits::ToolTargetHintKind::Path
+                        | crate::traits::ToolTargetHintKind::ProjectScope
+                )
+            })
+            .filter_map(|allowed| std::fs::canonicalize(&allowed.value).ok())
+            .any(|allowed| canonical_target == allowed || canonical_target.starts_with(allowed));
+        if !target_is_allowed {
+            return false;
+        }
+
+        self.state
+            .get_task_activities(&self.task_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|activity| {
+                activity.success == Some(false)
+                    && activity
+                        .result
+                        .as_deref()
+                        .is_some_and(|result| result.contains(target))
+            })
     }
 }
 
@@ -92,6 +144,8 @@ struct ReportBlockerArgs {
     next_step: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    dependency_repair: Option<bool>,
     #[serde(default)]
     consequence_if_not_provided: Option<String>,
     #[serde(default)]
@@ -193,7 +247,10 @@ fn build_blocker_notification(
     message
 }
 
-fn validate_blocker_boundary(args: &ReportBlockerArgs) -> Result<(), String> {
+fn validate_blocker_boundary(
+    args: &ReportBlockerArgs,
+    causal_local_repair_is_proven: bool,
+) -> Result<(), String> {
     let exact_need = args
         .exact_need
         .as_deref()
@@ -242,13 +299,32 @@ fn validate_blocker_boundary(args: &ReportBlockerArgs) -> Result<(), String> {
             }
         }
         BlockerClass::OwnerInput
-        | BlockerClass::MissingAuthority
         | BlockerClass::ExternalDependency
         | BlockerClass::AmbiguousExternalEffect
         | BlockerClass::SafetyBoundary => {
             if exact_need.is_none() {
                 return Err(
                     "this blocker class requires exact_need to identify the unavailable external input, authority, dependency, reconciliation, or safety judgment"
+                        .to_string(),
+                );
+            }
+        }
+        BlockerClass::MissingAuthority => {
+            if exact_need.is_none() {
+                return Err(
+                    "this blocker class requires exact_need to identify the unavailable authority"
+                        .to_string(),
+                );
+            }
+            let Some(_dependency_repair) = args.dependency_repair else {
+                return Err(
+                    "missing_authority requires dependency_repair so a minimal local repair of a proven task dependency is not escalated as unrelated work"
+                        .to_string(),
+                );
+            };
+            if causal_local_repair_is_proven {
+                return Err(
+                    "durable tool evidence proves that this target is inside the delegated project and directly blocked the required workflow. The proposed minimal reversible local repair is already in scope. Inspect the exact invariant, preserve substantive content, apply only that repair, rerun the failed workflow, and continue"
                         .to_string(),
                 );
             }
@@ -287,7 +363,7 @@ impl Tool for ReportBlockerTool {
     fn schema(&self) -> Value {
         json!({
             "name": "report_blocker",
-            "description": "Report an external boundary or failure still unresolved after bounded recovery; never a first tool failure.",
+            "description": "Report an unresolved external boundary or exhausted recovery.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -296,13 +372,11 @@ impl Tool for ReportBlockerTool {
                     },
                     "blocker_class": {
                         "type": "string",
-                        "enum": ["owner_input", "missing_authority", "external_dependency", "ambiguous_external_effect", "safety_boundary", "recovery_exhausted"],
-                        "description": "Use recovery_exhausted only after safe attempts and renewed verification."
+                        "enum": ["owner_input", "missing_authority", "external_dependency", "ambiguous_external_effect", "safety_boundary", "recovery_exhausted"]
                     },
                     "external_effect_state": {
                         "type": "string",
-                        "enum": ["none", "confirmed_no_effect", "confirmed_effect", "ambiguous"],
-                        "description": "Externally visible effect state; never retry an ambiguous effect."
+                        "enum": ["none", "confirmed_no_effect", "confirmed_effect", "ambiguous"]
                     },
                     "recovery_attempts": {
                         "type": "array",
@@ -316,42 +390,38 @@ impl Tool for ReportBlockerTool {
                             },
                             "required": ["action", "outcome", "evidence"],
                             "additionalProperties": false
-                        },
-                        "description": "Recovery attempts with evidence; empty only for an external boundary."
+                        }
                     },
                     "outcome": {
                         "type": "string",
-                        "enum": ["blocked", "partial_done_blocked", "needs_approval", "reduce_scope", "abandon"],
-                        "description": "Use partial_done_blocked for partial work or needs_approval for a gated action."
+                        "enum": ["blocked", "partial_done_blocked", "needs_approval", "reduce_scope", "abandon"]
                     },
                     "partial_work": {
                         "type": "string"
                     },
                     "exact_need": {
-                        "type": "string",
-                        "description": "Exact input, authority, or dependency needed."
+                        "type": "string"
                     },
                     "next_step": {
-                        "type": "string",
-                        "description": "Next action after resolution."
+                        "type": "string"
                     },
                     "target": {
-                        "type": "string",
-                        "description": "Affected path, URL, system, or artifact."
+                        "type": "string"
+                    },
+                    "dependency_repair": {
+                        "type": "boolean",
+                        "description": "For missing_authority: true only for a minimal reversible local repair of a path named by failed required-workflow evidence."
                     },
                     "consequence_if_not_provided": {
-                        "type": "string",
-                        "description": "Consequence if unresolved."
+                        "type": "string"
                     },
                     "artifacts": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Relevant artifacts or paths."
+                        "items": { "type": "string" }
                     },
                     "options": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Possible resolutions."
+                        "items": { "type": "string" }
                     }
                 },
                 "required": ["reason", "blocker_class", "external_effect_state", "recovery_attempts"],
@@ -388,7 +458,8 @@ impl Tool for ReportBlockerTool {
             sanitize_mandate_blocker_args(&mut args);
         }
 
-        if let Err(reason) = validate_blocker_boundary(&args) {
+        let causal_local_repair_is_proven = self.causal_local_repair_is_proven(&args).await;
+        if let Err(reason) = validate_blocker_boundary(&args, causal_local_repair_is_proven) {
             return Ok(format!(
                 "Error: blocker report rejected because {reason}. No task state changed. Continue the task autonomously: inspect current state, choose a safe in-scope RETRY, REPAIR, SUBSTITUTE, or RECONCILE action, and rerun the original verification before reporting a blocker."
             ));
@@ -476,7 +547,15 @@ impl Tool for ReportBlockerTool {
         // compatibility path is retained for direct unit tests and older
         // callers that do not execute under a durable claim.
         if let Ok(Some(mut task)) = self.state.get_task(&self.task_id).await {
-            let suppress_immediate_notification = self.mandate_execution
+            // A fenced executor is subordinate to a parent task lead. Its
+            // blocker is a durable handoff for that parent to reconcile, not a
+            // terminal owner escalation. The parent may resolve the blocker,
+            // retry safely, or eventually surface its own terminal outcome.
+            // Publishing here races that reconciliation and can tell the owner
+            // to intervene even though the harness is still recovering.
+            let parent_owns_terminal_decision = self.attempt.is_some();
+            let suppress_immediate_notification = parent_owns_terminal_decision
+                || self.mandate_execution
                 || suppresses_immediate_blocker_notification(task.context.as_deref());
             let result_summary = if task
                 .result
@@ -570,6 +649,7 @@ impl Tool for ReportBlockerTool {
             } else {
                 info!(
                     task_id = %self.task_id,
+                    parent_owns_terminal_decision,
                     mandate_execution = self.mandate_execution,
                     "Suppressed immediate blocker escalation for controlled task finalization"
                 );
@@ -710,6 +790,50 @@ mod tests {
         assert!(entry.message.contains("**Blocked:**"));
         assert!(entry.message.contains("**Needed:**"));
         assert!(entry.message.contains("**Resume:** `/work unblock"));
+    }
+
+    #[tokio::test]
+    async fn fenced_executor_blocker_is_handoff_not_owner_escalation() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let mut task = state.get_task(&task_id).await.unwrap().unwrap();
+        task.status = "pending".to_string();
+        task.started_at = None;
+        task.completed_at = None;
+        state.update_task(&task).await.unwrap();
+        let attempt = state
+            .claim_task_with_lease(&task_id, "synthetic-executor", None, 180)
+            .await
+            .unwrap()
+            .expect("executor should claim the task");
+        let tool = ReportBlockerTool::for_attempt(task_id.clone(), state.clone(), attempt, false);
+
+        tool.call(
+            &json!({
+                "reason": "Current source state contradicts the earlier deployment receipt.",
+                "blocker_class": "ambiguous_external_effect",
+                "external_effect_state": "ambiguous",
+                "recovery_attempts": [],
+                "outcome": "partial_done_blocked",
+                "partial_work": "The deployment completed and returned a public URL.",
+                "exact_need": "Reconcile the deployment receipt with current source state.",
+                "next_step": "Parent task lead should inspect current state and choose the safe recovery path."
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let task = state.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "blocked");
+        assert!(task.context.as_deref().unwrap().contains("executor_result"));
+        assert!(
+            state
+                .get_pending_notifications(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the parent task lead owns reconciliation and terminal notification"
+        );
     }
 
     #[test]
@@ -881,7 +1005,8 @@ mod tests {
                     "partial_work": "Validated the pending rotation script and staged the change plan",
                     "exact_need": "Owner approval to rotate the credentials in production.",
                     "next_step": "Run the approved credential rotation and verify the service health.",
-                    "target": "production credentials"
+                    "target": "production credentials",
+                    "dependency_repair": false
                 })
                 .to_string(),
             )
@@ -895,5 +1020,83 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("\"needs_approval\""));
+    }
+
+    #[tokio::test]
+    async fn proven_causal_local_repair_is_not_accepted_as_missing_authority() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("content/posts/synthetic-post.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            "---\ntitle: Synthetic\n---\n\nBody stays intact.\n",
+        )
+        .unwrap();
+
+        let mut task = state.get_task(&task_id).await.unwrap().unwrap();
+        let handoff = crate::agent::ExecutorHandoff {
+            task_id: task_id.clone(),
+            mission: "Build and publish the synthetic site.".to_string(),
+            task_description: "Repair the failed build and continue the workflow.".to_string(),
+            target_scope: crate::agent::TargetScope {
+                allowed_targets: vec![crate::traits::ToolTargetHint::new(
+                    crate::traits::ToolTargetHintKind::ProjectScope,
+                    project.path().to_string_lossy(),
+                )
+                .unwrap()],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            allowed_tools: None,
+        };
+        task.context = Some(
+            crate::agent::persist_executor_handoff_context(task.context.as_deref(), &handoff)
+                .unwrap(),
+        );
+        state.update_task(&task).await.unwrap();
+        state
+            .log_task_activity(&crate::traits::TaskActivity {
+                id: 0,
+                task_id: task_id.clone(),
+                activity_type: "tool_call".to_string(),
+                tool_name: Some("run_command".to_string()),
+                tool_args: Some("{\"command\":\"npm run build\"}".to_string()),
+                result: Some(format!(
+                    "Build failed: {} lacks the required numeric frontmatter id.",
+                    target.display()
+                )),
+                success: Some(false),
+                tokens_used: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let tool = ReportBlockerTool::new(task_id.clone(), state.clone());
+        let result = tool
+            .call(
+                &json!({
+                    "reason": "The pre-existing post needs a mechanical frontmatter repair.",
+                    "blocker_class": "missing_authority",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [],
+                    "outcome": "needs_approval",
+                    "exact_need": "Authority to add the required numeric id.",
+                    "next_step": "Add only the missing id, rerun the build, and continue.",
+                    "target": target.to_string_lossy(),
+                    "dependency_repair": true
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("already in scope"), "result: {result}");
+        assert!(result.contains("durable tool evidence"), "result: {result}");
+        assert_eq!(
+            state.get_task(&task_id).await.unwrap().unwrap().status,
+            "running"
+        );
     }
 }

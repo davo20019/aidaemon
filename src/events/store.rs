@@ -612,6 +612,33 @@ impl EventStore {
         Ok(pending.into_iter().map(|(_, data)| data).collect())
     }
 
+    /// Reconstruct unresolved approval interactions belonging to one task.
+    /// Completion uses this as a final fail-closed check so a model response
+    /// cannot race ahead of an approval resolution.
+    pub async fn get_pending_task_interactions(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Vec<InteractionRequestedData>> {
+        let events = self.query_task_events(task_id).await?;
+        let mut pending = std::collections::HashMap::<String, InteractionRequestedData>::new();
+        for event in events {
+            match event.event_type {
+                EventType::InteractionRequested => {
+                    if let Ok(data) = event.parse_data::<InteractionRequestedData>() {
+                        pending.insert(data.interaction_id.clone(), data);
+                    }
+                }
+                EventType::InteractionResolved => {
+                    if let Ok(data) = event.parse_data::<InteractionResolvedData>() {
+                        pending.remove(&data.interaction_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(pending.into_values().collect())
+    }
+
     /// Query events for a specific task
     pub async fn query_task_events(&self, task_id: &str) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(

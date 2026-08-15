@@ -5,8 +5,11 @@ user_text: Refactor the auth module, add tests, and deploy to staging
 orchestrator: true
 mock_responses:
   - text: "This requires three phases: inspect the auth module, refactor and test it, then deploy the verified result to staging."
+task_assessments:
+  - text: '{"schema_version":2,"goal":"Refactor, test, and deploy the auth module","steps":[],"success_criteria":[],"contract":{"confidence":"high","task_kind":"change","expects_mutation":true,"requires_observation":true,"required_effects":["local_source_write","remote_deploy"],"mutation_scope":"allowed","forbidden_actions":[],"constraint_evidence":[],"minimum_sources":0,"requires_primary_sources":false,"requires_exact_history":false,"project_reference":null},"task_shape":{"execution_mode":"inline","confidence":"high","independent_workstreams":1,"requires_background_continuation":false,"request_relationship":"new_request","semantic_scope":"local_workspace"}}'
 expect:
   llm_calls_min: 1
-  # This mutation/deploy contract did not execute any mutation, so an
-  # informative planning answer must not be persisted as success.
+  # This typed mutation/deploy contract produced no successful effect receipt,
+  # so it must terminate as failed rather than deriving partial success from
+  # the wording of an informative planning answer.
   outcome: failed

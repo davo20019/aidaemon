@@ -2,8 +2,7 @@ use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBlockKind, ToolBudget
 use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
-    extract_project_dir_hint_with_aliases, is_file_recheck_tool,
-    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
+    is_file_recheck_tool, maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
     project_instruction_targets_for_tool_call, tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
@@ -22,7 +21,7 @@ use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::self_correction::AttemptDecision;
 use crate::agent::*;
 use crate::events::TaskOutcome;
-use crate::traits::ToolCallSemantics;
+use crate::traits::{MandateDecisionOutcome, ToolCallSemantics};
 
 // ── Correction gate (P2.4) ───────────────────────────────────────────────────
 
@@ -48,6 +47,24 @@ enum MandateGateDecision {
     Deny {
         reason: String,
     },
+}
+
+fn committed_non_action_mandate_outcome(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    outcome_satisfied: bool,
+) -> Option<MandateDecisionOutcome> {
+    if !outcome_satisfied
+        || tool_name != "manage_mandates"
+        || arguments.get("action").and_then(serde_json::Value::as_str) != Some("record_decision")
+    {
+        return None;
+    }
+    let outcome = arguments
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .and_then(MandateDecisionOutcome::parse)?;
+    (outcome != MandateDecisionOutcome::Act).then_some(outcome)
 }
 
 async fn mandate_gate_for_tool_call(
@@ -271,7 +288,8 @@ async fn reconcile_successful_tool_checklist(
     agent: &Agent,
     session_id: &str,
     tool_name: &str,
-    arguments: &str,
+    tool_call_id: &str,
+    semantics: &ToolCallSemantics,
     result_text: &str,
     status_tx: &Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
 ) {
@@ -280,7 +298,7 @@ async fn reconcile_successful_tool_checklist(
     };
 
     let updated_plan = match plan_store
-        .reconcile_checklist_after_tool_success(session_id, tool_name, arguments, result_text)
+        .reconcile_checklist_after_tool_success(session_id, semantics, tool_call_id, result_text)
         .await
     {
         Ok(Some(plan)) => plan,
@@ -619,9 +637,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         .active_workspace_grant(user_role)
         .map(|grant| grant.project_root.clone());
     if known_project_dir.is_none() {
-        known_project_dir = workspace_project_root.clone().or_else(|| {
-            extract_project_dir_hint_with_aliases(_user_text, &agent.path_aliases.projects)
-        });
+        known_project_dir = workspace_project_root
+            .clone()
+            .or_else(|| turn_context.primary_project_scope.clone());
     }
 
     let mut successful_tool_calls = 0;
@@ -713,6 +731,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     // deliverable for the task lead, so the loop ends after this batch instead
     // of running reconciliation/verification iterations against it.
     let mut executor_blocker_summary: Option<String> = None;
+    // A durable WAIT/ASK/STOP is the authoritative terminal result of a
+    // mandate review. Once it commits, do not spend another model turn asking
+    // for prose that could obscure the typed outcome or hit an unrelated
+    // admission limit.
+    let mut committed_non_action_decision: Option<(MandateDecisionOutcome, String)> = None;
     for (tool_call_index, tc) in resp.tool_calls.iter().enumerate() {
         if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
         {
@@ -1900,6 +1923,12 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             }
         }
+        execution_state.record_tool_result_presentation(&result_metadata, &result_text);
+        if result_metadata.presentation
+            == Some(crate::traits::ToolResultPresentation::NaturalSummary)
+        {
+            pending_system_messages.push(SystemDirective::NaturalToolOutcomePresentation);
+        }
         let background_detached =
             tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
 
@@ -2203,6 +2232,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             restrict_to_personal_memory_tools,
             tool_arguments: &effective_arguments,
             tool_summary: &tool_summary,
+            semantics: &result_metadata.semantics,
         };
         let mut learning_state = ResultLearningState {
             learning_ctx,
@@ -2264,7 +2294,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 agent,
                 session_id,
                 &tc.name,
-                &effective_arguments,
+                &tc.id,
+                &result_metadata.semantics,
                 &result_text,
                 &status_tx,
             )
@@ -2310,9 +2341,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         }
 
         if outcome_satisfied {
-            // Each successful tool execution extends the budget so
-            // productive multi-step runs are never artificially stopped.
-            execution_state.extend_budget_on_progress();
+            // Only distinct, outcome-bearing results earn additional runway.
+            // Administrative calls and replayed evidence cannot manufacture
+            // execution capacity merely by succeeding at transport level.
+            execution_state.extend_budget_on_progress(
+                &tc.name,
+                &result_metadata.semantics,
+                &result_text,
+            );
 
             // `manage_memories`/`manage_people` encode read-vs-write in the ACTION
             // arg, and `user_facing_tool_activity` infers the "checking" vs
@@ -2373,7 +2409,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             );
             validation_state.clear_loop_repetition_reason();
             if semantics.mutates_state() {
-                completion_progress.mark_mutation(&turn_context.completion_contract, semantics);
+                completion_progress.mark_mutation_receipt(
+                    &turn_context.completion_contract,
+                    semantics,
+                    &tc.id,
+                );
                 // Track external mutation success for the completion gate
                 if caps.external_side_effect {
                     completion_progress.mark_successful_external_mutation();
@@ -2389,18 +2429,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     &result_text,
                 );
                 verified_observation = can_verify && matched_contract;
-                completion_progress.mark_observation(
+                completion_progress.mark_observation_receipt(
                     &turn_context.completion_contract,
                     verified_observation,
+                    &tc.id,
                 );
             }
             // send_file success means the artifact was delivered to the
             // user — this IS verification.  Clear the pending flag so the
             // completion gate doesn't block a perfectly successful task.
             if tc.name == "send_file" && completion_progress.verification_pending {
-                completion_progress.verification_pending = false;
-                completion_progress.verification_count =
-                    completion_progress.verification_count.saturating_add(1);
+                completion_progress.mark_delivery_verified(&tc.id);
                 info!(
                     session_id,
                     iteration, "send_file success cleared verification_pending"
@@ -2509,6 +2548,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             }),
                         )
                         .await;
+                }
+                if let Some(outcome) =
+                    committed_non_action_mandate_outcome(&tc.name, &arguments, outcome_satisfied)
+                {
+                    committed_non_action_decision = Some((outcome, result_text.clone()));
                 }
             }
         }
@@ -2686,6 +2730,34 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             );
             break;
         }
+        if committed_non_action_decision.is_some() {
+            break;
+        }
+    }
+
+    if let Some((outcome, summary)) = committed_non_action_decision {
+        info!(
+            session_id,
+            iteration,
+            ?outcome,
+            "Committed non-action mandate decision; ending the review without another model call"
+        );
+        agent
+            .emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Succeeded,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                None,
+                Some(summary.chars().take(200).collect()),
+            )
+            .await;
+        learning_ctx.completed_naturally = true;
+        learning_ctx.task_outcome = Some(TaskOutcome::Succeeded);
+        return Ok(ToolExecutionOutcome::Return(Ok(summary)));
     }
 
     if let Some(blocker_summary) = executor_blocker_summary {
@@ -2784,6 +2856,51 @@ mod state_application_tests {
 
         assert!(outcome.is_err());
         assert!(applied);
+    }
+}
+
+#[cfg(test)]
+mod mandate_decision_completion_tests {
+    use super::committed_non_action_mandate_outcome;
+    use crate::traits::MandateDecisionOutcome;
+    use serde_json::json;
+
+    #[test]
+    fn typed_non_action_decision_is_terminal_independent_of_rationale_wording() {
+        for rationale in [
+            "Nothing worthwhile changed.",
+            "The approved observations do not justify an account action today.",
+        ] {
+            let arguments = json!({
+                "action": "record_decision",
+                "outcome": "wait",
+                "rationale": rationale,
+            });
+            assert_eq!(
+                committed_non_action_mandate_outcome("manage_mandates", &arguments, true,),
+                Some(MandateDecisionOutcome::Wait)
+            );
+        }
+    }
+
+    #[test]
+    fn act_failed_call_and_unrelated_protocol_actions_are_not_terminal() {
+        let act = json!({"action": "record_decision", "outcome": "act"});
+        let wait = json!({"action": "record_decision", "outcome": "wait"});
+        let inspect = json!({"action": "get", "outcome": "wait"});
+
+        assert_eq!(
+            committed_non_action_mandate_outcome("manage_mandates", &act, true),
+            None
+        );
+        assert_eq!(
+            committed_non_action_mandate_outcome("manage_mandates", &wait, false),
+            None
+        );
+        assert_eq!(
+            committed_non_action_mandate_outcome("manage_mandates", &inspect, true),
+            None
+        );
     }
 }
 

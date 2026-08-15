@@ -12,17 +12,12 @@
 //! same names through `history::`.
 
 pub(super) use super::completion_contract::{
-    apply_planned_contract_signals, apply_planned_mutation_constraints,
-    apply_planned_required_mutation_effects, authored_artifact_still_needs_delivery_recovery,
-    completion_contract_allows_force_text, infer_completion_contract, mutation_contract_fulfilled,
-    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
-    CompletionContract, CompletionProgress, CompletionTaskKind, ExecutionRequirement,
-    ForbiddenMutationAction, VerificationTarget, VerificationTargetKind,
+    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
+    inherit_unfinished_request_contract, install_semantic_completion_contract,
+    mutation_contract_fulfilled, parse_planned_forbidden_action, parse_planned_mutation_effects,
+    parse_planned_task_kind, retain_structural_completion_contract, CompletionContract,
+    CompletionProgress, CompletionTaskKind, ExecutionRequirement, ForbiddenMutationAction,
+    SemanticCompletionRequirements, VerificationTarget, VerificationTargetKind,
 };
-pub(super) use super::followup::{
-    assistant_message_looks_like_clarifying_question,
-    looks_like_context_dependent_followup_question, looks_like_explicit_task_switch,
-    looks_like_self_contained_mutation_request, looks_like_short_command_request,
-    looks_like_standalone_goal_request, looks_like_unanswered_request_reference, FollowupMode,
-};
+pub(super) use super::followup::{assistant_message_looks_like_clarifying_question, FollowupMode};
 pub(super) use super::turn_context::TurnContext;

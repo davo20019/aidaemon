@@ -356,21 +356,31 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     );
 }
 
-/// Trust tier: on an Autonomous-tier model the deferred-action / tools-
-/// required text blocks are telemetry-only. The same deferred narration that
-/// the Guided test above bounces is accepted as the final reply.
+/// Trust tier does not weaken typed execution obligations. An Autonomous model
+/// chooses its own strategy, but it still gets one bounded evidence pass before
+/// a zero-tool text response may terminate the task.
 #[tokio::test]
-async fn test_deferred_action_text_accepted_on_autonomous_tier() {
+async fn test_autonomous_tier_performs_bounded_execution_evidence_pass() {
     let deferred_text =
         "I'll find your resume and send it over right away.\nStarting the send-resume workflow...";
     let provider = MockProvider::with_responses(vec![
-        // 1) First call: deferred-action text, no tool calls — on the
-        //    autonomous tier this is delivered to the user instead of bounced.
+        // 1) First call: text with no evidence. The obligation controller asks
+        //    the same capable model to resolve the request with a tool.
         MockProvider::text_response(deferred_text),
-        // 2) Never reached on autonomous tier; present so a regression to
-        //    guided-style blocking fails the call-count assert, not the mock.
-        MockProvider::text_response("Found it and sent it."),
-    ]);
+        // 2) The model chooses the tool; the controller does not prescribe the
+        //    implementation strategy.
+        MockProvider::tool_call_response("system_info", "{}"),
+        // 3) A concrete result may now be presented.
+        MockProvider::text_response("I completed the requested system inspection."),
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let policy = crate::config::PolicyConfig {
         trust_tier: "autonomous".to_string(),
@@ -385,7 +395,7 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
         .agent
         .handle_message(
             "autonomous_deferred_session",
-            "send me my resume",
+            "Run the command pwd on this machine and summarize the result.",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -394,12 +404,75 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
         .await
         .unwrap();
 
-    assert_eq!(response, deferred_text);
+    assert_eq!(response, "I completed the requested system inspection.");
     assert_eq!(
         harness.provider.call_count().await,
-        1,
-        "language-only completion heuristics must stay shadow-only on the autonomous tier"
+        3,
+        "the Autonomous model should receive exactly one evidence-seeking retry"
     );
+    let calls = harness.provider.call_log.lock().await;
+    assert!(calls
+        .iter()
+        .any(|call| matches!(call.options.tool_choice, crate::traits::ToolChoiceMode::Required)));
+}
+
+#[tokio::test]
+async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() {
+    let denial = "I cannot change that setting because no matching control is exposed.";
+    let limitation = "I inspected the available runtime state. It still does not expose a speaker-volume control, so the requested change remains incomplete.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(denial),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(limitation),
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "change",
+        true,
+        true,
+        &["configuration"],
+        "new_request",
+        "host_local",
+    )]);
+    let policy = crate::config::PolicyConfig {
+        trust_tier: "autonomous".to_string(),
+        ..Default::default()
+    };
+    let harness =
+        setup_test_agent_with_models_and_policy(provider, "primary-model", "smart-model", policy)
+            .await
+            .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "autonomous_denial_evidence_session",
+            "Change the synthetic Companion speaker volume to maximum.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, limitation);
+    assert_ne!(response, denial, "the unsupported claim needs an evidence pass");
+    let calls = harness.provider.call_log.lock().await;
+    assert_eq!(calls.len(), 3);
+    let recovery = &calls[1];
+    assert!(matches!(
+        recovery.options.tool_choice,
+        crate::traits::ToolChoiceMode::Required
+    ));
+    assert!(recovery.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| {
+                content.contains("requested outcome is still unresolved")
+                    && content.contains("Choose the best strategy yourself")
+            })
+    }));
 }
 
 /// Regression: even after some successful tool calls, a deferred-action
@@ -603,7 +676,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
         .await
         .unwrap();
 
-    let expected = "I wasn't able to process that request. Could you try rephrasing?";
+    let expected = "I wasn't able to process that request because automatic model recovery returned no usable output.";
     assert_eq!(response, expected);
     assert_eq!(harness.provider.call_count().await, 2);
 
@@ -672,9 +745,9 @@ async fn test_empty_execution_response_surfaces_provider_note() {
         .await
         .unwrap();
 
-    assert!(response.starts_with("I wasn't able to process that request."));
-    assert!(response.contains("The model returned no usable output (finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH)."));
-    assert!(response.ends_with("Could you try rephrasing?"));
+    assert!(response.starts_with("I wasn't able to process that request because automatic model recovery returned no usable output."));
+    assert!(response.contains("Provider detail: finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH."));
+    assert!(!response.contains('?'));
     assert_eq!(harness.provider.call_count().await, 2);
 
     let history = harness.state.get_history("test_session", 10).await.unwrap();

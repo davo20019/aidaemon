@@ -10,11 +10,20 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
-use crate::tools::goal_completion_summary_indicates_not_finished;
+#[cfg(test)]
+use crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished;
 use crate::traits::{Goal, ScheduledRunState, StateStore, Task};
 
+#[cfg(test)]
 use super::response_analysis::{is_substantive_text_response, looks_like_deferred_action_response};
 use super::{contains_keyword_as_words, Agent};
+
+/// Recurring runs may spend one additional envelope when their durable health
+/// snapshot shows concrete progress. This is intentionally small: autonomy
+/// means adapting inside a bounded policy, not silently turning a runaway run
+/// into unbounded spend.
+pub(crate) const SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS: usize = 1;
+pub(crate) const SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP: i64 = 2_000_000;
 
 /// Blocked path patterns for auto-sent files (mirrors SendFileTool).
 const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[
@@ -325,10 +334,7 @@ pub(in crate::agent) fn auto_dispatch_scheduled_run_extension_budget(
         .max(status.tokens_used.saturating_add(old_budget / 2))
         .min(hard_token_cap);
 
-    let has_meaningful_progress = Agent::has_meaningful_budget_progress(
-        status.health.evidence_gain_count,
-        status.health.total_successful_tool_calls,
-    );
+    let has_meaningful_progress = Agent::scheduled_run_has_structural_progress(&status.health);
     let clearly_unproductive =
         Agent::scheduled_run_metrics_are_clearly_unproductive(&status.health);
 
@@ -383,6 +389,7 @@ pub(in crate::agent) fn is_low_signal_task_lead_reply(text: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(in crate::agent) fn looks_like_incomplete_live_work_summary(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -551,6 +558,7 @@ pub(in crate::agent) fn looks_like_evidence_grounding_challenge(text: &str) -> b
                 .any(|term| contains_keyword_as_words(&lower, term)))
 }
 
+#[cfg(test)]
 pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {

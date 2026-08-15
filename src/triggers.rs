@@ -121,6 +121,7 @@ async fn imap_idle_loop(
                         session_id: "email_trigger".to_string(),
                         content: format!("New email from {}: {}", from, subject),
                         trusted: false,
+                        mandate_signal: None,
                     };
 
                     if sender.send(event).is_err() {

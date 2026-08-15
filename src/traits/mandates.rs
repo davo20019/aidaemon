@@ -113,6 +113,47 @@ impl std::fmt::Display for MandateStatus {
     }
 }
 
+/// Owner-selected operating posture for a mandate.
+///
+/// This is persisted policy, not a classification inferred from conversation
+/// text. `Autopilot` changes how the worker handles routine judgment and
+/// recovery inside the exact authority envelope; it never widens that
+/// envelope by itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateAutonomyMode {
+    #[default]
+    Bounded,
+    Autopilot,
+}
+
+impl MandateAutonomyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bounded => "bounded",
+            Self::Autopilot => "autopilot",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bounded" => Some(Self::Bounded),
+            "autopilot" => Some(Self::Autopilot),
+            _ => None,
+        }
+    }
+
+    pub const fn is_autopilot(self) -> bool {
+        matches!(self, Self::Autopilot)
+    }
+}
+
+impl std::fmt::Display for MandateAutonomyMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mandate {
     pub id: String,
@@ -122,6 +163,11 @@ pub struct Mandate {
     pub source_goal_id: Option<String>,
     pub objective: String,
     pub status: MandateStatus,
+    /// Explicit owner-confirmed operating posture. This is separate from the
+    /// authority envelope so selecting Autopilot cannot authorize a new tool,
+    /// operation, target, account, effect, or query parameter.
+    #[serde(default)]
+    pub autonomy_mode: MandateAutonomyMode,
     pub authority: MandateAuthority,
     /// Owner-confirmed, immutable strategy material. This may guide how the
     /// objective is pursued, but it never contributes authority.
@@ -137,6 +183,9 @@ pub struct Mandate {
     pub min_review_secs: i64,
     pub max_review_secs: i64,
     pub default_review_secs: i64,
+    /// Human-readable resource policy. Runtime token arithmetic is derived
+    /// internally from this effort level and the review cadence.
+    pub review_effort: String,
     /// Durable next wake time for the MAPE-K deliberation loop.
     pub next_review_at: String,
     /// Short-lived single-writer lease used by heartbeat dispatch.
@@ -176,6 +225,7 @@ impl Mandate {
             source_goal_id,
             objective: objective.trim().to_string(),
             status: MandateStatus::Active,
+            autonomy_mode: MandateAutonomyMode::Bounded,
             authority,
             strategy: None,
             suspension: None,
@@ -185,6 +235,7 @@ impl Mandate {
             min_review_secs,
             max_review_secs,
             default_review_secs,
+            review_effort: "balanced".to_string(),
             next_review_at,
             review_lease_token: None,
             review_lease_expires_at: None,
@@ -216,6 +267,17 @@ impl Mandate {
             .clamp(self.min_review_secs, self.max_review_secs)
     }
 
+    /// Deterministic activity-to-cadence edge in the proactive review graph.
+    /// The result always remains inside the owner-confirmed bounds.
+    pub fn review_secs_for_activity(&self, activity: MandateActivityLevel) -> i64 {
+        let requested = match activity {
+            MandateActivityLevel::Quiet => self.default_review_secs,
+            MandateActivityLevel::Active => self.default_review_secs / 3,
+            MandateActivityLevel::Urgent => self.min_review_secs,
+        };
+        self.clamp_review_secs(Some(requested))
+    }
+
     /// Choose the next durable review time without ever scheduling work past
     /// the owner-approved expiry boundary.
     pub fn bounded_next_review_at(
@@ -239,6 +301,15 @@ impl Mandate {
         if !canonical_text_within(&self.objective, MAX_MANDATE_OBJECTIVE_TEXT) {
             return Err(
                 "mandate objective must be canonical non-empty text of at most 2 KiB in both characters and bytes"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.review_effort.as_str(),
+            "efficient" | "balanced" | "thorough" | "legacy_custom"
+        ) {
+            return Err(
+                "mandate review_effort must be efficient, balanced, thorough, or legacy_custom"
                     .to_string(),
             );
         }
@@ -389,6 +460,14 @@ pub struct MandateOperationScope {
     pub kind: MandateOperationKind,
     #[serde(default)]
     pub target_prefixes: Vec<String>,
+    /// Query parameter names whose values may be selected at execution time.
+    ///
+    /// A query embedded in a URL target remains an exact authorization. This
+    /// separate list is the explicit owner-approved escape hatch for APIs such
+    /// as search, where the observation is bounded by endpoint and parameter
+    /// name but the value is deliberately chosen during each review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_query_params: Vec<String>,
     #[serde(default)]
     pub mutation_effects: Vec<String>,
 }
@@ -423,6 +502,38 @@ impl MandateOperationScope {
             .count();
         if url_targets == 0 {
             return Err("delegated operation scopes require a URL target".to_string());
+        }
+        if self.allowed_query_params.len() > 16 {
+            return Err("operation scope query parameters exceed their bounded size".to_string());
+        }
+        for (index, name) in self.allowed_query_params.iter().enumerate() {
+            if name.trim() != name
+                || name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+                })
+                || self.allowed_query_params[..index]
+                    .iter()
+                    .any(|seen| seen == name)
+            {
+                return Err(
+                    "operation scope query parameters must be unique canonical parameter names"
+                        .to_string(),
+                );
+            }
+        }
+        if !self.allowed_query_params.is_empty()
+            && self.target_prefixes.iter().any(|target| {
+                reqwest::Url::parse(target)
+                    .ok()
+                    .is_some_and(|url| url.query().is_some())
+            })
+        {
+            return Err(
+                "operation scopes must use either an exact URL query or allowed_query_params, not both"
+                    .to_string(),
+            );
         }
         let auth_targets = self
             .target_prefixes
@@ -532,6 +643,12 @@ impl MandateOperationScope {
                         .to_string(),
                 );
             }
+        }
+        if self.kind != MandateOperationKind::Observation && !self.allowed_query_params.is_empty() {
+            return Err(
+                "dynamic query parameters are supported only for observation operation scopes"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -991,6 +1108,38 @@ pub enum MandateDecisionOutcome {
     Stop,
 }
 
+/// Typed signal describing how quickly the mandate should look again.
+///
+/// This affects only the next wake time inside the owner's confirmed review
+/// bounds. It never changes tools, targets, quotas, or any other authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateActivityLevel {
+    #[default]
+    Quiet,
+    Active,
+    Urgent,
+}
+
+impl MandateActivityLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Active => "active",
+            Self::Urgent => "urgent",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "quiet" => Some(Self::Quiet),
+            "active" => Some(Self::Active),
+            "urgent" => Some(Self::Urgent),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime-authored rationale used when a mandate deliberator exits without
 /// committing a typed decision. This marker is deliberately exact and stable:
 /// finalization treats it as a failed review that must be surfaced and retried,
@@ -1064,6 +1213,8 @@ pub struct MandateDecisionCycle {
     /// Owner-policy revision observed when this decision was committed.
     pub mandate_version: i64,
     pub outcome: MandateDecisionOutcome,
+    #[serde(default)]
+    pub activity_level: MandateActivityLevel,
     pub rationale: String,
     /// Sourced observations used by the deliberator, serialized as JSON.
     pub belief_snapshot: Option<String>,
@@ -1100,6 +1251,7 @@ impl MandateDecisionCycle {
             goal_run_id: goal_run_id.to_string(),
             mandate_version,
             outcome,
+            activity_level: MandateActivityLevel::Quiet,
             rationale: rationale.trim().to_string(),
             belief_snapshot: None,
             evidence_receipt_ids: Vec::new(),
@@ -1166,6 +1318,185 @@ impl MandateDecisionCycle {
             }
         }
         Ok(())
+    }
+}
+
+/// One typed, evidence-backed revision to the mandate's adaptive operating
+/// strategy. These revisions are advisory and may change tactics only; they
+/// are never owner authority and are ignored by the authorization gate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateStrategyRevisionKind {
+    Reinforce,
+    Explore,
+    Avoid,
+    Retire,
+}
+
+impl MandateStrategyRevisionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reinforce => "reinforce",
+            Self::Explore => "explore",
+            Self::Avoid => "avoid",
+            Self::Retire => "retire",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reinforce" => Some(Self::Reinforce),
+            "explore" => Some(Self::Explore),
+            "avoid" => Some(Self::Avoid),
+            "retire" => Some(Self::Retire),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateStrategyRevision {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub decision_cycle_id: String,
+    pub strategy_key: String,
+    pub kind: MandateStrategyRevisionKind,
+    pub guidance: String,
+    /// Confidence in basis points (0–10,000), avoiding floating-point drift.
+    pub confidence_bps: u16,
+    pub evidence_receipt_ids: Vec<String>,
+    pub created_at: String,
+}
+
+impl MandateStrategyRevision {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        decision_cycle_id: &str,
+        strategy_key: &str,
+        kind: MandateStrategyRevisionKind,
+        guidance: &str,
+        confidence_bps: u16,
+        evidence_receipt_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            decision_cycle_id: decision_cycle_id.to_string(),
+            strategy_key: strategy_key.to_string(),
+            kind,
+            guidance: guidance.trim().to_string(),
+            confidence_bps,
+            evidence_receipt_ids,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let valid_key = !self.strategy_key.is_empty()
+            && self.strategy_key.len() <= 64
+            && self.strategy_key.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'_' | b'-' | b'.'))
+            });
+        if !canonical_text_within(&self.id, 256)
+            || !canonical_text_within(&self.mandate_id, 256)
+            || self.mandate_version <= 0
+            || !canonical_text_within(&self.decision_cycle_id, 256)
+            || !valid_key
+            || !canonical_text_within(&self.guidance, 750)
+            || self.confidence_bps > 10_000
+            || self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > 8
+            || self
+                .evidence_receipt_ids
+                .iter()
+                .any(|value| !canonical_text_within(value, 256))
+        {
+            return Err("invalid bounded mandate strategy revision".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "strategy revision created_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MandateOperatingUpdates {
+    pub learning_note: Option<MandateLearningNote>,
+    pub strategy_revisions: Vec<MandateStrategyRevision>,
+}
+
+/// Content-free external signal that may accelerate a matching Autopilot
+/// mandate. Matching uses exact typed account identity and URL scope only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateWakeSignal {
+    pub kind: MandateWakeSignalKind,
+    pub source: String,
+    pub target_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub dedupe_key: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateWakeSignalKind {
+    Mention,
+    Reply,
+    Reaction,
+    MetricChange,
+    DeliveryFailure,
+    ExternalChange,
+}
+
+impl MandateWakeSignal {
+    pub fn validate(&self) -> Result<(), String> {
+        let canonical_token = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.len() <= max
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                })
+        };
+        if !canonical_token(&self.source, 128)
+            || !canonical_token(&self.dedupe_key, 256)
+            || self
+                .account_id
+                .as_deref()
+                .is_some_and(|value| !value.starts_with("account:") || !canonical_token(value, 256))
+        {
+            return Err("invalid canonical mandate wake signal identifiers".to_string());
+        }
+        let target = reqwest::Url::parse(&self.target_url)
+            .map_err(|_| "mandate wake target_url must be an absolute URL".to_string())?;
+        if !matches!(target.scheme(), "http" | "https")
+            || target.host_str().is_none()
+            || !target.username().is_empty()
+            || target.password().is_some()
+            || target.fragment().is_some()
+        {
+            return Err("mandate wake target_url is not a safe HTTP(S) URL".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.occurred_at)
+            .map_err(|_| "mandate wake occurred_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+impl MandateWakeSignalKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Reply => "reply",
+            Self::Reaction => "reaction",
+            Self::MetricChange => "metric_change",
+            Self::DeliveryFailure => "delivery_failure",
+            Self::ExternalChange => "external_change",
+        }
     }
 }
 
@@ -1310,6 +1641,11 @@ pub struct Intention {
     pub goal_run_id: String,
     pub description: String,
     pub rationale: String,
+    /// Exact owner-authored success criterion this one-cycle commitment is
+    /// intended to advance. `None` is retained only for pre-value-contract
+    /// records created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_criterion: Option<String>,
     pub expected_benefit: Option<String>,
     pub risk: Option<String>,
     pub invalidation_criteria: Option<String>,
@@ -1335,6 +1671,7 @@ impl Intention {
             goal_run_id: goal_run_id.to_string(),
             description: description.trim().to_string(),
             rationale: rationale.trim().to_string(),
+            value_criterion: None,
             expected_benefit: None,
             risk: None,
             invalidation_criteria: None,
@@ -1361,6 +1698,7 @@ impl Intention {
         let mut metadata_chars = 0usize;
         let mut metadata_bytes = 0usize;
         for value in [
+            self.value_criterion.as_deref(),
             self.expected_benefit.as_deref(),
             self.risk.as_deref(),
             self.invalidation_criteria.as_deref(),
@@ -1380,6 +1718,39 @@ impl Intention {
             return Err(
                 "intention metadata exceeds its combined 4 KiB character/byte bound".to_string(),
             );
+        }
+        Ok(())
+    }
+
+    /// Validate the typed value judgment required before an ACT may be
+    /// persisted for a value-contract mandate. The criterion is matched by the
+    /// state store against immutable owner policy; this method owns the
+    /// content-presence half of that contract.
+    pub fn validate_value_contract(&self) -> Result<(), String> {
+        if !self
+            .value_criterion
+            .as_deref()
+            .is_some_and(|value| canonical_text_within(value, MAX_MANDATE_OBJECTIVE_TEXT))
+        {
+            return Err(
+                "ACT intention requires a canonical non-empty value_criterion within the mandate objective bound"
+                    .to_string(),
+            );
+        }
+        for (name, value) in [
+            ("expected_benefit", self.expected_benefit.as_deref()),
+            ("risk", self.risk.as_deref()),
+            (
+                "invalidation_criteria",
+                self.invalidation_criteria.as_deref(),
+            ),
+        ] {
+            if !value.is_some_and(|value| canonical_text_within(value, MAX_INTENTION_METADATA_TEXT))
+            {
+                return Err(format!(
+                    "ACT intention requires canonical non-empty {name} within the mandate policy entry bound"
+                ));
+            }
         }
         Ok(())
     }
@@ -2128,6 +2499,7 @@ mod tests {
             operation: ToolCallOperation::Get,
             kind: MandateOperationKind::Observation,
             target_prefixes: vec!["https://blog.aidaemon.ai/posts/".to_string()],
+            allowed_query_params: Vec::new(),
             mutation_effects: Vec::new(),
         };
         let post = MandateOperationScope {
@@ -2139,6 +2511,7 @@ mod tests {
                 "auth_profile:twitter".to_string(),
                 "account:12345".to_string(),
             ],
+            allowed_query_params: Vec::new(),
             mutation_effects: vec![
                 "remote_mutation".to_string(),
                 "external_delivery".to_string(),
@@ -2173,6 +2546,7 @@ mod tests {
             operation: ToolCallOperation::Get,
             kind: MandateOperationKind::Observation,
             target_prefixes: vec!["https://api.x.com/2/users/me".to_string()],
+            allowed_query_params: Vec::new(),
             mutation_effects: Vec::new(),
         };
         let error = unbound.validate().unwrap_err();
@@ -2190,9 +2564,44 @@ mod tests {
             operation: ToolCallOperation::Get,
             kind: MandateOperationKind::Observation,
             target_prefixes: vec!["https://api.example.test/v1/status".to_string()],
+            allowed_query_params: Vec::new(),
             mutation_effects: Vec::new(),
         };
         assert!(public_api.validate().is_ok());
+    }
+
+    #[test]
+    fn dynamic_query_authority_is_bounded_to_observation_parameter_names() {
+        let mut observation = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.example.test/v1/search".to_string()],
+            allowed_query_params: vec!["query".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        assert!(observation.validate().is_ok());
+
+        observation.allowed_query_params = vec!["query=value".to_string()];
+        assert!(observation.validate().is_err());
+
+        observation.allowed_query_params = vec!["query".to_string()];
+        observation.target_prefixes[0] =
+            "https://api.example.test/v1/search?query=exact".to_string();
+        assert!(observation.validate().is_err());
+
+        let mutation = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Post,
+            kind: MandateOperationKind::Mutation,
+            target_prefixes: vec!["https://api.example.test/v1/items".to_string()],
+            allowed_query_params: vec!["destination".to_string()],
+            mutation_effects: vec![
+                "remote_mutation".to_string(),
+                "external_delivery".to_string(),
+            ],
+        };
+        assert!(mutation.validate().is_err());
     }
 
     #[test]
@@ -2232,6 +2641,32 @@ mod tests {
         assert_eq!(
             mandate.bounded_next_review_at(None, now),
             expiry.to_rfc3339()
+        );
+    }
+
+    #[test]
+    fn typed_activity_edges_adjust_cadence_only_inside_confirmed_bounds() {
+        let mandate = Mandate::new(
+            "goal-id",
+            None,
+            "Adapt review cadence",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            3 * 60 * 60,
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Quiet),
+            3 * 60 * 60
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Active),
+            60 * 60
+        );
+        assert_eq!(
+            mandate.review_secs_for_activity(MandateActivityLevel::Urgent),
+            15 * 60
         );
     }
 
@@ -2307,6 +2742,13 @@ mod tests {
             "bounded intention",
             "bounded rationale",
         );
+        assert!(intention.validate_value_contract().is_err());
+        intention.value_criterion = Some("Produce a verified useful outcome".to_string());
+        intention.expected_benefit = Some("Advance the confirmed outcome".to_string());
+        intention.risk = Some("No material downside after bounded checks".to_string());
+        intention.invalidation_criteria =
+            Some("New evidence shows the intervention would not help".to_string());
+        assert!(intention.validate_value_contract().is_ok());
         intention.description = "é".repeat(513);
         assert!(intention.validate_content_bounds().is_err());
         intention.description = "bounded intention".to_string();

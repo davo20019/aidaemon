@@ -1799,11 +1799,11 @@ async fn calls_contains(backend: &MockBackend, needle: &MockCall) -> bool {
     backend.calls().lock().await.contains(needle)
 }
 
-/// ALLOW: an approving responder lets a navigate reach the backend and succeed.
+/// Public read-only navigation is within the authority of an interactive
+/// research request and must not generate a redundant approval prompt.
 #[tokio::test]
-async fn approval_allow_lets_navigate_reach_backend() {
-    let (tool, backend, recorder) =
-        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+async fn public_navigation_skips_approval_and_reaches_backend() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
         .call(
@@ -1820,32 +1820,119 @@ async fn approval_allow_lets_navigate_reach_backend() {
             &MockCall::Goto("https://example.com/".to_string())
         )
         .await,
-        "an approved navigate must reach the backend goto"
+        "validated public navigation must reach the backend goto"
     );
     assert_eq!(
         recorder.count().await,
-        1,
-        "navigate must prompt exactly once"
+        0,
+        "public navigation must not prompt"
     );
 }
 
-/// DENY: a denying responder blocks the navigation — the backend goto is never
-/// recorded and the result reports denial.
+/// Owner-confirmed schedules carry a runtime-injected trust bit, so a public
+/// read-only navigation must not create an expiring overnight approval prompt.
 #[tokio::test]
-async fn approval_deny_blocks_navigation_before_backend() {
+async fn trusted_scheduled_navigation_skips_prompt() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://www.nist.gov/research",
+                "_session_id": "scheduled-worker",
+                "_trusted_session": true
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out, "Navigated to https://www.nist.gov/research");
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "trusted public navigation must not request point-in-time approval"
+    );
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("https://www.nist.gov/research".to_string())
+        )
+        .await
+    );
+}
+
+/// The common dispatcher binds scheduled trust to this exact tool call, so a
+/// confirmed automation may perform its consequential publish step unattended.
+#[tokio::test]
+async fn trusted_scheduled_session_executes_consequential_click_without_prompt() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "click",
+                "selector": "#publish",
+                "_session_id": "scheduled-worker",
+                "_trusted_session": true
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out, "Clicked element '#publish'");
+    assert_eq!(recorder.count().await, 0);
+    assert!(
+        calls_contains(&backend, &MockCall::Click("#publish".to_string())).await,
+        "the scheduled publish action should reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn trusted_scheduled_session_still_prompts_for_arbitrary_javascript() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+    let out = tool
+        .call(
+            &json!({
+                "action": "execute_js",
+                "script": "document.body.remove()",
+                "_session_id": "scheduled-worker",
+                "_trusted_session": true
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(out.to_lowercase().contains("denied"), "{out}");
+    assert_eq!(recorder.count().await, 1);
+    assert!(
+        !calls_contains(
+            &backend,
+            &MockCall::Evaluate("document.body.remove()".to_string())
+        )
+        .await
+    );
+}
+
+/// DENY: a denying responder blocks an ordinary mutation before the backend is
+/// touched.
+#[tokio::test]
+async fn approval_deny_blocks_ordinary_mutation_before_backend() {
     let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
         .call(
-            &json!({ "action": "navigate", "url": "https://evil.example/", "_session_id": "sess-a" })
-                .to_string(),
+            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
         )
         .await
         .unwrap();
 
     assert!(
         out.to_lowercase().contains("denied"),
-        "denied navigate must report denial: {out}"
+        "denied mutation must report denial: {out}"
     );
     // The denied action must NOT have touched the backend at all.
     let calls = backend.calls();
@@ -1853,9 +1940,9 @@ async fn approval_deny_blocks_navigation_before_backend() {
     assert!(
         !calls.iter().any(|c| matches!(
             c,
-            MockCall::Goto(_) | MockCall::CreatePage(_) | MockCall::EnsureReady
+            MockCall::Click(_) | MockCall::CreatePage(_) | MockCall::EnsureReady
         )),
-        "a denied navigation must never reach the backend: {calls:?}"
+        "a denied mutation must never reach the backend: {calls:?}"
     );
 }
 
@@ -1901,8 +1988,7 @@ async fn approval_timeout_denies_without_backend() {
     let start = std::time::Instant::now();
     let out = tool
         .call(
-            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
-                .to_string(),
+            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
         )
         .await
         .unwrap();
@@ -1928,8 +2014,8 @@ async fn approval_timeout_denies_without_backend() {
     let calls = backend.calls();
     let calls = calls.lock().await;
     assert!(
-        !calls.iter().any(|c| matches!(c, MockCall::Goto(_))),
-        "a timed-out navigation must never reach the backend: {calls:?}"
+        !calls.iter().any(|c| matches!(c, MockCall::Click(_))),
+        "a timed-out mutation must never reach the backend: {calls:?}"
     );
 }
 
@@ -1940,7 +2026,7 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
     // `no_channel_tool` constructs the tool with NO approval channel.
     let (tool, backend, _rx) = no_channel_tool(MockBackend::new());
 
-    // A navigation requires approval → fail safe to Deny, no backend.
+    // Public navigation is read-only and remains available without a channel.
     let nav = tool
         .call(
             &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
@@ -1949,12 +2035,32 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
         .await
         .unwrap();
     assert!(
-        nav.to_lowercase().contains("approval") || nav.to_lowercase().contains("denied"),
-        "navigate must be denied with no channel: {nav}"
+        nav.starts_with("Navigated to"),
+        "public navigation must run without an approval channel: {nav}"
     );
     assert!(
-        backend.calls().lock().await.is_empty(),
-        "a denied navigation must not touch the backend with no channel"
+        calls_contains(
+            &backend,
+            &MockCall::Goto("https://example.com/".to_string())
+        )
+        .await,
+        "public navigation must reach the backend"
+    );
+
+    // A mutation still requires approval and fails closed without a channel.
+    let mutation = tool
+        .call(
+            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mutation.to_lowercase().contains("approval") || mutation.to_lowercase().contains("denied"),
+        "mutation must be denied with no channel: {mutation}"
+    );
+    assert!(
+        !calls_contains(&backend, &MockCall::Click("#menu".to_string())).await,
+        "denied mutation must not reach the backend"
     );
 
     // An observation (get_text) is free — it runs without a channel.
@@ -2010,49 +2116,45 @@ async fn observations_never_prompt() {
     );
 }
 
-/// SESSION-LEVEL REUSE: AllowSession on the first navigation suppresses the
-/// prompt for a SECOND navigation in the same session (one prompt total), yet
+/// SESSION-LEVEL REUSE: AllowSession on the first ordinary mutation suppresses
+/// the prompt for a second ordinary mutation in the same session, yet
 /// both reach the backend.
 #[tokio::test]
-async fn session_approval_suppresses_second_navigation_prompt() {
+async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
     tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
     )
     .await
     .unwrap();
-    assert_eq!(recorder.count().await, 1, "first navigation must prompt");
+    assert_eq!(recorder.count().await, 1, "first mutation must prompt");
 
     tool.call(
-        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-a" })
-            .to_string(),
+        &json!({ "action": "click", "selector": "#details", "_session_id": "sess-a" }).to_string(),
     )
     .await
     .unwrap();
     assert_eq!(
         recorder.count().await,
         1,
-        "second navigation in an approved session must NOT prompt again"
+        "second ordinary mutation in an approved session must NOT prompt again"
     );
 
-    // Both navigations reached the backend.
+    // Both mutations reached the backend.
     assert!(
-        calls_contains(&backend, &MockCall::Goto("https://a.example/".to_string())).await
-            && calls_contains(&backend, &MockCall::Goto("https://b.example/".to_string())).await,
-        "both navigations must reach the backend"
+        calls_contains(&backend, &MockCall::Click("#menu".to_string())).await
+            && calls_contains(&backend, &MockCall::Click("#details".to_string())).await,
+        "both mutations must reach the backend"
     );
 }
 
-/// PERSISTENT REUSE: an origin granted with AllowAlways is shared across
-/// internal agent sessions, which is required when a specialist tests a site
-/// and the parent agent later opens the same deployment URL.
+/// Public navigation is approval-free across origins and internal agent
+/// sessions; no persistent origin grant is needed.
 #[tokio::test]
-async fn persistent_navigation_origin_crosses_agent_sessions() {
-    let (tool, backend, recorder) =
-        approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
+async fn public_navigation_is_free_across_origins_and_agent_sessions() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     tool.call(
         &json!({
@@ -2067,7 +2169,7 @@ async fn persistent_navigation_origin_crosses_agent_sessions() {
     tool.call(
         &json!({
             "action": "navigate",
-            "url": "https://site.example/second?secret=two",
+            "url": "https://different.example/second?secret=two",
             "_session_id": "parent-session"
         })
         .to_string(),
@@ -2077,30 +2179,22 @@ async fn persistent_navigation_origin_crosses_agent_sessions() {
 
     assert_eq!(
         recorder.count().await,
-        1,
-        "the same approved origin must not prompt again across agent sessions"
+        0,
+        "public navigation must not prompt across origins or agent sessions"
     );
     assert!(
         calls_contains(
             &backend,
-            &MockCall::Goto("https://site.example/second?secret=two".to_string())
+            &MockCall::Goto("https://different.example/second?secret=two".to_string())
         )
         .await
     );
 }
 
 #[tokio::test]
-async fn persistent_navigation_origin_survives_tool_restart() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-
-    let (mut first, _backend, first_recorder) =
-        approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
-    first.approval_pool = Some(pool.clone());
-    first.initialize_persistent_approvals().await.unwrap();
+async fn public_navigation_needs_no_persistent_grant_after_tool_restart() {
+    let (first, _backend, first_recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::Deny);
     first
         .call(
             &json!({
@@ -2112,12 +2206,10 @@ async fn persistent_navigation_origin_survives_tool_restart() {
         )
         .await
         .unwrap();
-    assert_eq!(first_recorder.count().await, 1);
+    assert_eq!(first_recorder.count().await, 0);
 
-    let (mut restarted, backend, restarted_recorder) =
+    let (restarted, backend, restarted_recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::Deny);
-    restarted.approval_pool = Some(pool);
-    restarted.initialize_persistent_approvals().await.unwrap();
     let out = restarted
         .call(
             &json!({
@@ -2251,16 +2343,25 @@ async fn execute_js_prompt_uses_origin_cached_after_navigation() {
 }
 
 /// POINT-OF-ACTION: a consequential click prompts even after a prior ordinary
-/// (navigation) AllowSession marked the session approved.
+/// mutation received session approval.
 #[tokio::test]
 async fn consequential_click_prompts_despite_session_approval() {
     let (tool, _backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
-    // Ordinary navigation marks the session approved (one prompt).
+    // Public navigation is read-only and does not prompt or grant mutation
+    // authority.
     tool.call(
         &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
             .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 0);
+
+    // An ordinary mutation receives reusable session approval.
+    tool.call(
+        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
     )
     .await
     .unwrap();
@@ -2320,22 +2421,20 @@ async fn consequential_fill_prompt_hides_value() {
     );
 }
 
-/// ALLOW_ONCE on ordinary navigation must NOT mark the session approved: a
-/// second ordinary navigation prompts again.
+/// ALLOW_ONCE on an ordinary mutation must NOT mark the session approved: a
+/// second ordinary mutation prompts again.
 #[tokio::test]
 async fn allow_once_does_not_persist_session_approval() {
     let (tool, _backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
 
     tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
     )
     .await
     .unwrap();
     tool.call(
-        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-a" })
-            .to_string(),
+        &json!({ "action": "click", "selector": "#details", "_session_id": "sess-a" }).to_string(),
     )
     .await
     .unwrap();
@@ -2343,7 +2442,7 @@ async fn allow_once_does_not_persist_session_approval() {
     assert_eq!(
         recorder.count().await,
         2,
-        "AllowOnce must not persist session approval — each navigation prompts"
+        "AllowOnce must not persist session approval — each mutation prompts"
     );
 }
 
@@ -2461,7 +2560,8 @@ async fn navigate_redirect_to_public_is_allowed() {
 /// is itself a private/link-local target, and names only the host class.
 #[tokio::test]
 async fn navigate_to_metadata_endpoint_is_blocked_preflight() {
-    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
     let out = tool
         .call(
@@ -2490,12 +2590,19 @@ async fn navigate_to_metadata_endpoint_is_blocked_preflight() {
         !calls.iter().any(|c| matches!(c, MockCall::Goto(_))),
         "a pre-flight-blocked navigation must never goto: {calls:?}"
     );
+    drop(calls);
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "blocked navigation must fail directly without requesting approval"
+    );
 }
 
 /// `new_tab` with a private URL is blocked pre-flight (host class only).
 #[tokio::test]
 async fn new_tab_to_private_url_is_blocked() {
-    let (tool, _backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    let (tool, _backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
     let out = tool
         .call(
@@ -2516,6 +2623,11 @@ async fn new_tab_to_private_url_is_blocked() {
     assert!(
         !out.contains("10.0.0.5") && !out.contains("secret"),
         "new_tab block error must not leak the URL/query: {out}"
+    );
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "blocked new-tab navigation must fail without requesting approval"
     );
 }
 

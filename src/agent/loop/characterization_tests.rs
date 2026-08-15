@@ -328,6 +328,10 @@ impl Tool for BackgroundDetachTool {
             },
         })
     }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::PROCESS_STATE)
+    }
 }
 
 struct MockRemoteMutationTool;
@@ -830,7 +834,15 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
         MockProvider::text_response("This model text should be ignored."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "change",
+        true,
+        false,
+        &["process_state"],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
@@ -1282,7 +1294,15 @@ async fn guided_model_forces_required_only_after_concrete_no_tool_deferral() {
         MockProvider::text_response("I'll run the command now."),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Command inspection completed."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -1312,12 +1332,20 @@ async fn guided_model_forces_required_only_after_concrete_no_tool_deferral() {
 }
 
 #[tokio::test]
-async fn autonomous_model_never_forces_required_after_concrete_no_tool_deferral() {
+async fn autonomous_model_gets_one_required_evidence_pass_for_execution_obligation() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll run the command now."),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Command inspection completed."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_test_agent_with_models(provider, "gpt-5-codex", "gpt-5-codex")
         .await
@@ -1336,18 +1364,13 @@ async fn autonomous_model_never_forces_required_after_concrete_no_tool_deferral(
         .await
         .unwrap();
 
-    assert_eq!(reply, "I'll run the command now.");
+    assert_eq!(reply, "Command inspection completed.");
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        1,
-        "autonomous models must not be bounced by language-only deferral heuristics"
-    );
     assert!(
         call_log
             .iter()
-            .all(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
-        "autonomous models must remain on model-directed tool choice"
+            .any(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
+        "typed execution obligations require one evidence pass regardless of model tier"
     );
 }
 
@@ -1414,9 +1437,14 @@ async fn planner_refined_observation_contract_requires_execution_until_observed(
 #[tokio::test]
 async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation() {
     let url = "https://example.com/status";
-    let mut provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            r#"{
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("update_remote", &json!({"url": url}).to_string()),
+        MockProvider::tool_call_response("check_remote", &json!({"url": url}).to_string()),
+        MockProvider::text_response("Remote status updated."),
+    ])
+    .with_task_assessments(vec![MockProvider::text_response(
+        r#"{
+                "schema_version": 2,
                 "goal": "Update remote status",
                 "steps": [],
                 "success_criteria": [],
@@ -1425,28 +1453,34 @@ async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation()
                     "task_kind": "check",
                     "expects_mutation": false,
                     "requires_observation": true,
+                    "required_effects": [],
                     "mutation_scope": "read_only",
                     "forbidden_actions": [],
-                    "constraint_evidence": ["change locally but don't deploy"]
+                    "constraint_evidence": ["change locally but don't deploy"],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "project_reference": null
                 },
                 "task_shape": {
                     "execution_mode": "inline",
                     "confidence": "high",
                     "independent_workstreams": 1,
-                    "requires_background_continuation": false
+                    "requires_background_continuation": false,
+                    "request_relationship": "new_request",
+                    "semantic_scope": "external_remote"
                 }
             }"#,
-        ),
-        MockProvider::tool_call_response("update_remote", &json!({"url": url}).to_string()),
-        MockProvider::text_response("Remote status updated."),
-    ]);
-    provider.skip_planning_calls = false;
+    )]);
     let calls = Arc::new(AtomicUsize::new(0));
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
-        vec![Arc::new(CountingRemoteMutationTool {
-            calls: calls.clone(),
-        }) as Arc<dyn Tool>],
+        vec![
+            Arc::new(CountingRemoteMutationTool {
+                calls: calls.clone(),
+            }) as Arc<dyn Tool>,
+            Arc::new(MockRemoteObservationTool) as Arc<dyn Tool>,
+        ],
     )
     .await
     .unwrap();

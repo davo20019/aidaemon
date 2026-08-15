@@ -240,6 +240,14 @@ fn user_visible_side_effect_guard_blocks_tool(tool_name: &str, is_side_effecting
 }
 
 fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCall) -> bool {
+    // Delegation tools are opaque nested execution boundaries. If the current
+    // typed contract forbids an operation, prose inside a mission cannot prove
+    // that a delegate will avoid it. Fail closed until the child handoff has a
+    // typed operation/effect contract of its own.
+    if matches!(tc.name.as_str(), "spawn_agent" | "cli_agent") {
+        return true;
+    }
+
     let normalized_name = tc.name.replace(['_', '-'], " ").to_ascii_lowercase();
     let command = if matches!(tc.name.as_str(), "terminal" | "run_command") {
         serde_json::from_str::<Value>(&tc.arguments)
@@ -253,64 +261,12 @@ fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCal
     } else {
         String::new()
     };
-    let delegated_instructions = if matches!(tc.name.as_str(), "spawn_agent" | "cli_agent") {
-        serde_json::from_str::<Value>(&tc.arguments)
-            .ok()
-            .and_then(|args| args.as_object().cloned())
-            .map(|args| {
-                [
-                    "mission",
-                    "task",
-                    "prompt",
-                    "command",
-                    "description",
-                    "system_instruction",
-                ]
-                .iter()
-                .filter_map(|key| args.get(*key).and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-            })
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    } else {
-        String::new()
-    };
-
     let name_has = |keyword: &str| contains_keyword_as_words(&normalized_name, keyword);
     let command_effects = if command.is_empty() {
         crate::traits::ToolMutationEffects::NONE
     } else {
         crate::tools::command_semantics::classify_shell_command(&command).mutation_effects
     };
-    let delegated_requests = |keyword: &str| {
-        let text = delegated_instructions.trim();
-        if text.is_empty()
-            || [
-                format!("do not {keyword}"),
-                format!("don't {keyword}"),
-                format!("without {keyword}"),
-                format!("how to {keyword}"),
-                format!("whether to {keyword}"),
-            ]
-            .iter()
-            .any(|phrase| contains_keyword_as_words(text, phrase))
-        {
-            return false;
-        }
-        text.lines()
-            .any(|line| line.trim_start().starts_with(&format!("{keyword} ")))
-            || [
-                format!(" and {keyword}"),
-                format!(" then {keyword}"),
-                format!(" to {keyword}"),
-                format!(" please {keyword}"),
-                format!(" must {keyword}"),
-            ]
-            .iter()
-            .any(|phrase| text.contains(phrase))
-    };
-
     match action {
         ForbiddenMutationAction::Create => {
             matches!(tc.name.as_str(), "write_file")
@@ -319,22 +275,15 @@ fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCal
                     crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE
                         .union(crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE),
                 )
-                || ["create", "write", "build", "make", "generate"]
-                    .iter()
-                    .any(|keyword| delegated_requests(keyword))
         }
         ForbiddenMutationAction::Delete => {
             name_has("delete")
                 || name_has("remove")
                 || command_effects.intersects(crate::traits::ToolMutationEffects::DESTRUCTIVE)
-                || ["delete", "remove"]
-                    .iter()
-                    .any(|keyword| delegated_requests(keyword))
         }
         ForbiddenMutationAction::Deploy => {
             name_has("deploy")
                 || command_effects.intersects(crate::traits::ToolMutationEffects::REMOTE_DEPLOY)
-                || delegated_requests("deploy")
         }
         ForbiddenMutationAction::Publish => {
             name_has("publish")
@@ -343,7 +292,6 @@ fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCal
                         .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
                         .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
                 )
-                || delegated_requests("publish")
         }
         ForbiddenMutationAction::Post => {
             name_has("post")
@@ -351,12 +299,10 @@ fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCal
                     crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY
                         .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
                 )
-                || delegated_requests("post")
         }
         ForbiddenMutationAction::Send => {
             name_has("send")
                 || command_effects.intersects(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
-                || delegated_requests("send")
         }
     }
 }
@@ -1895,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_restriction_follows_delegated_work_without_disabling_other_work() {
+    fn scoped_restriction_fails_closed_across_opaque_delegation() {
         let contract = CompletionContract {
             expects_mutation: true,
             forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
@@ -1905,18 +1851,28 @@ mod tests {
             "spawn_agent",
             r#"{"mission":"Build the site","task":"Create and test the site locally"}"#,
         );
-        let deploy = tool_call(
+        let apparently_safe = tool_call(
             "spawn_agent",
-            r#"{"mission":"Ship the site","task":"Deploy the site and return its URL"}"#,
+            r#"{"mission":"Build locally","task":"Do not deploy; only run local tests"}"#,
+        );
+        let cli = tool_call(
+            "cli_agent",
+            r#"{"mission":"Inspect the project without deploying it"}"#,
         );
 
         assert_eq!(
-            negative_contract_block_reason(&contract, &build, true),
-            None
+            negative_contract_block_reason(&contract, &build, true).as_deref(),
+            Some("deploy")
         );
         assert_eq!(
-            negative_contract_block_reason(&contract, &deploy, true).as_deref(),
-            Some("deploy")
+            negative_contract_block_reason(&contract, &apparently_safe, false).as_deref(),
+            Some("deploy"),
+            "mission prose cannot prove that an opaque delegate respects the contract"
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &cli, false).as_deref(),
+            Some("deploy"),
+            "all opaque delegation paths require a typed child effect contract"
         );
 
         let turn = TurnContext {

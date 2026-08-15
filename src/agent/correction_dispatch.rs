@@ -17,8 +17,8 @@ use crate::agent::correction_execution::{
 };
 use crate::agent::correction_sandbox::CorrectionSubjectContext;
 use crate::agent::{spawn_background_task_lead, Agent};
-use crate::channels::ChannelHub;
 use crate::config::SelfCorrectionConfig;
+use crate::runtime_ports::OutboundRouter;
 use crate::traits::{Goal, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
@@ -160,7 +160,7 @@ const CORRECTION_REMEDIATION_SESSION: &str = "internal:self-correction";
 pub async fn dispatch_correction_remediation(
     agent: Arc<Agent>,
     state: Arc<dyn StateStore>,
-    hub: Option<Weak<ChannelHub>>,
+    hub: Option<Weak<dyn OutboundRouter>>,
     config: &SelfCorrectionConfig,
     subject: CorrectionSubjectContext,
     remediation_prompt: String,

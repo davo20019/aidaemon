@@ -16,6 +16,18 @@ pub struct GoalTokenBudgetStatus {
 pub struct ScheduledRunHealth {
     pub evidence_gain_count: usize,
     pub total_successful_tool_calls: usize,
+    /// The finalized completion contract requires at least one mutation.
+    #[serde(default)]
+    pub completion_requires_mutation: bool,
+    /// At least one successful mutation receipt matches a required effect.
+    #[serde(default)]
+    pub required_mutation_progress: bool,
+    /// The finalized completion contract requires result verification.
+    #[serde(default)]
+    pub completion_requires_observation: bool,
+    /// A verification receipt matched the task's target.
+    #[serde(default)]
+    pub verification_progress: bool,
     pub stall_count: usize,
     pub consecutive_same_tool_count: usize,
     pub consecutive_same_tool_unique_args: usize,
@@ -293,6 +305,34 @@ pub struct Task {
 }
 
 impl Task {
+    /// Parse the compatibility JSON projection into typed dependency IDs.
+    /// Durable scheduling also stores normalized edges; this method is the
+    /// shared validation boundary for callers and migration compatibility.
+    pub fn dependency_ids(&self) -> Result<Vec<String>, String> {
+        let Some(raw) = self.depends_on.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let ids = serde_json::from_str::<Vec<String>>(raw).map_err(|error| {
+            format!("task {} has invalid dependency metadata: {error}", self.id)
+        })?;
+        let mut unique = std::collections::BTreeSet::new();
+        for id in &ids {
+            if id.trim().is_empty() {
+                return Err(format!("task {} has an empty dependency ID", self.id));
+            }
+            if id == &self.id {
+                return Err(format!("task {} cannot depend on itself", self.id));
+            }
+            if !unique.insert(id.clone()) {
+                return Err(format!(
+                    "task {} lists dependency {} more than once",
+                    self.id, id
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
     /// SQLite contains legacy task rows whose optional error field is an empty
     /// string instead of NULL. Treat blank error text as absent everywhere task
     /// success is evaluated.
@@ -320,6 +360,38 @@ impl Task {
     /// replacement means it must not poison the run's terminal outcome.
     pub fn satisfies_run_completion(&self) -> bool {
         self.completed_successfully() || matches!(self.status.as_str(), "skipped" | "superseded")
+    }
+}
+
+pub(crate) fn task_execution_graph(
+    tasks: &[Task],
+) -> Result<crate::execution_graph::ExecutionGraph, String> {
+    let nodes = tasks
+        .iter()
+        .map(|task| {
+            Ok(crate::execution_graph::ExecutionTaskNode {
+                id: task.id.clone(),
+                status: task.status.clone(),
+                dependency_ids: task.dependency_ids()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::execution_graph::ExecutionGraph::from_task_nodes(&nodes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiredAttemptRecovery {
+    Requeue,
+    RequireVerification,
+}
+
+impl ExpiredAttemptRecovery {
+    pub(crate) fn classify(idempotent: bool, retry_count: i32, max_retries: i32) -> Self {
+        if idempotent && retry_count < max_retries {
+            Self::Requeue
+        } else {
+            Self::RequireVerification
+        }
     }
 }
 
@@ -616,6 +688,9 @@ pub struct NotificationEntry {
 }
 
 impl NotificationEntry {
+    pub const DEFAULT_QUIET_HOURS_START: u32 = 22;
+    pub const DEFAULT_QUIET_HOURS_END: u32 = 7;
+
     /// Create a new notification entry.
     pub fn new(goal_id: &str, session_id: &str, notification_type: &str, message: &str) -> Self {
         let now = chrono::Utc::now();
@@ -659,5 +734,52 @@ impl NotificationEntry {
         self.task_id = Some(task_id.to_string());
         self.action_token = Some(uuid::Uuid::new_v4().to_string());
         self
+    }
+
+    /// Whether this notification represents a condition that genuinely needs
+    /// immediate owner attention instead of routine autonomous handling.
+    pub fn interrupts_quiet_hours(&self) -> bool {
+        matches!(
+            self.notification_type.as_str(),
+            "mandate_ask" | "mandate_reconciliation_required" | "escalation" | "node_monitor_alert"
+        )
+    }
+
+    pub fn should_deliver_at_local_hour(&self, hour: u32) -> bool {
+        Self::routine_delivery_allowed_at_local_hour(hour) || self.interrupts_quiet_hours()
+    }
+
+    pub fn routine_delivery_allowed_at_local_hour(hour: u32) -> bool {
+        (Self::DEFAULT_QUIET_HOURS_END..Self::DEFAULT_QUIET_HOURS_START).contains(&hour)
+    }
+}
+
+#[cfg(test)]
+mod notification_attention_tests {
+    use super::NotificationEntry;
+
+    #[test]
+    fn recoverable_failures_wait_during_quiet_hours() {
+        let failed = NotificationEntry::new("goal", "session", "failed", "retry exhausted");
+        assert!(!failed.should_deliver_at_local_hour(2));
+        assert!(failed.should_deliver_at_local_hour(9));
+    }
+
+    #[test]
+    fn owner_action_requests_interrupt_quiet_hours() {
+        for kind in [
+            "mandate_ask",
+            "mandate_reconciliation_required",
+            "escalation",
+        ] {
+            let entry = NotificationEntry::new("goal", "session", kind, "owner action needed");
+            assert!(entry.should_deliver_at_local_hour(2));
+        }
+    }
+
+    #[test]
+    fn token_pressure_is_recoverable_not_an_owner_interrupt() {
+        let entry = NotificationEntry::new("goal", "session", "token_alert", "adapt budget");
+        assert!(!entry.should_deliver_at_local_hour(2));
     }
 }

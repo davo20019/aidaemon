@@ -5,9 +5,9 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use super::formatting::format_number;
-use crate::agent::Agent;
 use crate::config::AppConfig;
-use crate::tasks::TaskRegistry;
+use crate::runtime_ports::ChannelAgentRuntime;
+use crate::tasks::{TaskRegistry, TaskStatus};
 use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
 use crate::types::UserRole;
 
@@ -128,7 +128,7 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
 /// Shared command dispatcher for commands that behave identically across
 /// Telegram, Slack, and Discord channels.
 pub(crate) struct CommandContext {
-    pub agent: Arc<Agent>,
+    pub agent: Arc<dyn ChannelAgentRuntime>,
     pub state: Arc<dyn StateStore>,
     pub task_registry: Arc<TaskRegistry>,
     pub config_path: PathBuf,
@@ -334,9 +334,15 @@ impl CommandContext {
     }
 
     async fn handle_tasks(&self, session_id: &str) -> String {
-        let entries = self.task_registry.list_for_session(session_id).await;
+        let entries = self
+            .task_registry
+            .list_for_session(session_id)
+            .await
+            .into_iter()
+            .filter(|entry| !matches!(entry.status, TaskStatus::Completed))
+            .collect::<Vec<_>>();
         if entries.is_empty() {
-            "No tasks found.".to_string()
+            "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string()
         } else {
             let lines: Vec<String> = entries
                 .iter()
@@ -354,7 +360,10 @@ impl CommandContext {
                     format!("#{} [{}] {} ({})", e.id, e.status, e.description, elapsed)
                 })
                 .collect();
-            lines.join("\n")
+            format!(
+                "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
+                lines.join("\n")
+            )
         }
     }
 

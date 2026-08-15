@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::traits::{
     Mandate, MandateAuthorityGrant, MandateDecisionCycle, MandateDecisionOutcome,
     MandateMutationTarget, MandateOperationKind, MandateOperationScope, MandateStatus,
-    ToolCallEffect, ToolCallSemantics, ToolMutationEffects, ToolTargetHintKind,
+    MandateWakeSignal, ToolCallEffect, ToolCallSemantics, ToolMutationEffects, ToolTargetHintKind,
 };
 
 const ACTION_DIGEST_DOMAIN: &[u8] = b"aidaemon.mandate.action.v1\0";
@@ -596,10 +596,9 @@ fn operation_scope_matches(
     }
     if targets.is_empty()
         || targets.iter().any(|target| {
-            !scope
-                .target_prefixes
-                .iter()
-                .any(|prefix| target_is_within_scope(target, prefix))
+            !scope.target_prefixes.iter().any(|prefix| {
+                target_is_within_operation_scope(target, prefix, &scope.allowed_query_params)
+            })
         })
     {
         return false;
@@ -617,6 +616,41 @@ fn operation_scope_matches(
                 .iter()
                 .any(|target| target.kind == "resource_id" && target.value == *required)
         })
+}
+
+/// Match a content-free external signal to an already-confirmed observation
+/// tuple. This is a wake optimization only: the subsequent review still has
+/// to pass the ordinary mandate gate for every observation and mutation.
+pub(crate) fn mandate_accepts_wake_signal(mandate: &Mandate, signal: &MandateWakeSignal) -> bool {
+    if !mandate.autonomy_mode.is_autopilot()
+        || !mandate.is_active()
+        || !mandate.authority.allow_observations
+        || signal.validate().is_err()
+    {
+        return false;
+    }
+    let target = CanonicalTarget {
+        kind: "url",
+        value: signal.target_url.clone(),
+    };
+    mandate.authority.operation_scopes.iter().any(|scope| {
+        if scope.kind != MandateOperationKind::Observation
+            || !scope.target_prefixes.iter().any(|prefix| {
+                target_is_within_operation_scope(&target, prefix, &scope.allowed_query_params)
+            })
+        {
+            return false;
+        }
+        let required_account = scope
+            .target_prefixes
+            .iter()
+            .find(|prefix| prefix.starts_with("account:"));
+        match (required_account, signal.account_id.as_deref()) {
+            (Some(required), Some(actual)) => required == actual,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    })
 }
 
 /// Derive the content-safe audit fields persisted with a mutation reservation.
@@ -730,7 +764,28 @@ fn target_is_within_scope(target: &CanonicalTarget, raw_scope: &str) -> bool {
     }
 }
 
+fn target_is_within_operation_scope(
+    target: &CanonicalTarget,
+    raw_scope: &str,
+    allowed_query_params: &[String],
+) -> bool {
+    match target.kind {
+        "url" => {
+            url_is_within_scope_with_query_params(&target.value, raw_scope, allowed_query_params)
+        }
+        _ => target_is_within_scope(target, raw_scope),
+    }
+}
+
 fn url_is_within_scope(raw_target: &str, raw_scope: &str) -> bool {
+    url_is_within_scope_with_query_params(raw_target, raw_scope, &[])
+}
+
+fn url_is_within_scope_with_query_params(
+    raw_target: &str,
+    raw_scope: &str,
+    allowed_query_params: &[String],
+) -> bool {
     let Ok(target) = reqwest::Url::parse(raw_target) else {
         return false;
     };
@@ -772,9 +827,21 @@ fn url_is_within_scope(raw_target: &str, raw_scope: &str) -> bool {
         return false;
     }
 
-    // Query data is outbound data. It must be owner-pinned exactly instead of
-    // inheriting authority from a queryless path scope.
-    scope.query() == target.query()
+    // Query data is outbound data. An embedded scope query remains exact. A
+    // queryless scope can authorize dynamic values only for parameter names
+    // explicitly confirmed in the same non-combinable operation tuple.
+    if scope.query().is_some() {
+        return scope.query() == target.query();
+    }
+    let Some(_) = target.query() else {
+        return true;
+    };
+    !allowed_query_params.is_empty()
+        && target.query_pairs().all(|(name, _)| {
+            allowed_query_params
+                .iter()
+                .any(|allowed| allowed == name.as_ref())
+        })
 }
 
 fn target_kind_name(kind: ToolTargetHintKind) -> &'static str {
@@ -2160,6 +2227,7 @@ mod tests {
                 operation: ToolCallOperation::Get,
                 kind: MandateOperationKind::Observation,
                 target_prefixes: vec!["https://blog.aidaemon.ai/posts/".to_string()],
+                allowed_query_params: Vec::new(),
                 mutation_effects: Vec::new(),
             },
             MandateOperationScope {
@@ -2171,6 +2239,7 @@ mod tests {
                     "auth_profile:twitter".to_string(),
                     "account:12345".to_string(),
                 ],
+                allowed_query_params: Vec::new(),
                 mutation_effects: vec![
                     "remote_mutation".to_string(),
                     "external_delivery".to_string(),
@@ -2241,6 +2310,57 @@ mod tests {
             ),
             MandateAuthorityDecision::Allow(_)
         ));
+    }
+
+    #[test]
+    fn operation_scope_authorizes_only_explicit_dynamic_query_parameter_names() {
+        let scope = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec![
+                "https://api.x.com/2/tweets/search/recent".to_string(),
+                "auth_profile:twitter".to_string(),
+                "account:12345".to_string(),
+            ],
+            allowed_query_params: vec!["query".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        let mut mandate = mandate();
+        mandate.authority = MandateAuthority::from_operation_scopes(true, vec![scope], 0, 0, 0);
+
+        let semantics = |url: &str| {
+            ToolCallSemantics::observation()
+                .with_operation(ToolCallOperation::Get)
+                .with_target_hint(ToolTargetHintKind::Url, url)
+                .with_target_hint(ToolTargetHintKind::ResourceId, "auth_profile:twitter")
+                .with_target_hint(ToolTargetHintKind::ResourceId, "account:12345")
+        };
+        assert_eq!(
+            authorize_mandate_observation(
+                &mandate,
+                "http_request",
+                r#"{"method":"GET","url":"https://api.x.com/2/tweets/search/recent","auth_profile":"twitter","account_id":"12345","query_params":{"query":"from:synthetic_account"}}"#,
+                &semantics(
+                    "https://api.x.com/2/tweets/search/recent?query=from%3Asynthetic_account"
+                ),
+                &now(),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            authorize_mandate_observation(
+                &mandate,
+                "http_request",
+                r#"{"method":"GET","url":"https://api.x.com/2/tweets/search/recent","auth_profile":"twitter","account_id":"12345","query_params":{"query":"from:synthetic_account","max_results":"25"}}"#,
+                &semantics(
+                    "https://api.x.com/2/tweets/search/recent?query=from%3Asynthetic_account&max_results=25"
+                ),
+                &now(),
+            ),
+            Err(MandateAuthorityDenial::OperationNotAllowed)
+        );
     }
 
     #[test]

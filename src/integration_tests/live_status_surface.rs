@@ -109,7 +109,6 @@ mod live_status_surface_tests {
             vec![channel.clone() as Arc<dyn Channel>],
             session_map,
         ));
-
         let sink = HubSurfaceSink::new(hub, "telegram:synthetic-user-1".to_string());
         let sink_ref: &dyn SurfaceSink = &sink;
 
@@ -176,6 +175,7 @@ mod live_status_surface_tests {
             vec![channel.clone() as Arc<dyn Channel>],
             session_map,
         ));
+        let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
 
         // The delivered handoff reply registered its message id ("m1").
         hub.register_background_status_surface("telegram:synthetic-user-1", "m1")
@@ -183,7 +183,7 @@ mod live_status_surface_tests {
 
         let ping = "⏳ Background step finished in 1m 3s. Preparing your result now…";
         crate::tools::terminal::deliver_background_completion_ping(
-            Some(&hub),
+            Some(&outbound),
             None,
             "telegram:synthetic-user-1",
             "goal-1",
@@ -206,7 +206,7 @@ mod live_status_surface_tests {
         // background command whose handoff was never registered) falls back
         // to a fresh message.
         crate::tools::terminal::deliver_background_completion_ping(
-            Some(&hub),
+            Some(&outbound),
             None,
             "telegram:synthetic-user-1",
             "goal-1",

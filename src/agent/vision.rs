@@ -203,30 +203,7 @@ pub fn format_tool_observation_label(tool_name: &str, result_hint: &str) -> Stri
 
 /// Extract plain text from OpenAI-style string or multimodal content.
 pub fn content_value_as_text(content: &Value) -> Option<String> {
-    match content {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(blocks) => {
-            let parts: Vec<String> = blocks
-                .iter()
-                .filter_map(|block| {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        block
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
+    crate::message_content::content_value_as_text(content)
 }
 
 /// Whether a rendered user message matches the current turn's user text.

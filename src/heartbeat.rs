@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::agent::{build_goal_task_results_summary, is_group_session, Agent};
-use crate::channels::ChannelHub;
 use crate::goal_tokens::GoalTokenRegistry;
+use crate::runtime_ports::OutboundRouter;
 use crate::traits::{GoalSchedule, Mandate, MandateStatus, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
@@ -415,7 +415,7 @@ pub struct HeartbeatCoordinator {
     semaphore: Arc<Semaphore>,
     tick_interval: Duration,
     wake_rx: mpsc::Receiver<()>,
-    hub: Option<Weak<ChannelHub>>,
+    hub: Option<Weak<dyn OutboundRouter>>,
     goal_token_registry: Option<GoalTokenRegistry>,
     telemetry: Option<Arc<HeartbeatTelemetry>>,
     agent: Option<Weak<Agent>>,
@@ -433,7 +433,7 @@ impl HeartbeatCoordinator {
         tick_interval_secs: u64,
         max_concurrent: usize,
         wake_rx: mpsc::Receiver<()>,
-        hub: Option<Weak<ChannelHub>>,
+        hub: Option<Weak<dyn OutboundRouter>>,
         goal_token_registry: Option<GoalTokenRegistry>,
         telemetry: Option<Arc<HeartbeatTelemetry>>,
     ) -> Self {
@@ -460,7 +460,7 @@ impl HeartbeatCoordinator {
     }
 
     /// Set the hub reference (deferred, since hub is created after heartbeat).
-    pub fn set_hub(&mut self, hub: Weak<ChannelHub>) {
+    pub fn set_hub(&mut self, hub: Weak<dyn OutboundRouter>) {
         self.hub = Some(hub);
     }
 
@@ -922,17 +922,21 @@ impl HeartbeatCoordinator {
                     continue;
                 }
             };
+            let graph = match crate::traits::task_execution_graph(&tasks) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    error!(goal_id = %goal.id, %error, "Invalid task dependency graph; leaving tasks unclaimed");
+                    continue;
+                }
+            };
             let by_id: std::collections::HashMap<&str, &crate::traits::Task> =
                 tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
             for task in tasks.iter().filter(|t| t.status == "pending") {
-                let Some(deps_json) = task.depends_on.as_deref() else {
-                    continue;
-                };
-                let deps: Vec<String> = serde_json::from_str(deps_json).unwrap_or_default();
-                let Some(failed_dep) = deps
+                let Some(failed_dep) = graph
+                    .unresolved_dependencies(&task.id)
                     .iter()
-                    .filter_map(|dep_id| by_id.get(dep_id.as_str()))
+                    .filter_map(|dependency| by_id.get(dependency.id.as_str()))
                     .find(|dep| terminal_failed(&dep.status))
                 else {
                     continue;
@@ -1819,7 +1823,9 @@ impl HeartbeatCoordinator {
 
     /// Process the notification queue: attempt delivery, track attempts.
     async fn process_notification_queue(&self) {
-        let pending = match self.state.get_pending_notifications(20).await {
+        // Read past the normal delivery batch so quiet-hour routine entries at
+        // the front of the queue cannot hide a later owner-action request.
+        let pending = match self.state.get_pending_notifications(100).await {
             Ok(n) => n,
             Err(e) => {
                 error!(error = %e, "Failed to get pending notifications");
@@ -1827,7 +1833,22 @@ impl HeartbeatCoordinator {
             }
         };
 
+        let mut delivery_attempts = 0usize;
         for entry in &pending {
+            let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+            if !entry.should_deliver_at_local_hour(local_hour) {
+                tracing::debug!(
+                    notification_id = %entry.id,
+                    notification_type = %entry.notification_type,
+                    local_hour,
+                    "Deferring recoverable notification during quiet hours"
+                );
+                continue;
+            }
+            if delivery_attempts >= 20 {
+                break;
+            }
+            delivery_attempts = delivery_attempts.saturating_add(1);
             if entry.notification_type == "escalation" {
                 if let Some(task_id) = entry.task_id.as_deref() {
                     // Give the coordinator a brief chance to reconcile the
@@ -1892,6 +1913,50 @@ impl HeartbeatCoordinator {
             };
 
             if delivered {
+                if entry.notification_type == "mandate_ask" {
+                    if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
+                        // Queue delivery is the crash/retry path and bypasses
+                        // `deliver_parent_text_result`, so persist the visible
+                        // notice before installing its typed dialogue binding.
+                        if let Err(error) = agent
+                            .record_auxiliary_assistant_note(&entry.session_id, &entry.message)
+                            .await
+                        {
+                            warn!(
+                                notification_id = %entry.id,
+                                %error,
+                                "Failed to record delivered mandate ASK in owner history"
+                            );
+                        }
+                        match self.state.get_mandate_for_goal(&entry.goal_id).await {
+                            Ok(Some(mandate)) if mandate.status == MandateStatus::AwaitingInput => {
+                                if let Err(error) = agent
+                                    .record_mandate_owner_input_context(
+                                        &entry.session_id,
+                                        &mandate.id,
+                                        mandate.version,
+                                        entry.action_token.as_deref().unwrap_or(&entry.id),
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        mandate_id = %mandate.id,
+                                        notification_id = %entry.id,
+                                        %error,
+                                        "Failed to bind queued mandate ASK to owner dialogue state"
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn!(
+                                goal_id = %entry.goal_id,
+                                notification_id = %entry.id,
+                                %error,
+                                "Failed to load mandate after delivering queued ASK"
+                            ),
+                        }
+                    }
+                }
                 if let Err(e) = self.state.mark_notification_delivered(&entry.id).await {
                     error!(notification_id = %entry.id, error = %e, "Failed to mark notification delivered");
                 }
@@ -2339,8 +2404,21 @@ impl HeartbeatCoordinator {
         // goal deadlocks across the day boundary (it would defer forever and never
         // fire, so its counter would never reset).
         let budget_today = now.date_naive().to_string();
+        let effective_daily_budget = if let Some(configured_budget) = goal.budget_daily {
+            crate::goal_tokens::load_goal_daily_budget_override(
+                self.state.as_ref(),
+                &goal.id,
+                configured_budget,
+                crate::agent::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+            )
+            .await
+            .map(|value| value.budget_daily)
+            .or(Some(configured_budget))
+        } else {
+            None
+        };
         if daily_budget_exhausted(
-            goal.budget_daily,
+            effective_daily_budget,
             goal.tokens_used_today,
             &goal.tokens_used_day,
             &budget_today,
@@ -2357,10 +2435,11 @@ impl HeartbeatCoordinator {
             let _ = self.state.update_goal_schedule(&schedule).await;
             let msg = format!(
                 "Skipped the scheduled run for \"{}\" because today's daily token budget \
-                 ({}) is exhausted. No work was started. The schedule remains active and \
+                 ({}) is exhausted by cumulative usage across this goal's runs today, not by \
+                 this unstarted run alone. No work was started. The schedule remains active and \
                  will try again at its next normal fire after the counter resets.",
                 crate::tools::sanitize::short_goal_label(&goal.description),
-                goal.budget_daily.unwrap_or_default(),
+                effective_daily_budget.unwrap_or_default(),
             );
             let entry = crate::traits::NotificationEntry::new(
                 &goal.id,
@@ -2378,14 +2457,13 @@ impl HeartbeatCoordinator {
             return Ok(());
         }
         if !daily_budget_has_run_capacity(
-            goal.budget_daily,
+            effective_daily_budget,
             goal.budget_per_check,
             goal.tokens_used_today,
             &goal.tokens_used_day,
             &budget_today,
         ) {
-            let remaining = goal
-                .budget_daily
+            let remaining = effective_daily_budget
                 .unwrap_or_default()
                 .saturating_sub(goal.tokens_used_today)
                 .max(0);
@@ -2643,14 +2721,17 @@ impl HeartbeatCoordinator {
         // the task lead's progress heartbeat can edit it in place — one self-
         // updating message instead of a separate announcement + progress stream.
         let mut running_surface_id: Option<String> = None;
-        if !is_group_session(&goal.session_id) {
+        let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+        if !is_group_session(&goal.session_id)
+            && crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour)
+        {
             if let Some(hub_weak) = &self.hub {
                 if let Some(hub_arc) = hub_weak.upgrade() {
                     let short_desc = crate::tools::sanitize::short_goal_label(&goal.description);
                     running_surface_id = hub_arc
                         .send_text_tracked(
                             &goal.session_id,
-                            &format!("🔄 Running scheduled task: {}", short_desc),
+                            &format!("⏳ **Scheduled run in progress**\n\n{}", short_desc),
                         )
                         .await
                         .ok()
@@ -3280,7 +3361,7 @@ mod tests {
 
     async fn reminder_test_setup() -> (
         Arc<dyn StateStore>,
-        Arc<ChannelHub>,
+        Arc<crate::channels::ChannelHub>,
         Arc<crate::testing::TestChannel>,
         HeartbeatCoordinator,
         tempfile::NamedTempFile,
@@ -3302,16 +3383,17 @@ mod tests {
         let session_map: crate::channels::SessionMap = Arc::new(tokio::sync::RwLock::new(
             HashMap::from([("test_session".to_string(), "test".to_string())]),
         ));
-        let hub = Arc::new(ChannelHub::new(
+        let hub = Arc::new(crate::channels::ChannelHub::new(
             vec![channel.clone() as Arc<dyn crate::traits::Channel>],
             session_map,
         ));
+        let outbound: Arc<dyn OutboundRouter> = hub.clone();
         let coordinator = HeartbeatCoordinator::new(
             state.clone(),
             1,
             3,
             wake_rx,
-            Some(Arc::downgrade(&hub)),
+            Some(Arc::downgrade(&outbound)),
             None,
             None,
         );
@@ -3420,8 +3502,14 @@ mod tests {
         // Non-reminder goals keep the normal pipeline: a task is created and
         // the user is told the scheduled task is running.
         let msgs = channel.messages_for("test_session").await;
-        assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].starts_with("🔄 Running scheduled task:"));
+        let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+        if crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour) {
+            assert_eq!(msgs.len(), 1);
+            assert!(msgs[0].starts_with("⏳ **Scheduled run in progress**"));
+            assert!(msgs[0].contains("Check the deploy status"));
+        } else {
+            assert!(msgs.is_empty(), "routine progress must respect quiet hours");
+        }
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         // No agent wired in this test, so the task stays pending for the
@@ -4693,6 +4781,15 @@ mod tests {
             completed_at: None,
         };
         state.create_task(&pending).await.unwrap();
+        let run = state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .expect("task creation should bind both children to one implicit run");
+        state
+            .finish_goal_run(&run.id, "failed", Some("synthetic closed run"))
+            .await
+            .unwrap();
 
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
         let coordinator =

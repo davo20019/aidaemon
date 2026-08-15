@@ -1066,6 +1066,10 @@ struct IdempotencyProbeTool {
     calls: Arc<AtomicUsize>,
 }
 
+struct ReconciledIdempotencyProbeTool {
+    calls: Arc<AtomicUsize>,
+}
+
 #[async_trait::async_trait]
 impl crate::traits::Tool for IdempotencyProbeTool {
     fn name(&self) -> &str {
@@ -1108,6 +1112,75 @@ impl crate::traits::Tool for IdempotencyProbeTool {
             crate::traits::ToolMutationEffects::CONFIGURATION,
         )
         .with_target_hint(crate::traits::ToolTargetHintKind::ResourceId, value)
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("mutation applied".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for ReconciledIdempotencyProbeTool {
+    fn name(&self) -> &str {
+        "reconciled_idempotency_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only mutation whose exact postcondition can be reconciled"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": self.name(),
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": { "value": { "type": "string" } },
+                "required": ["value"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        let value = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::CONFIGURATION,
+        )
+        .with_target_hint(crate::traits::ToolTargetHintKind::ResourceId, value)
+    }
+
+    async fn durable_replay_decision(
+        &self,
+        _arguments: &str,
+    ) -> crate::traits::DurableReplayDecision {
+        if self.calls.load(Ordering::SeqCst) == 1 {
+            crate::traits::DurableReplayDecision::Reexecute {
+                reason: "the exact postcondition disappeared after the first successful call"
+                    .to_string(),
+            }
+        } else {
+            crate::traits::DurableReplayDecision::Replay
+        }
     }
 
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
@@ -1193,6 +1266,67 @@ async fn test_duplicate_mutation_replays_durable_receipt_without_second_side_eff
             .is_ok_and(|decision| {
                 decision.decision_type
                     == crate::events::DecisionType::IdempotencyReceiptReplayed
+            })
+    }));
+}
+
+#[tokio::test]
+async fn test_missing_postcondition_invalidates_receipt_and_reexecutes_exact_mutation() {
+    let args = r#"{"value":"same-operation"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("reconciled_idempotency_probe", args),
+        MockProvider::text_response(
+            r#"{"goal":"Restore one test postcondition","success_criteria":["The postcondition exists"],"first_action":{"tool":"reconciled_idempotency_probe","target":"same-operation","description":"Restore the postcondition"},"requires_verification":false,"risky_actions":[]}"#,
+        ),
+        MockProvider::tool_call_response("reconciled_idempotency_probe", args),
+        MockProvider::text_response("The missing postcondition was restored."),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReconciledIdempotencyProbeTool {
+            calls: calls.clone(),
+        })],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "idempotency_receipt_invalidation",
+            "Restore the missing probe postcondition.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "The missing postcondition was restored.");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the exact mutation should rerun after its postcondition disappears"
+    );
+    let decisions = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "idempotency_receipt_invalidation",
+            &[crate::events::EventType::DecisionPoint],
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(decisions.iter().any(|event| {
+        event
+            .parse_data::<crate::events::DecisionPointData>()
+            .is_ok_and(|decision| {
+                decision.decision_type
+                    == crate::events::DecisionType::IdempotencyReceiptInvalidated
             })
     }));
 }

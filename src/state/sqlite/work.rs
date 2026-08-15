@@ -458,10 +458,11 @@ impl WorkCoordinationStore for SqliteStateStore {
 
         let unmet = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)
-             FROM json_each(COALESCE((SELECT depends_on FROM tasks WHERE id = ?), '[]')) dep
-             WHERE NOT EXISTS (
+             FROM task_dependencies dep
+             WHERE dep.task_id = ?
+               AND NOT EXISTS (
                 SELECT 1 FROM tasks d
-                WHERE d.id = CAST(dep.value AS TEXT)
+                WHERE d.id = dep.depends_on_task_id
                   AND d.goal_run_id = ?
                   AND d.status IN ('completed', 'skipped', 'superseded')
              )",
@@ -936,12 +937,14 @@ impl WorkCoordinationStore for SqliteStateStore {
                 .get::<Option<String>, _>("current_attempt_id")
                 .as_deref()
                 == Some(attempt_id.as_str());
-            let retryable = row.get::<i64, _>("idempotent") != 0
-                && row.get::<i64, _>("retry_count") < row.get::<i64, _>("max_retries");
-            let attempt_status = if retryable {
-                "expired"
-            } else {
-                "needs_verification"
+            let recovery = crate::traits::ExpiredAttemptRecovery::classify(
+                row.get::<i64, _>("idempotent") != 0,
+                row.get::<i64, _>("retry_count") as i32,
+                row.get::<i64, _>("max_retries") as i32,
+            );
+            let attempt_status = match recovery {
+                crate::traits::ExpiredAttemptRecovery::Requeue => "expired",
+                crate::traits::ExpiredAttemptRecovery::RequireVerification => "needs_verification",
             };
             let expired = sqlx::query(
                 "UPDATE task_attempts
@@ -964,7 +967,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             .execute(&mut *tx)
             .await?;
             if is_current {
-                if retryable {
+                if recovery == crate::traits::ExpiredAttemptRecovery::Requeue {
                     sqlx::query(
                         "UPDATE tasks
                          SET status = 'pending', current_attempt_id = NULL, agent_id = NULL,
@@ -1001,10 +1004,13 @@ impl WorkCoordinationStore for SqliteStateStore {
                 }
                 affected.push(task_id.clone());
             }
-            let body = if retryable {
-                "Worker lease expired; task re-queued because the task is retryable."
-            } else {
-                "Worker lease expired; task requires human verification before another attempt."
+            let body = match recovery {
+                crate::traits::ExpiredAttemptRecovery::Requeue => {
+                    "Worker lease expired; task re-queued because the task is retryable."
+                }
+                crate::traits::ExpiredAttemptRecovery::RequireVerification => {
+                    "Worker lease expired; task requires human verification before another attempt."
+                }
             };
             let journal = TaskJournalEntry::new(
                 &project_id,
@@ -1558,10 +1564,11 @@ impl WorkCoordinationStore for SqliteStateStore {
                 SELECT t.id, t.goal_id, t.goal_run_id,
                     CASE
                         WHEN t.status = 'pending' AND EXISTS (
-                            SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) dep
-                            WHERE NOT EXISTS (
+                            SELECT 1 FROM task_dependencies dep
+                            WHERE dep.task_id = t.id
+                              AND NOT EXISTS (
                                 SELECT 1 FROM tasks d
-                                WHERE d.id = CAST(dep.value AS TEXT)
+                                WHERE d.id = dep.depends_on_task_id
                                   AND d.goal_run_id = t.goal_run_id
                                   AND d.status IN ('completed', 'skipped', 'superseded')
                             )
@@ -1660,10 +1667,11 @@ impl WorkCoordinationStore for SqliteStateStore {
                        wp.name AS worker_profile, a.worker_instance_id, a.lease_expires_at,
                        CASE
                            WHEN t.status = 'pending' AND EXISTS (
-                               SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) dep
-                               WHERE NOT EXISTS (
+                               SELECT 1 FROM task_dependencies dep
+                               WHERE dep.task_id = t.id
+                                 AND NOT EXISTS (
                                    SELECT 1 FROM tasks d
-                                   WHERE d.id = CAST(dep.value AS TEXT)
+                                   WHERE d.id = dep.depends_on_task_id
                                      AND d.goal_run_id = t.goal_run_id
                                      AND d.status IN ('completed', 'skipped', 'superseded')
                                )
@@ -1883,6 +1891,44 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn normalized_dependency_edges_are_atomic_and_reject_cycles() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_finite("dependency graph", "session-a");
+        store.create_goal(&goal).await.unwrap();
+        let first = task(&goal.id, "first", None);
+        let second = task(&goal.id, "second", Some(vec![first.id.clone()]));
+        store.create_task(&first).await.unwrap();
+        store.create_task(&second).await.unwrap();
+
+        let edge_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?",
+        )
+        .bind(&second.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(edge_count, 1);
+
+        let mut cyclic = first.clone();
+        cyclic.depends_on = Some(serde_json::json!([second.id]).to_string());
+        let error = store.update_task(&cyclic).await.unwrap_err();
+        assert!(error.to_string().contains("task dependency cycle"));
+
+        let unchanged = store.get_task(&first.id).await.unwrap().unwrap();
+        assert!(unchanged.depends_on.is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?",
+            )
+            .bind(&first.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -134,45 +134,48 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         model.clone(),
     );
 
-    let agent = Agent::new(
+    let agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
         model,
-        "You are a helpful assistant. Use terminal commands to gather information when asked."
-            .to_string(),
+        system_prompt:
+            "You are a helpful assistant. Use terminal commands to gather information when asked."
+                .to_string(),
         config_path,
-        skills_dir.path().to_path_buf(),
-        3,
-        50,
-        100,
-        8000,
-        30,
-        20,
-        None,
-        IterationLimitConfig::Unlimited,
-        None,
-        None,
-        None,
-        None,
-        None, // goal_token_registry
-        None, // hub
-        true, // record_decision_points
-        crate::config::ContextWindowConfig {
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: None,
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
 
     let channel = Arc::new(TestChannel::new());
     let mut map = HashMap::new();
@@ -333,44 +336,46 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         model.clone(),
     );
 
-    let agent = Agent::new(
+    let agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
         model,
-        system_prompt.to_string(),
+        system_prompt: system_prompt.to_string(),
         config_path,
-        skills_dir.path().to_path_buf(),
-        3,
-        50,
-        100,
-        8000,
-        30,
-        20,
-        None,
-        IterationLimitConfig::Unlimited,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        true,
-        crate::config::ContextWindowConfig {
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: None,
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
 
     let channel = Arc::new(TestChannel::new());
     let mut map = HashMap::new();

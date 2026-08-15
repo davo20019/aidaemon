@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,7 +5,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -214,6 +212,10 @@ struct ActionArgs<'a> {
     script: Option<&'a str>,
     tab_id: Option<&'a str>,
     session_id: &'a str,
+    /// Runtime-injected proof that this call belongs to owner-confirmed
+    /// scheduled automation. The dispatcher strips model-supplied underscore
+    /// fields before setting this flag, so callers cannot self-authorize.
+    trusted_session: bool,
 }
 
 /// Reduce a full URL to its origin (`scheme://host[:port]`), dropping any
@@ -270,23 +272,6 @@ fn redact_url_for_display(url: &str) -> String {
     let url = url.trim();
     let cut = url.find(['?', '#']).unwrap_or(url.len());
     url[..cut].to_string()
-}
-
-/// Return the canonical public HTTP(S) origin eligible for a durable browser
-/// navigation grant. Grants never cover paths, queries, local files, or private
-/// network targets.
-fn durable_navigation_origin(action: &str, url: Option<&str>) -> Option<String> {
-    if !matches!(action, "navigate" | "new_tab") {
-        return None;
-    }
-    let url = url?;
-    policy::validate_network_url(url).ok()?;
-    let parsed = reqwest::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    let origin = parsed.origin().ascii_serialization();
-    (origin != "null").then_some(origin)
 }
 
 /// User-facing description of a browser action for approval prompts.
@@ -473,10 +458,6 @@ pub struct BrowserTool {
     action_timeout: Duration,
     /// Console logs and network load failures, scoped per session/tab.
     diagnostics: BrowserDiagnosticsStore,
-    /// Durable, origin-scoped navigation grants selected with "Allow Always".
-    /// Per-session mutation approval deliberately remains separate.
-    approval_pool: Option<SqlitePool>,
-    allowed_navigation_origins: tokio::sync::RwLock<HashSet<String>>,
 }
 
 /// Upper bound on the element-poll timeout, mirroring `BrowserConfig`'s
@@ -532,7 +513,6 @@ impl BrowserTool {
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
         inbox_dir: impl Into<PathBuf>,
-        approval_pool: Option<SqlitePool>,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -561,38 +541,7 @@ impl BrowserTool {
             element_timeout,
             action_timeout,
             diagnostics: BrowserDiagnosticsStore::new(),
-            approval_pool,
-            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         })
-    }
-
-    /// Create and hydrate the durable navigation-approval store before the
-    /// browser becomes available to agents.
-    pub async fn initialize_persistent_approvals(&self) -> Result<(), String> {
-        let Some(pool) = &self.approval_pool else {
-            return Ok(());
-        };
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS browser_allowed_navigation_origins (
-                origin TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(|error| format!("failed to initialize browser approvals: {error}"))?;
-
-        let persisted = sqlx::query_scalar::<_, String>(
-            "SELECT origin FROM browser_allowed_navigation_origins",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|error| format!("failed to load browser approvals: {error}"))?;
-        self.allowed_navigation_origins
-            .write()
-            .await
-            .extend(persisted);
-        Ok(())
     }
 
     /// Test-only constructor that injects an arbitrary backend (e.g. the mock)
@@ -614,8 +563,6 @@ impl BrowserTool {
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
             diagnostics: BrowserDiagnosticsStore::new(),
-            approval_pool: None,
-            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -640,8 +587,6 @@ impl BrowserTool {
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
             diagnostics: BrowserDiagnosticsStore::new(),
-            approval_pool: None,
-            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -762,34 +707,6 @@ impl BrowserTool {
         }
     }
 
-    async fn navigation_origin_is_allowed(&self, origin: Option<&str>) -> bool {
-        let Some(origin) = origin else {
-            return false;
-        };
-        self.allowed_navigation_origins
-            .read()
-            .await
-            .contains(origin)
-    }
-
-    async fn remember_navigation_origin(&self, origin: &str) {
-        if let Some(pool) = &self.approval_pool {
-            if let Err(error) = sqlx::query(
-                "INSERT OR IGNORE INTO browser_allowed_navigation_origins (origin) VALUES (?)",
-            )
-            .bind(origin)
-            .execute(pool)
-            .await
-            {
-                warn!(%error, "Failed to persist browser navigation approval");
-            }
-        }
-        self.allowed_navigation_origins
-            .write()
-            .await
-            .insert(origin.to_string());
-    }
-
     /// The approval gate. Runs BEFORE any backend/page method is touched, so a
     /// denied action can never reach the browser. Returns [`GateDecision::Allow`]
     /// only when the action is permitted.
@@ -798,45 +715,48 @@ impl BrowserTool {
     /// - `Observation` (get_text/inspect_page/screenshot/wait/list_tabs): never prompt.
     /// - `Administrative` (close/close_tab/set_mode): never prompt — local
     ///   lifecycle / mode switch, not a consequential web side effect.
-    /// - `sensitive || consequential` (every `execute_js`, plus consequential
-    ///   click/fill): point-of-action — ALWAYS prompt, every call, regardless of
-    ///   any prior session approval. A non-Deny response allows ONLY this single
-    ///   action and NEVER records persistent/session approval.
-    /// - Public HTTP(S) `navigate`/`new_tab`: may be approved persistently for
-    ///   that exact origin. The grant crosses agent/session boundaries and is
-    ///   restored after restart.
-    /// - Other navigation / ordinary mutation: session-level only. Allowed
-    ///   without a prompt once the session is approved; otherwise prompt.
+    /// - `sensitive` (`execute_js`): point-of-action — ALWAYS prompt, every call,
+    ///   regardless of scheduled or session authority.
+    /// - Consequential click/fill is point-of-action for interactive sessions,
+    ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
+    ///   issued call without waking the owner.
+    /// - `Navigation` (`navigate`/`new_tab`/`switch_tab`): never prompt. Public
+    ///   HTTP(S) targets are validated against network/private-host policy before
+    ///   this gate, while tab-only operations have no external side effect.
+    /// - Ordinary mutation: session-level only. Allowed without a prompt once
+    ///   the session is approved; otherwise prompt.
     /// - Missing approval channel + an action that needs approval → fail safe to
-    ///   Deny (observations/administrative still run).
+    ///   Deny (observations/navigation/administrative still run).
     async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
         let action = args.action;
         let session_id = args.session_id;
         let risk = policy::classify(action, args.selector, args.script);
 
-        // Free actions: never prompt.
+        // Free actions: never prompt. Navigation reaches this point only after
+        // its requested URL has passed the shared public-network preflight in
+        // `run_action`; switching/opening an empty tab is local browser state.
         if matches!(
             risk.class,
-            BrowserRiskClass::Observation | BrowserRiskClass::Administrative
+            BrowserRiskClass::Observation
+                | BrowserRiskClass::Navigation
+                | BrowserRiskClass::Administrative
         ) {
             return GateDecision::Allow;
         }
 
         let point_of_action = risk.sensitive || risk.consequential;
-        let durable_origin = durable_navigation_origin(action, args.url);
 
-        // "Allow Always" navigation grants are origin-scoped, not tied to the
-        // internal agent session that happened to request them.
-        if !point_of_action
-            && self
-                .navigation_origin_is_allowed(durable_origin.as_deref())
-                .await
-        {
+        // The scheduler already carries durable owner confirmation, and the
+        // common dispatcher injects this bit only for the exact call after
+        // stripping model-supplied internal fields. Apply that authority
+        // consistently to navigation and click/fill mutations. Arbitrary JS
+        // remains sensitive and always requires a live owner decision.
+        if args.trusted_session && !risk.sensitive {
             return GateDecision::Allow;
         }
 
         // Session-level fast path: an already-approved session skips the prompt
-        // for ordinary navigation/mutation — but NEVER for point-of-action.
+        // for ordinary mutation — but NEVER for point-of-action.
         if !point_of_action && self.sessions.is_session_approved(session_id).await {
             return GateDecision::Allow;
         }
@@ -876,13 +796,9 @@ impl BrowserTool {
                 warnings,
                 session_id,
                 point_of_action,
-                // Only origin-scoped navigation has real durable semantics.
-                // All other reusable browser approval is honestly session-only.
-                if durable_origin.is_some() {
-                    PermissionMode::Default
-                } else {
-                    PermissionMode::Cautious
-                },
+                // Browser mutations have no safe durable scope; reusable
+                // approval is honestly limited to the current session.
+                PermissionMode::Cautious,
             )
             .await;
 
@@ -897,7 +813,7 @@ impl BrowserTool {
             Some(ApprovalResponse::AllowSession) => {
                 // Point-of-action approvals NEVER persist: each consequential
                 // action / execute_js must be approved on its own. Only ordinary
-                // navigation/mutation marks the session approved.
+                // mutation marks the session approved.
                 if !point_of_action {
                     self.sessions.mark_session_approved(session_id).await;
                 }
@@ -905,9 +821,6 @@ impl BrowserTool {
             }
             Some(ApprovalResponse::AllowAlways) => {
                 if !point_of_action {
-                    if let Some(origin) = durable_origin {
-                        self.remember_navigation_origin(&origin).await;
-                    }
                     self.sessions.mark_session_approved(session_id).await;
                 }
                 GateDecision::Allow
@@ -2170,6 +2083,27 @@ impl BrowserTool {
             }
         }
 
+        // Validate navigation before the approval gate. Public read-only
+        // navigation is approval-free, while private, local, malformed, and
+        // unsupported targets fail closed without first asking the user to
+        // approve an action that cannot run.
+        if matches!(action, "navigate" | "new_tab") {
+            let url = args.get("url").and_then(|v| v.as_str());
+            if action == "navigate" && url.is_none() {
+                return Ok(DispatchResult::text_only(
+                    "Error: Missing required parameter: url".to_string(),
+                ));
+            }
+            if let Some(url) = url {
+                if let Err(blocked) = policy::validate_network_url(url) {
+                    return Ok(DispatchResult::text_only(format!(
+                        "Error: {}",
+                        blocked.message()
+                    )));
+                }
+            }
+        }
+
         let action_args = ActionArgs {
             action,
             url: args.get("url").and_then(|v| v.as_str()),
@@ -2177,6 +2111,10 @@ impl BrowserTool {
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
             session_id,
+            trusted_session: args
+                .get("_trusted_session")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
             warn!(action, "Browser action blocked by approval gate");
@@ -2200,7 +2138,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a persistent browser for navigation, forms, screenshots, PDF rendering, page inspection, tabs, logs, and headless/visible modes. Prefer inspect_page for research. execute_js runs arbitrary JavaScript and always requires one-time approval. Use only opaque tab IDs returned by the tool."
+        "Control a persistent browser for JavaScript/login-required pages and interactive website tasks. For readable public research, prefer web_search/web_fetch; use browser when those cannot access the content. Validated public navigation and read-only inspection do not require approval; page mutations may require approval, and execute_js always requires one-time approval. Use only opaque tab IDs returned by the tool."
     }
 
     fn schema(&self) -> Value {
@@ -2372,7 +2310,21 @@ fn browser_call_semantics(
         Some("click") => {
             let risk = policy::classify("click", Some(selector), None);
             if risk.consequential {
-                ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
+                let lower = selector.to_ascii_lowercase();
+                let mut effects = ToolMutationEffects::REMOTE_MUTATION;
+                if ["deploy", "release", "go live"]
+                    .iter()
+                    .any(|keyword| lower.contains(keyword))
+                {
+                    effects = effects.union(ToolMutationEffects::REMOTE_DEPLOY);
+                }
+                if ["publish", "post", "tweet", "upload", "send", "submit"]
+                    .iter()
+                    .any(|keyword| lower.contains(keyword))
+                {
+                    effects = effects.union(ToolMutationEffects::EXTERNAL_DELIVERY);
+                }
+                ToolCallSemantics::mutation_with(effects)
             } else {
                 ToolCallSemantics::observation()
             }

@@ -81,18 +81,25 @@ impl Router {
         out
     }
 
-    pub fn select(&self, _tier: Tier) -> &str {
-        &self.models.default_model
+    pub fn select(&self, tier: Tier) -> &str {
+        match tier {
+            Tier::Fast => nonempty_or(&self.models.fast, &self.models.default_model),
+            Tier::Primary => &self.models.default_model,
+            Tier::Smart => nonempty_or(&self.models.smart, &self.models.default_model),
+        }
     }
 
     /// Profile mapping on top of default+fallback:
-    /// All profiles use the default model. Cost savings for Cheap come from
-    /// reduced tool_budget and context_budget, not from switching to a weaker
-    /// model. The open-source default policy auto-routing floors at Balanced;
-    /// Cheap remains available as an explicit lower-budget preset. Fallback
-    /// models are reserved for error-recovery cascades only.
-    pub fn select_for_profile(&self, _profile: ModelProfile) -> &str {
-        &self.models.default_model
+    /// Cheap uses the configured fast model, Balanced uses the canonical
+    /// default, and Strong uses the configured smart model. Deployments that
+    /// prefer one model can keep all three keys equal; deployments that provide
+    /// distinct models now receive real cost/capability adaptation.
+    pub fn select_for_profile(&self, profile: ModelProfile) -> &str {
+        match profile {
+            ModelProfile::Cheap => self.select(Tier::Fast),
+            ModelProfile::Balanced => self.select(Tier::Primary),
+            ModelProfile::Strong => self.select(Tier::Smart),
+        }
     }
 
     /// Returns true when there are no distinct fallback models.
@@ -101,6 +108,14 @@ impl Router {
             .fallback_models
             .iter()
             .all(|m| m == &self.models.default_model)
+    }
+}
+
+fn nonempty_or<'a>(candidate: &'a str, fallback: &'a str) -> &'a str {
+    if candidate.trim().is_empty() {
+        fallback
+    } else {
+        candidate
     }
 }
 
@@ -151,22 +166,17 @@ mod tests {
             smart: "smart-model".to_string(),
         };
         let router = Router::new(models);
-        // All tiers and profiles now use the default model; fallbacks are
-        // reserved for error-recovery cascades only.
-        assert_eq!(router.select(Tier::Fast), "primary-model");
+        assert_eq!(router.select(Tier::Fast), "fast-model");
         assert_eq!(router.select(Tier::Primary), "primary-model");
-        assert_eq!(router.select(Tier::Smart), "primary-model");
-        assert_eq!(
-            router.select_for_profile(ModelProfile::Cheap),
-            "primary-model"
-        );
+        assert_eq!(router.select(Tier::Smart), "smart-model");
+        assert_eq!(router.select_for_profile(ModelProfile::Cheap), "fast-model");
         assert_eq!(
             router.select_for_profile(ModelProfile::Balanced),
             "primary-model"
         );
         assert_eq!(
             router.select_for_profile(ModelProfile::Strong),
-            "primary-model"
+            "smart-model"
         );
         assert_eq!(
             router.all_models_ordered(),

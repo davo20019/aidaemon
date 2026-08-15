@@ -3,6 +3,49 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Permission persistence mode for commands requiring owner approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Safe/Medium/High persist; Critical remains session-scoped.
+    #[default]
+    Default,
+    /// All approvals remain session-scoped.
+    Cautious,
+    /// All approvals persist, including Critical.
+    Yolo,
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermissionMode::Default => write!(f, "default"),
+            PermissionMode::Cautious => write!(f, "cautious"),
+            PermissionMode::Yolo => write!(f, "yolo"),
+        }
+    }
+}
+
+/// Relative impact of an operation requiring approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RiskLevel {
+    Safe,
+    Medium,
+    High,
+    Critical,
+}
+
+impl std::fmt::Display for RiskLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RiskLevel::Safe => write!(f, "Safe"),
+            RiskLevel::Medium => write!(f, "Medium"),
+            RiskLevel::High => write!(f, "High"),
+            RiskLevel::Critical => write!(f, "Critical"),
+        }
+    }
+}
+
 /// Least-privilege access granted to one collaborator for one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -303,6 +346,18 @@ pub enum ApprovalKind {
     CommandOnce,
     /// Scheduled-goal confirmation (Confirm / Cancel).
     GoalConfirmation,
+    /// Exact owner confirmation for a persisted Autopilot mandate policy.
+    /// Kept distinct so channels never infer high-autonomy presentation from
+    /// user or model prose.
+    AutopilotConfirmation,
+}
+
+/// Typed presentation requested for an exact goal/mandate confirmation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoalConfirmationStyle {
+    #[default]
+    Standard,
+    Autopilot,
 }
 
 /// Response to an approval request from the user.
@@ -328,6 +383,10 @@ pub enum StatusUpdate {
     ToolStart { name: String, summary: String },
     /// Streaming output chunk from a tool (e.g., CLI agent progress).
     ToolProgress { name: String, chunk: String },
+    /// A tool is paused until the user completes an explicit action, such as
+    /// authorizing an OAuth connection in their browser. Unlike ordinary tool
+    /// progress, channels must deliver this immediately and without truncation.
+    UserActionRequired { message: String },
     /// Tool execution completed with a brief summary.
     ToolComplete { name: String, summary: String },
     /// Tool can be cancelled with the given task_id.
@@ -394,6 +453,36 @@ pub enum StatusUpdate {
     /// Replaces the separate checklist message previously posted by
     /// `track_requirements` directly through the hub.
     Checklist { text: String },
+}
+
+impl StatusUpdate {
+    /// Whether a channel must deliver this update immediately instead of
+    /// treating it as optional, rate-limited progress.
+    pub fn requires_immediate_delivery(&self) -> bool {
+        matches!(
+            self,
+            Self::UserActionRequired { .. } | Self::BudgetExtended { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod status_update_tests {
+    use super::StatusUpdate;
+
+    #[test]
+    fn url_in_ordinary_progress_does_not_force_chat_delivery() {
+        let progress = StatusUpdate::ToolProgress {
+            name: "agent delegation".to_string(),
+            chunk: "Checking https://blog.example.test/posts/example/".to_string(),
+        };
+        assert!(!progress.requires_immediate_delivery());
+
+        let action = StatusUpdate::UserActionRequired {
+            message: "[Authorize](https://auth.example.test/)".to_string(),
+        };
+        assert!(action.requires_immediate_delivery());
+    }
 }
 
 /// The kind of media being sent.

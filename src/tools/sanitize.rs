@@ -667,6 +667,39 @@ fn shorten_home_dir_with(text: &str, home: &str) -> String {
     text.replace(&format!("{}/", home), "~/")
 }
 
+static UUID_IDENTIFIER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+        .expect("valid UUID identifier regex")
+});
+
+/// Extract exact UUID-shaped control-plane identifiers from internal tool
+/// evidence. Matching is structural; callers do not infer identifiers from
+/// labels such as "task", "run", or "schedule".
+pub fn extract_uuid_identifiers(text: &str) -> Vec<String> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    for found in UUID_IDENTIFIER.find_iter(text).take(128) {
+        identifiers.insert(found.as_str().to_ascii_lowercase());
+    }
+    identifiers.into_iter().collect()
+}
+
+/// Remove complete lines that expose one of the exact internal identifiers.
+/// This is a last-resort fallback after the model has already received one
+/// chance to restate the outcome naturally.
+pub fn remove_lines_with_identifiers(text: &str, identifiers: &[String]) -> String {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            !identifiers
+                .iter()
+                .any(|identifier| lower.contains(identifier))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 /// Maximum length of a user-facing status-ping summary (characters, not bytes).
 const STATUS_SUMMARY_MAX_CHARS: usize = 80;
 
@@ -2129,5 +2162,30 @@ mod tests {
         // Degenerate home values never rewrite anything.
         assert_eq!(shorten_home_dir_with("ls /tmp", "/"), "ls /tmp");
         assert_eq!(shorten_home_dir_with("ls /tmp", ""), "ls /tmp");
+    }
+
+    #[test]
+    fn internal_identifier_extraction_is_structural_and_deduplicated() {
+        let first = "265636d3-b6e3-424a-839e-daebbf031067";
+        let second = "34453851-0ad1-4707-b527-736a497196c5";
+        let found = extract_uuid_identifiers(&format!(
+            "goal {first}\nrun {second}\nagain {first}\nnot-an-id task-pending"
+        ));
+
+        assert_eq!(found, vec![first.to_string(), second.to_string()]);
+    }
+
+    #[test]
+    fn identifier_line_filter_preserves_the_natural_outcome() {
+        let id = "34453851-0ad1-4707-b527-736a497196c5".to_string();
+        let reply = format!(
+            "I started the existing daily blog run.\n\n- Manual run: {id}\n- Status: pending\n\nI'll report when it finishes."
+        );
+
+        let filtered = remove_lines_with_identifiers(&reply, &[id]);
+
+        assert!(filtered.contains("started the existing daily blog run"));
+        assert!(!filtered.contains("Manual run"));
+        assert!(filtered.contains("I'll report when it finishes"));
     }
 }

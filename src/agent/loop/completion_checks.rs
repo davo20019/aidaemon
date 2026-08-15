@@ -619,14 +619,48 @@ pub(super) async fn latest_task_tool_result_for_completion(
 
 pub(super) fn should_enforce_no_tool_text_when_tools_required(
     reply: &str,
-    guided_tool_recovery: bool,
-    attempted_tool_calls: usize,
+    execution_recovery_required: bool,
+    execution_evidence_count: usize,
     depth: usize,
 ) -> bool {
-    if depth != 0 || !guided_tool_recovery || attempted_tool_calls > 0 {
+    if depth != 0 || !execution_recovery_required || execution_evidence_count > 0 {
         return false;
     }
-    !reply.trim().is_empty()
+    reply_reports_unresolved_execution(reply) || looks_like_deferred_action_response(reply)
+}
+
+/// Detect a model-authored terminal limitation for an execution obligation.
+/// This is a language feature rather than a success decision: it can trigger
+/// one evidence-seeking pass, but it can never prove success or unsupported
+/// capability by itself.
+fn reply_reports_unresolved_execution(reply: &str) -> bool {
+    let normalized = reply
+        .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'")
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.is_empty() || claims_unqualified_success(&normalized) {
+        return false;
+    }
+    reply_admits_unfulfilled_request(&normalized)
+        || [
+            "i can't",
+            "i cannot",
+            "i couldn't",
+            "i could not",
+            "i'm unable",
+            "i am unable",
+            "not able to",
+            "not supported",
+            "unsupported",
+            "not available",
+            "unavailable",
+            "doesn't expose",
+            "does not expose",
+            "isn't exposed",
+            "is not exposed",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
 }
 
 /// Whether the request carries a concrete mutation destination that the
@@ -635,12 +669,10 @@ pub(super) fn should_enforce_no_tool_text_when_tools_required(
 pub(super) fn contract_has_concrete_mutation_target(contract: &CompletionContract) -> bool {
     contract.expects_mutation
         && (contract.required_mutation_effects.has_specific_effects()
-            || contract.verification_targets.iter().any(|target| {
-                matches!(
-                    target.kind,
-                    VerificationTargetKind::Path | VerificationTargetKind::ProjectScope
-                )
-            }))
+            || contract
+                .verification_targets
+                .iter()
+                .any(|target| target.kind == VerificationTargetKind::Path))
 }
 
 pub(super) fn completion_verification_still_required(
@@ -951,7 +983,6 @@ pub(super) fn build_outcome_reconciliation_fallback_reply(reconciliation: &str) 
             out.push_str("\n\nWhat failed:\n");
             out.push_str(&detail_lines.join("\n"));
         }
-        out.push_str("\n\nWant me to try a different approach?");
         return out;
     }
 
@@ -1607,6 +1638,28 @@ Top-level keys: data
             0,
             0
         ));
+        assert!(should_enforce_no_tool_text_when_tools_required(
+            "I can’t adjust the Companion speaker because that control is not exposed.",
+            true,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn execution_hint_does_not_override_a_self_contained_model_answer() {
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "I prepared the requested draft and did not activate anything.",
+            true,
+            0,
+            0
+        ));
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "Here is the recap based on our prior conversation.",
+            true,
+            0,
+            0
+        ));
     }
 
     #[test]
@@ -1777,11 +1830,9 @@ Top-level keys: data
             fallback.contains("SyntaxError"),
             "error gist must survive: {fallback:?}"
         );
-        // Offers a path forward.
         assert!(
-            fallback.to_lowercase().contains("different approach")
-                || fallback.to_lowercase().contains("try again"),
-            "must offer recovery: {fallback:?}"
+            !fallback.contains('?'),
+            "a terminal reconciliation must not ask permission for routine recovery: {fallback:?}"
         );
     }
 

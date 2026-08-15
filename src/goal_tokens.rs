@@ -9,7 +9,90 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::{Goal, ScheduledRunHealth};
+use serde::{Deserialize, Serialize};
+
+use crate::traits::{Goal, ScheduledRunHealth, StateStore};
+
+const DAILY_BUDGET_OVERRIDE_PREFIX: &str = "goal_daily_budget_override:";
+
+/// Same-day adaptive capacity earned by useful work or an explicit owner run.
+/// It is durable across daemon restarts but expires by UTC day, so it does not
+/// permanently ratchet the configured goal budget upward.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GoalDailyBudgetOverride {
+    pub budget_daily: i64,
+    pub day_anchor: String,
+    pub extensions_count: usize,
+}
+
+fn daily_budget_override_key(goal_id: &str) -> String {
+    format!("{DAILY_BUDGET_OVERRIDE_PREFIX}{goal_id}")
+}
+
+pub async fn load_goal_daily_budget_override(
+    state: &dyn StateStore,
+    goal_id: &str,
+    configured_budget: i64,
+    hard_token_cap: i64,
+) -> Option<GoalDailyBudgetOverride> {
+    let raw = state
+        .get_setting(&daily_budget_override_key(goal_id))
+        .await
+        .ok()
+        .flatten()?;
+    let value: GoalDailyBudgetOverride = serde_json::from_str(&raw).ok()?;
+    let today = chrono::Utc::now().date_naive().to_string();
+    (value.day_anchor == today
+        && value.budget_daily >= configured_budget
+        && value.budget_daily <= hard_token_cap
+        && value.extensions_count > 0)
+        .then_some(value)
+}
+
+pub async fn persist_goal_daily_budget_override(
+    state: &dyn StateStore,
+    goal_id: &str,
+    budget_daily: i64,
+    extensions_count: usize,
+) -> anyhow::Result<GoalDailyBudgetOverride> {
+    let value = GoalDailyBudgetOverride {
+        budget_daily,
+        day_anchor: chrono::Utc::now().date_naive().to_string(),
+        extensions_count,
+    };
+    state
+        .set_setting(
+            &daily_budget_override_key(goal_id),
+            &serde_json::to_string(&value)?,
+        )
+        .await?;
+    Ok(value)
+}
+
+pub async fn clear_goal_daily_budget_override(
+    state: &dyn StateStore,
+    goal_id: &str,
+) -> anyhow::Result<()> {
+    // StateStore intentionally exposes an upsert-only settings interface.
+    // An empty value is fail-closed for the typed loader and avoids adding a
+    // second deletion contract solely for an expiring runtime override.
+    state
+        .set_setting(&daily_budget_override_key(goal_id), "")
+        .await
+}
+
+pub fn next_goal_daily_budget(
+    current_budget: i64,
+    tokens_used_today: i64,
+    hard_token_cap: i64,
+) -> Option<i64> {
+    let next = current_budget
+        .saturating_mul(2)
+        .max(tokens_used_today.saturating_add(current_budget / 2))
+        .min(hard_token_cap);
+    (current_budget > 0 && current_budget < hard_token_cap && next > tokens_used_today)
+        .then_some(next)
+}
 
 /// Registry of cancellation tokens keyed by goal ID.
 ///
@@ -250,6 +333,7 @@ impl GoalTokenRegistry {
         Some(Self::run_budget_status_from_state(state))
     }
 
+    #[allow(dead_code)]
     pub async fn set_run_budget(
         &self,
         goal_id: &str,
@@ -291,6 +375,22 @@ impl GoalTokenRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_budget_extension_is_bounded_and_requires_remaining_capacity() {
+        assert_eq!(
+            next_goal_daily_budget(1_000_000, 1_253_197, 2_000_000),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            next_goal_daily_budget(1_000_000, 2_000_000, 2_000_000),
+            None
+        );
+        assert_eq!(
+            next_goal_daily_budget(2_000_000, 2_000_000, 2_000_000),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn test_register_and_cancel() {
@@ -435,6 +535,7 @@ mod tests {
                     consecutive_same_tool_count: 1,
                     consecutive_same_tool_unique_args: 1,
                     unrecovered_error_count: 0,
+                    ..Default::default()
                 },
             )
             .await
@@ -477,6 +578,7 @@ mod tests {
                     consecutive_same_tool_count: 1,
                     consecutive_same_tool_unique_args: 1,
                     unrecovered_error_count: 0,
+                    ..Default::default()
                 },
             )
             .await

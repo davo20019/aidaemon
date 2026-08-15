@@ -168,6 +168,14 @@ pub struct HumanInterventionRequest {
     pub next_step: String,
     pub consequence_if_not_provided: Option<String>,
     pub partial_result: Option<PartialResult>,
+    /// False for an agent-side terminal execution failure. Missing evidence is
+    /// not automatically a request for the user to manufacture a receipt.
+    #[serde(default = "default_user_action_required")]
+    pub user_action_required: bool,
+}
+
+fn default_user_action_required() -> bool {
+    true
 }
 
 impl HumanInterventionRequest {
@@ -197,10 +205,18 @@ impl HumanInterventionRequest {
         }
 
         lines.push(String::new());
-        lines.push(format!("What I need from you: {}", self.exact_need));
-        lines.push(format!("What I will do next: {}", self.next_step));
-        if let Some(consequence) = &self.consequence_if_not_provided {
-            lines.push(format!("If not provided: {}", consequence));
+        if self.user_action_required {
+            lines.push(format!("What I need from you: {}", self.exact_need));
+            lines.push(format!("What I will do next: {}", self.next_step));
+            if let Some(consequence) = &self.consequence_if_not_provided {
+                lines.push(format!("If not provided: {}", consequence));
+            }
+        } else {
+            lines.push(
+                "This attempt ended without verified success; no action is required from you."
+                    .to_string(),
+            );
+            lines.push(format!("Next safe step: {}", self.next_step));
         }
 
         lines.join("\n")
@@ -519,11 +535,12 @@ pub fn derive_executor_step_result(
                 remaining_work: vec!["Resolve the blocker and resume the task.".to_string()],
             });
 
-        let needs_approval =
-            mentions_approval(&blocker) || task_response.as_deref().is_some_and(mentions_approval);
-        let exact_need = if needs_approval {
-            "Explicit approval or permission to perform the blocked action.".to_string()
-        } else if let Some(partial_result) = &partial_result {
+        // Approval is a typed executor outcome persisted by `report_blocker`.
+        // A legacy/free-form blocker cannot be upgraded to an approval request
+        // by words in its summary: that would let prose manufacture authority
+        // and change retry behavior. Treat it as the blocker state it actually
+        // is; callers that need approval must persist `executor_result`.
+        let exact_need = if let Some(partial_result) = &partial_result {
             format!(
                 "Resolve the blocker after '{}'.",
                 partial_result.completed_work_summary
@@ -531,38 +548,16 @@ pub fn derive_executor_step_result(
         } else {
             "Clarify the blocker or provide the missing dependency.".to_string()
         };
-        let next_step = if needs_approval {
-            "Resume the blocked action once approval is granted.".to_string()
-        } else {
-            "Continue the task after the blocker is resolved.".to_string()
-        };
-        let approval_request = needs_approval.then(|| HumanInterventionRequest {
-            outcome: ValidationOutcome::NeedsApproval,
-            approval_state: ApprovalState::Required,
-            action_requested: blocker.clone(),
-            target: artifacts.first().cloned(),
-            reason: blocker.clone(),
-            exact_need: exact_need.clone(),
-            next_step: next_step.clone(),
-            consequence_if_not_provided: Some(
-                "The task will remain blocked and the executor will stop without taking the gated action."
-                    .to_string(),
-            ),
-            partial_result: partial_result.clone(),
-        });
+        let next_step = "Continue the task after the blocker is resolved.".to_string();
 
         return ExecutorStepResult {
             task_id: task_id.to_string(),
-            step_outcome: if needs_approval {
-                StepValidationOutcome::NeedsApproval
-            } else if partial_result.is_some() {
+            step_outcome: if partial_result.is_some() {
                 StepValidationOutcome::PartialDoneBlocked
             } else {
                 StepValidationOutcome::Blocked
             },
-            task_outcome: if needs_approval {
-                TaskValidationOutcome::NeedsApproval
-            } else if partial_result.is_some() {
+            task_outcome: if partial_result.is_some() {
                 TaskValidationOutcome::PartialDoneBlocked
             } else {
                 TaskValidationOutcome::Blocked
@@ -572,44 +567,15 @@ pub fn derive_executor_step_result(
             blocker: Some(blocker),
             exact_need: Some(exact_need),
             next_step: Some(next_step),
-            approval_request,
+            approval_request: None,
             partial_result,
         };
     }
 
-    if task_response
-        .as_deref()
-        .is_some_and(super::goal_completion_response_indicates_incomplete_work)
-    {
-        let blocker =
-            "The executor reported progress but did not verify the final outcome.".to_string();
-        return ExecutorStepResult {
-            task_id: task_id.to_string(),
-            step_outcome: StepValidationOutcome::VerifyAgain,
-            task_outcome: TaskValidationOutcome::PartialDoneBlocked,
-            summary,
-            artifacts: artifacts.clone(),
-            blocker: Some(blocker.clone()),
-            exact_need: Some(
-                "A fresh verification step before treating the task as complete.".to_string(),
-            ),
-            next_step: Some(
-                "Run the remaining verification or follow-up check, then update the task."
-                    .to_string(),
-            ),
-            approval_request: None,
-            partial_result: Some(PartialResult {
-                completed_work_summary: task_response
-                    .unwrap_or_else(|| "The executor reported partial progress.".to_string()),
-                artifacts,
-                blocker,
-                remaining_work: vec![
-                    "Verify the final state before marking the task complete.".to_string()
-                ],
-            }),
-        };
-    }
-
+    // Reaching this branch means the invocation completed without a typed
+    // error, blocker, or persisted executor result. The response is a summary,
+    // not a second protocol: words such as "partial" or "not verified" must
+    // not overturn the structured invocation outcome.
     ExecutorStepResult {
         task_id: task_id.to_string(),
         step_outcome: StepValidationOutcome::StepDone,
@@ -622,13 +588,6 @@ pub fn derive_executor_step_result(
         approval_request: None,
         partial_result: None,
     }
-}
-
-fn mentions_approval(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    super::contains_keyword_as_words(&lower, "approval")
-        || super::contains_keyword_as_words(&lower, "permission")
-        || super::contains_keyword_as_words(&lower, "approve")
 }
 
 fn normalize_success_text(text: &str) -> String {
@@ -683,6 +642,7 @@ pub fn build_needs_approval_request(
                 .to_string(),
         ),
         partial_result,
+        user_action_required: true,
     }
 }
 
@@ -734,6 +694,7 @@ pub fn build_partial_done_blocked_request_with_plan(
                 .to_string(),
         ),
         partial_result: Some(partial_result),
+        user_action_required: true,
     }
 }
 
@@ -782,6 +743,7 @@ pub fn build_reduce_scope_request_with_plan(
             execution_state,
             blocker,
         )),
+        user_action_required: true,
     }
 }
 
@@ -807,6 +769,7 @@ pub fn build_abandon_request(
         ),
         partial_result: (!learning_ctx.tool_calls.is_empty())
             .then(|| summarize_partial_result(turn_context, learning_ctx, blocker)),
+        user_action_required: true,
     }
 }
 
@@ -996,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_persisted_executor_blocker_remains_authoritative() {
+    fn legacy_blocker_prose_cannot_manufacture_approval_state() {
         let task = executor_task(Some("Production approval is required."));
 
         let result = derive_executor_step_result(
@@ -1006,8 +969,9 @@ mod tests {
             None,
         );
 
-        assert_eq!(result.step_outcome, StepValidationOutcome::NeedsApproval);
-        assert_eq!(result.task_outcome, TaskValidationOutcome::NeedsApproval);
+        assert_eq!(result.step_outcome, StepValidationOutcome::Blocked);
+        assert_eq!(result.task_outcome, TaskValidationOutcome::Blocked);
+        assert!(result.approval_request.is_none());
         assert_eq!(
             result.blocker.as_deref(),
             Some("Production approval is required.")

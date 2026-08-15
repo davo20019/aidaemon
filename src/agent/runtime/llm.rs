@@ -481,27 +481,26 @@ impl Agent {
                     "LLM call failed: {}",
                     provider_err
                 );
-                if options.single_attempt_fail_closed {
+                let recovery_route =
+                    provider_err.recovery_route(options.single_attempt_fail_closed);
+                if recovery_route == ProviderRecoveryRoute::Fail {
                     warn!(
                         model,
-                        "Provider attempt failed under a single-attempt budget fence; refusing retries and fallback"
+                        single_attempt_fail_closed = options.single_attempt_fail_closed,
+                        kind = ?provider_err.kind,
+                        "Provider recovery graph reached a terminal state"
                     );
                     return Err(anyhow::anyhow!("{}", provider_err.user_message()));
                 }
                 let provider_label =
                     provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
 
-                match provider_err.kind {
-                    // --- Auth: non-retryable (invalid API key) ---
-                    ProviderErrorKind::Auth => {
-                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
-                    }
-
+                match recovery_route {
                     // --- Billing (402): try reduced max_tokens first, then cascade ---
                     // If the 402 tells us how many tokens we can afford, retry the
                     // same model with a reduced cap. This avoids falling back to a
                     // weaker free model when the primary still has partial budget.
-                    ProviderErrorKind::Billing => {
+                    ProviderRecoveryRoute::RetryReducedBudgetThenFallback => {
                         const MIN_USEFUL_TOKENS: u32 = 512;
                         if let Some(affordable) = provider_err.affordable_tokens {
                             if affordable >= MIN_USEFUL_TOKENS
@@ -576,7 +575,7 @@ impl Agent {
                         )
                         .await
                     }
-                    ProviderErrorKind::BadRequest => {
+                    ProviderRecoveryRoute::AdaptRequestOnce => {
                         if crate::providers::multimodal::messages_contain_multimodal_blocks(
                             messages,
                         ) {
@@ -616,7 +615,7 @@ impl Agent {
                     }
 
                     // --- Rate limit: exponential backoff, then cascade fallback ---
-                    ProviderErrorKind::RateLimit => {
+                    ProviderRecoveryRoute::RetryRateLimitThenFallback => {
                         let base_wait = provider_err.retry_after_secs.unwrap_or(5);
                         for attempt in 0..Self::MAX_LLM_RETRIES {
                             let wait = crate::backoff::exponential_backoff(
@@ -661,9 +660,7 @@ impl Agent {
                     }
 
                     // --- Timeout / Network / Server: exponential backoff, then cascade ---
-                    ProviderErrorKind::Timeout
-                    | ProviderErrorKind::Network
-                    | ProviderErrorKind::ServerError => {
+                    ProviderRecoveryRoute::RetryTransientThenFallback => {
                         if provider_err.kind == ProviderErrorKind::ServerError {
                             if let Some(resp) = self
                                 .try_text_only_vision_fallback(
@@ -717,13 +714,12 @@ impl Agent {
                     }
 
                     // --- Malformed payload: reason-aware recovery ---
-                    ProviderErrorKind::MalformedResponse => {
+                    ProviderRecoveryRoute::RetryMalformedThenFallback
+                    | ProviderRecoveryRoute::RetryMalformedThenFail => {
                         let reason = malformed_reason_label(provider_err.malformed_reason);
                         record_llm_payload_invalid_metric(provider_label, model, reason);
 
-                        if provider_err.malformed_reason
-                            == Some(crate::providers::MalformedResponseReason::Parse)
-                        {
+                        if recovery_route == ProviderRecoveryRoute::RetryMalformedThenFallback {
                             // Parse failures can be transient (gateway/proxy/body corruption).
                             // Use the same resilient policy as other transient provider failures.
                             let retry_result = self
@@ -788,7 +784,7 @@ impl Agent {
                     }
 
                     // --- NotFound (bad model name): cascade fallback immediately ---
-                    ProviderErrorKind::NotFound => {
+                    ProviderRecoveryRoute::Fallback => {
                         warn!(
                             bad_model = model,
                             "Model not found, trying cascade fallback"
@@ -807,9 +803,8 @@ impl Agent {
                         .await
                     }
 
-                    // --- Unknown: propagate ---
-                    ProviderErrorKind::Unknown => {
-                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                    ProviderRecoveryRoute::Fail => {
+                        unreachable!("terminal provider recovery routes return before dispatch")
                     }
                 }
             }

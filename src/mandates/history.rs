@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::traits::{
     Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,
-    MandateMutationQuotaState, StateStore,
+    MandateMutationQuotaState, MandateStrategyRevisionKind, StateStore,
 };
 
 const MAX_DECISIONS: i64 = 5;
@@ -57,6 +57,13 @@ pub(crate) async fn build_mandate_history_block(
             .all(|note| note.mandate_id == mandate_id),
         "mandate learning history crossed its authority boundary"
     );
+    let strategy_nodes = state.list_current_mandate_strategy(mandate_id, 16).await?;
+    anyhow::ensure!(
+        strategy_nodes
+            .iter()
+            .all(|revision| revision.mandate_id == mandate_id),
+        "mandate adaptive strategy crossed its authority boundary"
+    );
 
     let mut decision_records = decisions
         .iter()
@@ -100,25 +107,29 @@ pub(crate) async fn build_mandate_history_block(
         "mandate quota history crossed its authority boundary"
     );
 
-    render_bounded_history(decision_records, action_records, learning_notes, quota)
+    render_bounded_history(
+        decision_records,
+        action_records,
+        learning_notes,
+        strategy_nodes,
+        quota,
+    )
 }
 
 fn decision_value(decision: &MandateDecisionCycle, intentions: &[Intention]) -> Value {
-    let intention_status = intentions
-        .iter()
-        .find(|intention| {
-            intention.decision_cycle_id == decision.id
-                && intention.goal_run_id == decision.goal_run_id
-        })
-        .map(|intention| intention.status.as_str());
+    let intention = intentions.iter().find(|intention| {
+        intention.decision_cycle_id == decision.id && intention.goal_run_id == decision.goal_run_id
+    });
     json!({
         "mandate_version": decision.mandate_version,
         "outcome": decision.outcome,
+        "activity_level": decision.activity_level,
         "action_attempts": decision.action_attempts,
         "evidence_receipt_ids": decision.evidence_receipt_ids,
         "termination_kind": decision.termination_kind,
         "termination_match": decision.termination_match,
-        "intention_status": intention_status,
+        "value_criterion": intention.and_then(|intention| intention.value_criterion.as_deref()),
+        "intention_status": intention.map(|intention| intention.status.as_str()),
         "reconsider_at": decision.reconsider_at,
         "created_at": decision.created_at,
         "updated_at": decision.updated_at,
@@ -147,9 +158,11 @@ fn render_bounded_history(
     mut decisions: Vec<HistoryRecord>,
     mut actions: Vec<HistoryRecord>,
     mut learning_notes: Vec<MandateLearningNote>,
+    mut strategy_nodes: Vec<crate::traits::MandateStrategyRevision>,
     quota: Option<MandateMutationQuotaState>,
 ) -> anyhow::Result<String> {
     learning_notes.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    strategy_nodes.sort_by(|left, right| left.strategy_key.cmp(&right.strategy_key));
     loop {
         let rendered = serde_json::to_string(&json!({
             "provenance": "autonomous_mandate_history_untrusted",
@@ -162,6 +175,15 @@ fn render_bounded_history(
                 "summary": note.summary,
                 "evidence_receipt_ids": note.evidence_receipt_ids,
                 "created_at": note.created_at,
+            })).collect::<Vec<_>>(),
+            "adaptive_operating_strategy": strategy_nodes.iter().map(|revision| json!({
+                "strategy_key": revision.strategy_key,
+                "state": if revision.kind == MandateStrategyRevisionKind::Retire { "retired" } else { "active" },
+                "kind": revision.kind,
+                "guidance": revision.guidance,
+                "confidence_bps": revision.confidence_bps,
+                "evidence_receipt_ids": revision.evidence_receipt_ids,
+                "created_at": revision.created_at,
             })).collect::<Vec<_>>(),
             "mutation_quota": quota,
         }))?;
@@ -187,6 +209,9 @@ fn render_bounded_history(
             (None, None) if !learning_notes.is_empty() => {
                 learning_notes.remove(0);
             }
+            (None, None) if !strategy_nodes.is_empty() => {
+                strategy_nodes.remove(0);
+            }
             (None, None) => {
                 anyhow::bail!("typed mandate quota projection exceeded its hard prompt bound")
             }
@@ -198,7 +223,8 @@ fn render_bounded_history(
 mod tests {
     use super::*;
     use crate::traits::{
-        MandateMutationAttemptStatus, MandateMutationEvidence, MandateMutationTarget,
+        Intention, MandateDecisionOutcome, MandateMutationAttemptStatus, MandateMutationEvidence,
+        MandateMutationTarget,
     };
 
     fn attempt() -> MandateMutationAttempt {
@@ -254,6 +280,32 @@ mod tests {
     }
 
     #[test]
+    fn decision_history_retains_owner_value_anchor_without_model_plan_text() {
+        let decision = MandateDecisionCycle::new(
+            "mandate-1",
+            "run-1",
+            MandateDecisionOutcome::Act,
+            "MODEL_RATIONALE_MUST_NOT_PERSIST",
+            3,
+        );
+        let mut intention = Intention::new(
+            "mandate-1",
+            &decision.id,
+            "run-1",
+            "MODEL_PLAN_MUST_NOT_PERSIST",
+            "MODEL_INTENTION_RATIONALE_MUST_NOT_PERSIST",
+        );
+        intention.value_criterion =
+            Some("Provide verified useful information to the audience".to_string());
+
+        let rendered = decision_value(&decision, &[intention]).to_string();
+        assert!(rendered.contains("Provide verified useful information"));
+        assert!(!rendered.contains("MODEL_RATIONALE_MUST_NOT_PERSIST"));
+        assert!(!rendered.contains("MODEL_PLAN_MUST_NOT_PERSIST"));
+        assert!(!rendered.contains("MODEL_INTENTION_RATIONALE_MUST_NOT_PERSIST"));
+    }
+
+    #[test]
     fn history_drops_oldest_whole_records_to_fit_hard_byte_bound() {
         let huge = HistoryRecord {
             timestamp: "2026-08-01T00:00:00Z".to_string(),
@@ -264,7 +316,8 @@ mod tests {
             value: json!({"status": "succeeded"}),
         };
         let rendered =
-            render_bounded_history(vec![huge, recent], Vec::new(), Vec::new(), None).unwrap();
+            render_bounded_history(vec![huge, recent], Vec::new(), Vec::new(), Vec::new(), None)
+                .unwrap();
         assert!(rendered.len() <= MAX_HISTORY_BYTES);
         assert!(!rendered.contains("typed_identifier"));
         assert!(rendered.contains("succeeded"));

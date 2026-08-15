@@ -192,6 +192,15 @@ impl ManageOAuthTool {
         }
     }
 
+    async fn send_authorization_action(
+        status_tx: Option<&mpsc::Sender<StatusUpdate>>,
+        message: String,
+    ) {
+        if let Some(tx) = status_tx {
+            let _ = tx.send(StatusUpdate::UserActionRequired { message }).await;
+        }
+    }
+
     fn validate_auth_type(raw: Option<&str>) -> anyhow::Result<String> {
         let normalized = raw.unwrap_or("oauth2_pkce").trim().to_ascii_lowercase();
         match normalized.as_str() {
@@ -704,8 +713,10 @@ impl ManageOAuthTool {
         if let Some(warning) = &callback_warning {
             authorize_parts.push(format!("Note: {}", warning));
         }
-        authorize_parts.push(format!("Click this link to authorize:\n{}", authorize_url));
-        Self::send_connect_progress(status_tx.as_ref(), authorize_parts.join("\n\n")).await;
+        authorize_parts.push(format!(
+            "🔐 **Authorization required**\n\n[Continue in your browser]({authorize_url})"
+        ));
+        Self::send_authorization_action(status_tx.as_ref(), authorize_parts.join("\n\n")).await;
 
         let compose_result = |body: String| {
             let mut parts = Vec::new();
@@ -1624,13 +1635,15 @@ allowed_domains = ["api.linear.app"]
             .unwrap()
             .unwrap();
         let authorize_chunk = match first_update {
-            StatusUpdate::ToolProgress { chunk, .. } => chunk,
+            StatusUpdate::UserActionRequired { message } => message,
             other => panic!("unexpected first status update: {other:?}"),
         };
-        assert!(authorize_chunk.contains("Click this link to authorize:"));
+        assert!(authorize_chunk.contains("🔐 **Authorization required**"));
+        assert!(authorize_chunk.contains("[Continue in your browser]("));
         let authorize_url = authorize_chunk
-            .lines()
-            .find(|line| line.starts_with("https://"))
+            .split_once("[Continue in your browser](")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once(')').map(|(url, _)| url))
             .unwrap()
             .trim();
         let state = reqwest::Url::parse(authorize_url)

@@ -9,10 +9,11 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use crate::state::sqlite::history_search::{self, HistoryMessage, HistoryScope, TaskBookends};
-use crate::state::SqliteStateStore;
+use crate::state::sqlite::history_search::{
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, TaskBookends,
+};
 use crate::traits::{
-    EpisodeStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolOutcomeStatus, ToolVerificationMode,
 };
 use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
@@ -20,13 +21,13 @@ use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct SearchHistoryTool {
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn HistorySearchStore>,
     retention_days: u32,
     cursor_secret: Vec<u8>,
 }
 
 impl SearchHistoryTool {
-    pub fn new(state: Arc<SqliteStateStore>, retention_days: u32) -> Self {
+    pub fn new(state: Arc<dyn HistorySearchStore>, retention_days: u32) -> Self {
         Self {
             state,
             retention_days,
@@ -169,9 +170,8 @@ impl SearchHistoryTool {
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let args: SearchHistoryArgs = serde_json::from_str(arguments)?;
         let action = args.action.as_str();
-        let pool = self.state.pool();
         let authorization_scope =
-            Self::runtime_scope(&args, history_search::snapshot_max_event_id(&pool).await?)?;
+            Self::runtime_scope(&args, self.state.history_snapshot_max_event_id().await?)?;
         if authorization_scope.user_role != UserRole::Owner {
             anyhow::bail!("exact history is restricted to the owner");
         }
@@ -181,7 +181,7 @@ impl SearchHistoryTool {
 
         if action == "health" {
             let coverage = if Self::may_report_global_coverage(&authorization_scope) {
-                Some(history_search::coverage(&pool).await?)
+                Some(self.state.history_coverage().await?)
             } else {
                 None
             };
@@ -205,7 +205,7 @@ impl SearchHistoryTool {
                     "global exact-history repair is restricted to private or trusted internal contexts"
                 );
             }
-            let stats = history_search::repair_and_backfill(&pool, 100).await?;
+            let stats = self.state.repair_history_projection(100).await?;
             return self.outcome(
                 serde_json::to_string_pretty(&stats)?,
                 "search_history projection repair completed".to_string(),
@@ -226,7 +226,7 @@ impl SearchHistoryTool {
                 cursor.direction == "older",
             )
         } else {
-            let snapshot = history_search::snapshot_max_event_id(&pool).await?;
+            let snapshot = self.state.history_snapshot_max_event_id().await?;
             (Self::runtime_scope(&args, snapshot)?, args.event_id, false)
         };
 
@@ -238,7 +238,7 @@ impl SearchHistoryTool {
             snapshot_max_event_id: scope.snapshot_max_event_id,
             retention: retention_disclosure(self.retention_days),
             coverage: if Self::may_report_global_coverage(&scope) {
-                Some(history_search::coverage(&pool).await?)
+                Some(self.state.history_coverage().await?)
             } else {
                 None
             },
@@ -256,7 +256,10 @@ impl SearchHistoryTool {
                     .filter(|q| !q.trim().is_empty())
                     .ok_or_else(|| anyhow::anyhow!("query is required for search"))?;
                 let semantic = self.semantic_sessions(query, &scope).await;
-                let hits = history_search::search(&pool, query, &scope, limit, &semantic).await?;
+                let hits = self
+                    .state
+                    .search_history(query, &scope, limit, &semantic)
+                    .await?;
                 for hit in hits {
                     // Discovery spans authorized sessions, but scrolling from a
                     // hit follows that hit's exact session timeline.
@@ -264,15 +267,14 @@ impl SearchHistoryTool {
                     hit_scope.session_filter = Some(hit.session_id.clone());
                     let older_cursor = self.cursor_for(&hit_scope, hit.event_id, "older")?;
                     let newer_cursor = self.cursor_for(&hit_scope, hit.event_id, "newer")?;
-                    let context =
-                        history_search::context(&pool, hit.event_id, radius, &scope).await?;
-                    let bookends = history_search::task_bookends(
-                        &pool,
-                        hit.task_id.as_deref(),
-                        &hit.session_id,
-                        &scope,
-                    )
-                    .await?;
+                    let context = self
+                        .state
+                        .history_context(hit.event_id, radius, &scope)
+                        .await?;
+                    let bookends = self
+                        .state
+                        .history_task_bookends(hit.task_id.as_deref(), &hit.session_id, &scope)
+                        .await?;
                     response.matches.push(SearchHit {
                         anchor: hit,
                         context,
@@ -285,13 +287,13 @@ impl SearchHistoryTool {
             "open" => {
                 let event_id =
                     anchor.ok_or_else(|| anyhow::anyhow!("event_id is required for open"))?;
-                response.messages =
-                    history_search::context(&pool, event_id, radius, &scope).await?;
+                response.messages = self.state.history_context(event_id, radius, &scope).await?;
             }
             "page" => {
-                response.messages =
-                    history_search::page(&pool, anchor.unwrap_or_default(), older, &scope, limit)
-                        .await?;
+                response.messages = self
+                    .state
+                    .history_page(anchor.unwrap_or_default(), older, &scope, limit)
+                    .await?;
             }
             other => anyhow::bail!("unsupported search_history action: {other}"),
         }
@@ -410,7 +412,7 @@ struct SearchResponse {
     snapshot_max_event_id: i64,
     retention: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<history_search::HistoryCoverage>,
+    coverage: Option<HistoryCoverage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     matches: Vec<SearchHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -505,6 +507,7 @@ mod tests {
     use super::*;
     use crate::events::{Event, EventStore, EventType};
     use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
 
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();

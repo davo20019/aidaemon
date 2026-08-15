@@ -90,6 +90,22 @@ pub struct LatestSensorReading {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeCapabilitySnapshot {
+    pub capability_id: String,
+    pub capability_version: u16,
+    pub limits: serde_json::Value,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeAuthorizationSnapshot {
+    pub action: String,
+    pub constraints: serde_json::Value,
+    pub revision: u64,
+    pub granted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeHealthSnapshot {
     pub display_name: String,
     pub last_seen_at: Option<DateTime<Utc>>,
@@ -100,6 +116,12 @@ pub struct NodeHealthSnapshot {
     pub largest_internal_allocation: Option<u64>,
     pub psram_free: Option<u64>,
     pub recovery: Option<RuntimeRecoveryReport>,
+    /// Capabilities from the latest authenticated Node heartbeat. Their absence
+    /// is evidence about the reported protocol surface, not proof about
+    /// unreported physical hardware.
+    pub capabilities: Vec<NodeCapabilitySnapshot>,
+    /// Currently granted gateway actions for the selected Node.
+    pub authorizations: Vec<NodeAuthorizationSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -2237,9 +2259,50 @@ pub async fn node_health_snapshot(
                 last_firmware_version, last_health_json
          FROM nodes WHERE node_id = ? AND revoked_at IS NULL",
     )
-    .bind(selected)
+    .bind(&selected)
     .fetch_one(pool)
     .await?;
+    let capability_rows = sqlx::query(
+        "SELECT capability_id, capability_version, limits_json, observed_at
+         FROM node_capabilities WHERE node_id = ? ORDER BY capability_id ASC",
+    )
+    .bind(&selected)
+    .fetch_all(pool)
+    .await?;
+    let capabilities = capability_rows
+        .into_iter()
+        .map(|row| {
+            let limits_json: String = row.get("limits_json");
+            let observed_at: String = row.get("observed_at");
+            Ok(NodeCapabilitySnapshot {
+                capability_id: row.get("capability_id"),
+                capability_version: row.get::<i64, _>("capability_version") as u16,
+                limits: serde_json::from_str(&limits_json)?,
+                observed_at: parse_timestamp(&observed_at)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let authorization_rows = sqlx::query(
+        "SELECT action, constraints_json, revision, granted_at
+         FROM node_authorizations
+         WHERE node_id = ? AND revoked_at IS NULL ORDER BY action ASC",
+    )
+    .bind(&selected)
+    .fetch_all(pool)
+    .await?;
+    let authorizations = authorization_rows
+        .into_iter()
+        .map(|row| {
+            let constraints_json: String = row.get("constraints_json");
+            let granted_at: String = row.get("granted_at");
+            Ok(NodeAuthorizationSnapshot {
+                action: row.get("action"),
+                constraints: serde_json::from_str(&constraints_json)?,
+                revision: row.get::<i64, _>("revision") as u64,
+                granted_at: parse_timestamp(&granted_at)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let last_seen_at: Option<String> = row.get("last_seen_at");
     let health_json: Option<String> = row.get("last_health_json");
     let health: serde_json::Value = health_json
@@ -2267,6 +2330,8 @@ pub async fn node_health_snapshot(
             .and_then(serde_json::Value::as_u64),
         psram_free: health.get("psram_free").and_then(serde_json::Value::as_u64),
         recovery,
+        capabilities,
+        authorizations,
     })
 }
 

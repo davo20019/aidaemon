@@ -660,6 +660,7 @@ pub enum DecisionType {
     MandateDeliberation,
     MandateAuthorityGate,
     IdempotencyReceiptReplayed,
+    IdempotencyReceiptInvalidated,
     IdempotencyIndeterminateBlock,
     EvidenceGate,
     ExecutionFailureClassification,

@@ -11,7 +11,6 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::channels::ChannelHub;
 use crate::config::{
     AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
 };
@@ -24,8 +23,9 @@ use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
-use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
 use crate::router::{self, Router};
+use crate::runtime_ports::OutboundRouter;
 use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
@@ -128,11 +128,12 @@ mod response_analysis;
 #[cfg(test)]
 use response_analysis::has_action_promise;
 #[cfg(test)]
+use response_analysis::looks_like_incomplete_retry_plan;
+#[cfg(test)]
 use response_analysis::sanitize_response_analysis;
 use response_analysis::{
     claims_completed_side_effect, claims_delegation_started, is_substantive_text_response,
-    looks_like_deferred_action_response, looks_like_incomplete_retry_plan,
-    looks_like_multi_part_request, reply_is_pasted_file_page,
+    looks_like_deferred_action_response, looks_like_multi_part_request, reply_is_pasted_file_page,
 };
 #[cfg(test)]
 use response_analysis::{reply_defers_file_access, user_text_references_file};
@@ -173,9 +174,10 @@ pub(in crate::agent) use validation_state::{
     ValidationOutcome,
 };
 pub(crate) use validation_state::{
-    build_needs_approval_request, derive_executor_step_result, persist_executor_handoff_context,
-    persist_executor_result_context, ExecutorHandoff, ExecutorStepResult, PartialResult,
-    StepValidationOutcome, TaskValidationOutcome, ValidationState,
+    build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
+    persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
+    ExecutorStepResult, PartialResult, StepValidationOutcome, TaskValidationOutcome,
+    ValidationState,
 };
 #[path = "loop/execution_state.rs"]
 mod execution_state;
@@ -214,6 +216,7 @@ use post_task::LearningContext;
 pub(in crate::agent) use post_task::ReplayNoteCategory;
 pub(in crate::agent) use task_outcome::{
     response_has_user_value, response_looks_like_plain_text_tool_call, TaskOutcomeDerivation,
+    TaskTerminalCause,
 };
 #[allow(dead_code, unused_imports)]
 #[path = "loop/state/mod.rs"]
@@ -270,13 +273,13 @@ pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
 pub(in crate::agent) use history::{
-    apply_planned_contract_signals, apply_planned_mutation_constraints,
-    apply_planned_required_mutation_effects, parse_planned_forbidden_action,
-    parse_planned_mutation_effects, parse_planned_task_kind,
-};
-pub(in crate::agent) use history::{
     authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
     mutation_contract_fulfilled,
+};
+pub(in crate::agent) use history::{
+    inherit_unfinished_request_contract, install_semantic_completion_contract,
+    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
+    retain_structural_completion_contract, SemanticCompletionRequirements,
 };
 #[path = "runtime/llm.rs"]
 mod llm;
@@ -300,6 +303,7 @@ mod prefix_fingerprint;
 mod request_dump;
 #[path = "runtime/resume.rs"]
 mod resume;
+mod runtime_ports;
 #[path = "loop/sliding_window.rs"]
 mod sliding_window;
 #[path = "runtime/spawn.rs"]
@@ -373,14 +377,15 @@ mod agent_helpers;
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
     build_empty_response_fallback, filter_tool_defs_for_untrusted_external_reference,
-    is_resume_request, is_untrusted_external_reference_blocked_tool,
-    matched_untrusted_external_reference_skill_names,
-    should_allow_contextual_project_nickname_scope, summarize_tool_args,
-    text_has_explicit_project_scope_cues, truncate_for_resume,
-    user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
-    ResumeCheckpoint, ResumeExecutionSnapshot,
+    is_resume_request, is_untrusted_external_reference_blocked_tool, summarize_tool_args,
+    truncate_for_resume, user_text_references_filesystem_path, ResumeCheckpoint,
+    ResumeExecutionSnapshot,
 };
 pub use agent_helpers::{send_status, touch_heartbeat};
+#[cfg(test)]
+pub(in crate::agent) use agent_helpers::{
+    text_has_explicit_project_scope_cues, user_explicitly_requests_local_file_inspection,
+};
 
 /// Phase 0 per-session window-boundary memory: `session_id` →
 /// (last `keep_from` index, last oldest-kept persisted message id). Used by
@@ -462,7 +467,7 @@ pub struct Agent {
     goal_token_registry: Option<GoalTokenRegistry>,
     /// Weak reference to the ChannelHub for background notifications.
     /// Uses RwLock because hub is created after Agent (core.rs ordering).
-    hub: RwLock<Option<Weak<ChannelHub>>>,
+    hub: RwLock<Option<Weak<dyn OutboundRouter>>>,
     /// Plan store for the requirement-checklist feature. Set after construction
     /// (core.rs ordering) via `set_plan_store`; `None` on subagents and in tests,
     /// in which case checklist verification/recap degrade to current behavior.
@@ -634,19 +639,23 @@ impl AgentLimits {
 // Goal/task dispatch helpers. Implementation lives in `goal_dispatch.rs`.
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
+#[cfg(test)]
+pub(crate) use goal_dispatch::goal_completion_response_indicates_incomplete_work;
 pub use goal_dispatch::is_group_session;
+#[cfg(test)]
+pub(in crate::agent) use goal_dispatch::looks_like_incomplete_live_work_summary;
 pub(in crate::agent) use goal_dispatch::{
     active_scheduled_root_task_id, auto_dispatch_scheduled_run_extension_budget,
     clear_scheduled_run_state, effective_goal_daily_budget, goal_has_scheduled_provenance,
     is_goal_run_root_task_description, is_low_signal_task_lead_reply,
     looks_like_evidence_grounding_challenge, looks_like_false_capability_denial_after_tool_success,
-    looks_like_incomplete_live_work_summary, parse_goal_leading_wait, parse_wait_task_seconds,
-    persist_scheduled_run_state, strip_leading_wait, task_has_scheduled_provenance,
-    truncate_goal_result_text, user_facing_task_description,
+    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
+    strip_leading_wait, task_has_scheduled_provenance, truncate_goal_result_text,
+    user_facing_task_description,
 };
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
-    goal_completion_response_indicates_incomplete_work,
+    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
 
 // Background task-lead spawner. Implementation lives in `background_task_lead.rs`.
@@ -663,6 +672,7 @@ pub mod self_correction;
 // `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
 #[path = "construct.rs"]
 mod construct;
+pub(crate) use construct::AgentConstruction;
 
 // impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
@@ -748,8 +758,33 @@ impl Agent {
     }
 
     /// Set the ChannelHub reference (called after hub creation in core.rs).
-    pub async fn set_hub(&self, hub: Weak<ChannelHub>) {
+    pub(crate) async fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
         *self.hub.write().await = Some(hub);
+    }
+
+    pub(crate) async fn runtime_wiring_ready(&self) -> bool {
+        self.self_ref
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some()
+            && self
+                .hub
+                .read()
+                .await
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some()
+    }
+
+    pub(crate) async fn self_reference_ready(&self) -> bool {
+        self.self_ref
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some()
     }
 
     /// Set the plan store (called after construction in core.rs). Enables the
@@ -1149,6 +1184,7 @@ impl Agent {
                 user_role,
                 channel_ctx,
                 heartbeat,
+                false,
             )
             .await;
 
@@ -1165,6 +1201,34 @@ impl Agent {
         let reply = Self::sanitize_final_reply_markers(&reply);
 
         Ok(reply)
+    }
+
+    /// Re-enter an unfinished conversation with runtime-produced evidence.
+    /// Unlike a channel ingress turn, this must not be interpreted as new
+    /// owner intent or let worker output broaden the request's target scope.
+    pub(crate) async fn handle_internal_continuation(
+        &self,
+        session_id: &str,
+        continuation_text: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
+        heartbeat: Option<Arc<AtomicU64>>,
+    ) -> anyhow::Result<String> {
+        let _activity = activity_gate::AgentActivityGuard::acquire();
+        let reply = self
+            .handle_message_impl(
+                session_id,
+                continuation_text,
+                &[],
+                status_tx,
+                user_role,
+                channel_ctx,
+                heartbeat,
+                true,
+            )
+            .await?;
+        Ok(Self::sanitize_final_reply_markers(&reply))
     }
 
     /// Cancel all active/pending goals for a session.

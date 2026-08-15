@@ -123,6 +123,19 @@ pub enum ToolCallEffect {
 pub struct ToolMutationEffects(u32);
 
 impl ToolMutationEffects {
+    pub const PROTOCOL_NAMES: [&str; 11] = [
+        "local_source_write",
+        "local_workspace_write",
+        "local_derived_write",
+        "repository_write",
+        "remote_mutation",
+        "remote_deploy",
+        "external_delivery",
+        "process_state",
+        "configuration",
+        "destructive",
+        "unspecified",
+    ];
     pub const NONE: Self = Self(0);
     /// A write to user-authored files through a path-aware editing tool.
     pub const LOCAL_SOURCE_WRITE: Self = Self(1 << 0);
@@ -151,6 +164,25 @@ impl ToolMutationEffects {
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// Parse a protocol enum value. These names are structured tool metadata,
+    /// not natural-language routing keywords.
+    pub fn from_protocol_name(name: &str) -> Option<Self> {
+        match name {
+            "local_source_write" => Some(Self::LOCAL_SOURCE_WRITE),
+            "local_workspace_write" => Some(Self::LOCAL_WORKSPACE_WRITE),
+            "local_derived_write" => Some(Self::LOCAL_DERIVED_WRITE),
+            "repository_write" => Some(Self::REPOSITORY_WRITE),
+            "remote_mutation" => Some(Self::REMOTE_MUTATION),
+            "remote_deploy" => Some(Self::REMOTE_DEPLOY),
+            "external_delivery" => Some(Self::EXTERNAL_DELIVERY),
+            "process_state" => Some(Self::PROCESS_STATE),
+            "configuration" => Some(Self::CONFIGURATION),
+            "destructive" => Some(Self::DESTRUCTIVE),
+            "unspecified" => Some(Self::UNSPECIFIED),
+            _ => None,
+        }
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -507,6 +539,18 @@ impl ToolOutcomeStatus {
     }
 }
 
+/// How the response layer should treat a successful tool result.
+///
+/// This is control-plane metadata, not a canned user response. Tools use it to
+/// distinguish an owner-facing operational outcome from an explicitly
+/// requested diagnostic view while leaving the wording to the model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultPresentation {
+    NaturalSummary,
+    DiagnosticDetail,
+}
+
 /// Structured execution metadata returned by tools.
 ///
 /// This is intentionally minimal and backward-compatible: tools can continue
@@ -578,6 +622,17 @@ pub struct ToolCallMetadata {
     /// Do not copy result content into executor task-activity telemetry.
     #[serde(default)]
     pub suppress_activity_result: bool,
+    /// Presentation policy for this result. `NaturalSummary` asks the response
+    /// layer to communicate the user-level outcome without exposing control-
+    /// plane bookkeeping. `DiagnosticDetail` is selected only when the caller
+    /// explicitly requested those details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ToolResultPresentation>,
+    /// Exact control-plane identifiers observed by the tool. They remain
+    /// available to the agent/runtime but are omitted from a natural summary
+    /// unless the owner supplied the same identifier or requested diagnostics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_identifiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -767,6 +822,20 @@ pub struct ToolExecutionContext {
     pub mandate_execution: bool,
 }
 
+/// A tool-owned decision about whether a previously successful durable receipt
+/// still represents current state.
+///
+/// Most mutations cannot be repeated safely and therefore use `Replay`. Tools
+/// with an exact deterministic postcondition may opt into current-state
+/// reconciliation and either re-execute when that postcondition is missing or
+/// block when the target drifted in a way that could make repetition unsafe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableReplayDecision {
+    Replay,
+    Reexecute { reason: String },
+    Block { reason: String },
+}
+
 /// Tool trait — system tools, terminal, MCP-proxied tools.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -851,6 +920,16 @@ pub trait Tool: Send + Sync {
             arguments,
             self.capabilities(),
         )
+    }
+
+    /// Reconcile a successful durable receipt with current state before replay.
+    ///
+    /// The conservative default always replays. An override may return
+    /// `Reexecute` only when repeating the exact same invocation is safe after
+    /// the observed state transition, and `Block` when current state cannot be
+    /// reconciled safely.
+    async fn durable_replay_decision(&self, _arguments: &str) -> DurableReplayDecision {
+        DurableReplayDecision::Replay
     }
 
     /// Semantic domains this tool can answer or affect.

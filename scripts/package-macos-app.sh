@@ -20,6 +20,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 APP="$HOME/Applications/aidaemon.app"
 LABEL="ai.aidaemon"
 BUNDLE_ID="ai.aidaemon"
@@ -54,9 +55,9 @@ if [ "$DO_BUILD" = "1" ]; then
 fi
 
 if [ -z "$PROFILE" ]; then
-  if [ -x "$PROJECT_DIR/target/release/aidaemon" ]; then PROFILE="release"; else PROFILE="debug"; fi
+  if [ -x "$TARGET_DIR/release/aidaemon" ]; then PROFILE="release"; else PROFILE="debug"; fi
 fi
-BIN="$PROJECT_DIR/target/$PROFILE/aidaemon"
+BIN="$TARGET_DIR/$PROFILE/aidaemon"
 [ -x "$BIN" ] || { echo "error: $BIN not found — build first (e.g. --build)" >&2; exit 1; }
 
 echo "Packaging $PROFILE binary -> $APP"

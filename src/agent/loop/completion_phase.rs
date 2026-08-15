@@ -2,7 +2,9 @@
 
 use super::completion_checks::*;
 use super::response_phase::ResponsePhaseOutcome;
+use super::validation_state::HumanInterventionRequest;
 use super::*;
+use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
 use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::ProviderResponse;
@@ -161,6 +163,63 @@ fn build_final_sanitization_gate_telemetry(
     )
 }
 
+fn build_terminal_verification_request(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+    execution_state: Option<&ExecutionState>,
+    concrete_progress: bool,
+    partial_blocker: impl Into<String>,
+    exact_need: impl Into<String>,
+    next_step: impl Into<String>,
+) -> (HumanInterventionRequest, Option<TaskTerminalCause>) {
+    let exact_need = exact_need.into();
+    let next_step = next_step.into();
+    if concrete_progress {
+        let mut request = build_partial_done_blocked_request_with_plan(
+            turn_context,
+            learning_ctx,
+            execution_state,
+            partial_blocker,
+            exact_need,
+            next_step,
+        );
+        request.user_action_required = false;
+        request.consequence_if_not_provided = None;
+        return (request, None);
+    }
+
+    let mut request = build_abandon_request(
+            turn_context,
+            learning_ctx,
+            "No concrete tool or verification step completed, so there is no partial result to preserve.",
+            exact_need,
+            next_step,
+        );
+    request.user_action_required = false;
+    request.consequence_if_not_provided = None;
+    (request, Some(TaskTerminalCause::HardFailure))
+}
+
+fn build_agent_side_partial_failure(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+    execution_state: Option<&ExecutionState>,
+    blocker: impl Into<String>,
+    next_step: impl Into<String>,
+) -> HumanInterventionRequest {
+    let mut request = build_partial_done_blocked_request_with_plan(
+        turn_context,
+        learning_ctx,
+        execution_state,
+        blocker,
+        "No user input is required for this agent-side execution failure.",
+        next_step,
+    );
+    request.user_action_required = false;
+    request.consequence_if_not_provided = None;
+    request
+}
+
 /// Decide whether ordinary conversational memory maintenance may run after a
 /// completed turn. Mandate workers have their own bounded, typed continuity;
 /// allowing either background path here would both leak mandate content into
@@ -179,6 +238,73 @@ fn post_completion_memory_plan(
         progressive_facts_enabled && fact_extraction_eligible,
         summarization_enabled,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MandateDecisionCommitState {
+    NotApplicable,
+    Missing,
+    Committed,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MandateDecisionCompletionAction {
+    Allow,
+    Retry,
+    Reject,
+}
+
+async fn mandate_decision_commit_state(
+    agent: &Agent,
+) -> anyhow::Result<MandateDecisionCommitState> {
+    let Some(fence) = agent.mandate_execution.as_ref() else {
+        return Ok(MandateDecisionCommitState::NotApplicable);
+    };
+    if fence.worker_task_id != fence.root_task_id {
+        return Ok(MandateDecisionCommitState::NotApplicable);
+    }
+    let Some(decision) = agent
+        .state
+        .get_mandate_decision_for_run(&fence.goal_run_id)
+        .await?
+    else {
+        return Ok(MandateDecisionCommitState::Missing);
+    };
+    if decision.goal_run_id == fence.goal_run_id
+        && decision.mandate_id == fence.mandate_id
+        && decision.mandate_version == fence.mandate_version
+    {
+        Ok(MandateDecisionCommitState::Committed)
+    } else {
+        Ok(MandateDecisionCommitState::Invalid)
+    }
+}
+
+fn mandate_decision_completion_action(
+    state: MandateDecisionCommitState,
+    retries_used: usize,
+    decision_tool_available: bool,
+) -> MandateDecisionCompletionAction {
+    match state {
+        MandateDecisionCommitState::NotApplicable | MandateDecisionCommitState::Committed => {
+            MandateDecisionCompletionAction::Allow
+        }
+        MandateDecisionCommitState::Missing if retries_used == 0 && decision_tool_available => {
+            MandateDecisionCompletionAction::Retry
+        }
+        MandateDecisionCommitState::Missing | MandateDecisionCommitState::Invalid => {
+            MandateDecisionCompletionAction::Reject
+        }
+    }
+}
+
+fn tool_definition_is_named(definition: &Value, expected: &str) -> bool {
+    definition
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        == Some(expected)
 }
 
 #[cfg(test)]
@@ -211,6 +337,162 @@ mod gate_telemetry_tests {
             post_completion_memory_plan(false, true, true, true),
             (true, true)
         );
+    }
+
+    #[test]
+    fn mandate_decision_completion_retries_once_then_rejects_prose() {
+        assert_eq!(
+            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 0, true),
+            MandateDecisionCompletionAction::Retry
+        );
+        assert_eq!(
+            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 1, true),
+            MandateDecisionCompletionAction::Reject
+        );
+        assert_eq!(
+            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 0, false),
+            MandateDecisionCompletionAction::Reject
+        );
+        assert_eq!(
+            mandate_decision_completion_action(MandateDecisionCommitState::Committed, 1, true),
+            MandateDecisionCompletionAction::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_prose_closeout_retries_and_corrected_typed_wait_commits() {
+        use crate::testing::{setup_test_agent_with_mandates, MockProvider};
+        use crate::traits::store_prelude::*;
+        use crate::traits::{Goal, Mandate, MandateAuthority, MandateDecisionOutcome, Task};
+
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::text_response("Decision: WAIT. No worthwhile action is available."),
+            MockProvider::tool_call_response(
+                "manage_mandates",
+                &json!({
+                    "action": "record_decision",
+                    "outcome": "wait",
+                    "activity_level": "quiet",
+                    "rationale": "No worthwhile action is available in this review.",
+                    "reconsider_minutes": 180,
+                    "learning_note": "",
+                    "learning_evidence_receipt_ids": [],
+                    "strategy_key": "",
+                    "strategy_kind": "explore",
+                    "strategy_confidence_bps": 0
+                })
+                .to_string(),
+            ),
+        ]);
+        let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
+        let goal = Goal::new_continuous(
+            "Review a synthetic bounded source",
+            "owner-session",
+            Some(250_000),
+            Some(2_000_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a synthetic bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            3_600,
+            21_600,
+            10_800,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        harness
+            .state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let leased = harness
+            .state
+            .claim_due_mandates(1, "prose-closeout-test", 300)
+            .await
+            .unwrap()
+            .pop()
+            .expect("one due mandate");
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let root_task = Task {
+            id: root_task_id.clone(),
+            goal_id: goal.id.clone(),
+            description: "Record one bounded decision".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run = harness
+            .state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased.review_lease_token.as_deref().unwrap(),
+                &run_id,
+                &root_task,
+            )
+            .await
+            .unwrap();
+        let attempt = harness
+            .state
+            .claim_task_with_lease(&root_task_id, "prose-closeout-task-lead", None, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        harness.agent.set_test_mandate_execution(
+            &mandate.id,
+            mandate.version,
+            mandate.authority.clone(),
+            &goal.id,
+            &root_task_id,
+            &attempt.id,
+            &attempt,
+        );
+
+        let response = harness
+            .agent
+            .handle_message(
+                "synthetic-mandate-session",
+                "Run one bounded autonomous review and record exactly one decision.",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::internal(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.contains("Decision: WAIT"));
+        assert_eq!(harness.provider.call_count().await, 2);
+        let decision = harness
+            .state
+            .get_mandate_decision_for_run(&run.id)
+            .await
+            .unwrap()
+            .expect("corrected durable decision");
+        assert_eq!(decision.outcome, MandateDecisionOutcome::Wait);
+        let calls = harness.provider.call_log.lock().await;
+        let retry_messages = &calls[1].messages;
+        assert!(retry_messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("no durable decision"))
+        }));
     }
 
     #[test]
@@ -345,11 +627,13 @@ pub(super) async fn run_completion_phase(
     let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
     let mut completion_progress = ctx.completion_progress.clone();
     let mut validation_state = ctx.validation_state.clone();
+    let mut terminal_cause = None;
     let turn_context = ctx.turn_context;
     let execution_requirement = ctx.execution_requirement;
-    let guided_tool_recovery = agent.trust_tier_for_model(&model)
-        == crate::agent::trust_tier::ModelTrustTier::Guided
-        && execution_requirement.requires_execution();
+    // Execution obligations are lifecycle invariants, not model-quality
+    // heuristics. Autonomous models choose their own strategy, but a first-pass
+    // text denial is not evidence that an actionable request was resolved.
+    let execution_tool_recovery = execution_requirement.requires_execution();
     let force_text_allowed = completion_contract_allows_force_text(
         &turn_context.completion_contract,
         &completion_progress,
@@ -377,6 +661,94 @@ pub(super) async fn run_completion_phase(
         // bounce model-authored pastes — a daemon-built reply is deliberate,
         // already policy-gated at its build site.
         let model_authored_reply = reply.clone();
+
+        // A mandate task lead's prose is never the authoritative decision.
+        // Give a missing typed commit one bounded correction turn, then fail
+        // closed so background finalization can safely schedule a retry.
+        let mandate_commit_state = mandate_decision_commit_state(agent).await?;
+        let decision_tool_available = tool_defs
+            .iter()
+            .any(|definition| tool_definition_is_named(definition, "manage_mandates"));
+        match mandate_decision_completion_action(
+            mandate_commit_state,
+            completion_progress.mandate_decision_retry_count,
+            decision_tool_available,
+        ) {
+            MandateDecisionCompletionAction::Allow => {}
+            MandateDecisionCompletionAction::Retry => {
+                completion_progress.mandate_decision_retry_count += 1;
+                force_text_response = false;
+                stall_count = 0;
+                consecutive_clean_iterations = 0;
+                pending_system_messages.push(SystemDirective::MandateDecisionCommitRequired);
+                agent
+                    .emit_warning_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::PostExecutionValidation,
+                        "Blocked mandate prose completion without a durable decision".to_string(),
+                        json!({
+                            "condition": "mandate_decision_commit_missing",
+                            "goal_run_id": agent
+                                .mandate_execution
+                                .as_ref()
+                                .map(|fence| fence.goal_run_id.as_str()),
+                            "retry": completion_progress.mandate_decision_retry_count,
+                        }),
+                    )
+                    .await;
+                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+            }
+            MandateDecisionCompletionAction::Reject => {
+                let error_message = match mandate_commit_state {
+                    MandateDecisionCommitState::Invalid => {
+                        "Mandate deliberator found a decision for the current run with mismatched immutable identity."
+                    }
+                    _ => {
+                        "Mandate deliberator returned without committing an exact durable decision after its bounded correction turn."
+                    }
+                }
+                .to_string();
+                agent
+                    .emit_warning_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::PostExecutionValidation,
+                        "Rejected mandate prose completion without a durable decision".to_string(),
+                        json!({
+                            "condition": "mandate_decision_commit_rejected",
+                            "goal_run_id": agent
+                                .mandate_execution
+                                .as_ref()
+                                .map(|fence| fence.goal_run_id.as_str()),
+                            "commit_state": format!("{mandate_commit_state:?}"),
+                            "retries_used": completion_progress.mandate_decision_retry_count,
+                            "decision_tool_available": decision_tool_available,
+                        }),
+                    )
+                    .await;
+                agent
+                    .emit_task_end(
+                        emitter,
+                        task_id,
+                        TaskStatus::Failed,
+                        TaskOutcome::Failed,
+                        task_start,
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        Some(error_message.clone()),
+                        None,
+                    )
+                    .await;
+                learning_ctx.completed_naturally = false;
+                learning_ctx.task_outcome = Some(TaskOutcome::Failed);
+                return Ok(Some(ResponsePhaseOutcome::Return(Err(anyhow::anyhow!(
+                    error_message
+                )))));
+            }
+        }
 
         // If we used an identity-attack prefill, prepend it so the user
         // sees the full decline (the API only returns continuation tokens).
@@ -516,11 +888,13 @@ pub(super) async fn run_completion_phase(
             // Fall through to the normal completion path (sanitize + return)
         } else if should_enforce_no_tool_text_when_tools_required(
             &reply,
-            guided_tool_recovery,
-            learning_ctx.tool_calls.len(),
+            execution_tool_recovery,
+            learning_ctx
+                .tool_calls
+                .len()
+                .saturating_add(validation_state.failed_checks.len()),
             agent.depth,
-        ) && !reply_admits_unfulfilled_request(&reply)
-        {
+        ) {
             if tool_defs.is_empty() || force_text_response {
                 if !force_text_response {
                     // Only show the "no tools available" message when tools are genuinely
@@ -544,17 +918,8 @@ pub(super) async fn run_completion_phase(
                 // forever.  This prevents stalls on queries the intent gate
                 // classified as needing tools but the model can answer directly
                 // (e.g., "Tell me a joke in Spanish", "List your capabilities").
-                if (deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
-                    && is_substantive_text_response(&reply, 15))
-                    || !agent
-                        .supervision_gate_enforced(
-                            "tools_required_text_block",
-                            &model,
-                            emitter,
-                            task_id,
-                            iteration,
-                        )
-                        .await
+                if deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
+                    && is_substantive_text_response(&reply, 15)
                 {
                     info!(
                             session_id,
@@ -566,13 +931,14 @@ pub(super) async fn run_completion_phase(
                     deferred_no_tool_streak = 0;
                     // Fall through to normal completion path
                 } else {
-                    pending_system_messages.push(SystemDirective::RoutingContractEnforcement);
+                    pending_system_messages
+                        .push(SystemDirective::ExecutionResolutionEvidenceRequired);
                     agent.emit_decision_point(
                             emitter,
                             task_id,
                             iteration,
                             DecisionType::IntentGate,
-                            "Intent gate contract enforced: blocked text-only answer while tools required"
+                            "Execution obligation enforced: evidence-seeking pass required before text completion"
                                 .to_string(),
                             json!({
                                 "condition":"tools_required_no_tool_response",
@@ -657,9 +1023,9 @@ pub(super) async fn run_completion_phase(
             let mutation_gate_block_condition = !force_text_fast_path_accepted
                 && !force_text_response
                 && agent.depth == 0
-                && (unbacked_mutation_claim || unfulfilled_concrete_mutation)
-                && has_tool_attempts
-                && stall_count < 2;
+                && (unbacked_mutation_claim
+                    || (unfulfilled_concrete_mutation && has_tool_attempts))
+                && completion_progress.mutation_claim_nudge_count == 0;
             let zero_tool_claim_condition = !has_tool_attempts && unbacked_mutation_claim;
             let (outcome, skip_reason) = if force_text_fast_path_accepted {
                 ("skipped_force_text_fast_path", Some("force_text_fast_path"))
@@ -1100,7 +1466,7 @@ pub(super) async fn run_completion_phase(
                 iteration, "Recovered empty force-text completion with shared send_file closeout"
             );
         } else if reply.is_empty() && total_successful_tool_calls > 0 && agent.depth == 0 {
-            reply = "I executed the requested tools, but I couldn't recover a usable output snapshot. Please ask me to rerun the command and I'll return the exact result.".to_string();
+            reply = "I executed the requested tools, but no usable output snapshot was retained, so I couldn't verify the result.".to_string();
             info!(
                 session_id,
                 iteration, "Tool execution completed but no output snapshot was available"
@@ -1393,6 +1759,12 @@ pub(super) async fn run_completion_phase(
             if completion_progress.verification_pending
                 && turn_context.completion_contract.requires_observation
             {
+                let has_concrete_progress = super::stopping_progress::has_any_concrete_execution(
+                    turn_context,
+                    &completion_progress,
+                    false,
+                    total_successful_tool_calls,
+                );
                 execution_state.record_validation_round();
                 validation_state.record_failure(ValidationFailure::VerificationPending);
                 execution_state.mark_persisted_now();
@@ -1408,10 +1780,7 @@ pub(super) async fn run_completion_phase(
                                 .to_string(),
                             true,
                         );
-                    let made_progress = !learning_ctx.tool_calls.is_empty()
-                        || completion_progress.mutation_count > 0
-                        || completion_progress.observation_count > 0;
-                    let request = if made_progress {
+                    let request = if has_concrete_progress {
                         build_reduce_scope_request_with_plan(
                                 turn_context,
                                 learning_ctx,
@@ -1421,22 +1790,29 @@ pub(super) async fn run_completion_phase(
                                 "I will spend the next validation pass on the reduced scope and then report the confirmed outcome.",
                             )
                     } else {
-                        build_partial_done_blocked_request_with_plan(
+                        let (request, cause) = build_terminal_verification_request(
                                 turn_context,
                                 learning_ctx,
                                 Some(execution_state),
+                                false,
                                 "I used the current validation budget and still do not have a confirmed final result.",
                                 "A narrower scope, explicit permission to keep validating, or the exact verification target I should confirm.",
                                 "I will spend the next validation pass on a concrete re-check and then report the confirmed outcome.",
-                            )
+                            );
+                        terminal_cause = cause;
+                        request
                     };
                     agent.emit_warning_decision_point(
                             emitter,
                             task_id,
                             iteration,
                             DecisionType::PostExecutionValidation,
-                            "Surfacing partial result because validation budget is exhausted"
-                                .to_string(),
+                            if has_concrete_progress {
+                                "Surfacing partial result because validation budget is exhausted"
+                            } else {
+                                "Failing verification because validation budget was exhausted before concrete progress"
+                            }
+                            .to_string(),
                             json!({
                                 "condition": "validation_budget_exhausted",
                                 "outcome": request.outcome.clone(),
@@ -1451,20 +1827,19 @@ pub(super) async fn run_completion_phase(
                         .await;
                     reply = request.render_user_message();
                     pending_external_action_ack = None;
-                    completion_progress.verification_pending = false;
                 } else if completion_progress.verification_block_count >= 2 {
-                    // Safety valve: verification blocked 2+ times but the model
-                    // already did the work.  Clear the guard silently and let the
-                    // LLM's natural reply through instead of replacing it with an
-                    // ugly "I'm blocked" template.  Lowered from 3 to 2: each
-                    // verification loop costs a full LLM call, and budget often
-                    // exhausts before reaching 3, producing an "I'm blocked"
-                    // message instead of presenting completed work.
+                    // A bounded retry may end in an honest partial result only
+                    // when concrete work exists. With no successful execution,
+                    // the typed terminal cause must remain a failure.
                     learning_ctx.record_replay_note(
                             ReplayNoteCategory::ValidationFailure,
                             "verification_stall_escape",
-                            "Verification stalled 2+ times; clearing guard to prevent infinite loop. Presenting work as-is."
-                                .to_string(),
+                            if has_concrete_progress {
+                                "Verification stalled 2+ times; returning an honest partial result without claiming verification."
+                            } else {
+                                "Verification stalled 2+ times without concrete progress; failing the attempt."
+                            }
+                            .to_string(),
                             true,
                         );
                     agent.emit_warning_decision_point(
@@ -1472,8 +1847,12 @@ pub(super) async fn run_completion_phase(
                             task_id,
                             iteration,
                             DecisionType::PostExecutionValidation,
-                            "Clearing verification guard after 2+ stalls — presenting work as-is"
-                                .to_string(),
+                            if has_concrete_progress {
+                                "Verification retries exhausted — returning an honest partial result"
+                            } else {
+                                "Verification retries exhausted without concrete progress — failing the attempt"
+                            }
+                            .to_string(),
                             json!({
                                 "verification_block_count": completion_progress.verification_block_count,
                                 "stall_count": stall_count,
@@ -1484,27 +1863,23 @@ pub(super) async fn run_completion_phase(
                         session_id,
                         iteration,
                         verification_block_count = completion_progress.verification_block_count,
-                        "Verification stalled 3+ times; clearing guard and presenting work as-is"
+                        "Verification retries exhausted; suppressing unverified completion claim"
                     );
-                    // Just clear the flag — don't override `reply`.
-                    completion_progress.verification_pending = false;
+                    let (request, cause) = build_terminal_verification_request(
+                        turn_context,
+                        learning_ctx,
+                        Some(execution_state),
+                        has_concrete_progress,
+                        "I completed part of the request, but I could not obtain the required final verification receipt.",
+                        "A successful read-only verification against the requested target or output.",
+                        "Once that check succeeds, I can report the outcome as verified.",
+                    );
+                    terminal_cause = cause;
+                    reply = request.render_user_message();
+                    pending_external_action_ack = None;
                 } else if tool_defs.is_empty() || force_text_response {
-                    // When tools are unavailable (force-text mode or empty tool set),
-                    // check if the LLM already produced a substantive reply that
-                    // serves as de-facto verification evidence.  Replacing a real
-                    // answer like "All tests pass — here's the summary" with an
-                    // ugly "I'm blocked" template is always worse for the user.
-                    if !reply.is_empty() && reply.len() > 100 {
-                        warn!(
-                                session_id,
-                                iteration,
-                                reply_len = reply.len(),
-                                "Verification required but tools unavailable; LLM provided substantive reply — presenting as-is"
-                            );
-                        completion_progress.verification_pending = false;
-                    } else {
-                        validation_state.note_retry(LoopRepetitionReason::VerificationPending);
-                        learning_ctx.record_replay_note(
+                    validation_state.note_retry(LoopRepetitionReason::VerificationPending);
+                    learning_ctx.record_replay_note(
                             ReplayNoteCategory::ValidationFailure,
                             "verification_unavailable_in_phase",
                             "Verification was still required, but this phase could not run the needed read-only checks."
@@ -1518,21 +1893,27 @@ pub(super) async fn run_completion_phase(
                                 .to_string(),
                             true,
                         );
-                        let request = build_partial_done_blocked_request_with_plan(
-                            turn_context,
-                            learning_ctx,
-                            Some(execution_state),
-                            "I completed part of the request, but the final outcome still needs a read-only verification step.",
-                            "A final read-only verification against the current target/output.",
-                            "Once verification is available, I will run that check and then report the confirmed result.",
-                        );
-                        agent.emit_warning_decision_point(
+                    let (request, cause) = build_terminal_verification_request(
+                        turn_context,
+                        learning_ctx,
+                        Some(execution_state),
+                        has_concrete_progress,
+                        "I completed part of the request, but the final outcome still needs a read-only verification step.",
+                        "A final read-only verification against the current target/output.",
+                        "Once verification is available, I will run that check and then report the confirmed result.",
+                    );
+                    terminal_cause = cause;
+                    agent.emit_warning_decision_point(
                             emitter,
                             task_id,
                             iteration,
                             DecisionType::PostExecutionValidation,
-                            "Surfacing partial result because post-execution verification cannot run in this phase"
-                                .to_string(),
+                            if has_concrete_progress {
+                                "Surfacing partial result because post-execution verification cannot run in this phase"
+                            } else {
+                                "Failing the attempt because verification cannot run and no concrete work completed"
+                            }
+                            .to_string(),
                             json!({
                                 "outcome": request.outcome.clone(),
                                 "approval_state": request.approval_state.clone(),
@@ -1551,12 +1932,8 @@ pub(super) async fn run_completion_phase(
                             force_text_response,
                             "Completion verification required but tools unavailable; clearing guard"
                         );
-                        reply = request.render_user_message();
-                        pending_external_action_ack = None;
-                    }
-                    // Avoid deadlocks when tools cannot run in this phase, but
-                    // preserve the fact that verification did not happen in the reply itself.
-                    completion_progress.verification_pending = false;
+                    reply = request.render_user_message();
+                    pending_external_action_ack = None;
                 } else {
                     validation_state.note_retry(LoopRepetitionReason::VerificationPending);
                     learning_ctx.record_replay_note(
@@ -1595,26 +1972,39 @@ pub(super) async fn run_completion_phase(
                         .verification_block_count
                         .saturating_add(1);
 
-                    // Safety valve: if we just hit the threshold, clear the guard
-                    // immediately and let the current reply through. Otherwise the
-                    // stopping_phase will catch the high stall_count first and
-                    // produce an ugly activity dump.
+                    // Bound retries, then preserve a partial result only when
+                    // concrete work exists. Never clear missing verification
+                    // merely because the model stalled.
                     if completion_progress.verification_block_count >= 2 {
                         learning_ctx.record_replay_note(
                                 ReplayNoteCategory::ValidationFailure,
                                 "verification_stall_escape",
-                                "Verification stalled 2+ times; clearing guard in blocking branch to prevent loop."
-                                    .to_string(),
+                                if has_concrete_progress {
+                                    "Verification stalled 2+ times; returning a partial result without claiming success."
+                                } else {
+                                    "Verification stalled 2+ times without concrete progress; failing the attempt."
+                                }
+                                .to_string(),
                                 true,
                             );
                         warn!(
                                 session_id,
                                 iteration,
                                 verification_block_count = completion_progress.verification_block_count,
-                                "Verification stalled 2+ times; clearing guard in blocking branch — presenting work as-is"
+                                "Verification retries exhausted in blocking branch; preserving evidence-based outcome"
                             );
-                        completion_progress.verification_pending = false;
-                        // Fall through to normal completion — don't ContinueLoop.
+                        let (request, cause) = build_terminal_verification_request(
+                            turn_context,
+                            learning_ctx,
+                            Some(execution_state),
+                            has_concrete_progress,
+                            "I completed part of the request, but the required verification still has no successful receipt.",
+                            "A successful read-only verification against the requested target or output.",
+                            "Once that check succeeds, I can report the outcome as verified.",
+                        );
+                        terminal_cause = cause;
+                        reply = request.render_user_message();
+                        pending_external_action_ack = None;
                     } else {
                         consecutive_clean_iterations = 0;
                         pending_system_messages.push(
@@ -1647,11 +2037,9 @@ pub(super) async fn run_completion_phase(
         // re-decode). The gate targets false success claims and content
         // dumps, both of which lack such an admission.
         if !force_text_fast_path_accepted
-            && !force_text_response
             && agent.depth == 0
-            && (unbacked_mutation_claim || unfulfilled_concrete_mutation)
-            && has_tool_attempts
-            && stall_count < 2
+            && (unbacked_mutation_claim || (unfulfilled_concrete_mutation && has_tool_attempts))
+            && completion_progress.mutation_claim_nudge_count == 0
             && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
             && agent
                 .supervision_gate_enforced_with_context(
@@ -1669,6 +2057,9 @@ pub(super) async fn run_completion_phase(
                 )
                 .await
         {
+            completion_progress.mutation_claim_nudge_count = completion_progress
+                .mutation_claim_nudge_count
+                .saturating_add(1);
             stall_count = stall_count.saturating_add(1);
             consecutive_clean_iterations = 0;
             pending_system_messages.push(SystemDirective::MutationStillRequired);
@@ -1699,6 +2090,30 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
+        if !force_text_fast_path_accepted
+            && agent.depth == 0
+            && (unbacked_mutation_claim || (unfulfilled_concrete_mutation && has_tool_attempts))
+            && completion_progress.mutation_claim_nudge_count > 0
+            && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
+        {
+            let request = build_agent_side_partial_failure(
+                turn_context,
+                learning_ctx,
+                Some(execution_state),
+                "I do not have a successful typed receipt for the requested side effect, so I cannot claim it completed.",
+                "After the action succeeds, I will verify the resulting state before reporting completion.",
+            );
+            reply = request.render_user_message();
+            pending_external_action_ack = None;
+            // Preserve the unresolved proof in task-outcome derivation.
+            completion_progress.verification_pending = true;
+            warn!(
+                session_id,
+                iteration,
+                "Suppressed side-effect success claim after bounded receipt retry"
+            );
+        }
+
         // Guardrail: don't accept "I'll do X" / workflow narration as
         // completion text. Either keep the loop alive (if tools exist)
         // or return an explicit blocker (if no tools are available).
@@ -1722,8 +2137,6 @@ pub(super) async fn run_completion_phase(
         };
         let reply_is_substantive =
             !has_structural_markers && is_substantive_text_response(&reply, 200);
-        let incomplete_live_work_summary = looks_like_incomplete_live_work_summary(&reply);
-        let incomplete_retry_plan = looks_like_incomplete_retry_plan(&reply);
         // Fabricated-action guard: a reply that claims a completed side
         // effect ("I have deleted the folder") in a task that made ZERO
         // tool calls cannot be truthful. Treat it like a deferred action so the
@@ -1766,15 +2179,11 @@ pub(super) async fn run_completion_phase(
         if !used_identity_prefill
             && !force_text_fast_path_accepted
             && (looks_like_deferred_action_response(&reply)
-                || incomplete_live_work_summary
-                || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
                 || claims_false_in_progress
                 || terminal_unbacked_plan)
             && (!reply_is_substantive
-                || incomplete_live_work_summary
-                || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
                 || claims_false_in_progress
@@ -1796,8 +2205,6 @@ pub(super) async fn run_completion_phase(
                             "claims_unfulfilled_delegation": claims_unfulfilled_delegation,
                             "claims_false_in_progress": claims_false_in_progress,
                             "terminal_unbacked_plan": terminal_unbacked_plan,
-                            "incomplete_live_work_summary": incomplete_live_work_summary,
-                            "incomplete_retry_plan": incomplete_retry_plan,
                         }),
                     )
                     .await)
@@ -1809,7 +2216,6 @@ pub(super) async fn run_completion_phase(
             // Replace it with an activity summary of what was actually done.
             if has_tool_attempts
                 && stall_count >= 1
-                && !incomplete_retry_plan
                 && !claims_false_in_progress
             {
                 if force_text_response && !learning_ctx.tool_calls.is_empty() {
@@ -2052,8 +2458,6 @@ pub(super) async fn run_completion_phase(
                             } else {
                                 SystemDirective::DeferredToolCallRequired
                             }
-                        } else if incomplete_live_work_summary || incomplete_retry_plan {
-                            SystemDirective::LiveWorkPivotRequired
                         } else {
                             SystemDirective::DeferredProvideConcreteResults
                         };
@@ -2233,7 +2637,7 @@ pub(super) async fn run_completion_phase(
         // with repetitive content; without this the user sees a wall of
         // duplicated text split across many chunked messages.
         let original_final_reply_chars = reply.trim().chars().count();
-        let (reply, collapsed_repetition) =
+        let (mut reply, collapsed_repetition) =
             crate::tools::sanitize::collapse_degenerate_repetition(&reply);
         if collapsed_repetition {
             warn!(
@@ -2242,6 +2646,32 @@ pub(super) async fn run_completion_phase(
                 original_len = original_final_reply_chars,
                 collapsed_len = reply.trim().chars().count(),
                 "Collapsed degenerate repetition loop in final reply"
+            );
+        }
+
+        let leaked_internal_identifiers = if reply_is_model_authored {
+            execution_state.unrequested_internal_identifiers(&reply, user_text)
+        } else {
+            Vec::new()
+        };
+        if !leaked_internal_identifiers.is_empty() && !empty_response_retry_used {
+            warn!(
+                session_id,
+                iteration,
+                identifier_count = leaked_internal_identifiers.len(),
+                "Natural outcome reply exposed internal identifiers — retrying presentation once"
+            );
+            empty_response_retry_used = true;
+            empty_response_retry_pending = true;
+            empty_response_retry_note =
+                Some("natural_outcome_exposed_internal_identifiers".to_string());
+            pending_system_messages.push(SystemDirective::NaturalToolOutcomePresentation);
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
+        if !leaked_internal_identifiers.is_empty() {
+            reply = crate::tools::sanitize::remove_lines_with_identifiers(
+                &reply,
+                &leaked_internal_identifiers,
             );
         }
 
@@ -2330,7 +2760,7 @@ pub(super) async fn run_completion_phase(
             sanitized_reply
         };
 
-        let reply = match channel_ctx.visibility {
+        let mut reply = match channel_ctx.visibility {
             ChannelVisibility::Public | ChannelVisibility::PublicExternal => {
                 let (sanitized, had_redactions) = crate::tools::sanitize::sanitize_output(&reply);
                 if had_redactions && channel_ctx.visibility == ChannelVisibility::PublicExternal {
@@ -2579,6 +3009,87 @@ pub(super) async fn run_completion_phase(
             }
         }
 
+        // Exact-history honesty gate. Immediate context may answer the question
+        // directly; this only intervenes when the draft claims the wording is
+        // unavailable and canonical history has not been queried.
+        if turn_context.completion_contract.requires_exact_history
+            && crate::agent::response_analysis::reply_claims_history_unavailable(&reply)
+            && !execution_state
+                .outcome_ledger
+                .iter()
+                .any(|entry| entry.tool_name == "search_history" && entry.success)
+        {
+            if completion_progress.history_lookup_nudge_count == 0
+                && !force_text_response
+                && tool_defs
+                    .iter()
+                    .any(|schema| tool_definition_is_named(schema, "search_history"))
+            {
+                completion_progress.history_lookup_nudge_count = completion_progress
+                    .history_lookup_nudge_count
+                    .saturating_add(1);
+                pending_system_messages.push(SystemDirective::ExactHistoryLookupRequired);
+                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+            }
+            let request = build_agent_side_partial_failure(
+                turn_context,
+                learning_ctx,
+                Some(execution_state),
+                "I could not establish the exact earlier wording from immediate context or a successful retained-history lookup, so I will not guess it.",
+                "Once that lookup is available, I can quote or summarize the exact earlier condition.",
+            );
+            reply = request.render_user_message();
+            completion_progress.verification_pending = true;
+            pending_external_action_ack = None;
+        }
+
+        // Explicit source contract: both successful source-page reads and
+        // direct citations in the candidate answer are required. Approval
+        // prompts cannot count as evidence because they produce neither.
+        if turn_context.completion_contract.minimum_sources > 0 {
+            let required = turn_context.completion_contract.minimum_sources;
+            let sources_read = execution_state.web_source_urls.len();
+            let sources_cited = execution_state.cited_web_source_count(&reply);
+            if sources_read < required || sources_cited < required {
+                if completion_progress.source_evidence_nudge_count == 0
+                    && !force_text_response
+                    && !tool_defs.is_empty()
+                {
+                    completion_progress.source_evidence_nudge_count = completion_progress
+                        .source_evidence_nudge_count
+                        .saturating_add(1);
+                    pending_system_messages.push(SystemDirective::SourceEvidenceRequired {
+                        required,
+                        sources_read,
+                        sources_cited,
+                        primary: turn_context.completion_contract.requires_primary_sources,
+                    });
+                    warn!(
+                        session_id,
+                        iteration,
+                        required,
+                        sources_read,
+                        sources_cited,
+                        "Blocking completion until explicit source requirement is met"
+                    );
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                }
+
+                let request = build_agent_side_partial_failure(
+                    turn_context,
+                    learning_ctx,
+                    Some(execution_state),
+                    format!(
+                        "I could not satisfy the requested evidence threshold: {sources_read} qualifying source page(s) were read and {sources_cited} were cited, out of {required} required."
+                    ),
+                    "Once those sources are available, I can complete the comparison without overstating verification.",
+                );
+                reply = request.render_user_message();
+                completion_progress.verification_pending = true;
+                pending_external_action_ack = None;
+            }
+        }
+
         // Corroboration guard: an enumeration-style answer produced from web
         // research must rest on at least two successfully read source pages —
         // snippets-only or single-page answers get one chance to fetch a
@@ -2615,6 +3126,50 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
+        // Approval-producing tools normally await their resolution before
+        // returning. This durable task-local projection is a defense-in-depth
+        // gate against any transport/restart race: pending authority can never
+        // be reported as completed or verified.
+        match agent
+            .event_store
+            .get_pending_task_interactions(task_id)
+            .await
+        {
+            Ok(pending) if !pending.is_empty() => {
+                let request = build_partial_done_blocked_request_with_plan(
+                    turn_context,
+                    learning_ctx,
+                    Some(execution_state),
+                    "The requested action is still awaiting approval, so it has not been performed or verified.",
+                    "Resolution of the pending approval request.",
+                    "After approval is resolved, I will execute the action and report only the resulting receipts.",
+                );
+                reply = request.render_user_message();
+                completion_progress.verification_pending = true;
+                pending_external_action_ack = None;
+                warn!(
+                    session_id,
+                    iteration,
+                    pending_approvals = pending.len(),
+                    "Suppressed completion while task approval remains unresolved"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, task_id, "Could not query task approval projection at completion");
+                let request = build_agent_side_partial_failure(
+                    turn_context,
+                    learning_ctx,
+                    Some(execution_state),
+                    "I could not verify whether the task still has a pending approval, so I cannot safely report the action as completed.",
+                    "Once approval state is available, I will continue or report the resulting receipts.",
+                );
+                reply = request.render_user_message();
+                completion_progress.verification_pending = true;
+                pending_external_action_ack = None;
+            }
+        }
+
         let has_unrecovered_errors = learning_ctx.has_unrecovered_model_error();
         let (sanitization_summary, sanitization_metadata) = build_final_sanitization_gate_telemetry(
             original_final_reply_chars,
@@ -2639,7 +3194,7 @@ pub(super) async fn run_completion_phase(
             &turn_context.completion_contract,
             response_has_user_value(&reply, total_successful_tool_calls),
             has_unrecovered_errors,
-            None,
+            terminal_cause,
         )
         .derive_outcome();
 

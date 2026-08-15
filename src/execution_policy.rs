@@ -131,6 +131,7 @@ impl PolicyBundle {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UncertaintySignals {
     pub missing_required_slot: bool,
@@ -144,6 +145,7 @@ pub struct UncertaintySignals {
     pub prior_immediate_failure: bool,
 }
 
+#[cfg(test)]
 pub fn score_uncertainty(signals: UncertaintySignals) -> f32 {
     let mut score = 0.0f32;
     if signals.missing_required_slot {

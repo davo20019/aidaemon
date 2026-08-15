@@ -11,7 +11,7 @@ use teloxide::error_handlers::{ErrorHandler, LoggingErrorHandler};
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo,
+    KeyboardButton, KeyboardMarkup, LinkPreviewOptions, ParseMode, WebAppInfo,
 };
 use teloxide::update_listeners::webhooks;
 use teloxide::RequestError;
@@ -30,13 +30,13 @@ use super::telegram_bootstrap_signing::{
     random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
     terminal_tenant_bot_bootstrap_url,
 };
-use crate::agent::Agent;
-use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
 use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
 use crate::config::{AppConfig, TelegramWebhookConfig};
+use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
 use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
@@ -44,6 +44,16 @@ use crate::types::{
     ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate,
     UserRole,
 };
+
+fn disabled_link_preview() -> LinkPreviewOptions {
+    LinkPreviewOptions {
+        is_disabled: true,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: false,
+        show_above_text: false,
+    }
+}
 
 pub struct TelegramChannel {
     /// Bot username fetched from Telegram API (e.g., "coding_bot", "debug_bot").
@@ -61,7 +71,7 @@ pub struct TelegramChannel {
     allowed_user_ids: StdRwLock<Vec<u64>>,
     /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
     owner_user_ids: Vec<u64>,
-    agent: Arc<Agent>,
+    agent: Arc<dyn ChannelAgentRuntime>,
     config_path: PathBuf,
     /// Pending approvals keyed by a unique callback ID.
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
@@ -86,8 +96,6 @@ pub struct TelegramChannel {
     terminal_web_app_url: String,
     /// Terminal-lite session manager.
     terminal_lite: crate::terminal_lite::TerminalLiteManager,
-    /// Daemon start time used for post-restart UX guardrails.
-    started_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -220,21 +228,12 @@ fn interpret_terminal_bot_sync_response(
 }
 
 impl TelegramChannel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
         webhook: TelegramWebhookConfig,
         owner_user_ids: Vec<u64>,
-        agent: Arc<Agent>,
-        config_path: PathBuf,
-        session_map: SessionMap,
-        task_registry: Arc<TaskRegistry>,
-        files_enabled: bool,
-        inbox_dir: PathBuf,
-        max_file_size_mb: u64,
-        state: Arc<dyn StateStore>,
-        watchdog_stale_threshold_secs: u64,
+        runtime: ChannelRuntimeDeps,
         terminal_web_app_url: String,
         terminal_allowed_prefixes: Vec<String>,
     ) -> Self {
@@ -253,22 +252,35 @@ impl TelegramChannel {
             webhook,
             allowed_user_ids: StdRwLock::new(allowed_user_ids),
             owner_user_ids,
-            agent,
-            config_path,
+            agent: runtime.agent,
+            config_path: runtime.config_path,
             pending_approvals: Mutex::new(HashMap::new()),
-            session_map,
-            task_registry,
-            files_enabled,
-            inbox_dir,
-            max_file_size_mb,
-            state,
+            session_map: runtime.session_map,
+            task_registry: runtime.task_registry,
+            files_enabled: runtime.files_enabled,
+            inbox_dir: runtime.inbox_dir,
+            max_file_size_mb: runtime.max_file_size_mb,
+            state: runtime.state,
             channel_hub: StdRwLock::new(None),
-            watchdog_stale_threshold_secs,
+            watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
             terminal_web_app_url,
             terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
                 terminal_allowed_prefixes,
             ),
-            started_at: Instant::now(),
+        }
+    }
+
+    fn runtime_deps(&self) -> ChannelRuntimeDeps {
+        ChannelRuntimeDeps {
+            agent: self.agent.clone(),
+            config_path: self.config_path.clone(),
+            session_map: self.session_map.clone(),
+            task_registry: self.task_registry.clone(),
+            files_enabled: self.files_enabled,
+            inbox_dir: self.inbox_dir.clone(),
+            max_file_size_mb: self.max_file_size_mb,
+            state: self.state.clone(),
+            watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
         }
     }
 
@@ -866,10 +878,13 @@ impl TelegramChannel {
             return;
         }
 
-        // Parse callback data: "approve:{once|session|always|deny}:{id}"
-        // or "goal:{confirm|cancel}:{id}"
+        // Parse callback data: "approve:{once|session|always|deny}:{id}",
+        // "goal:{confirm|cancel}:{id}", or the structurally distinct
+        // "autopilot:{confirm|edit|cancel}:{id}".
         let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3 || (parts[0] != "approve" && parts[0] != "goal") || parts[2].is_empty()
+        if parts.len() != 3
+            || !matches!(parts[0], "approve" | "goal" | "autopilot")
+            || parts[2].is_empty()
         {
             let _ = bot
                 .answer_callback_query(q.id)
@@ -883,10 +898,28 @@ impl TelegramChannel {
         let action = parts[1];
         let approval_id = parts[2];
 
-        let (response, label) = if prefix == "goal" {
+        let (response, label) = if matches!(prefix, "goal" | "autopilot") {
             match action {
-                "confirm" => (ApprovalResponse::AllowOnce, "Goal approved ✅".to_string()),
-                "cancel" => (ApprovalResponse::Deny, "Goal cancelled".to_string()),
+                "confirm" => (
+                    ApprovalResponse::AllowOnce,
+                    if prefix == "autopilot" {
+                        "Autopilot enabled ✅"
+                    } else {
+                        "Goal approved ✅"
+                    }
+                    .to_string(),
+                ),
+                "cancel" | "edit" => (
+                    ApprovalResponse::Deny,
+                    if prefix == "autopilot" && action == "edit" {
+                        "Edit Autopilot permissions"
+                    } else if prefix == "autopilot" {
+                        "Autopilot cancelled"
+                    } else {
+                        "Goal cancelled"
+                    }
+                    .to_string(),
+                ),
                 _ => {
                     let _ = bot
                         .answer_callback_query(q.id)
@@ -950,11 +983,21 @@ impl TelegramChannel {
 
         if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
             let original = m.text().unwrap_or("");
-            let updated = if prefix == "goal" {
-                let status = if matches!(response, ApprovalResponse::Deny) {
-                    "❌ Goal cancelled\nNothing was activated."
+            let updated = if matches!(prefix, "goal" | "autopilot") {
+                let status = if prefix == "autopilot" && action == "edit" {
+                    "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
+                } else if matches!(response, ApprovalResponse::Deny) {
+                    if prefix == "autopilot" {
+                        "❌ Autopilot cancelled\nNo new autonomy was activated."
+                    } else {
+                        "❌ Goal cancelled\nNothing was activated."
+                    }
                 } else {
-                    "✅ Goal approved\nActivation is continuing now."
+                    if prefix == "autopilot" {
+                        "✅ Autopilot enabled\nActivation is continuing now."
+                    } else {
+                        "✅ Goal approved\nActivation is continuing now."
+                    }
                 };
                 format!("{}\n\n{status}", original.trim_end())
             } else {
@@ -966,7 +1009,7 @@ impl TelegramChannel {
             // approval doesn't linger and get mistaken for one still awaiting a
             // response. This runs only after the user has responded, so a
             // still-pending prompt is never removed out from under them.
-            if prefix != "goal" {
+            if !matches!(prefix, "goal" | "autopilot") {
                 if let Some(delay) = Self::resolved_approval_dismiss_delay() {
                     let bot = bot.clone();
                     let chat_id = m.chat.id;
@@ -3394,15 +3437,7 @@ impl TelegramChannel {
                         .clone(),
                     TelegramWebhookConfig::default(),
                     self.owner_user_ids.clone(),
-                    Arc::clone(&self.agent),
-                    self.config_path.clone(),
-                    self.session_map.clone(),
-                    Arc::clone(&self.task_registry),
-                    self.files_enabled,
-                    self.inbox_dir.clone(),
-                    self.max_file_size_mb,
-                    Arc::clone(&self.state),
-                    self.watchdog_stale_threshold_secs,
+                    self.runtime_deps(),
                     self.terminal_web_app_url.clone(),
                     self.terminal_lite.allowed_prefixes(),
                 ));
@@ -3503,15 +3538,7 @@ impl TelegramChannel {
                     vec![], // Empty: auto-claim on first DM
                     vec![], // Owner set on auto-claim
                     None,   // No guild_id for dynamic bots
-                    Arc::clone(&self.agent),
-                    self.config_path.clone(),
-                    self.session_map.clone(),
-                    Arc::clone(&self.task_registry),
-                    self.files_enabled,
-                    self.inbox_dir.clone(),
-                    self.max_file_size_mb,
-                    Arc::clone(&self.state),
-                    self.watchdog_stale_threshold_secs,
+                    self.runtime_deps(),
                 ));
 
                 // Give the new channel a reference to the hub
@@ -3617,15 +3644,7 @@ impl TelegramChannel {
                     Vec::new(),           // Empty preserves legacy allowed-user owner behavior
                     Vec::new(),           // Dynamic bot starts without delegated workspaces
                     false,                // use_threads default
-                    Arc::clone(&self.agent),
-                    self.config_path.clone(),
-                    self.session_map.clone(),
-                    Arc::clone(&self.task_registry),
-                    self.files_enabled,
-                    self.inbox_dir.clone(),
-                    self.max_file_size_mb,
-                    Arc::clone(&self.state),
-                    self.watchdog_stale_threshold_secs,
+                    self.runtime_deps(),
                 ));
 
                 // Give the new channel a reference to the hub
@@ -3673,9 +3692,11 @@ impl TelegramChannel {
     /// Handle /bots command - list all connected bots.
     async fn handle_bots_command(&self) -> String {
         let mut bots_list = vec![];
+        let mut seen_credentials = std::collections::HashSet::new();
 
         // Add current bot (from config)
         let current_username = self.get_bot_username().await;
+        seen_credentials.insert(("telegram".to_string(), self.bot_token.clone()));
         bots_list.push(format!(
             "• telegram:@{} (this bot, from config)",
             current_username
@@ -3685,6 +3706,9 @@ impl TelegramChannel {
         match super::connect::list_dynamic_bots(self.state.as_ref()).await {
             Ok(bots) => {
                 for bot in bots {
+                    if !seen_credentials.insert((bot.channel_type.clone(), bot.bot_token.clone())) {
+                        continue;
+                    }
                     let bot_info = match bot.channel_type.as_str() {
                         "telegram" => {
                             // Try to get username for display
@@ -4531,25 +4555,6 @@ impl TelegramChannel {
 
         // Check if a task is already running - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
-            let daemon_uptime = self.started_at.elapsed();
-            if should_ignore_lightweight_interjection(&text, daemon_uptime) {
-                let current_task = self
-                    .task_registry
-                    .get_running_task_description(&session_id)
-                    .await
-                    .unwrap_or_else(|| "processing".to_string());
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "⏳ Still working on: {}. I ignored that short check-in. \
-                             Send `cancel` to stop the current task.",
-                            current_task
-                        ),
-                    )
-                    .await;
-                return;
-            }
             // Atomic check-and-queue: if the task finished between the
             // has_running_task() check above and this call, the registry
             // reports NoRunningTask and we fall through to direct processing
@@ -4777,7 +4782,15 @@ impl TelegramChannel {
 
             loop {
                 let result = tokio::select! {
-                    r = agent.handle_message_with_attachments(&session_id, &current_text, &current_attachments, Some(current_status_tx), current_user_role, current_channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    r = agent.handle_inbound_message(InboundMessageRequest {
+                        session_id: session_id.clone(),
+                        user_text: current_text.clone(),
+                        attachments: current_attachments.clone(),
+                        status_tx: Some(current_status_tx.clone()),
+                        user_role: current_user_role,
+                        channel_ctx: current_channel_ctx.clone(),
+                        heartbeat: Some(current_heartbeat.clone()),
+                    }) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -5104,12 +5117,18 @@ impl Channel for TelegramChannel {
             self.bot
                 .send_message(ChatId(chat_id), &html)
                 .parse_mode(ParseMode::Html)
+                .link_preview_options(disabled_link_preview())
         })
         .await
         {
             Ok(m) => m,
             Err(_) => {
-                retry_telegram_rate_limit(|| self.bot.send_message(ChatId(chat_id), text)).await?
+                retry_telegram_rate_limit(|| {
+                    self.bot
+                        .send_message(ChatId(chat_id), text)
+                        .link_preview_options(disabled_link_preview())
+                })
+                .await?
             }
         };
         Ok(Some(msg.id.0.to_string()))
@@ -5143,6 +5162,7 @@ impl Channel for TelegramChannel {
             .bot
             .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), &html)
             .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
             .await
         {
             Ok(_) => Ok(true),
@@ -5152,6 +5172,7 @@ impl Channel for TelegramChannel {
             Err(_) => match self
                 .bot
                 .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
+                .link_preview_options(disabled_link_preview())
                 .await
             {
                 Ok(_) => Ok(true),
@@ -5297,6 +5318,7 @@ impl Channel for TelegramChannel {
         session_id: &str,
         goal_description: &str,
         details: &[String],
+        style: crate::types::GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {
@@ -5318,8 +5340,9 @@ impl Channel for TelegramChannel {
             pending.insert(approval_id.clone(), response_tx);
         }
 
-        let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id);
-        let pages = approval_render::build_goal_confirmation_pages(goal_description, details);
+        let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id, style);
+        let pages =
+            approval_render::build_goal_confirmation_pages(goal_description, details, style);
         let page_count = pages.len();
 
         for (index, text) in pages.iter().enumerate() {
@@ -5398,13 +5421,21 @@ async fn send_html_or_fallback(
     html: &str,
     plain: &str,
 ) -> Result<(), teloxide::RequestError> {
-    match retry_telegram_rate_limit(|| bot.send_message(chat_id, html).parse_mode(ParseMode::Html))
-        .await
+    match retry_telegram_rate_limit(|| {
+        bot.send_message(chat_id, html)
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
+    })
+    .await
     {
         Ok(_) => Ok(()),
         Err(e) => {
             warn!("HTML send failed, falling back to plain text: {}", e);
-            retry_telegram_rate_limit(|| bot.send_message(chat_id, plain)).await?;
+            retry_telegram_rate_limit(|| {
+                bot.send_message(chat_id, plain)
+                    .link_preview_options(disabled_link_preview())
+            })
+            .await?;
             Ok(())
         }
     }
@@ -5557,10 +5588,10 @@ fn is_indicator_only_status(update: &StatusUpdate) -> bool {
 /// Single status consumer used at both the primary and queue-drain sites.
 ///
 /// Ordinary progress events are folded into the `LiveStatus` single-surface owner
-/// (one message created lazily and edited in place). BudgetExtended and URL-bearing
-/// OAuth links are must-deliver and sent as their own messages. All existing gating
-/// is preserved: `is_indicator_only_status`, non-DM suppression, 3 s `min_interval`,
-/// and the BudgetExtended / URL bypass.
+/// (one message created lazily and edited in place). BudgetExtended and explicitly
+/// typed user actions are must-deliver and sent as their own messages. Merely
+/// containing a URL does not make internal progress user-facing: task descriptions
+/// often contain URLs too.
 async fn run_status_consumer(
     mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
     owner: std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>,
@@ -5577,16 +5608,15 @@ async fn run_status_consumer(
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
             continue;
         }
-        let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
-            if chunk.contains("https://") || chunk.contains("http://"));
+        let is_immediate = update.requires_immediate_delivery();
         let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
         // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
         if !is_dm && !is_budget_ext {
             continue;
         }
-        // BudgetExtended and URL-bearing OAuth links are must-deliver: send as
+        // BudgetExtended and explicit user actions are must-deliver: send as
         // their own message (never folded into the live surface).
-        if is_budget_ext || has_url {
+        if is_immediate {
             let text = match &update {
                 StatusUpdate::BudgetExtended {
                     old_budget,
@@ -5597,7 +5627,7 @@ async fn run_status_consumer(
                     "💰 Auto-extended token budget {old_budget} → {new_budget} \
                      ({extension}/{max_extensions}) — continuing."
                 ),
-                StatusUpdate::ToolProgress { name, chunk } => format!("📤 {name}\n{chunk}"),
+                StatusUpdate::UserActionRequired { message } => message.clone(),
                 _ => String::new(),
             };
             if !text.is_empty() {
@@ -5689,19 +5719,18 @@ async fn run_legacy_status_consumer(
             }
         }
         let now = tokio::time::Instant::now();
-        // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
-        // and for BudgetExtended (cost notifications should always be delivered)
-        let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
-            if chunk.contains("https://") || chunk.contains("http://"));
-        let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+        // Explicit user actions and BudgetExtended notifications must always be
+        // delivered. Ordinary progress remains rate-limited even when the task
+        // description happens to include a URL.
+        let is_immediate = update.requires_immediate_delivery();
         // Hard cap on DM status messages to prevent notification spam.
-        // BudgetExtended and URL-containing messages always bypass the cap.
-        if !has_url && !is_budget_ext && dm_status_count >= MAX_DM_STATUS_MESSAGES {
+        // BudgetExtended and explicit user actions always bypass the cap.
+        if !is_immediate && dm_status_count >= MAX_DM_STATUS_MESSAGES {
             // After the cap, just send typing indicator instead
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
             continue;
         }
-        if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
+        if !is_immediate && now.duration_since(last_sent) < min_interval {
             continue;
         }
         let text = match &update {
@@ -5719,18 +5748,14 @@ async fn run_legacy_status_consumer(
                 }
             }
             StatusUpdate::ToolProgress { name, chunk } => {
-                // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
-                if chunk.contains("https://") || chunk.contains("http://") {
-                    format!("📤 {}\n{}", name, chunk)
+                let preview: String = chunk.chars().take(100).collect();
+                if chunk.chars().count() > 100 {
+                    format!("📤 {}: {}...", name, preview)
                 } else {
-                    let preview: String = chunk.chars().take(100).collect();
-                    if chunk.len() > 100 {
-                        format!("📤 {}: {}...", name, preview)
-                    } else {
-                        format!("📤 {}: {}", name, preview)
-                    }
+                    format!("📤 {}: {}", name, preview)
                 }
             }
+            StatusUpdate::UserActionRequired { message } => message.clone(),
             StatusUpdate::ToolComplete { name, summary } => {
                 format!("✓ {}: {}", name, summary)
             }

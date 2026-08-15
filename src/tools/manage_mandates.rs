@@ -10,23 +10,27 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateLearningNote, MandateOperationScope, MandateReconciliationResolution, MandateStatus,
-    MandateStrategySnapshot, MandateSuspensionKind, MandateTerminationKind, StateStore, Tool,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
+    Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
+    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateOperatingUpdates,
+    MandateOperationScope, MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
+    MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
+    MandateTerminationKind, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_REVIEW_SECS: i64 = 4 * 60 * 60;
-// One review needs at least two model turns: observe, then commit a typed
-// ACT/WAIT/ASK/STOP decision, plus enough room for one bounded correction when
-// the typed commit is rejected. Live policy prompts can conservatively reserve
-// 7–8k per turn, so a 20k envelope can still strand the correction turn.
+const AUTOPILOT_DEFAULT_REVIEW_SECS: i64 = 3 * 60 * 60;
+// Token counts are an internal runaway guard, not an owner-facing unit. The
+// owner chooses a human-readable review effort; cadence and the selected mode
+// derive enough aggregate capacity to fund every expected review in a UTC day.
+// Legacy raw values remain parseable for backward compatibility but are not
+// advertised in the tool schema.
 const MIN_MANDATE_TOKEN_BUDGET: i64 = 30_000;
-const DEFAULT_MANDATE_TOKEN_BUDGET_PER_CYCLE: i64 = 100_000;
-const DEFAULT_MANDATE_TOKEN_BUDGET_DAILY: i64 = 1_000_000;
+const MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE: i64 = 1_000_000;
+const MAX_MANDATE_TOKEN_BUDGET_DAILY: i64 = 50_000_000;
 const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_POLICY_ENTRIES: usize = 16;
 const MAX_POLICY_ENTRY_TEXT: usize = 500;
@@ -44,6 +48,65 @@ const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
 const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only; update rejects.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewEffort {
+    Efficient,
+    Balanced,
+    Thorough,
+}
+
+impl ReviewEffort {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "efficient" => Some(Self::Efficient),
+            "balanced" => Some(Self::Balanced),
+            "thorough" => Some(Self::Thorough),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Efficient => "efficient",
+            Self::Balanced => "balanced",
+            Self::Thorough => "thorough",
+        }
+    }
+
+    const fn per_cycle_capacity(self) -> i64 {
+        match self {
+            Self::Efficient => 100_000,
+            Self::Balanced => 250_000,
+            Self::Thorough => 500_000,
+        }
+    }
+
+    const fn daily_capacity_floor(self) -> i64 {
+        match self {
+            Self::Efficient => 1_000_000,
+            Self::Balanced => 2_000_000,
+            Self::Thorough => 4_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedReviewCapacity {
+    effort: Option<ReviewEffort>,
+    per_cycle: i64,
+    daily: i64,
+}
+
+impl ResolvedReviewCapacity {
+    const fn automatically_managed(self) -> bool {
+        self.effort.is_some()
+    }
+
+    fn display_mode(self) -> &'static str {
+        self.effort.map_or("legacy_custom", ReviewEffort::as_str)
+    }
+}
 
 /// Owner-facing mandate administration and the internal deliberation commit point.
 ///
@@ -138,41 +201,92 @@ impl ManageMandatesTool {
         })
     }
 
-    fn resolved_token_budgets(
+    fn autonomy_mode_from_args(
+        args: &ManageMandatesArgs,
+        existing: Option<MandateAutonomyMode>,
+    ) -> anyhow::Result<MandateAutonomyMode> {
+        args.autonomy_mode
+            .as_deref()
+            .map(|value| {
+                MandateAutonomyMode::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("autonomy_mode must be bounded or autopilot"))
+            })
+            .transpose()
+            .map(|mode| mode.or(existing).unwrap_or_default())
+    }
+
+    fn resolved_review_capacity(
         args: &ManageMandatesArgs,
         default_review_secs: i64,
         timing: &ActivationTiming,
-    ) -> anyhow::Result<(i64, i64)> {
-        let per_cycle = args
-            .budget_per_cycle
-            .unwrap_or(DEFAULT_MANDATE_TOKEN_BUDGET_PER_CYCLE);
+        existing: Option<(i64, i64)>,
+        existing_effort: Option<ReviewEffort>,
+        default_effort: Option<ReviewEffort>,
+    ) -> anyhow::Result<ResolvedReviewCapacity> {
         anyhow::ensure!(
-            per_cycle >= MIN_MANDATE_TOKEN_BUDGET,
-            "budget_per_cycle is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
+            args.review_effort.is_none()
+                || (args.budget_per_cycle.is_none() && args.budget_daily.is_none()),
+            "review_effort cannot be combined with legacy raw token budgets"
+        );
+        let requested_effort = args
+            .review_effort
+            .as_deref()
+            .map(|value| {
+                ReviewEffort::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("review_effort must be efficient, balanced, or thorough")
+                })
+            })
+            .transpose()?;
+        let has_legacy_raw = args.budget_per_cycle.is_some() || args.budget_daily.is_some();
+
+        let effort = (!has_legacy_raw)
+            .then(|| requested_effort.or(existing_effort).or(default_effort))
+            .flatten();
+        let per_cycle = if let Some(effort) = effort {
+            effort.per_cycle_capacity()
+        } else {
+            args.budget_per_cycle
+                .or(existing.map(|value| value.0))
+                .unwrap_or(ReviewEffort::Balanced.per_cycle_capacity())
+        };
+        anyhow::ensure!(
+            (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE)
+                .contains(&per_cycle),
+            "legacy per-review token capacity must be between {MIN_MANDATE_TOKEN_BUDGET} and {MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE}"
         );
         let review_cycles = expected_default_review_cycles(default_review_secs, timing)?;
         let cadence_floor = per_cycle
             .checked_mul(review_cycles)
             .ok_or_else(|| anyhow::anyhow!("review cadence token budget is too large"))?;
-        // An omitted daily budget must always be usable with the other defaults.
-        // In particular, a 30-minute cadence has 48 reviews in a full day and
-        // therefore needs more than the static one-million-token floor.
-        let daily = args
-            .budget_daily
-            .unwrap_or(DEFAULT_MANDATE_TOKEN_BUDGET_DAILY.max(cadence_floor));
+        let daily = if let Some(effort) = effort {
+            effort.daily_capacity_floor().max(cadence_floor)
+        } else {
+            args.budget_daily
+                .or(existing.map(|value| value.1))
+                .unwrap_or(
+                    default_effort
+                        .unwrap_or(ReviewEffort::Balanced)
+                        .daily_capacity_floor()
+                        .max(cadence_floor),
+                )
+        };
         anyhow::ensure!(
-            daily >= MIN_MANDATE_TOKEN_BUDGET,
-            "budget_daily is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
+            (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_DAILY).contains(&daily),
+            "legacy daily token capacity must be between {MIN_MANDATE_TOKEN_BUDGET} and {MAX_MANDATE_TOKEN_BUDGET_DAILY}"
         );
         anyhow::ensure!(
             daily >= per_cycle,
-            "budget_daily must be at least budget_per_cycle"
+            "daily review capacity must be at least one review cycle"
         );
         anyhow::ensure!(
             daily >= cadence_floor,
-            "budget_daily must be at least {cadence_floor} tokens to fund {review_cycles} default review cycle(s) in the mandate's busiest UTC day; increase budget_daily or lengthen default_review_minutes"
+            "daily review capacity cannot fund {review_cycles} default review cycle(s); select automatic review_effort or lengthen default_review_minutes"
         );
-        Ok((per_cycle, daily))
+        Ok(ResolvedReviewCapacity {
+            effort,
+            per_cycle,
+            daily,
+        })
     }
 
     fn strategy_snapshot(
@@ -210,17 +324,19 @@ impl ManageMandatesTool {
 
     fn confirmation_warnings(
         mandate: &Mandate,
-        budget_per_cycle: i64,
-        budget_daily: i64,
+        capacity: ResolvedReviewCapacity,
         activation_duration_secs: Option<i64>,
+        proposed_policy_version: i64,
     ) -> Vec<String> {
-        vec![
+        let mut warnings = vec![
             format!("Objective: {}", mandate.objective),
             format!("Constraints: {}", display_policy(&mandate.constraints)),
             format!(
                 "Success criteria: {}",
                 display_policy(&mandate.success_criteria)
             ),
+            "Value contract: every ACT must cite one exact success criterion, current-run evidence, expected benefit, assessed risk, and invalidation criteria; activity alone is not success."
+                .to_string(),
             format!("Stop conditions: {}", display_policy(&mandate.stop_conditions)),
             format!(
                 "Pinned strategy: {}",
@@ -271,9 +387,31 @@ impl ManageMandatesTool {
                 )
             ),
             format!(
-                "Resolved token budgets: {budget_per_cycle} tokens per decision cycle; {budget_daily} tokens per UTC day"
+                "Review effort: {}; capacity is {} from cadence with internal runaway protection",
+                capacity.display_mode(),
+                if capacity.automatically_managed() {
+                    "automatically managed"
+                } else {
+                    "legacy custom"
+                }
             ),
-        ]
+            format!("Autonomy mode: {}", mandate.autonomy_mode),
+            format!(
+                "Confirmation binding: mandate {} policy version {}; exact accounts, operations, targets, limits, and guardrails shown here",
+                mandate.id, proposed_policy_version
+            ),
+        ];
+        if mandate.autonomy_mode.is_autopilot() {
+            warnings.push(
+                "Owner checkpoints: only a new account, tool, operation, effect, target, query scope, destructive action, spending authority, private-data scope, or genuinely owner-only judgment requires another confirmation or question. Routine reviews and in-envelope actions do not."
+                    .to_string(),
+            );
+            warnings.push(
+                "Recovery policy: retry safe internal failures, resume after restart, reconcile durable receipts, and never blindly repeat an externally ambiguous mutation."
+                    .to_string(),
+            );
+        }
+        warnings
     }
 
     async fn draft(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
@@ -285,6 +423,7 @@ impl ManageMandatesTool {
         }
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let autonomy_mode = Self::autonomy_mode_from_args(args, None)?;
         let authority = Self::authority_from_args(args)?;
         let min_review_secs = minutes_to_secs(
             args.min_review_minutes,
@@ -298,7 +437,11 @@ impl ManageMandatesTool {
         )?;
         let default_review_secs = minutes_to_secs(
             args.default_review_minutes,
-            DEFAULT_REVIEW_SECS,
+            if autonomy_mode.is_autopilot() {
+                AUTOPILOT_DEFAULT_REVIEW_SECS
+            } else {
+                DEFAULT_REVIEW_SECS
+            },
             "default_review_minutes",
         )?;
         anyhow::ensure!(
@@ -306,8 +449,19 @@ impl ManageMandatesTool {
             "review bounds must satisfy min <= default <= max"
         );
         let timing = activation_timing(args)?;
-        let (budget_per_cycle, budget_daily) =
-            Self::resolved_token_budgets(args, default_review_secs, &timing)?;
+        let default_effort = if autonomy_mode.is_autopilot() {
+            ReviewEffort::Thorough
+        } else {
+            ReviewEffort::Balanced
+        };
+        let capacity = Self::resolved_review_capacity(
+            args,
+            default_review_secs,
+            &timing,
+            None,
+            None,
+            Some(default_effort),
+        )?;
         let constraints = clean_strings(args.constraints.as_deref());
         let success_criteria = clean_strings(args.success_criteria.as_deref());
         let stop_conditions = clean_strings(args.stop_conditions.as_deref());
@@ -339,6 +493,9 @@ impl ManageMandatesTool {
                 missing.push("min_seconds_between_mutations_at_least_900");
             }
         }
+        if success_criteria.is_empty() {
+            missing.push("success_criteria");
+        }
         let validation_error = authority.validate().err();
         let ready_to_confirm = missing.is_empty() && validation_error.is_none();
         Ok(serde_json::to_string_pretty(&json!({
@@ -349,6 +506,7 @@ impl ManageMandatesTool {
             "validation_status": validation_error.as_deref().unwrap_or("ready"),
             "proposal": {
                 "objective": objective,
+                "autonomy_mode": autonomy_mode,
                 "constraints": constraints,
                 "success_criteria": success_criteria,
                 "stop_conditions": stop_conditions,
@@ -357,10 +515,11 @@ impl ManageMandatesTool {
                     "content_sha256": value.content_sha256,
                 })),
                 "authority": authority,
-                "token_budgets": {
-                    "units": "tokens",
-                    "per_decision_cycle": budget_per_cycle,
-                    "per_utc_day": budget_daily,
+                "resource_policy": {
+                    "review_effort": capacity.display_mode(),
+                    "automatically_managed": capacity.automatically_managed(),
+                    "cadence_funded": true,
+                    "runaway_protection": true,
                 },
                 "review_minutes": {
                     "minimum": min_review_secs / 60,
@@ -453,6 +612,7 @@ impl ManageMandatesTool {
         let session_id = Self::owner_session(args)?;
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let autonomy_mode = Self::autonomy_mode_from_args(args, None)?;
         let authority = Self::authority_from_args(args)?;
         anyhow::ensure!(
             authority.uses_operation_scopes()
@@ -476,7 +636,11 @@ impl ManageMandatesTool {
         )?;
         let default_review_secs = minutes_to_secs(
             args.default_review_minutes,
-            DEFAULT_REVIEW_SECS,
+            if autonomy_mode.is_autopilot() {
+                AUTOPILOT_DEFAULT_REVIEW_SECS
+            } else {
+                DEFAULT_REVIEW_SECS
+            },
             "default_review_minutes",
         )?;
         anyhow::ensure!(
@@ -485,13 +649,24 @@ impl ManageMandatesTool {
         );
 
         let timing = activation_timing(args)?;
-        let (budget_per_cycle, budget_daily) =
-            Self::resolved_token_budgets(args, default_review_secs, &timing)?;
+        let default_effort = if autonomy_mode.is_autopilot() {
+            ReviewEffort::Thorough
+        } else {
+            ReviewEffort::Balanced
+        };
+        let capacity = Self::resolved_review_capacity(
+            args,
+            default_review_secs,
+            &timing,
+            None,
+            None,
+            Some(default_effort),
+        )?;
         let mut goal = crate::traits::Goal::new_continuous_pending(
             &format!("Mandate: {objective}"),
             session_id,
-            Some(budget_per_cycle),
-            Some(budget_daily),
+            Some(capacity.per_cycle),
+            Some(capacity.daily),
         );
         goal.priority = args.priority.clone().unwrap_or_else(|| "high".to_string());
         anyhow::ensure!(
@@ -516,16 +691,22 @@ impl ManageMandatesTool {
         // Once activated, this timestamp makes the first deliberation immediately due.
         mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
+        mandate.autonomy_mode = autonomy_mode;
         mandate.next_review_at = chrono::Utc::now().to_rfc3339();
         mandate.constraints = clean_strings(args.constraints.as_deref());
         mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
         mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
         mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        mandate.review_effort = capacity.display_mode().to_string();
         validate_policy_text(
             &mandate.constraints,
             &mandate.success_criteria,
             &mandate.stop_conditions,
         )?;
+        anyhow::ensure!(
+            !mandate.success_criteria.is_empty(),
+            "new mandates require at least one observable success criterion so autonomous reviews can judge value instead of merely repeating activity"
+        );
         mandate.expires_at = timing.expires_at.clone();
         if let Some(expires_at) = mandate.expires_at.as_deref() {
             let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
@@ -550,11 +731,13 @@ impl ManageMandatesTool {
             .await?;
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let pending_version = mandate.version;
+        let proposed_policy_version = pending_version + 1;
         let mut warnings = Self::confirmation_warnings(
             &mandate,
-            budget_per_cycle,
-            budget_daily,
+            capacity,
             timing.duration_secs,
+            proposed_policy_version,
         );
         if timing.normalized_redundant_expiry {
             warnings.push(
@@ -563,7 +746,11 @@ impl ManageMandatesTool {
             );
         }
         let request = ApprovalRequest {
-            command: format!("Delegate mandate: {objective}"),
+            command: if autonomy_mode.is_autopilot() {
+                format!("Enable Autopilot: {objective}")
+            } else {
+                format!("Delegate mandate: {objective}")
+            },
             session_id: session_id.to_string(),
             risk_level: if mandate.authority.max_mutating_actions_per_cycle == 0 {
                 RiskLevel::Medium
@@ -573,7 +760,11 @@ impl ManageMandatesTool {
             warnings,
             permission_mode: PermissionMode::Cautious,
             response_tx,
-            kind: ApprovalKind::GoalConfirmation,
+            kind: if autonomy_mode.is_autopilot() {
+                ApprovalKind::AutopilotConfirmation
+            } else {
+                ApprovalKind::GoalConfirmation
+            },
         };
         if let Err(error) = self.approval_tx.send(request).await {
             self.cancel_unconfirmed(&mandate).await?;
@@ -590,7 +781,7 @@ impl ManageMandatesTool {
             ) => {
                 anyhow::ensure!(
                     self.state
-                        .confirm_mandate(&mandate.id, timing.duration_secs)
+                        .confirm_mandate(&mandate.id, pending_version, timing.duration_secs)
                         .await?,
                     "mandate could not be activated"
                 );
@@ -599,9 +790,15 @@ impl ManageMandatesTool {
                         anyhow::anyhow!("activated mandate could not be reloaded")
                     })?;
                 Ok(format!(
-                    "Activated mandate {} at {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+                    "{} {} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+                    if activated.autonomy_mode.is_autopilot() {
+                        "Autopilot enabled for mandate"
+                    } else {
+                        "Activated mandate"
+                    },
                     activated.id,
                     activated.confirmed_at.as_deref().unwrap_or("unavailable"),
+                    activated.version,
                     activated.expires_at.as_deref().unwrap_or("none"),
                     activated.min_review_secs / 60,
                     activated.max_review_secs / 60
@@ -642,13 +839,14 @@ impl ManageMandatesTool {
         let mut output = format!("Mandates ({}):\n", mandates.len());
         for mandate in mandates {
             let admission = match self.state.get_goal(&mandate.goal_id).await? {
-                Some(goal) => controller_budget_admission_label(&goal),
+                Some(goal) => controller_budget_admission_label(&goal, &mandate.review_effort),
                 None => "controller-missing".to_string(),
             };
             output.push_str(&format!(
-                "- {} [{} v{}] {} — next review {}; review admission {}; {}/cycle, {}/rolling-24h mutations\n",
+                "- {} [{} {} v{}] {} — next review {}; review admission {}; {}/cycle, {}/rolling-24h mutations\n",
                 mandate.id,
                 mandate.status,
+                mandate.autonomy_mode,
                 mandate.version,
                 mandate.objective,
                 mandate.next_review_at,
@@ -707,6 +905,10 @@ impl ManageMandatesTool {
                     .await?
                     .into_iter()
                     .next();
+                let adaptive_strategy = self
+                    .state
+                    .list_current_mandate_strategy(&mandate.id, 16)
+                    .await?;
                 let latest_goal_run = self
                     .state
                     .get_goal_runs(&mandate.goal_id)
@@ -729,6 +931,7 @@ impl ManageMandatesTool {
                         "source_goal_id": mandate.source_goal_id,
                         "objective": mandate.objective,
                         "status": mandate.status,
+                        "autonomy_mode": mandate.autonomy_mode,
                         "version": mandate.version,
                         "confirmed_at": mandate.confirmed_at,
                         "expires_at": mandate.expires_at,
@@ -740,11 +943,12 @@ impl ManageMandatesTool {
                         "updated_at": mandate.updated_at,
                     },
                     "review_policy": {
+                        "effort": mandate.review_effort,
                         "minimum_seconds": mandate.min_review_secs,
                         "default_seconds": mandate.default_review_secs,
                         "maximum_seconds": mandate.max_review_secs,
                     },
-                    "controller_budget": controller_budget_snapshot(&controller),
+                    "resource_policy": controller_budget_snapshot(&controller, &mandate.review_effort),
                     "authority_summary": {
                         "observations_allowed": mandate.authority.allow_observations,
                         "operation_scope_count": mandate.authority.operation_scopes.len(),
@@ -754,11 +958,18 @@ impl ManageMandatesTool {
                         "max_mutations_per_rolling_24h": mandate.authority.max_mutating_actions_per_rolling_24h,
                         "minimum_seconds_between_mutations": mandate.authority.min_seconds_between_mutations,
                     },
+                    "owner_input_contract": {
+                        "answer_question_records_guidance_only": true,
+                        "answer_question_changes_authority": false,
+                        "authority_changes_require_confirmed_update": true,
+                        "exact_policy": "Call get with section=policy before constructing an update."
+                    },
                     "strategy": strategy,
                     "latest_goal_run": latest_goal_run,
                     "latest_decision": latest_decision,
                     "latest_intention": latest_intention,
                     "latest_learning_note": latest_learning_note,
+                    "adaptive_operating_strategy": adaptive_strategy,
                     "latest_mutation_receipts": latest_mutation_receipts,
                     "more": {
                         "policy": "Call get again with section=policy for exact scopes and owner policy.",
@@ -773,10 +984,12 @@ impl ManageMandatesTool {
                 "controller_goal_id": mandate.goal_id,
                 "version": mandate.version,
                 "objective": mandate.objective,
+                "autonomy_mode": mandate.autonomy_mode,
                 "authority": mandate.authority,
                 "constraints": mandate.constraints,
                 "success_criteria": mandate.success_criteria,
                 "stop_conditions": mandate.stop_conditions,
+                "review_effort": mandate.review_effort,
                 "strategy": strategy,
             }),
             "history" => {
@@ -789,6 +1002,10 @@ impl ManageMandatesTool {
                 let learning = self
                     .state
                     .list_mandate_learning_notes(&mandate.id, limit)
+                    .await?;
+                let adaptive_strategy = self
+                    .state
+                    .list_current_mandate_strategy(&mandate.id, 16)
                     .await?;
                 let goal_runs = self
                     .state
@@ -815,6 +1032,7 @@ impl ManageMandatesTool {
                     "recent_decisions": decisions,
                     "recent_intentions": intentions,
                     "recent_learning_notes": learning,
+                    "adaptive_operating_strategy": adaptive_strategy,
                     "recent_mutation_receipts": mutation_receipts,
                 })
             }
@@ -936,10 +1154,14 @@ impl ManageMandatesTool {
                     .await?,
                 "mandate suspension changed before it could be resolved"
             );
-            return Ok(format!(
-                "Mandate {} is active after typed {}.",
-                mandate.id, action
-            ));
+            return Ok(if action == "answer_question" {
+                format!(
+                    "Mandate {} is active after recording bounded owner guidance. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change, and do not claim this answer authorized one.",
+                    mandate.id
+                )
+            } else {
+                format!("Mandate {} is active after typed {}.", mandate.id, action)
+            });
         }
 
         let (from, to) = match action {
@@ -995,7 +1217,9 @@ impl ManageMandatesTool {
         let owner = Self::owner_session(args)?;
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
         let mut mandate = self.resolve_owned_mandate(id, owner).await?;
+        let previous_autonomy_mode = mandate.autonomy_mode;
         let has_change = args.objective.is_some()
+            || args.autonomy_mode.is_some()
             || args.allow_observations.is_some()
             || args.operation_scopes.is_some()
             || args.allowed_tools.is_some()
@@ -1011,6 +1235,7 @@ impl ManageMandatesTool {
             || args.max_review_minutes.is_some()
             || args.default_review_minutes.is_some()
             || args.expires_at.is_some()
+            || args.review_effort.is_some()
             || args.budget_per_cycle.is_some()
             || args.budget_daily.is_some()
             || args.strategy_skill.is_some()
@@ -1025,6 +1250,9 @@ impl ManageMandatesTool {
                 required_bounded_trimmed(Some(objective), "objective", MAX_OBJECTIVE_TEXT)?
                     .to_string();
         }
+        mandate.autonomy_mode = Self::autonomy_mode_from_args(args, Some(mandate.autonomy_mode))?;
+        let enabled_autopilot =
+            !previous_autonomy_mode.is_autopilot() && mandate.autonomy_mode.is_autopilot();
         if args.allow_observations.is_some()
             || args.operation_scopes.is_some()
             || args.allowed_tools.is_some()
@@ -1121,7 +1349,14 @@ impl ManageMandatesTool {
         )?;
         mandate.default_review_secs = minutes_to_secs(
             args.default_review_minutes,
-            mandate.default_review_secs,
+            if enabled_autopilot
+                && (mandate.min_review_secs..=mandate.max_review_secs)
+                    .contains(&AUTOPILOT_DEFAULT_REVIEW_SECS)
+            {
+                AUTOPILOT_DEFAULT_REVIEW_SECS
+            } else {
+                mandate.default_review_secs
+            },
             "default_review_minutes",
         )?;
         anyhow::ensure!(
@@ -1145,41 +1380,53 @@ impl ManageMandatesTool {
             .get_goal(&mandate.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
-        let proposed_budget_args =
-            ManageMandatesArgs {
-                budget_per_cycle: Some(
-                    args.budget_per_cycle
-                        .or(controller.budget_per_check)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("mandate controller per-cycle budget is missing")
-                        })?,
-                ),
-                budget_daily: Some(args.budget_daily.or(controller.budget_daily).ok_or_else(
-                    || anyhow::anyhow!("mandate controller daily budget is missing"),
-                )?),
-                ..Default::default()
-            };
+        let current_capacity = (
+            controller
+                .budget_per_check
+                .ok_or_else(|| anyhow::anyhow!("mandate controller capacity is missing"))?,
+            controller
+                .budget_daily
+                .ok_or_else(|| anyhow::anyhow!("mandate controller daily capacity is missing"))?,
+        );
         let timing = ActivationTiming {
             duration_secs: None,
             expires_at: mandate.expires_at.clone(),
             normalized_redundant_expiry: false,
         };
-        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(
-            &proposed_budget_args,
+        let capacity = Self::resolved_review_capacity(
+            args,
             mandate.default_review_secs,
             &timing,
+            Some(current_capacity),
+            if enabled_autopilot && args.review_effort.is_none() {
+                None
+            } else {
+                ReviewEffort::parse(&mandate.review_effort)
+            },
+            enabled_autopilot.then_some(ReviewEffort::Thorough),
         )?;
-        let warnings = Self::confirmation_warnings(&mandate, budget_per_cycle, budget_daily, None);
+        mandate.review_effort = capacity.display_mode().to_string();
+        let proposed_policy_version = mandate.version + 1;
+        let warnings =
+            Self::confirmation_warnings(&mandate, capacity, None, proposed_policy_version);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
-                command: format!("Update delegated mandate: {}", mandate.objective),
+                command: if mandate.autonomy_mode.is_autopilot() {
+                    format!("Enable or update Autopilot: {}", mandate.objective)
+                } else {
+                    format!("Update delegated mandate: {}", mandate.objective)
+                },
                 session_id: owner.to_string(),
                 risk_level: RiskLevel::High,
                 warnings,
                 permission_mode: PermissionMode::Cautious,
                 response_tx,
-                kind: ApprovalKind::GoalConfirmation,
+                kind: if mandate.autonomy_mode.is_autopilot() {
+                    ApprovalKind::AutopilotConfirmation
+                } else {
+                    ApprovalKind::GoalConfirmation
+                },
             })
             .await
             .map_err(|error| anyhow::anyhow!("mandate update confirmation unavailable: {error}"))?;
@@ -1202,11 +1449,15 @@ impl ManageMandatesTool {
         mandate.updated_at = updated_at;
         self.state.update_mandate(&mandate).await?;
         self.state
-            .set_goal_budgets(&mandate.goal_id, Some(budget_per_cycle), Some(budget_daily))
+            .set_goal_budgets(
+                &mandate.goal_id,
+                Some(capacity.per_cycle),
+                Some(capacity.daily),
+            )
             .await?;
         Ok(format!(
-            "Updated mandate {} to policy version {} with {budget_per_cycle} tokens per cycle and {budget_daily} per UTC day. In-flight decisions on older versions are revoked; the next review is due now.",
-            mandate.id, mandate.version,
+            "Updated mandate {} to policy version {} in {} mode with {} review effort and automatically managed capacity. In-flight decisions on older versions are revoked; the next review is due now.",
+            mandate.id, mandate.version, mandate.autonomy_mode, capacity.display_mode(),
         ))
     }
 
@@ -1285,6 +1536,11 @@ impl ManageMandatesTool {
             required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
         let mut decision =
             MandateDecisionCycle::new(&mandate.id, &run.id, outcome, rationale, mandate.version);
+        decision.activity_level =
+            MandateActivityLevel::parse(args.activity_level.as_deref().unwrap_or("quiet"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("activity_level must be quiet, active, or urgent")
+                })?;
         let observations = clean_strings(args.observations.as_deref());
         validate_bounded_strings(
             &observations,
@@ -1304,6 +1560,7 @@ impl ManageMandatesTool {
             256,
             4 * 1024,
         )?;
+        validate_act_evidence(outcome, &observations, &decision.evidence_receipt_ids)?;
         decision.question = args
             .question
             .as_deref()
@@ -1324,9 +1581,9 @@ impl ManageMandatesTool {
             args.termination_kind.as_deref(),
             args.termination_match.as_deref(),
         )?;
-        let review_secs = mandate.clamp_review_secs(
-            args.reconsider_minutes
-                .map(|minutes| minutes.saturating_mul(60)),
+        let review_secs = args.reconsider_minutes.map_or_else(
+            || mandate.review_secs_for_activity(decision.activity_level),
+            |minutes| mandate.clamp_review_secs(Some(minutes.saturating_mul(60))),
         );
         if outcome != MandateDecisionOutcome::Stop {
             decision.reconsider_at =
@@ -1340,18 +1597,54 @@ impl ManageMandatesTool {
             )?;
             let mut intention =
                 Intention::new(&mandate.id, &decision.id, &run.id, description, rationale);
-            intention.expected_benefit = bounded_optional_text(
-                args.expected_benefit.as_deref(),
-                "expected_benefit",
-                MAX_INTENTION_METADATA_TEXT,
+            let value_criterion = required_bounded_trimmed(
+                args.value_criterion.as_deref(),
+                "value_criterion",
+                MAX_OBJECTIVE_TEXT,
             )?;
-            intention.risk =
-                bounded_optional_text(args.risk.as_deref(), "risk", MAX_INTENTION_METADATA_TEXT)?;
-            intention.invalidation_criteria = bounded_optional_text(
-                args.invalidation_criteria.as_deref(),
-                "invalidation_criteria",
-                MAX_INTENTION_METADATA_TEXT,
-            )?;
+            let criterion_matches = if mandate.success_criteria.is_empty() {
+                // Compatibility for mandates created before value criteria
+                // became mandatory. Their immutable objective is the only
+                // owner-authored value anchor available.
+                value_criterion == mandate.objective
+            } else {
+                mandate
+                    .success_criteria
+                    .iter()
+                    .any(|criterion| criterion == value_criterion)
+            };
+            anyhow::ensure!(
+                criterion_matches,
+                "value_criterion must exactly match one owner-confirmed success criterion (or the immutable objective on a legacy mandate)"
+            );
+            intention.value_criterion = Some(value_criterion.to_string());
+            intention.expected_benefit = Some(
+                required_bounded_trimmed(
+                    args.expected_benefit.as_deref(),
+                    "expected_benefit",
+                    MAX_INTENTION_METADATA_TEXT,
+                )?
+                .to_string(),
+            );
+            intention.risk = Some(
+                required_bounded_trimmed(
+                    args.risk.as_deref(),
+                    "risk",
+                    MAX_INTENTION_METADATA_TEXT,
+                )?
+                .to_string(),
+            );
+            intention.invalidation_criteria = Some(
+                required_bounded_trimmed(
+                    args.invalidation_criteria.as_deref(),
+                    "invalidation_criteria",
+                    MAX_INTENTION_METADATA_TEXT,
+                )?
+                .to_string(),
+            );
+            intention
+                .validate_value_contract()
+                .map_err(anyhow::Error::msg)?;
             let metadata = [
                 intention.expected_benefit.as_deref(),
                 intention.risk.as_deref(),
@@ -1376,23 +1669,61 @@ impl ManageMandatesTool {
         } else {
             None
         };
-        let learning = normalized_learning_note(
+        // Learning/strategy annotations are optional advisory metadata, never
+        // the authority-bearing decision itself. Structured providers can
+        // populate only part of an optional field family; do not let that
+        // prevent a valid ACT/WAIT/ASK/STOP decision from being committed.
+        let learning_fields_complete = learning_note_fields_complete(
             args.learning_note.as_deref(),
             args.learning_evidence_receipt_ids.as_deref(),
-        )?;
-        self.state
-            .record_mandate_decision(&decision, intention.as_ref(), Some(pinned_attempt_id))
-            .await?;
-        if let Some((summary, evidence)) = learning {
-            let note = MandateLearningNote::new(
+        );
+        let learning = if learning_fields_complete {
+            normalized_learning_note(
+                args.learning_note.as_deref(),
+                args.learning_evidence_receipt_ids.as_deref(),
+            )?
+        } else {
+            None
+        };
+        let learning_note = learning.map(|(summary, evidence)| {
+            MandateLearningNote::new(
                 &mandate.id,
                 mandate.version,
                 &decision.id,
                 &summary,
                 evidence,
-            );
-            self.state.record_mandate_learning_note(&note).await?;
-        }
+            )
+        });
+        let strategy_fields_complete = strategy_update_fields_complete(
+            args.strategy_key.as_deref(),
+            args.strategy_kind.as_deref(),
+            args.strategy_confidence_bps,
+            learning_note.as_ref(),
+        );
+        let strategy_revisions = if strategy_fields_complete {
+            normalized_strategy_revisions(
+                &mandate,
+                &decision,
+                args.strategy_key.as_deref(),
+                args.strategy_kind.as_deref(),
+                args.strategy_confidence_bps,
+                learning_note.as_ref(),
+            )?
+        } else {
+            Vec::new()
+        };
+        let operating_updates = MandateOperatingUpdates {
+            learning_note,
+            strategy_revisions,
+        };
+        self.state
+            .record_mandate_decision_with_updates(
+                &decision,
+                intention.as_ref(),
+                Some(&operating_updates),
+                Some(pinned_attempt_id),
+            )
+            .await?;
         Ok(match outcome {
             MandateDecisionOutcome::Act => {
                 format!(
@@ -1441,6 +1772,7 @@ struct ManageMandatesArgs {
     action: String,
     mandate_id: Option<String>,
     objective: Option<String>,
+    autonomy_mode: Option<String>,
     source_goal_id: Option<String>,
     allow_observations: Option<bool>,
     operation_scopes: Option<Vec<MandateOperationScope>>,
@@ -1461,12 +1793,16 @@ struct ManageMandatesArgs {
     duration_minutes: Option<i64>,
     expires_at: Option<String>,
     priority: Option<String>,
+    review_effort: Option<String>,
+    /// Backward-compatible internal fields. Raw token arithmetic is no longer
+    /// part of the owner/model-facing schema; use review_effort instead.
     budget_per_cycle: Option<i64>,
     budget_daily: Option<i64>,
     include_terminal: Option<bool>,
     section: Option<String>,
     limit: Option<i64>,
     outcome: Option<String>,
+    activity_level: Option<String>,
     rationale: Option<String>,
     observations: Option<Vec<String>>,
     evidence_receipt_ids: Option<Vec<String>>,
@@ -1475,11 +1811,15 @@ struct ManageMandatesArgs {
     termination_match: Option<String>,
     reconsider_minutes: Option<i64>,
     intention: Option<String>,
+    value_criterion: Option<String>,
     expected_benefit: Option<String>,
     risk: Option<String>,
     invalidation_criteria: Option<String>,
     learning_note: Option<String>,
     learning_evidence_receipt_ids: Option<Vec<String>>,
+    strategy_key: Option<String>,
+    strategy_kind: Option<String>,
+    strategy_confidence_bps: Option<u16>,
     guidance: Option<String>,
     reconciliation_resolution: Option<String>,
     #[serde(default)]
@@ -1494,6 +1834,24 @@ struct ManageMandatesArgs {
     _goal_run_id: Option<String>,
     #[serde(default)]
     _task_attempt_id: Option<String>,
+}
+
+fn op_schema() -> Value {
+    json!({
+        "type": "array", "minItems": 1, "maxItems": 64,
+        "items": { "type": "object",
+            "properties": {
+                "tool": { "type": "string", "enum": ["http_request", "web_fetch"] },
+                "operation": { "type": "string", "enum": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] },
+                "kind": { "type": "string", "enum": ["observation", "mutation"] },
+                "target_prefixes": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 2048 } },
+                "allowed_query_params": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 128 } },
+                "mutation_effects": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["remote_mutation", "external_delivery"] } }
+            },
+            "required": ["tool", "operation", "kind", "target_prefixes", "allowed_query_params", "mutation_effects"],
+            "additionalProperties": false
+        }
+    })
 }
 
 #[async_trait]
@@ -1514,63 +1872,20 @@ impl Tool for ManageMandatesTool {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["draft", "create", "list", "get", "update", "pause", "resume", "answer_question", "resolve_reconciliation", "cancel", "record_decision", "list_intentions"] },
-                    "mandate_id": { "type": "string", "maxLength": 256 },
-                    "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT },
-                    "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "mandate_id": { "type": "string", "maxLength": 256 }, "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT }, "autonomy_mode": { "type": "string", "enum": ["bounded", "autopilot"] }, "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
                     "allow_observations": { "type": "boolean" },
-                    "operation_scopes": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 64,
-                        "description": "Exact authority tuples. Authenticated calls repeat URL, auth_profile:<name>, and account:<id>; X requires both identity targets. URL query strings are exact policy data: a queryless URL authorizes only a queryless call, so include each approved query-bearing URL used via query_params.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "tool": { "type": "string", "enum": ["http_request", "web_fetch"] },
-                                "operation": { "type": "string", "enum": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] },
-                                "kind": { "type": "string", "enum": ["observation", "mutation"] },
-                                "target_prefixes": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 2048 } },
-                                "mutation_effects": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["remote_mutation", "external_delivery"] } }
-                            },
-                            "required": ["tool", "operation", "kind", "target_prefixes", "mutation_effects"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 },
-                    "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 },
-                    "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
-                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
-                    "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
-                    "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
-                    "strategy_skill": { "type": "string", "maxLength": 256 },
-                    "clear_strategy": { "type": "boolean" },
-                    "min_review_minutes": { "type": "integer", "minimum": 1 },
-                    "max_review_minutes": { "type": "integer", "minimum": 1 },
-                    "default_review_minutes": { "type": "integer", "minimum": 1 },
-                    "duration_minutes": { "type": "integer", "minimum": 1, "description": "Create only; update rejects. Relative minutes; wins over expires_at." },
-                    "expires_at": { "type": "string", "description": "Fixed RFC3339 deadline if no duration." },
-                    "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
-                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Tokens per review; create/update." },
-                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "UTC-day tokens; must fund the busiest day's reviews." },
-                    "include_terminal": { "type": "boolean" },
-                    "section": { "type": "string", "enum": ["summary", "policy", "history"] },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
-                    "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] },
-                    "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
-                    "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } },
-                    "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } },
-                    "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
-                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"], "description": "STOP only; omit for ACT, WAIT, and ASK." },
-                    "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": "STOP only; omit for ACT, WAIT, and ASK." },
-                    "reconsider_minutes": { "type": "integer", "minimum": 1 },
-                    "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT },
-                    "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
-                    "risk": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
-                    "invalidation_criteria": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
-                    "learning_note": { "type": "string", "maxLength": MAX_LEARNING_NOTE_TEXT },
-                    "learning_evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } },
-                    "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT },
-                    "reconciliation_resolution": { "type": "string", "enum": ["confirmed_effect_occurred", "confirmed_no_effect", "abandon_attempt"] }
+                    "operation_scopes": op_schema(),
+                    "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 }, "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 }, "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
+                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } }, "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } }, "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "strategy_skill": { "type": "string", "maxLength": 256 }, "clear_strategy": { "type": "boolean" }, "min_review_minutes": { "type": "integer", "minimum": 1 }, "max_review_minutes": { "type": "integer", "minimum": 1 }, "default_review_minutes": { "type": "integer", "minimum": 1 },
+                    "duration_minutes": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION }, "expires_at": { "type": "string" }, "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION }, "review_effort": { "type": "string", "enum": ["efficient", "balanced", "thorough"] },
+                    "include_terminal": { "type": "boolean" }, "section": { "type": "string", "enum": ["summary", "policy", "history"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
+                    "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] }, "activity_level": { "type": "string", "enum": ["quiet", "active", "urgent"] }, "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
+                    "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } }, "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } }, "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
+                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"], "description": "STOP only; omit for ACT, WAIT, and ASK." }, "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": "STOP only; omit for ACT, WAIT, and ASK." }, "reconsider_minutes": { "type": "integer", "minimum": 1 },
+                    "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT }, "value_criterion": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT, "description": "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective." }, "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: benefit of acting now instead of waiting." }, "risk": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: expected cost or downside, or why none is material." }, "invalidation_criteria": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: evidence making the intervention unsafe or not worthwhile." },
+                    "learning_note": { "type": "string", "maxLength": MAX_LEARNING_NOTE_TEXT }, "learning_evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } }, "strategy_key": { "type": "string", "maxLength": 64 },
+                    "strategy_kind": { "type": "string", "enum": ["reinforce", "explore", "avoid", "retire"] }, "strategy_confidence_bps": { "type": "integer", "minimum": 0, "maximum": 10000 }, "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT }, "reconciliation_resolution": { "type": "string", "enum": ["confirmed_effect_occurred", "confirmed_no_effect", "abandon_attempt"] }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -1695,6 +2010,20 @@ fn normalized_termination_fields(
     Ok((kind, matched))
 }
 
+fn validate_act_evidence(
+    outcome: MandateDecisionOutcome,
+    observations: &[String],
+    evidence_receipt_ids: &[String],
+) -> anyhow::Result<()> {
+    if outcome == MandateDecisionOutcome::Act {
+        anyhow::ensure!(
+            !observations.is_empty() && !evidence_receipt_ids.is_empty(),
+            "ACT requires at least one current-run sourced observation and its durable evidence receipt; choose WAIT when no evidence shows that intervention is worthwhile"
+        );
+    }
+    Ok(())
+}
+
 fn normalized_learning_note(
     learning_note: Option<&str>,
     learning_evidence_receipt_ids: Option<&[String]>,
@@ -1720,6 +2049,66 @@ fn normalized_learning_note(
         "learning_note requires learning_evidence_receipt_ids"
     );
     Ok(Some((summary, evidence)))
+}
+
+fn learning_note_fields_complete(learning_note: Option<&str>, evidence: Option<&[String]>) -> bool {
+    learning_note.is_some_and(|value| !value.trim().is_empty())
+        && evidence.is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))
+}
+
+fn strategy_update_fields_complete(
+    strategy_key: Option<&str>,
+    strategy_kind: Option<&str>,
+    strategy_confidence_bps: Option<u16>,
+    learning_note: Option<&MandateLearningNote>,
+) -> bool {
+    strategy_key.is_some_and(|value| !value.trim().is_empty())
+        && strategy_kind.is_some_and(|value| !value.trim().is_empty())
+        && strategy_confidence_bps.is_some()
+        && learning_note.is_some()
+}
+
+fn normalized_strategy_revisions(
+    mandate: &Mandate,
+    decision: &MandateDecisionCycle,
+    strategy_key: Option<&str>,
+    strategy_kind: Option<&str>,
+    strategy_confidence_bps: Option<u16>,
+    learning_note: Option<&MandateLearningNote>,
+) -> anyhow::Result<Vec<MandateStrategyRevision>> {
+    let Some(key) = bounded_optional_text(strategy_key, "strategy_key", 64)? else {
+        // Some structured-tool providers fill every optional field. The
+        // non-empty strategy key is the authoritative presence marker for an
+        // adaptive update, so enum/numeric defaults without a key are ignored.
+        return Ok(Vec::new());
+    };
+    let kind = strategy_kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(MandateStrategyRevisionKind::parse)
+        .ok_or_else(|| {
+            anyhow::anyhow!("strategy_kind must be reinforce, explore, avoid, or retire")
+        })?;
+    let confidence = strategy_confidence_bps.ok_or_else(|| {
+        anyhow::anyhow!(
+            "strategy_key, strategy_kind, strategy_confidence_bps, learning_note, and learning evidence must be supplied together"
+        )
+    })?;
+    let note = learning_note.ok_or_else(|| {
+        anyhow::anyhow!(
+            "strategy_key, strategy_kind, strategy_confidence_bps, learning_note, and learning evidence must be supplied together"
+        )
+    })?;
+    Ok(vec![MandateStrategyRevision::new(
+        &mandate.id,
+        mandate.version,
+        &decision.id,
+        &key,
+        kind,
+        &note.summary,
+        confidence,
+        note.evidence_receipt_ids.clone(),
+    )])
 }
 
 fn clean_strings(values: Option<&[String]>) -> Vec<String> {
@@ -1846,7 +2235,7 @@ fn expected_default_review_cycles(
     Ok(((horizon_secs - 1) / default_review_secs) + 1)
 }
 
-fn controller_budget_snapshot(goal: &crate::traits::Goal) -> Value {
+fn controller_budget_snapshot(goal: &crate::traits::Goal, review_effort: &str) -> Value {
     let now = chrono::Utc::now();
     let today = now.date_naive().to_string();
     let used_today = if goal.tokens_used_day == today {
@@ -1871,20 +2260,24 @@ fn controller_budget_snapshot(goal: &crate::traits::Goal) -> Value {
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc)
             .to_rfc3339()
     });
+    let used_percent = goal
+        .budget_daily
+        .filter(|daily| *daily > 0)
+        .map(|daily| ((used_today as f64 / daily as f64) * 100.0).clamp(0.0, 100.0));
+    let effort = ReviewEffort::parse(review_effort);
     json!({
-        "units": "tokens",
-        "per_cycle": goal.budget_per_check,
-        "per_utc_day": goal.budget_daily,
+        "review_effort": effort.map_or("legacy_custom", ReviewEffort::as_str),
+        "automatically_managed": effort.is_some(),
+        "runaway_protection": true,
+        "usage_percent_today": used_percent,
         "usage_utc_day": today,
-        "used_today": used_today,
-        "remaining_today": remaining,
         "can_fund_full_cycle": can_fund_full_cycle,
         "blocked_until_utc": blocked_until_utc,
     })
 }
 
-fn controller_budget_admission_label(goal: &crate::traits::Goal) -> String {
-    let snapshot = controller_budget_snapshot(goal);
+fn controller_budget_admission_label(goal: &crate::traits::Goal, review_effort: &str) -> String {
+    let snapshot = controller_budget_snapshot(goal, review_effort);
     if snapshot["can_fund_full_cycle"] == Value::Bool(true) {
         "ready".to_string()
     } else {
@@ -2013,12 +2406,197 @@ mod tests {
     }
 
     #[test]
+    fn act_requires_sourced_evidence_while_non_actions_do_not_manufacture_it() {
+        let observations = vec!["The monitored value crossed its confirmed threshold".to_string()];
+        let receipts = vec!["tool-call-1".to_string()];
+        assert!(validate_act_evidence(MandateDecisionOutcome::Act, &[], &receipts).is_err());
+        assert!(validate_act_evidence(MandateDecisionOutcome::Act, &observations, &[]).is_err());
+        assert!(
+            validate_act_evidence(MandateDecisionOutcome::Act, &observations, &receipts).is_ok()
+        );
+        assert!(validate_act_evidence(MandateDecisionOutcome::Wait, &[], &[]).is_ok());
+    }
+
+    #[test]
     fn empty_learning_note_ignores_generator_supplied_receipt_defaults_before_commit() {
         let receipts = vec!["provider-filled-default".to_string()];
         assert!(normalized_learning_note(Some(""), Some(&receipts))
             .unwrap()
             .is_none());
         assert!(normalized_learning_note(Some("real learning"), None).is_err());
+    }
+
+    #[test]
+    fn empty_strategy_key_ignores_structured_provider_companion_defaults() {
+        let goal = crate::traits::Goal::new_continuous(
+            "Review a synthetic bounded source",
+            "owner-session",
+            None,
+            None,
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a synthetic bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        let decision = MandateDecisionCycle::new(
+            &mandate.id,
+            "synthetic-run",
+            MandateDecisionOutcome::Wait,
+            "Nothing worthwhile to do in this review.",
+            mandate.version,
+        );
+
+        let revisions = normalized_strategy_revisions(
+            &mandate,
+            &decision,
+            Some(""),
+            Some("explore"),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert!(revisions.is_empty());
+    }
+
+    #[test]
+    fn partial_optional_learning_and_strategy_metadata_is_not_decision_blocking() {
+        assert!(!learning_note_fields_complete(
+            Some("possible learning"),
+            None
+        ));
+        assert!(!strategy_update_fields_complete(
+            Some("source-selection"),
+            Some("reinforce"),
+            None,
+            None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_default_filled_wait_payload_commits_exact_decision() {
+        use crate::traits::{Goal, Task};
+
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = Goal::new_continuous(
+            "Review a synthetic bounded source",
+            "owner-session",
+            Some(250_000),
+            Some(2_000_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a synthetic bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            3_600,
+            21_600,
+            10_800,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let leased = state
+            .claim_due_mandates(1, "provider-default-test", 300)
+            .await
+            .unwrap()
+            .pop()
+            .expect("one due mandate");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let root_task = Task {
+            id: root_task_id.clone(),
+            goal_id: goal.id.clone(),
+            description: "Record one bounded WAIT decision".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let run = state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased.review_lease_token.as_deref().unwrap(),
+                &run_id,
+                &root_task,
+            )
+            .await
+            .unwrap();
+        let attempt = state
+            .claim_task_with_lease(&root_task_id, "provider-default-task-lead", None, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "record_decision",
+                    "outcome": "wait",
+                    "activity_level": "quiet",
+                    "rationale": "No worthwhile action is available in this review.",
+                    "reconsider_minutes": 180,
+                    "learning_note": "",
+                    "learning_evidence_receipt_ids": [],
+                    "strategy_key": "",
+                    "strategy_kind": "explore",
+                    "strategy_confidence_bps": 0,
+                    "_goal_id": goal.id,
+                    "_goal_run_id": run.id,
+                    "_task_attempt_id": attempt.id,
+                    "_session_id": "synthetic-task-lead",
+                    "_channel_visibility": "internal"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("WAIT recorded"));
+        let decision = state
+            .get_mandate_decision_for_run(&run.id)
+            .await
+            .unwrap()
+            .expect("durable decision");
+        assert_eq!(decision.outcome, MandateDecisionOutcome::Wait);
+        assert_eq!(
+            decision.rationale,
+            "No worthwhile action is available in this review."
+        );
+        assert!(state
+            .list_mandate_learning_notes(&mandate.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .list_current_mandate_strategy(&mandate.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2085,6 +2663,7 @@ mod tests {
                     "max_mutating_actions_per_rolling_24h":8,
                     "min_seconds_between_mutations":900,
                     "constraints":["No fabrication"],
+                    "success_criteria":["Interventions measurably improve the usefulness of the account without degrading trust"],
                     "_session_id":"owner-session",
                     "_user_role":"owner",
                     "_channel_visibility":"private"
@@ -2101,8 +2680,7 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("http_request")));
         assert!(request.warnings.iter().any(|warning| {
-            warning
-                == "Resolved token budgets: 100000 tokens per decision cycle; 1000000 tokens per UTC day"
+            warning.contains("Review effort: balanced") && warning.contains("automatically managed")
         }));
         assert!(request
             .warnings
@@ -2151,13 +2729,89 @@ mod tests {
         assert_eq!(controller.status, "active");
         assert_eq!(controller.domain, "orchestration");
         assert_eq!(controller.goal_type, "continuous");
-        assert_eq!(controller.budget_per_check, Some(100_000));
-        assert_eq!(controller.budget_daily, Some(1_000_000));
+        assert_eq!(controller.budget_per_check, Some(250_000));
+        assert_eq!(controller.budget_daily, Some(2_000_000));
         assert!(state
             .get_schedules_for_goal(&controller.id)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_autopilot_mode_gets_distinct_version_bound_confirmation() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let call = tokio::spawn(async move {
+            tool.call(
+                r#"{
+                    "action":"create",
+                    "objective":"Maintain the synthetic account without routine hand-holding",
+                    "autonomy_mode":"autopilot",
+                    "operation_scopes":[{
+                        "tool":"http_request",
+                        "operation":"POST",
+                        "kind":"mutation",
+                        "target_prefixes":["https://api.example.test/v1/posts","auth_profile:synthetic-social","account:synthetic-1"],
+                        "allowed_query_params":[],
+                        "mutation_effects":["remote_mutation","external_delivery"]
+                    }],
+                    "max_mutating_actions_per_cycle":2,
+                    "max_mutating_actions_per_rolling_24h":12,
+                    "min_seconds_between_mutations":900,
+                    "success_criteria":["Each intervention provides concrete value to the synthetic audience"],
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+        });
+
+        let request = approval_rx.recv().await.expect("autopilot confirmation");
+        assert!(matches!(request.kind, ApprovalKind::AutopilotConfirmation));
+        assert!(request.command.starts_with("Enable Autopilot:"));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning == "Autonomy mode: autopilot"));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Confirmation binding:") && warning.contains("policy version 2")
+        }));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("account:synthetic-1")
+                && warning.contains("https://api.example.test/v1/posts")
+        }));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Review effort: thorough") && warning.contains("automatically managed")
+        }));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Owner checkpoints:")));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Recovery policy:")));
+        request
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .unwrap();
+
+        let result = call.await.unwrap().unwrap();
+        assert!(result.contains("Autopilot enabled for mandate"));
+        let mandate = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(mandate.autonomy_mode, MandateAutonomyMode::Autopilot);
+        assert_eq!(mandate.review_effort, "thorough");
+        assert_eq!(mandate.default_review_secs, AUTOPILOT_DEFAULT_REVIEW_SECS);
+        assert_eq!(mandate.version, 2);
     }
 
     #[tokio::test]
@@ -2214,7 +2868,7 @@ mod tests {
             "Mutation limits:",
             "Review interval:",
             "Expiration:",
-            "Resolved token budgets:",
+            "Review effort:",
         ] {
             assert!(
                 request
@@ -2277,6 +2931,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|field| field == "operation_scopes"));
+        assert!(value["required_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "success_criteria"));
         assert!(state
             .list_mandates(Some("owner-session"), true)
             .await
@@ -2319,7 +2978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draft_labels_resolved_token_budgets_and_rejects_action_count_values() {
+    async fn draft_uses_human_review_effort_and_hides_token_arithmetic() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
@@ -2336,12 +2995,21 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(value["proposal"]["token_budgets"]["units"], "tokens");
         assert_eq!(
-            value["proposal"]["token_budgets"]["per_decision_cycle"],
-            100_000
+            value["proposal"]["resource_policy"]["review_effort"],
+            "balanced"
         );
-        assert_eq!(value["proposal"]["token_budgets"]["per_utc_day"], 1_000_000);
+        assert_eq!(
+            value["proposal"]["resource_policy"]["automatically_managed"],
+            true
+        );
+        assert!(value["proposal"].get("token_budgets").is_none());
+
+        let schema = tool.schema();
+        let properties = &schema["parameters"]["properties"];
+        assert!(properties.get("review_effort").is_some());
+        assert!(properties.get("budget_per_cycle").is_none());
+        assert!(properties.get("budget_daily").is_none());
 
         let error = tool
             .call(
@@ -2357,8 +3025,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("token budget"));
-        assert!(error.to_string().contains("at least 30000"));
+        assert!(error
+            .to_string()
+            .contains("legacy per-review token capacity"));
     }
 
     #[tokio::test]
@@ -2383,8 +3052,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("1440000"));
-        assert!(error.to_string().contains("48 default review cycle"));
+        assert!(error
+            .to_string()
+            .contains("cannot fund 48 default review cycle"));
 
         let defaulted = tool
             .call(
@@ -2402,8 +3072,12 @@ mod tests {
             .unwrap();
         let defaulted: Value = serde_json::from_str(&defaulted).unwrap();
         assert_eq!(
-            defaulted["proposal"]["token_budgets"]["per_utc_day"],
-            4_800_000
+            defaulted["proposal"]["resource_policy"]["review_effort"],
+            "balanced"
+        );
+        assert_eq!(
+            defaulted["proposal"]["resource_policy"]["cadence_funded"],
+            true
         );
 
         let result = tool
@@ -2423,7 +3097,14 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(value["proposal"]["token_budgets"]["per_utc_day"], 1_440_000);
+        assert_eq!(
+            value["proposal"]["resource_policy"]["review_effort"],
+            "legacy_custom"
+        );
+        assert_eq!(
+            value["proposal"]["resource_policy"]["automatically_managed"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -2492,7 +3173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_confirmed_update_can_repair_controller_token_budgets() {
+    async fn owner_confirmed_effort_update_manages_controller_capacity() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
         let goal = crate::traits::Goal::new_continuous(
@@ -2524,8 +3205,7 @@ mod tests {
                 &json!({
                     "action": "update",
                     "mandate_id": mandate_id,
-                    "budget_per_cycle": 30_000,
-                    "budget_daily": 180_000,
+                    "review_effort": "thorough",
                     "_session_id": "owner-session",
                     "_user_role": "owner",
                     "_channel_visibility": "private"
@@ -2538,22 +3218,22 @@ mod tests {
             .recv()
             .await
             .expect("budget update confirmation");
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("30000 tokens per decision cycle")));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Review effort: thorough") && warning.contains("automatically managed")
+        }));
         request
             .response_tx
             .send(ApprovalResponse::AllowOnce)
             .unwrap();
         let result = update.await.unwrap().unwrap();
-        assert!(result.contains("30000 tokens per cycle"));
+        assert!(result.contains("thorough review effort"));
 
         let updated_goal = state.get_goal(&goal.id).await.unwrap().unwrap();
-        assert_eq!(updated_goal.budget_per_check, Some(30_000));
-        assert_eq!(updated_goal.budget_daily, Some(180_000));
+        assert_eq!(updated_goal.budget_per_check, Some(500_000));
+        assert_eq!(updated_goal.budget_daily, Some(4_000_000));
         let updated_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(updated_mandate.version, mandate.version + 1);
+        assert_eq!(updated_mandate.review_effort, "thorough");
     }
 
     #[tokio::test]
@@ -2569,6 +3249,7 @@ mod tests {
                     "action":"create",
                     "objective":"Never activate without confirmation",
                     "max_mutating_actions_per_cycle":0,
+                    "success_criteria":["The bounded source is reviewed without unauthorized action"],
                     "_session_id":"owner-session",
                     "_user_role":"owner",
                     "_channel_visibility":"private"
@@ -2641,6 +3322,14 @@ mod tests {
 
         assert_eq!(value["section"], "summary");
         assert_eq!(value["mandate"]["controller_goal_id"], goal.id);
+        assert_eq!(
+            value["owner_input_contract"]["answer_question_changes_authority"],
+            false
+        );
+        assert_eq!(
+            value["owner_input_contract"]["authority_changes_require_confirmed_update"],
+            true
+        );
         assert!(value.get("latest_decision").is_some());
         assert!(value.get("latest_mutation_receipts").is_some());
         assert!(!result.contains(body_marker));
@@ -2818,8 +3507,11 @@ mod tests {
             .await
             .unwrap();
         assert!(resumed.contains("is active"));
+        assert!(resumed.contains("Immutable authority is unchanged"));
+        assert!(resumed.contains("owner-confirmed update workflow"));
         let resumed_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(resumed_mandate.status, MandateStatus::Active);
+        assert_eq!(resumed_mandate.authority, mandate.authority);
         let resumed_review_at =
             chrono::DateTime::parse_from_rfc3339(&resumed_mandate.next_review_at)
                 .unwrap()

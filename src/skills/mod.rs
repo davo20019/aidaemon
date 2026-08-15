@@ -834,8 +834,9 @@ pub fn match_skills<'a>(
     }
 }
 
-/// Ask a fast LLM to confirm which candidate skills are truly relevant to the user message.
-/// Returns only the confirmed subset. On any error, returns the full candidate list (fail-open).
+/// Ask an LLM to confirm which trigger-generated candidate skills are truly
+/// relevant to the user message. Returns only the confirmed subset. Malformed
+/// classifier output is an error so lexical candidates never activate alone.
 pub async fn confirm_skills<'a>(
     provider: &dyn ModelProvider,
     fast_model: &str,
@@ -877,7 +878,7 @@ pub async fn confirm_skills<'a>(
 
     let text = response
         .content
-        .ok_or_else(|| anyhow::anyhow!("Empty response from skill confirmation LLM"))?;
+        .ok_or_else(|| anyhow::anyhow!("empty response from skill confirmation LLM"))?;
 
     // Parse: strip markdown fences, find [...], deserialize
     let trimmed = text.trim();
@@ -885,16 +886,14 @@ pub async fn confirm_skills<'a>(
         if let Some(end) = trimmed.rfind(']') {
             &trimmed[start..=end]
         } else {
-            return Ok(candidates); // malformed, fail-open
+            anyhow::bail!("skill confirmation response had an unterminated JSON array");
         }
     } else {
-        return Ok(candidates); // no array found, fail-open
+        anyhow::bail!("skill confirmation response did not contain a JSON array");
     };
 
-    let names: Vec<String> = match serde_json::from_str(json_str) {
-        Ok(n) => n,
-        Err(_) => return Ok(candidates), // parse error, fail-open
-    };
+    let names: Vec<String> = serde_json::from_str(json_str)
+        .map_err(|error| anyhow::anyhow!("invalid skill confirmation JSON: {error}"))?;
 
     let confirmed: Vec<&'a Skill> = candidates
         .into_iter()

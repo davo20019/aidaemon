@@ -3002,6 +3002,55 @@ async fn test_tasks_crud() {
 }
 
 #[tokio::test]
+async fn implicit_goal_run_binds_its_first_task_as_root() {
+    let (store, _file) = setup_test_store().await;
+    let goal = crate::traits::Goal::new_continuous(
+        "Synthetic recurring work",
+        "synthetic-owner-session",
+        Some(10_000),
+        Some(100_000),
+    );
+    store.create_goal(&goal).await.unwrap();
+
+    let task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "Recover the current synthetic run".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 1,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+    };
+    store.create_task(&task).await.unwrap();
+
+    let run = store.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+    assert_eq!(run.trigger_type, "manual");
+    assert_eq!(run.root_task_id.as_deref(), Some(task.id.as_str()));
+    assert_eq!(
+        store
+            .get_tasks_for_goal_run(&run.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![task.id.as_str()]
+    );
+}
+
+#[tokio::test]
 async fn generic_task_update_cannot_bypass_human_unblock_transition() {
     let (store, _file) = setup_test_store().await;
     let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
@@ -3866,6 +3915,63 @@ async fn test_migrate_fixup_scheduled_goal_budgets() {
     let after = store.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(after.budget_per_check, Some(100_000));
     assert_eq!(after.budget_daily, Some(500_000));
+}
+
+#[tokio::test]
+async fn test_migrate_balanced_mandates_to_cadence_funded_capacity_only() {
+    let (store, _db_file) = setup_test_store().await;
+
+    let managed_goal = Goal::new_continuous(
+        "Managed mandate capacity",
+        "owner-session",
+        Some(100_000),
+        Some(1_000_000),
+    );
+    let managed = crate::traits::Mandate::new(
+        &managed_goal.id,
+        None,
+        "Review a synthetic managed source",
+        "owner-session",
+        crate::traits::MandateAuthority::default(),
+        900,
+        21_600,
+        3_600,
+    );
+    store
+        .create_mandate_controller(&managed_goal, &managed)
+        .await
+        .unwrap();
+
+    let custom_goal = Goal::new_continuous(
+        "Legacy custom mandate capacity",
+        "owner-session",
+        Some(30_000),
+        Some(720_000),
+    );
+    let mut custom = crate::traits::Mandate::new(
+        &custom_goal.id,
+        None,
+        "Review a synthetic custom source",
+        "owner-session",
+        crate::traits::MandateAuthority::default(),
+        900,
+        21_600,
+        3_600,
+    );
+    custom.review_effort = "legacy_custom".to_string();
+    store
+        .create_mandate_controller(&custom_goal, &custom)
+        .await
+        .unwrap();
+
+    migrations::migrate_state(&store.pool()).await.unwrap();
+
+    let managed_after = store.get_goal(&managed_goal.id).await.unwrap().unwrap();
+    assert_eq!(managed_after.budget_per_check, Some(250_000));
+    assert_eq!(managed_after.budget_daily, Some(6_000_000));
+    let custom_after = store.get_goal(&custom_goal.id).await.unwrap().unwrap();
+    assert_eq!(custom_after.budget_per_check, Some(30_000));
+    assert_eq!(custom_after.budget_daily, Some(720_000));
 }
 
 #[tokio::test]

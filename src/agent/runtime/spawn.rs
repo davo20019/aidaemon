@@ -3,6 +3,7 @@ use crate::agent::specialists::{
     validation as specialist_validation, SpecialistRegistry, SpecialistRenderContext,
 };
 use crate::events::TaskOutcome;
+use crate::runtime_ports::SessionRouteLease;
 use crate::traits::SpecialistKind;
 
 struct TaskLeadSpec {
@@ -180,96 +181,17 @@ impl Agent {
 
     pub(crate) fn select_specialist_kind(
         role: AgentRole,
-        mission: &str,
-        task: &str,
+        _mission: &str,
+        _task: &str,
     ) -> SpecialistKind {
         match role {
-            AgentRole::TaskLead => return SpecialistKind::TaskLead,
-            AgentRole::Orchestrator => return SpecialistKind::Generic,
-            AgentRole::Executor => {}
+            AgentRole::TaskLead => SpecialistKind::TaskLead,
+            AgentRole::Orchestrator => SpecialistKind::Generic,
+            // An omitted specialist is an explicit choice of the broad executor
+            // profile. Mission prose is not a stable authority or capability
+            // signal and must not silently narrow the child's tools or budget.
+            AgentRole::Executor => SpecialistKind::Executor,
         }
-
-        let text = format!("{} {}", mission, task).to_ascii_lowercase();
-        let has_marker = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
-        let has_word = |needles: &[&str]| {
-            needles
-                .iter()
-                .any(|needle| contains_keyword_as_words(&text, needle))
-        };
-
-        if has_marker(&[".md", "write-up"])
-            || has_word(&[
-                "markdown",
-                // "a report" (noun), not bare "report": ops tasks routinely
-                // say "report success" / "report the error" (verb) and must
-                // not be routed to the artifact writer.
-                "a report",
-                "the report",
-                "document",
-                "writeup",
-                "save it as",
-                "create a file",
-                "write a file",
-            ])
-        {
-            return SpecialistKind::ArtifactWriter;
-        }
-
-        // Check browser-verifier BEFORE Code so a task like "open the homepage
-        // in the browser and run the smoke test" isn't captured by Code's
-        // `test` keyword.
-        if has_word(&[
-            "browser",
-            "web page",
-            "website",
-            "screenshot",
-            "playwright",
-            "verify ui",
-            "localhost",
-        ]) {
-            return SpecialistKind::BrowserVerifier;
-        }
-
-        // `test` is intentionally specific (`cargo test`, `unit test`, `pytest`)
-        // to avoid matching incidental uses like "smoke test in the browser".
-        if has_marker(&[".rs", ".ts", ".tsx", ".js", ".py"])
-            || has_word(&[
-                "cargo",
-                "cargo test",
-                "unit test",
-                "pytest",
-                "bug",
-                "code",
-                "compile",
-                "refactor",
-                "implement",
-            ])
-        {
-            return SpecialistKind::Code;
-        }
-
-        if has_word(&["review", "audit", "inspect", "risk", "regression"]) {
-            return SpecialistKind::Review;
-        }
-
-        if has_word(&[
-            "research",
-            "look up",
-            "web search",
-            "current",
-            "latest",
-            "source",
-            "sources",
-            "investigate",
-        ]) {
-            return SpecialistKind::Research;
-        }
-
-        if has_word(&["draft", "email", "message", "reply", "comms"]) {
-            return SpecialistKind::CommsDraft;
-        }
-
-        SpecialistKind::Executor
     }
 
     pub(crate) fn build_specialist_session_id(kind: SpecialistKind, id: Uuid) -> String {
@@ -279,28 +201,22 @@ impl Agent {
     /// Resolve the effective `SpecialistKind` for a spawn given:
     /// - explicit role (role-typed spawns normally ignore the arg),
     /// - optional caller-supplied `arg_specialist` (from `spawn_agent`'s schema),
-    /// - mission + task text (heuristic fallback).
+    /// - broad executor fallback when no typed specialist is supplied.
     ///
     /// "task_lead" is role-typed and rejected when passed as an arg (the
     /// `AgentRole::TaskLead` spawn path produces it). Invalid arg values fall
-    /// through to the executor heuristic and produce a warn log.
+    /// through to the broad executor and produce a warn log.
     pub(crate) fn resolve_specialist_kind(
         role: Option<AgentRole>,
         arg_specialist: Option<&str>,
-        mission: &str,
-        task: &str,
+        _mission: &str,
+        _task: &str,
     ) -> SpecialistKind {
-        if let Some(role) = role {
-            // Internal whole-mission recovery is deliberately broad. It may
-            // contain URLs, code, research, and deployment evidence in the
-            // same prompt, so a narrow heuristic specialist would discard
-            // valid recovery paths. Only the generic executor override is
-            // accepted across this role boundary; every other role remains
-            // authoritative.
-            if role == AgentRole::Executor && arg_specialist == Some("executor") {
-                return SpecialistKind::Executor;
-            }
-            return Self::select_specialist_kind(role, mission, task);
+        if matches!(role, Some(AgentRole::TaskLead)) {
+            return SpecialistKind::TaskLead;
+        }
+        if matches!(role, Some(AgentRole::Orchestrator)) {
+            return SpecialistKind::Generic;
         }
         if let Some(s) = arg_specialist {
             match SpecialistKind::from_str(s) {
@@ -312,12 +228,12 @@ impl Agent {
                 None => {
                     warn!(
                         arg = %s,
-                        "ignoring invalid specialist arg; falling back to heuristic"
+                        "ignoring invalid specialist arg; using broad executor"
                     );
                 }
             }
         }
-        Self::select_specialist_kind(AgentRole::Executor, mission, task)
+        SpecialistKind::Executor
     }
 
     async fn sync_worker_profile(
@@ -766,6 +682,7 @@ impl Agent {
             system_prompt.push_str(&format!(
                 "\n\n## Autonomous mandate decision cycle\n\
                  Mandate: {} (policy version {})\n\
+                 Autonomy mode: {}\n\
                  Objective: {}\n\
                  Constraints:\n{}\n\
                  Success criteria:\n{}\n\
@@ -785,6 +702,7 @@ impl Agent {
                  Choose reconsider_minutes within the mandate bounds. Never use scheduled-goal trust, generic approval, or another agent to broaden this envelope.\n",
                 mandate.id,
                 mandate.version,
+                mandate.autonomy_mode,
                 mandate.objective,
                 render(&mandate.constraints),
                 render(&mandate.success_criteria),
@@ -1591,7 +1509,8 @@ impl Agent {
         ));
 
         if let Some(spawn_tool) = spawn_tool {
-            spawn_tool.set_agent(Arc::downgrade(&child));
+            let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = child.clone();
+            spawn_tool.set_agent(Arc::downgrade(&runtime));
         }
 
         child
@@ -1610,7 +1529,7 @@ impl Agent {
     /// - Executor: Action + Universal + ReportBlockerTool, NO SpawnAgentTool
     #[allow(dead_code, clippy::too_many_arguments)]
     pub async fn spawn_child(
-        self: &Arc<Self>,
+        &self,
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -1641,7 +1560,7 @@ impl Agent {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_child_with_outcome(
-        self: &Arc<Self>,
+        &self,
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -1676,7 +1595,7 @@ impl Agent {
     /// child cannot rediscover a replacement attempt or a later goal run.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_child_with_outcome_and_attempt(
-        self: &Arc<Self>,
+        &self,
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -2081,7 +2000,7 @@ impl Agent {
     /// Internal helper to create and run a child agent.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_child_inner(
-        self: &Arc<Self>,
+        &self,
         tools: &[Arc<dyn Tool>],
         mut model: String,
         mut system_prompt: String,
@@ -2350,8 +2269,7 @@ impl Agent {
             };
             match hub {
                 Some(hub) => {
-                    hub.register_session_route(&child_session, parent_session)
-                        .await
+                    SessionRouteLease::register(&hub, &child_session, parent_session).await
                 }
                 None => None,
             }
@@ -2640,6 +2558,7 @@ impl Agent {
                it was not given\n\
              - Always check list_tasks before spawning the next executor\n\
              - If an executor reports a blocker, inspect the recorded task status/result and resolve it or adjust the plan\n\
+             - Do not escalate a local file merely because it existed before the run. When build, test, validation, or deployment evidence identifies a file inside the authorized project as a concrete blocker, treat the smallest reversible mechanical repair as a causal dependency of the task. Preserve its substantive content; only escalate broader behavior/content changes, destructive actions, genuinely unrelated files, or missing external authority\n\
              - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
              - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\"\n\
              - Make the final reply easy to scan on a phone: lead with the outcome, use short paragraphs or bullets, and label important links, paths, verification status, and IDs. Do not repeat the goal instructions.\n\n\
@@ -2810,11 +2729,12 @@ impl Agent {
              - If `terminal` is available, keep commands simple and single-line.\n\
              - If `terminal` is available, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
              - Treat operational failures as recovery work inside this task. After a failed command, tool, validation, or stale-state contradiction, inspect current state and choose a safe in-scope RETRY, REPAIR, SUBSTITUTE, or RECONCILE action. Then rerun the original verification. Do not ask the owner to perform recovery that your current tools and authority permit.\n\
+             - Judge scope by causal necessity, not by whether a file predates this run. If the documented build, test, validation, or deployment workflow identifies a file inside the authorized project as the concrete blocker, that file is a task dependency rather than an unrelated file. Inspect it and make the smallest reversible local repair that restores an existing mechanical invariant (for example required frontmatter, formatting, generated metadata, or a manifest entry), preserving body content and unrelated behavior. Dirty or untracked status alone does not make a causal dependency off-limits. A file is genuinely unrelated only when no observed failure or required workflow connects it to this task; broader content/behavior changes, destructive changes, secrets, and external authority remain out of scope.\n\
              - Keep recovery bounded. Before declaring recovery_exhausted, make at least two concrete recovery attempts and retain the action, outcome, and evidence for each. If newer evidence contradicts an earlier failure, treat the earlier result as stale and retry the original operation against current state.\n\
              - Never retry a mutation whose external effect is ambiguous. Reconcile read-only when authorized; otherwise report an ambiguous_external_effect blocker for owner reconciliation.\n\
              - For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.\n\
              - Use report_blocker only for owner_input, missing_authority, external_dependency, ambiguous_external_effect, safety_boundary, or genuinely recovery_exhausted conditions.\n\
-             - When using report_blocker, include blocker_class, external_effect_state, recovery_attempts, outcome, reason, partial_work when applicable, exact_need, next_step, and target.\n\
+             - When using report_blocker, include blocker_class, external_effect_state, recovery_attempts, outcome, reason, partial_work when applicable, exact_need, next_step, and target. For missing_authority, set dependency_repair=true only for a minimal reversible local repair of a path named by failed required-workflow evidence; otherwise set it false.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
@@ -2939,14 +2859,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_specialist_arg_falls_back_to_heuristic() {
+    fn invalid_specialist_arg_falls_back_to_broad_executor() {
         let kind = Agent::resolve_specialist_kind(
             None,
             Some("not_a_real_kind"),
             "Implement the sorting algorithm in src/sort.rs",
             "Add a unit test",
         );
-        assert_eq!(kind, SpecialistKind::Code);
+        assert_eq!(kind, SpecialistKind::Executor);
     }
 
     #[test]
@@ -2972,50 +2892,50 @@ mod tests {
     }
 
     #[test]
-    fn task_lead_arg_is_rejected_falling_back_to_heuristic() {
+    fn executor_role_honors_explicit_typed_specialist() {
+        let kind = Agent::resolve_specialist_kind(
+            Some(AgentRole::Executor),
+            Some("research"),
+            "Mission wording is deliberately irrelevant",
+            "Task wording is deliberately irrelevant",
+        );
+        assert_eq!(kind, SpecialistKind::Research);
+    }
+
+    #[test]
+    fn task_lead_arg_is_rejected_falling_back_to_broad_executor() {
         // "task_lead" is role-typed only — when passed as an arg (without
-        // explicit role) it must be ignored and the heuristic should run.
+        // explicit role) it must be ignored and the broad executor should run.
         let kind = Agent::resolve_specialist_kind(
             None,
             Some("task_lead"),
             "Implement the sorting algorithm in src/sort.rs",
             "Add a unit test",
         );
-        assert_eq!(kind, SpecialistKind::Code);
+        assert_eq!(kind, SpecialistKind::Executor);
     }
 
     #[test]
-    fn specialist_kind_prefers_artifact_writer_for_report_files() {
-        let kind = Agent::select_specialist_kind(
-            AgentRole::Executor,
-            "Compile and format morning AI job preparation tips report",
-            "Create a markdown report and save it as ~/morning_ai_job_preparation_tips_report.md",
-        );
-        assert_eq!(kind, SpecialistKind::ArtifactWriter);
-    }
-
-    #[test]
-    fn specialist_kind_ops_task_with_report_verb_is_not_artifact_writer() {
-        // "report success" / "report the error" is reporting back, not
-        // writing a document — must not select ArtifactWriter for ops work.
-        let kind = Agent::select_specialist_kind(
-            AgentRole::Executor,
-            "Run ddev composer update for the Drupal site",
-            "1. Navigate to the project. 2. Run `ddev composer update`. \
-             3. Monitor the output for errors. 4. If successful, report success. \
-             If it fails, report the error.",
-        );
-        assert_ne!(kind, SpecialistKind::ArtifactWriter);
-    }
-
-    #[test]
-    fn specialist_kind_written_report_noun_still_artifact_writer() {
-        let kind = Agent::select_specialist_kind(
-            AgentRole::Executor,
-            "Summarize the benchmark findings",
-            "Write a report of the benchmark results for the team",
-        );
-        assert_eq!(kind, SpecialistKind::ArtifactWriter);
+    fn omitted_specialist_never_depends_on_mission_wording() {
+        for (mission, task) in [
+            (
+                "Compile and format a report",
+                "Create a markdown report in /tmp/report.md",
+            ),
+            (
+                "Smoke-check the landing page",
+                "Open the homepage in a browser and run the smoke test",
+            ),
+            (
+                "Fix the broken assertion",
+                "Run cargo test until src/math.rs passes",
+            ),
+        ] {
+            assert_eq!(
+                Agent::select_specialist_kind(AgentRole::Executor, mission, task),
+                SpecialistKind::Executor
+            );
+        }
     }
 
     #[test]
@@ -3071,26 +2991,6 @@ mod tests {
         let a = Agent::build_specialist_session_id(SpecialistKind::Code, Uuid::new_v4());
         let b = Agent::build_specialist_session_id(SpecialistKind::Code, Uuid::new_v4());
         assert_ne!(a, b, "fresh uuids must produce unique session ids");
-    }
-
-    #[test]
-    fn specialist_kind_browser_check_wins_over_code_for_smoke_tests() {
-        let kind = Agent::select_specialist_kind(
-            AgentRole::Executor,
-            "Smoke-check the landing page",
-            "Open the homepage in a browser and run the smoke test",
-        );
-        assert_eq!(kind, SpecialistKind::BrowserVerifier);
-    }
-
-    #[test]
-    fn specialist_kind_code_still_wins_for_cargo_test() {
-        let kind = Agent::select_specialist_kind(
-            AgentRole::Executor,
-            "Fix the broken assertion in math::add",
-            "Run cargo test until the failing case in src/math.rs passes",
-        );
-        assert_eq!(kind, SpecialistKind::Code);
     }
 
     #[test]

@@ -16,8 +16,8 @@ use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::QueueTelemetry;
 use crate::skills;
 use crate::startup::{
-    channels as startup_channels, mcp as startup_mcp, memory_pipeline, provider_router,
-    skills as startup_skills, stores, tools as startup_tools,
+    channels as startup_channels, mcp as startup_mcp, memory_pipeline, skills as startup_skills,
+    stores, tools as startup_tools,
 };
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
@@ -130,13 +130,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         health_store,
     } = stores::build_stores(&config).await?;
 
-    let provider_router::ProviderRouterBundle {
+    let crate::providers::factory::ProviderRouterBundle {
         provider,
         primary_model: model,
         router,
         provider_kind,
         failover_targets,
-    } = provider_router::build_provider_router(&config)?;
+    } = crate::providers::factory::build_provider_router(&config)?;
     let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
         router,
@@ -230,51 +230,51 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists_dir.as_deref(),
     ));
 
-    let agent = Arc::new(Agent::new(
-        llm_runtime.clone(),
-        state.clone(),
-        event_store.clone(),
+    let agent = Arc::new(Agent::new(crate::agent::AgentConstruction {
+        llm_runtime: llm_runtime.clone(),
+        state: state.clone(),
+        event_store: event_store.clone(),
         tools,
         model,
-        base_system_prompt,
-        config_path.clone(),
-        skills_dir.clone().unwrap_or_default(),
-        config.subagents.max_depth,
-        config.subagents.max_iterations,
-        config.subagents.max_iterations_cap,
-        config.subagents.max_response_chars,
-        config.subagents.timeout_secs,
-        config.state.max_facts,
-        config.state.daily_token_budget,
-        config.subagents.effective_iteration_limit(),
-        config.subagents.task_timeout_secs,
-        config.subagents.task_token_budget,
+        system_prompt: base_system_prompt,
+        config_path: config_path.clone(),
+        skills_dir: skills_dir.clone().unwrap_or_default(),
+        max_depth: config.subagents.max_depth,
+        max_iterations: config.subagents.max_iterations,
+        max_iterations_cap: config.subagents.max_iterations_cap,
+        max_response_chars: config.subagents.max_response_chars,
+        timeout_secs: config.subagents.timeout_secs,
+        max_facts: config.state.max_facts,
+        daily_token_budget: config.state.daily_token_budget,
+        iteration_config: config.subagents.effective_iteration_limit(),
+        task_timeout_secs: config.subagents.task_timeout_secs,
+        task_token_budget: config.subagents.task_token_budget,
         llm_call_timeout_secs,
-        Some(mcp_registry.clone()),
-        Some(goal_token_registry.clone()),
-        None, // hub — set after ChannelHub creation via set_hub()
-        config.diagnostics.record_decision_points,
-        config.state.context_window.clone(),
-        config.policy.clone(),
-        config.path_aliases.clone(),
-        None,
+        mcp_registry: Some(mcp_registry.clone()),
+        goal_token_registry: Some(goal_token_registry.clone()),
+        hub: None,
+        record_decision_points: config.diagnostics.record_decision_points,
+        context_window_config: config.state.context_window.clone(),
+        policy_config: config.policy.clone(),
+        path_aliases: config.path_aliases.clone(),
+        inherited_project_scope: None,
         specialists,
         // Pin the interactive generation loop to the configured slot only when
         // slot routing is enabled on the primary provider; otherwise None (no
         // id_slot is ever sent — zero behavior change for cloud-API users).
-        if config.provider.slot_routing.enabled {
+        interactive_slot: if config.provider.slot_routing.enabled {
             Some(config.provider.slot_routing.interactive_slot)
         } else {
             None
         },
-        VisionConfig::from_files(&config.files),
-        AudioConfig::from_files(&config.files),
-        SttConfig::from_files(&config.files),
-        (&config.diagnostics.harness_eval).into(),
-    ));
+        vision_config: VisionConfig::from_files(&config.files),
+        audio_config: AudioConfig::from_files(&config.files),
+        stt_config: SttConfig::from_files(&config.files),
+        harness_eval_config: (&config.diagnostics.harness_eval).into(),
+    }));
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
-    crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await;
+    crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;
 
     // Merge persisted runtime-learned "ignores tool_choice=required" models into
     // the config-seeded in-memory set, so a model that melted down once stays
@@ -294,7 +294,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     maybe_run_legacy_system_maintenance_goal_migration(state.clone()).await;
 
     // 9c. Heartbeat coordinator (replaces individual background task loops)
-    let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
     let HeartbeatSetup {
         coordinator: heartbeat_opt,
         telemetry: heartbeat_telemetry,
@@ -324,15 +324,20 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let task_registry = Arc::new(TaskRegistry::new(50));
 
     // 11. Channels
+    let channel_agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> = agent.clone();
     let channel_bundle = startup_channels::build_channels(
         &config,
-        agent.clone(),
-        config_path.clone(),
-        session_map.clone(),
-        task_registry.clone(),
-        &inbox_dir,
-        state.clone(),
-        watchdog_stale_threshold_secs,
+        crate::channels::ChannelRuntimeDeps {
+            agent: channel_agent,
+            config_path: config_path.clone(),
+            session_map: session_map.clone(),
+            task_registry: task_registry.clone(),
+            files_enabled: config.files.enabled,
+            inbox_dir: std::path::PathBuf::from(&inbox_dir),
+            max_file_size_mb: config.files.max_file_size_mb,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            watchdog_stale_threshold_secs,
+        },
     )
     .await;
 
@@ -340,7 +345,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let hub = Arc::new(
         ChannelHub::new(channel_bundle.channels.clone(), session_map)
             .with_queue_telemetry(queue_telemetry.clone())
-            .with_delivery_note_agent(agent.clone())
+            .with_delivery_note_sink(agent.clone())
             .with_queue_policy(queue_policy.clone()),
     );
 
@@ -348,12 +353,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     crate::startup::wiring::wire_hub_cycles(
         &agent,
         &hub,
-        spawn_tool,
-        terminal_tool,
-        cli_agent_tool,
+        spawn_tool.as_ref(),
+        terminal_tool.as_ref(),
+        cli_agent_tool.as_ref(),
         plan_store.clone(),
     )
-    .await;
+    .await?;
     crate::startup::nodes::start(&config, state.pool(), agent.clone(), hub.clone()).await?;
     // Give the agent its plan_store handle so the completion phase can read the
     // active checklist for soft verification + recap (deferred to avoid touching
@@ -396,6 +401,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         oauth_gateway.clone(),
         write_consistency_thresholds,
         queue_telemetry.clone(),
+        wake_tx.clone(),
     );
 
     // 14. Event listener: route trigger events to agent -> broadcast via hub
@@ -404,6 +410,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         event_rx,
         hub.clone(),
         agent.clone(),
+        state.clone(),
+        wake_tx,
         notify_session_ids.clone(),
         queue_telemetry.clone(),
         queue_policy.clone(),
@@ -993,7 +1001,8 @@ fn start_heartbeat_coordinator(
     agent: &Arc<Agent>,
 ) {
     if let Some(mut heartbeat) = heartbeat_opt {
-        heartbeat.set_hub(Arc::downgrade(hub));
+        let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
+        heartbeat.set_hub(Arc::downgrade(&outbound));
         heartbeat.set_agent(Arc::downgrade(agent));
         info!("Heartbeat coordinator starting with hub and agent references");
         heartbeat.start();
@@ -1080,6 +1089,7 @@ fn spawn_dashboard_or_health_server(
     oauth_gateway: Option<crate::oauth::OAuthGateway>,
     write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
     queue_telemetry: Arc<QueueTelemetry>,
+    heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
@@ -1089,6 +1099,8 @@ fn spawn_dashboard_or_health_server(
             Ok(dashboard_token_info) => {
                 let ds = crate::dashboard::DashboardState {
                     pool: state.pool(),
+                    mandate_store: state.clone(),
+                    heartbeat_wake_tx,
                     event_store: Some(event_store),
                     provider_kind: format!("{:?}", config.provider.kind),
                     models: config.provider.models.clone(),
@@ -1162,10 +1174,13 @@ fn collect_notify_session_ids(config: &AppConfig) -> Vec<String> {
     notify_session_ids
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_trigger_event_listener(
     mut event_rx: triggers::EventReceiver,
     hub: Arc<ChannelHub>,
     agent: Arc<Agent>,
+    state: Arc<SqliteStateStore>,
+    heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
     notify_session_ids: Vec<String>,
     queue_telemetry: Arc<QueueTelemetry>,
     queue_policy: crate::config::QueuePolicyConfig,
@@ -1208,6 +1223,24 @@ fn spawn_trigger_event_listener(
                             "Dropping untrusted trigger event due to configured overload shedding policy"
                         );
                         continue;
+                    }
+                    if let Some(signal) = event.mandate_signal.as_ref() {
+                        match state.wake_mandates_for_signal(signal).await {
+                            Ok(awakened) if !awakened.is_empty() => {
+                                let _ = heartbeat_wake_tx.try_send(());
+                                info!(
+                                    count = awakened.len(),
+                                    signal_kind = signal.kind.as_str(),
+                                    "Structured external signal awakened Autopilot mandates"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn!(
+                                %error,
+                                source = %event.source,
+                                "Rejected structured mandate wake signal"
+                            ),
+                        }
                     }
                     info!(source = %event.source, "Received trigger event");
                     // Wrap trigger content so the LLM sees it as external/untrusted data.
@@ -1538,7 +1571,7 @@ fn build_base_system_prompt(
         "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
 
     let browser_table_row = if cfg!(feature = "browser") && config.browser.enabled {
-        "| Visit website, search web | browser | terminal (curl/wget) |\n"
+        "| Interact with login/JavaScript website | browser | web_fetch for readable public pages |\n"
     } else {
         ""
     };
@@ -1818,7 +1851,8 @@ use a one-shot task for one finite outcome, a schedule when the time/cadence is 
 owner-confirmed mandate when the user delegates an ongoing objective and expects the agent to choose \
 when to observe, act, wait, ask, and adapt. Do not use keyword filters. For a mandate, call \
 manage_mandates(action=\"draft\") first, resolve missing integration identity/target fields, show the \
-complete proposal through create confirmation, and never infer authority from the objective. Bind every \
+complete proposal through create confirmation, include at least one observable success criterion that \
+describes user value rather than mere activity, and never infer authority from the objective. Bind every \
 delegated call in one operation_scope (exact tool, adapter operation, effect, and targets); never combine \
 independent read/write allowlists. Authenticated HTTP scopes must pin both auth_profile and account IDs, \
 and an unauthenticated 401 says nothing about a configured profile. HTTP POST/PUT/PATCH bodies require \
@@ -2262,6 +2296,15 @@ primary = "gpt-4o"
         assert!(prompt.contains(
             "| Read web pages, articles, docs | web_fetch | http_request for REST/JSON APIs; browser for login/JS pages"
         ));
+        assert!(
+            !prompt.contains("| Visit website, search web | browser"),
+            "browser guidance must not conflict with web_search/web_fetch-first research routing"
+        );
+        if cfg!(feature = "browser") && config.browser.enabled {
+            assert!(prompt.contains(
+                "| Interact with login/JavaScript website | browser | web_fetch for readable public pages |"
+            ));
+        }
         assert!(prompt.contains(
             "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
         ));

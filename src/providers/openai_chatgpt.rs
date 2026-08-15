@@ -231,7 +231,54 @@ struct ResponseCollector {
     /// The terminal `response.completed` payload — authoritative for usage and
     /// for `output` when the endpoint actually populates it.
     completed: Option<Value>,
-    failure: Option<String>,
+    /// A typed failure captured from the terminal stream event. Keeping the
+    /// provider classification here lets the shared recovery layer distinguish
+    /// overload/rate-limit infrastructure failures from refusals or filters.
+    failure: Option<ProviderError>,
+}
+
+fn stream_failure(event: &Value, message: &str) -> ProviderError {
+    let code = event
+        .get("code")
+        .or_else(|| event.pointer("/error/code"))
+        .or_else(|| event.pointer("/response/error/code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let status = event
+        .get("status")
+        .or_else(|| event.pointer("/error/status"))
+        .or_else(|| event.pointer("/response/error/status"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    let lower_message = message.to_ascii_lowercase();
+
+    let kind = match status {
+        Some(429) => ProviderErrorKind::RateLimit,
+        Some(500 | 502 | 503 | 504) => ProviderErrorKind::ServerError,
+        Some(408) => ProviderErrorKind::Timeout,
+        _ if code.contains("rate_limit") => ProviderErrorKind::RateLimit,
+        _ if code.contains("overload")
+            || code == "server_error"
+            || code == "service_unavailable" =>
+        {
+            ProviderErrorKind::ServerError
+        }
+        // Some Codex SSE error events currently omit both status and code.
+        // In that protocol shape, the provider's explicit overload marker is
+        // the only available infrastructure signal.
+        _ if lower_message.contains("overload") => ProviderErrorKind::ServerError,
+        _ => ProviderErrorKind::Unknown,
+    };
+
+    ProviderError {
+        kind,
+        status,
+        message: format!("Codex stream failed: {message}"),
+        malformed_reason: None,
+        retry_after_secs: None,
+        affordable_tokens: None,
+    }
 }
 
 impl ResponseCollector {
@@ -254,27 +301,23 @@ impl ResponseCollector {
                 self.completed = event.get("response").cloned();
             }
             "response.failed" | "response.incomplete" => {
-                self.failure = Some(
-                    event
-                        .pointer("/response/error/message")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            event
-                                .pointer("/response/incomplete_details/reason")
-                                .and_then(Value::as_str)
-                        })
-                        .unwrap_or("the model stopped before completing the response")
-                        .to_string(),
-                );
+                let message = event
+                    .pointer("/response/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event
+                            .pointer("/response/incomplete_details/reason")
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("the model stopped before completing the response");
+                self.failure = Some(stream_failure(event, message));
             }
             "error" => {
-                self.failure = Some(
-                    event
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unspecified stream error")
-                        .to_string(),
-                );
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unspecified stream error");
+                self.failure = Some(stream_failure(event, message));
             }
             _ => {}
         }
@@ -300,18 +343,7 @@ impl ResponseCollector {
             return Ok(parsed);
         }
         if let Some(failure) = failure {
-            // Not a server outage: a failed/incomplete response is usually a
-            // content filter, refusal, or truncation. `Unknown` keeps the real
-            // reason in the user-facing message instead of replacing it with a
-            // generic "provider is having issues, will retry".
-            return Err(ProviderError {
-                kind: ProviderErrorKind::Unknown,
-                status: None,
-                message: format!("Codex stream failed: {failure}"),
-                malformed_reason: None,
-                retry_after_secs: None,
-                affordable_tokens: None,
-            });
+            return Err(failure);
         }
         // Stream died before the completion event. Hand back whatever arrived
         // rather than discarding a partial answer.
@@ -1042,13 +1074,24 @@ mod tests {
     fn stream_error_event_fails_the_turn() {
         let stream = "data: {\"type\":\"error\",\"message\":\"model overloaded\"}\n\n";
         let err = collect(stream).unwrap_err();
-        assert!(err.user_message().contains("model overloaded"));
+        assert_eq!(err.kind, ProviderErrorKind::ServerError);
+        assert!(err.message.contains("model overloaded"));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_uses_structured_rate_limit_code() {
+        let stream = "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"capacity unavailable\"}\n\n";
+        let err = collect(stream).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::RateLimit);
+        assert!(err.is_retryable());
     }
 
     #[test]
     fn failed_response_event_surfaces_reason() {
         let stream = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"content filtered\"}}}\n\n";
         let err = collect(stream).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Unknown);
         assert!(err.user_message().contains("content filtered"));
     }
 

@@ -48,10 +48,28 @@ impl crate::traits::Tool for DialogueStateWebSearchTool {
 }
 
 #[tokio::test]
-async fn test_unanswered_request_followup_uses_dialogue_state_projection() {
+async fn test_semantic_followup_uses_dialogue_state_projection() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I searched for AI news and found several results."),
         MockProvider::text_response("Here is the original answer you asked for."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "none",
+        ),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -94,7 +112,7 @@ async fn test_unanswered_request_followup_uses_dialogue_state_projection() {
             .open_request
             .as_ref()
             .map(|request| request.text.as_str()),
-        Some("What were the deployment regressions in yesterday's rollout?")
+        Some("You didn't answer my question")
     );
     assert_eq!(
         dialogue_state.last_user_turn.as_ref().map(|turn| turn.kind),
@@ -156,6 +174,32 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
         MockProvider::text_response(
             "I based that recap on the saved job-preparation notes returned in the prior turn.",
         ),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session_id = "exact_source_question_adjacency";
@@ -179,9 +223,10 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
             .unwrap();
     }
 
-    // This exact wording intentionally has no source-question phrase rule. Its
-    // persisted lexical label may remain NewRequest; transcript continuity must
-    // still bind it to the immediately preceding answer by canonical topology.
+    // This exact wording intentionally has no source-question phrase rule. The
+    // unresolved typed antecedent may classify it as a Followup without parsing
+    // the wording; transcript continuity must still bind it to the immediately
+    // preceding answer by canonical topology.
     let dialogue_state = harness
         .state
         .get_dialogue_state(session_id)
@@ -190,7 +235,7 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
         .expect("dialogue state");
     assert_eq!(
         dialogue_state.last_user_turn.as_ref().map(|turn| turn.kind),
-        Some(crate::traits::UserTurnKind::NewRequest)
+        Some(crate::traits::UserTurnKind::Followup)
     );
 
     let calls = harness.provider.call_log.lock().await;
@@ -245,6 +290,24 @@ async fn test_schedule_trigger_followup_blocks_off_topic_web_search() {
         MockProvider::text_response(
             "I need to check the scheduled run state for that 9:00 AM trigger instead of searching the web.",
         ),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "goal_state",
+        ),
+        MockProvider::semantic_task_assessment(
+            "check",
+            false,
+            true,
+            &[],
+            "continuation",
+            "goal_state",
+        ),
     ]);
 
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
@@ -284,8 +347,9 @@ async fn test_schedule_trigger_followup_blocks_off_topic_web_search() {
         .unwrap();
 
     assert!(
-        response.contains("scheduled run state"),
-        "response should pivot back to schedule state instead of external web search: {response}"
+        response.contains("without verified success")
+            && !response.contains("What I need from you"),
+        "an unavailable in-scope observation must fail honestly without asking the user to manufacture a receipt: {response}"
     );
     assert!(
         queries.lock().await.is_empty(),

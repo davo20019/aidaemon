@@ -112,31 +112,77 @@ impl PlanStore {
         trigger: &str,
         items: &[(String, crate::plans::StepStatus)],
     ) -> anyhow::Result<TaskPlan> {
+        let graph_items: Vec<crate::plans::ChecklistItem> = items
+            .iter()
+            .map(|(description, status)| crate::plans::ChecklistItem {
+                description: description.clone(),
+                status: *status,
+                depends_on: Vec::new(),
+                required_mutation_effects: crate::traits::ToolMutationEffects::NONE,
+                requires_observation: false,
+                expected_targets: Vec::new(),
+            })
+            .collect();
+        self.upsert_checklist_graph(session_id, task_id, trigger, &graph_items)
+            .await
+    }
+
+    /// Create or replace a checklist with explicit prerequisite edges.
+    pub async fn upsert_checklist_graph(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        trigger: &str,
+        items: &[crate::plans::ChecklistItem],
+    ) -> anyhow::Result<TaskPlan> {
         use crate::plans::{PlanStep, StepStatus};
         let now = Utc::now();
         let steps: Vec<PlanStep> = items
             .iter()
             .enumerate()
-            .map(|(index, (description, status))| PlanStep {
+            .map(|(index, item)| PlanStep {
                 index,
-                description: description.clone(),
-                status: *status,
+                description: item.description.clone(),
+                depends_on: item.depends_on.clone(),
+                required_mutation_effects: item.required_mutation_effects,
+                requires_observation: item.requires_observation,
+                expected_targets: item.expected_targets.clone(),
+                evidence_receipt_ids: Vec::new(),
+                status: item.status,
                 tool_call_ids: Vec::new(),
                 result_summary: None,
                 error: None,
                 retry_count: 0,
-                started_at: if matches!(status, StepStatus::InProgress | StepStatus::Completed) {
+                started_at: if matches!(item.status, StepStatus::InProgress | StepStatus::Completed)
+                {
                     Some(now)
                 } else {
                     None
                 },
-                completed_at: if matches!(status, StepStatus::Completed) {
+                completed_at: if matches!(item.status, StepStatus::Completed) {
                     Some(now)
                 } else {
                     None
                 },
             })
             .collect();
+        let validation_plan = TaskPlan {
+            id: "checklist-validation".to_string(),
+            session_id: session_id.to_string(),
+            description: trigger.to_string(),
+            trigger_message: trigger.to_string(),
+            steps: steps.clone(),
+            current_step: 0,
+            status: PlanStatus::InProgress,
+            checkpoint: serde_json::Value::Object(serde_json::Map::new()),
+            creation_reason: "graph_validation".to_string(),
+            task_id: task_id.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+        };
+        validation_plan
+            .validate_graph()
+            .map_err(anyhow::Error::msg)?;
         let current_step = steps
             .iter()
             .position(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
@@ -230,171 +276,55 @@ impl PlanStore {
         Ok(())
     }
 
-    /// Mark exactly one unchecked delivery-style step Completed, only if unambiguous.
-    ///
-    /// A "delivery-style" step is one whose `status` is `Pending` or `InProgress` AND whose
-    /// description (lowercased) contains a delivery verb (`send`, `deliver`, `attach`, `share`)
-    /// AND a file/result noun (`file`, `result`, `report`, `output`, or a file extension like
-    /// `.txt`, `.csv`, `.json`, `.log`, `.zip`, `.pdf`, `.md`, `.yaml`, `.toml`, `.xlsx`).
-    ///
-    /// If exactly one step matches → sets it `Completed` + `completed_at = Utc::now()`, persists
-    /// via `update()`, returns `Ok(true)`.
-    ///
-    /// Otherwise (zero matches, >1 match, or no active plan) → returns `Ok(false)`.
-    /// Never rewrites/regenerates the plan.
-    pub async fn mark_delivery_step_complete(&self, session_id: &str) -> anyhow::Result<bool> {
-        use crate::agent::keyword_match as contains_keyword_as_words;
-        use crate::plans::StepStatus;
-
-        let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
-            return Ok(false);
-        };
-
-        const DELIVERY_VERBS: &[&str] = &["send", "deliver", "attach", "share"];
-        const FILE_NOUNS: &[&str] = &["file", "result", "report", "output"];
-        const FILE_EXTENSIONS: &[&str] = &[
-            ".txt", ".csv", ".json", ".log", ".zip", ".pdf", ".md", ".yaml", ".toml", ".xlsx",
-        ];
-
-        let matching_indices: Vec<usize> = plan
-            .steps
-            .iter()
-            .enumerate()
-            .filter(|(_, step)| matches!(step.status, StepStatus::Pending | StepStatus::InProgress))
-            .filter(|(_, step)| {
-                let desc = step.description.to_lowercase();
-                DELIVERY_VERBS
-                    .iter()
-                    .any(|v| contains_keyword_as_words(&desc, v))
-                    && (FILE_NOUNS
-                        .iter()
-                        .any(|n| contains_keyword_as_words(&desc, n))
-                        || FILE_EXTENSIONS.iter().any(|ext| desc.contains(ext)))
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        if matching_indices.len() != 1 {
-            return Ok(false);
-        }
-
-        let idx = matching_indices[0];
-        plan.steps[idx].status = StepStatus::Completed;
-        plan.steps[idx].completed_at = Some(Utc::now());
-        self.update(&plan).await?;
-        Ok(true)
-    }
-
-    /// Reconcile a successful tool call back into the active requirement checklist.
-    ///
-    /// This is intentionally conservative: it only checks off pending/in-progress
-    /// items whose text names the same path (or basename) as the successful tool
-    /// call and whose wording matches the tool's role. The model should still use
-    /// `track_requirements` for nuanced/non-file requirements.
+    /// Reconcile a successful tool-call receipt into explicit checklist evidence
+    /// contracts. Step descriptions are display-only and never decide completion.
     pub async fn reconcile_checklist_after_tool_success(
         &self,
         session_id: &str,
-        tool_name: &str,
-        arguments: &str,
+        semantics: &crate::traits::ToolCallSemantics,
+        receipt_id: &str,
         result: &str,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        use crate::agent::keyword_match as contains_keyword_as_words;
         use crate::plans::StepStatus;
 
         let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
             return Ok(None);
         };
-
-        let evidence_paths = checklist_tool_evidence_paths(tool_name, arguments, result);
-        if evidence_paths.is_empty() {
-            return Ok(None);
-        }
 
         let mut changed = false;
         for step in &mut plan.steps {
             if !matches!(step.status, StepStatus::Pending | StepStatus::InProgress) {
                 continue;
             }
-            let desc = step.description.to_lowercase();
-            if !evidence_paths
-                .iter()
-                .any(|path| checklist_step_mentions_path(&desc, path))
-            {
+            let has_evidence_contract =
+                !step.required_mutation_effects.is_empty() || step.requires_observation;
+            if !has_evidence_contract {
                 continue;
             }
+            let effects_match = step.required_mutation_effects.is_empty()
+                || semantics
+                    .mutation_effects
+                    .satisfies(step.required_mutation_effects);
+            let observation_matches = !step.requires_observation || semantics.observes_state();
+            let targets_match = step.expected_targets.is_empty()
+                || step.expected_targets.iter().all(|expected| {
+                    semantics
+                        .target_hints
+                        .iter()
+                        .any(|actual| actual.value == *expected)
+                });
 
-            let matches_tool_role = match tool_name {
-                "send_file" => {
-                    checklist_is_delivery_step(&desc)
-                        || contains_keyword_as_words(&desc, "send")
-                        || contains_keyword_as_words(&desc, "deliver")
-                }
-                "write_file" => {
-                    contains_keyword_as_words(&desc, "create")
-                        || contains_keyword_as_words(&desc, "write")
-                        || contains_keyword_as_words(&desc, "save")
-                }
-                "edit_file" => {
-                    contains_keyword_as_words(&desc, "edit")
-                        || contains_keyword_as_words(&desc, "update")
-                        || contains_keyword_as_words(&desc, "modify")
-                        || contains_keyword_as_words(&desc, "append")
-                }
-                "read_file" => {
-                    !checklist_is_delivery_step(&desc)
-                        && (contains_keyword_as_words(&desc, "ensure")
-                            || contains_keyword_as_words(&desc, "verify")
-                            || contains_keyword_as_words(&desc, "check")
-                            || contains_keyword_as_words(&desc, "read")
-                            || contains_keyword_as_words(&desc, "result")
-                            || contains_keyword_as_words(&desc, "results")
-                            || contains_keyword_as_words(&desc, "output")
-                            || contains_keyword_as_words(&desc, "append")
-                            || contains_keyword_as_words(&desc, "appended"))
-                }
-                "terminal" | "run_command" => {
-                    !result.to_lowercase().contains("moved to background")
-                        && (contains_keyword_as_words(&desc, "run")
-                            || contains_keyword_as_words(&desc, "execute")
-                            || contains_keyword_as_words(&desc, "start"))
-                }
-                _ => false,
-            };
-
-            if matches_tool_role {
+            if effects_match && observation_matches && targets_match {
                 step.status = StepStatus::Completed;
                 step.completed_at = Some(Utc::now());
                 step.result_summary = Some(crate::utils::truncate_str(result, 200));
-                changed = true;
-            }
-        }
-
-        if changed
-            && tool_name == "read_file"
-            && result.contains("File:")
-            && result.contains("lines")
-        {
-            let matching_run_steps: Vec<usize> = plan
-                .steps
-                .iter()
-                .enumerate()
-                .filter(|(_, step)| {
-                    matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
-                })
-                .filter(|(_, step)| {
-                    let desc = step.description.to_lowercase();
-                    contains_keyword_as_words(&desc, "script")
-                        && (contains_keyword_as_words(&desc, "run")
-                            || contains_keyword_as_words(&desc, "execute")
-                            || contains_keyword_as_words(&desc, "start"))
-                })
-                .map(|(idx, _)| idx)
-                .collect();
-            if matching_run_steps.len() == 1 {
-                let idx = matching_run_steps[0];
-                plan.steps[idx].status = StepStatus::Completed;
-                plan.steps[idx].completed_at = Some(Utc::now());
-                plan.steps[idx].result_summary = Some(crate::utils::truncate_str(result, 200));
+                if !step
+                    .evidence_receipt_ids
+                    .iter()
+                    .any(|existing| existing == receipt_id)
+                {
+                    step.evidence_receipt_ids.push(receipt_id.to_string());
+                }
                 changed = true;
             }
         }
@@ -620,78 +550,6 @@ impl PlanStore {
     }
 }
 
-fn checklist_tool_evidence_paths(tool_name: &str, arguments: &str, result: &str) -> Vec<String> {
-    let args: serde_json::Value =
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-    let mut paths = Vec::new();
-    match tool_name {
-        "send_file" => push_json_path_arg(&args, "file_path", &mut paths),
-        "write_file" | "read_file" | "edit_file" => {
-            push_json_path_arg(&args, "path", &mut paths);
-            push_json_path_arg(&args, "file_path", &mut paths);
-        }
-        "terminal" | "run_command" => {
-            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
-                paths.extend(extract_absolute_paths_for_checklist(command));
-            }
-        }
-        _ => {}
-    }
-    paths.extend(extract_absolute_paths_for_checklist(result));
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn push_json_path_arg(args: &serde_json::Value, key: &str, paths: &mut Vec<String>) {
-    if let Some(path) = args.get(key).and_then(serde_json::Value::as_str) {
-        paths.push(path.to_string());
-    }
-}
-
-fn extract_absolute_paths_for_checklist(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|token| {
-            let trimmed = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '"' | '\'' | '`' | ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
-                )
-            });
-            if trimmed.starts_with('/') {
-                Some(trimmed.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn checklist_step_mentions_path(step_desc_lower: &str, path: &str) -> bool {
-    let path_lower = path.to_lowercase();
-    if step_desc_lower.contains(&path_lower) {
-        return true;
-    }
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .map(|filename| step_desc_lower.contains(&filename.to_lowercase()))
-        .unwrap_or(false)
-}
-
-fn checklist_is_delivery_step(step_desc_lower: &str) -> bool {
-    use crate::agent::keyword_match as contains_keyword_as_words;
-
-    const DELIVERY_VERBS: &[&str] = &["send", "deliver", "attach", "share"];
-    const FILE_NOUNS: &[&str] = &["file", "result", "results", "report", "output"];
-    DELIVERY_VERBS
-        .iter()
-        .any(|v| contains_keyword_as_words(step_desc_lower, v))
-        && FILE_NOUNS
-            .iter()
-            .any(|n| contains_keyword_as_words(step_desc_lower, n))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,127 +565,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_delivery_step_complete_marks_single_unambiguous_item() {
-        use crate::plans::StepStatus;
+    async fn typed_receipt_completes_only_its_exact_checklist_contract() {
+        use crate::plans::{ChecklistItem, StepStatus};
+        use crate::traits::{ToolCallSemantics, ToolMutationEffects, ToolTargetHintKind};
         let store = create_test_store().await;
         store
-            .upsert_checklist(
+            .upsert_checklist_graph(
                 "s1",
                 None,
                 "test",
-                &[
-                    ("Create the script".into(), StepStatus::Completed),
-                    ("Run it for 40 seconds".into(), StepStatus::Completed),
-                    (
-                        "Send the results file to the user".into(),
-                        StepStatus::Pending,
-                    ),
-                ],
+                &[ChecklistItem {
+                    description: "Opaque synthetic requirement".into(),
+                    status: StepStatus::Pending,
+                    depends_on: Vec::new(),
+                    required_mutation_effects: ToolMutationEffects::EXTERNAL_DELIVERY,
+                    requires_observation: false,
+                    expected_targets: vec!["/tmp/report.pdf".into()],
+                }],
             )
             .await
             .unwrap();
 
-        assert!(store.mark_delivery_step_complete("s1").await.unwrap());
-        let plan = store
-            .get_incomplete_for_session("s1")
+        let wrong_target = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+            .with_target_hint(ToolTargetHintKind::Path, "/tmp/other.pdf");
+        assert!(store
+            .reconcile_checklist_after_tool_success(
+                "s1",
+                &wrong_target,
+                "receipt-wrong",
+                "delivered",
+            )
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(plan.steps[2].status, StepStatus::Completed);
-    }
+            .is_none());
 
-    #[tokio::test]
-    async fn mark_delivery_step_complete_skips_when_ambiguous() {
-        use crate::plans::StepStatus;
-        let store = create_test_store().await;
+        let exact = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+            .with_target_hint(ToolTargetHintKind::Path, "/tmp/report.pdf");
         store
-            .upsert_checklist(
-                "s1",
-                None,
-                "test",
-                &[
-                    ("Send file A".into(), StepStatus::Pending),
-                    ("Send file B".into(), StepStatus::Pending),
-                ],
-            )
-            .await
-            .unwrap();
-        assert!(!store.mark_delivery_step_complete("s1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn mark_delivery_step_complete_uses_word_boundaries_for_verbs() {
-        use crate::plans::StepStatus;
-        let store = create_test_store().await;
-        store
-            .upsert_checklist(
-                "s1",
-                None,
-                "test",
-                &[("Research sender output format".into(), StepStatus::Pending)],
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !store.mark_delivery_step_complete("s1").await.unwrap(),
-            "`sender` must not match the delivery verb `send`"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_checklist_after_tool_success_marks_obvious_tool_backed_items() {
-        use crate::plans::StepStatus;
-        let store = create_test_store().await;
-        store
-            .upsert_checklist(
-                "s1",
-                None,
-                "test",
-                &[
-                    (
-                        "Create /tmp/mgate.py to measure TCP latency to 1.1.1.1".into(),
-                        StepStatus::Pending,
-                    ),
-                    (
-                        "Ensure results are appended to /tmp/mgate_results.txt".into(),
-                        StepStatus::Pending,
-                    ),
-                    ("Run the script for 45 seconds".into(), StepStatus::Pending),
-                    (
-                        "Send /tmp/mgate_results.txt to the user".into(),
-                        StepStatus::Pending,
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-
-        store
-            .reconcile_checklist_after_tool_success(
-                "s1",
-                "write_file",
-                r#"{"path":"/tmp/mgate.py"}"#,
-                "Created /tmp/mgate.py 888 bytes, 31 lines",
-            )
-            .await
-            .unwrap();
-        store
-            .reconcile_checklist_after_tool_success(
-                "s1",
-                "read_file",
-                r#"{"path":"/tmp/mgate_results.txt"}"#,
-                "File: /tmp/mgate_results.txt (45 lines, 1539 bytes)",
-            )
-            .await
-            .unwrap();
-        store
-            .reconcile_checklist_after_tool_success(
-                "s1",
-                "send_file",
-                r#"{"file_path":"/tmp/mgate_results.txt"}"#,
-                "File sent: mgate_results.txt (2 KB)",
-            )
+            .reconcile_checklist_after_tool_success("s1", &exact, "receipt-exact", "delivered")
             .await
             .unwrap();
 
@@ -838,10 +613,30 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(plan.steps[0].status, StepStatus::Completed);
-        assert_eq!(plan.steps[1].status, StepStatus::Completed);
-        assert_eq!(plan.steps[2].status, StepStatus::Completed);
-        assert_eq!(plan.steps[3].status, StepStatus::Completed);
+        assert_eq!(plan.steps[0].evidence_receipt_ids, vec!["receipt-exact"]);
         assert_eq!(plan.status, PlanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn checklist_prose_cannot_complete_without_a_typed_evidence_contract() {
+        use crate::plans::StepStatus;
+        use crate::traits::{ToolCallSemantics, ToolMutationEffects};
+        let store = create_test_store().await;
+        store
+            .upsert_checklist(
+                "s1",
+                None,
+                "test",
+                &[("Send the report file now".into(), StepStatus::Pending)],
+            )
+            .await
+            .unwrap();
+        let delivery = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
+        assert!(store
+            .reconcile_checklist_after_tool_success("s1", &delivery, "receipt-1", "delivered",)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

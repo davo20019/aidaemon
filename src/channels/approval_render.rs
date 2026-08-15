@@ -8,7 +8,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use super::formatting::html_escape;
 use super::formatting::split_message;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::types::ApprovalResponse;
+use crate::types::{ApprovalResponse, GoalConfirmationStyle};
 
 /// Truncate command display to fit Telegram's 4096 char limit.
 /// Reserve ~300 chars for header, warnings, buttons, and footer.
@@ -262,11 +262,32 @@ pub(super) fn build_approval_message_slack(
 }
 
 /// Build the inline keyboard for a scheduled-goal-confirmation prompt.
-pub(super) fn build_goal_confirmation_keyboard(approval_id: &str) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Approve goal ✅", format!("goal:confirm:{}", approval_id)),
-        InlineKeyboardButton::callback("Cancel", format!("goal:cancel:{}", approval_id)),
-    ]])
+pub(super) fn build_goal_confirmation_keyboard(
+    approval_id: &str,
+    style: GoalConfirmationStyle,
+) -> InlineKeyboardMarkup {
+    match style {
+        GoalConfirmationStyle::Standard => InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(
+                "Approve goal ✅",
+                format!("goal:confirm:{approval_id}"),
+            ),
+            InlineKeyboardButton::callback("Cancel", format!("goal:cancel:{approval_id}")),
+        ]]),
+        GoalConfirmationStyle::Autopilot => InlineKeyboardMarkup::new(vec![
+            vec![InlineKeyboardButton::callback(
+                "Enable Autopilot ✅",
+                format!("autopilot:confirm:{approval_id}"),
+            )],
+            vec![
+                InlineKeyboardButton::callback(
+                    "Edit permissions",
+                    format!("autopilot:edit:{approval_id}"),
+                ),
+                InlineKeyboardButton::callback("Cancel", format!("autopilot:cancel:{approval_id}")),
+            ],
+        ]),
+    }
 }
 
 fn goal_detail_section(detail: &str) -> (&'static str, &str) {
@@ -283,6 +304,11 @@ fn goal_detail_section(detail: &str) -> (&'static str, &str) {
         ("Mutation limits:", "📏 Action limits"),
         ("Review interval:", "🔄 Review timing"),
         ("Expiration:", "⏱️ Duration"),
+        ("Autonomy mode:", "🚀 Operating mode"),
+        ("Owner checkpoints:", "🙋 Owner checkpoints"),
+        ("Recovery policy:", "♻️ Recovery"),
+        ("Confirmation binding:", "🔏 Confirmation binding"),
+        ("Review effort:", "🧠 Review effort"),
         ("Resolved token budgets:", "🧮 Compute budget"),
     ] {
         if let Some(value) = detail.strip_prefix(prefix) {
@@ -317,8 +343,12 @@ fn readable_policy(value: &str) -> String {
 pub(super) fn build_goal_confirmation_pages(
     goal_description: &str,
     details: &[String],
+    style: GoalConfirmationStyle,
 ) -> Vec<String> {
-    const PAGE_BODY_BYTES: usize = 3_200;
+    // Fits Telegram, Discord, and Slack Block Kit after headings/footer are
+    // added, so every supported inline channel can render the same lossless
+    // policy card without truncating authority details.
+    const PAGE_BODY_BYTES: usize = 1_500;
 
     let summary = goal_description
         .trim()
@@ -326,8 +356,17 @@ pub(super) fn build_goal_confirmation_pages(
         .unwrap_or(goal_description.trim())
         .trim();
     let summary_normalized = normalized_goal_text(summary);
-    let mut body =
-        format!("What you’re approving\n{summary}\n\nNothing starts until you approve this goal.");
+    let (subject, waiting_copy) = match style {
+        GoalConfirmationStyle::Standard => (
+            "What you’re approving",
+            "Nothing starts until you approve this goal.",
+        ),
+        GoalConfirmationStyle::Autopilot => (
+            "What Autopilot will manage",
+            "Nothing starts until you approve this exact policy.",
+        ),
+    };
+    let mut body = format!("{subject}\n{summary}\n\n{waiting_copy}");
     for detail in details {
         let (heading, value) = goal_detail_section(detail);
         if heading == "🎯 Objective" && normalized_goal_text(value) == summary_normalized {
@@ -342,13 +381,24 @@ pub(super) fn build_goal_confirmation_pages(
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| {
+            let title = match style {
+                GoalConfirmationStyle::Standard => "🔐 Review goal",
+                GoalConfirmationStyle::Autopilot => "🚀 Enable Autopilot",
+            };
             let mut page = if page_count == 1 {
-                format!("🔐 Review goal before activation\n\n{chunk}")
+                format!("{title} before activation\n\n{chunk}")
             } else {
-                format!("🔐 Review goal · {}/{page_count}\n\n{chunk}", index + 1)
+                format!("{title} · {}/{page_count}\n\n{chunk}", index + 1)
             };
             if index + 1 == page_count {
-                page.push_str("\n\nReady to proceed? Approve this exact goal or cancel it below.");
+                page.push_str(match style {
+                    GoalConfirmationStyle::Standard => {
+                        "\n\nReady to proceed? Approve this exact goal or cancel it below."
+                    }
+                    GoalConfirmationStyle::Autopilot => {
+                        "\n\nReady to proceed? Enable this exact Autopilot policy or cancel below."
+                    }
+                });
             }
             page
         })
@@ -416,7 +466,11 @@ mod tests {
             "scope <unescaped> ".repeat(500),
             final_marker
         )];
-        let pages = build_goal_confirmation_pages("Delegate an ongoing mandate", &details);
+        let pages = build_goal_confirmation_pages(
+            "Delegate an ongoing mandate",
+            &details,
+            GoalConfirmationStyle::Standard,
+        );
 
         assert!(pages.len() > 1);
         assert!(pages.iter().all(|page| page.len() <= 4_096));
@@ -437,12 +491,33 @@ mod tests {
             "Expiration: 86400 seconds after actual activation".to_string(),
         ];
 
-        let pages = build_goal_confirmation_pages(description, &details);
+        let pages =
+            build_goal_confirmation_pages(description, &details, GoalConfirmationStyle::Standard);
         let rendered = pages.join("\n");
         assert!(rendered.starts_with("🔐 Review goal before activation"));
         assert_eq!(rendered.matches("Steward the synthetic account").count(), 1);
         assert!(rendered.contains("🛡️ Guardrails\n1. Verify identity.\n2. Never retry"));
         assert!(rendered.contains("⏱️ Duration"));
         assert!(rendered.contains("Nothing starts until you approve this goal."));
+    }
+
+    #[test]
+    fn autopilot_confirmation_is_structurally_distinct() {
+        let keyboard =
+            build_goal_confirmation_keyboard("approval-1", GoalConfirmationStyle::Autopilot);
+        let serialized = serde_json::to_string(&keyboard).unwrap();
+        assert!(serialized.contains("Enable Autopilot"));
+        assert!(serialized.contains("Edit permissions"));
+        assert!(serialized.contains("autopilot:confirm:approval-1"));
+        assert!(!serialized.contains("goal:confirm"));
+
+        let pages = build_goal_confirmation_pages(
+            "Maintain the synthetic account",
+            &["Autonomy mode: Autopilot".to_string()],
+            GoalConfirmationStyle::Autopilot,
+        );
+        let rendered = pages.join("\n");
+        assert!(rendered.starts_with("🚀 Enable Autopilot"));
+        assert!(rendered.contains("Enable this exact Autopilot policy"));
     }
 }

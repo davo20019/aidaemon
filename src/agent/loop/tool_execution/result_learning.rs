@@ -28,6 +28,7 @@ pub(super) struct ResultLearningEnv<'a> {
     pub iteration: usize,
     pub tool_arguments: &'a str,
     pub tool_summary: &'a str,
+    pub semantics: &'a crate::traits::ToolCallSemantics,
 }
 
 pub(super) struct ResultLearningState<'a> {
@@ -646,7 +647,11 @@ pub(super) async fn apply_result_learning(
     } else {
         *state.no_evidence_result_streak = 0;
         state.no_evidence_tools_seen.clear();
-        *state.evidence_gain_count = state.evidence_gain_count.saturating_add(1);
+        if outcome_satisfied
+            && (env.semantics.mutates_state() || env.semantics.can_verify_with_result_content())
+        {
+            *state.evidence_gain_count = state.evidence_gain_count.saturating_add(1);
+        }
     }
 
     if env.restrict_to_personal_memory_tools

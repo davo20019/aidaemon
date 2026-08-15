@@ -4,11 +4,12 @@
 //! unchanged. Owns [`FollowupMode`], [`TurnContextReason`], and the
 //! `looks_like_*` / `classify_followup_mode` family.
 
-use super::completion_contract::{looks_like_question_request, HTTP_URL_RE};
-use super::project_scope::{
-    extract_project_hints_from_text, extract_project_scopes_from_text,
-    token_looks_like_filesystem_path,
-};
+use super::completion_contract::looks_like_question_request;
+#[cfg(test)]
+use super::completion_contract::HTTP_URL_RE;
+use super::project_scope::extract_project_scopes_from_text;
+#[cfg(test)]
+use super::project_scope::token_looks_like_filesystem_path;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +32,12 @@ impl FollowupMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TurnContextReason {
     DefaultNewTask,
+    InternalContinuation,
+    #[cfg(test)]
     ExplicitFollowup,
     ClarificationAnswer,
     ContextDependentQuestion,
+    #[cfg(test)]
     FollowupOverrideStandalone,
     FollowupOverrideMismatchPreflight,
     CarryoverSanitized,
@@ -43,9 +47,12 @@ impl TurnContextReason {
     pub(super) fn as_code(&self) -> &'static str {
         match self {
             TurnContextReason::DefaultNewTask => "default_new_task",
+            TurnContextReason::InternalContinuation => "internal_continuation",
+            #[cfg(test)]
             TurnContextReason::ExplicitFollowup => "explicit_followup",
             TurnContextReason::ClarificationAnswer => "clarification_answer",
             TurnContextReason::ContextDependentQuestion => "context_dependent_question",
+            #[cfg(test)]
             TurnContextReason::FollowupOverrideStandalone => "followup_override_standalone",
             TurnContextReason::FollowupOverrideMismatchPreflight => {
                 "followup_override_mismatch_preflight"
@@ -59,6 +66,7 @@ impl TurnContextReason {
 /// These turns must retain the prior task contract; treating them as standalone
 /// questions is how "Can you try one more time?" lost an outstanding PDF
 /// delivery obligation in the live incident.
+#[cfg(test)]
 pub(super) fn looks_like_retry_followup(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 120 {
@@ -91,7 +99,6 @@ pub(super) fn find_previous_turns(
     let mut saw_current_user = false;
     let mut prev_assistant: Option<String> = None;
     let mut prev_user: Option<String> = None;
-    let current_is_retry = looks_like_retry_followup(current_user_text);
     for msg in history.iter().rev() {
         match msg.role.as_str() {
             "user" => {
@@ -102,12 +109,6 @@ pub(super) fn find_previous_turns(
                 if let Some(content) = msg.content.as_deref() {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
-                        // Collapse a chain of "retry" turns to the nearest
-                        // substantive request instead of enriching one retry
-                        // with another and losing the actual task again.
-                        if current_is_retry && looks_like_retry_followup(trimmed) {
-                            continue;
-                        }
                         prev_user = Some(trimmed.to_string());
                         break;
                     }
@@ -128,30 +129,14 @@ pub(super) fn find_previous_turns(
 }
 
 pub(super) fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
-    let trimmed = message.trim();
-    if !trimmed.contains('?') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let clarifying_markers = [
-        "which",
-        "what",
-        "how",
-        "do you want",
-        "would you like",
-        "want me to",
-        "should i",
-        "shall i",
-        "can you clarify",
-        "any specific",
-        "do you prefer",
-        "prefer",
-        "what style",
-        "what elements",
-    ];
-    clarifying_markers.iter().any(|m| lower.contains(m))
+    // Question punctuation is the language feature here. Do not maintain a
+    // phrase vocabulary whose omissions can silently lose the open-question
+    // lifecycle; only a final model-authored question opens this provisional
+    // dialogue edge. Durable mandate/approval questions use typed state.
+    message.trim_end().ends_with('?')
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
     lower_text.starts_with("new task")
         || lower_text.starts_with("different task")
@@ -160,6 +145,7 @@ pub(super) fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
         || lower_text.starts_with("ignore that")
 }
 
+#[cfg(test)]
 fn looks_like_style_followup(lower_text: &str) -> bool {
     let style_markers = [
         "do what you consider",
@@ -177,6 +163,7 @@ fn looks_like_style_followup(lower_text: &str) -> bool {
 /// Detect strong followup indicators that override the length heuristic.
 /// These are phrases that unambiguously reference prior conversation context,
 /// e.g. "follow-up on the newsletter you just created".
+#[cfg(test)]
 fn has_strong_followup_indicators(lower_text: &str) -> bool {
     // Explicit followup phrases
     let followup_phrases = [
@@ -298,6 +285,7 @@ pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -
 /// Detect messages that explicitly reference a prior unanswered request:
 /// "You didn't respond my question", "answer my question", "you ignored my request".
 /// These are meta-commentary about the prior interaction and must keep context.
+#[cfg(test)]
 pub(super) fn looks_like_unanswered_request_reference(lower: &str) -> bool {
     if lower.chars().count() > 120 {
         return false;
@@ -349,6 +337,7 @@ pub(super) fn looks_like_unanswered_request_reference(lower: &str) -> bool {
     has_complaint_cue || asks_for_response
 }
 
+#[cfg(test)]
 fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
     let mentions_artifact = text_contains_any_phrase(
         lower_text,
@@ -379,6 +368,7 @@ fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
     let word_count = lower_text.split_whitespace().count();
     if word_count < 8 {
@@ -426,6 +416,7 @@ pub(super) fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
         || (word_count >= 14 && has_action_verb && has_scope_detail)
 }
 
+#[cfg(test)]
 fn payload_has_self_contained_detail(text: &str) -> bool {
     let meaningful_tokens = text
         .split_whitespace()
@@ -506,6 +497,7 @@ fn payload_has_self_contained_detail(text: &str) -> bool {
     meaningful_tokens >= 3
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.split_whitespace().count() < 6 {
@@ -539,6 +531,7 @@ pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_te
     has_structured_target && payload_has_self_contained_detail(trimmed)
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_short_command_request(current: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.ends_with('?') {
@@ -623,9 +616,6 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
         !token.is_empty()
             && (token_looks_like_filesystem_path(token)
                 || token.starts_with('-')
-                || token.contains('.')
-                || token.contains('/')
-                || token.contains('\\')
                 || token.chars().any(|c| c.is_ascii_digit()))
     }) || has_cli_token;
     if !has_structured_target {
@@ -648,6 +638,7 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
 /// its own object (no anaphoric reference back to the assistant's question).
 /// "Send me my Microsoft resume" is a new request even when the assistant just
 /// asked a clarifying question; "Post it." / "send that one" answer it.
+#[cfg(test)]
 pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower: &str) -> bool {
     if trimmed.split_whitespace().count() < 2 {
         return false;
@@ -668,40 +659,6 @@ pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower:
     !ANAPHORS
         .iter()
         .any(|anaphor| contains_keyword_as_words(lower, anaphor))
-}
-
-pub(super) fn looks_like_scope_carryover_ack(current: &str) -> bool {
-    let trimmed = current.trim();
-    if trimmed.is_empty() || trimmed.ends_with('?') || trimmed.chars().count() > 80 {
-        return false;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    [
-        "yes",
-        "go ahead",
-        "do it",
-        "continue",
-        "keep going",
-        "proceed",
-        "sounds good",
-        "ok",
-        "okay",
-        "sure",
-        "same repo",
-        "same project",
-    ]
-    .iter()
-    .any(|phrase| contains_keyword_as_words(&lower, phrase))
-}
-
-pub(super) fn looks_like_multi_project_request(lower_text: &str) -> bool {
-    contains_keyword_as_words(lower_text, "all my projects")
-        || contains_keyword_as_words(lower_text, "across all projects")
-        || contains_keyword_as_words(lower_text, "across my projects")
-        || contains_keyword_as_words(lower_text, "every project")
-        || (contains_keyword_as_words(lower_text, "all projects")
-            && contains_keyword_as_words(lower_text, "compare"))
 }
 
 pub(super) fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
@@ -727,6 +684,7 @@ pub(super) fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
     (sanitized.trim().to_string(), changed)
 }
 
+#[cfg(test)]
 pub(super) fn classify_followup_mode(
     current: &str,
     prev_assistant: Option<&str>,
@@ -858,16 +816,10 @@ pub(super) fn has_project_scope_divergence_with_aliases(
             .any(|scope| prev_scopes.iter().any(|prev| prev == scope));
     }
 
-    let mut prev_hints = Vec::new();
-    let mut current_hints = Vec::new();
-    extract_project_hints_from_text(prev_user_text, &mut prev_hints, 6, false);
-    extract_project_hints_from_text(current, &mut current_hints, 6, false);
-    if prev_hints.is_empty() || current_hints.is_empty() {
-        return false;
-    }
-    !current_hints
-        .iter()
-        .any(|hint| prev_hints.iter().any(|p| p == hint))
+    // Plain-language project names are not identities. If either turn lacks
+    // an exact structural scope, semantic request assessment decides whether
+    // it is a continuation; a nickname mismatch cannot override that state.
+    false
 }
 
 #[cfg(test)]
@@ -948,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_chain_resolves_to_nearest_substantive_user_request() {
+    fn previous_turn_resolution_uses_canonical_message_topology() {
         fn message(role: &str, content: &str) -> Message {
             Message {
                 content: Some(content.to_string()),
@@ -964,7 +916,7 @@ mod tests {
             message("user", "Can you try one more time?"),
         ];
         let (_, previous_user) = find_previous_turns(&history, "Can you try one more time?");
-        assert_eq!(previous_user.as_deref(), Some("Send me the investor PDF."));
+        assert_eq!(previous_user.as_deref(), Some("Retry"));
     }
 
     #[test]
@@ -1171,11 +1123,21 @@ mod tests {
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         assert!(has_project_scope_divergence_with_aliases(
-            "Deploy dogs-project",
-            "Now deploy blog.aidaemon.ai",
+            &format!("Deploy {}", dogs.display()),
+            &format!("Now deploy {}", blog.display()),
             &alias_roots,
         ));
     }
+
+    #[test]
+    fn plain_project_names_cannot_override_semantic_continuation() {
+        assert!(!has_project_scope_divergence_with_aliases(
+            "Keep working on synthetic-dogs-project",
+            "Use synthetic-blog-project for that part",
+            &[],
+        ));
+    }
+
     proptest! {
         #[test]
         fn sanitize_carryover_blocks_removes_known_markers(payload in ".*") {

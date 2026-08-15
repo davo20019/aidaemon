@@ -212,6 +212,95 @@ fn mandate_output_token_ceiling(remaining: i64, estimated_input_tokens: u32) -> 
     (available > 0).then(|| u32::try_from(available).unwrap_or(u32::MAX))
 }
 
+async fn committed_non_action_mandate_summary(agent: &Agent) -> Option<String> {
+    let fence = agent.mandate_execution.as_ref()?;
+    let decision = agent
+        .state
+        .get_mandate_decision_for_run(&fence.goal_run_id)
+        .await
+        .ok()
+        .flatten()?;
+    if decision.mandate_id != fence.mandate_id || decision.mandate_version != fence.mandate_version
+    {
+        return None;
+    }
+    match decision.outcome {
+        crate::traits::MandateDecisionOutcome::Act => None,
+        crate::traits::MandateDecisionOutcome::Wait => Some(format!(
+            "WAIT recorded: {} Review again at {}.",
+            decision.rationale,
+            decision
+                .reconsider_at
+                .as_deref()
+                .unwrap_or("the bounded default")
+        )),
+        crate::traits::MandateDecisionOutcome::Ask => Some(format!(
+            "ASK recorded: {}",
+            decision.question.as_deref().unwrap_or(&decision.rationale)
+        )),
+        crate::traits::MandateDecisionOutcome::Stop => {
+            Some(format!("STOP recorded: {}", decision.rationale))
+        }
+    }
+}
+
+const CAPACITY_RECOVERY_WAIT_RATIONALE: &str =
+    "This review reached its internal runaway-protection ceiling before another model turn could be admitted. No new action was authorized; the controller will retry automatically at the earliest bounded review time.";
+
+async fn recover_mandate_capacity_as_wait(agent: &Agent) -> Option<String> {
+    if let Some(summary) = committed_non_action_mandate_summary(agent).await {
+        return Some(summary);
+    }
+    let fence = agent.mandate_execution.as_ref()?;
+    if fence.worker_task_id != fence.root_task_id {
+        return None;
+    }
+    if agent
+        .state
+        .get_mandate_decision_for_run(&fence.goal_run_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return None;
+    }
+    let mandate = agent
+        .state
+        .get_mandate_for_goal(&fence.goal_id)
+        .await
+        .ok()
+        .flatten()?;
+    if !mandate.is_active()
+        || mandate.id != fence.mandate_id
+        || mandate.version != fence.mandate_version
+    {
+        return None;
+    }
+    let mut decision = crate::traits::MandateDecisionCycle::new(
+        &mandate.id,
+        &fence.goal_run_id,
+        crate::traits::MandateDecisionOutcome::Wait,
+        CAPACITY_RECOVERY_WAIT_RATIONALE,
+        mandate.version,
+    );
+    decision.reconsider_at =
+        Some(mandate.bounded_next_review_at(Some(mandate.min_review_secs), chrono::Utc::now()));
+    if let Err(error) = agent
+        .state
+        .record_mandate_decision(&decision, None, Some(fence.root_task_attempt_id.as_str()))
+        .await
+    {
+        warn!(
+            mandate_id = %fence.mandate_id,
+            goal_run_id = %fence.goal_run_id,
+            %error,
+            "Could not persist capacity-recovery WAIT"
+        );
+    }
+    committed_non_action_mandate_summary(agent).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn mandate_cycle_budget_stop(
     agent: &Agent,
@@ -227,6 +316,47 @@ async fn mandate_cycle_budget_stop(
     budget_per_cycle: i64,
     detail: &str,
 ) -> LlmPhaseOutcome {
+    // A committed WAIT/ASK/STOP already completed the review. The durable
+    // decision outranks a later model-call admission failure, which can occur
+    // during crash recovery or when an older worker attempts an unnecessary
+    // narration turn. Close successfully from typed state instead of
+    // overwriting the review with a token-budget error.
+    if let Some(summary) = recover_mandate_capacity_as_wait(agent).await {
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::StoppingCondition,
+                "Closed mandate review from a committed or recovered non-action decision"
+                    .to_string(),
+                json!({
+                    "condition": "mandate_non_action_decision_recovered",
+                    "goal_run_id": agent
+                        .mandate_execution
+                        .as_ref()
+                        .map(|fence| fence.goal_run_id.as_str()),
+                    "tokens_used": tokens_used,
+                    "budget_per_cycle": budget_per_cycle,
+                }),
+            )
+            .await;
+        agent
+            .emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Succeeded,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                None,
+                Some(summary.chars().take(200).collect()),
+            )
+            .await;
+        return LlmPhaseOutcome::Return(Ok(summary));
+    }
+
     let error_message = format!(
         "Mandate cycle token budget stopped execution: {detail} (used {tokens_used} / limit {budget_per_cycle})."
     );
@@ -393,6 +523,8 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub identity_prefill_text: &'a mut Option<String>,
     pub deferred_no_tool_streak: usize,
     pub execution_requirement: &'a ExecutionRequirement,
+    pub completion_contract: &'a CompletionContract,
+    pub completion_progress: &'a CompletionProgress,
     pub force_text_allowed: bool,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
@@ -508,6 +640,8 @@ pub(super) async fn run_llm_phase(
     let identity_prefill_text = &mut *ctx.identity_prefill_text;
     let deferred_no_tool_streak = ctx.deferred_no_tool_streak;
     let execution_requirement = ctx.execution_requirement;
+    let completion_contract = ctx.completion_contract;
+    let completion_progress = ctx.completion_progress;
     let force_text_allowed = ctx.force_text_allowed;
     let max_budget_extensions = ctx.max_budget_extensions;
     let hard_token_cap = ctx.hard_token_cap;
@@ -726,19 +860,19 @@ pub(super) async fn run_llm_phase(
     }
     if force_text_response {
         llm_options.tool_choice = ToolChoiceMode::None;
-    } else if services.agent.trust_tier_for_model(model)
-        == crate::agent::trust_tier::ModelTrustTier::Guided
-        && execution_requirement.requires_execution()
+    } else if execution_requirement.requires_execution()
         && deferred_no_tool_streak > 0
         && deferred_no_tool_streak < DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
         && total_successful_tool_calls == 0
         && !effective_tools.is_empty()
     {
-        // Deterministic escalation: once the model has already deferred work
-        // without tools, require a tool call on subsequent retries.
+        // Deterministic escalation: once any model has returned text for a
+        // still-open execution obligation without evidence, require one tool
+        // call on the bounded recovery pass. The model retains full control of
+        // which action or read-only capability probe is appropriate.
         // BUT: after DEFERRED_NO_TOOL_ACCEPT_THRESHOLD retries, stop forcing —
-        // the query may genuinely not need tools (greetings, capability questions,
-        // jokes, etc.) and forcing tool_choice=required just causes stalls.
+        // the contract may be imperfect and forcing tool_choice=required beyond
+        // the bounded evidence pass would cause stalls.
         // AND: skip models that previously ignored a forced `required` — the
         // forcing only burns tokens there, and the substantive-text acceptance
         // path in the completion phase converges without it.
@@ -1335,25 +1469,31 @@ pub(super) async fn run_llm_phase(
             {
                 Ok(Some(status)) => {
                     if is_scheduled_goal {
-                        let run_budget_status =
-                            if let Some(registry) = &services.agent.goal_token_registry {
-                                let _ = registry.add_run_tokens(goal_id, delta_tokens).await;
-                                registry
-                                    .update_run_health(
-                                        goal_id,
-                                        Agent::scheduled_run_health_snapshot(
-                                            learning_ctx,
+                        let run_budget_status = if let Some(registry) =
+                            &services.agent.goal_token_registry
+                        {
+                            let _ = registry.add_run_tokens(goal_id, delta_tokens).await;
+                            registry
+                                .update_run_health(
+                                    goal_id,
+                                    Agent::scheduled_run_health_snapshot(
+                                        learning_ctx,
+                                        graceful::ScheduledRunActivityMetrics {
                                             evidence_gain_count,
-                                            *stall_count,
-                                            consecutive_same_tool.1,
-                                            consecutive_same_tool_arg_hashes.len(),
+                                            stall_count: *stall_count,
+                                            consecutive_same_tool_count: consecutive_same_tool.1,
+                                            consecutive_same_tool_unique_args:
+                                                consecutive_same_tool_arg_hashes.len(),
                                             total_successful_tool_calls,
-                                        ),
-                                    )
-                                    .await
-                            } else {
-                                None
-                            };
+                                        },
+                                        completion_contract,
+                                        completion_progress,
+                                    ),
+                                )
+                                .await
+                        } else {
+                            None
+                        };
                         if let Some(run_budget_status) = run_budget_status {
                             persist_scheduled_run_state(
                                 &services.agent.state,
@@ -1369,8 +1509,7 @@ pub(super) async fn run_llm_phase(
                                 iteration,
                                 goal_id,
                                 status: &run_budget_status,
-                                user_role,
-                                status_tx,
+                                pending_system_messages,
                                 max_budget_extensions,
                                 hard_token_cap,
                             };
@@ -1926,6 +2065,145 @@ fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::store_prelude::*;
+
+    async fn install_due_mandate_root(
+        harness: &mut crate::testing::TestHarness,
+    ) -> (crate::traits::Mandate, crate::traits::GoalRun) {
+        use crate::traits::{Goal, Mandate, MandateAuthority, Task};
+
+        let goal = Goal::new_continuous(
+            "Review a synthetic bounded source",
+            "owner-session",
+            Some(250_000),
+            Some(2_000_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a synthetic bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        harness
+            .state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .expect("persist mandate controller");
+
+        let leased = harness
+            .state
+            .claim_due_mandates(1, "capacity-recovery-test", 300)
+            .await
+            .expect("claim due mandate")
+            .pop()
+            .expect("one due mandate");
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let root_task = Task {
+            id: root_task_id.clone(),
+            goal_id: goal.id.clone(),
+            description: "Review the synthetic bounded source".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        let goal_run_id = uuid::Uuid::new_v4().to_string();
+        let run = harness
+            .state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased
+                    .review_lease_token
+                    .as_deref()
+                    .expect("review lease token"),
+                &goal_run_id,
+                &root_task,
+            )
+            .await
+            .expect("create mandate review run");
+        let root_attempt = harness
+            .state
+            .claim_task_with_lease(&root_task_id, "capacity-recovery-lead", None, 300)
+            .await
+            .expect("claim root task")
+            .expect("root task attempt");
+        harness.agent.set_test_mandate_execution(
+            &mandate.id,
+            mandate.version,
+            mandate.authority.clone(),
+            &goal.id,
+            &root_task_id,
+            &root_attempt.id,
+            &root_attempt,
+        );
+        (mandate, run)
+    }
+
+    #[tokio::test]
+    async fn exhausted_mandate_review_recovers_with_one_typed_wait_and_bounded_retry() {
+        let mut harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .expect("setup test agent");
+        let (mandate, run) = install_due_mandate_root(&mut harness).await;
+        let before = chrono::Utc::now();
+
+        let summary = recover_mandate_capacity_as_wait(&harness.agent)
+            .await
+            .expect("capacity exhaustion should recover as WAIT");
+        assert!(summary.contains("WAIT recorded"));
+        assert!(summary.contains("retry automatically"));
+
+        let decision = harness
+            .state
+            .get_mandate_decision_for_run(&run.id)
+            .await
+            .expect("read recovered decision")
+            .expect("recovered decision");
+        assert_eq!(
+            decision.outcome,
+            crate::traits::MandateDecisionOutcome::Wait
+        );
+        assert_eq!(decision.rationale, CAPACITY_RECOVERY_WAIT_RATIONALE);
+        let retry_at = chrono::DateTime::parse_from_rfc3339(
+            decision
+                .reconsider_at
+                .as_deref()
+                .expect("bounded retry time"),
+        )
+        .expect("valid retry timestamp")
+        .with_timezone(&chrono::Utc);
+        assert!(retry_at >= before + chrono::Duration::seconds(mandate.min_review_secs - 1));
+        assert!(retry_at <= before + chrono::Duration::seconds(mandate.min_review_secs + 2));
+
+        let second_summary = recover_mandate_capacity_as_wait(&harness.agent)
+            .await
+            .expect("recovery is idempotent");
+        assert_eq!(second_summary, summary);
+        let decisions = harness
+            .state
+            .list_mandate_decisions(&mandate.id, 10)
+            .await
+            .expect("list decisions");
+        assert_eq!(decisions.len(), 1);
+    }
 
     #[test]
     fn mandate_output_ceiling_reserves_margin_and_never_exceeds_remaining_balance() {

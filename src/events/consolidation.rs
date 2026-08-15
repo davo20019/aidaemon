@@ -291,6 +291,12 @@ impl Consolidator {
         for event in events {
             if event.event_type == crate::events::EventType::UserMessage {
                 if let Ok(data) = event.parse_data::<super::UserMessageData>() {
+                    if data
+                        .annotations
+                        .contains(&crate::traits::MessageAnnotation::InternalContinuation)
+                    {
+                        continue;
+                    }
                     last_user_message = Some(data.content);
                     last_msg_time = Some(event.created_at);
                 }

@@ -1,18 +1,13 @@
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use tracing::{info, warn};
 
-use crate::agent::Agent;
 #[cfg(feature = "discord")]
 use crate::channels::DiscordChannel;
 #[cfg(feature = "slack")]
 use crate::channels::SlackChannel;
-use crate::channels::{ChannelHub, SessionMap, TelegramChannel};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramChannel};
 use crate::config::AppConfig;
-use crate::state::SqliteStateStore;
-use crate::tasks::TaskRegistry;
-use crate::traits::store_prelude::*;
 use crate::traits::Channel;
 
 pub struct ChannelBundle {
@@ -139,29 +134,27 @@ fn parse_u64_ids(ids: &[String]) -> Vec<u64> {
     ids.iter().filter_map(|s| s.parse::<u64>().ok()).collect()
 }
 
+/// Register a channel credential once across static config and dynamic state.
+/// Credentials stay in this startup-local set and are never logged.
+fn register_bot_credential(
+    seen: &mut std::collections::HashSet<(String, String)>,
+    channel_type: &str,
+    bot_token: &str,
+) -> bool {
+    seen.insert((channel_type.to_string(), bot_token.to_string()))
+}
+
 /// Extract a slug from a bot token (e.g. "123456:ABC..." → "bot-123456").
 fn slug_from_bot_token(token: &str) -> String {
     let id_part = token.split(':').next().unwrap_or("unknown");
     format!("bot-{}", id_part)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn build_channels(
-    config: &AppConfig,
-    agent: Arc<Agent>,
-    config_path: PathBuf,
-    session_map: SessionMap,
-    task_registry: Arc<TaskRegistry>,
-    inbox_dir: &str,
-    state: Arc<SqliteStateStore>,
-    watchdog_stale_threshold_secs: u64,
-) -> ChannelBundle {
+pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> ChannelBundle {
     let telegram_owner_ids = parse_owner_ids(config, "telegram");
-    let inbox_dir = PathBuf::from(inbox_dir);
-    let files_enabled = config.files.enabled;
-    let max_file_size_mb = config.files.max_file_size_mb;
     let terminal_web_app_url = config.terminal.effective_web_app_url();
     let terminal_allowed_prefixes = config.terminal.allowed_prefixes.clone();
+    let state = runtime.state.clone();
 
     let make_telegram = |bot_token: &str,
                          allowed_user_ids: Vec<u64>,
@@ -172,15 +165,7 @@ pub async fn build_channels(
             allowed_user_ids,
             webhook,
             telegram_owner_ids.clone(),
-            Arc::clone(&agent),
-            config_path.clone(),
-            session_map.clone(),
-            task_registry.clone(),
-            files_enabled,
-            inbox_dir.clone(),
-            max_file_size_mb,
-            state.clone(),
-            watchdog_stale_threshold_secs,
+            runtime.clone(),
             terminal_web_app_url.clone(),
             terminal_allowed_prefixes.clone(),
         ))
@@ -199,10 +184,19 @@ pub async fn build_channels(
         }
     }
 
+    let mut seen_bot_credentials = std::collections::HashSet::new();
     let telegram_bots: Vec<Arc<TelegramChannel>> = config
         .all_telegram_bots()
         .into_iter()
-        .map(|bot_config| {
+        .filter_map(|bot_config| {
+            if !register_bot_credential(
+                &mut seen_bot_credentials,
+                "telegram",
+                &bot_config.bot_token,
+            ) {
+                warn!("Skipping duplicate configured Telegram bot credential");
+                return None;
+            }
             let webhook = if bot_config.webhook.enabled {
                 // Explicit webhook config takes precedence
                 bot_config.webhook.clone()
@@ -216,11 +210,11 @@ pub async fn build_channels(
                 bot_config.webhook.clone()
             };
             info!("Registering Telegram bot (username will be fetched from API)");
-            make_telegram(
+            Some(make_telegram(
                 &bot_config.bot_token,
                 bot_config.allowed_user_ids.clone(),
                 webhook,
-            )
+            ))
         })
         .collect();
 
@@ -236,28 +230,25 @@ pub async fn build_channels(
             allowed_user_ids,
             discord_owner_ids.clone(),
             guild_id,
-            Arc::clone(&agent),
-            config_path.clone(),
-            session_map.clone(),
-            task_registry.clone(),
-            files_enabled,
-            inbox_dir.clone(),
-            max_file_size_mb,
-            state.clone(),
-            watchdog_stale_threshold_secs,
+            runtime.clone(),
         ))
     };
     #[cfg(feature = "discord")]
     let discord_bots: Vec<Arc<DiscordChannel>> = config
         .all_discord_bots()
         .into_iter()
-        .map(|bot_config| {
+        .filter_map(|bot_config| {
+            if !register_bot_credential(&mut seen_bot_credentials, "discord", &bot_config.bot_token)
+            {
+                warn!("Skipping duplicate configured Discord bot credential");
+                return None;
+            }
             info!("Registering Discord bot (username will be fetched from API)");
-            make_discord(
+            Some(make_discord(
                 &bot_config.bot_token,
                 bot_config.allowed_user_ids.clone(),
                 bot_config.guild_id,
-            )
+            ))
         })
         .collect();
 
@@ -278,29 +269,25 @@ pub async fn build_channels(
             slack_owner_ids.clone(),
             slack_workspace_grants.clone(),
             use_threads,
-            Arc::clone(&agent),
-            config_path.clone(),
-            session_map.clone(),
-            task_registry.clone(),
-            files_enabled,
-            inbox_dir.clone(),
-            max_file_size_mb,
-            state.clone(),
-            watchdog_stale_threshold_secs,
+            runtime.clone(),
         ))
     };
     #[cfg(feature = "slack")]
     let slack_bots: Vec<Arc<SlackChannel>> = config
         .all_slack_bots()
         .into_iter()
-        .map(|bot_config| {
+        .filter_map(|bot_config| {
+            if !register_bot_credential(&mut seen_bot_credentials, "slack", &bot_config.bot_token) {
+                warn!("Skipping duplicate configured Slack bot credential");
+                return None;
+            }
             info!("Registering Slack bot (bot name will be fetched from API)");
-            make_slack(
+            Some(make_slack(
                 &bot_config.app_token,
                 &bot_config.bot_token,
                 bot_config.allowed_user_ids.clone(),
                 bot_config.use_threads,
-            )
+            ))
         })
         .collect();
 
@@ -315,6 +302,14 @@ pub async fn build_channels(
             for bot in bots {
                 match bot.channel_type.as_str() {
                     "telegram" => {
+                        if !register_bot_credential(
+                            &mut seen_bot_credentials,
+                            "telegram",
+                            &bot.bot_token,
+                        ) {
+                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Telegram bot credential already registered from config or state");
+                            continue;
+                        }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
                         let webhook = if defaults.enabled && defaults.base_domain.is_some() {
                             let extra: serde_json::Value =
@@ -339,6 +334,14 @@ pub async fn build_channels(
                     }
                     #[cfg(feature = "discord")]
                     "discord" => {
+                        if !register_bot_credential(
+                            &mut seen_bot_credentials,
+                            "discord",
+                            &bot.bot_token,
+                        ) {
+                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Discord bot credential already registered from config or state");
+                            continue;
+                        }
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
                         let extra: serde_json::Value =
                             serde_json::from_str(&bot.extra_config).unwrap_or_default();
@@ -359,6 +362,14 @@ pub async fn build_channels(
                     }
                     #[cfg(feature = "slack")]
                     "slack" => {
+                        if !register_bot_credential(
+                            &mut seen_bot_credentials,
+                            "slack",
+                            &bot.bot_token,
+                        ) {
+                            warn!(bot_id = bot.id, "Skipping duplicate dynamic Slack bot credential already registered from config or state");
+                            continue;
+                        }
                         if let Some(app_token) = &bot.app_token {
                             let extra: serde_json::Value =
                                 serde_json::from_str(&bot.extra_config).unwrap_or_default();
@@ -436,5 +447,30 @@ pub async fn build_channels(
         slack_bots,
         #[cfg(feature = "slack")]
         dynamic_slack_bots,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_bot_credential;
+
+    #[test]
+    fn bot_credentials_are_unique_across_registration_sources() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(register_bot_credential(
+            &mut seen,
+            "telegram",
+            "100:synthetic"
+        ));
+        assert!(!register_bot_credential(
+            &mut seen,
+            "telegram",
+            "100:synthetic"
+        ));
+        assert!(register_bot_credential(
+            &mut seen,
+            "discord",
+            "100:synthetic"
+        ));
     }
 }

@@ -10,11 +10,10 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::agent::{Agent, StatusUpdate};
-use crate::channels::ChannelHub;
 use crate::events::TaskOutcome;
+use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime, OutboundRouter};
 use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
-use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -22,12 +21,12 @@ use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 /// system prompt that includes the given mission. Its final text response is
 /// returned as the tool result.
 ///
-/// The circular dependency (Agent → tools → SpawnAgentTool → Agent) is broken
-/// by storing a `Weak<Agent>` inside a `OnceLock`. The weak reference is set
-/// after the owning `Arc<Agent>` is constructed.
+/// The circular dependency (runtime → tools → SpawnAgentTool → runtime) is
+/// broken by storing a weak [`ChildAgentRuntime`] port inside a `OnceLock`.
+/// The reference is installed after the concrete root runtime is constructed.
 pub struct SpawnAgentTool {
-    agent: OnceLock<Weak<Agent>>,
-    hub: OnceLock<Weak<ChannelHub>>,
+    agent: OnceLock<Weak<dyn ChildAgentRuntime>>,
+    hub: OnceLock<Weak<dyn OutboundRouter>>,
     state: Option<Arc<dyn StateStore>>,
     max_response_chars: usize,
     timeout_secs: u64,
@@ -39,17 +38,17 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
 #[cfg(not(test))]
 const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 20;
 
-/// Fallback description used when the parent `Agent` isn't wired yet
+/// Fallback description used when the parent runtime isn't wired yet
 /// (early bootstrap) or when the registry is empty.
 const STATIC_SPECIALIST_ARG_DESCRIPTION: &str =
     "Optional. Pick the specialist profile matching this task. \
-     Omit to let the agent infer one from mission/task text.";
+     Omit to use the broad executor profile.";
 
 /// Format the per-kind `(name, description)` pairs from
 /// `SpecialistRegistry::llm_visible_kinds()` into the multi-line description
 /// surfaced via the `specialist` parameter of `spawn_agent`. Kept as a free
 /// function so tests can exercise the formatter without wiring a full Agent.
-pub(crate) fn format_specialist_arg_description(entries: &[(&'static str, String)]) -> String {
+pub(crate) fn format_specialist_arg_description<S: AsRef<str>>(entries: &[(S, String)]) -> String {
     if entries.is_empty() {
         return STATIC_SPECIALIST_ARG_DESCRIPTION.to_string();
     }
@@ -57,7 +56,7 @@ pub(crate) fn format_specialist_arg_description(entries: &[(&'static str, String
         String::from("Optional. Pick the specialist profile that best matches this task:\n");
     for (name, description) in entries {
         s.push_str("- ");
-        s.push_str(name);
+        s.push_str(name.as_ref());
         s.push_str(": ");
         s.push_str(description);
         if !description.ends_with('.') {
@@ -65,14 +64,18 @@ pub(crate) fn format_specialist_arg_description(entries: &[(&'static str, String
         }
         s.push('\n');
     }
-    s.push_str("Omit `specialist` to let the agent infer from the mission/task text.");
+    s.push_str("Omit `specialist` to use the broad executor profile.");
     s
 }
 
 impl SpawnAgentTool {
-    /// Create a SpawnAgentTool with a known agent reference.
+    /// Create a SpawnAgentTool with a known child-runtime reference.
     #[allow(dead_code)]
-    pub fn new(agent: Weak<Agent>, max_response_chars: usize, timeout_secs: u64) -> Self {
+    pub fn new(
+        agent: Weak<dyn ChildAgentRuntime>,
+        max_response_chars: usize,
+        timeout_secs: u64,
+    ) -> Self {
         let lock = OnceLock::new();
         let _ = lock.set(agent);
         Self {
@@ -86,7 +89,7 @@ impl SpawnAgentTool {
     }
 
     /// Create a SpawnAgentTool with a deferred agent reference.
-    /// Call [`set_agent`] after constructing the `Arc<Agent>`.
+    /// Call [`set_agent`] after constructing the root runtime.
     pub fn new_deferred(max_response_chars: usize, timeout_secs: u64) -> Self {
         Self {
             agent: OnceLock::new(),
@@ -105,15 +108,15 @@ impl SpawnAgentTool {
         self
     }
 
-    /// Set the agent reference. Must be called exactly once after the owning
-    /// `Arc<Agent>` is constructed. Panics if called more than once.
-    pub fn set_agent(&self, agent: Weak<Agent>) {
+    /// Set the child-runtime reference exactly once after root construction.
+    /// Panics if called more than once.
+    pub fn set_agent(&self, agent: Weak<dyn ChildAgentRuntime>) {
         self.agent
             .set(agent)
             .expect("SpawnAgentTool::set_agent called more than once");
     }
 
-    fn get_agent(&self) -> anyhow::Result<std::sync::Arc<Agent>> {
+    fn get_agent(&self) -> anyhow::Result<Arc<dyn ChildAgentRuntime>> {
         let weak = self
             .agent
             .get()
@@ -123,12 +126,22 @@ impl SpawnAgentTool {
     }
 
     /// Set the channel hub reference for background mode notifications.
-    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
-        let _ = self.hub.set(hub);
+    pub fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
+        self.hub
+            .set(hub)
+            .expect("SpawnAgentTool::set_hub called more than once");
     }
 
-    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+    fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
         self.hub.get().and_then(|w| w.upgrade())
+    }
+
+    pub(crate) fn wiring_ready(&self) -> bool {
+        self.agent_wired() && self.hub.get().and_then(Weak::upgrade).is_some()
+    }
+
+    pub(crate) fn agent_wired(&self) -> bool {
+        self.agent.get().and_then(Weak::upgrade).is_some()
     }
 
     /// Render the `specialist` parameter's description text, pulling each
@@ -152,7 +165,7 @@ impl SpawnAgentTool {
             }
         };
 
-        format_specialist_arg_description(&agent.specialists.llm_visible_kinds())
+        format_specialist_arg_description(&agent.specialist_descriptions())
     }
 
     /// Acquire a per-task in-flight lock for executor spawns.
@@ -259,7 +272,7 @@ fn strip_leading_wait(task: &str) -> String {
 }
 
 async fn deliver_background_notification(
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn StateStore>>,
     goal_id: &str,
     session_id: &str,
@@ -654,23 +667,21 @@ impl Tool for SpawnAgentTool {
                 tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
             progress_interval.tick().await; // consume immediate tick
             let timeout_duration = Duration::from_secs(timeout_secs);
-            let arg_specialist_owned: Option<String> = args.specialist.clone();
-            let arg_specialist = arg_specialist_owned.as_deref();
             let mut result_fut = std::pin::pin!(tokio::time::timeout(
                 timeout_duration,
-                agent.spawn_child_with_outcome(
-                    &mission,
-                    &task,
-                    status_tx.clone(),
+                agent.run_child(ChildAgentRequest {
+                    mission: mission.clone(),
+                    task: task.clone(),
+                    status_tx: status_tx.clone(),
                     channel_ctx,
                     user_role,
                     child_role,
-                    goal_id_ref.as_deref(),
-                    task_id_ref.as_deref(),
-                    args._project_scope.as_deref(),
-                    arg_specialist,
-                    Some(&session_id),
-                ),
+                    goal_id: goal_id_ref.clone(),
+                    task_id: task_id_ref.clone(),
+                    project_scope: args._project_scope.clone(),
+                    specialist: args.specialist.clone(),
+                    approval_session_id: Some(session_id.clone()),
+                }),
             ));
             let result = loop {
                 tokio::select! {
@@ -763,15 +774,14 @@ impl Tool for SpawnAgentTool {
                 }
             };
             let delivered = match agent
-                .deliver_parent_text_result(
+                .deliver_background_child_result(
                     hub_for_parent_delivery.as_ref(),
                     &session_id,
                     &message,
-                    crate::agent::ParentDeliveryKind::BackgroundSpawnResult,
                 )
                 .await
             {
-                Ok(outcome) => outcome.sent,
+                Ok(sent) => sent,
                 Err(e) => {
                     warn!(
                         session_id = %session_id,
@@ -815,7 +825,7 @@ impl SpawnAgentTool {
     #[allow(clippy::too_many_arguments)]
     async fn run_sync(
         &self,
-        agent: Arc<Agent>,
+        agent: Arc<dyn ChildAgentRuntime>,
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -831,19 +841,19 @@ impl SpawnAgentTool {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
-            agent.spawn_child_with_outcome(
-                mission,
-                task,
+            agent.run_child(ChildAgentRequest {
+                mission: mission.to_string(),
+                task: task.to_string(),
                 status_tx,
                 channel_ctx,
                 user_role,
                 child_role,
-                goal_id,
-                task_id,
-                project_scope,
-                arg_specialist,
-                approval_session_id,
-            ),
+                goal_id: goal_id.map(str::to_string),
+                task_id: task_id.map(str::to_string),
+                project_scope: project_scope.map(str::to_string),
+                specialist: arg_specialist.map(str::to_string),
+                approval_session_id: approval_session_id.map(str::to_string),
+            }),
         )
         .await;
 

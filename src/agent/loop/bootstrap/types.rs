@@ -14,6 +14,9 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub user_role: UserRole,
     pub channel_ctx: &'a ChannelContext,
+    /// True for runtime-generated background-result continuations. These turns
+    /// carry evidence for the existing request, not fresh user intent.
+    pub internal_continuation: bool,
 }
 
 pub(in crate::agent) struct BootstrapData {
@@ -28,9 +31,7 @@ pub(in crate::agent) struct BootstrapData {
     pub resume_execution_snapshot: Option<ResumeExecutionSnapshot>,
     pub emitter: crate::events::EventEmitter,
     pub learning_ctx: LearningContext,
-    pub is_personal_memory_recall_turn: bool,
     pub is_reaffirmation_challenge_turn: bool,
-    pub requests_external_verification: bool,
     pub restrict_to_personal_memory_tools: bool,
     pub active_skill_names: Vec<String>,
     pub active_untrusted_external_reference_skills: Vec<String>,

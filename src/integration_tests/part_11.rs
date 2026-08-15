@@ -483,7 +483,8 @@ async fn test_task_budget_stops_when_not_productive() {
 }
 
 /// Non-scheduled goals should auto-extend when the run has already made
-/// concrete progress, without persisting the temporary extension to SQLite.
+/// concrete progress. The configured budget stays unchanged, while the
+/// same-day adaptive lease is durable across daemon restarts.
 #[tokio::test]
 async fn test_goal_budget_auto_extends_and_persists() {
     let provider = MockProvider::with_responses(vec![
@@ -524,7 +525,7 @@ async fn test_goal_budget_auto_extends_and_persists() {
 
     assert_eq!(response, "Goal task completed.");
 
-    // Verify the DB budget was NOT persisted/inflated; runtime extensions are in-memory only.
+    // The configured budget is not permanently inflated.
     let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(
         updated_goal.budget_daily.unwrap(),
@@ -532,6 +533,16 @@ async fn test_goal_budget_auto_extends_and_persists() {
         "Budget should NOT be ratcheted up in DB — expected 60, got {:?}",
         updated_goal.budget_daily
     );
+    let durable = crate::goal_tokens::load_goal_daily_budget_override(
+        harness.state.as_ref(),
+        &goal.id,
+        60,
+        2_000_000,
+    )
+    .await
+    .expect("productive extension should survive a daemon restart");
+    assert!(durable.budget_daily > 60);
+    assert_eq!(durable.extensions_count, 1);
 }
 
 /// Scheduled goals relax the auto-extension threshold so a productive scheduled
@@ -989,6 +1000,83 @@ async fn test_scheduled_goal_run_budget_stops_unproductive_run() {
     assert_eq!(updated_goal.budget_daily, Some(500));
 }
 
+/// A recurring run with concrete progress should manage its own soft budget
+/// boundary instead of pausing for an owner approval. The extension remains
+/// bounded and applies only to the active run; the persisted schedule budget
+/// is unchanged.
+#[tokio::test]
+async fn test_scheduled_goal_run_budget_auto_extends_once_on_progress() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response(
+            "remember_fact",
+            r#"{"category":"test","key":"scheduled-progress","value":"synthetic"}"#,
+        ),
+        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
+        MockProvider::text_response("Scheduled task completed autonomously."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled productive task",
+        "scheduled_goal_adaptive_budget_session",
+        Some(45),
+        Some(500),
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    harness
+        .state
+        .create_goal_schedule(&crate::traits::GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("hourly".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+    let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_adaptive_budget_session",
+            "Execute the scheduled goal task",
+            Some(status_tx),
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Scheduled task completed autonomously.");
+    assert!(
+        collect_status_updates(status_rx)
+            .await
+            .iter()
+            .all(|update| !matches!(update, StatusUpdate::BudgetExtended { .. })),
+        "scheduled budget adaptation should remain an internal event, not an owner interruption"
+    );
+
+    let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(updated_goal.budget_per_check, Some(45));
+}
+
 /// Each scheduled run should get a fresh per-run budget even when the goal stays active.
 #[tokio::test]
 async fn test_scheduled_goal_run_budget_resets_between_runs() {
@@ -1248,6 +1336,7 @@ async fn test_scheduled_goal_restores_run_state_after_restart_like_resume() {
                 consecutive_same_tool_count: 0,
                 consecutive_same_tool_unique_args: 0,
                 unrecovered_error_count: 1,
+                ..Default::default()
             },
             created_at: now.clone(),
             updated_at: now,
@@ -1776,8 +1865,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///   3) Second LLM call (with directive injected) → corrected answer
 #[tokio::test]
 async fn test_relational_denial_is_blocked_then_corrected() {
-    let denial =
-        "I don't have information about Caro's spouse. I don't know who that person is.";
+    let denial = "I don't have information about Caro's spouse. I don't know who that person is.";
     let corrected = "Based on the memory search, Caro's spouse is Frank Mendez.";
     // The classifier must return a JSON object with relational intent and the entity name.
     let classifier_json = r#"{"intent":"relational","entities":["Caro"]}"#;
@@ -1838,7 +1926,9 @@ async fn test_relational_denial_is_blocked_then_corrected() {
 
     // The denial must not reach the user — the gate must block it.
     assert!(
-        !response.to_ascii_lowercase().contains("don't have information"),
+        !response
+            .to_ascii_lowercase()
+            .contains("don't have information"),
         "denial must not reach the user; final response was: {}",
         response
     );
@@ -1957,15 +2047,17 @@ async fn grounded_partial_answer_is_not_blocked() {
     use crate::traits::ToolRole;
 
     // The grounded partial reply: contains "i don't have" but "Juan" is in evidence.
-    let grounded_reply =
-        "I don't have Juan's phone number, but he's your coworker at the company.";
+    let grounded_reply = "I don't have Juan's phone number, but he's your coworker at the company.";
 
     // MockTool named "find_coworker" returns evidence that contains "Juan".
-    let coworker_tool = Arc::new(MockTool::new(
-        "find_coworker",
-        "Find coworker information",
-        "Juan is a coworker at the company. He sits next to you.",
-    ).with_role(ToolRole::Universal));
+    let coworker_tool = Arc::new(
+        MockTool::new(
+            "find_coworker",
+            "Find coworker information",
+            "Juan is a coworker at the company. He sits next to you.",
+        )
+        .with_role(ToolRole::Universal),
+    );
 
     let provider = MockProvider::with_responses(vec![
         // Call 1: LLM calls the find_coworker tool → tool output contains "Juan".
@@ -2066,8 +2158,7 @@ async fn denial_gate_skipped_when_coreference_fired() {
     // "don't have information" is in DENIAL_PHRASES checked by
     // `reply_contains_unsearched_denial_phrase`, so this reply would arm the
     // denial gate if `coreference_fired` were not set.
-    let reply =
-        "I don't have information about where she works. She might work nearby.";
+    let reply = "I don't have information about where she works. She might work nearby.";
 
     // Only one LLM call: the coreference gate fires at turn-init,
     // the denial gate is suppressed, and the reply passes through.
@@ -2097,7 +2188,11 @@ async fn denial_gate_skipped_when_coreference_fired() {
         ..Message::runtime_defaults()
     };
     harness.state.append_message(&prior_user).await.unwrap();
-    harness.state.append_message(&prior_assistant).await.unwrap();
+    harness
+        .state
+        .append_message(&prior_assistant)
+        .await
+        .unwrap();
 
     let response = harness
         .agent

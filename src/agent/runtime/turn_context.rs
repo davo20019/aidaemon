@@ -7,22 +7,19 @@
 //! sibling [`project_scope`](super::project_scope) module.
 
 use super::completion_contract::{
-    infer_completion_contract, inherit_unfinished_request_contract,
-    scope_contract_for_delegated_executor,
+    completion_contract_from_persisted, infer_structural_completion_contract,
+    inherit_unfinished_request_contract, scope_contract_for_delegated_executor,
 };
 use super::followup::{
-    classify_followup_mode, find_previous_turns, has_project_scope_divergence_with_aliases,
-    looks_like_multi_project_request, looks_like_scope_carryover_ack, sanitize_carryover_blocks,
+    find_previous_turns, has_project_scope_divergence_with_aliases, sanitize_carryover_blocks,
     FollowupMode, TurnContextReason,
 };
 use super::project_scope::{
     choose_primary_project_scope, extract_explicit_path_scopes_from_text,
-    extract_project_scopes_from_history, extract_project_scopes_from_text,
-    resolve_primary_project_scope, turn_allows_inherited_project_scope, unify_current_turn_scopes,
+    extract_project_scopes_from_history, resolve_primary_project_scope, unify_current_turn_scopes,
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
-use crate::traits::OpenRequestStatus;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct TurnContext {
@@ -34,6 +31,13 @@ pub(super) struct TurnContext {
     pub followup_mode: Option<FollowupMode>,
     pub reasons: Vec<TurnContextReason>,
     pub completion_contract: CompletionContract,
+    /// Semantic task-assessment signal: after an asynchronous process starts,
+    /// this turn still has independent inline work it can execute immediately.
+    pub continue_inline_after_background_start: bool,
+    /// True when an unresolved request supplied a durable semantic contract.
+    /// Assessment failure may retain this contract instead of demoting it to
+    /// structural resource identity alone.
+    pub inherited_completion_contract: bool,
 }
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
@@ -44,16 +48,8 @@ fn unfinished_open_request(
     state: Option<&crate::traits::DialogueState>,
 ) -> Option<&crate::traits::OpenRequest> {
     state
+        .filter(|state| state.has_unresolved_request_obligation())
         .and_then(|state| state.open_request.as_ref())
-        .filter(|request| {
-            matches!(
-                request.status,
-                OpenRequestStatus::Open
-                    | OpenRequestStatus::InProgress
-                    | OpenRequestStatus::PartiallyAnswered
-                    | OpenRequestStatus::Blocked
-            )
-        })
 }
 
 fn normalize_message_resources(msg: &Message) -> Message {
@@ -265,10 +261,21 @@ fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> V
 
 // impl-Agent justification: history I/O (append_*/load_*) and turn-context building over state/event_store — shared service for all phases.
 impl Agent {
+    #[cfg(test)]
     pub(super) async fn build_turn_context_from_recent_history(
         &self,
         session_id: &str,
         user_text: &str,
+    ) -> TurnContext {
+        self.build_turn_context_from_recent_history_with_origin(session_id, user_text, false)
+            .await
+    }
+
+    pub(super) async fn build_turn_context_from_recent_history_with_origin(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        internal_continuation: bool,
     ) -> TurnContext {
         let stored_current = user_text.trim();
         if stored_current.is_empty() {
@@ -281,9 +288,8 @@ impl Agent {
             .get_history(session_id, GOAL_CONTEXT_HINT_HISTORY_LIMIT)
             .await
             .unwrap_or_default();
-        let (prev_assistant, prev_user) = find_previous_turns(&history, stored_current);
-        let (lexical_mode, mut reasons) =
-            classify_followup_mode(stored_current, prev_assistant.as_deref());
+        let (_, prev_user) = find_previous_turns(&history, stored_current);
+        let mut reasons = Vec::new();
         // Dialogue ingestion already classified this exact persisted user turn.
         // Reuse that decision so dialogue state and prompt assembly cannot drift
         // into contradictory modes for the same message.
@@ -293,11 +299,19 @@ impl Agent {
             .await
             .ok()
             .flatten();
-        let mut followup_mode = dialogue_state
-            .as_ref()
-            .and_then(|state| super::dialogue_state::resolved_followup_mode(state, stored_current))
-            .unwrap_or(lexical_mode);
-        if followup_mode != lexical_mode {
+        let mut followup_mode = if internal_continuation {
+            reasons.clear();
+            reasons.push(TurnContextReason::InternalContinuation);
+            FollowupMode::Followup
+        } else {
+            dialogue_state
+                .as_ref()
+                .and_then(|state| {
+                    super::dialogue_state::resolved_followup_mode(state, stored_current)
+                })
+                .unwrap_or(FollowupMode::NewTask)
+        };
+        if !internal_continuation {
             reasons.clear();
             reasons.push(match followup_mode {
                 FollowupMode::NewTask => TurnContextReason::DefaultNewTask,
@@ -311,9 +325,16 @@ impl Agent {
         } else {
             authored_current.clone()
         };
+        let continuation_request_anchor = internal_continuation
+            .then(|| {
+                unfinished_open_request(dialogue_state.as_ref())
+                    .map(|request| request.text.as_str())
+                    .or(prev_user.as_deref())
+            })
+            .flatten();
         // Mismatch preflight: still used for project scope divergence detection
         // (affects scope extraction below), but no longer gates goal_user_text enrichment.
-        if followup_mode != FollowupMode::NewTask {
+        if !internal_continuation && followup_mode != FollowupMode::NewTask {
             let request_anchor = unfinished_open_request(dialogue_state.as_ref())
                 .map(|request| request.text.as_str())
                 .or(prev_user.as_deref());
@@ -340,9 +361,11 @@ impl Agent {
         // conversation context separately; concatenating the previous request
         // here leaks stale instructions into contracts, schedules, and goals.
         if followup_mode != FollowupMode::NewTask {
-            let request_anchor = unfinished_open_request(dialogue_state.as_ref())
-                .map(|request| request.text.as_str())
-                .or(prev_user.as_deref());
+            let request_anchor = continuation_request_anchor.or_else(|| {
+                unfinished_open_request(dialogue_state.as_ref())
+                    .map(|request| request.text.as_str())
+                    .or(prev_user.as_deref())
+            });
             if let Some(prev_user_text) =
                 request_anchor.filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
             {
@@ -376,39 +399,26 @@ impl Agent {
         // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
         // common English words like "modern" (in "modern website") from resolving
         // to existing project directories like modern-plants-site.
+        let intent_scope_text = continuation_request_anchor.unwrap_or(&authored_current);
         let mut current_project_scopes = Vec::new();
         extract_explicit_path_scopes_from_text(
-            &authored_current,
+            intent_scope_text,
             &mut current_project_scopes,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
             &self.path_aliases.projects,
         );
-        let allow_scope_carryover = if looks_like_scope_carryover_ack(stored_current) {
-            let mut prior_user_scopes = Vec::new();
-            if let Some(prev_user_text) = prev_user.as_deref() {
-                extract_project_scopes_from_text(
-                    prev_user_text,
-                    &mut prior_user_scopes,
-                    GOAL_CONTEXT_MAX_PROJECT_SCOPES,
-                    &self.path_aliases.projects,
-                );
-            }
-            !prior_user_scopes.is_empty()
-                || prev_user.as_deref().is_some_and(|prev_user_text| {
-                    turn_allows_inherited_project_scope(prev_user_text, &prior_user_scopes)
-                })
-        } else {
-            turn_allows_inherited_project_scope(&authored_current, &current_project_scopes)
-        };
+        // Scope carryover follows the persisted dialogue relationship, not an
+        // acknowledgement/command phrase list. New requests must name their
+        // scope structurally or receive a grounded semantic project reference.
+        let allow_scope_carryover = internal_continuation || followup_mode != FollowupMode::NewTask;
         let project_scopes = extract_project_scopes_from_history(
             &history,
-            &authored_current,
+            intent_scope_text,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
             allow_scope_carryover,
             &self.path_aliases.projects,
         );
-        let allow_multi_project_scope =
-            looks_like_multi_project_request(&authored_current.to_ascii_lowercase());
+        let allow_multi_project_scope = current_project_scopes.len() > 1;
         // For current-turn scopes, unify all explicitly mentioned paths into a
         // single scope that encompasses them all.  When the user mentions paths
         // in different subdirectories (e.g. ~/projects/blog/posts/file.md and
@@ -428,12 +438,23 @@ impl Agent {
             allow_multi_project_scope,
             allow_scope_carryover,
         );
+        let contract_text = continuation_request_anchor.unwrap_or(&goal_user_text);
         let mut completion_contract =
-            infer_completion_contract(&goal_user_text, &self.path_aliases.projects);
+            infer_structural_completion_contract(contract_text, &self.path_aliases.projects);
+        let mut inherited_completion_contract = false;
         if followup_mode != FollowupMode::NewTask {
             if let Some(request) = unfinished_open_request(dialogue_state.as_ref()) {
-                let unfinished_contract =
-                    infer_completion_contract(&request.text, &self.path_aliases.projects);
+                let unfinished_contract = request
+                    .completion_contract
+                    .as_ref()
+                    .map(completion_contract_from_persisted)
+                    .unwrap_or_else(|| {
+                        infer_structural_completion_contract(
+                            &request.text,
+                            &self.path_aliases.projects,
+                        )
+                    });
+                inherited_completion_contract = request.completion_contract.is_some();
                 completion_contract =
                     inherit_unfinished_request_contract(completion_contract, &unfinished_contract);
             }
@@ -452,6 +473,8 @@ impl Agent {
             followup_mode: Some(followup_mode),
             reasons,
             completion_contract,
+            continue_inline_after_background_start: false,
+            inherited_completion_contract,
         }
     }
 
@@ -957,6 +980,20 @@ mod tests {
             task_id: Some("task-1".to_string()),
             project_scope: None,
             semantic_scope: None,
+            completion_contract: Some(crate::traits::RequestCompletionContract {
+                task_kind: crate::traits::RequestTaskKind::Diagnose,
+                expects_mutation: true,
+                required_mutation_effects: crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
+                forbids_mutation: false,
+                forbidden_actions: Vec::new(),
+                requires_observation: true,
+                requires_reverification_after_mutation: true,
+                explicit_verification_requested: true,
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+                verification_targets: Vec::new(),
+            }),
             opened_at: now,
             resolved_at: None,
         });
@@ -989,6 +1026,79 @@ mod tests {
             .completion_contract
             .required_mutation_effects
             .contains(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE));
+    }
+
+    #[tokio::test]
+    async fn internal_continuation_output_cannot_replace_request_verification_target() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{
+            DialogueState, DialogueStateStore, MessageStore, OpenRequest, OpenRequestStatus,
+        };
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let original = "Find all the information about the Brunswick Allenton 8-foot pool table, including its Pros/cons.";
+        let now = Utc::now();
+        let mut state = DialogueState::new("test-session");
+        state.open_request = Some(OpenRequest {
+            user_message_id: "request-1".to_string(),
+            text: original.to_string(),
+            status: OpenRequestStatus::InProgress,
+            task_id: Some("task-1".to_string()),
+            project_scope: None,
+            semantic_scope: Some(crate::traits::ToolSemanticScope::ExternalRemote),
+            completion_contract: Some(crate::traits::RequestCompletionContract {
+                task_kind: crate::traits::RequestTaskKind::Find,
+                expects_mutation: false,
+                required_mutation_effects: crate::traits::ToolMutationEffects::NONE,
+                forbids_mutation: false,
+                forbidden_actions: Vec::new(),
+                requires_observation: true,
+                requires_reverification_after_mutation: false,
+                explicit_verification_requested: false,
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+                verification_targets: Vec::new(),
+            }),
+            opened_at: now,
+            resolved_at: None,
+        });
+        harness
+            .state
+            .upsert_dialogue_state(&state)
+            .await
+            .expect("persist dialogue state");
+
+        let continuation = "[Background command completed]\nExit status: completed\nOutput:\nSee https://goo.gle/gemini-cli-auth-docs#workspace-gca";
+        harness
+            .state
+            .append_message(&Message {
+                content: Some(continuation.to_string()),
+                annotations: vec![crate::traits::MessageAnnotation::InternalContinuation],
+                ..Message::new_runtime("continuation-1", "test-session", "user")
+            })
+            .await
+            .expect("append continuation evidence");
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history_with_origin("test-session", continuation, true)
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
+        assert_eq!(
+            turn_context.completion_contract.task_kind,
+            CompletionTaskKind::Find
+        );
+        assert!(turn_context.completion_contract.requires_observation);
+        assert!(turn_context
+            .completion_contract
+            .verification_targets
+            .is_empty());
+        assert!(turn_context.goal_user_text.contains(original));
+        assert!(turn_context.goal_user_text.contains("workspace-gca"));
     }
 
     #[tokio::test]
@@ -1079,7 +1189,8 @@ mod tests {
         );
         assert_eq!(
             turn_context.completion_contract.task_kind,
-            CompletionTaskKind::Schedule
+            CompletionTaskKind::Conversational,
+            "bootstrap context must not infer schedule semantics from request words"
         );
         assert!(!turn_context.completion_contract.requires_observation);
     }

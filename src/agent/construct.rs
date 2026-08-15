@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::channels::ChannelHub;
 use crate::config::{
     AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
 };
@@ -19,6 +18,7 @@ use crate::events::EventStore;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
+use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::VerificationTracker;
 use crate::traits::{AgentRole, StateStore, Tool};
@@ -27,44 +27,82 @@ use crate::traits::{AgentRole, StateStore, Tool};
 use super::execution_state::ExecutionBudget;
 use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
 
+/// Named root-agent construction contract. Keeping startup inputs as data
+/// prevents positional argument drift as dependencies evolve.
+pub(crate) struct AgentConstruction {
+    pub llm_runtime: SharedLlmRuntime,
+    pub state: Arc<dyn StateStore>,
+    pub event_store: Arc<EventStore>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub model: String,
+    pub system_prompt: String,
+    pub config_path: PathBuf,
+    pub skills_dir: PathBuf,
+    pub max_depth: usize,
+    pub max_iterations: usize,
+    pub max_iterations_cap: usize,
+    pub max_response_chars: usize,
+    pub timeout_secs: u64,
+    pub max_facts: usize,
+    pub daily_token_budget: Option<u64>,
+    pub iteration_config: IterationLimitConfig,
+    pub task_timeout_secs: Option<u64>,
+    pub task_token_budget: Option<u64>,
+    pub llm_call_timeout_secs: Option<u64>,
+    pub mcp_registry: Option<McpRegistry>,
+    pub goal_token_registry: Option<GoalTokenRegistry>,
+    pub hub: Option<Weak<dyn OutboundRouter>>,
+    pub record_decision_points: bool,
+    pub context_window_config: crate::config::ContextWindowConfig,
+    pub policy_config: PolicyConfig,
+    pub path_aliases: PathAliasConfig,
+    pub inherited_project_scope: Option<String>,
+    pub specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
+    pub interactive_slot: Option<u32>,
+    pub vision_config: VisionConfig,
+    pub audio_config: AudioConfig,
+    pub stt_config: SttConfig,
+    pub harness_eval_config: HarnessEvalConfig,
+}
+
 // impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
 impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        llm_runtime: SharedLlmRuntime,
-        state: Arc<dyn StateStore>,
-        event_store: Arc<EventStore>,
-        tools: Vec<Arc<dyn Tool>>,
-        model: String,
-        system_prompt: String,
-        config_path: PathBuf,
-        skills_dir: PathBuf,
-        max_depth: usize,
-        max_iterations: usize,
-        max_iterations_cap: usize,
-        max_response_chars: usize,
-        timeout_secs: u64,
-        max_facts: usize,
-        daily_token_budget: Option<u64>,
-        iteration_config: IterationLimitConfig,
-        task_timeout_secs: Option<u64>,
-        task_token_budget: Option<u64>,
-        llm_call_timeout_secs: Option<u64>,
-        mcp_registry: Option<McpRegistry>,
-        goal_token_registry: Option<GoalTokenRegistry>,
-        hub: Option<Weak<ChannelHub>>,
-        record_decision_points: bool,
-        context_window_config: crate::config::ContextWindowConfig,
-        policy_config: PolicyConfig,
-        path_aliases: PathAliasConfig,
-        inherited_project_scope: Option<String>,
-        specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
-        interactive_slot: Option<u32>,
-        vision_config: VisionConfig,
-        audio_config: AudioConfig,
-        stt_config: SttConfig,
-        harness_eval_config: HarnessEvalConfig,
-    ) -> Self {
+    pub(crate) fn new(input: AgentConstruction) -> Self {
+        let AgentConstruction {
+            llm_runtime,
+            state,
+            event_store,
+            tools,
+            model,
+            system_prompt,
+            config_path,
+            skills_dir,
+            max_depth,
+            max_iterations,
+            max_iterations_cap,
+            max_response_chars,
+            timeout_secs,
+            max_facts,
+            daily_token_budget,
+            iteration_config,
+            task_timeout_secs,
+            task_token_budget,
+            llm_call_timeout_secs,
+            mcp_registry,
+            goal_token_registry,
+            hub,
+            record_decision_points,
+            context_window_config,
+            policy_config,
+            path_aliases,
+            inherited_project_scope,
+            specialists,
+            interactive_slot,
+            vision_config,
+            audio_config,
+            stt_config,
+            harness_eval_config,
+        } = input;
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
             info!(
@@ -319,7 +357,7 @@ impl Agent {
         mandate_execution: Option<super::MandateExecutionFence>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         goal_token_registry: Option<GoalTokenRegistry>,
-        hub: Option<Weak<ChannelHub>>,
+        hub: Option<Weak<dyn OutboundRouter>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
         billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
         required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,

@@ -258,6 +258,99 @@ pub fn token_is_absolute_like(token: &str) -> bool {
         || looks_windows_abs
 }
 
+/// Resolve a token as a filesystem reference only when its shape or the live
+/// filesystem provides structural evidence that it is a path.
+///
+/// Explicit path forms (`/`, `~/`, `./`, `../`, Windows drive roots, and UNC
+/// paths) may name a not-yet-created target. Bare relative references must be
+/// anchored by an existing first component (or an exact existing entry) in the
+/// working directory or an explicitly configured project root. This prevents
+/// natural-language compounds such as `pros/cons` from becoming invented local
+/// targets without maintaining a vocabulary of prose exceptions.
+pub fn resolve_structural_filesystem_reference(
+    raw: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    let token = raw.trim();
+    if token.is_empty() || token.contains("://") || token.contains('?') || token.contains('*') {
+        return None;
+    }
+
+    let explicit = token_is_absolute_like(token)
+        || token.starts_with("\\\\")
+        || (token.starts_with('.') && (token.contains('/') || token.contains('\\')));
+    let has_separator = token.contains('/') || token.contains('\\');
+
+    if active_execution_backend().kind() != BackendKind::Local {
+        if explicit {
+            return validate_path(token).ok();
+        }
+        return resolve_projects_folder_alias(token, alias_roots);
+    }
+
+    let direct = if explicit {
+        let expanded = shellexpand::tilde(token).to_string();
+        let path = PathBuf::from(expanded);
+        let joined = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                value => normalized.push(value.as_os_str()),
+            }
+        }
+        normalized
+    } else {
+        validate_path(token).ok()?
+    };
+    // A bare existing directory name is still ordinary language ("tests",
+    // "docs", "memory") often enough that it cannot establish a hard path
+    // obligation. Exact bare files remain structural; directories require an
+    // explicit path separator or a grounded semantic project reference.
+    if explicit || (direct.exists() && (has_separator || direct.is_file())) {
+        return Some(direct);
+    }
+    if !has_separator {
+        return None;
+    }
+
+    if let Some(alias_path) = resolve_projects_folder_alias(token, alias_roots) {
+        return Some(alias_path);
+    }
+
+    let first_component = Path::new(token)
+        .components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })?;
+    let cwd = std::env::current_dir().ok()?;
+    if cwd.join(first_component).exists() {
+        return Some(direct);
+    }
+
+    for raw_root in alias_roots {
+        let Ok(root) = validate_path(raw_root) else {
+            continue;
+        };
+        if !root.is_dir() || !root.join(first_component).exists() {
+            continue;
+        }
+        return Some(root.join(token.replace('\\', "/")));
+    }
+
+    None
+}
+
 fn push_unique_search_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
     if candidate.is_dir() && !roots.iter().any(|existing| existing == &candidate) {
         roots.push(candidate);
@@ -454,6 +547,7 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
     None
 }
 
+#[cfg(test)]
 fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
     if active_execution_backend().kind() != BackendKind::Local {
         return alias_roots
@@ -472,6 +566,7 @@ fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(test)]
 fn resolve_contextual_project_nickname_across_roots(
     raw_name: &str,
     roots: Vec<PathBuf>,
@@ -532,6 +627,7 @@ fn resolve_contextual_project_nickname_across_roots(
     }
 }
 
+#[cfg(test)]
 pub fn resolve_contextual_project_nickname(
     raw_name: &str,
     alias_roots: &[String],
@@ -539,6 +635,7 @@ pub fn resolve_contextual_project_nickname(
     resolve_contextual_project_nickname_across_roots(raw_name, project_search_roots(alias_roots))
 }
 
+#[cfg(test)]
 pub fn resolve_contextual_project_nickname_in_explicit_roots(
     raw_name: &str,
     alias_roots: &[String],
@@ -963,6 +1060,47 @@ mod tests {
         let aliased = resolve_project_scope_reference("projects/blog.aidaemon.ai", &alias_roots)
             .expect("aliased project");
         assert_eq!(aliased, project);
+    }
+
+    #[test]
+    fn structural_filesystem_references_require_path_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        let source = alias_root.join("synthetic-project").join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        for prose in [
+            "Pros/cons",
+            "input/output",
+            "client/server",
+            "read/write",
+            "pass/fail",
+            "alpha/beta/gamma",
+        ] {
+            assert_eq!(
+                resolve_structural_filesystem_reference(prose, &alias_roots),
+                None,
+                "unanchored prose compound must not become a path: {prose}"
+            );
+        }
+
+        assert_eq!(
+            resolve_structural_filesystem_reference(
+                "synthetic-project/src/new_module.rs",
+                &alias_roots
+            ),
+            Some(source.join("new_module.rs"))
+        );
+
+        let explicit_new_target = dir.path().join("not-created-yet").join("result.md");
+        assert_eq!(
+            resolve_structural_filesystem_reference(
+                explicit_new_target.to_string_lossy().as_ref(),
+                &alias_roots
+            ),
+            Some(explicit_new_target)
+        );
     }
 
     #[test]

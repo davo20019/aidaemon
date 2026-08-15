@@ -141,7 +141,8 @@ async fn make_terminal_with_hub(
         vec![channel.clone() as Arc<dyn Channel>],
         session_map,
     ));
-    tool.set_hub(Arc::downgrade(&hub));
+    let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
+    tool.set_hub(Arc::downgrade(&outbound));
     tool.set_plan_store(plan_store);
     // Keep the hub alive for the duration of the notifier task.
     std::mem::forget(hub);

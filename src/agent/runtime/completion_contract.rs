@@ -6,13 +6,18 @@
 //! [`VerificationTargetKind`], `CompletionSignals`) and the `infer_*` /
 //! `extract_verification_*` helpers.
 
+#[cfg(test)]
 use super::followup::{looks_like_retry_followup, text_contains_any_phrase};
-use super::project_scope::{
-    normalize_project_scope_path_with_aliases, push_project_scope, token_looks_like_filesystem_path,
-};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::execution_graph::{
+    ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
+};
+use crate::traits::{
+    RequestCompletionContract, RequestForbiddenAction, RequestTaskKind, RequestVerificationTarget,
+    RequestVerificationTargetKind,
+};
 use crate::traits::{ToolCallSemantics, ToolMutationEffects};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,7 +38,6 @@ pub(super) enum CompletionTaskKind {
 pub(super) enum VerificationTargetKind {
     Url,
     Path,
-    ProjectScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +100,10 @@ pub(super) struct CompletionContract {
     pub requires_observation: bool,
     pub requires_reverification_after_mutation: bool,
     pub explicit_verification_requested: bool,
+    /// Semantic evidence requirements from the validated task contract.
+    pub minimum_sources: usize,
+    pub requires_primary_sources: bool,
+    pub requires_exact_history: bool,
     pub connected_content_mode: super::intent_routing::ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
 }
@@ -105,6 +113,107 @@ impl CompletionContract {
         self.verification_targets
             .first()
             .map(|target| target.value.clone())
+    }
+}
+
+pub(super) fn persistable_completion_contract(
+    contract: &CompletionContract,
+) -> RequestCompletionContract {
+    RequestCompletionContract {
+        task_kind: match contract.task_kind {
+            CompletionTaskKind::Conversational => RequestTaskKind::Conversational,
+            CompletionTaskKind::Answer => RequestTaskKind::Answer,
+            CompletionTaskKind::Check => RequestTaskKind::Check,
+            CompletionTaskKind::Find => RequestTaskKind::Find,
+            CompletionTaskKind::Change => RequestTaskKind::Change,
+            CompletionTaskKind::Deliver => RequestTaskKind::Deliver,
+            CompletionTaskKind::Schedule => RequestTaskKind::Schedule,
+            CompletionTaskKind::Monitor => RequestTaskKind::Monitor,
+            CompletionTaskKind::Diagnose => RequestTaskKind::Diagnose,
+        },
+        expects_mutation: contract.expects_mutation,
+        required_mutation_effects: contract.required_mutation_effects,
+        forbids_mutation: contract.forbids_mutation,
+        forbidden_actions: contract
+            .forbidden_mutation_actions
+            .iter()
+            .map(|action| match action {
+                ForbiddenMutationAction::Create => RequestForbiddenAction::Create,
+                ForbiddenMutationAction::Delete => RequestForbiddenAction::Delete,
+                ForbiddenMutationAction::Deploy => RequestForbiddenAction::Deploy,
+                ForbiddenMutationAction::Publish => RequestForbiddenAction::Publish,
+                ForbiddenMutationAction::Post => RequestForbiddenAction::Post,
+                ForbiddenMutationAction::Send => RequestForbiddenAction::Send,
+            })
+            .collect(),
+        requires_observation: contract.requires_observation,
+        requires_reverification_after_mutation: contract.requires_reverification_after_mutation,
+        explicit_verification_requested: contract.explicit_verification_requested,
+        minimum_sources: contract.minimum_sources,
+        requires_primary_sources: contract.requires_primary_sources,
+        requires_exact_history: contract.requires_exact_history,
+        verification_targets: contract
+            .verification_targets
+            .iter()
+            .map(|target| RequestVerificationTarget {
+                kind: match target.kind {
+                    VerificationTargetKind::Url => RequestVerificationTargetKind::Url,
+                    VerificationTargetKind::Path => RequestVerificationTargetKind::Path,
+                },
+                value: target.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn completion_contract_from_persisted(
+    contract: &RequestCompletionContract,
+) -> CompletionContract {
+    CompletionContract {
+        task_kind: match contract.task_kind {
+            RequestTaskKind::Conversational => CompletionTaskKind::Conversational,
+            RequestTaskKind::Answer => CompletionTaskKind::Answer,
+            RequestTaskKind::Check => CompletionTaskKind::Check,
+            RequestTaskKind::Find => CompletionTaskKind::Find,
+            RequestTaskKind::Change => CompletionTaskKind::Change,
+            RequestTaskKind::Deliver => CompletionTaskKind::Deliver,
+            RequestTaskKind::Schedule => CompletionTaskKind::Schedule,
+            RequestTaskKind::Monitor => CompletionTaskKind::Monitor,
+            RequestTaskKind::Diagnose => CompletionTaskKind::Diagnose,
+        },
+        expects_mutation: contract.expects_mutation,
+        required_mutation_effects: contract.required_mutation_effects,
+        forbids_mutation: contract.forbids_mutation,
+        forbidden_mutation_actions: contract
+            .forbidden_actions
+            .iter()
+            .map(|action| match action {
+                RequestForbiddenAction::Create => ForbiddenMutationAction::Create,
+                RequestForbiddenAction::Delete => ForbiddenMutationAction::Delete,
+                RequestForbiddenAction::Deploy => ForbiddenMutationAction::Deploy,
+                RequestForbiddenAction::Publish => ForbiddenMutationAction::Publish,
+                RequestForbiddenAction::Post => ForbiddenMutationAction::Post,
+                RequestForbiddenAction::Send => ForbiddenMutationAction::Send,
+            })
+            .collect(),
+        requires_observation: contract.requires_observation,
+        requires_reverification_after_mutation: contract.requires_reverification_after_mutation,
+        explicit_verification_requested: contract.explicit_verification_requested,
+        minimum_sources: contract.minimum_sources,
+        requires_primary_sources: contract.requires_primary_sources,
+        requires_exact_history: contract.requires_exact_history,
+        connected_content_mode: super::intent_routing::ConnectedContentMode::None,
+        verification_targets: contract
+            .verification_targets
+            .iter()
+            .map(|target| VerificationTarget {
+                kind: match target.kind {
+                    RequestVerificationTargetKind::Url => VerificationTargetKind::Url,
+                    RequestVerificationTargetKind::Path => VerificationTargetKind::Path,
+                },
+                value: target.value.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -192,6 +301,15 @@ pub(super) fn mutation_contract_fulfilled(
 ) -> bool {
     if !contract.expects_mutation {
         return true;
+    }
+    if progress.proof_graph_initialized {
+        return !progress.mutation_obligation_ids.is_empty()
+            && progress.mutation_obligation_ids.iter().all(|id| {
+                progress
+                    .proof_graph
+                    .state(id)
+                    .is_some_and(ExecutionNodeState::satisfies_dependency)
+            });
     }
     progress.mutation_count > 0
         && (contract.required_mutation_effects.is_empty()
@@ -281,6 +399,7 @@ pub(super) fn parse_planned_mutation_effects(values: &[String]) -> Option<ToolMu
 /// Add semantically classified positive proof obligations. This never grants
 /// permission and never erases deterministic requirements; it only prevents a
 /// mismatched mutation from being treated as completion.
+#[cfg(test)]
 pub(super) fn apply_planned_required_mutation_effects(
     contract: &mut CompletionContract,
     effects: Option<ToolMutationEffects>,
@@ -292,10 +411,95 @@ pub(super) fn apply_planned_required_mutation_effects(
     }
 }
 
+/// Replace advisory text inference with a complete, validated semantic task
+/// contract. Exact resource identities survive because they are structural
+/// evidence extracted from the request; lexical obligation guesses do not.
+pub(super) struct SemanticCompletionRequirements<'a> {
+    pub expects_mutation: bool,
+    pub requires_observation: bool,
+    pub task_kind: CompletionTaskKind,
+    pub required_mutation_effects: ToolMutationEffects,
+    pub mutation_scope: &'a str,
+    pub forbidden_actions: &'a [ForbiddenMutationAction],
+    pub minimum_sources: usize,
+    pub requires_primary_sources: bool,
+    pub requires_exact_history: bool,
+}
+
+pub(super) fn install_semantic_completion_contract(
+    contract: &mut CompletionContract,
+    requirements: SemanticCompletionRequirements<'_>,
+) {
+    let verification_targets = std::mem::take(&mut contract.verification_targets);
+    let scope = requirements.mutation_scope.trim().to_ascii_lowercase();
+    let forbids_mutation = matches!(scope.as_str(), "read_only" | "read-only");
+    let expects_mutation = requirements.expects_mutation && !forbids_mutation;
+
+    *contract = CompletionContract {
+        task_kind: requirements.task_kind,
+        expects_mutation,
+        required_mutation_effects: if expects_mutation {
+            requirements.required_mutation_effects
+        } else {
+            ToolMutationEffects::NONE
+        },
+        forbids_mutation,
+        forbidden_mutation_actions: if scope == "scoped" {
+            requirements.forbidden_actions.to_vec()
+        } else {
+            Vec::new()
+        },
+        requires_observation: requirements.requires_observation,
+        requires_reverification_after_mutation: expects_mutation
+            && requirements.requires_observation,
+        // This now records a semantic observation obligation, not an English
+        // verification-phrase match.
+        explicit_verification_requested: requirements.requires_observation,
+        minimum_sources: requirements.minimum_sources,
+        requires_primary_sources: requirements.requires_primary_sources,
+        requires_exact_history: requirements.requires_exact_history,
+        connected_content_mode: super::intent_routing::ConnectedContentMode::None,
+        verification_targets,
+    };
+}
+
+/// Remove language-derived obligations when semantic assessment was skipped or
+/// failed. Exact URLs and structurally resolved paths remain observable.
+pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
+    let verification_targets = std::mem::take(&mut contract.verification_targets);
+    let requires_observation = !verification_targets.is_empty();
+    *contract = CompletionContract {
+        task_kind: if requires_observation {
+            CompletionTaskKind::Check
+        } else {
+            CompletionTaskKind::Conversational
+        },
+        requires_observation,
+        explicit_verification_requested: requires_observation,
+        verification_targets,
+        ..CompletionContract::default()
+    };
+}
+
+/// Construct the bootstrap contract from concrete resource identities only.
+/// Semantic obligations are installed later by task assessment.
+pub(super) fn infer_structural_completion_contract(
+    text: &str,
+    alias_roots: &[String],
+) -> CompletionContract {
+    let mut contract = CompletionContract {
+        verification_targets: extract_verification_targets(text, alias_roots),
+        ..CompletionContract::default()
+    };
+    retain_structural_completion_contract(&mut contract);
+    contract
+}
+
 /// Refine a keyword-inferred contract with the planning LLM's classification.
 /// The planner read the actual request (any language), so its signals win —
 /// with one exception: an explicit user verification request ("verify it",
 /// "make sure") is never relaxed by a planner saying observation isn't needed.
+#[cfg(test)]
 pub(super) fn apply_planned_contract_signals(
     contract: &mut CompletionContract,
     expects_mutation: Option<bool>,
@@ -343,6 +547,7 @@ pub(super) fn apply_planned_contract_signals(
 /// non-English constraint, but it may never erase a deterministic constraint
 /// already found in the request. `read_only` is global; `scoped` blocks only
 /// the supplied operations and leaves other required mutations available.
+#[cfg(test)]
 pub(super) fn apply_planned_mutation_constraints(
     contract: &mut CompletionContract,
     mutation_scope: Option<&str>,
@@ -372,6 +577,7 @@ pub(super) fn apply_planned_mutation_constraints(
     }
 }
 
+#[cfg(test)]
 fn explicitly_forbids_mutation(lower: &str) -> bool {
     let trimmed = lower.trim();
     let explicit_mode = ["read-only", "inspect-only", "report-only"]
@@ -425,6 +631,7 @@ fn explicitly_forbids_mutation(lower: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 const SCOPED_NEGATIVE_MUTATION_PHRASES: &[(ForbiddenMutationAction, &[&str])] = &[
     (
         ForbiddenMutationAction::Create,
@@ -452,6 +659,7 @@ const SCOPED_NEGATIVE_MUTATION_PHRASES: &[(ForbiddenMutationAction, &[&str])] = 
     ),
 ];
 
+#[cfg(test)]
 fn scoped_forbidden_mutation_actions(lower: &str) -> Vec<ForbiddenMutationAction> {
     SCOPED_NEGATIVE_MUTATION_PHRASES
         .iter()
@@ -473,6 +681,7 @@ fn scoped_forbidden_mutation_actions(lower: &str) -> Vec<ForbiddenMutationAction
 /// This intentionally prefers false negatives for ambiguous noun phrases. The
 /// completion contract is an execution backstop, not a natural-language policy
 /// engine, so it should hard-block only high-confidence operation-wide bans.
+#[cfg(test)]
 fn negative_phrase_is_operation_wide(lower: &str, phrase: &str) -> bool {
     lower.match_indices(phrase).any(|(index, _)| {
         let before = lower[..index].chars().next_back();
@@ -538,6 +747,7 @@ fn negative_phrase_is_operation_wide(lower: &str, phrase: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn negative_phrase_has_conditional_context(lower: &str, index: usize, phrase: &str) -> bool {
     let before = &lower[..index];
     let sentence_start = before
@@ -571,6 +781,7 @@ fn negative_phrase_has_conditional_context(lower: &str, index: usize, phrase: &s
             || paragraph_prefix.contains("if nothing"))
 }
 
+#[cfg(test)]
 fn remove_scoped_negative_mutation_phrases(lower: &str) -> String {
     SCOPED_NEGATIVE_MUTATION_PHRASES
         .iter()
@@ -618,29 +829,142 @@ pub(super) struct CompletionProgress {
     /// injected (enumeration answer from web research with <2 source pages
     /// read). Fires once.
     pub corroboration_nudge_count: usize,
+    /// Count of retries issued to satisfy an explicit source-count and direct
+    /// citation requirement from the user.
+    pub source_evidence_nudge_count: usize,
+    /// Count of retries issued when the draft claimed exact conversation
+    /// history was unavailable without attempting canonical retrieval.
+    pub history_lookup_nudge_count: usize,
+    /// Count of bounded retries issued after a completion claim lacked the
+    /// typed mutation receipt required by the request.
+    pub mutation_claim_nudge_count: usize,
     /// Count of times the search-before-deny gate has fired (reply denies/
     /// asserts a personal fact about an entity that was not looked up in
     /// memory this turn). Bounded to 1 to prevent infinite loops.
     pub denial_gate_count: usize,
+    /// Count of bounded retries issued because a mandate task lead attempted
+    /// to finish without an exact durable decision for its current run.
+    pub mandate_decision_retry_count: usize,
     /// True when the coreference grounding gate already fired this turn
     /// (a pronoun-referent follow-up that was anchored to the prior exchange).
     /// When set, the denial gate must NOT also fire — coreference gate takes
     /// precedence and the denial would be a false positive.
     pub coreference_fired: bool,
+    /// Per-turn proof graph. Legacy/default-constructed progress values keep
+    /// using counters; runtime construction initializes this graph and makes
+    /// typed receipt evidence authoritative for completion.
+    pub(in crate::agent) proof_graph: ExecutionGraph,
+    pub(in crate::agent) proof_graph_initialized: bool,
+    pub(in crate::agent) mutation_obligation_ids: Vec<String>,
+    pub(in crate::agent) verification_obligation_id: Option<String>,
 }
 
 impl CompletionProgress {
     pub(super) fn new(contract: &CompletionContract) -> Self {
-        Self {
+        let mut progress = Self {
             verification_pending: contract.requires_observation,
             ..Self::default()
+        };
+        // Runtime-created progress always uses graph proof. If construction
+        // ever hits an internal invariant, keep the partial graph authoritative
+        // (fail closed) rather than falling back to mutation counters.
+        progress.proof_graph_initialized = true;
+        if let Err(error) = progress.initialize_proof_graph(contract) {
+            tracing::error!(%error, "Completion proof graph initialization failed closed");
+        }
+        progress
+    }
+
+    fn initialize_proof_graph(&mut self, contract: &CompletionContract) -> Result<(), String> {
+        const REQUEST_ID: &str = "request:current";
+        self.proof_graph.add_node(
+            REQUEST_ID,
+            ExecutionNodeKind::Request,
+            ExecutionNodeState::Running,
+        )?;
+
+        if contract.expects_mutation {
+            let mut add_mutation_obligation = |id: String| -> Result<(), String> {
+                self.proof_graph.add_node(
+                    id.clone(),
+                    ExecutionNodeKind::Obligation,
+                    ExecutionNodeState::Pending,
+                )?;
+                self.proof_graph
+                    .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+                self.mutation_obligation_ids.push(id);
+                Ok(())
+            };
+
+            if contract.required_mutation_effects.is_empty() {
+                add_mutation_obligation("obligation:mutation:any".to_string())?;
+            } else {
+                for (label, effect) in mutation_effect_obligations() {
+                    if contract.required_mutation_effects.intersects(effect) {
+                        add_mutation_obligation(format!("obligation:mutation:{label}"))?;
+                    }
+                }
+            }
+        }
+
+        if contract.requires_observation {
+            let id = "obligation:verification".to_string();
+            self.proof_graph.add_node(
+                id.clone(),
+                ExecutionNodeKind::Obligation,
+                ExecutionNodeState::Pending,
+            )?;
+            self.proof_graph
+                .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+            self.verification_obligation_id = Some(id);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn next_evidence_id(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}:{}",
+            self.mutation_count
+                .saturating_add(self.observation_count)
+                .saturating_add(1)
+        )
+    }
+
+    fn record_receipt_node(&mut self, tool_call_id: &str) -> Option<String> {
+        if !self.proof_graph_initialized {
+            return None;
+        }
+        let id = format!("receipt:{tool_call_id}");
+        match self.proof_graph.add_node(
+            id.clone(),
+            ExecutionNodeKind::Receipt,
+            ExecutionNodeState::Satisfied,
+        ) {
+            Ok(()) => Some(id),
+            Err(error) => {
+                tracing::warn!(%error, "Completion proof graph rejected a tool receipt");
+                None
+            }
         }
     }
 
+    #[cfg(test)]
     pub(super) fn mark_mutation(
         &mut self,
         contract: &CompletionContract,
         semantics: &ToolCallSemantics,
+    ) {
+        let evidence_id = self.next_evidence_id("synthetic-mutation");
+        self.mark_mutation_receipt(contract, semantics, &evidence_id);
+    }
+
+    pub(super) fn mark_mutation_receipt(
+        &mut self,
+        contract: &CompletionContract,
+        semantics: &ToolCallSemantics,
+        tool_call_id: &str,
     ) {
         self.mutation_count = self.mutation_count.saturating_add(1);
         let effects = if semantics.mutation_effects.is_empty() {
@@ -649,12 +973,67 @@ impl CompletionProgress {
             semantics.mutation_effects
         };
         self.observed_mutation_effects = self.observed_mutation_effects.union(effects);
+        if let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
+            for (label, required_effect) in mutation_effect_obligations() {
+                let obligation_id = format!("obligation:mutation:{label}");
+                let observed_matches = if required_effect == ToolMutationEffects::UNSPECIFIED {
+                    !effects.is_empty()
+                } else {
+                    effects.contains(required_effect)
+                };
+                if observed_matches && self.mutation_obligation_ids.contains(&obligation_id) {
+                    if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                        &obligation_id,
+                        &receipt_id,
+                        Some(tool_call_id.to_string()),
+                    ) {
+                        tracing::warn!(%error, %obligation_id, "Completion proof was rejected");
+                    }
+                }
+            }
+            let generic_id = "obligation:mutation:any";
+            if self.proof_graph_initialized
+                && self
+                    .mutation_obligation_ids
+                    .iter()
+                    .any(|id| id == generic_id)
+            {
+                if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                    generic_id,
+                    &receipt_id,
+                    Some(tool_call_id.to_string()),
+                ) {
+                    tracing::warn!(%error, "Generic mutation completion proof was rejected");
+                }
+            }
+        }
         if contract.requires_reverification_after_mutation {
             self.verification_pending = true;
+            if self.proof_graph_initialized {
+                if let (Some(receipt_id), Some(obligation_id)) = (
+                    self.record_receipt_node(tool_call_id),
+                    self.verification_obligation_id.as_deref(),
+                ) {
+                    if let Err(error) = self.proof_graph.invalidate(&receipt_id, obligation_id) {
+                        tracing::warn!(%error, "Verification invalidation was rejected");
+                    }
+                }
+            }
         }
     }
 
+    #[cfg(test)]
     pub(super) fn mark_observation(&mut self, contract: &CompletionContract, matched_target: bool) {
+        let evidence_id = self.next_evidence_id("synthetic-verification");
+        self.mark_observation_receipt(contract, matched_target, &evidence_id);
+    }
+
+    pub(super) fn mark_observation_receipt(
+        &mut self,
+        contract: &CompletionContract,
+        matched_target: bool,
+        tool_call_id: &str,
+    ) {
         self.observation_count = self.observation_count.saturating_add(1);
         if !contract.requires_observation {
             return;
@@ -662,6 +1041,44 @@ impl CompletionProgress {
         if matched_target || contract.verification_targets.is_empty() {
             self.verification_pending = false;
             self.verification_count = self.verification_count.saturating_add(1);
+            self.record_verification_evidence(tool_call_id);
+        }
+    }
+
+    /// Mark a successful delivery receipt as direct verification. This keeps
+    /// delivery semantics structural without special-casing response text.
+    pub(super) fn mark_delivery_verified(&mut self, tool_call_id: &str) {
+        if self.verification_pending {
+            self.verification_pending = false;
+            self.verification_count = self.verification_count.saturating_add(1);
+            self.record_verification_evidence(tool_call_id);
+        }
+    }
+
+    fn record_verification_evidence(&mut self, tool_call_id: &str) {
+        if !self.proof_graph_initialized {
+            return;
+        }
+        let Some(obligation_id) = self.verification_obligation_id.clone() else {
+            return;
+        };
+        let id = format!("verification:{tool_call_id}");
+        let result = self
+            .proof_graph
+            .add_node(
+                id.clone(),
+                ExecutionNodeKind::Verification,
+                ExecutionNodeState::Satisfied,
+            )
+            .and_then(|()| {
+                self.proof_graph.satisfy_with_evidence(
+                    &obligation_id,
+                    &id,
+                    Some(tool_call_id.to_string()),
+                )
+            });
+        if let Err(error) = result {
+            tracing::warn!(%error, "Completion proof graph rejected verification evidence");
         }
     }
 
@@ -692,21 +1109,42 @@ impl CompletionProgress {
     }
 }
 
+fn mutation_effect_obligations() -> [(&'static str, ToolMutationEffects); 11] {
+    [
+        (
+            "local_source_write",
+            ToolMutationEffects::LOCAL_SOURCE_WRITE,
+        ),
+        (
+            "local_workspace_write",
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+        ),
+        (
+            "local_derived_write",
+            ToolMutationEffects::LOCAL_DERIVED_WRITE,
+        ),
+        ("repository_write", ToolMutationEffects::REPOSITORY_WRITE),
+        ("remote_mutation", ToolMutationEffects::REMOTE_MUTATION),
+        ("remote_deploy", ToolMutationEffects::REMOTE_DEPLOY),
+        ("external_delivery", ToolMutationEffects::EXTERNAL_DELIVERY),
+        ("process_state", ToolMutationEffects::PROCESS_STATE),
+        ("configuration", ToolMutationEffects::CONFIGURATION),
+        ("destructive", ToolMutationEffects::DESTRUCTIVE),
+        ("unspecified", ToolMutationEffects::UNSPECIFIED),
+    ]
+}
+
 pub(super) static HTTP_URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
 
-fn should_allow_verification_nickname_scope(text: &str, token: &str) -> bool {
-    super::should_allow_contextual_project_nickname_scope(text, token)
-}
-
-fn extract_verification_project_scopes(
+fn extract_verification_filesystem_targets(
     text: &str,
-    scopes: &mut Vec<String>,
-    max_scopes: usize,
+    targets: &mut Vec<VerificationTarget>,
+    max_targets: usize,
     alias_roots: &[String],
 ) {
     for raw in text.split_whitespace() {
-        if scopes.len() >= max_scopes {
+        if targets.len() >= max_targets {
             break;
         }
         let token = raw
@@ -735,22 +1173,20 @@ fn extract_verification_project_scopes(
             continue;
         }
 
-        let scope = if token_looks_like_filesystem_path(token) {
-            normalize_project_scope_path_with_aliases(token, alias_roots)
-        } else {
-            should_allow_verification_nickname_scope(text, token)
-                .then(|| {
-                    crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
-                        .or_else(|| {
-                            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
-                        })
-                })
-                .flatten()
-                .map(|path| path.to_string_lossy().to_string())
+        let Some(path) =
+            crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
+        else {
+            continue;
         };
-
-        if let Some(scope) = scope {
-            push_project_scope(scopes, scope, max_scopes);
+        let value = path.to_string_lossy().to_string();
+        if !targets
+            .iter()
+            .any(|target| target.kind == VerificationTargetKind::Path && target.value == value)
+        {
+            targets.push(VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value,
+            });
         }
     }
 }
@@ -778,70 +1214,13 @@ fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<Verif
         });
     }
 
-    let mut scopes = Vec::new();
-    extract_verification_project_scopes(text, &mut scopes, 4, alias_roots);
-    for scope in scopes {
-        if targets.iter().any(|existing| existing.value == scope) {
-            continue;
-        }
-        targets.push(VerificationTarget {
-            kind: VerificationTargetKind::ProjectScope,
-            value: scope,
-        });
-    }
-
-    if targets.is_empty() && super::user_text_references_filesystem_path(text) {
-        for raw in text.split_whitespace() {
-            let token = raw
-                .trim_matches(|c: char| {
-                    c.is_ascii_whitespace()
-                        || matches!(
-                            c,
-                            '`' | '\''
-                                | '"'
-                                | ','
-                                | ';'
-                                | ':'
-                                | '.'
-                                | '!'
-                                | '?'
-                                | '('
-                                | ')'
-                                | '['
-                                | ']'
-                                | '{'
-                                | '}'
-                        )
-                })
-                .trim();
-            if token.is_empty() || token.contains("://") || !token_looks_like_filesystem_path(token)
-            {
-                continue;
-            }
-            let resolved = if crate::execution::active_execution_backend().kind()
-                == crate::execution::BackendKind::Local
-            {
-                crate::tools::fs_utils::validate_path(token)
-                    .map(|path| path.to_string_lossy().to_string())
-            } else {
-                crate::execution::normalize_active_path_lexically(token)
-                    .map(|path| path.as_str().to_string())
-            };
-            if let Ok(value) = resolved {
-                if !targets.iter().any(|existing| existing.value == value) {
-                    targets.push(VerificationTarget {
-                        kind: VerificationTargetKind::Path,
-                        value,
-                    });
-                }
-            }
-        }
-    }
+    extract_verification_filesystem_targets(text, &mut targets, 4, alias_roots);
 
     targets
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg(test)]
 struct CompletionSignals {
     is_question: bool,
     asks_schedule: bool,
@@ -879,6 +1258,7 @@ pub(super) fn looks_like_question_request(lower_text: &str) -> bool {
 
 /// Mutation-flavored request verbs, split so run-and-report detection can ask
 /// "does this text ask for any change BEYOND merely running something?".
+#[cfg(test)]
 const CHANGE_KEYWORDS: &[&str] = &[
     "change",
     "update",
@@ -907,6 +1287,8 @@ const CHANGE_KEYWORDS: &[&str] = &[
     "note",
     "pull",
     "push",
+    "commit",
+    "publish",
     "fetch",
     "merge",
     "start",
@@ -926,12 +1308,14 @@ const CHANGE_KEYWORDS: &[&str] = &[
 
 /// Verbs that only mean "execute something" — mutating ONLY if the executed
 /// thing mutates, which the other keywords capture.
+#[cfg(test)]
 const RUN_KEYWORDS: &[&str] = &["run", "execute", "rerun", "re-run"];
 
 /// Keywords that are strong enough to arm a mutation contract when they appear
 /// as direct requests. Broader content verbs such as "write" stay out of this
 /// list unless there is an artifact cue; "write a tweet" is reply generation,
 /// while "write a test file" is a filesystem mutation.
+#[cfg(test)]
 const STRONG_MUTATION_KEYWORDS: &[&str] = &[
     "change",
     "update",
@@ -957,6 +1341,8 @@ const STRONG_MUTATION_KEYWORDS: &[&str] = &[
     "save",
     "pull",
     "push",
+    "commit",
+    "publish",
     "fetch",
     "merge",
     "start",
@@ -974,6 +1360,7 @@ const STRONG_MUTATION_KEYWORDS: &[&str] = &[
     "do it again",
 ];
 
+#[cfg(test)]
 const WRITE_ARTIFACT_CUES: &[&str] = &[
     "file", "script", "test", "tests", "readme", "code", "module", "function", "class", "document",
     "doc", "page", "record", "database", "db",
@@ -982,6 +1369,7 @@ const WRITE_ARTIFACT_CUES: &[&str] = &[
 /// "Run X and tell me what it said" — the deliverable is the OBSERVATION.
 /// True when the text asks to report/return/provide output AND the only
 /// execution verbs are the bare run/execute family (no genuine change verb).
+#[cfg(test)]
 fn is_run_and_report_only(lower_text: &str) -> bool {
     let report_intent = text_contains_any_phrase(
         lower_text,
@@ -1004,6 +1392,7 @@ fn is_run_and_report_only(lower_text: &str) -> bool {
         && !text_contains_any_phrase(lower_text, CHANGE_KEYWORDS)
 }
 
+#[cfg(test)]
 fn infer_completion_signals(
     lower_text: &str,
     verification_targets: &[VerificationTarget],
@@ -1245,7 +1634,20 @@ fn infer_completion_signals(
     // need a tool to observe the answer even though they carry no file/URL
     // target. Scoped to questions so plain conversational text is unaffected.
     let live_state_query = is_question
-        && (lower_text.starts_with("any ")
+        && (text_contains_any_phrase(
+            lower_text,
+            &[
+                "current branch",
+                "which branch",
+                "what branch",
+                "git branch",
+                "working directory",
+                "current directory",
+                "what is the cwd",
+                "what's the cwd",
+                "git status",
+            ],
+        ) || lower_text.starts_with("any ")
             || text_contains_any_phrase(
                 lower_text,
                 &[
@@ -1311,6 +1713,7 @@ fn infer_completion_signals(
     }
 }
 
+#[cfg(test)]
 fn infer_completion_task_kind(signals: &CompletionSignals) -> CompletionTaskKind {
     if signals.asks_schedule {
         return CompletionTaskKind::Schedule;
@@ -1357,6 +1760,7 @@ fn infer_completion_task_kind(signals: &CompletionSignals) -> CompletionTaskKind
 /// which would block completion for extra iterations and score the turn failed.
 /// Returns the full text unchanged when no marker is present (the common,
 /// non-enriched case → byte-identical behavior).
+#[cfg(test)]
 fn current_request_segment(text: &str) -> &str {
     let segment_start = ["Current request:", "Follow-up:"]
         .iter()
@@ -1374,6 +1778,7 @@ fn current_request_segment(text: &str) -> &str {
 /// Return the request that preceded an enriched `Current request:` segment.
 /// `sanitize_carryover_blocks` may already have removed the `Original request:`
 /// label, so the surviving current marker is the reliable split point.
+#[cfg(test)]
 fn prior_request_segment(text: &str) -> Option<&str> {
     let marker_start = ["Current request:", "Follow-up:"]
         .iter()
@@ -1402,6 +1807,7 @@ pub(super) fn scope_contract_for_delegated_executor(
     contract
 }
 
+#[cfg(test)]
 fn infer_required_mutation_effects(
     lower_text: &str,
     expects_mutation: bool,
@@ -1432,6 +1838,29 @@ fn infer_required_mutation_effects(
         ],
     ) {
         required = required.union(ToolMutationEffects::REMOTE_DEPLOY);
+    }
+
+    if text_contains_any_phrase(lower_text, &["commit", "create a commit", "make a commit"]) {
+        required = required.union(ToolMutationEffects::REPOSITORY_WRITE);
+    }
+
+    if text_contains_any_phrase(
+        lower_text,
+        &[
+            "publish the post",
+            "publish the article",
+            "publish the blog",
+            "publish this",
+            "post this",
+            "post it",
+            "tweet this",
+            "tweet it",
+            "upload",
+            "send",
+            "email",
+        ],
+    ) {
+        required = required.union(ToolMutationEffects::EXTERNAL_DELIVERY);
     }
 
     let local_artifact = text_contains_any_phrase(
@@ -1544,6 +1973,7 @@ fn infer_required_mutation_effects(
     }
 }
 
+#[cfg(test)]
 pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1634,6 +2064,9 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         requires_observation,
         requires_reverification_after_mutation,
         explicit_verification_requested: signals.explicit_verification_requested,
+        minimum_sources: 0,
+        requires_primary_sources: false,
+        requires_exact_history: false,
         connected_content_mode,
         verification_targets,
     }
@@ -1642,6 +2075,78 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_contract_replaces_lexical_obligations_but_keeps_exact_targets() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::Url,
+            value: "https://example.test/status".to_string(),
+        };
+        let mut contract = CompletionContract {
+            task_kind: CompletionTaskKind::Deliver,
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::REMOTE_DEPLOY,
+            forbids_mutation: true,
+            forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
+            requires_observation: true,
+            requires_reverification_after_mutation: true,
+            explicit_verification_requested: true,
+            minimum_sources: 3,
+            requires_primary_sources: true,
+            requires_exact_history: true,
+            connected_content_mode: super::super::intent_routing::ConnectedContentMode::DeliverOnly,
+            verification_targets: vec![target.clone()],
+        };
+
+        install_semantic_completion_contract(
+            &mut contract,
+            SemanticCompletionRequirements {
+                expects_mutation: false,
+                requires_observation: true,
+                task_kind: CompletionTaskKind::Check,
+                required_mutation_effects: ToolMutationEffects::NONE,
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+            },
+        );
+
+        assert_eq!(contract.task_kind, CompletionTaskKind::Check);
+        assert!(!contract.expects_mutation);
+        assert!(!contract.forbids_mutation);
+        assert!(contract.forbidden_mutation_actions.is_empty());
+        assert_eq!(contract.minimum_sources, 0);
+        assert!(!contract.requires_exact_history);
+        assert_eq!(contract.verification_targets, vec![target]);
+    }
+
+    #[test]
+    fn failed_assessment_retains_only_structural_resource_obligation() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::Path,
+            value: "/tmp/synthetic-target".to_string(),
+        };
+        let mut contract = CompletionContract {
+            task_kind: CompletionTaskKind::Change,
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            forbids_mutation: true,
+            forbidden_mutation_actions: vec![ForbiddenMutationAction::Delete],
+            verification_targets: vec![target.clone()],
+            ..CompletionContract::default()
+        };
+
+        retain_structural_completion_contract(&mut contract);
+
+        assert_eq!(contract.task_kind, CompletionTaskKind::Check);
+        assert!(contract.requires_observation);
+        assert!(contract.explicit_verification_requested);
+        assert!(!contract.expects_mutation);
+        assert!(!contract.forbids_mutation);
+        assert_eq!(contract.verification_targets, vec![target]);
+    }
 
     #[test]
     fn run_and_report_missions_are_checks_not_changes() {
@@ -2032,6 +2537,19 @@ mod tests {
         assert!(contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
     }
+
+    #[test]
+    fn current_git_state_questions_require_live_observation() {
+        for request in [
+            "What is the current branch?",
+            "Which git branch are we on?",
+            "What is the current working directory?",
+        ] {
+            let contract = infer_completion_contract(request, &[]);
+            assert!(contract.requires_observation, "{request:?}");
+            assert!(!contract.expects_mutation, "{request:?}");
+        }
+    }
     #[test]
     fn deliver_request_does_not_force_observation_without_explicit_verification() {
         let contract = infer_completion_contract("Email this note to Alice.", &[]);
@@ -2173,6 +2691,14 @@ mod tests {
 
             assert!(!completion_contract_allows_force_text(&contract, &progress));
             progress.mutation_count = 1;
+            assert!(
+                !completion_contract_allows_force_text(&contract, &progress),
+                "runtime proof graph must not accept a bare counter as mutation evidence"
+            );
+            progress.mark_mutation(
+                &contract,
+                &ToolCallSemantics::mutation_with(ToolMutationEffects::UNSPECIFIED),
+            );
             assert!(completion_contract_allows_force_text(&contract, &progress));
         }
     }
@@ -2248,15 +2774,13 @@ mod tests {
         );
 
         assert!(
-            targets
-                .iter()
-                .all(|target| target.kind != VerificationTargetKind::ProjectScope),
+            targets.is_empty(),
             "plain-word nickname should not resolve without local scope cues: {:?}",
             targets
         );
     }
     #[test]
-    fn verification_targets_allow_plain_word_nicknames_with_explicit_project_scope_cues() {
+    fn verification_targets_do_not_invent_targets_from_project_prose() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
         let project = alias_root.join("fairfax-va-site");
@@ -2264,30 +2788,52 @@ mod tests {
         std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
-        assert!(should_allow_verification_nickname_scope(
-            "Check the Fairfax project for broken links.",
-            "Fairfax"
-        ));
-        assert_eq!(
-            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(
-                "Fairfax",
-                &alias_roots
-            ),
-            Some(project.clone())
-        );
-
         let targets = extract_verification_targets(
             "Check the Fairfax project for broken links.",
             &alias_roots,
         );
 
         assert!(
-            targets.iter().any(|target| {
-                target.kind == VerificationTargetKind::ProjectScope
-                    && target.value == project.to_string_lossy()
-            }),
-            "explicit local scope cue should still allow nickname resolution: {:?}",
+            targets.is_empty(),
+            "natural-language project references need a resolved typed scope, not a guessed verification target: {:?}",
             targets
+        );
+    }
+    #[test]
+    fn verification_targets_reject_unanchored_slash_compounds_without_phrase_lists() {
+        for request in [
+            "Find everything about the table, including its Pros/cons.",
+            "Compare input/output behavior.",
+            "Explain client/server tradeoffs.",
+            "Summarize read/write performance.",
+            "Return a pass/fail assessment.",
+        ] {
+            let targets = extract_verification_targets(request, &[]);
+            assert!(
+                targets.is_empty(),
+                "unanchored prose compound became a target for {request:?}: {targets:?}"
+            );
+        }
+    }
+    #[test]
+    fn verification_targets_preserve_exact_structurally_anchored_paths() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let source = alias_root.join("synthetic-project").join("src");
+        std::fs::create_dir_all(&source).expect("create source tree");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let targets = extract_verification_targets(
+            "Inspect synthetic-project/src/new_module.rs before proceeding.",
+            &alias_roots,
+        );
+
+        assert_eq!(
+            targets,
+            vec![VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value: source.join("new_module.rs").to_string_lossy().to_string(),
+            }]
         );
     }
     #[test]

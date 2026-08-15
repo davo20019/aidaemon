@@ -15,10 +15,9 @@ pub(crate) struct TaskPlanStep {
     pub tool_hint: Option<String>,
 }
 
-/// Completion-contract signals classified by the planning LLM. Unlike the
-/// keyword-based contract inference (English-only), these come from the
-/// model reading the actual request in any language. All fields optional —
-/// absent fields leave the keyword-inferred contract untouched.
+/// Completion-contract signals classified by the task-assessment model. The
+/// runtime installs them only when the full contract is present and valid;
+/// partial output never refines a hard completion decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PlannedContractSignals {
     /// `low`, `medium`, or `high`. Permission-affecting refinements require
@@ -47,6 +46,17 @@ pub(crate) struct PlannedContractSignals {
     /// negative mutation constraint.
     #[serde(default)]
     pub constraint_evidence: Vec<String>,
+    /// Typed evidence requirements consumed directly by completion checks.
+    #[serde(default)]
+    pub minimum_sources: Option<u8>,
+    #[serde(default)]
+    pub requires_primary_sources: Option<bool>,
+    #[serde(default)]
+    pub requires_exact_history: Option<bool>,
+    /// Exact user-authored path or project name selected semantically for this
+    /// turn. The runtime resolves and validates it before changing scope.
+    #[serde(default)]
+    pub project_reference: Option<String>,
 }
 
 /// Semantic task shape used by the orchestration router. The route decision is
@@ -65,6 +75,16 @@ pub(crate) struct PlannedTaskShape {
     pub independent_workstreams: Option<u8>,
     #[serde(default)]
     pub requires_background_continuation: Option<bool>,
+    /// True only when the current inline run has another independent action it
+    /// can perform immediately after starting a background process.
+    #[serde(default)]
+    pub continue_inline_after_background_start: Option<bool>,
+    /// Relationship of this turn to persisted dialogue state.
+    #[serde(default)]
+    pub request_relationship: Option<String>,
+    /// Typed tool/resource domain for the request.
+    #[serde(default)]
+    pub semantic_scope: Option<String>,
 }
 
 fn confidence_is_sufficient(value: Option<&str>) -> bool {
@@ -84,6 +104,73 @@ pub(crate) fn planned_contract_is_confident(
             .as_deref()
             .or_else(|| task_shape.and_then(|shape| shape.confidence.as_deref())),
     )
+}
+
+/// Hard completion decisions require a complete semantic contract. This is a
+/// schema/invariant check, not a text classifier.
+pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> bool {
+    let Some(expects_mutation) = signals.expects_mutation else {
+        return false;
+    };
+    if signals.requires_observation.is_none()
+        || signals.minimum_sources.is_none()
+        || signals.requires_primary_sources.is_none()
+        || signals.requires_exact_history.is_none()
+        || signals
+            .task_kind
+            .as_deref()
+            .and_then(crate::agent::parse_planned_task_kind)
+            .is_none()
+    {
+        return false;
+    }
+
+    let Some(scope) = signals
+        .mutation_scope
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|scope| {
+            matches!(
+                scope.as_str(),
+                "allowed" | "read_only" | "read-only" | "scoped"
+            )
+        })
+    else {
+        return false;
+    };
+
+    if matches!(scope.as_str(), "read_only" | "read-only") && expects_mutation {
+        return false;
+    }
+    if scope == "allowed"
+        && (!signals.forbidden_actions.is_empty() || !signals.constraint_evidence.is_empty())
+    {
+        return false;
+    }
+    if scope == "scoped" && signals.forbidden_actions.is_empty() {
+        return false;
+    }
+    if signals
+        .forbidden_actions
+        .iter()
+        .any(|action| crate::agent::parse_planned_forbidden_action(action).is_none())
+    {
+        return false;
+    }
+    let minimum_sources = signals.minimum_sources.unwrap_or_default();
+    if minimum_sources > 20
+        || (signals.requires_primary_sources == Some(true) && minimum_sources == 0)
+    {
+        return false;
+    }
+
+    match signals.required_effects.as_deref() {
+        Some(effects) if expects_mutation => {
+            !effects.is_empty() && crate::agent::parse_planned_mutation_effects(effects).is_some()
+        }
+        Some(effects) => effects.is_empty(),
+        None => false,
+    }
 }
 
 pub(crate) fn planned_mutation_constraints_are_grounded(
@@ -164,7 +251,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 1;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 2;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -270,8 +357,8 @@ async fn record_auxiliary_model_call(
     .await;
 }
 
-/// Assess the user's request for a Guided model before its main loop.
-/// Autonomous models do not invoke this auxiliary classifier or step planner.
+/// Assess the user's request before its main loop. Guided models receive step
+/// scaffolding; autonomous models receive only semantic routing/obligations.
 ///
 /// Returns None if the assessment call fails, times out, or returns
 /// unparseable JSON. Failure is silent and callers continue without a plan.
@@ -312,7 +399,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 1,\n\
+           \"schema_version\": 2,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -324,13 +411,20 @@ pub(crate) async fn generate_task_plan(
              \"required_effects\": [\"local_source_write\", \"remote_deploy\"],\n\
              \"mutation_scope\": \"allowed|read_only|scoped\",\n\
              \"forbidden_actions\": [\"deploy\"],\n\
-             \"constraint_evidence\": [\"exact verbatim span from the current user request\"]\n\
+             \"constraint_evidence\": [\"exact verbatim span from the current user request\"],\n\
+             \"minimum_sources\": 0,\n\
+             \"requires_primary_sources\": false,\n\
+             \"requires_exact_history\": false,\n\
+             \"project_reference\": null\n\
            }},\n\
            \"task_shape\": {{\n\
              \"execution_mode\": \"inline|durable\",\n\
              \"confidence\": \"low|medium|high\",\n\
              \"independent_workstreams\": 1,\n\
-             \"requires_background_continuation\": false\n\
+             \"requires_background_continuation\": false,\n\
+             \"continue_inline_after_background_start\": false,\n\
+             \"request_relationship\": \"new_request|continuation|clarification_answer|courtesy\",\n\
+             \"semantic_scope\": \"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"\n\
            }}\n\
          }}\n\n\
          Classification rules:\n\
@@ -346,6 +440,15 @@ pub(crate) async fn generate_task_plan(
          - A long or multi-stage request is not automatically durable. One cohesive target \
            remains inline even when the same agent must build, deploy, verify, and return \
            an external URL. Persistence and task decomposition are separate decisions.\n\
+         - continue_inline_after_background_start=true only when starting an asynchronous \
+           process leaves another requested action that can run immediately in this same \
+           turn without waiting for that process to finish. Otherwise set it false and let \
+           the durable completion notification resume dependent work.\n\
+         - request_relationship is semantic: use continuation only when this turn advances, \
+           retries, or asks about an unresolved prior request; clarification_answer only when \
+           it answers the currently pending assistant question; otherwise use new_request.\n\
+         - semantic_scope names the typed resource domain, or none. It is independent of \
+           request_relationship and must reflect the current request rather than keyword overlap.\n\
          - expects_mutation=true only when completion changes files or external state. \
            Text generated in the reply is not a mutation.\n\
          - requires_observation=true when live files, commands, web pages, APIs, or \
@@ -355,6 +458,14 @@ pub(crate) async fn generate_task_plan(
            remote_deploy, external_delivery, process_state, configuration, and \
            destructive. Use [] when expects_mutation=false. A build cache or installed \
            dependency is not a local_source_write.\n\
+         - minimum_sources is the explicit number of distinct source pages required by the \
+           request, or 0 when there is no numeric threshold. Set requires_primary_sources \
+           only when those sources must be primary.\n\
+         - requires_exact_history=true only when completion requires canonical earlier \
+           conversation wording rather than ordinary conversational context.\n\
+         - project_reference is null unless the current request identifies a project or \
+           filesystem scope. Otherwise copy only the exact user-authored path or project \
+           name; never invent or expand a path.\n\
          - mutation_scope=read_only only when the whole task forbids changes. Use \
            mutation_scope=scoped when the task still requires changes but forbids only \
            named operations. Example: build locally but do not deploy => scoped, \
@@ -784,6 +895,33 @@ mod tests {
     }
 
     #[test]
+    fn hard_contract_requires_complete_typed_semantic_output() {
+        let complete = PlannedContractSignals {
+            confidence: Some("high".to_string()),
+            expects_mutation: Some(true),
+            requires_observation: Some(true),
+            required_effects: Some(vec!["local_source_write".to_string()]),
+            task_kind: Some("change".to_string()),
+            mutation_scope: Some("allowed".to_string()),
+            forbidden_actions: Vec::new(),
+            constraint_evidence: Vec::new(),
+            minimum_sources: Some(0),
+            requires_primary_sources: Some(false),
+            requires_exact_history: Some(false),
+            project_reference: None,
+        };
+        assert!(planned_contract_is_complete(&complete));
+
+        let mut partial = complete.clone();
+        partial.required_effects = None;
+        assert!(!planned_contract_is_complete(&partial));
+
+        let mut malformed_constraint = complete;
+        malformed_constraint.forbidden_actions = vec!["deploy".to_string()];
+        assert!(!planned_contract_is_complete(&malformed_constraint));
+    }
+
+    #[test]
     fn test_parse_plan_response_with_partial_contract() {
         let json = r#"{
             "goal": "g",
@@ -814,7 +952,8 @@ mod tests {
                 "execution_mode": "inline",
                 "confidence": "high",
                 "independent_workstreams": 1,
-                "requires_background_continuation": false
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": true
             }
         }"#;
 
@@ -834,6 +973,7 @@ mod tests {
         assert_eq!(shape.execution_mode.as_deref(), Some("inline"));
         assert_eq!(shape.confidence.as_deref(), Some("high"));
         assert_eq!(shape.independent_workstreams, Some(1));
+        assert_eq!(shape.continue_inline_after_background_start, Some(true));
     }
 
     #[test]
@@ -847,6 +987,10 @@ mod tests {
             mutation_scope: Some("read_only".to_string()),
             forbidden_actions: vec!["deploy".to_string()],
             constraint_evidence: vec!["do not deploy".to_string()],
+            minimum_sources: Some(0),
+            requires_primary_sources: Some(false),
+            requires_exact_history: Some(false),
+            project_reference: None,
         };
         assert!(!planned_mutation_constraints_are_grounded(
             &signals,

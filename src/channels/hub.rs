@@ -1,13 +1,15 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-use crate::agent::Agent;
 use crate::config::QueuePolicyConfig;
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::{QueuePressure, QueueTelemetry};
+#[cfg(test)]
+use crate::runtime_ports::SessionRouteLease;
+use crate::runtime_ports::{AssistantNoteSink, OutboundRouter};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
@@ -17,41 +19,6 @@ use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 /// Written by channels when they receive incoming messages,
 /// read by the hub to route outbound messages (approvals, media, notifications).
 pub type SessionMap = Arc<RwLock<HashMap<String, String>>>;
-
-/// Cancellation-safe lifetime for an internal child-session route.
-///
-/// Child agent futures can be aborted while awaiting an LLM or a tool. Keeping
-/// cleanup in `Drop` prevents those cancellations from leaving stale routes in
-/// the hub indefinitely. The parent value is checked before removal so an old
-/// guard can never erase a newer route for the same child identifier.
-pub(crate) struct SessionRouteGuard {
-    hub: Weak<ChannelHub>,
-    child_session: String,
-    parent_session: String,
-}
-
-impl Drop for SessionRouteGuard {
-    fn drop(&mut self) {
-        let Some(hub) = self.hub.upgrade() else {
-            return;
-        };
-        if let Ok(mut routes) = hub.session_routes.try_write() {
-            if routes.get(&self.child_session) == Some(&self.parent_session) {
-                routes.remove(&self.child_session);
-            }
-            return;
-        }
-
-        let child_session = self.child_session.clone();
-        let parent_session = self.parent_session.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                hub.unregister_session_route(&child_session, &parent_session)
-                    .await;
-            });
-        }
-    }
-}
 
 /// Central router for outbound messages across all channels.
 ///
@@ -69,7 +36,7 @@ pub struct ChannelHub {
     session_routes: RwLock<HashMap<String, String>>,
     queue_telemetry: Option<Arc<QueueTelemetry>>,
     queue_policy: Option<QueuePolicyConfig>,
-    delivery_note_agent: Option<Arc<Agent>>,
+    delivery_note_sink: Option<Arc<dyn AssistantNoteSink>>,
     /// Best-effort duplicate suppression for rapid-fire identical messages.
     /// Keyed by session_id.
     last_sent_text: RwLock<HashMap<String, (String, tokio::time::Instant)>>,
@@ -96,7 +63,7 @@ impl ChannelHub {
             session_routes: RwLock::new(HashMap::new()),
             queue_telemetry: None,
             queue_policy: None,
-            delivery_note_agent: None,
+            delivery_note_sink: None,
             last_sent_text: RwLock::new(HashMap::new()),
             recent_media_deliveries: RwLock::new(HashMap::new()),
             background_status_surfaces: RwLock::new(HashMap::new()),
@@ -171,13 +138,13 @@ impl ChannelHub {
         self
     }
 
-    pub fn with_delivery_note_agent(mut self, agent: Arc<Agent>) -> Self {
-        self.delivery_note_agent = Some(agent);
+    pub(crate) fn with_delivery_note_sink(mut self, sink: Arc<dyn AssistantNoteSink>) -> Self {
+        self.delivery_note_sink = Some(sink);
         self
     }
 
     async fn record_media_delivery_note(&self, session_id: &str, media: &MediaMessage) {
-        let Some(agent) = self.delivery_note_agent.as_ref() else {
+        let Some(sink) = self.delivery_note_sink.as_ref() else {
             return;
         };
         let MediaKind::Document {
@@ -191,10 +158,7 @@ impl ChannelHub {
             "Delivery note: I sent the attachment {} in chat. Local copy: {}",
             filename, file_path
         );
-        if let Err(err) = agent
-            .record_auxiliary_assistant_note(session_id, &summary)
-            .await
-        {
+        if let Err(err) = sink.record_assistant_note(session_id, &summary).await {
             warn!(
                 session_id,
                 error = %err,
@@ -231,28 +195,14 @@ impl ChannelHub {
         &self.session_map
     }
 
-    /// Route an internal child session through its originating human session.
-    /// Only the agent runtime calls this; tool/model arguments cannot register
-    /// routes. The parent may itself be a child, so resolution follows a short
-    /// bounded chain.
-    pub(crate) async fn register_session_route(
+    #[cfg(test)]
+    async fn register_session_route(
         self: &Arc<Self>,
         child_session: &str,
         parent_session: &str,
-    ) -> Option<SessionRouteGuard> {
-        if child_session.is_empty() || parent_session.is_empty() || child_session == parent_session
-        {
-            return None;
-        }
-        self.session_routes
-            .write()
-            .await
-            .insert(child_session.to_string(), parent_session.to_string());
-        Some(SessionRouteGuard {
-            hub: Arc::downgrade(self),
-            child_session: child_session.to_string(),
-            parent_session: parent_session.to_string(),
-        })
+    ) -> Option<SessionRouteLease> {
+        let router: Arc<dyn OutboundRouter> = self.clone();
+        SessionRouteLease::register(&router, child_session, parent_session).await
     }
 
     async fn unregister_session_route(&self, child_session: &str, parent_session: &str) {
@@ -427,12 +377,19 @@ impl ChannelHub {
                 let mut had_error = false;
                 let response = match route {
                     Some((ch, routed_session)) => match request.kind {
-                        ApprovalKind::GoalConfirmation => {
+                        ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation => {
+                            let style =
+                                if matches!(request.kind, ApprovalKind::AutopilotConfirmation) {
+                                    crate::types::GoalConfirmationStyle::Autopilot
+                                } else {
+                                    crate::types::GoalConfirmationStyle::Standard
+                                };
                             match ch
                                 .request_goal_confirmation(
                                     &routed_session,
                                     &request.command,
                                     &request.warnings,
+                                    style,
                                 )
                                 .await
                             {
@@ -821,6 +778,81 @@ impl ChannelHub {
                 }
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl OutboundRouter for ChannelHub {
+    async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        ChannelHub::send_text(self, session_id, text).await
+    }
+
+    async fn send_text_tracked(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        ChannelHub::send_text_tracked(self, session_id, text).await
+    }
+
+    async fn edit_text(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
+        ChannelHub::edit_text(self, session_id, message_id, text).await
+    }
+
+    async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+        ChannelHub::send_media(self, session_id, media).await
+    }
+
+    async fn send_media_strict(
+        &self,
+        session_id: &str,
+        media: &MediaMessage,
+    ) -> anyhow::Result<()> {
+        ChannelHub::send_media_strict(self, session_id, media).await
+    }
+
+    async fn take_background_status_surface(&self, session_id: &str) -> Option<String> {
+        ChannelHub::take_background_status_surface(self, session_id).await
+    }
+
+    async fn request_inline_approval(
+        &self,
+        session_id: &str,
+        description: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
+    ) -> anyhow::Result<ApprovalResponse> {
+        ChannelHub::request_inline_approval(
+            self,
+            session_id,
+            description,
+            risk_level,
+            warnings,
+            permission_mode,
+        )
+        .await
+    }
+
+    async fn register_session_route(&self, child_session: &str, parent_session: &str) -> bool {
+        if child_session.is_empty() || parent_session.is_empty() || child_session == parent_session
+        {
+            return false;
+        }
+        self.session_routes
+            .write()
+            .await
+            .insert(child_session.to_string(), parent_session.to_string());
+        true
+    }
+
+    async fn unregister_session_route(&self, child_session: &str, parent_session: &str) {
+        ChannelHub::unregister_session_route(self, child_session, parent_session).await;
     }
 }
 

@@ -1,48 +1,7 @@
-use serde::Deserialize;
 use shell_words;
 use std::path::Path;
 
-/// Permission persistence mode for terminal commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PermissionMode {
-    /// Default: Safe/Medium/High persist forever, Critical per-session only
-    #[default]
-    Default,
-    /// Cautious: All approvals are per-session only (nothing persists)
-    Cautious,
-    /// YOLO: All approvals persist forever, including Critical
-    Yolo,
-}
-
-impl std::fmt::Display for PermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PermissionMode::Default => write!(f, "default"),
-            PermissionMode::Cautious => write!(f, "cautious"),
-            PermissionMode::Yolo => write!(f, "yolo"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RiskLevel {
-    Safe,
-    Medium,
-    High,
-    Critical,
-}
-
-impl std::fmt::Display for RiskLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RiskLevel::Safe => write!(f, "Safe"),
-            RiskLevel::Medium => write!(f, "Medium"),
-            RiskLevel::High => write!(f, "High"),
-            RiskLevel::Critical => write!(f, "Critical"),
-        }
-    }
-}
+pub use crate::types::{PermissionMode, RiskLevel};
 
 pub struct RiskAssessment {
     pub level: RiskLevel,

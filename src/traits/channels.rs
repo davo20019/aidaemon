@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::types::{ApprovalResponse, MediaMessage};
+use crate::types::{
+    ApprovalResponse, GoalConfirmationStyle, MediaMessage, PermissionMode, RiskLevel,
+};
 
 /// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).
 ///
@@ -93,7 +94,11 @@ pub trait Channel: Send + Sync {
         _session_id: &str,
         _goal_description: &str,
         _details: &[String],
+        style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        Ok(true)
+        // Preserve the historical fallback for ordinary scheduled goals, but
+        // never auto-confirm an Autopilot posture on a channel that has not
+        // implemented an explicit confirmation surface.
+        Ok(matches!(style, GoalConfirmationStyle::Standard))
     }
 }

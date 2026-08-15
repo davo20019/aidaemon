@@ -262,6 +262,7 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
         session_id,
         &checkpoint.task_id,
         TaskStatus::Interrupted,
+        crate::events::TaskOutcome::Partial,
     )
     .await
     {

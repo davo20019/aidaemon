@@ -7,4 +7,7 @@ pub struct TriggerEvent {
     /// Whether this event originates from an explicitly trusted source
     /// (e.g., a scheduled task marked `trusted = true` in config).
     pub trusted: bool,
+    /// Optional content-free structural signal for matching Autopilot mandates.
+    /// The human-readable `content` is never used for wake routing.
+    pub mandate_signal: Option<super::MandateWakeSignal>,
 }

@@ -1,5 +1,6 @@
 mod anthropic_native;
 mod error;
+pub(crate) mod factory;
 mod google_genai;
 pub(crate) mod multimodal;
 mod openai_chatgpt;
@@ -16,6 +17,7 @@ pub use anthropic_native::AnthropicNativeProvider;
 // Re-exported for goal-dispatch healing (consumed from src/agent/ in later tasks).
 #[allow(unused_imports)]
 pub use error::is_provider_infra_error_text;
+pub(crate) use error::ProviderRecoveryRoute;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;
 pub use openai_chatgpt::OpenAiChatGptProvider;

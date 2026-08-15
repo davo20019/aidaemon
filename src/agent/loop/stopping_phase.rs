@@ -204,6 +204,53 @@ pub(super) async fn run_stopping_phase(
 
     let outcome: anyhow::Result<StoppingPhaseOutcome> = async {
 
+    if let Some(pressure) = execution_state.resource_pressure(task_tokens_used, task_start.elapsed()) {
+        execution_state.resource_pressure_emitted = true;
+        let prior_model = model.clone();
+        if !computer_use_pin_active {
+            if let Some(router) = llm_router.as_ref() {
+                let recovery_model = router.select(crate::router::Tier::Smart).to_string();
+                if recovery_model != model {
+                    info!(
+                        session_id,
+                        iteration,
+                        from_model = %model,
+                        to_model = %recovery_model,
+                        constrained_resource = pressure.limit.as_str(),
+                        "Promoted model at execution resource pressure"
+                    );
+                    model = recovery_model;
+                }
+            }
+        }
+        pending_system_messages.push(SystemDirective::ExecutionResourcePressure {
+            limit: pressure.limit.as_str().to_string(),
+            used: pressure.used,
+            maximum: pressure.maximum,
+            pct: pressure.pct,
+        });
+        agent
+            .emit_warning_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::ExecutionStateSnapshot,
+                "Execution resource-pressure threshold reached".to_string(),
+                json!({
+                    "condition": "execution_resource_pressure",
+                    "budget_limit": pressure.limit,
+                    "used": pressure.used,
+                    "maximum": pressure.maximum,
+                    "pct": pressure.pct,
+                    "progress_extensions_used": execution_state.progress_extensions_used,
+                    "observation_extensions_used": execution_state.observation_extensions_used,
+                    "prior_model": prior_model,
+                    "adapted_model": model.as_str(),
+                }),
+            )
+            .await;
+    }
+
     if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed()) {
         let text_only_turn = turn_contract_is_text_only(turn_context);
         let recoverable_tool_snapshot_present = if total_successful_tool_calls > 0
@@ -466,21 +513,9 @@ pub(super) async fn run_stopping_phase(
         if let Some(_background_ack) = pending_background_ack.take() {
             let budget_cap = hard_cap.unwrap_or(60);
             let well_within_budget = total_successful_tool_calls < (budget_cap / 2);
-            let request_has_followup_work = [
-                "and then",
-                "after that",
-                "also",
-                "test it",
-                "test the",
-                "verify",
-                "check if",
-                "make sure",
-                "connect to",
-                "when done",
-                "when finished",
-            ]
-            .iter()
-            .any(|phrase| crate::agent::keyword_match(user_text, phrase));
+            let request_has_followup_work =
+                turn_context.continue_inline_after_background_start
+                    || execution_state.linear_intent_plan_has_remaining_steps();
 
             if request_has_followup_work && well_within_budget {
                 info!(
@@ -706,6 +741,42 @@ pub(super) async fn run_stopping_phase(
     } else {
         false
     };
+
+    if scheduled_run_budget_active && !budget_warning_sent {
+        if let (Some(goal_id), Some(registry)) = (
+            resolved_goal_id.as_deref(),
+            agent.goal_token_registry.as_ref(),
+        ) {
+            if let Some(status) = registry.get_run_budget(goal_id).await {
+                if let Some(pct) =
+                    Agent::scheduled_run_budget_pressure_pct(&status, budget_warning_sent)
+                {
+                    budget_warning_sent = true;
+                    pending_system_messages.push(SystemDirective::ScheduledRunBudgetPressure {
+                        used: status.tokens_used,
+                        budget: status.effective_budget_per_check,
+                        pct,
+                    });
+                    agent
+                        .emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::StoppingCondition,
+                            "Scheduled run resource-pressure threshold reached".to_string(),
+                            json!({
+                                "condition": "scheduled_run_budget_pressure",
+                                "goal_id": goal_id,
+                                "budget": status.effective_budget_per_check,
+                                "tokens_used": status.tokens_used,
+                                "pct": pct,
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
 
     if let Some(budget) = effective_task_budget.filter(|_| !scheduled_run_budget_active) {
         // One-time warning at 80% of budget
@@ -942,11 +1013,16 @@ pub(super) async fn run_stopping_phase(
                         goal_id,
                         Agent::scheduled_run_health_snapshot(
                             learning_ctx,
-                            evidence_gain_count,
-                            stall_count,
-                            consecutive_same_tool.1,
-                            consecutive_same_tool_arg_hashes.len(),
-                            total_successful_tool_calls,
+                            graceful::ScheduledRunActivityMetrics {
+                                evidence_gain_count,
+                                stall_count,
+                                consecutive_same_tool_count: consecutive_same_tool.1,
+                                consecutive_same_tool_unique_args:
+                                    consecutive_same_tool_arg_hashes.len(),
+                                total_successful_tool_calls,
+                            },
+                            &turn_context.completion_contract,
+                            completion_progress,
                         ),
                     )
                     .await
@@ -961,8 +1037,7 @@ pub(super) async fn run_stopping_phase(
                     iteration,
                     goal_id,
                     status: &run_budget_status,
-                    user_role,
-                    status_tx,
+                    pending_system_messages,
                     max_budget_extensions,
                     hard_token_cap,
                 };
@@ -1212,15 +1287,17 @@ pub(super) async fn run_stopping_phase(
                         extension: budget_extensions_count,
                         max_extensions: max_budget_extensions,
                     });
-                    send_status(
-                        status_tx,
-                        StatusUpdate::BudgetExtended {
-                            old_budget: daily_budget as i64,
-                            new_budget: new_daily_budget as i64,
-                            extension: budget_extensions_count,
-                            max_extensions: max_budget_extensions,
-                        },
-                    );
+                    if !is_scheduled_goal {
+                        send_status(
+                            status_tx,
+                            StatusUpdate::BudgetExtended {
+                                old_budget: daily_budget as i64,
+                                new_budget: new_daily_budget as i64,
+                                extension: budget_extensions_count,
+                                max_extensions: max_budget_extensions,
+                            },
+                        );
+                    }
                     agent
                         .emit_decision_point(
                             emitter,
@@ -1241,7 +1318,8 @@ pub(super) async fn run_stopping_phase(
                         .await;
                     return Ok(StoppingPhaseOutcome::ContinueLoop);
                 }
-                if daily_budget < cap_u64
+                if !is_scheduled_goal
+                    && daily_budget < cap_u64
                     && new_daily_budget > total
                     && agent
                         .request_budget_continue_approval(
@@ -1373,7 +1451,7 @@ pub(super) async fn run_stopping_phase(
                 }),
             )
             .await;
-        let reply = "I'm having trouble processing this request. Could you try rephrasing it or breaking it into smaller steps?"
+        let reply = "I couldn't complete this request after automatic tool, model, and execution-strategy recovery."
                 .to_string();
         let assistant_msg = Message {
             id: Uuid::new_v4().to_string(),

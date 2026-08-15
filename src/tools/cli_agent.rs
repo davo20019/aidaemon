@@ -21,13 +21,13 @@ use crate::agent::{
     derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
     ExecutorHandoff, TargetScope, TaskValidationOutcome,
 };
-use crate::channels::ChannelHub;
 use crate::config::CliAgentsConfig;
 use crate::execution::{
     active_execution_backend, BackendFileType, BackendPath, ExecutionRequest, ProcessHandle,
     SharedExecutionBackend,
 };
 use crate::llm_runtime::SharedLlmRuntime;
+use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
@@ -37,10 +37,49 @@ use crate::traits::{
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
-use crate::utils::{truncate_str, truncate_with_note};
+use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
+const BUFFER_TRUNCATION_MARKER: &str = "\n[... middle of CLI output omitted ...]\n";
+
+/// Append one output line while preserving both startup diagnostics and the
+/// most recent events. Final-result records are normally at the end of JSONL
+/// streams, so a prefix-only cap can erase the authoritative outcome.
+fn append_bounded_line(buffer: &mut String, prefix: &str, line: &str, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+
+    buffer.push_str(prefix);
+    buffer.push_str(line);
+    buffer.push('\n');
+    if buffer.len() <= cap {
+        return;
+    }
+
+    if cap <= BUFFER_TRUNCATION_MARKER.len() {
+        let mut tail_start = buffer.len().saturating_sub(cap);
+        while tail_start < buffer.len() && !buffer.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        *buffer = buffer[tail_start..].to_string();
+        return;
+    }
+
+    let head_end = floor_char_boundary(buffer, cap / 4);
+    let tail_budget = cap - head_end - BUFFER_TRUNCATION_MARKER.len();
+    let mut tail_start = buffer.len().saturating_sub(tail_budget);
+    while tail_start < buffer.len() && !buffer.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let mut retained = String::with_capacity(cap);
+    retained.push_str(&buffer[..head_end]);
+    retained.push_str(BUFFER_TRUNCATION_MARKER);
+    retained.push_str(&buffer[tail_start..]);
+    *buffer = retained;
+}
 
 /// Interval for emitting progress updates (avoid spamming the channel).
 #[cfg(test)]
@@ -90,7 +129,7 @@ fn format_background_progress(
 }
 
 async fn deliver_cli_agent_notification(
-    hub: Option<&Arc<ChannelHub>>,
+    hub: Option<&Arc<dyn OutboundRouter>>,
     state: &Arc<dyn StateStore>,
     goal_id: &str,
     session_id: &str,
@@ -240,6 +279,33 @@ struct CompletedCliAgent {
     session_id: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CliCompletionResult {
+    success: bool,
+    authentication_failed: bool,
+    persisted_output: String,
+    response: Option<String>,
+    error: Option<String>,
+}
+
+/// A configured CLI could not execute any part of the delegated task, so it is
+/// safe to retry the same request with another configured CLI. This remains a
+/// typed internal signal: the caller must not infer retryability from the
+/// wording of a tool error.
+#[derive(Debug)]
+struct CliAgentUnavailableError {
+    tool_name: String,
+    message: String,
+}
+
+impl std::fmt::Display for CliAgentUnavailableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliAgentUnavailableError {}
+
 /// A working directory claim with enough metadata to explain conflicts.
 struct WorkingDirClaim {
     task_id: String,
@@ -372,10 +438,10 @@ pub struct CliAgentTool {
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
     approval_tx: ApprovalBroker,
-    hub: OnceLock<Weak<ChannelHub>>,
+    hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// Re-enter the root agent when background delegation completes so the
     /// delegated step advances the original user outcome instead of ending it.
-    agent: OnceLock<Weak<crate::agent::Agent>>,
+    agent: OnceLock<Weak<dyn ConversationRuntime>>,
     reengagements: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
@@ -625,28 +691,6 @@ fn failed_before_agent_launch(output: &str, exit_code: Option<i32>) -> bool {
             && lower.contains("no such file or directory"))
 }
 
-fn delegated_prompt_requests_deployment(prompt: &str, system_instruction: Option<&str>) -> bool {
-    let combined = format!("{prompt}\n{}", system_instruction.unwrap_or_default());
-    let lower = combined.to_ascii_lowercase();
-    let explicitly_non_deploying = [
-        "do not deploy",
-        "don't deploy",
-        "without deploying",
-        "do not publish",
-        "don't publish",
-        "without publishing",
-        "do not release",
-        "don't release",
-        "without releasing",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    !explicitly_non_deploying
-        && ["deploy", "publish", "release"]
-            .iter()
-            .any(|keyword| crate::agent::keyword_match(&lower, keyword))
-}
-
 fn first_cli_failure_detail(output: &str) -> String {
     output
         .lines()
@@ -750,6 +794,13 @@ impl CliAgentTool {
     async fn build_finished_result(agent: &RunningCliAgent) -> String {
         let elapsed = agent.started_at.elapsed().as_secs();
         let stdout_output = agent.stdout_buf.lock().await.clone();
+        let display_output = agent.display_buf.lock().await.clone();
+        if let Some(error) = Self::detect_auth_error(&display_output, &agent.tool_name) {
+            return format!(
+                "CLI agent '{}' failed after {}s.\n\n{}",
+                agent.tool_name, elapsed, error
+            );
+        }
         let result = extract_meaningful_output(&stdout_output, 10000);
 
         // Capture git diff for finished background tasks.
@@ -812,6 +863,14 @@ impl CliAgentTool {
                 .then_with(|| a.cmp(b))
         });
         names.into_iter().next()
+    }
+
+    fn configured_tool(&self, name: &str) -> Option<String> {
+        self.tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(name)
+            .then(|| name.to_string())
     }
 
     fn is_owner_role(user_role: Option<&str>) -> bool {
@@ -1002,20 +1061,29 @@ impl CliAgentTool {
     }
 
     /// Set channel hub reference for immediate background completion delivery.
-    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
-        let _ = self.hub.set(hub);
+    pub fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
+        self.hub
+            .set(hub)
+            .expect("CliAgentTool::set_hub called more than once");
     }
 
-    pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
-        let _ = self.agent.set(agent);
+    pub fn set_agent(&self, agent: Weak<dyn ConversationRuntime>) {
+        self.agent
+            .set(agent)
+            .expect("CliAgentTool::set_agent called more than once");
     }
 
-    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+    fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
         self.hub.get().and_then(|w| w.upgrade())
     }
 
-    fn get_agent(&self) -> Option<Arc<crate::agent::Agent>> {
+    fn get_agent(&self) -> Option<Arc<dyn ConversationRuntime>> {
         self.agent.get().and_then(|w| w.upgrade())
+    }
+
+    pub(crate) fn wiring_ready(&self) -> bool {
+        self.hub.get().and_then(Weak::upgrade).is_some()
+            && self.agent.get().and_then(Weak::upgrade).is_some()
     }
 
     /// Load dynamically registered agents from the database.
@@ -1614,25 +1682,89 @@ impl CliAgentTool {
     /// Detect auth-related errors in output.
     fn detect_auth_error(output: &str, tool_name: &str) -> Option<String> {
         let auth_patterns = [
-            "authentication",
+            "authentication required",
+            "authentication failed",
             "unauthorized",
-            "expired",
+            "not authenticated",
+            "not logged in",
             "login required",
-            "api key",
+            "sign in required",
+            "token expired",
+            "invalid api key",
+            "api key is required",
+            "missing api key",
             "access denied",
             "forbidden",
             "invalid token",
+            "gemini-cli-auth-docs",
         ];
         let lower = output.to_lowercase();
         for pattern in &auth_patterns {
             if lower.contains(pattern) {
                 return Some(format!(
-                    "CLI agent '{}' authentication failed. Check that your subscription/API key for {} is valid.",
-                    tool_name, tool_name
+                    "ERROR: CLI agent '{}' authentication failed before it produced a task result. It has been disabled for this daemon session; retry with another configured CLI agent, or authenticate '{}' before restarting it.",
+                    tool_name, tool_name,
                 ));
             }
         }
         None
+    }
+
+    fn quarantine_unavailable_tool(
+        tools: &Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
+        tool_names: &Arc<std::sync::RwLock<Vec<String>>>,
+        tool_name: &str,
+        reason: &'static str,
+    ) {
+        tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(tool_name);
+        tool_names
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|name| name != tool_name);
+        warn!(
+            tool = tool_name,
+            reason, "Quarantined unavailable CLI agent"
+        );
+    }
+
+    fn classify_completion_result(
+        tool_name: &str,
+        exit_code: Option<i32>,
+        stdout: &str,
+        display_output: &str,
+        max_output: usize,
+    ) -> CliCompletionResult {
+        if let Some(error) = Self::detect_auth_error(display_output, tool_name) {
+            return CliCompletionResult {
+                success: false,
+                authentication_failed: true,
+                persisted_output: error.clone(),
+                response: None,
+                error: Some(error),
+            };
+        }
+
+        if exit_code == Some(0) {
+            let result = extract_meaningful_output(stdout, max_output);
+            return CliCompletionResult {
+                success: true,
+                authentication_failed: false,
+                persisted_output: result.clone(),
+                response: Some(result),
+                error: None,
+            };
+        }
+
+        CliCompletionResult {
+            success: false,
+            authentication_failed: false,
+            persisted_output: display_output.to_string(),
+            response: None,
+            error: Some(display_output.to_string()),
+        }
     }
 
     /// Try to answer a question from a CLI agent using the LLM.
@@ -1714,20 +1846,6 @@ impl CliAgentTool {
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        // Announce which agent is being dispatched and what it's working on
-        if let Some(ref tx) = status_tx {
-            let task_preview: String = prompt.chars().take(60).collect();
-            let task_desc = if prompt.len() > 60 {
-                format!("{}...", task_preview)
-            } else {
-                task_preview
-            };
-            let _ = tx.try_send(StatusUpdate::ToolProgress {
-                name: tool_name.to_string(),
-                chunk: format!("🚀 Delegating to {}: {}", tool_name, task_desc),
-            });
-        }
-
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output) = {
             let tools = self.tools.read().unwrap();
@@ -1790,16 +1908,17 @@ impl CliAgentTool {
                     "ERROR: CLI agent '{tool_name}' could not start: {error}. \
                  Re-register it with an absolute executable path or reinstall it."
                 );
-                if let Some(task_id) = delegated_task_id {
-                    Self::persist_delegated_cli_result_with_state(
-                        self.state.clone(),
-                        task_id,
-                        None,
-                        Some(&message),
-                    )
-                    .await;
+                Self::quarantine_unavailable_tool(
+                    &self.tools,
+                    &self.tool_names,
+                    tool_name,
+                    "launch resolution failed",
+                );
+                return Err(CliAgentUnavailableError {
+                    tool_name: tool_name.to_string(),
+                    message,
                 }
-                return Ok(message);
+                .into());
             }
         }
 
@@ -1947,6 +2066,8 @@ impl CliAgentTool {
             .unwrap_or(0);
 
         let state_for_completion = self.state.clone();
+        let tools_for_completion = self.tools.clone();
+        let tool_names_for_completion = self.tool_names.clone();
         let delegated_task_id_owned = delegated_task_id.map(|task_id| task_id.to_string());
 
         let mut command_args = args.clone();
@@ -2142,13 +2263,12 @@ impl CliAgentTool {
                                         );
                                         {
                                             let mut buf = display_buf_writer.lock().await;
-                                            if buf.len() < BUFFER_CAP {
-                                                buf.push_str(&format!(
-                                                    "[killed] Prohibited CLI agent command: {}\nReason: {}\n",
-                                                    cmd,
-                                                    reason
-                                                ));
-                                            }
+                                            append_bounded_line(
+                                                &mut buf,
+                                                "[killed] Prohibited CLI agent command: ",
+                                                &format!("{cmd}\nReason: {reason}"),
+                                                BUFFER_CAP,
+                                            );
                                         }
                                         kill_process(
                                             &backend_for_task,
@@ -2168,18 +2288,12 @@ impl CliAgentTool {
                                 // Write to stdout buffer (for JSON extraction)
                                 {
                                     let mut buf = stdout_buf_writer.lock().await;
-                                    if buf.len() < BUFFER_CAP {
-                                        buf.push_str(&text);
-                                        buf.push('\n');
-                                    }
+                                    append_bounded_line(&mut buf, "", &text, BUFFER_CAP);
                                 }
                                 // Write to display buffer
                                 {
                                     let mut buf = display_buf_writer.lock().await;
-                                    if buf.len() < BUFFER_CAP {
-                                        buf.push_str(&text);
-                                        buf.push('\n');
-                                    }
+                                    append_bounded_line(&mut buf, "", &text, BUFFER_CAP);
                                 }
                                 pending_lines.push(text);
                             }
@@ -2202,11 +2316,7 @@ impl CliAgentTool {
 
                                 // Only write to display buffer with [stderr] prefix
                                 let mut buf = display_buf_writer.lock().await;
-                                if buf.len() < BUFFER_CAP {
-                                    buf.push_str("[stderr] ");
-                                    buf.push_str(&text);
-                                    buf.push('\n');
-                                }
+                                append_bounded_line(&mut buf, "[stderr] ", &text, BUFFER_CAP);
                                 pending_lines.push(format!("[stderr] {}", text));
                             }
                             _ => stderr_done = true,
@@ -2234,7 +2344,12 @@ impl CliAgentTool {
                                 "CLI agent appears stuck waiting for input — killing (stdin is null)"
                             );
                             let mut buf = display_buf_writer.lock().await;
-                            buf.push_str(&format!("[killed] CLI agent appears stuck waiting for input: {}\n", line));
+                            append_bounded_line(
+                                &mut buf,
+                                "[killed] CLI agent appears stuck waiting for input: ",
+                                line,
+                                BUFFER_CAP,
+                            );
                             drop(buf);
                             kill_process(&backend_for_task, &process_handle_for_task).await;
                             break;
@@ -2350,30 +2465,38 @@ impl CliAgentTool {
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
                 let duration = invocation_started_at.elapsed().as_secs_f64();
-                let (success, persisted_output, structured_response, structured_error) =
-                    if loop_detected {
-                        (
-                            false,
-                            "Killed - infinite loop detected".to_string(),
-                            None,
-                            Some("Killed - infinite loop detected".to_string()),
-                        )
-                    } else {
-                        // Prefer stdout for success summaries; fall back to display output for failures.
-                        let stdout_text = stdout_buf_writer.lock().await.clone();
-                        let display_text = display_buf_writer.lock().await.clone();
-
-                        if exit_code == Some(0) {
-                            let result_text =
-                                extract_meaningful_output(&stdout_text, max_output_for_log);
-                            (true, result_text.clone(), Some(result_text), None)
-                        } else {
-                            let auth_msg =
-                                CliAgentTool::detect_auth_error(&display_text, &tool_name_owned);
-                            let summary_src = auth_msg.unwrap_or(display_text);
-                            (false, summary_src.clone(), None, Some(summary_src))
-                        }
-                    };
+                let completion = if loop_detected {
+                    CliCompletionResult {
+                        success: false,
+                        authentication_failed: false,
+                        persisted_output: "Killed - infinite loop detected".to_string(),
+                        response: None,
+                        error: Some("Killed - infinite loop detected".to_string()),
+                    }
+                } else {
+                    // Prefer stdout for success summaries; fall back to display output for failures.
+                    let stdout_text = stdout_buf_writer.lock().await.clone();
+                    let display_text = display_buf_writer.lock().await.clone();
+                    CliAgentTool::classify_completion_result(
+                        &tool_name_owned,
+                        exit_code,
+                        &stdout_text,
+                        &display_text,
+                        max_output_for_log,
+                    )
+                };
+                let success = completion.success;
+                if completion.authentication_failed {
+                    CliAgentTool::quarantine_unavailable_tool(
+                        &tools_for_completion,
+                        &tool_names_for_completion,
+                        &tool_name_owned,
+                        "authentication failed",
+                    );
+                }
+                let persisted_output = completion.persisted_output;
+                let structured_response = completion.response;
+                let structured_error = completion.error;
 
                 let _ = state_for_completion
                     .log_cli_agent_complete(
@@ -2500,14 +2623,15 @@ impl CliAgentTool {
                             continuation_progress
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             continuation_progress.tick().await;
-                            let mut continuation = std::pin::pin!(agent.handle_message(
-                                &notify_session_id,
-                                &followup,
-                                None,
-                                crate::types::UserRole::Owner,
-                                crate::types::ChannelContext::internal(),
-                                None,
-                            ));
+                            let mut continuation =
+                                std::pin::pin!(agent.continue_conversation(ConversationRequest {
+                                    session_id: notify_session_id.clone(),
+                                    user_text: followup,
+                                    status_tx: None,
+                                    user_role: crate::types::UserRole::Owner,
+                                    channel_ctx: crate::types::ChannelContext::internal(),
+                                    heartbeat: None,
+                                },));
                             let continuation_result = loop {
                                 tokio::select! {
                                     result = &mut continuation => break result,
@@ -2705,6 +2829,37 @@ impl CliAgentTool {
                     ));
                 }
 
+                // Authentication/setup failures are failures even when a CLI
+                // exits zero (Gemini CLI has emitted its auth-help URL and a
+                // successful process status without executing the prompt).
+                // Classify this before emitting ToolComplete so the live
+                // status cannot briefly report a false success.
+                let display_output = display_buf.lock().await.clone();
+                if let Some(auth_msg) = Self::detect_auth_error(&display_output, tool_name) {
+                    if let Some(ref tx) = status_tx {
+                        let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                            tool_name,
+                            "authentication failed",
+                            crate::types::ChannelVisibility::Public,
+                        );
+                        let _ = tx.try_send(StatusUpdate::ToolComplete {
+                            name: label,
+                            summary,
+                        });
+                    }
+                    Self::quarantine_unavailable_tool(
+                        &self.tools,
+                        &self.tool_names,
+                        tool_name,
+                        "authentication failed",
+                    );
+                    return Err(CliAgentUnavailableError {
+                        tool_name: tool_name.to_string(),
+                        message: auth_msg,
+                    }
+                    .into());
+                }
+
                 // Completed within timeout normally
                 // Use stdout_buf for JSON extraction (clean, no stderr prefixes)
                 let stdout_output = stdout_buf.lock().await.clone();
@@ -2751,13 +2906,6 @@ impl CliAgentTool {
 
                 if exit_code != Some(0) {
                     // On error, show the display buffer which includes stderr
-                    let display_output = display_buf.lock().await.clone();
-
-                    // Check for auth errors
-                    if let Some(auth_msg) = Self::detect_auth_error(&display_output, tool_name) {
-                        return Ok(auth_msg);
-                    }
-
                     let error_msg = format_cli_agent_failure(
                         tool_name,
                         exit_code,
@@ -3537,6 +3685,22 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
     let mut last_content: Option<String> = None;
     for line in raw.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
+            // Codex CLI JSONL emits the final response as:
+            // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+            //
+            // Command events can contain very large `aggregated_output` values.
+            // If this final message is not recognized, `extract_meaningful_output`
+            // falls back to truncating the raw stream from the front and loses the
+            // authoritative outcome. That can make a completed side effect look
+            // unfinished and cause the orchestrator to repeat it.
+            if v.get("type").and_then(Value::as_str) == Some("item.completed")
+                && v.pointer("/item/type").and_then(Value::as_str) == Some("agent_message")
+            {
+                if let Some(text) = v.pointer("/item/text").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+
             if let Some(content) = v
                 .pointer("/item/content")
                 .or_else(|| v.pointer("/content"))
@@ -3719,43 +3883,45 @@ impl Tool for CliAgentTool {
         let exit_code = cli_agent_exit_code(&output);
         let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
         let policy_block = output.trim_start().starts_with("Blocked:");
-        let metadata = if exit_code.is_some() || prelaunch_failure || policy_block {
-            ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
-                exit_code,
-                transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
-                semantics: if prelaunch_failure || policy_block {
-                    ToolCallSemantics::administrative()
-                } else {
-                    ToolCallSemantics::default()
-                },
-                ..ToolCallMetadata::default()
-            }
-        } else if output.contains("started in background")
-            || output.contains("Moved to background")
-            || output.contains("still running")
-            || output.contains("only active CLI task for this session")
-        {
-            ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::Backgrounded),
-                background_started: true,
-                completion_notifications_enabled: action == "run",
-                ..ToolCallMetadata::default()
-            }
-        } else if action == "check"
-            && (output.starts_with("No CLI agent task matched")
-                || output.starts_with("No running CLI agent"))
-        {
-            ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
-                ..ToolCallMetadata::default()
-            }
-        } else {
-            ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::Succeeded),
-                ..ToolCallMetadata::default()
-            }
-        };
+        let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
+        let metadata =
+            if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
+                ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
+                    exit_code,
+                    transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
+                    semantics: if prelaunch_failure || policy_block || reported_failure {
+                        ToolCallSemantics::administrative()
+                    } else {
+                        ToolCallSemantics::default()
+                    },
+                    ..ToolCallMetadata::default()
+                }
+            } else if output.contains("started in background")
+                || output.contains("Moved to background")
+                || output.contains("still running")
+                || output.contains("only active CLI task for this session")
+            {
+                ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+                    background_started: true,
+                    completion_notifications_enabled: action == "run",
+                    ..ToolCallMetadata::default()
+                }
+            } else if action == "check"
+                && (output.starts_with("No CLI agent task matched")
+                    || output.starts_with("No running CLI agent"))
+            {
+                ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                    ..ToolCallMetadata::default()
+                }
+            } else {
+                ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                    ..ToolCallMetadata::default()
+                }
+            };
         Ok(ToolCallOutcome { output, metadata })
     }
 
@@ -3786,9 +3952,10 @@ impl Tool for CliAgentTool {
 
         match action {
             "run" => {
-                let tool = args
+                let mut tool = args
                     .tool
-                    .clone()
+                    .as_deref()
+                    .and_then(|name| self.configured_tool(name))
                     .or_else(|| self.default_tool_name())
                     .ok_or_else(|| anyhow::anyhow!("No CLI agents available for action=run"))?;
                 let prompt = if let Some(prompt) = args.run_prompt() {
@@ -3818,15 +3985,15 @@ impl Tool for CliAgentTool {
                     anyhow::bail!("Missing 'prompt' parameter for action=run");
                 };
 
-                if args._trusted_session
-                    && delegated_prompt_requests_deployment(
-                        &prompt,
-                        args.system_instruction.as_deref(),
-                    )
-                {
+                // Trusted sessions bypass the interactive approval boundary.
+                // A CLI delegate is an opaque, mutation-capable executor, so
+                // prompt wording cannot narrow its effects. Require a concrete
+                // clean repository for every unattended run rather than trying
+                // to recognize deployment verbs or negations in prose.
+                if args._trusted_session {
                     let Some(working_dir) = args.working_dir.as_deref() else {
                         return Ok(
-                            "Blocked: unattended deployment delegation requires an explicit working_dir so repository cleanliness can be verified."
+                            "Blocked: unattended CLI delegation requires an explicit working_dir so repository cleanliness can be verified."
                                 .to_string(),
                         );
                     };
@@ -3835,7 +4002,7 @@ impl Tool for CliAgentTool {
                         .filter(|count| *count > 0)
                     {
                         return Ok(format!(
-                            "Blocked: unattended deployment delegation found {entry_count} pre-existing changed or untracked worktree entries. Deploy from a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not published."
+                            "Blocked: unattended CLI delegation found {entry_count} pre-existing changed or untracked worktree entries. Use a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not exposed to opaque delegated mutation."
                         ));
                     }
                 }
@@ -3895,18 +4062,58 @@ impl Tool for CliAgentTool {
                     args.async_mode.unwrap_or(false)
                 };
 
-                self.handle_run(
-                    &tool,
-                    &prompt,
-                    args.working_dir.as_deref(),
-                    &session_id,
-                    args._goal_id.as_deref(),
-                    args._task_id.as_deref(),
-                    args.system_instruction.as_deref(),
-                    async_mode,
-                    status_tx,
-                )
-                .await
+                let mut unavailable = Vec::new();
+                loop {
+                    match self
+                        .handle_run(
+                            &tool,
+                            &prompt,
+                            args.working_dir.as_deref(),
+                            &session_id,
+                            args._goal_id.as_deref(),
+                            args._task_id.as_deref(),
+                            args.system_instruction.as_deref(),
+                            async_mode,
+                            status_tx.clone(),
+                        )
+                        .await
+                    {
+                        Ok(output) => return Ok(output),
+                        Err(error) => {
+                            let Some(failure) = error.downcast_ref::<CliAgentUnavailableError>()
+                            else {
+                                return Err(error);
+                            };
+                            unavailable.push((failure.tool_name.clone(), failure.message.clone()));
+
+                            let Some(next_tool) = self.default_tool_name() else {
+                                let mut message = String::from(
+                                    "ERROR: CLI agent recovery exhausted before task execution. \
+                                     No configured CLI agent was able to start the delegated task.",
+                                );
+                                for (name, detail) in &unavailable {
+                                    message.push_str(&format!("\n- {name}: {detail}"));
+                                }
+                                if let Some(task_id) = args._task_id.as_deref() {
+                                    self.persist_delegated_cli_result(
+                                        task_id,
+                                        None,
+                                        Some(&message),
+                                    )
+                                    .await;
+                                }
+                                return Ok(message);
+                            };
+
+                            info!(
+                                unavailable_tool = %tool,
+                                fallback_tool = %next_tool,
+                                "Retrying delegated task with another configured CLI agent"
+                            );
+                            tool = next_tool;
+                        }
+                    }
+                }
             }
             "check" => {
                 let task_id = args.task_id.as_ref().ok_or_else(|| {
@@ -3992,6 +4199,7 @@ mod tests {
         let (tool, _db_file) = setup_echo_tool().await;
         {
             let mut tools = tool.tools.write().unwrap();
+            tools.clear();
             tools.insert(
                 "broken".to_string(),
                 CliToolEntry {
@@ -4004,7 +4212,7 @@ mod tests {
                 },
             );
         }
-        tool.tool_names.write().unwrap().push("broken".to_string());
+        *tool.tool_names.write().unwrap() = vec!["broken".to_string()];
 
         let outcome = tool
             .call_with_status_outcome(
@@ -4257,12 +4465,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_unknown_tool() {
+    async fn test_run_unavailable_requested_tool_uses_configured_fallback() {
         let (tool, _db) = setup_echo_tool().await;
         let result = tool
             .call(r#"{"action":"run","tool":"nonexistent","prompt":"test"}"#)
-            .await;
-        assert!(result.is_err());
+            .await
+            .unwrap();
+        assert!(result.contains("test"), "got: {result}");
     }
 
     #[tokio::test]
@@ -5080,6 +5289,10 @@ mod tests {
             ("Invalid API key provided", true),
             ("Access denied: forbidden", true),
             ("Invalid token for this resource", true),
+            (
+                "See https://goo.gle/gemini-cli-auth-docs#workspace-gca",
+                true,
+            ),
             ("Normal output: everything is fine", false),
             ("Compiling project...", false),
         ];
@@ -5101,6 +5314,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_automatically_retries_another_configured_agent() {
+        let (tool, _db) = setup_echo_tool().await;
+        tool.tools.write().unwrap().insert(
+            "auth-agent".to_string(),
+            CliToolEntry {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'authentication required\\n'; exit 1".to_string(),
+                ],
+                description: "Unauthenticated test agent".to_string(),
+                timeout: Duration::from_secs(10),
+                max_output_chars: 10_000,
+                is_dynamic: false,
+            },
+        );
+        tool.tool_names
+            .write()
+            .unwrap()
+            .push("auth-agent".to_string());
+
+        let result = tool
+            .call(r#"{"action":"run","tool":"auth-agent","prompt":"finish autonomously"}"#)
+            .await
+            .unwrap();
+
+        assert!(result.contains("finish autonomously"), "got: {result}");
+        assert!(
+            !tool.tools.read().unwrap().contains_key("auth-agent"),
+            "the unavailable agent must remain quarantined"
+        );
+    }
+
+    #[test]
+    fn zero_exit_auth_setup_output_is_a_failed_completion() {
+        let completion = CliAgentTool::classify_completion_result(
+            "gemini",
+            Some(0),
+            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca",
+            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca",
+            10_000,
+        );
+
+        assert!(!completion.success);
+        assert!(completion.response.is_none());
+        assert!(completion
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authentication failed")));
+        assert!(!completion.persisted_output.contains("workspace-gca"));
     }
 
     // -----------------------------------------------------------------------
@@ -5163,6 +5429,110 @@ mod tests {
         let output = r#"{"output": "Generated report successfully"}"#;
         let result = extract_meaningful_output(output, 10000);
         assert_eq!(result, "Generated report successfully");
+    }
+
+    #[test]
+    fn test_extract_meaningful_output_codex_jsonl_uses_final_agent_message() {
+        let noisy_prefix = "repository guidance\n".repeat(2_000);
+        let output = format!(
+            "{}\n{}\n{}\n{}",
+            serde_json::json!({"type":"thread.started","thread_id":"synthetic-thread"}),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "id":"item-1",
+                    "type":"command_execution",
+                    "aggregated_output":noisy_prefix,
+                    "exit_code":0,
+                    "status":"completed"
+                }
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "id":"item-2",
+                    "type":"agent_message",
+                    "text":"Published and verified https://example.test/posts/synthetic/"
+                }
+            }),
+            serde_json::json!({"type":"turn.completed","usage":{"output_tokens":42}}),
+        );
+
+        let result = extract_meaningful_output(&output, 200);
+
+        assert_eq!(
+            result,
+            "Published and verified https://example.test/posts/synthetic/"
+        );
+        assert!(!result.contains("repository guidance"));
+        assert!(!result.contains("truncated"));
+    }
+
+    #[test]
+    fn test_extract_meaningful_output_codex_jsonl_prefers_last_agent_message() {
+        let output = [
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","text":"I will inspect the repository."}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","text":"Publication completed and verified."}
+            })
+            .to_string(),
+            serde_json::json!({"type":"turn.completed"}).to_string(),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            extract_meaningful_output(&output, 10_000),
+            "Publication completed and verified."
+        );
+    }
+
+    #[test]
+    fn bounded_output_retains_final_codex_result_after_overflow() {
+        let mut output = String::new();
+        append_bounded_line(
+            &mut output,
+            "",
+            &serde_json::json!({"type":"thread.started"}).to_string(),
+            512,
+        );
+        append_bounded_line(
+            &mut output,
+            "",
+            &serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"command_execution",
+                    "aggregated_output":"inspection noise ".repeat(200)
+                }
+            })
+            .to_string(),
+            512,
+        );
+        append_bounded_line(
+            &mut output,
+            "",
+            &serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"agent_message",
+                    "text":"Published exactly once."
+                }
+            })
+            .to_string(),
+            512,
+        );
+
+        assert!(output.len() <= 512);
+        assert!(output.contains(BUFFER_TRUNCATION_MARKER.trim()));
+        assert_eq!(
+            extract_meaningful_output(&output, 10_000),
+            "Published exactly once."
+        );
     }
 
     #[test]
@@ -5706,7 +6076,7 @@ mod tests {
         let (tool, _db) = setup_bash_tool().await;
         let state = tool.state.clone();
         tool.call(
-            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 1","async_mode":true,"_session_id":"session-progress"}"#,
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true,"_session_id":"session-progress"}"#,
         )
         .await
         .unwrap();
@@ -5736,20 +6106,26 @@ mod tests {
         assert!(result.is_none(), "Non-git directory should return None");
     }
 
-    #[test]
-    fn deployment_prompt_detection_respects_explicit_negative_instructions() {
-        assert!(delegated_prompt_requests_deployment(
+    #[tokio::test]
+    async fn trusted_cli_delegation_requires_structural_worktree_scope() {
+        let (tool, _db) = setup_echo_tool().await;
+        for prompt in [
             "Build, deploy, and verify the exact public URL",
-            None,
-        ));
-        assert!(delegated_prompt_requests_deployment(
-            "Prepare the artifact",
-            Some("Publish the release after tests pass"),
-        ));
-        assert!(!delegated_prompt_requests_deployment(
             "Build locally but do not deploy",
-            None,
-        ));
+            "Inspect the code and return a report",
+        ] {
+            let args = serde_json::json!({
+                "action": "run",
+                "tool": "echo",
+                "prompt": prompt,
+                "_trusted_session": true
+            });
+            let result = tool.call(&args.to_string()).await.unwrap();
+            assert!(
+                result.contains("requires an explicit working_dir"),
+                "prompt wording must not narrow an opaque unattended delegation: {result}"
+            );
+        }
     }
 
     #[tokio::test]

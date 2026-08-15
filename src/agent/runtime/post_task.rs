@@ -300,17 +300,17 @@ pub(super) fn classify_stall(
     if recent_errors.contains("rate limit") || recent_errors.contains("429") {
         (
             "Rate Limited",
-            "I'm being rate-limited right now. Try again in a few minutes.",
+            "Automatic provider recovery remained rate-limited.",
         )
     } else if recent_errors.contains("timed out") || recent_errors.contains("timeout") {
         (
             "Timeout",
-            "Responses are taking too long right now. This usually resolves on its own -- try again shortly, or try a simpler request.",
+            "Automatic recovery still exceeded the current response-time limits.",
         )
     } else if recent_errors.contains("network") || recent_errors.contains("connection") {
         (
             "Network Error",
-            "There seems to be a connectivity issue. Check your network connection and try again.",
+            "Automatic recovery could not get a working network connection.",
         )
     } else if is_tool_policy_block(&recent_errors) {
         (
@@ -320,17 +320,17 @@ pub(super) fn classify_stall(
     } else if is_edit_target_drift(&recent_errors) {
         (
             "Edit Target Drift",
-            "I had trouble editing files because the content changed while I was working. Try again so I can re-read the files first.",
+            "The edit target kept changing after automatic re-read and retry recovery.",
         )
     } else if looks_like_provider_server_error(&recent_errors) {
         (
             "Server Error",
-            "I'm experiencing temporary server issues. Try again in a few minutes.",
+            "Automatic provider recovery remained blocked by server errors.",
         )
     } else if recent_errors.contains("unknown tool") {
         (
             "Unknown Tool",
-            "Something went wrong on my end. This usually resolves on retry -- try again, or rephrase your request.",
+            "Automatic tool-resolution recovery could not find a working capability.",
         )
     } else if recent_errors.contains("unauthorized")
         || recent_errors.contains("api key")
@@ -344,12 +344,12 @@ pub(super) fn classify_stall(
     } else if recent_errors.contains(deferred_no_tool_error_marker) {
         (
             "Deferred No-Tool Loop",
-            "I'm having trouble processing this request. Could you try rephrasing it or breaking it into smaller steps?",
+            "Automatic tool and model recovery did not produce an executable step.",
         )
     } else {
         (
             "Stuck",
-            "Try rephrasing your request or providing more specific guidance.",
+            "The available in-run recovery strategies were exhausted.",
         )
     }
 }
@@ -492,8 +492,9 @@ pub(super) fn graceful_scheduled_run_budget_response(
     let mut summary = format!(
         "This scheduled run hit its per-run processing budget (used {} / {} tokens). \
             Here's what I accomplished so far:\n\n{}\
-            The run stopped because it no longer looked productive enough to keep extending automatically. \
-            If this task legitimately needs more room, raise `budget_per_check`.",
+            The run used its bounded autonomous compute envelope, so it stopped instead of \
+            spending indefinitely. Recorded work remains available to the recurring workflow; \
+            no owner action is required.",
         tokens_used, budget_per_check, activity,
     );
     if summary.len() > 1500 {
@@ -523,7 +524,7 @@ pub(super) fn graceful_goal_daily_budget_response(
         .map(|dt| dt.format("%B %-d, %Y 00:00 UTC").to_string())
         .unwrap_or_else(|| "the next UTC day boundary".to_string());
     let scope = if is_scheduled_goal {
-        "This scheduled goal hit its daily processing budget"
+        "This scheduled goal hit its cumulative daily processing budget across today's runs"
     } else {
         "This goal hit its daily processing budget"
     };
@@ -543,7 +544,7 @@ pub(super) fn graceful_goal_daily_budget_response(
     }
     if is_scheduled_goal {
         msg.push_str(
-            "To prevent this, raise the scheduled goal's `budget_daily` or reduce how often it runs.",
+            "This total is not the cost of the current run alone. The recurring schedule remains active and no owner action is required; the next eligible run can resume after the UTC reset.",
         );
     } else {
         msg.push_str("You can ask me to continue this later, or increase the goal's daily budget.");
@@ -662,7 +663,7 @@ pub(super) fn graceful_repetitive_response(
     if !error_explanation.is_empty() {
         msg.push_str(&error_explanation);
     }
-    msg.push_str("Could you try a different approach or provide more specific instructions?");
+    msg.push_str("The task remains incomplete after the available in-run recovery attempts.");
     msg
 }
 
@@ -672,7 +673,7 @@ pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, _iterations:
     let mut summary = format!(
         "I've reached my processing limit for this task. \
             Here's what I accomplished so far:\n\n{}\
-            The task may be incomplete. You can ask me to continue where I left off or try breaking it into smaller parts.",
+            The task remains incomplete after the available in-run recovery budget was exhausted.",
         activity,
     );
     if summary.len() > 1500 {
@@ -1363,10 +1364,11 @@ mod tests {
         };
 
         let result = graceful_goal_daily_budget_response(&ctx, 60, 60, true);
-        assert!(result.contains("scheduled goal hit its daily processing budget"));
+        assert!(result.contains("cumulative daily processing budget across today's runs"));
         assert!(result.contains("used 60 / 60 tokens"));
+        assert!(result.contains("not the cost of the current run alone"));
         assert!(result.contains("00:00 UTC"));
-        assert!(result.contains("budget_daily"));
+        assert!(result.contains("no owner action is required"));
     }
 
     #[test]

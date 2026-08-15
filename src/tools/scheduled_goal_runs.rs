@@ -3,11 +3,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 use crate::traits::{
-    semantics_for_exact_read_actions, Goal, StateStore, Task, TaskActivity, Tool,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, Goal, StateStore, Task, TaskActivity, Tool, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolResultPresentation,
 };
+use crate::types::StatusUpdate;
 
 pub struct ScheduledGoalRunsTool {
     state: Arc<dyn StateStore>,
@@ -20,18 +23,37 @@ impl ScheduledGoalRunsTool {
 
     const RUN_INSTRUCTIONS_MARKER: &'static str = "\n\nLATEST RUN INSTRUCTIONS:\n";
 
-    fn description_with_run_instructions(description: &str, instructions: &str) -> String {
+    fn description_with_run_instructions(
+        description: &str,
+        instructions: &str,
+        revision: u64,
+        run_requirement: Option<&str>,
+        insufficient_evidence: Option<&str>,
+    ) -> String {
         let base = description
             .split_once(Self::RUN_INSTRUCTIONS_MARKER)
             .map_or(description, |(base, _)| base)
             .trim_end();
-        format!("{base}{}{instructions}", Self::RUN_INSTRUCTIONS_MARKER)
+        let mut compiled = format!(
+            "{base}{}REVISION {revision} (authoritative for this run; it supersedes any conflicting earlier execution policy while preserving the base objective and non-conflicting safety constraints).\n",
+            Self::RUN_INSTRUCTIONS_MARKER
+        );
+        if let Some(requirement) = run_requirement {
+            compiled.push_str(&format!("RUN REQUIREMENT: {requirement}\n"));
+        }
+        if let Some(fallback) = insufficient_evidence {
+            compiled.push_str(&format!("INSUFFICIENT EVIDENCE: {fallback}\n"));
+        }
+        compiled.push_str(instructions);
+        compiled
     }
 
     async fn update_instructions(
         &self,
         goal_id_input: &str,
         instructions: &str,
+        run_requirement: Option<&str>,
+        insufficient_evidence: Option<&str>,
     ) -> anyhow::Result<String> {
         let instructions = instructions.trim();
         if instructions.is_empty() {
@@ -39,6 +61,12 @@ impl ScheduledGoalRunsTool {
         }
         if instructions.chars().count() > 6000 {
             return Ok("Instructions are too long (maximum 6000 characters).".to_string());
+        }
+        if run_requirement == Some("must_complete") && insufficient_evidence == Some("skip_run") {
+            return Ok(
+                "Conflicting run policy: must_complete cannot use skip_run when evidence is insufficient. Choose use_public_sources, use_best_available, or best_effort."
+                    .to_string(),
+            );
         }
 
         let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
@@ -57,14 +85,35 @@ impl ScheduledGoalRunsTool {
             return Ok("Only scheduled goals can have run instructions updated.".to_string());
         }
 
-        goal.description = Self::description_with_run_instructions(&goal.description, instructions);
         let mut context = goal
             .context
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}));
+        let revision = context
+            .get("run_instruction_spec")
+            .and_then(|spec| spec.get("revision"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        goal.description = Self::description_with_run_instructions(
+            &goal.description,
+            instructions,
+            revision,
+            run_requirement,
+            insufficient_evidence,
+        );
         context["run_instructions"] = Value::String(instructions.to_string());
+        context["run_instruction_spec"] = json!({
+            "version": 1,
+            "revision": revision,
+            "instructions": instructions,
+            "run_requirement": run_requirement,
+            "insufficient_evidence": insufficient_evidence,
+            "conflict_rule": "latest_revision_wins",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
         goal.context = Some(context.to_string());
         goal.updated_at = chrono::Utc::now().to_rfc3339();
         self.state.update_goal(&goal).await?;
@@ -132,6 +181,10 @@ impl ScheduledGoalRunsTool {
         self.state
             .set_goal_budgets(&goal.id, budget_per_check, budget_daily)
             .await?;
+        if budget_daily.is_some() {
+            crate::goal_tokens::clear_goal_daily_budget_override(self.state.as_ref(), &goal.id)
+                .await?;
+        }
 
         let mut out = format!(
             "Updated budget for scheduled goal {}.\n- budget_per_check: {:?} -> {:?}\n- budget_daily: {:?} -> {:?}",
@@ -327,11 +380,54 @@ impl ScheduledGoalRunsTool {
             return Ok("Only scheduled goals can be run with scheduled_goal_runs.".to_string());
         }
 
-        if let Some(budget_daily) = goal.budget_daily {
-            if goal.tokens_used_today >= budget_daily {
+        let mut adaptive_extension = None;
+        if let Some(configured_budget) = goal.budget_daily.filter(|budget| *budget > 0) {
+            let today = chrono::Utc::now().date_naive().to_string();
+            let used_today = if goal.tokens_used_day == today {
+                goal.tokens_used_today.max(0)
+            } else {
+                0
+            };
+            let durable = crate::goal_tokens::load_goal_daily_budget_override(
+                self.state.as_ref(),
+                &goal.id,
+                configured_budget,
+                crate::agent::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+            )
+            .await;
+            let mut effective_budget = durable
+                .as_ref()
+                .map(|value| value.budget_daily)
+                .unwrap_or(configured_budget);
+            let extensions_count = durable
+                .as_ref()
+                .map(|value| value.extensions_count)
+                .unwrap_or(0);
+
+            if used_today >= effective_budget
+                && extensions_count < crate::agent::SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS
+            {
+                if let Some(next_budget) = crate::goal_tokens::next_goal_daily_budget(
+                    effective_budget,
+                    used_today,
+                    crate::agent::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+                ) {
+                    let persisted = crate::goal_tokens::persist_goal_daily_budget_override(
+                        self.state.as_ref(),
+                        &goal.id,
+                        next_budget,
+                        extensions_count.saturating_add(1),
+                    )
+                    .await?;
+                    adaptive_extension = Some((effective_budget, persisted.budget_daily));
+                    effective_budget = persisted.budget_daily;
+                }
+            }
+
+            if used_today >= effective_budget {
                 return Ok(format!(
-                    "Skipped run_now for {}: daily budget exhausted (used {} / limit {}). Wait for the UTC daily reset or raise `budget_daily`.",
-                    resolved_goal_id, goal.tokens_used_today, budget_daily
+                    "Skipped run_now for {}: cumulative usage for this goal across today's runs is {} / {} tokens, so its bounded same-day hard cap is exhausted. This is not the cost of one run. It can run after the UTC reset.",
+                    resolved_goal_id, used_today, effective_budget
                 ));
             }
         }
@@ -482,6 +578,11 @@ impl ScheduledGoalRunsTool {
         );
         if schedule_consumed {
             out.push_str("\n- One-shot schedule consumed: schedule deleted.");
+        }
+        if let Some((old_budget, new_budget)) = adaptive_extension {
+            out.push_str(&format!(
+                "\n- Same-day adaptive capacity: {old_budget} -> {new_budget}; restart-safe and bounded by the hard cap."
+            ));
         }
         Ok(out)
     }
@@ -752,13 +853,23 @@ struct ScheduledGoalRunsArgs {
     #[serde(default)]
     instructions: Option<String>,
     #[serde(default)]
+    run_requirement: Option<String>,
+    #[serde(default)]
+    insufficient_evidence: Option<String>,
+    #[serde(default)]
+    include_diagnostics: Option<bool>,
+    #[serde(default)]
     _user_role: Option<String>,
+}
+
+fn string_enum(values: &[&str]) -> Value {
+    json!({"type": "string", "enum": values})
 }
 
 fn scheduled_goal_runs_schema() -> Value {
     json!({
         "name": "scheduled_goal_runs",
-        "description": "Trigger and inspect scheduled-goal runs. ONLY for scheduled goals; NOT for storing facts.",
+        "description": "Manage runs.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -782,8 +893,13 @@ fn scheduled_goal_runs_schema() -> Value {
                     "type": "integer"
                 },
                 "instructions": {
-                    "type": "string",
-                    "description": "Persistent run instructions (update_instructions)"
+                    "type": "string"
+                },
+                "run_requirement": string_enum(&["must_complete", "best_effort"]),
+                "insufficient_evidence": string_enum(&["use_public_sources", "use_best_available", "skip_run"]),
+                "include_diagnostics": {
+                    "type": "boolean",
+                    "description": "True only for user-requested internal IDs."
                 }
             },
             "required": ["action", "goal_id"],
@@ -886,13 +1002,57 @@ impl Tool for ScheduledGoalRunsTool {
 	                let instructions = args.instructions.as_deref().ok_or_else(|| {
 	                    anyhow::anyhow!("'instructions' is required for update_instructions")
 	                })?;
-	                self.update_instructions(goal_id, instructions).await
+	                self.update_instructions(
+                        goal_id,
+                        instructions,
+                        args.run_requirement.as_deref(),
+                        args.insufficient_evidence.as_deref(),
+                    )
+                    .await
 	            }
 	            other => Ok(format!(
 	                "Unknown action: '{}'. Use run_now, run_history, last_failure, unblock_hints, set_budget, or update_instructions.",
 	                other
 	            )),
 	        }
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
+        let output = self.call(arguments).await?;
+        let mut internal_identifiers = crate::tools::sanitize::extract_uuid_identifiers(&output);
+        for candidate in [args.goal_id.as_deref(), args.schedule_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            internal_identifiers
+                .extend(crate::tools::sanitize::extract_uuid_identifiers(candidate));
+        }
+        internal_identifiers.sort();
+        internal_identifiers.dedup();
+
+        let presentation = if args.include_diagnostics.unwrap_or(false) {
+            Some(ToolResultPresentation::DiagnosticDetail)
+        } else if matches!(
+            args.action.as_str(),
+            "run_now" | "set_budget" | "update_instructions"
+        ) {
+            Some(ToolResultPresentation::NaturalSummary)
+        } else {
+            None
+        };
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                presentation,
+                internal_identifiers,
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 }
 
@@ -929,6 +1089,7 @@ mod tests {
         let required_values: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(required_values.contains(&"action"));
         assert!(required_values.contains(&"goal_id"));
+        assert!(schema["parameters"]["properties"]["include_diagnostics"].is_object());
     }
 
     #[tokio::test]
@@ -1002,6 +1163,191 @@ mod tests {
         assert_eq!(
             state.get_tasks_for_goal_run(&run.id).await.unwrap()[0].id,
             tasks[0].id
+        );
+    }
+
+    #[tokio::test]
+    async fn run_now_durably_extends_an_exhausted_daily_budget_once() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let mut goal = Goal::new_continuous(
+            "Publish a synthetic daily entry",
+            "synthetic-session",
+            Some(400_000),
+            Some(1_000_000),
+        );
+        goal.tokens_used_today = 1_253_197;
+        goal.tokens_used_day = chrono::Utc::now().date_naive().to_string();
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 6 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("daily".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: crate::cron_utils::compute_next_run("0 6 * * *")
+                    .unwrap()
+                    .to_rfc3339(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(&json!({"action": "run_now", "goal_id": goal.id}).to_string())
+            .await
+            .unwrap();
+
+        assert!(result.contains("Queued manual run"), "result: {result}");
+        assert!(result.contains("Same-day adaptive capacity"));
+        let durable = crate::goal_tokens::load_goal_daily_budget_override(
+            state.as_ref(),
+            &goal.id,
+            1_000_000,
+            crate::agent::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+        )
+        .await
+        .expect("manual run should persist the adaptive budget");
+        assert_eq!(durable.budget_daily, 2_000_000);
+        assert_eq!(durable.extensions_count, 1);
+    }
+
+    #[tokio::test]
+    async fn run_now_still_stops_at_the_bounded_daily_hard_cap() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let mut goal = Goal::new_continuous(
+            "Run bounded synthetic work",
+            "synthetic-session",
+            Some(400_000),
+            Some(1_000_000),
+        );
+        goal.tokens_used_today = 2_100_000;
+        goal.tokens_used_day = chrono::Utc::now().date_naive().to_string();
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 6 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("daily".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: crate::cron_utils::compute_next_run("0 6 * * *")
+                    .unwrap()
+                    .to_rfc3339(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(&json!({"action": "run_now", "goal_id": goal.id}).to_string())
+            .await
+            .unwrap();
+
+        assert!(result.contains("hard cap is exhausted"), "result: {result}");
+        assert!(state.get_tasks_for_goal(&goal.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_now_marks_internal_ids_for_natural_owner_presentation() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous("Run synthetic diagnostics", "session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: crate::cron_utils::compute_next_run("0 */6 * * *")
+                .unwrap()
+                .to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({"action": "run_now", "goal_id": goal.id}).to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.presentation,
+            Some(ToolResultPresentation::NaturalSummary)
+        );
+        assert!(outcome.metadata.internal_identifiers.contains(&goal.id));
+        let run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        assert!(outcome.metadata.internal_identifiers.contains(&run.id));
+        assert!(!outcome.metadata.internal_identifiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_run_diagnostics_select_diagnostic_presentation() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous("Run synthetic diagnostics", "session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 */6 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("every 6h".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: crate::cron_utils::compute_next_run("0 */6 * * *")
+                    .unwrap()
+                    .to_rfc3339(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "run_now",
+                    "goal_id": goal.id,
+                    "include_diagnostics": true
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.presentation,
+            Some(ToolResultPresentation::DiagnosticDetail)
         );
     }
 
@@ -1159,6 +1505,12 @@ mod tests {
             context["run_instructions"],
             "Use one current primary source and write a human-useful insight."
         );
+        assert_eq!(context["run_instruction_spec"]["version"], 1);
+        assert_eq!(context["run_instruction_spec"]["revision"], 2);
+        assert_eq!(
+            context["run_instruction_spec"]["conflict_rule"],
+            "latest_revision_wins"
+        );
         assert!(state.get_tasks_for_goal(&goal.id).await.unwrap().is_empty());
         assert!(state
             .get_current_goal_run(&goal.id)
@@ -1168,6 +1520,55 @@ mod tests {
         assert_eq!(
             state.get_schedules_for_goal(&goal.id).await.unwrap()[0].id,
             schedule.id
+        );
+    }
+
+    #[tokio::test]
+    async fn update_instructions_rejects_structurally_conflicting_policy() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous("Publish one verified note", "session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 9 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("daily".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: crate::cron_utils::compute_next_run("0 9 * * *")
+                    .unwrap()
+                    .to_rfc3339(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "update_instructions",
+                    "goal_id": goal.id,
+                    "instructions": "Always finish the run.",
+                    "run_requirement": "must_complete",
+                    "insufficient_evidence": "skip_run",
+                    "_user_role": "Owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Conflicting run policy"));
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().description,
+            goal.description
         );
     }
 

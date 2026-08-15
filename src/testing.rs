@@ -46,6 +46,7 @@ pub struct MockChatCall {
 /// Mock LLM provider that returns scripted responses.
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
+    task_assessment_responses: Mutex<Vec<ProviderResponse>>,
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
@@ -61,6 +62,7 @@ impl MockProvider {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(Vec::new()),
+            task_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -72,6 +74,7 @@ impl MockProvider {
     pub fn with_responses(responses: Vec<ProviderResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            task_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -86,6 +89,7 @@ impl MockProvider {
     ) -> Self {
         Self {
             responses: Mutex::new(responses),
+            task_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -98,6 +102,57 @@ impl MockProvider {
     pub fn rejecting_non_default_options(mut self) -> Self {
         self.reject_non_default_options = true;
         self
+    }
+
+    /// Supply task-assessment responses without interleaving them with the
+    /// main-loop response queue. This keeps behavior tests explicit about the
+    /// typed contract they exercise instead of teaching the mock to classify
+    /// English request phrases.
+    pub fn with_task_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
+        self.task_assessment_responses = Mutex::new(responses);
+        self
+    }
+
+    /// Helper for a complete schema-v2 semantic assessment used by tests.
+    pub fn semantic_task_assessment(
+        task_kind: &str,
+        expects_mutation: bool,
+        requires_observation: bool,
+        required_effects: &[&str],
+        request_relationship: &str,
+        semantic_scope: &str,
+    ) -> ProviderResponse {
+        Self::text_response(
+            &json!({
+                "schema_version": 2,
+                "goal": "Synthetic typed task assessment",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": task_kind,
+                    "expects_mutation": expects_mutation,
+                    "requires_observation": requires_observation,
+                    "required_effects": required_effects,
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": [],
+                    "constraint_evidence": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "request_relationship": request_relationship,
+                    "semantic_scope": semantic_scope
+                }
+            })
+            .to_string(),
+        )
     }
 
     /// Helper: build a text-only ProviderResponse.
@@ -177,6 +232,10 @@ impl ModelProvider for MockProvider {
                 })
             });
             if is_planning_call {
+                let mut task_assessments = self.task_assessment_responses.lock().await;
+                if !task_assessments.is_empty() {
+                    return Ok(task_assessments.remove(0));
+                }
                 return Ok(ProviderResponse {
                     content: None,
                     tool_calls: vec![],
@@ -495,44 +554,46 @@ async fn setup_test_agent_internal(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let mut agent = Agent::new(
+    let mut agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
-        "mock-model".to_string(),                        // model
-        "You are a helpful test assistant.".to_string(), // system_prompt
-        PathBuf::from("config.toml"),                    // config_path
-        skills_dir.path().to_path_buf(),                 // skills_dir
-        3,                                               // max_depth
-        50,                                              // max_iterations
-        100,                                             // max_iterations_cap
-        8000,                                            // max_response_chars
-        30,                                              // timeout_secs
-        20,                                              // max_facts
-        None,                                            // daily_token_budget
-        IterationLimitConfig::Unlimited,
-        None,                      // task_timeout_secs
-        None,                      // task_token_budget
-        llm_call_timeout_secs,     // llm_call_timeout_secs
-        None,                      // mcp_registry
-        Some(goal_token_registry), // goal_token_registry
-        None,                      // hub
-        true,                      // record_decision_points
-        crate::config::ContextWindowConfig {
+        model: "mock-model".to_string(),
+        system_prompt: "You are a helpful test assistant.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs,
+        mcp_registry: None,
+        goal_token_registry: Some(goal_token_registry),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
-        policy_config.unwrap_or_default(),
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        policy_config: policy_config.unwrap_or_default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
 
     if use_test_executor_mode {
         // Set executor mode so integration tests exercise the execution loop directly,
@@ -616,44 +677,46 @@ pub async fn setup_test_agent_with_models_and_policy(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let agent = Agent::new(
+    let agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
-        primary_model.to_string(),
-        "You are a helpful test assistant.".to_string(),
-        PathBuf::from("config.toml"),
-        skills_dir.path().to_path_buf(),
-        3,    // max_depth
-        50,   // max_iterations
-        100,  // max_iterations_cap
-        8000, // max_response_chars
-        30,   // timeout_secs
-        20,   // max_facts
-        None, // daily_token_budget
-        IterationLimitConfig::Unlimited,
-        None,                      // task_timeout_secs
-        None,                      // task_token_budget
-        None,                      // llm_call_timeout_secs
-        None,                      // mcp_registry
-        Some(goal_token_registry), // goal_token_registry
-        None,                      // hub
-        true,                      // record_decision_points
-        crate::config::ContextWindowConfig {
+        model: primary_model.to_string(),
+        system_prompt: "You are a helpful test assistant.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: Some(goal_token_registry),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
         policy_config,
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
     // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
 
     let channel = Arc::new(TestChannel::new());
@@ -706,44 +769,46 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let agent = Agent::new(
+    let agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
-        "primary-model".to_string(),
-        "You are a helpful test assistant.".to_string(),
-        PathBuf::from("config.toml"),
-        skills_dir.path().to_path_buf(),
-        3,    // max_depth
-        50,   // max_iterations
-        100,  // max_iterations_cap
-        8000, // max_response_chars
-        30,   // timeout_secs
-        20,   // max_facts
-        None, // daily_token_budget
-        IterationLimitConfig::Unlimited,
-        None,                      // task_timeout_secs
-        None,                      // task_token_budget
-        None,                      // llm_call_timeout_secs
-        None,                      // mcp_registry
-        Some(goal_token_registry), // goal_token_registry
-        None,                      // hub
-        true,                      // record_decision_points
-        crate::config::ContextWindowConfig {
+        model: "primary-model".to_string(),
+        system_prompt: "You are a helpful test assistant.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: Some(goal_token_registry),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
 
     let channel = Arc::new(TestChannel::new());
 
@@ -963,44 +1028,46 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     );
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
-    let mut agent = Agent::new(
+    let mut agent = Agent::new(crate::agent::AgentConstruction {
         llm_runtime,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state: state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
-        "mock-model".to_string(),
-        "You are a helpful test assistant.".to_string(),
-        PathBuf::from("config.toml"),
-        skills_dir.path().to_path_buf(),
-        3,    // max_depth
-        50,   // max_iterations
-        100,  // max_iterations_cap
-        8000, // max_response_chars
-        30,   // timeout_secs
-        20,   // max_facts
-        None, // daily_token_budget
-        IterationLimitConfig::Unlimited,
-        None,                      // task_timeout_secs
-        None,                      // task_token_budget
-        None,                      // llm_call_timeout_secs
-        None,                      // mcp_registry
-        Some(goal_token_registry), // goal_token_registry
-        None,                      // hub
-        true,                      // record_decision_points
-        crate::config::ContextWindowConfig {
+        model: "mock-model".to_string(),
+        system_prompt: "You are a helpful test assistant.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 30,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: Some(goal_token_registry),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
-        crate::config::PathAliasConfig::default(),
-        None,
-        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
-        None, // interactive_slot — slot routing not exercised in tests
-        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
-        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
-        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
-    );
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
 
     // Set executor mode so tests exercise the execution loop directly
     agent.set_test_executor_mode();

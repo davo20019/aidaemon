@@ -74,10 +74,22 @@ fn test_infer_intent_gate_path_still_forces_tools() {
 
 #[test]
 fn test_user_text_references_filesystem_path_ignores_fractions_and_shorthand() {
-    assert!(!user_text_references_filesystem_path("3/4"));
-    assert!(!user_text_references_filesystem_path("2/14"));
-    assert!(!user_text_references_filesystem_path("yes/no"));
-    assert!(!user_text_references_filesystem_path("w/o"));
+    for prose in [
+        "3/4",
+        "2/14",
+        "yes/no",
+        "w/o",
+        "Pros/cons",
+        "input/output",
+        "client/server",
+        "read/write",
+        "pass/fail",
+    ] {
+        assert!(
+            !user_text_references_filesystem_path(prose),
+            "unanchored prose compound became a filesystem reference: {prose}"
+        );
+    }
 }
 
 #[test]
@@ -307,7 +319,8 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
 
     let (label, suggestion) = Agent::classify_stall(&learning_ctx);
     assert_eq!(label, "Deferred No-Tool Loop");
-    assert!(suggestion.contains("rephrasing"));
+    assert!(suggestion.contains("Automatic tool and model recovery"));
+    assert!(!suggestion.contains('?'));
 }
 
 #[test]

@@ -454,26 +454,16 @@ impl Tool for ManageGoalTasksTool {
 /// Check if all dependencies for a task are completed. Returns Ok(()) if all are met,
 /// or an error message string describing which dependencies are unmet.
 async fn check_dependencies_met(state: &dyn StateStore, task: &Task) -> Result<(), String> {
-    if let Some(ref deps_json) = task.depends_on {
-        let dep_ids = serde_json::from_str::<Vec<String>>(deps_json)
-            .map_err(|_| "dependency metadata is invalid".to_string())?;
-        for dep_id in &dep_ids {
-            match state.get_task(dep_id).await {
-                Ok(Some(dep_task))
-                    if matches!(
-                        dep_task.status.as_str(),
-                        "completed" | "skipped" | "superseded"
-                    ) => {}
-                Ok(Some(dep_task)) => {
-                    return Err(format!(
-                        "dependency {} is not completed or otherwise accepted (status: {})",
-                        dep_id, dep_task.status
-                    ));
-                }
-                Ok(None) => return Err(format!("dependency {} does not exist", dep_id)),
-                Err(error) => return Err(format!("could not read dependency {dep_id}: {error}")),
-            }
-        }
+    let tasks = state
+        .get_tasks_for_goal(&task.goal_id)
+        .await
+        .map_err(|error| format!("could not read task dependency graph: {error}"))?;
+    let graph = crate::traits::task_execution_graph(&tasks)?;
+    if let Some(dependency) = graph.unresolved_dependencies(&task.id).first() {
+        return Err(format!(
+            "dependency {} is not completed or otherwise accepted (state: {:?})",
+            dependency.id, dependency.state
+        ));
     }
     Ok(())
 }
@@ -499,79 +489,30 @@ fn compress_old_entries(entries: &mut [Value]) {
 }
 
 /// Validate that adding a new task with the given dependencies won't create a cycle.
-/// Uses Kahn's algorithm (topological sort) on the task dependency graph.
+/// Uses the shared typed execution graph so scheduling and validation enforce
+/// the same dependency and cycle invariants.
 fn validate_no_cycles(
     existing: &[Task],
     new_task_id: &str,
     new_deps: &[String],
 ) -> Result<(), String> {
-    use std::collections::{HashMap, HashSet, VecDeque};
-
-    // Build adjacency list: task_id -> set of tasks it depends on (owned strings)
-    let mut deps_map: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut all_ids: HashSet<String> = HashSet::new();
-
-    for task in existing {
-        all_ids.insert(task.id.clone());
-        if let Some(ref deps_json) = task.depends_on {
-            if let Ok(dep_ids) = serde_json::from_str::<Vec<String>>(deps_json) {
-                deps_map.insert(task.id.clone(), dep_ids.into_iter().collect());
-            }
-        }
-    }
-
-    // Add the new task
-    all_ids.insert(new_task_id.to_string());
-    let new_dep_set: HashSet<String> = new_deps.iter().cloned().collect();
-
-    // Verify all dependencies reference existing tasks within this goal
-    for dep in &new_dep_set {
-        if !all_ids.contains(dep) {
-            return Err(format!("Dependency {} does not exist in this goal", dep));
-        }
-    }
-
-    deps_map.insert(new_task_id.to_string(), new_dep_set);
-
-    // Kahn's algorithm: compute in-degree, then peel off zero-degree nodes
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    for id in &all_ids {
-        in_degree.insert(id.clone(), 0);
-    }
-
-    // in-degree of task_id = number of deps it has
-    for (task_id, deps) in &deps_map {
-        *in_degree.entry(task_id.clone()).or_insert(0) += deps.len();
-    }
-
-    let mut queue: VecDeque<String> = VecDeque::new();
-    for (id, &degree) in &in_degree {
-        if degree == 0 {
-            queue.push_back(id.clone());
-        }
-    }
-
-    let mut processed = 0usize;
-    while let Some(node) = queue.pop_front() {
-        processed += 1;
-        // Find all tasks that depend on this node and reduce their in-degree
-        for (task_id, deps) in &deps_map {
-            if deps.contains(&node) {
-                if let Some(deg) = in_degree.get_mut(task_id) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(task_id.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    if processed < all_ids.len() {
-        Err("Dependency cycle detected — cannot create task".to_string())
-    } else {
-        Ok(())
-    }
+    let Some(template) = existing.first() else {
+        return if new_deps.is_empty() {
+            Ok(())
+        } else {
+            Err("Dependencies cannot be added before their tasks exist".to_string())
+        };
+    };
+    let mut tasks = existing.to_vec();
+    let mut candidate = template.clone();
+    candidate.id = new_task_id.to_string();
+    candidate.status = "pending".to_string();
+    candidate.depends_on = Some(
+        serde_json::to_string(new_deps)
+            .map_err(|error| format!("Could not encode dependencies: {error}"))?,
+    );
+    tasks.push(candidate);
+    crate::traits::task_execution_graph(&tasks).map(|_| ())
 }
 
 impl ManageGoalTasksTool {
@@ -1148,12 +1089,6 @@ impl ManageGoalTasksTool {
             .summary
             .as_deref()
             .unwrap_or("Goal completed successfully");
-        if goal_completion_summary_indicates_not_finished(summary) {
-            return Ok(
-                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") when the summary says verification is still pending or only partial progress is done. Keep the goal active, finish the final read-only check, then complete it; or use fail_goal if the work cannot be finished."
-                    .to_string(),
-            );
-        }
 
         let tasks = self.scoped_tasks().await?;
         if tasks.is_empty() {
@@ -2129,26 +2064,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_goal_blocks_verification_pending_summary() {
+    async fn test_complete_goal_uses_task_state_not_summary_wording() {
         let (state, goal_id) = setup_test_state().await;
         let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Verify the synthetic target"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let task = state.get_tasks_for_goal(&goal_id).await.unwrap().remove(0);
+        tool.call(
+            &json!({
+                "action": "update_task",
+                "task_id": task.id,
+                "status": "completed",
+                "result": "Structured verification receipt recorded"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
 
         let result = tool
             .call(
                 &json!({
                     "action": "complete_goal",
-                    "summary": "I completed part of the request, but I haven't verified the final outcome against /Users/davidloor/Library/Logs/aidaemon yet.\n\nI need a final read-only check before I can claim success."
+                    "summary": "The documentation explains that partially completed runs say verification pending."
                 })
                 .to_string(),
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Blocked:"));
+        assert!(
+            result.contains(" completed:"),
+            "unexpected result: {result}"
+        );
 
         let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
-        assert_eq!(goal.status, "active");
-        assert!(goal.completed_at.is_none());
+        assert_eq!(goal.status, "completed");
+        assert!(goal.completed_at.is_some());
     }
 
     #[tokio::test]

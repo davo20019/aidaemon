@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::execution::active_execution_backend;
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
+};
 
 use super::fs_utils;
 
@@ -57,6 +59,20 @@ impl Tool for GitCommitTool {
             idempotent: false,
             high_impact_write: true,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| ".".to_string());
+        ToolCallSemantics::mutation_with(ToolMutationEffects::REPOSITORY_WRITE)
+            .with_target_hint(ToolTargetHintKind::ProjectScope, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

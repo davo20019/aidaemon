@@ -1045,6 +1045,14 @@ mod tests {
         assert!(health_output.contains("recently_connected"));
         assert!(health_output.contains("aidaemon.runtime.recovery.v1"));
         assert!(health_output.contains("test_restart"));
+        assert!(health_output.contains("reported_capabilities"));
+        assert!(health_output.contains("output.audio"));
+        assert!(health_output.contains("current_authorizations"));
+        assert!(health_output.contains("receive_audio"));
+        assert!(
+            !health_output.contains("output.audio.volume"),
+            "the capability snapshot must not invent an unreported volume control"
+        );
         let events = simulator.text_turn("hello").await.unwrap();
         assert!(events
             .iter()

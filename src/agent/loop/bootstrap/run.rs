@@ -1,7 +1,6 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::agent::recall_guardrails::{
     looks_like_personal_memory_recall_question, user_is_reaffirmation_challenge,
-    user_requests_external_verification,
 };
 use crate::agent::*;
 
@@ -212,9 +211,7 @@ async fn build_isolated_mandate_bootstrap(
         resume_execution_snapshot: None,
         emitter,
         learning_ctx,
-        is_personal_memory_recall_turn: false,
         is_reaffirmation_challenge_turn: false,
-        requests_external_verification: false,
         restrict_to_personal_memory_tools: false,
         active_skill_names,
         active_untrusted_external_reference_skills: Vec::new(),
@@ -370,6 +367,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         importance: 0.5, // Will be updated by score_message below
         turn_id: Some(user_msg_id.clone()),
         attachments: ctx.attachments.to_vec(),
+        annotations: ctx
+            .internal_continuation
+            .then_some(crate::traits::MessageAnnotation::InternalContinuation)
+            .into_iter()
+            .collect(),
         ..Message::new_runtime(user_msg_id.clone(), session_id, "user")
     };
     // Calculate heuristic score immediately
@@ -507,7 +509,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             }
         }
     }
-    let requests_external_verification = user_requests_external_verification(user_text);
     // Bootstrap tool exposure happens before per-task model selection. Use the
     // runtime primary model's trust tier to decide whether policy filtering is
     // merely observed or may narrow the roster.
@@ -516,17 +517,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let llm_router = llm_runtime_snapshot.router();
     let autonomous_bootstrap = agent.trust_tier_for_model(&llm_runtime_snapshot.primary_model())
         == crate::agent::trust_tier::ModelTrustTier::Autonomous;
-    let skills_snapshot = agent.skill_cache.get();
-    let active_untrusted_external_reference_skills =
-        matched_untrusted_external_reference_skill_names(
-            &skills_snapshot,
-            user_text,
-            user_role,
-            channel_ctx.visibility,
-        );
-    let restrict_untrusted_external_reference_tools = !active_untrusted_external_reference_skills
-        .is_empty()
-        && !user_explicitly_requests_local_file_inspection(user_text);
     let restrict_to_personal_memory_tools = false;
     let personal_memory_tool_call_cap = 4;
 
@@ -615,22 +605,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                     "filtered",
                 ));
             }
-        }
-
-        if restrict_untrusted_external_reference_tools {
-            let before = defs.len();
-            defs = filter_tool_defs_for_untrusted_external_reference(&defs);
-            caps.retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
-            tool_filter_stages.push(GateFilterStage::new(
-                "untrusted_external_reference",
-                before,
-                defs.len(),
-                if before == defs.len() {
-                    "passed"
-                } else {
-                    "filtered"
-                },
-            ));
         }
 
         if correction_mode {
@@ -732,48 +706,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             ));
         }
     }
-
-    if restrict_untrusted_external_reference_tools {
-        let before = tool_defs.len();
-        tool_defs = filter_tool_defs_for_untrusted_external_reference(&tool_defs);
-        tool_filter_stages.push(GateFilterStage::new(
-            "untrusted_external_reference_final",
-            before,
-            tool_defs.len(),
-            if before == tool_defs.len() {
-                "passed"
-            } else {
-                "filtered"
-            },
-        ));
-        let before_base = base_tool_defs.len();
-        base_tool_defs = filter_tool_defs_for_untrusted_external_reference(&base_tool_defs);
-        tool_filter_stages.push(GateFilterStage::new(
-            "untrusted_external_reference_base_final",
-            before_base,
-            base_tool_defs.len(),
-            if before_base == base_tool_defs.len() {
-                "passed"
-            } else {
-                "filtered"
-            },
-        ));
-        available_capabilities
-            .retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
-    }
-
-    let (tool_filter_summary, tool_filter_metadata) =
-        build_tool_filter_gate_telemetry(&tool_filter_stages, initial_tool_count, tool_defs.len());
-    agent
-        .emit_decision_point(
-            &emitter,
-            &task_id,
-            0,
-            DecisionType::GateTelemetry,
-            tool_filter_summary,
-            tool_filter_metadata,
-        )
-        .await;
 
     // Provider + router came from the same runtime snapshot above, keeping
     // this task internally consistent even if runtime configuration reloads.
@@ -967,7 +899,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // reuses this exact snapshot so instruction scope cannot drift between the
     // prompt AIDaemon saw and the filesystem scope its tools enforce.
     let turn_context = agent
-        .build_turn_context_from_recent_history(session_id, user_text)
+        .build_turn_context_from_recent_history_with_origin(
+            session_id,
+            user_text,
+            ctx.internal_continuation,
+        )
         .await;
     let project_instruction_scope = if turn_context.allow_multi_project_scope {
         // A single instruction hierarchy must not silently govern an explicit
@@ -1011,6 +947,51 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             )
             .await?;
 
+    // An external-reference skill may narrow the roster only after it is the
+    // final activated skill. Raw trigger matches are merely semantic
+    // candidates and cannot independently remove tools.
+    let skills_snapshot = agent.skill_cache.get();
+    let active_untrusted_external_reference_skills: Vec<String> = skills_snapshot
+        .iter()
+        .filter(|skill| {
+            active_skill_names.iter().any(|name| name == &skill.name)
+                && crate::skills::is_untrusted_external_reference_skill(skill)
+        })
+        .map(|skill| skill.name.clone())
+        .collect();
+    let restrict_untrusted_external_reference_tools =
+        !active_untrusted_external_reference_skills.is_empty();
+    if restrict_untrusted_external_reference_tools {
+        let before = tool_defs.len();
+        tool_defs = filter_tool_defs_for_untrusted_external_reference(&tool_defs);
+        tool_filter_stages.push(GateFilterStage::new(
+            "active_untrusted_external_reference",
+            before,
+            tool_defs.len(),
+            if before == tool_defs.len() {
+                "passed"
+            } else {
+                "filtered"
+            },
+        ));
+        base_tool_defs = filter_tool_defs_for_untrusted_external_reference(&base_tool_defs);
+        available_capabilities
+            .retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
+    }
+
+    let (tool_filter_summary, tool_filter_metadata) =
+        build_tool_filter_gate_telemetry(&tool_filter_stages, initial_tool_count, tool_defs.len());
+    agent
+        .emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::GateTelemetry,
+            tool_filter_summary,
+            tool_filter_metadata,
+        )
+        .await;
+
     // Pillar B (Task 7): historical conversation retention is now owned
     // entirely by the turn-anchored fetch in `message_build_phase`
     // (`get_turns_from_anchor`). The old `load_initial_history` + pinned/recent
@@ -1043,9 +1024,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
         emitter,
         learning_ctx,
-        is_personal_memory_recall_turn,
         is_reaffirmation_challenge_turn,
-        requests_external_verification,
         restrict_to_personal_memory_tools,
         active_skill_names,
         active_untrusted_external_reference_skills,
@@ -1133,6 +1112,7 @@ mod mandate_bootstrap_isolation_tests {
                 status_tx: None,
                 user_role: UserRole::Owner,
                 channel_ctx: &ChannelContext::internal(),
+                internal_continuation: false,
             },
         )
         .await

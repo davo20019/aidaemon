@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 
 use crate::execution::{active_execution_backend, WriteMode};
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
+    DurableReplayDecision, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolRole, ToolTargetHintKind,
 };
 
 use super::fs_utils;
@@ -211,6 +212,130 @@ impl Tool for WriteFileTool {
             "{} {}\n{} bytes, {} lines{}{}",
             action, path_str, new_size, line_count, size_info, diagnostics
         ))
+    }
+
+    async fn durable_replay_decision(&self, arguments: &str) -> DurableReplayDecision {
+        let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+            return DurableReplayDecision::Replay;
+        };
+        // Appending the same bytes twice is not safe. Keep the durable receipt
+        // authoritative for append calls; callers must issue a new operation.
+        if args["mode"].as_str().unwrap_or("overwrite") != "overwrite" {
+            return DurableReplayDecision::Replay;
+        }
+        let Some(path_str) = args["path"]
+            .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .or_else(|| args["file"].as_str())
+            .or_else(|| args["filename"].as_str())
+        else {
+            return DurableReplayDecision::Replay;
+        };
+        let Some(content) = args["content"]
+            .as_str()
+            .or_else(|| args["data"].as_str())
+            .or_else(|| args["text"].as_str())
+        else {
+            return DurableReplayDecision::Replay;
+        };
+
+        let backend = active_execution_backend();
+        let path = match backend.resolve_path(path_str).await {
+            Ok(path) => path,
+            Err(error) => {
+                return DurableReplayDecision::Block {
+                    reason: format!(
+                        "the prior file-write target can no longer be resolved safely: {error}"
+                    ),
+                }
+            }
+        };
+        match backend.read(&path).await {
+            Ok(current) if current == content.as_bytes() => DurableReplayDecision::Replay,
+            Ok(_) => DurableReplayDecision::Block {
+                reason: format!(
+                    "the file at {path_str} exists but no longer matches the successful write receipt; inspect and reconcile the current content before overwriting it"
+                ),
+            },
+            Err(read_error) => {
+                let Some(parent) = path.parent() else {
+                    return DurableReplayDecision::Block {
+                        reason: format!(
+                            "the prior file-write target could not be inspected: {read_error}"
+                        ),
+                    };
+                };
+                match backend.read_dir(&parent).await {
+                    Ok(entries) if entries.iter().all(|entry| entry.path != path) => {
+                        DurableReplayDecision::Reexecute {
+                            reason: format!(
+                                "the exact overwrite target {path_str} is absent, so the prior successful receipt no longer satisfies current state"
+                            ),
+                        }
+                    }
+                    Ok(_) => DurableReplayDecision::Block {
+                        reason: format!(
+                            "the file at {path_str} still exists but could not be read; refusing to overwrite unreconciled current state"
+                        ),
+                    },
+                    Err(parent_error) => DurableReplayDecision::Block {
+                        reason: format!(
+                            "the prior file-write target and its parent could not be inspected safely: {read_error}; {parent_error}"
+                        ),
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod durable_replay_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn overwrite_receipt_reconciles_exact_current_file_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.md");
+        let arguments = json!({
+            "path": path.to_string_lossy(),
+            "content": "expected content\n"
+        })
+        .to_string();
+        let tool = WriteFileTool;
+
+        assert!(matches!(
+            tool.durable_replay_decision(&arguments).await,
+            DurableReplayDecision::Reexecute { .. }
+        ));
+
+        std::fs::write(&path, "expected content\n").unwrap();
+        assert_eq!(
+            tool.durable_replay_decision(&arguments).await,
+            DurableReplayDecision::Replay
+        );
+
+        std::fs::write(&path, "concurrent content\n").unwrap();
+        assert!(matches!(
+            tool.durable_replay_decision(&arguments).await,
+            DurableReplayDecision::Block { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_receipt_is_never_automatically_reexecuted() {
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = json!({
+            "path": directory.path().join("result.md").to_string_lossy(),
+            "content": "one chunk\n",
+            "mode": "append"
+        })
+        .to_string();
+
+        assert_eq!(
+            WriteFileTool.durable_replay_decision(&arguments).await,
+            DurableReplayDecision::Replay
+        );
     }
 }
 

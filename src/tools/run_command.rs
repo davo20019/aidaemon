@@ -120,7 +120,7 @@ impl Tool for RunCommandTool {
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Working directory (default: current directory)"
+                        "description": "Working directory (default: configured execution workspace root)"
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -206,12 +206,27 @@ impl Tool for RunCommandTool {
 
         let backend = active_execution_backend();
         let dir = if let Some(d) = working_dir {
-            Some(backend.resolve_path(d).await?)
+            backend.resolve_path(d).await?
         } else {
-            None
+            backend.workspace_root().clone()
         };
 
-        let result = fs_utils::run_cmd_backend(trimmed, dir.as_ref(), timeout).await?;
+        // Fail early with an actionable workspace error. Letting a Git command
+        // run from an accidental daemon launch directory (frequently `/` for a
+        // service) produces a misleading generic exit 128 and invites the model
+        // to guess at repository state.
+        if trimmed == "git" || trimmed.starts_with("git ") {
+            let preflight =
+                fs_utils::run_cmd_backend("git rev-parse --show-toplevel", Some(&dir), 5).await?;
+            if preflight.exit_code != 0 {
+                anyhow::bail!(
+                    "Git preflight failed: execution directory '{}' is not inside a repository. Configure execution.workspace_root or pass working_dir explicitly.",
+                    dir
+                );
+            }
+        }
+
+        let result = fs_utils::run_cmd_backend(trimmed, Some(&dir), timeout).await?;
 
         format_output(&result, trimmed, parse_format)
     }
@@ -419,6 +434,28 @@ mod tests {
         let args = json!({"command": "ls"}).to_string();
         let result = RunCommandTool.call(&args).await.unwrap();
         assert!(result.contains("exit: 0"));
+    }
+
+    #[tokio::test]
+    async fn git_command_defaults_to_the_execution_workspace() {
+        let args = json!({"command": "git status --short --branch"}).to_string();
+        let result = RunCommandTool.call(&args).await.unwrap();
+        assert!(result.contains("exit: 0"));
+        assert!(result.contains("## "));
+    }
+
+    #[tokio::test]
+    async fn git_command_preflight_explains_a_non_repository_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({
+            "command": "git status --short --branch",
+            "working_dir": dir.path().to_str().unwrap()
+        })
+        .to_string();
+
+        let error = RunCommandTool.call(&args).await.unwrap_err().to_string();
+        assert!(error.contains("Git preflight failed"));
+        assert!(error.contains("execution.workspace_root"));
     }
 
     #[tokio::test]

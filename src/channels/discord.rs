@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serenity::all::{
@@ -20,12 +20,12 @@ use tracing::{debug, info, warn};
 use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{build_help_text, sanitize_filename, split_message};
-use crate::agent::Agent;
-use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
+use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
 use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// Commands available in the Discord channel (shared Core only).
@@ -53,7 +53,7 @@ pub struct DiscordChannel {
     /// Discord user IDs recognized as owners (from `users.owner_ids.discord`).
     owner_user_ids: Vec<u64>,
     guild_id: Option<u64>,
-    agent: Arc<Agent>,
+    agent: Arc<dyn ChannelAgentRuntime>,
     config_path: PathBuf,
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
     session_map: SessionMap,
@@ -68,26 +68,15 @@ pub struct DiscordChannel {
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
-    /// Daemon start time used for post-restart UX guardrails.
-    started_at: Instant,
 }
 
 impl DiscordChannel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
         owner_user_ids: Vec<u64>,
         guild_id: Option<u64>,
-        agent: Arc<Agent>,
-        config_path: PathBuf,
-        session_map: SessionMap,
-        task_registry: Arc<TaskRegistry>,
-        files_enabled: bool,
-        inbox_dir: PathBuf,
-        max_file_size_mb: u64,
-        state: Arc<dyn StateStore>,
-        watchdog_stale_threshold_secs: u64,
+        runtime: ChannelRuntimeDeps,
     ) -> Self {
         Self {
             bot_username: std::sync::RwLock::new("discord".to_string()),
@@ -95,19 +84,18 @@ impl DiscordChannel {
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids,
             guild_id,
-            agent,
-            config_path,
+            agent: runtime.agent,
+            config_path: runtime.config_path,
             pending_approvals: Mutex::new(HashMap::new()),
-            session_map,
-            task_registry,
-            files_enabled,
-            inbox_dir,
-            max_file_size_mb,
-            state,
+            session_map: runtime.session_map,
+            task_registry: runtime.task_registry,
+            files_enabled: runtime.files_enabled,
+            inbox_dir: runtime.inbox_dir,
+            max_file_size_mb: runtime.max_file_size_mb,
+            state: runtime.state,
             http: Mutex::new(None),
             channel_hub: std::sync::RwLock::new(None),
-            watchdog_stale_threshold_secs,
-            started_at: Instant::now(),
+            watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
         }
     }
 
@@ -355,12 +343,11 @@ impl DiscordChannel {
                     continue;
                 }
                 let now = tokio::time::Instant::now();
-                // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
-                // and for BudgetExtended (cost notifications should always be delivered)
-                let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
-                    if chunk.contains("https://") || chunk.contains("http://"));
-                let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
-                if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
+                // Explicit user actions and BudgetExtended notifications bypass
+                // rate limiting. URLs in task descriptions do not change the
+                // delivery semantics of ordinary progress.
+                let is_immediate = update.requires_immediate_delivery();
+                if !is_immediate && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -378,17 +365,14 @@ impl DiscordChannel {
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {
-                        if chunk.contains("https://") || chunk.contains("http://") {
-                            format!("📤 {}\n{}", name, chunk)
+                        let preview: String = chunk.chars().take(100).collect();
+                        if chunk.chars().count() > 100 {
+                            format!("📤 {}: {}...", name, preview)
                         } else {
-                            let preview: String = chunk.chars().take(100).collect();
-                            if chunk.len() > 100 {
-                                format!("📤 {}: {}...", name, preview)
-                            } else {
-                                format!("📤 {}: {}", name, chunk)
-                            }
+                            format!("📤 {}: {}", name, preview)
                         }
                     }
+                    StatusUpdate::UserActionRequired { message } => message.clone(),
                     StatusUpdate::ToolComplete { name, summary } => {
                         format!("✓ {}: {}", name, summary)
                     }
@@ -704,27 +688,6 @@ impl DiscordChannel {
 
         // Check if a task is already running for this session - if so, queue this message.
         if self.task_registry.has_running_task(&session_id).await {
-            let daemon_uptime = self.started_at.elapsed();
-            if should_ignore_lightweight_interjection(&text, daemon_uptime) {
-                let current_task = self
-                    .task_registry
-                    .get_running_task_description(&session_id)
-                    .await
-                    .unwrap_or_else(|| "processing".to_string());
-                let _ = msg
-                    .channel_id
-                    .say(
-                        &ctx.http,
-                        format!(
-                            "⏳ Still working on: {}. I ignored that short check-in. \
-                             Send `cancel` to stop the current task.",
-                            current_task
-                        ),
-                    )
-                    .await;
-                return;
-            }
-
             // Atomic check-and-queue: if the task finished between the
             // has_running_task() check above and this call, fall through to
             // direct processing instead of stranding the message.
@@ -845,15 +808,15 @@ impl DiscordChannel {
 
             loop {
                 let result = tokio::select! {
-                    r = agent.handle_message_with_attachments(
-                        &session_id,
-                        &current_text,
-                        &current_attachments,
-                        Some(current_status_tx.clone()),
-                        current_user_role,
-                        current_channel_ctx.clone(),
-                        Some(current_heartbeat.clone()),
-                    ) => r,
+                    r = agent.handle_inbound_message(InboundMessageRequest {
+                        session_id: session_id.clone(),
+                        user_text: current_text.clone(),
+                        attachments: current_attachments.clone(),
+                        status_tx: Some(current_status_tx.clone()),
+                        user_role: current_user_role,
+                        channel_ctx: current_channel_ctx.clone(),
+                        heartbeat: Some(current_heartbeat.clone()),
+                    }) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 8), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -1130,24 +1093,48 @@ impl DiscordChannel {
 
         let data = &interaction.data.custom_id;
         let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3 || parts[0] != "approve" {
+        if parts.len() != 3 || !matches!(parts[0], "approve" | "goal" | "autopilot") {
             return;
         }
 
+        let prefix = parts[0];
         let action = parts[1];
         let approval_id = parts[2];
 
-        let response = match action {
-            "once" => ApprovalResponse::AllowOnce,
-            "session" => ApprovalResponse::AllowSession,
-            "always" => ApprovalResponse::AllowAlways,
-            "deny" => ApprovalResponse::Deny,
-            _ => return,
+        let response = if matches!(prefix, "goal" | "autopilot") {
+            match action {
+                "confirm" => ApprovalResponse::AllowOnce,
+                "cancel" | "edit" => ApprovalResponse::Deny,
+                _ => return,
+            }
+        } else {
+            match action {
+                "once" => ApprovalResponse::AllowOnce,
+                "session" => ApprovalResponse::AllowSession,
+                "always" => ApprovalResponse::AllowAlways,
+                "deny" => ApprovalResponse::Deny,
+                _ => return,
+            }
         };
 
         // Acknowledge the interaction and update the message to remove buttons
         let original_content = interaction.message.content.clone();
-        let updated = approval_render::finalize_approval_message(&original_content, &response);
+        let updated = if matches!(prefix, "goal" | "autopilot") {
+            let status = match (prefix, action, &response) {
+                ("autopilot", "edit", _) => {
+                    "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
+                }
+                ("autopilot", _, ApprovalResponse::Deny) => {
+                    "❌ Autopilot cancelled\nNo new autonomy was activated."
+                }
+                ("autopilot", _, _) => "✅ Autopilot enabled\nActivation is continuing now.",
+                (_, _, ApprovalResponse::Deny) => "❌ Goal cancelled\nNothing was activated.",
+                _ => "✅ Goal approved\nActivation is continuing now.",
+            };
+            format!("{}\n\n{status}", original_content.trim_end())
+        } else {
+            approval_render::finalize_approval_message(&original_content, &response)
+        };
 
         // Send the response
         {
@@ -1401,6 +1388,75 @@ impl Channel for DiscordChannel {
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Err(anyhow::anyhow!("Discord approval request timed out"))
+            }
+        }
+    }
+
+    async fn request_goal_confirmation(
+        &self,
+        session_id: &str,
+        goal_description: &str,
+        details: &[String],
+        style: GoalConfirmationStyle,
+    ) -> anyhow::Result<bool> {
+        let http = self.get_http().await?;
+        let channel_id = self.resolve_channel_id(session_id).await?;
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), response_tx);
+
+        let pages =
+            approval_render::build_goal_confirmation_pages(goal_description, details, style);
+        let prefix = match style {
+            GoalConfirmationStyle::Standard => "goal",
+            GoalConfirmationStyle::Autopilot => "autopilot",
+        };
+        let approve_label = match style {
+            GoalConfirmationStyle::Standard => "Approve goal",
+            GoalConfirmationStyle::Autopilot => "Enable Autopilot",
+        };
+        let page_count = pages.len();
+        for (index, text) in pages.iter().enumerate() {
+            let mut message = CreateMessage::new().content(text);
+            if index + 1 == page_count {
+                let mut buttons =
+                    vec![CreateButton::new(format!("{prefix}:confirm:{approval_id}"))
+                        .label(approve_label)
+                        .style(ButtonStyle::Primary)];
+                if matches!(style, GoalConfirmationStyle::Autopilot) {
+                    buttons.push(
+                        CreateButton::new(format!("{prefix}:edit:{approval_id}"))
+                            .label("Edit permissions")
+                            .style(ButtonStyle::Secondary),
+                    );
+                }
+                buttons.push(
+                    CreateButton::new(format!("{prefix}:cancel:{approval_id}"))
+                        .label("Cancel")
+                        .style(ButtonStyle::Danger),
+                );
+                message = message.components(vec![CreateActionRow::Buttons(buttons)]);
+            }
+            if let Err(error) = channel_id.send_message(&http, message).await {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(anyhow::anyhow!(
+                    "Discord goal confirmation could not be delivered: {error}"
+                ));
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(1800), response_rx).await {
+            Ok(Ok(response)) => Ok(!matches!(response, ApprovalResponse::Deny)),
+            Ok(Err(_)) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!("Discord goal confirmation channel closed"))
+            }
+            Err(_) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!("Discord goal confirmation timed out"))
             }
         }
     }

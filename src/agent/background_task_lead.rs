@@ -23,9 +23,10 @@ use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
     extract_file_paths_from_text, goal_has_scheduled_provenance, is_goal_run_root_task_description,
-    is_group_session, is_low_signal_task_lead_reply, parse_goal_leading_wait,
-    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
-    truncate_goal_result_text, user_facing_task_description, Agent,
+    is_group_session, parse_goal_leading_wait, parse_wait_task_seconds,
+    persist_scheduled_run_state, strip_leading_wait, truncate_goal_result_text,
+    user_facing_task_description, Agent, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+    SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
 
 /// Progress-heartbeat wait schedule: quick early updates, then exponential
@@ -61,26 +62,72 @@ fn task_failed_only_due_to_provider_infrastructure(task: &crate::traits::Task) -
 
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
     let mut scopes = Vec::new();
-    super::project_scope::extract_positive_explicit_path_scopes_from_text(
+    super::project_scope::extract_explicit_path_scopes_from_text(
         mission,
         &mut scopes,
         8,
         alias_roots,
     );
-    // Scheduled missions are often phrased with a repository nickname rather
-    // than an absolute path (for example, "the blog repository"). Resolve that
-    // name deterministically inside configured project roots instead of letting
-    // a delegated CLI agent escape to any directory that merely looks like a
-    // project. An explicit positive path always wins.
-    if scopes.is_empty() {
-        super::project_scope::extract_project_scopes_from_text(
-            mission,
-            &mut scopes,
-            8,
-            alias_roots,
-        );
+    scopes.sort();
+    scopes.dedup();
+    // Multiple distinct exact paths are an ambiguous authority boundary. Do
+    // not parse nearby negation words to guess which one is writable, and do
+    // not widen them to a common ancestor. A persisted typed workspace is
+    // required for cross-project scheduled work.
+    if scopes.len() > 1 {
+        return None;
     }
-    super::project_scope::unify_current_turn_scopes(&scopes)
+    if let Some(scope) = scopes.pop() {
+        return Some(scope);
+    }
+    // A public site URL is also durable target identity when its hostname is
+    // the exact name of a local project root. Scheduled missions commonly
+    // carry the URL but no filesystem path. Resolve that exact identity;
+    // otherwise recovery can inherit an empty synthetic task directory even
+    // though the authorized repository is locally available under the same
+    // hostname.
+    if scopes.is_empty() {
+        for raw in mission.split_whitespace() {
+            let candidate = raw.trim_matches(|ch: char| {
+                ch.is_ascii_whitespace()
+                    || matches!(
+                        ch,
+                        '`' | '\''
+                            | '"'
+                            | ','
+                            | ';'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+            });
+            let Ok(url) = reqwest::Url::parse(candidate) else {
+                continue;
+            };
+            if !matches!(url.scheme(), "http" | "https") {
+                continue;
+            }
+            let Some(host) = url.host_str() else {
+                continue;
+            };
+            let host = host.strip_prefix("www.").unwrap_or(host);
+            if let Some(scope) =
+                crate::tools::fs_utils::resolve_named_project_root(host, alias_roots)
+            {
+                super::project_scope::push_project_scope(
+                    &mut scopes,
+                    scope.to_string_lossy().to_string(),
+                    8,
+                );
+            }
+        }
+    }
+    scopes.into_iter().next()
 }
 
 fn sqlite_busy_code(value: &str) -> bool {
@@ -429,11 +476,15 @@ async fn execute_auto_dispatch_task(
 async fn deliver_auto_dispatch_result(
     agent: &Arc<Agent>,
     state: &Arc<dyn crate::traits::StateStore>,
-    hub: Option<&Weak<crate::channels::ChannelHub>>,
+    hub: Option<&Weak<dyn crate::runtime_ports::OutboundRouter>>,
     session_id: &str,
     task: &crate::traits::Task,
     result: &anyhow::Result<String>,
+    owner_visible: bool,
 ) -> bool {
+    if !owner_visible {
+        return false;
+    }
     let Ok(response) = result else {
         return false;
     };
@@ -507,26 +558,82 @@ enum RecurringRunTerminalOutcome {
     Failed,
 }
 
-fn recurring_run_terminal_outcome(
-    trigger_status: Option<&str>,
-) -> Option<RecurringRunTerminalOutcome> {
-    match trigger_status {
+fn recurring_run_terminal_outcome(run_status: Option<&str>) -> Option<RecurringRunTerminalOutcome> {
+    match run_status {
         Some("completed") => Some(RecurringRunTerminalOutcome::Completed),
-        Some("failed") => Some(RecurringRunTerminalOutcome::Failed),
+        Some("failed" | "blocked") => Some(RecurringRunTerminalOutcome::Failed),
         _ => None,
     }
 }
 
-fn dispatch_trigger_succeeded(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchTriggerDisposition {
+    Completed,
+    Continuable,
+    Failed,
+}
+
+fn dispatch_trigger_disposition(
     task_lead_succeeded: bool,
     work_tasks: &[crate::traits::Task],
-) -> bool {
+) -> DispatchTriggerDisposition {
     if work_tasks.is_empty() {
-        return task_lead_succeeded;
+        return if task_lead_succeeded {
+            DispatchTriggerDisposition::Completed
+        } else {
+            DispatchTriggerDisposition::Failed
+        };
     }
-    work_tasks
+    if work_tasks.iter().any(|task| {
+        matches!(
+            task.status.as_str(),
+            "failed" | "blocked" | "interrupted" | "cancelled"
+        ) || task
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty())
+            || task
+                .blocker
+                .as_deref()
+                .is_some_and(|blocker| !blocker.trim().is_empty())
+    }) {
+        return DispatchTriggerDisposition::Failed;
+    }
+    if work_tasks
         .iter()
-        .all(|task| task.satisfies_run_completion())
+        .all(crate::traits::Task::satisfies_run_completion)
+    {
+        DispatchTriggerDisposition::Completed
+    } else {
+        // The task lead has durably handed off unfinished work. Its own turn is
+        // complete, while the enclosing goal run stays open for continuation.
+        DispatchTriggerDisposition::Continuable
+    }
+}
+
+fn goal_run_terminal_status(
+    goal_status: &str,
+    trigger_status: Option<&str>,
+    work_tasks: &[crate::traits::Task],
+) -> Option<&'static str> {
+    if work_tasks.iter().any(|task| task.status == "blocked") {
+        Some("blocked")
+    } else if matches!(goal_status, "failed" | "stalled" | "cancelled")
+        || trigger_status == Some("failed")
+        || work_tasks
+            .iter()
+            .any(|task| matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled"))
+    {
+        Some("failed")
+    } else if (goal_status == "completed" || trigger_status == Some("completed"))
+        && work_tasks
+            .iter()
+            .all(crate::traits::Task::satisfies_run_completion)
+    {
+        Some("completed")
+    } else {
+        None
+    }
 }
 
 fn task_lead_semantically_succeeded(
@@ -586,6 +693,59 @@ fn clear_partial_success_context(goal: &mut crate::traits::Goal) {
 fn recovery_task_succeeded(outcome: TaskOutcome, persisted: Option<&crate::traits::Task>) -> bool {
     outcome == TaskOutcome::Succeeded
         && persisted.is_some_and(crate::traits::Task::completed_successfully)
+}
+
+fn is_terminal_recovery_task(task: &crate::traits::Task) -> bool {
+    task.context
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|context| {
+            context
+                .get("terminal_recovery")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+async fn rebind_scheduled_recovery_state(
+    state: &Arc<dyn StateStore>,
+    registry: Option<&crate::goal_tokens::GoalTokenRegistry>,
+    goal_id: &str,
+    recovery_task_id: &str,
+) {
+    if let Some(registry) = registry {
+        if let Some(status) = registry.get_run_budget(goal_id).await {
+            persist_scheduled_run_state(state, goal_id, Some(recovery_task_id), &status).await;
+            return;
+        }
+    }
+
+    // A restart or terminal transition can clear the in-memory registry before
+    // recovery is created. Preserve the persisted counters and health while
+    // rebinding their root (and, via the store upsert, goal_run_id) to the
+    // recovery task's actual run.
+    if let Ok(Some(mut record)) = state.get_scheduled_run_state(goal_id).await {
+        record.root_task_id = recovery_task_id.to_string();
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        let _ = state.upsert_scheduled_run_state(&record).await;
+    }
+}
+
+fn terminal_recovery_eligible(
+    goal_type: &str,
+    goal_status: &str,
+    run_status: Option<&str>,
+    already_notified: bool,
+    tasks: &[crate::traits::Task],
+) -> bool {
+    if tasks.iter().any(is_terminal_recovery_task) {
+        return false;
+    }
+    match goal_type {
+        "finite" => !already_notified && matches!(goal_status, "failed" | "stalled"),
+        "continuous" => matches!(run_status, Some("failed" | "blocked")),
+        _ => false,
+    }
 }
 
 fn failed_run_summary(tasks: &[crate::traits::Task], fallback: Option<&str>) -> String {
@@ -857,11 +1017,15 @@ fn run_completion_should_close_goal(goal_type: &str, all_done: bool) -> bool {
 /// heartbeat into one updating message instead of a stream of pings. Falls back
 /// to a fresh tracked send if the channel can't edit (e.g. the message aged out).
 async fn emit_progress_surface(
-    hub: &Option<Weak<crate::channels::ChannelHub>>,
+    hub: &Option<Weak<dyn crate::runtime_ports::OutboundRouter>>,
     session: &str,
     surface_id: &mut Option<String>,
     text: &str,
 ) {
+    let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+    if !crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour) {
+        return;
+    }
     let Some(hub_arc) = hub.as_ref().and_then(|w| w.upgrade()) else {
         return;
     };
@@ -889,7 +1053,7 @@ pub fn spawn_background_task_lead(
     channel_ctx: ChannelContext,
     user_role: UserRole,
     state: Arc<dyn crate::traits::StateStore>,
-    hub: Option<Weak<crate::channels::ChannelHub>>,
+    hub: Option<Weak<dyn crate::runtime_ports::OutboundRouter>>,
     goal_token_registry: Option<crate::goal_tokens::GoalTokenRegistry>,
     dispatch_trigger_task_id: Option<String>,
     // When the caller already posted a tracked "starting" message (e.g. the
@@ -1052,14 +1216,14 @@ pub fn spawn_background_task_lead(
             // child execution, trigger finalization, and terminal notification.
             // Nested Agent turns must not clear the shared budget when they
             // return, because later siblings still belong to this same cycle.
-            if dispatch_trigger_task_id.is_some()
+            let is_scheduled_run = dispatch_trigger_task_id.is_some()
                 && goal_has_scheduled_provenance(
                     &state,
                     &goal_id,
                     dispatch_trigger_task_id.as_deref(),
                 )
-                .await
-            {
+                .await;
+            if is_scheduled_run {
                 body_finalize_scheduled_run.store(true, Ordering::Release);
             }
 
@@ -1146,7 +1310,7 @@ pub fn spawn_background_task_lead(
                     // notifications; only the static finalizer may surface a
                     // mandate cycle outcome.
                     let _ = heartbeat_cancel_rx.await;
-                    return;
+                    return heartbeat_initial_surface;
                 }
                 let mut interval_count = 0u32;
                 let mut last_progress_key: Option<String> = None;
@@ -1185,7 +1349,7 @@ pub fn spawn_background_task_lead(
                                 &heartbeat_hub,
                                 &heartbeat_session,
                                 &mut surface_id,
-                                "⏳ Still working on your request — planning the steps...",
+                                "⏳ **Scheduled run in progress**\n\nPlanning the steps…",
                             )
                             .await;
                         }
@@ -1219,18 +1383,21 @@ pub fn spawn_background_task_lead(
                             if interval_count < 2 {
                                 continue;
                             }
-                            "⏳ Still working on it...".to_string()
+                            "⏳ **Scheduled run in progress**\n\nWorking…".to_string()
                         } else if !in_progress.is_empty() {
                             format!(
-                                "⏳ Progress: {}/{} steps done — working on: {}",
+                                "⏳ **Scheduled run in progress**\n\n{} of {} steps complete\n\n_Currently: {}_",
                                 completed,
                                 total,
                                 in_progress.join(", ")
                             )
                         } else if completed == total || started > completed {
-                            format!("⏳ Progress: {}/{} steps done", completed, total)
+                            format!(
+                                "⏳ **Scheduled run in progress**\n\n{} of {} steps complete",
+                                completed, total
+                            )
                         } else {
-                            "⏳ Still working on your request...".to_string()
+                            "⏳ **Scheduled run in progress**\n\nWorking…".to_string()
                         };
 
                         // Dedup key uses only completed|total so we don't spam when
@@ -1256,6 +1423,7 @@ pub fn spawn_background_task_lead(
                         .await;
                     }
                 }
+                surface_id
             });
 
             // Intercept pure wait/sleep goals to avoid spawning a full LLM task lead
@@ -1278,7 +1446,7 @@ pub fn spawn_background_task_lead(
                     if remainder.is_empty() {
                         // Pure wait goal with nothing after — mark complete, skip LLM entirely.
                         let _ = heartbeat_cancel_tx.send(());
-                        let _ = heartbeat_handle.await;
+                        let terminal_surface_id = heartbeat_handle.await.ok().flatten();
                         let _ = keepalive_cancel_tx.send(());
                         let _ = keepalive_handle.await;
                         let now = chrono::Utc::now().to_rfc3339();
@@ -1345,9 +1513,10 @@ pub fn spawn_background_task_lead(
                         }
 
                         if let Err(err) = agent
-                            .deliver_parent_text_result(
+                            .deliver_parent_text_result_to_surface(
                                 hub.as_ref(),
                                 &session_id,
+                                terminal_surface_id.as_deref(),
                                 &msg,
                                 parent_delivery::ParentDeliveryKind::WaitResult,
                             )
@@ -1455,8 +1624,6 @@ pub fn spawn_background_task_lead(
             // is therefore unavailable for mandate-origin work.
             if !is_mandate_run {
                 let max_dispatch_rounds = 4; // safety limit — keep low to bound token usage
-                const AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS: usize = 0;
-                const AUTO_DISPATCH_HARD_TOKEN_CAP: i64 = 2_000_000;
                 let mut budget_exhausted = false;
                 for _round in 0..max_dispatch_rounds {
                     if task_lead_lease_lost.load(Ordering::Acquire) {
@@ -1550,8 +1717,8 @@ pub fn spawn_background_task_lead(
                                         if let Some(new_budget) =
                                             auto_dispatch_scheduled_run_extension_budget(
                                                 &run_budget,
-                                                AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS,
-                                                AUTO_DISPATCH_HARD_TOKEN_CAP,
+                                                SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+                                                SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
                                             )
                                         {
                                             if let Some(registry) = goal_token_registry.as_ref() {
@@ -1642,6 +1809,7 @@ pub fn spawn_background_task_lead(
                                             &session_id,
                                             &executed_task,
                                             &execution_result,
+                                            !is_scheduled_run,
                                         )
                                         .await;
                                     }
@@ -1661,6 +1829,7 @@ pub fn spawn_background_task_lead(
                                 &session_id,
                                 &executed_task,
                                 &execution_result,
+                                !is_scheduled_run,
                             )
                             .await;
                         }
@@ -1760,23 +1929,26 @@ pub fn spawn_background_task_lead(
                             is_mandate_run,
                             mandate_decision_ready,
                         );
-                        let success = dispatch_trigger_succeeded(
+                        let disposition = dispatch_trigger_disposition(
                             semantic_task_lead_success,
                             &trigger_work_tasks,
-                        ) && mandate_decision_ready;
-                        let status = if success {
-                            "completed".to_string()
+                        );
+                        let disposition = if mandate_decision_ready {
+                            disposition
                         } else {
-                            "failed".to_string()
+                            DispatchTriggerDisposition::Failed
                         };
-                        let error = if success {
-                            None
-                        } else if is_mandate_run && !mandate_decision_ready {
+                        let status = match disposition {
+                            DispatchTriggerDisposition::Completed
+                            | DispatchTriggerDisposition::Continuable => "completed".to_string(),
+                            DispatchTriggerDisposition::Failed => "failed".to_string(),
+                        };
+                        let error = if is_mandate_run && !mandate_decision_ready {
                             Some(
                                 "Mandate review ended without exactly one current durable decision."
                                     .to_string(),
                             )
-                        } else {
+                        } else if disposition == DispatchTriggerDisposition::Failed {
                             Some(failed_run_summary(
                                 &trigger_work_tasks,
                                 result
@@ -1785,24 +1957,39 @@ pub fn spawn_background_task_lead(
                                     .map(|error| error.to_string())
                                     .as_deref(),
                             ))
+                        } else {
+                            None
                         };
                         if let Some(attempt) = dispatch_attempt.as_ref() {
                             let handoff = crate::traits::TaskHandoff {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 task_id: trigger_task_id.clone(),
                                 attempt_id: attempt.id.clone(),
-                                summary: if success {
-                                    "Task-lead run completed.".to_string()
-                                } else {
-                                    error
+                                summary: match disposition {
+                                    DispatchTriggerDisposition::Completed => {
+                                        "Task-lead run completed.".to_string()
+                                    }
+                                    DispatchTriggerDisposition::Continuable => {
+                                        "Task lead committed durable unfinished work for autonomous continuation."
+                                            .to_string()
+                                    }
+                                    DispatchTriggerDisposition::Failed => error
                                         .clone()
-                                        .unwrap_or_else(|| "Task-lead run failed.".to_string())
+                                        .unwrap_or_else(|| "Task-lead run failed.".to_string()),
                                 },
                                 artifacts: Vec::new(),
                                 verification: Vec::new(),
                                 remaining_risk: error.clone(),
-                                next_step: (!success)
-                                    .then(|| "Inspect failed or blocked child tasks.".to_string()),
+                                next_step: match disposition {
+                                    DispatchTriggerDisposition::Completed => None,
+                                    DispatchTriggerDisposition::Continuable => Some(
+                                        "Resume the next pending child obligation from this goal run."
+                                            .to_string(),
+                                    ),
+                                    DispatchTriggerDisposition::Failed => {
+                                        Some("Inspect failed or blocked child tasks.".to_string())
+                                    }
+                                },
                                 created_at: chrono::Utc::now().to_rfc3339(),
                             };
                             let patch = crate::traits::TaskAttemptPatch {
@@ -1863,7 +2050,7 @@ pub fn spawn_background_task_lead(
 
             // Stop the heartbeat
             let _ = heartbeat_cancel_tx.send(());
-            let _ = heartbeat_handle.await;
+            let terminal_surface_id = heartbeat_handle.await.ok().flatten();
             let _ = keepalive_cancel_tx.send(());
             let _ = keepalive_handle.await;
 
@@ -2185,10 +2372,32 @@ pub fn spawn_background_task_lead(
                             )
                             .await
                         {
-                            Ok(outcome) if outcome.sent => {
-                                let _ = state.mark_notification_delivered(&notification_id).await;
+                            Ok(outcome) => {
+                                if outcome.recorded
+                                    && notice.kind == MandateRunNotificationKind::Ask
+                                {
+                                    if let Err(error) = agent
+                                        .record_mandate_owner_input_context(
+                                            &session_id,
+                                            &notice.mandate_id,
+                                            notice.mandate_version,
+                                            &notification_id,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            mandate_id = %notice.mandate_id,
+                                            run_id,
+                                            %error,
+                                            "Failed to bind delivered mandate ASK to owner dialogue state"
+                                        );
+                                    }
+                                }
+                                if outcome.sent {
+                                    let _ =
+                                        state.mark_notification_delivered(&notification_id).await;
+                                }
                             }
-                            Ok(_) => {}
                             Err(error) => warn!(
                                 goal_id = %goal_id,
                                 run_id,
@@ -2207,22 +2416,16 @@ pub fn spawn_background_task_lead(
                 return;
             }
 
+            let run_status =
+                goal_run_terminal_status(status, trigger_status.as_deref(), &final_run_tasks);
+            let continuous_controller = initial_goal.goal_type == "continuous";
+            let defer_run_finalization_for_recovery = continuous_controller
+                && matches!(run_status, Some("failed" | "blocked"))
+                && !final_run_tasks.iter().any(is_terminal_recovery_task);
             if let Some(run_id) = goal_run_id.as_deref() {
-                let run_status = if final_run_tasks.iter().any(|task| task.status == "blocked") {
-                    Some("blocked")
-                } else if matches!(status, "failed" | "stalled" | "cancelled")
-                    || trigger_status.as_deref() == Some("failed")
-                    || final_run_tasks.iter().any(|task| {
-                        matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
-                    })
+                if let Some(run_status) =
+                    run_status.filter(|_| !defer_run_finalization_for_recovery)
                 {
-                    Some("failed")
-                } else if status == "completed" || trigger_status.as_deref() == Some("completed") {
-                    Some("completed")
-                } else {
-                    None
-                };
-                if let Some(run_status) = run_status {
                     let summary = build_goal_task_results_summary(
                         &final_run_tasks,
                         if run_status == "completed" {
@@ -2250,115 +2453,110 @@ pub fn spawn_background_task_lead(
             // of silently treating the durable goal's active status as
             // "nothing to notify."
             if status == "active" || status == "pending" {
-                let terminal_notification = match recurring_run_terminal_outcome(
-                    trigger_status.as_deref(),
-                ) {
+                let terminal_notification = match recurring_run_terminal_outcome(run_status) {
                     Some(RecurringRunTerminalOutcome::Failed) => {
                         let task_lead_error = result.as_ref().err().map(|error| error.to_string());
                         Some((
-                                "failed",
-                                format!(
-                                    "⚠️ **Scheduled run needs attention**\n\n{}\n\n🔁 The recurring schedule remains active.",
-                                    failed_run_summary(
-                                        &final_run_tasks,
-                                        task_lead_error.as_deref()
-                                    )
-                                ),
-                            ))
+                            "failed",
+                            failed_run_summary(&final_run_tasks, task_lead_error.as_deref()),
+                        ))
                     }
                     Some(RecurringRunTerminalOutcome::Completed) => {
                         let summary = build_goal_task_results_summary(
                             &final_run_tasks,
                             "All required tasks completed.",
                         );
-                        Some((
-                                "completed",
-                                format!(
-                                    "✅ **Scheduled run complete**\n\n{}\n\n🔁 The recurring schedule remains active.",
-                                    truncate_goal_result_text(&summary, 3500)
-                                ),
-                            ))
+                        Some(("completed", truncate_goal_result_text(&summary, 3500)))
                     }
                     None => None,
                 };
 
-                if let Some((notification_type, msg)) = terminal_notification {
-                    let msg = crate::channels::present_notification(notification_type, &msg);
-                    let entry = crate::traits::NotificationEntry::new(
-                        &goal_id,
-                        &session_id,
-                        notification_type,
-                        &msg,
-                    );
-                    let notification_id = entry.id.clone();
-                    let queued = match state.enqueue_notification(&entry).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            warn!(
-                                goal_id = %goal_id,
-                                notification_id = %notification_id,
-                                %error,
-                                "Failed to queue recurring-run terminal notification"
-                            );
-                            false
-                        }
-                    };
-                    match agent
-                        .deliver_parent_text_result(
-                            hub.as_ref(),
-                            &session_id,
+                // A recoverable terminal cycle is not yet an owner-facing
+                // event. Route it through the same bounded direct-recovery path
+                // used by finite goals. The durable recovery-task marker keeps
+                // this to one attempt for the exact run.
+                let defer_to_autonomous_recovery = continuous_controller
+                    && matches!(
+                        recurring_run_terminal_outcome(run_status),
+                        Some(RecurringRunTerminalOutcome::Failed)
+                    )
+                    && !final_run_tasks.iter().any(is_terminal_recovery_task);
+
+                if !defer_to_autonomous_recovery {
+                    if let Some((notification_type, msg)) = terminal_notification {
+                        let msg = crate::channels::present_scheduled_run_notification(
+                            notification_type,
                             &msg,
-                            parent_delivery::ParentDeliveryKind::GoalNotification,
-                        )
-                        .await
-                    {
-                        Ok(outcome) if outcome.sent => {
-                            if queued {
-                                let _ = state.mark_notification_delivered(&notification_id).await;
+                            true,
+                        );
+                        let entry = crate::traits::NotificationEntry::new(
+                            &goal_id,
+                            &session_id,
+                            notification_type,
+                            &msg,
+                        );
+                        let notification_id = entry.id.clone();
+                        let queued = match state.enqueue_notification(&entry).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                warn!(
+                                    goal_id = %goal_id,
+                                    notification_id = %notification_id,
+                                    %error,
+                                    "Failed to queue recurring-run terminal notification"
+                                );
+                                false
                             }
+                        };
+                        let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+                        if !entry.should_deliver_at_local_hour(local_hour) {
+                            // The durable outbox remains pending for the heartbeat
+                            // to deliver after quiet hours.
+                            if let Some(ref registry) = goal_token_registry {
+                                registry.remove(&goal_id).await;
+                            }
+                            return;
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(
-                                session_id = %session_id,
-                                notification_id = %notification_id,
-                                %error,
-                                "Failed to deliver recurring-run terminal notification"
-                            );
-                        }
-                    }
-                } else {
-                    // Goal still in progress: optionally relay substantive task-lead text,
-                    // but only if executor results haven't already been sent inline
-                    // (which would cover the same content).
-                    if !any_executor_results_sent {
-                        if let Some(response) = task_lead_response.as_ref() {
-                            if !is_low_signal_task_lead_reply(response) {
-                                if let Err(err) = agent
-                                    .deliver_parent_text_result(
-                                        hub.as_ref(),
-                                        &session_id,
-                                        response,
-                                        parent_delivery::ParentDeliveryKind::TaskLeadResult,
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        session_id = %session_id,
-                                        error = %err,
-                                        "Failed to record parent-mediated task-lead result"
-                                    );
+                        match agent
+                            .deliver_parent_text_result_to_surface(
+                                hub.as_ref(),
+                                &session_id,
+                                terminal_surface_id.as_deref(),
+                                &msg,
+                                parent_delivery::ParentDeliveryKind::GoalNotification,
+                            )
+                            .await
+                        {
+                            Ok(outcome) if outcome.sent => {
+                                if queued {
+                                    let _ =
+                                        state.mark_notification_delivered(&notification_id).await;
                                 }
                             }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(
+                                    session_id = %session_id,
+                                    notification_id = %notification_id,
+                                    %error,
+                                    "Failed to deliver recurring-run terminal notification"
+                                );
+                            }
+                        }
+                    } else {
+                        // Durable child obligations remain open. Routine
+                        // handoffs are internal coordination, not owner-facing
+                        // attention events; heartbeat will resume them.
+                    }
+
+                    // Clean up cancellation token and return.
+                    if run_status.is_some() {
+                        if let Some(ref registry) = goal_token_registry {
+                            registry.remove(&goal_id).await;
                         }
                     }
+                    return;
                 }
-
-                // Clean up cancellation token and return.
-                if let Some(ref registry) = goal_token_registry {
-                    registry.remove(&goal_id).await;
-                }
-                return;
             }
 
             // For failed/stalled finite goals: attempt direct fallback before giving up.
@@ -2374,36 +2572,62 @@ pub fn spawn_background_task_lead(
                 .and_then(|g| g.as_ref())
                 .map(|g| g.notified_at.is_some())
                 .unwrap_or(false);
-            let (notification_type, msg) = if (status == "failed" || status == "stalled")
-                && !goal_already_notified
-                && final_goal
-                    .as_ref()
-                    .ok()
-                    .and_then(|g| g.as_ref())
-                    .map(|g| g.goal_type == "finite")
-                    .unwrap_or(false)
-            {
-                info!(goal_id = %goal_id, "Finite goal failed — attempting durable direct recovery");
+            let goal_type = final_goal
+                .as_ref()
+                .ok()
+                .and_then(|goal| goal.as_ref())
+                .map(|goal| goal.goal_type.as_str())
+                .unwrap_or(initial_goal.goal_type.as_str());
+            let (notification_type, msg) = if terminal_recovery_eligible(
+                goal_type,
+                status,
+                run_status,
+                goal_already_notified,
+                &final_run_tasks,
+            ) {
+                info!(goal_id = %goal_id, is_scheduled_run, "Goal run failed — attempting bounded durable direct recovery");
 
                 // Prevent the heartbeat from racing a duplicate terminal notice
                 // while a separately tracked recovery run is active.
-                let _ = state.mark_goal_notified(&goal_id).await;
+                if !continuous_controller {
+                    let _ = state.mark_goal_notified(&goal_id).await;
+                }
                 if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
                     g.status = "active".to_string();
                     g.completed_at = None;
-                    g.notified_at = None;
+                    if !continuous_controller {
+                        g.notified_at = None;
+                    }
                     g.updated_at = chrono::Utc::now().to_rfc3339();
                     let _ = state.update_goal(&g).await;
                 }
 
-                if let Some(hub_weak) = &hub {
-                    if let Some(hub_arc) = hub_weak.upgrade() {
-                        let _ = hub_arc
-                            .send_text(
-                                &session_id,
-                                "The planned run did not complete. I am retrying it as a directly tracked recovery task...",
-                            )
-                            .await;
+                let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+                if crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(
+                    local_hour,
+                ) {
+                    if let Some(hub_weak) = &hub {
+                        if let Some(hub_arc) = hub_weak.upgrade() {
+                            let retry_text = if is_scheduled_run {
+                                "⏳ **Scheduled run in progress**\n\nThe first attempt did not finish, so I’m retrying safely…"
+                            } else {
+                                "⏳ **Still working**\n\nThe first attempt did not finish, so I’m retrying safely…"
+                            };
+                            let edited = if let Some(surface_id) = terminal_surface_id.as_deref() {
+                                hub_arc
+                                    .edit_text(&session_id, surface_id, retry_text)
+                                    .await
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            // A scheduled retry is routine unattended recovery. If
+                            // no existing progress surface can be updated, stay
+                            // silent until the run reaches a genuine terminal state.
+                            if !edited && !is_scheduled_run {
+                                let _ = hub_arc.send_text(&session_id, retry_text).await;
+                            }
+                        }
                     }
                 }
 
@@ -2428,6 +2652,7 @@ pub fn spawn_background_task_lead(
                         serde_json::json!({
                             "recovery_for_run": goal_run_id.as_deref(),
                             "terminal_recovery": true,
+                            "project_scope": dispatch_project_scope.as_deref(),
                             "prior_report": task_lead_response.as_deref().map(|report| {
                                 report.chars().take(2000).collect::<String>()
                             }),
@@ -2446,14 +2671,24 @@ pub fn spawn_background_task_lead(
                 };
                 let recovery_created = state.create_task(&recovery_task).await;
                 let recovery_run_id = if recovery_created.is_ok() {
+                    if is_scheduled_run {
+                        rebind_scheduled_recovery_state(
+                            &state,
+                            goal_token_registry.as_ref(),
+                            &goal_id,
+                            &recovery_task_id,
+                        )
+                        .await;
+                    }
                     state
                         .get_current_goal_run(&goal_id)
                         .await
                         .ok()
                         .flatten()
                         .map(|run| run.id)
+                        .or_else(|| goal_run_id.clone())
                 } else {
-                    None
+                    goal_run_id.clone()
                 };
                 let recovery_ledger = render_recovery_task_ledger(&final_run_tasks);
                 let prior_report = task_lead_response
@@ -2461,7 +2696,7 @@ pub fn spawn_background_task_lead(
                     .map(|report| report.chars().take(3000).collect::<String>())
                     .unwrap_or_else(|| "No usable prior summary was returned.".to_string());
                 let recovery_prompt = format!(
-                    "{user_text}\n\nRecover the whole mission, using the durable task ledger below as authoritative evidence. Preserve successful work and never repeat a completed external side effect. If the requested artifact, deployment, and verification are already proven by the ledger, report the mission complete without demanding a second verification surface. Only execute work that is genuinely unmet.\n\nExisting task ledger:\n{recovery_ledger}\n\nPrevious task-lead report:\n{prior_report}"
+                    "{user_text}\n\nRecover the whole mission autonomously, using the durable task ledger below as authoritative evidence. Preserve successful work and never repeat a completed external side effect. Inspect the exact failure, make only the smallest in-scope correction needed, then rerun the documented validation and continue from the first unmet obligation. Scope is causal, not chronological: when the required build, test, validation, or deployment workflow identifies a pre-existing file inside the authorized project as its concrete blocker, that file is a task dependency. Inspect it and make the smallest reversible repair that restores the existing mechanical invariant while preserving body content and unrelated behavior. Dirty or untracked status alone does not make that dependency unrelated. Do not change files with no observed causal connection, broaden external authority, make destructive changes, or ask the owner about routine tactics. If the requested artifact, deployment, and verification are already proven by the ledger, report the mission complete without demanding a second verification surface. Only execute work that is genuinely unmet.\n\nExisting task ledger:\n{recovery_ledger}\n\nPrevious task-lead report:\n{prior_report}"
                 );
                 let fallback_result = match recovery_created {
                     Ok(()) => {
@@ -2504,9 +2739,30 @@ pub fn spawn_background_task_lead(
                                 superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
                                 let _ = state.update_task(&superseded).await;
                             }
+                            if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
+                                if let Ok(Some(mut trigger)) = state.get_task(trigger_task_id).await
+                                {
+                                    if !trigger.satisfies_run_completion() {
+                                        trigger.status = "superseded".to_string();
+                                        trigger.error = None;
+                                        trigger.blocker = None;
+                                        trigger.result = Some(format!(
+                                            "Replaced by successful recovery task {recovery_task_id}."
+                                        ));
+                                        trigger.completed_at =
+                                            Some(chrono::Utc::now().to_rfc3339());
+                                        let _ = state.update_task(&trigger).await;
+                                    }
+                                }
+                            }
                             if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                                g.status = "completed".to_string();
-                                g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                if continuous_controller {
+                                    g.status = "active".to_string();
+                                    g.completed_at = None;
+                                } else {
+                                    g.status = "completed".to_string();
+                                    g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                }
                                 g.updated_at = chrono::Utc::now().to_rfc3339();
                                 clear_partial_success_context(&mut g);
                                 let _ = state.update_goal(&g).await;
@@ -2535,8 +2791,13 @@ pub fn spawn_background_task_lead(
                                     .await;
                             }
                             if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                                g.status = "failed".to_string();
-                                g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                if continuous_controller {
+                                    g.status = "active".to_string();
+                                    g.completed_at = None;
+                                } else {
+                                    g.status = "failed".to_string();
+                                    g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                }
                                 g.updated_at = chrono::Utc::now().to_rfc3339();
                                 let _ = state.update_goal(&g).await;
                             }
@@ -2557,8 +2818,13 @@ pub fn spawn_background_task_lead(
                                 .await;
                         }
                         if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                            g.status = "failed".to_string();
-                            g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            if continuous_controller {
+                                g.status = "active".to_string();
+                                g.completed_at = None;
+                            } else {
+                                g.status = "failed".to_string();
+                                g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            }
                             g.updated_at = chrono::Utc::now().to_rfc3339();
                             let _ = state.update_goal(&g).await;
                         }
@@ -2695,7 +2961,11 @@ pub fn spawn_background_task_lead(
                 }
             };
 
-            let msg = crate::channels::present_notification(notification_type, &msg);
+            let msg = if is_scheduled_run {
+                crate::channels::present_scheduled_run_notification(notification_type, &msg, false)
+            } else {
+                crate::channels::present_notification(notification_type, &msg)
+            };
             let entry = crate::traits::NotificationEntry::new(
                 &goal_id,
                 &session_id,
@@ -2703,13 +2973,28 @@ pub fn spawn_background_task_lead(
                 &msg,
             );
             let notification_id = entry.id.clone();
-            match state.enqueue_goal_notification(&entry).await {
+            let enqueue_result = if continuous_controller {
+                state.enqueue_notification(&entry).await.map(|()| true)
+            } else {
+                state.enqueue_goal_notification(&entry).await
+            };
+            match enqueue_result {
                 Ok(true) => {
+                    let local_hour = chrono::Timelike::hour(&chrono::Local::now());
+                    if !entry.should_deliver_at_local_hour(local_hour) {
+                        // Persisted successfully; normal notification delivery
+                        // will resume outside quiet hours.
+                        if let Some(ref registry) = goal_token_registry {
+                            registry.remove(&goal_id).await;
+                        }
+                        return;
+                    }
                     // Attempt immediate delivery — if it fails, heartbeat will retry from queue.
                     match agent
-                        .deliver_parent_text_result(
+                        .deliver_parent_text_result_to_surface(
                             hub.as_ref(),
                             &session_id,
+                            terminal_surface_id.as_deref(),
                             &msg,
                             parent_delivery::ParentDeliveryKind::GoalNotification,
                         )
@@ -2770,9 +3055,10 @@ pub fn spawn_background_task_lead(
                         "Failed to atomically enqueue terminal notification; attempting direct delivery"
                     );
                     match agent
-                        .deliver_parent_text_result(
+                        .deliver_parent_text_result_to_surface(
                             hub.as_ref(),
                             &session_id,
+                            terminal_surface_id.as_deref(),
                             &msg,
                             parent_delivery::ParentDeliveryKind::GoalNotification,
                         )
@@ -2806,10 +3092,23 @@ pub fn spawn_background_task_lead(
         // stays false for duplicate spawns that returned before acquiring the
         // per-goal run guard, so they cannot disrupt the active owner.
         if finalize_scheduled_run.load(Ordering::Acquire) {
-            if let Some(registry) = teardown_goal_token_registry.as_ref() {
-                registry.clear_run_budget(&teardown_goal_id).await;
+            let run_still_open = teardown_state
+                .get_current_goal_run(&teardown_goal_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|run| run.status == "running");
+            if !run_still_open {
+                if let Some(registry) = teardown_goal_token_registry.as_ref() {
+                    registry.clear_run_budget(&teardown_goal_id).await;
+                }
+                clear_scheduled_run_state(&teardown_state, &teardown_goal_id).await;
+            } else {
+                tracing::debug!(
+                    goal_id = %teardown_goal_id,
+                    "Preserving scheduled-run budget and health for durable continuation"
+                );
             }
-            clear_scheduled_run_state(&teardown_state, &teardown_goal_id).await;
         }
 
         // Self-correction bridge teardown (3c P3b.3): clear any correction-
@@ -3353,7 +3652,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_dispatch_resolves_named_repository_inside_configured_roots() {
+    fn scheduled_dispatch_resolves_exact_repository_path() {
         let root = tempfile::tempdir().expect("project root");
         let blog = root.path().join("blog.aidaemon.ai");
         std::fs::create_dir_all(&blog).expect("blog directory");
@@ -3361,14 +3660,133 @@ mod tests {
             .expect("project marker");
 
         let resolved = resolve_dispatch_project_scope(
-            "Inspect the blog repository, write one post, deploy it, and verify the public URL.",
+            &format!(
+                "Inspect {}, write one post, deploy it, and verify the public URL.",
+                blog.display()
+            ),
             &[root.path().to_string_lossy().to_string()],
         );
         assert_eq!(resolved.as_deref(), Some(blog.to_string_lossy().as_ref()));
     }
 
     #[test]
-    fn trigger_requires_every_created_work_task_to_succeed() {
+    fn scheduled_dispatch_resolves_exact_public_host_identity() {
+        let root = tempfile::tempdir().expect("project root");
+        let blog = root.path().join("blog.aidaemon.ai");
+        let daemon = root.path().join("aidaemon");
+        std::fs::create_dir_all(&blog).expect("blog directory");
+        std::fs::create_dir_all(&daemon).expect("daemon directory");
+        std::fs::write(blog.join("package.json"), r#"{"name":"synthetic-blog"}"#)
+            .expect("blog marker");
+        std::fs::write(
+            daemon.join("Cargo.toml"),
+            "[package]\nname='synthetic-daemon'\n",
+        )
+        .expect("daemon marker");
+
+        let resolved = resolve_dispatch_project_scope(
+            "Independently manage the aidaemon blog at https://blog.aidaemon.ai/: publish and verify it.",
+            &[root.path().to_string_lossy().to_string()],
+        );
+        assert_eq!(resolved.as_deref(), Some(blog.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn scheduled_dispatch_refuses_to_choose_between_distinct_exact_paths() {
+        let root = tempfile::tempdir().expect("project root");
+        let first = root.path().join("first-project");
+        let second = root.path().join("second-project");
+        std::fs::create_dir_all(&first).expect("first directory");
+        std::fs::create_dir_all(&second).expect("second directory");
+
+        let resolved = resolve_dispatch_project_scope(
+            &format!(
+                "Work in {} but never write in {}",
+                first.display(),
+                second.display()
+            ),
+            &[root.path().to_string_lossy().to_string()],
+        );
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn scheduled_recovery_rebinds_persisted_run_state_to_its_real_root() {
+        let (state, _database) = mandate_test_state().await;
+        let goal = Goal::new_continuous(
+            "Publish a synthetic site update",
+            "synthetic-session",
+            Some(400_000),
+            Some(1_000_000),
+        );
+        state.create_goal(&goal).await.unwrap();
+        let make_task = |id: &str, description: &str| Task {
+            id: id.to_string(),
+            goal_id: goal.id.clone(),
+            description: description.to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+
+        let old_task = make_task("old-root", "Initial scheduled attempt");
+        state.create_task(&old_task).await.unwrap();
+        let old_run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        state
+            .finish_goal_run(&old_run.id, "failed", Some("synthetic failure"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .upsert_scheduled_run_state(&crate::traits::ScheduledRunState {
+                goal_id: goal.id.clone(),
+                root_task_id: old_task.id,
+                effective_budget_per_check: 800_000,
+                tokens_used: 525_063,
+                budget_extensions_count: 1,
+                health: crate::traits::ScheduledRunHealth::default(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let recovery_task = make_task("recovery-root", "Recover the failed scheduled attempt");
+        state.create_task(&recovery_task).await.unwrap();
+        let recovery_run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        assert_eq!(
+            recovery_run.root_task_id.as_deref(),
+            Some(recovery_task.id.as_str())
+        );
+
+        rebind_scheduled_recovery_state(&state, None, &goal.id, &recovery_task.id).await;
+
+        let rebound = state
+            .get_scheduled_run_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.root_task_id, recovery_task.id);
+        assert_eq!(rebound.tokens_used, 525_063);
+        assert_eq!(rebound.effective_budget_per_check, 800_000);
+        assert_eq!(rebound.budget_extensions_count, 1);
+    }
+
+    #[test]
+    fn trigger_distinguishes_continuable_work_from_terminal_failure() {
         let task = |id: &str, status: &str, error: Option<&str>| crate::traits::Task {
             id: id.to_string(),
             goal_id: "goal-1".to_string(),
@@ -3402,22 +3820,97 @@ mod tests {
         superseded.result =
             Some("Replaced by task 01234567, which completed the publish directly.".to_string());
 
-        assert!(!dispatch_trigger_succeeded(
-            false,
-            &[completed.clone(), failed.clone()]
-        ));
-        assert!(!dispatch_trigger_succeeded(
-            true,
-            &[completed.clone(), failed.clone()]
-        ));
-        assert!(dispatch_trigger_succeeded(true, &[completed]));
-        assert!(dispatch_trigger_succeeded(
-            true,
-            &[task("review", "completed", None), superseded]
-        ));
-        assert!(dispatch_trigger_succeeded(true, &[]));
-        assert!(!dispatch_trigger_succeeded(false, &[]));
+        assert_eq!(
+            dispatch_trigger_disposition(false, &[completed.clone(), failed.clone()]),
+            DispatchTriggerDisposition::Failed
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(true, &[completed.clone(), failed.clone()]),
+            DispatchTriggerDisposition::Failed
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(true, &[completed]),
+            DispatchTriggerDisposition::Completed
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(true, &[task("review", "completed", None), superseded]),
+            DispatchTriggerDisposition::Completed
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(true, &[task("publish", "pending", None)]),
+            DispatchTriggerDisposition::Continuable
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(false, &[task("publish", "pending", None)]),
+            DispatchTriggerDisposition::Continuable
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(true, &[]),
+            DispatchTriggerDisposition::Completed
+        );
+        assert_eq!(
+            dispatch_trigger_disposition(false, &[]),
+            DispatchTriggerDisposition::Failed
+        );
         assert!(failed_run_summary(&[failed], None).contains("109976 / 100000"));
+
+        assert!(terminal_recovery_eligible(
+            "finite",
+            "failed",
+            Some("failed"),
+            false,
+            &[]
+        ));
+        assert!(terminal_recovery_eligible(
+            "continuous",
+            "active",
+            Some("failed"),
+            true,
+            &[]
+        ));
+        let mut prior_recovery = task("recovery", "failed", Some("still incomplete"));
+        prior_recovery.context = Some(serde_json::json!({"terminal_recovery": true}).to_string());
+        assert!(!terminal_recovery_eligible(
+            "continuous",
+            "active",
+            Some("failed"),
+            false,
+            &[prior_recovery]
+        ));
+    }
+
+    #[test]
+    fn open_child_obligation_keeps_run_nonterminal_regardless_of_trigger_wording() {
+        let mut pending = Goal::new_continuous("synthetic", "session", None, None);
+        let task = crate::traits::Task {
+            id: "pending-1".to_string(),
+            goal_id: pending.id.clone(),
+            description: "Finish the remaining verified work".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+
+        for goal_status in ["active", "pending"] {
+            pending.status = goal_status.to_string();
+            assert_eq!(
+                goal_run_terminal_status(&pending.status, Some("completed"), &[task.clone()]),
+                None
+            );
+        }
     }
 
     #[test]

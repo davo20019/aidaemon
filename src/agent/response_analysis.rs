@@ -76,6 +76,7 @@ pub(super) fn looks_like_deferred_action_response(text: &str) -> bool {
 
 /// Detect a long status/plan response that reports a failed attempt and promises
 /// unsupported future recovery instead of delivering the requested result.
+#[cfg(test)]
 pub(super) fn looks_like_incomplete_retry_plan(text: &str) -> bool {
     let normalized = text
         .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'")
@@ -205,6 +206,8 @@ pub(super) fn claims_completed_side_effect(text: &str) -> bool {
         "copied",
         "combined",
         "merged",
+        "published",
+        "posted",
         "deployed",
         "restarted",
         "stopped",
@@ -266,6 +269,82 @@ pub(super) fn claims_completed_side_effect(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Extract an explicit requested source count (for example, "two primary
+/// sources"). This is a language-level requirement, so bounded phrase parsing
+/// is appropriate; it never decides authority or whether an action succeeded.
+#[cfg(test)]
+pub(super) fn requested_source_count(text: &str) -> Option<usize> {
+    let tokens = text
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let number = |token: &str| match token {
+        "one" => Some(1),
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        "ten" => Some(10),
+        other => other
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=10).contains(value)),
+    };
+    for (index, token) in tokens.iter().enumerate() {
+        if token == "source" || token == "sources" {
+            for preceding in tokens[index.saturating_sub(3)..index].iter().rev() {
+                if let Some(count) = number(preceding) {
+                    return Some(count);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(super) fn requests_exact_conversation_history(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "exact stop condition",
+        "exact wording",
+        "what did you say",
+        "what did i say",
+        "your earlier plan",
+        "your previous plan",
+        "immediately earlier",
+        "earlier message",
+        "previous message",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+pub(super) fn reply_claims_history_unavailable(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "don't have the exact",
+        "do not have the exact",
+        "can't recall",
+        "cannot recall",
+        "can't retrieve",
+        "cannot retrieve",
+        "not available in context",
+        "isn't available in context",
+        "is not available in context",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 /// Detect claims that a delegated agent has already been started. Without a
@@ -897,7 +976,33 @@ pub(super) fn reply_is_unbacked_action_promise(reply: &str) -> bool {
 
 #[cfg(test)]
 mod unbacked_promise_tests {
-    use super::reply_is_unbacked_action_promise;
+    use super::{
+        reply_claims_history_unavailable, reply_is_unbacked_action_promise, requested_source_count,
+        requests_exact_conversation_history,
+    };
+
+    #[test]
+    fn parses_explicit_source_counts() {
+        assert_eq!(
+            requested_source_count("Verify this against two primary sources."),
+            Some(2)
+        );
+        assert_eq!(requested_source_count("Use 3 independent sources"), Some(3));
+        assert_eq!(requested_source_count("Research this thoroughly"), None);
+    }
+
+    #[test]
+    fn recognizes_exact_history_lookup_shortfall() {
+        assert!(requests_exact_conversation_history(
+            "What was the exact stop condition in your earlier plan?"
+        ));
+        assert!(reply_claims_history_unavailable(
+            "I don't have the exact wording available in context."
+        ));
+        assert!(!requests_exact_conversation_history(
+            "What is a reasonable stop condition?"
+        ));
+    }
 
     #[test]
     fn fires_on_false_in_progress_status_claims() {

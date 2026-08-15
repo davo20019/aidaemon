@@ -242,6 +242,13 @@ installed skill do not silently change an already-confirmed delegation.
 
 The model may decide that an action is worthwhile, but the kernel grants no
 mutation until that run has committed ACT against the current mandate version.
+New mandates must define at least one observable, owner-confirmed success
+criterion. An ACT must bind its intention to one exact criterion and carry a
+complete value judgment: current-run sourced evidence, the expected benefit of
+acting now instead of waiting, assessed cost or downside, and evidence that
+would invalidate the intervention. This makes activity, cadence, and literal
+instruction-following insufficient by themselves; when no intervention clears
+the value threshold, WAIT is the correct successful outcome.
 The grant is bound to the mandate, decision cycle, canonical tool arguments, and
 typed semantics by a SHA-256 digest. After all local guards pass, the dispatcher
 durably reserves the operation, then atomically claims that exact reservation

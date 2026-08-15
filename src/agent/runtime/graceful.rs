@@ -52,8 +52,7 @@ pub(super) struct ScheduledRunBudgetControlCtx<'a> {
     pub iteration: usize,
     pub goal_id: &'a str,
     pub status: &'a crate::goal_tokens::GoalRunBudgetStatus,
-    pub user_role: UserRole,
-    pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
 }
@@ -66,38 +65,68 @@ pub(super) enum ScheduledRunBudgetControlOutcome {
     },
 }
 
+pub(super) struct ScheduledRunActivityMetrics {
+    pub evidence_gain_count: usize,
+    pub stall_count: usize,
+    pub consecutive_same_tool_count: usize,
+    pub consecutive_same_tool_unique_args: usize,
+    pub total_successful_tool_calls: usize,
+}
+
 // impl-Agent justification: graceful shutdown, budget progress, and task-end hooks over state/event_store.
 impl Agent {
     pub(super) fn has_meaningful_budget_progress(
         evidence_gain_count: usize,
-        total_successful_tool_calls: usize,
+        _total_successful_tool_calls: usize,
     ) -> bool {
-        // A single evidence gain is enough to show the run produced something
-        // concrete; otherwise require at least a few successful tool calls so
-        // we do not auto-extend pure narration or shallow retries.
-        evidence_gain_count > 0 || total_successful_tool_calls >= 3
+        // Transport-level success and administrative calls are not progress.
+        // Only a mutation receipt or result-content verification can justify
+        // spending the run's single autonomous extension.
+        evidence_gain_count > 0
     }
 
     pub(super) fn scheduled_run_health_snapshot(
         learning_ctx: &LearningContext,
-        evidence_gain_count: usize,
-        stall_count: usize,
-        consecutive_same_tool_count: usize,
-        consecutive_same_tool_unique_args: usize,
-        total_successful_tool_calls: usize,
+        metrics: ScheduledRunActivityMetrics,
+        completion_contract: &CompletionContract,
+        completion_progress: &CompletionProgress,
     ) -> crate::traits::ScheduledRunHealth {
+        let required_mutation_progress = completion_contract.expects_mutation
+            && completion_progress.mutation_count > 0
+            && (completion_contract.required_mutation_effects.is_empty()
+                || completion_progress
+                    .observed_mutation_effects
+                    .intersects(completion_contract.required_mutation_effects));
         crate::traits::ScheduledRunHealth {
-            evidence_gain_count,
-            total_successful_tool_calls,
-            stall_count,
-            consecutive_same_tool_count,
-            consecutive_same_tool_unique_args,
+            evidence_gain_count: metrics.evidence_gain_count,
+            total_successful_tool_calls: metrics.total_successful_tool_calls,
+            completion_requires_mutation: completion_contract.expects_mutation,
+            required_mutation_progress,
+            completion_requires_observation: completion_contract.requires_observation,
+            verification_progress: completion_progress.verification_count > 0,
+            stall_count: metrics.stall_count,
+            consecutive_same_tool_count: metrics.consecutive_same_tool_count,
+            consecutive_same_tool_unique_args: metrics.consecutive_same_tool_unique_args,
             unrecovered_error_count: learning_ctx
                 .errors
                 .iter()
                 .filter(|(_, recovered)| !recovered)
                 .count(),
         }
+    }
+
+    pub(super) fn scheduled_run_has_structural_progress(
+        health: &crate::traits::ScheduledRunHealth,
+    ) -> bool {
+        if health.completion_requires_mutation {
+            return health.required_mutation_progress;
+        }
+        if health.completion_requires_observation {
+            return health.verification_progress;
+        }
+        // Text-only scheduled work has no mutation/verification receipt to
+        // satisfy, so bounded result evidence remains its progress signal.
+        health.evidence_gain_count > 0
     }
 
     pub(super) fn scheduled_run_metrics_are_clearly_unproductive(
@@ -137,10 +166,7 @@ impl Agent {
             .max(status.tokens_used.saturating_add(old_budget / 2))
             .min(hard_token_cap);
 
-        let has_meaningful_progress = Self::has_meaningful_budget_progress(
-            status.health.evidence_gain_count,
-            status.health.total_successful_tool_calls,
-        );
+        let has_meaningful_progress = Self::scheduled_run_has_structural_progress(&status.health);
         let clearly_unproductive =
             Self::scheduled_run_metrics_are_clearly_unproductive(&status.health);
 
@@ -154,6 +180,19 @@ impl Agent {
         } else {
             None
         }
+    }
+
+    pub(super) fn scheduled_run_budget_pressure_pct(
+        status: &crate::goal_tokens::GoalRunBudgetStatus,
+        warning_already_sent: bool,
+    ) -> Option<i64> {
+        let budget = status.effective_budget_per_check;
+        if warning_already_sent || budget <= 0 || status.tokens_used >= budget {
+            return None;
+        }
+        let warning_threshold = budget.saturating_mul(80) / 100;
+        (status.tokens_used >= warning_threshold)
+            .then(|| status.tokens_used.saturating_mul(100) / budget)
     }
 
     pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
@@ -332,9 +371,32 @@ impl Agent {
         } else {
             None
         };
-        let budget_daily = (*ctx.effective_goal_daily_budget)
-            .or(shared_budget_daily)
-            .unwrap_or(db_budget_daily);
+        let durable_override = crate::goal_tokens::load_goal_daily_budget_override(
+            self.state.as_ref(),
+            ctx.goal_id,
+            db_budget_daily,
+            ctx.hard_token_cap,
+        )
+        .await;
+        if let Some(durable) = durable_override.as_ref() {
+            *ctx.budget_extensions_count = (*ctx.budget_extensions_count)
+                .max(durable.extensions_count.min(ctx.max_budget_extensions));
+            if let Some(registry) = &self.goal_token_registry {
+                registry
+                    .set_effective_daily_budget(ctx.goal_id, durable.budget_daily)
+                    .await;
+            }
+        }
+        let budget_daily = [
+            Some(db_budget_daily),
+            *ctx.effective_goal_daily_budget,
+            shared_budget_daily,
+            durable_override.map(|value| value.budget_daily),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(db_budget_daily);
         *ctx.effective_goal_daily_budget = Some(budget_daily);
         if budget_daily <= 0 || ctx.status.tokens_used_today < budget_daily {
             return GoalBudgetControlOutcome::Continue;
@@ -347,10 +409,10 @@ impl Agent {
             .min(ctx.hard_token_cap);
 
         let productive = if ctx.is_scheduled_goal {
-            Self::has_meaningful_budget_progress(
-                ctx.evidence_gain_count,
-                ctx.total_successful_tool_calls,
-            ) && ctx.stall_count == 0
+            // Active scheduled runs are governed by their shared per-run
+            // budget above. Keep this fail-closed for any legacy caller that
+            // reaches daily control directly.
+            false
         } else {
             Self::has_meaningful_budget_progress(
                 ctx.evidence_gain_count,
@@ -389,6 +451,20 @@ impl Agent {
                     .set_effective_daily_budget(ctx.goal_id, new_gbudget)
                     .await;
             }
+            if let Err(error) = crate::goal_tokens::persist_goal_daily_budget_override(
+                self.state.as_ref(),
+                ctx.goal_id,
+                new_gbudget,
+                *ctx.budget_extensions_count,
+            )
+            .await
+            {
+                warn!(
+                    goal_id = %ctx.goal_id,
+                    %error,
+                    "Failed to persist same-day goal budget extension"
+                );
+            }
             info!(
                 ctx.session_id,
                 goal_id = %ctx.goal_id,
@@ -405,15 +481,17 @@ impl Agent {
                     extension: *ctx.budget_extensions_count,
                     max_extensions: ctx.max_budget_extensions,
                 });
-            send_status(
-                ctx.status_tx,
-                StatusUpdate::BudgetExtended {
-                    old_budget: old_gbudget,
-                    new_budget: new_gbudget,
-                    extension: *ctx.budget_extensions_count,
-                    max_extensions: ctx.max_budget_extensions,
-                },
-            );
+            if !ctx.is_scheduled_goal {
+                send_status(
+                    ctx.status_tx,
+                    StatusUpdate::BudgetExtended {
+                        old_budget: old_gbudget,
+                        new_budget: new_gbudget,
+                        extension: *ctx.budget_extensions_count,
+                        max_extensions: ctx.max_budget_extensions,
+                    },
+                );
+            }
             self.emit_decision_point(
                 ctx.emitter,
                 ctx.task_id,
@@ -431,6 +509,17 @@ impl Agent {
             )
             .await;
             return GoalBudgetControlOutcome::Continue;
+        }
+
+        // Scheduled work has an owner-confirmed unattended authority envelope.
+        // It may use the bounded autonomous extension above, but it must never
+        // convert resource management into a live approval interruption. Once
+        // that envelope is spent, stop this cycle cleanly at the hard boundary.
+        if ctx.is_scheduled_goal {
+            return GoalBudgetControlOutcome::Exhausted {
+                tokens_used_today: ctx.status.tokens_used_today,
+                budget_daily,
+            };
         }
 
         let approved_extension =
@@ -457,6 +546,20 @@ impl Agent {
                 registry
                     .set_effective_daily_budget(ctx.goal_id, new_gbudget)
                     .await;
+            }
+            if let Err(error) = crate::goal_tokens::persist_goal_daily_budget_override(
+                self.state.as_ref(),
+                ctx.goal_id,
+                new_gbudget,
+                (*ctx.budget_extensions_count).saturating_add(1),
+            )
+            .await
+            {
+                warn!(
+                    goal_id = %ctx.goal_id,
+                    %error,
+                    "Failed to persist owner-approved same-day goal budget extension"
+                );
             }
             ctx.pending_system_messages
                 .push(SystemDirective::GoalDailyBudgetExtensionApproved {
@@ -498,10 +601,6 @@ impl Agent {
         }
 
         let old_budget = budget_per_check;
-        let proposed_budget = old_budget
-            .saturating_mul(2)
-            .max(ctx.status.tokens_used.saturating_add(old_budget / 2))
-            .min(ctx.hard_token_cap);
         if let Some(new_budget) = Self::scheduled_run_auto_extension_candidate(
             ctx.status,
             ctx.max_budget_extensions,
@@ -526,9 +625,12 @@ impl Agent {
                     extension,
                     "Auto-extended scheduled run budget"
                 );
-                send_status(
-                    ctx.status_tx,
-                    StatusUpdate::BudgetExtended {
+                // This is routine internal adaptation, not an owner-attention
+                // event. Keep it in the directive/event ledger instead of the
+                // channel status stream so an unattended run cannot wake the
+                // owner merely because it resized its own budget.
+                ctx.pending_system_messages.push(
+                    SystemDirective::ScheduledRunBudgetAdaptationRequired {
                         old_budget,
                         new_budget,
                         extension,
@@ -554,49 +656,6 @@ impl Agent {
                 .await;
                 return ScheduledRunBudgetControlOutcome::Continue;
             }
-        }
-
-        let approved_extension =
-            if old_budget < ctx.hard_token_cap && proposed_budget > ctx.status.tokens_used {
-                self.request_budget_continue_approval(
-                    ctx.emitter,
-                    ctx.task_id,
-                    ctx.iteration,
-                    ctx.session_id,
-                    ctx.user_role,
-                    "scheduled run",
-                    ctx.status.tokens_used,
-                    old_budget,
-                    proposed_budget,
-                )
-                .await
-            } else {
-                false
-            };
-
-        if approved_extension {
-            if let Some(registry) = &self.goal_token_registry {
-                if let Some(status) = registry.set_run_budget(ctx.goal_id, proposed_budget).await {
-                    persist_scheduled_run_state(&self.state, ctx.goal_id, None, &status).await;
-                }
-            }
-            self.emit_decision_point(
-                ctx.emitter,
-                ctx.task_id,
-                ctx.iteration,
-                DecisionType::BudgetAutoExtension,
-                "Extended scheduled run budget via owner approval".to_string(),
-                json!({
-                    "condition": "scheduled_run_budget_extension_manual",
-                    "goal_id": ctx.goal_id,
-                    "approval_state": ApprovalState::Granted,
-                    "old_budget": old_budget,
-                    "new_budget": proposed_budget,
-                    "tokens_used": ctx.status.tokens_used,
-                }),
-            )
-            .await;
-            return ScheduledRunBudgetControlOutcome::Continue;
         }
 
         ScheduledRunBudgetControlOutcome::Exhausted {
@@ -1084,6 +1143,7 @@ impl Agent {
             emitter.session_id(),
             task_id,
             status,
+            outcome,
         )
         .await
         {
@@ -1319,8 +1379,8 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_budget_progress_accepts_three_successful_calls() {
-        assert!(Agent::has_meaningful_budget_progress(0, 3));
+    fn meaningful_budget_progress_rejects_transport_success_without_evidence() {
+        assert!(!Agent::has_meaningful_budget_progress(0, 30));
     }
 
     #[test]
@@ -1338,6 +1398,7 @@ mod tests {
                 consecutive_same_tool_count: 0,
                 consecutive_same_tool_unique_args: 0,
                 unrecovered_error_count: 1,
+                ..Default::default()
             }
         ));
     }
@@ -1360,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_run_auto_extension_candidate_accepts_productive_snapshot() {
+    fn scheduled_run_auto_extension_candidate_accepts_required_mutation_receipt() {
         assert_eq!(
             Agent::scheduled_run_auto_extension_candidate(
                 &crate::goal_tokens::GoalRunBudgetStatus {
@@ -1370,16 +1431,119 @@ mod tests {
                     health: crate::traits::ScheduledRunHealth {
                         evidence_gain_count: 1,
                         total_successful_tool_calls: 3,
+                        completion_requires_mutation: true,
+                        required_mutation_progress: true,
                         stall_count: 0,
                         consecutive_same_tool_count: 1,
                         consecutive_same_tool_unique_args: 1,
                         unrecovered_error_count: 0,
+                        ..Default::default()
                     },
                 },
                 12,
                 1_000,
             ),
             Some(200)
+        );
+    }
+
+    #[test]
+    fn scheduled_run_auto_extension_rejects_read_only_activity_for_mutation_task() {
+        let status = crate::goal_tokens::GoalRunBudgetStatus {
+            effective_budget_per_check: 400_000,
+            tokens_used: 400_000,
+            budget_extensions_count: 0,
+            health: crate::traits::ScheduledRunHealth {
+                evidence_gain_count: 28,
+                total_successful_tool_calls: 30,
+                completion_requires_mutation: true,
+                required_mutation_progress: false,
+                stall_count: 0,
+                consecutive_same_tool_count: 1,
+                consecutive_same_tool_unique_args: 1,
+                unrecovered_error_count: 0,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(
+            Agent::scheduled_run_auto_extension_candidate(&status, 1, 2_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_run_auto_extension_accepts_verified_research_progress() {
+        let status = crate::goal_tokens::GoalRunBudgetStatus {
+            effective_budget_per_check: 100,
+            tokens_used: 100,
+            budget_extensions_count: 0,
+            health: crate::traits::ScheduledRunHealth {
+                evidence_gain_count: 2,
+                total_successful_tool_calls: 2,
+                completion_requires_observation: true,
+                verification_progress: true,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(
+            Agent::scheduled_run_auto_extension_candidate(&status, 1, 1_000),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn scheduled_run_auto_extension_candidate_respects_autonomous_extension_limit() {
+        assert_eq!(
+            Agent::scheduled_run_auto_extension_candidate(
+                &crate::goal_tokens::GoalRunBudgetStatus {
+                    effective_budget_per_check: 200,
+                    tokens_used: 200,
+                    budget_extensions_count: SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+                    health: crate::traits::ScheduledRunHealth {
+                        evidence_gain_count: 2,
+                        total_successful_tool_calls: 4,
+                        completion_requires_mutation: true,
+                        required_mutation_progress: true,
+                        stall_count: 0,
+                        consecutive_same_tool_count: 1,
+                        consecutive_same_tool_unique_args: 1,
+                        unrecovered_error_count: 0,
+                        ..Default::default()
+                    },
+                },
+                SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
+                SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_run_budget_pressure_fires_once_before_exhaustion() {
+        let status = crate::goal_tokens::GoalRunBudgetStatus {
+            effective_budget_per_check: 400_000,
+            tokens_used: 320_000,
+            budget_extensions_count: 0,
+            health: crate::traits::ScheduledRunHealth::default(),
+        };
+        assert_eq!(
+            Agent::scheduled_run_budget_pressure_pct(&status, false),
+            Some(80)
+        );
+        assert_eq!(
+            Agent::scheduled_run_budget_pressure_pct(&status, true),
+            None
+        );
+
+        let exhausted = crate::goal_tokens::GoalRunBudgetStatus {
+            tokens_used: 400_000,
+            ..status
+        };
+        assert_eq!(
+            Agent::scheduled_run_budget_pressure_pct(&exhausted, false),
+            None
         );
     }
 

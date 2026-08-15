@@ -6,8 +6,29 @@
 
 use super::*;
 
-// impl-Agent justification: cross-subsystem note API — called from channels/hub.rs and telegram.rs via Arc<Agent>.
+// impl-Agent justification: this is the concrete AssistantNoteSink port used by
+// channel delivery without exposing the rest of Agent.
 impl Agent {
+    /// Bind the next related owner turn to a delivered, content-free mandate
+    /// ASK notice. The actual generated question remains in mandate-local
+    /// storage and must be inspected with the management tool.
+    pub(crate) async fn record_mandate_owner_input_context(
+        &self,
+        session_id: &str,
+        mandate_id: &str,
+        mandate_version: i64,
+        notification_id: &str,
+    ) -> anyhow::Result<()> {
+        super::dialogue_state::record_mandate_owner_input(
+            self,
+            session_id,
+            mandate_id,
+            mandate_version,
+            notification_id,
+        )
+        .await
+    }
+
     pub(crate) async fn record_auxiliary_assistant_note(
         &self,
         session_id: &str,
@@ -54,6 +75,62 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn delivered_mandate_ask_persists_typed_owner_input_context() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{DialogueStateStore, QuestionKind};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let session_id = "telegram:test_bot:synthetic-owner";
+        let mandate_id = "08012d3d-synthetic";
+
+        harness
+            .agent
+            .record_mandate_owner_input_context(
+                session_id,
+                mandate_id,
+                2,
+                "mandate-run-notice:review-synthetic",
+            )
+            .await
+            .expect("record mandate owner input");
+
+        let state = harness
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .expect("load dialogue state")
+            .expect("dialogue state persisted");
+        let question = state
+            .open_question
+            .expect("mandate ASK should remain an open owner question");
+        assert_eq!(question.kind, QuestionKind::MandateInput);
+        assert_eq!(question.mandate_id.as_deref(), Some(mandate_id));
+        assert!(question.awaiting_user_reply);
+        assert!(!question.text.contains("generated question"));
+
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                "Walk me through the reason.",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .expect("handle bound owner follow-up");
+
+        let calls = harness.provider.call_log.lock().await;
+        let prompt = serde_json::to_string(&calls[0].messages).expect("serialize prompt");
+        assert!(prompt.contains("structurally bound to unresolved mandate"));
+        assert!(prompt.contains("manage_mandates"));
+        assert!(prompt.contains(mandate_id));
+    }
+
     #[tokio::test]
     async fn parent_text_result_delivery_records_parent_visible_text() {
         use super::super::parent_delivery::ParentDeliveryKind;
@@ -114,11 +191,12 @@ mod tests {
         let delivered = "Result that should not be recorded when hub is dropped";
 
         // Build a Weak that cannot upgrade by dropping the strong Arc first.
-        let weak_hub: Weak<ChannelHub> = {
+        let weak_hub: Weak<dyn crate::runtime_ports::OutboundRouter> = {
             let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             let hub = Arc::new(ChannelHub::new(Vec::new(), session_map));
-            let weak = Arc::downgrade(&hub);
-            drop(hub);
+            let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub;
+            let weak = Arc::downgrade(&outbound);
+            drop(outbound);
             weak
         };
         assert!(weak_hub.upgrade().is_none(), "weak hub must be dead");

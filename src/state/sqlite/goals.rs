@@ -500,6 +500,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
 #[async_trait]
 impl crate::traits::TaskStore for SqliteStateStore {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
+        let dependency_ids = task.dependency_ids().map_err(anyhow::Error::msg)?;
         let goal_run = match self.get_current_goal_run(&task.goal_id).await? {
             Some(run) => run,
             None => {
@@ -512,7 +513,11 @@ impl crate::traits::TaskStore for SqliteStateStore {
                 } else {
                     "manual"
                 };
-                self.start_goal_run(&task.goal_id, trigger_type, None, None)
+                // The first task created after a terminal run is the root of
+                // the new implicit run. Persist that relationship instead of
+                // creating an anonymous run that recovery/accounting cannot
+                // rebind structurally.
+                self.start_goal_run(&task.goal_id, trigger_type, None, Some(&task.id))
                     .await?
             }
         };
@@ -528,6 +533,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO tasks (id, goal_id, goal_run_id, description, status, priority, task_order,
              parallel_group, depends_on, agent_id, context, result, error, blocker,
@@ -555,8 +561,15 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.started_at)
         .bind(&task.completed_at)
         .bind(&task.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        for dependency_id in dependency_ids {
+            sqlx::query("INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)")
+                .bind(&task.id)
+                .bind(dependency_id)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         let normalized = task.description.trim_start().to_ascii_lowercase();
         if normalized.starts_with("execute scheduled goal:")
@@ -571,9 +584,10 @@ impl crate::traits::TaskStore for SqliteStateStore {
             )
             .bind(&task.id)
             .bind(&goal_run.id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -612,6 +626,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
     }
 
     async fn update_task(&self, task: &Task) -> anyhow::Result<()> {
+        let dependency_ids = task.dependency_ids().map_err(anyhow::Error::msg)?;
         let result = task
             .result
             .as_deref()
@@ -624,6 +639,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE tasks SET description = ?, status = ?, priority = ?, task_order = ?,
              parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
@@ -651,14 +667,14 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.completed_at)
         .bind(&task.id)
         .bind(&task.status)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if updated.rows_affected() == 0 {
             let current_status =
                 sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id = ?")
                     .bind(&task.id)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *tx)
                     .await?;
             if current_status.as_deref() == Some("blocked") && task.status != "blocked" {
                 anyhow::bail!(
@@ -668,6 +684,18 @@ impl crate::traits::TaskStore for SqliteStateStore {
                 );
             }
             anyhow::bail!("task {} no longer exists", task.id);
+        }
+
+        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await?;
+        for dependency_id in dependency_ids {
+            sqlx::query("INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)")
+                .bind(&task.id)
+                .bind(dependency_id)
+                .execute(&mut *tx)
+                .await?;
         }
 
         // A completed task counts as useful progress for its goal — refresh the
@@ -680,9 +708,10 @@ impl crate::traits::TaskStore for SqliteStateStore {
                 .bind(&now)
                 .bind(&now)
                 .bind(&task.goal_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

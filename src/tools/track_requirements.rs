@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::plans::{PlanStore, StepStatus};
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities};
+use crate::plans::{ChecklistItem, PlanStore, StepStatus};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects};
 
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
@@ -52,15 +52,39 @@ impl Tool for TrackRequirementsTool {
                             "properties": {
                                 "text": {
                                     "type": "string",
-                                    "description": "One concrete requirement, e.g. 'send the report file to the user'."
+                                    "description": "One concrete requirement."
                                 },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed", "deferred"]
                                 },
                                 "note": {
-                                    "type": "string",
-                                    "description": "Optional short note (e.g. why deferred)."
+                                    "type": "string"
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "description": "Zero-based prerequisite indices.",
+                                    "items": { "type": "integer", "minimum": 0 },
+                                    "uniqueItems": true
+                                },
+                                "mutation_effects": {
+                                    "type": "array",
+                                    "description": "Typed outcomes required for receipt-based completion.",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ToolMutationEffects::PROTOCOL_NAMES
+                                    },
+                                    "uniqueItems": true
+                                },
+                                "requires_observation": {
+                                    "type": "boolean",
+                                    "description": "Require an observation receipt."
+                                },
+                                "targets": {
+                                    "type": "array",
+                                    "description": "Exact canonical receipt targets.",
+                                    "items": { "type": "string", "minLength": 1 },
+                                    "uniqueItems": true
                                 }
                             },
                             "required": ["text", "status"],
@@ -72,27 +96,6 @@ impl Tool for TrackRequirementsTool {
                 "additionalProperties": false
             }
         })
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        // Administrative, never Mutation: the checklist is the agent's own
-        // bookkeeping. Counting it as a mutation satisfied expects_mutation
-        // gates for turns whose REQUESTED mutation (a send_file, a post) never
-        // happened — letting recovery paste tool output in its place
-        // (live 2026-07-12).
-        ToolCallSemantics::administrative()
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        // Internal bookkeeping only: writes the checklist to the local plan store.
-        // No external side effect, no approval, full-set replace is idempotent.
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -111,23 +114,92 @@ impl Tool for TrackRequirementsTool {
             .and_then(Value::as_str)
             .map(|s| s.to_string());
 
-        let items: Vec<(String, StepStatus)> = v
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|it| {
-                        let text = it.get("text").and_then(Value::as_str)?.to_string();
-                        let status = it
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .map(parse_status)
-                            .unwrap_or(StepStatus::Pending);
-                        Some((text, status))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let Some(raw_items) = v.get("items").and_then(Value::as_array) else {
+            return Ok("track_requirements: no items provided.".to_string());
+        };
+        let mut items = Vec::with_capacity(raw_items.len());
+        for (item_index, item) in raw_items.iter().enumerate() {
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                return Ok(format!(
+                    "track_requirements: item {item_index} is missing text."
+                ));
+            };
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(parse_status)
+                .unwrap_or(StepStatus::Pending);
+            let depends_on = match item.get("depends_on") {
+                None => Vec::new(),
+                Some(Value::Array(values)) => {
+                    let Some(indices) = values
+                        .iter()
+                        .map(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Ok(format!(
+                            "track_requirements: item {item_index} has an invalid dependency index."
+                        ));
+                    };
+                    indices
+                }
+                Some(_) => {
+                    return Ok(format!(
+                        "track_requirements: item {item_index} dependencies must be an array."
+                    ))
+                }
+            };
+            let mut required_mutation_effects = ToolMutationEffects::NONE;
+            if let Some(raw_effects) = item.get("mutation_effects") {
+                let Some(values) = raw_effects.as_array() else {
+                    return Ok(format!(
+                        "track_requirements: item {item_index} mutation_effects must be an array."
+                    ));
+                };
+                for value in values {
+                    let Some(effect) = value
+                        .as_str()
+                        .and_then(ToolMutationEffects::from_protocol_name)
+                    else {
+                        return Ok(format!(
+                            "track_requirements: item {item_index} has an unknown mutation effect."
+                        ));
+                    };
+                    required_mutation_effects = required_mutation_effects.union(effect);
+                }
+            }
+            let expected_targets = match item.get("targets") {
+                None => Vec::new(),
+                Some(Value::Array(values)) => {
+                    let Some(targets) = values
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Ok(format!(
+                            "track_requirements: item {item_index} has an invalid exact target."
+                        ));
+                    };
+                    targets
+                }
+                Some(_) => {
+                    return Ok(format!(
+                        "track_requirements: item {item_index} targets must be an array."
+                    ))
+                }
+            };
+            items.push(ChecklistItem {
+                description: text.to_string(),
+                status,
+                depends_on,
+                required_mutation_effects,
+                requires_observation: item
+                    .get("requires_observation")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                expected_targets,
+            });
+        }
 
         if items.is_empty() {
             return Ok("track_requirements: no items provided.".to_string());
@@ -135,7 +207,7 @@ impl Tool for TrackRequirementsTool {
 
         let plan = match self
             .plan_store
-            .upsert_checklist(
+            .upsert_checklist_graph(
                 &session_id,
                 task_id.as_deref(),
                 "track_requirements",
@@ -160,6 +232,21 @@ impl Tool for TrackRequirementsTool {
             plan.steps.len(),
             plan.render_compact_checklist()
         ))
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        // Checklist bookkeeping cannot prove a requested mutation occurred.
+        ToolCallSemantics::administrative()
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
