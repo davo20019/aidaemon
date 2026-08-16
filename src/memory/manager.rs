@@ -499,6 +499,39 @@ impl MemoryManager {
         Ok(eligible)
     }
 
+    async fn memory_suppressed_tasks_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT task_id
+             FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'suppressed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
+    async fn all_memory_suppressed_tasks(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT task_id
+             FROM events
+             WHERE event_type = 'memory_policy_compiled' AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'suppressed'",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
     async fn fetch_fact_consolidation_messages(
         &self,
         session_id: &str,
@@ -506,9 +539,10 @@ impl MemoryManager {
         after_event_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<crate::events::ConversationTurn>> {
+        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
         let rows = sqlx::query(
             r#"
-            SELECT id, event_type, data, created_at
+            SELECT id, event_type, data, created_at, task_id
             FROM events
             WHERE session_id = ?
               AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -527,6 +561,12 @@ impl MemoryManager {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            if row
+                .try_get::<Option<String>, _>("task_id")?
+                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
+            {
+                continue;
+            }
             let event_id: i64 = row.get("id");
             let event_type: String = row.get("event_type");
             let created_str: String = row.get("created_at");
@@ -2104,6 +2144,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
+        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
         let last_episode = sqlx::query(
             "SELECT end_event_id, end_time FROM episodes
              WHERE session_id = ?
@@ -2119,7 +2160,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .flatten()
         {
             sqlx::query(
-                "SELECT id, session_id, event_type, data, created_at
+                "SELECT id, session_id, event_type, data, created_at, task_id
                  FROM events
                  WHERE session_id = ?
                    AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -2137,7 +2178,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .and_then(|row| row.try_get::<String, _>("end_time").ok())
         {
             sqlx::query(
-                "SELECT id, session_id, event_type, data, created_at
+                "SELECT id, session_id, event_type, data, created_at, task_id
                  FROM events
                  WHERE session_id = ?
                    AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -2152,7 +2193,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .await?
         } else {
             sqlx::query(
-                "SELECT id, session_id, event_type, data, created_at
+                "SELECT id, session_id, event_type, data, created_at, task_id
                  FROM events
                  WHERE session_id = ?
                    AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -2167,6 +2208,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows {
+            if row
+                .try_get::<Option<String>, _>("task_id")?
+                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
+            {
+                continue;
+            }
             let event_id: i64 = row.get("id");
             let row_session_id: String = row.get("session_id");
             let event_type: String = row.get("event_type");
@@ -2240,8 +2287,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
+        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
         let rows = sqlx::query(
-            "SELECT id, session_id, event_type, data, created_at
+            "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
              WHERE session_id = ?
                AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -2255,6 +2303,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows {
+            if row
+                .try_get::<Option<String>, _>("task_id")?
+                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
+            {
+                continue;
+            }
             let event_id: i64 = row.get("id");
             let row_session_id: String = row.get("session_id");
             let event_type: String = row.get("event_type");
@@ -2296,8 +2350,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         since: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
+        let suppressed_tasks = self.all_memory_suppressed_tasks().await?;
         let rows = sqlx::query(
-            "SELECT id, session_id, event_type, data, created_at
+            "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
              WHERE created_at >= ?
                AND event_type IN ('user_message', 'assistant_response', 'tool_result')
@@ -2312,6 +2367,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         let mut messages = Vec::with_capacity(rows.len());
         let mut isolation_by_session: HashMap<String, bool> = HashMap::new();
         for row in rows {
+            if row
+                .try_get::<Option<String>, _>("task_id")?
+                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
+            {
+                continue;
+            }
             let event_id: i64 = row.get("id");
             let session_id: String = row.get("session_id");
             let memory_isolated = match isolation_by_session.get(&session_id) {
@@ -2363,8 +2424,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         since: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
+        let suppressed_tasks = self.all_memory_suppressed_tasks().await?;
         let rows = sqlx::query(
-            "SELECT id, session_id, event_type, data, created_at
+            "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
              WHERE created_at >= ?
                AND event_type = 'user_message'
@@ -2379,6 +2441,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         let mut messages = Vec::with_capacity(rows.len());
         let mut isolation_by_session: HashMap<String, bool> = HashMap::new();
         for row in rows {
+            if row
+                .try_get::<Option<String>, _>("task_id")?
+                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
+            {
+                continue;
+            }
             let event_id: i64 = row.get("id");
             let session_id: String = row.get("session_id");
             let memory_isolated = match isolation_by_session.get(&session_id) {

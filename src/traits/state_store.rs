@@ -47,6 +47,23 @@ pub trait MessageStore: Send + Sync {
     async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
         self.clear_session(session_id).await
     }
+
+    /// Advance the durable context floor without hiding the current turn.
+    ///
+    /// This is the lifecycle equivalent of starting a new conversation thread:
+    /// earlier events remain queryable for audit and explicit history lookup,
+    /// while ordinary prompt/context hydration begins after
+    /// `cleared_after_event_id`. Stores without a durable boundary may keep the
+    /// default no-op; production stores should also prune their hot context to
+    /// `retained_turn_id` so an in-memory cache cannot bypass the boundary.
+    async fn advance_session_context_boundary(
+        &self,
+        _session_id: &str,
+        _cleared_after_event_id: i64,
+        _retained_turn_id: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Durable projection of a session's open request/question state.

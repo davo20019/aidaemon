@@ -130,22 +130,29 @@ async fn build_isolated_mandate_bootstrap(
         }
     };
 
-    let (core_prompt_bytes, task_context_tail, active_skill_names, project_instruction_tracker) =
-        agent
-            .build_system_prompt_for_message(
-                &emitter,
-                &task_id,
-                session_id,
-                user_text,
-                user_role,
-                channel_ctx,
-                tool_defs.len(),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await?;
+    let (
+        core_prompt_bytes,
+        fresh_task_context_tail,
+        continuation_task_context_tail,
+        active_skill_names,
+        project_instruction_tracker,
+    ) = agent
+        .build_system_prompt_for_message(
+            &emitter,
+            &task_id,
+            session_id,
+            user_text,
+            user_role,
+            channel_ctx,
+            tool_defs.len(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .await?;
     anyhow::ensure!(
         active_skill_names.is_empty() && project_instruction_tracker.is_none(),
         "isolated mandate prompt unexpectedly returned generic instruction state"
@@ -171,6 +178,7 @@ async fn build_isolated_mandate_bootstrap(
 
     let learning_ctx = LearningContext {
         user_text: user_text.to_string(),
+        memory_persistence_allowed: false,
         intent_domains: Vec::new(),
         tool_calls: Vec::new(),
         errors: Vec::new(),
@@ -208,6 +216,10 @@ async fn build_isolated_mandate_bootstrap(
     Ok(BootstrapOutcome::Continue(Box::new(BootstrapData {
         user_text: user_text.to_string(),
         task_id,
+        task_plan: None,
+        task_assessment_attempted: false,
+        memory_pipeline_policy:
+            super::task_planning::MemoryPipelinePolicy::SuppressedByCurrentContract,
         resume_execution_snapshot: None,
         emitter,
         learning_ctx,
@@ -229,7 +241,8 @@ async fn build_isolated_mandate_bootstrap(
         turn_context,
         project_instruction_tracker,
         core_prompt_bytes,
-        task_context_tail,
+        fresh_task_context_tail,
+        continuation_task_context_tail,
         session_summary: None,
         harness_eval,
     })))
@@ -380,7 +393,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let mut user_msg = user_msg;
     user_msg.importance = score;
 
-    agent
+    let user_message_event_id = agent
         .append_user_message_with_event(
             &emitter,
             &user_msg,
@@ -423,36 +436,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
-    // Only fetch identity/profile categories — NOT get_facts(None) which returned
-    // every fact in the DB, causing unrelated facts (Ecuador travel, WiFi router
-    // tips, etc.) to bleed into prompts for unrelated queries.
-    let owner_dm_fact_cache = if agent.depth == 0
-        && user_role == UserRole::Owner
-        && channel_ctx.should_inject_personal_memory()
-    {
-        let mut identity_facts = Vec::new();
-        for cat in &[
-            "identity",
-            "personal",
-            "profile",
-            "user",
-            "assistant",
-            "bot",
-            "relationship",
-            "preference",
-            "family",
-        ] {
-            if let Ok(mut facts) = agent.state.get_facts(Some(cat)).await {
-                identity_facts.append(&mut facts);
-            }
-        }
-        Some(identity_facts)
-    } else {
-        None
-    };
     // Initialize learning context for post-task learning
     let mut learning_ctx = LearningContext {
         user_text: user_text.to_string(),
+        // Finalized below after semantic assessment, before this context can
+        // reach any post-task learning path.
+        memory_persistence_allowed: false,
         intent_domains: Vec::new(),
         tool_calls: Vec::new(),
         errors: Vec::new(),
@@ -824,9 +813,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         );
     }
 
-    // 2a. Load conversation summary BEFORE building the prompt. Pillar A: the
-    // session summary now participates in the per-task context tail, so it must
-    // be available when `build_system_prompt_for_message` compiles the tail.
+    // Compile task relationship and capability policy before any optional
+    // memory access. The same assessment artifact is handed to the main loop;
+    // policy and finalization therefore cannot diverge through two model calls.
     let non_owner_shared_context = user_role != UserRole::Owner
         && matches!(
             channel_ctx.visibility,
@@ -835,13 +824,203 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 | ChannelVisibility::PublicExternal
         );
 
+    let mut session_summary = if agent.context_window_config.enabled
+        && agent.mandate_execution.is_none()
+        && !non_owner_shared_context
+    {
+        agent
+            .state
+            .get_conversation_summary(session_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|summary| summary.last_turn_seq.is_some())
+    } else {
+        None
+    };
+
+    // Resolve turn/project context before task assessment and prompt
+    // construction. The main loop reuses this exact snapshot.
+    let turn_context = agent
+        .build_turn_context_from_recent_history_with_origin(
+            session_id,
+            user_text,
+            ctx.internal_continuation,
+        )
+        .await;
+    let model_trust_tier = agent.trust_tier_for_model(&model);
+    let planner_trust_tier = model_trust_tier.as_str();
+    let assessment_mode = match model_trust_tier {
+        crate::agent::trust_tier::ModelTrustTier::Guided => {
+            super::task_planning::TaskAssessmentMode::GuidedPlan
+        }
+        crate::agent::trust_tier::ModelTrustTier::Autonomous => {
+            super::task_planning::TaskAssessmentMode::AutonomousRouting
+        }
+    };
+    let assessment_decision_type = match assessment_mode {
+        super::task_planning::TaskAssessmentMode::GuidedPlan => {
+            crate::events::DecisionType::HandHoldingTelemetry
+        }
+        super::task_planning::TaskAssessmentMode::AutonomousRouting => {
+            crate::events::DecisionType::IntentGate
+        }
+    };
+    let planner_skip_reason = if agent.mandate_execution.is_some() {
+        Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
+    } else {
+        super::task_planning::planning_skip_reason(user_text, false)
+    };
+    let (task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
+        agent
+            .emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                assessment_decision_type,
+                "Task assessment skipped".to_string(),
+                crate::agent::hand_holding_telemetry::planner_skip_metadata(
+                    reason,
+                    &model,
+                    planner_trust_tier,
+                ),
+            )
+            .await;
+        (None, false)
+    } else {
+        let planner_context = super::task_planning::task_assessment_conversation_context(
+            turn_context.followup_mode,
+            session_summary
+                .as_ref()
+                .map(|summary| summary.summary.as_str()),
+            &turn_context.recent_messages,
+        );
+        let planner_model = llm_router
+            .as_ref()
+            .map(|router| router.select(crate::router::Tier::Primary))
+            .unwrap_or(model.as_str());
+        agent
+            .emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                assessment_decision_type,
+                "Task assessment attempted".to_string(),
+                crate::agent::hand_holding_telemetry::planner_result_metadata(
+                    "attempted",
+                    planner_model,
+                    planner_trust_tier,
+                    crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
+                    None,
+                ),
+            )
+            .await;
+        (
+            super::task_planning::generate_task_plan(
+                llm_provider.clone(),
+                planner_model,
+                user_text,
+                planner_context.as_deref(),
+                assessment_mode,
+                Some(super::task_planning::PlannerTelemetryCtx {
+                    emitter: &emitter,
+                    state: agent.state.as_ref(),
+                    session_id,
+                    task_id: &task_id,
+                }),
+            )
+            .await,
+            true,
+        )
+    };
+    let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
+        &turn_context.completion_contract,
+        task_plan.as_ref(),
+        user_text,
+    );
+    let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
+    learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;
+    emitter
+        .emit(
+            EventType::MemoryPolicyCompiled,
+            crate::events::MemoryPolicyCompiledData {
+                task_id: task_id.clone(),
+                turn_id: Some(user_msg_id.clone()),
+                access: if memory_pipeline_allowed {
+                    crate::events::MemoryPipelineAccess::Allowed
+                } else {
+                    crate::events::MemoryPipelineAccess::Suppressed
+                },
+                reason_code: memory_pipeline_policy.reason_code().to_string(),
+                retrieval_suppressed: !memory_pipeline_allowed,
+                persistence_suppressed: !memory_pipeline_allowed,
+            },
+        )
+        .await?;
+    agent
+        .emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::GateTelemetry,
+            "Compiled automatic memory policy".to_string(),
+            json!({
+                "condition": "memory_policy_compiled",
+                "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
+                "reason_code": memory_pipeline_policy.reason_code(),
+                "retrieval_suppressed": !memory_pipeline_allowed,
+                "message_projection_suppressed": !memory_pipeline_allowed,
+                "post_task_learning_suppressed": !memory_pipeline_allowed,
+            }),
+        )
+        .await;
+    if memory_pipeline_allowed {
+        if let Err(error) = agent
+            .event_store
+            .project_user_message_memory_span(user_message_event_id)
+            .await
+        {
+            tracing::debug!(%error, user_message_event_id, "Deferred allowed user-message span projection");
+        }
+    }
+
+    // Identity/profile retrieval is optional memory access too; compile the
+    // policy first, then fetch only the bounded categories used by the prompt.
+    let owner_dm_fact_cache = if memory_pipeline_allowed
+        && agent.depth == 0
+        && user_role == UserRole::Owner
+        && channel_ctx.should_inject_personal_memory()
+    {
+        let mut identity_facts = Vec::new();
+        for category in &[
+            "identity",
+            "personal",
+            "profile",
+            "user",
+            "assistant",
+            "bot",
+            "relationship",
+            "preference",
+            "family",
+        ] {
+            if let Ok(mut facts) = agent.state.get_facts(Some(category)).await {
+                identity_facts.append(&mut facts);
+            }
+        }
+        Some(identity_facts)
+    } else {
+        None
+    };
+
     // Emergency pre-call compaction is token-driven and happens before the
     // tail/cursor snapshot is built, so this turn can safely use the refreshed
-    // state. Normal maintenance remains the coalesced post-turn worker.
+    // state. It is itself a memory read/write pipeline and is therefore gated
+    // by the compiled task policy.
     if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && user_role.can_persist_owner_memory()
         && !non_owner_shared_context
+        && memory_pipeline_allowed
     {
         let compaction_model = llm_router
             .as_ref()
@@ -878,9 +1057,10 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         }
     }
 
-    let session_summary = if agent.context_window_config.enabled
+    session_summary = if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && !non_owner_shared_context
+        && memory_pipeline_allowed
     {
         agent
             .state
@@ -896,16 +1076,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         None
     };
 
-    // Resolve turn/project context before prompt construction. The main loop
-    // reuses this exact snapshot so instruction scope cannot drift between the
-    // prompt AIDaemon saw and the filesystem scope its tools enforce.
-    let turn_context = agent
-        .build_turn_context_from_recent_history_with_origin(
-            session_id,
-            user_text,
-            ctx.internal_continuation,
-        )
-        .await;
     let project_instruction_scope = if turn_context.allow_multi_project_scope {
         // A single instruction hierarchy must not silently govern an explicit
         // multi-repository request. Each delegated working directory can still
@@ -918,6 +1088,13 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         // already authorized by their active workspace grant.
         workspace_grant.map(|grant| grant.project_root.as_str())
     };
+    let preserve_conversation_context = matches!(
+        turn_context.followup_mode,
+        Some(
+            crate::agent::followup::FollowupMode::Followup
+                | crate::agent::followup::FollowupMode::ClarificationAnswer
+        )
+    );
 
     // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
     // Returns the session-static CORE bytes (message zero) and the per-task
@@ -931,22 +1108,29 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // MISS a `Core prompt invalidated component=...` line is logged there. Option
     // (b) in the plan — chosen for the smaller diff since assemble + render already
     // co-locate at that call site.
-    let (core_prompt_bytes, task_context_tail, active_skill_names, project_instruction_tracker) =
-        agent
-            .build_system_prompt_for_message(
-                &emitter,
-                &task_id,
-                session_id,
-                user_text,
-                user_role,
-                &channel_ctx,
-                tool_defs.len(),
-                resume_checkpoint.as_ref(),
-                owner_dm_fact_cache.as_deref(),
-                session_summary.as_ref(),
-                project_instruction_scope,
-            )
-            .await?;
+    let (
+        core_prompt_bytes,
+        fresh_task_context_tail,
+        continuation_task_context_tail,
+        active_skill_names,
+        project_instruction_tracker,
+    ) = agent
+        .build_system_prompt_for_message(
+            &emitter,
+            &task_id,
+            session_id,
+            user_text,
+            user_role,
+            &channel_ctx,
+            tool_defs.len(),
+            resume_checkpoint.as_ref(),
+            owner_dm_fact_cache.as_deref(),
+            session_summary.as_ref(),
+            memory_pipeline_allowed,
+            preserve_conversation_context,
+            project_instruction_scope,
+        )
+        .await?;
 
     // An external-reference skill may narrow the roster only after it is the
     // final activated skill. Raw trigger matches are merely semantic
@@ -1020,6 +1204,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let data = BootstrapData {
         user_text: user_text.to_string(),
         task_id,
+        task_plan,
+        task_assessment_attempted,
+        memory_pipeline_policy,
         resume_execution_snapshot: resume_checkpoint
             .as_ref()
             .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
@@ -1043,7 +1230,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         turn_context,
         project_instruction_tracker,
         core_prompt_bytes,
-        task_context_tail,
+        fresh_task_context_tail,
+        continuation_task_context_tail,
         session_summary,
         harness_eval,
     };
@@ -1141,7 +1329,12 @@ mod mandate_bootstrap_isolation_tests {
             data.turn_context.goal_user_text,
             "Execute the built-in bounded mandate protocol for this exact worker fence."
         );
-        let prompt = format!("{}\n{}", data.core_prompt_bytes, data.task_context_tail);
+        let prompt = format!(
+            "{}\n{}\n{}",
+            data.core_prompt_bytes,
+            data.fresh_task_context_tail,
+            data.continuation_task_context_tail
+        );
         for sentinel in forbidden {
             assert!(
                 !prompt.contains(sentinel),

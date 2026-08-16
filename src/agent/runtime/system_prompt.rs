@@ -172,8 +172,11 @@ impl Agent {
         resume_checkpoint: Option<&ResumeCheckpoint>,
         owner_dm_fact_cache: Option<&[crate::traits::Fact]>,
         session_summary: Option<&crate::traits::ConversationSummary>,
+        memory_pipeline_allowed: bool,
+        preserve_conversation_context: bool,
         project_instruction_scope: Option<&str>,
     ) -> anyhow::Result<(
+        String,
         String,
         String,
         Vec<String>,
@@ -185,7 +188,7 @@ impl Agent {
         // conversation summaries, and project-instruction discovery are all
         // outside the immutable delegated authority envelope.
         if self.mandate_execution.is_some() {
-            return self
+            let (core, tail, skills, tracker) = self
                 .build_isolated_mandate_system_prompt(
                     emitter,
                     task_id,
@@ -194,7 +197,8 @@ impl Agent {
                     channel_ctx,
                     tools_count,
                 )
-                .await;
+                .await?;
+            return Ok((core, tail.clone(), tail, skills, tracker));
         }
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
@@ -306,42 +310,18 @@ impl Agent {
                     | ChannelVisibility::Public
                     | ChannelVisibility::PublicExternal
             );
-        // Anaphoric explanation follow-ups can benefit from the subject of the
-        // preceding exchange in the private memory-retrieval query. Provider
-        // transcript continuity itself is structural and does not depend on
-        // this heuristic or rewrite the persisted/current user message.
-        let retrieval_query = if mandate_context {
-            user_text.to_string()
-        } else if super::followup::looks_like_context_dependent_followup_question(
-            &user_text.trim().to_ascii_lowercase(),
-        ) {
-            let history = self
-                .state
-                .get_history(session_id, 8)
-                .await
-                .unwrap_or_default();
-            let (previous_assistant, previous_user) =
-                super::followup::find_previous_turns(&history, user_text);
-            let mut parts = vec![user_text.to_string()];
-            if let Some(previous_user) = previous_user {
-                parts.push(format!("Previous request: {previous_user}"));
-            }
-            if let Some(previous_assistant) = previous_assistant {
-                parts.push(format!(
-                    "Previous answer: {}",
-                    crate::utils::truncate_str(&previous_assistant, 1200)
-                ));
-            }
-            parts.join("\n")
-        } else {
-            user_text.to_string()
-        };
+        // Memory retrieval remains current-request-scoped. Conversation
+        // continuity is assembled separately from typed task lineage below;
+        // mixing previous prose into this query would create an unremovable
+        // stale-context channel when semantic assessment refines a provisional
+        // follow-up into a new task.
+        let retrieval_query = user_text.to_string();
 
         // Facts: always use channel-scoped semantic retrieval.
         // Previously the owner_dm_fact_cache (all facts) was used here, but
         // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
         // to bleed into prompts for unrelated queries like "count lines in router.rs".
-        let facts = if mandate_context {
+        let facts = if mandate_context || !memory_pipeline_allowed {
             vec![]
         } else {
             self.state
@@ -357,7 +337,7 @@ impl Agent {
 
         // Critical facts (identity/profile) use the pre-fetched identity-only
         // cache from bootstrap, NOT get_facts(None) which returns ALL facts.
-        let mut critical_fact_summary = if mandate_context {
+        let mut critical_fact_summary = if mandate_context || !memory_pipeline_allowed {
             Default::default()
         } else if inject_personal && user_role == UserRole::Owner {
             if let Some(identity_facts) = owner_dm_fact_cache {
@@ -388,7 +368,7 @@ impl Agent {
         };
 
         // Cross-channel hints (only in non-DM, non-PublicExternal channels)
-        let cross_channel_hints = if mandate_context {
+        let cross_channel_hints = if mandate_context || !memory_pipeline_allowed {
             vec![]
         } else {
             match channel_ctx.visibility {
@@ -409,7 +389,7 @@ impl Agent {
         };
 
         // Episodes: channel-scoped for non-DM channels
-        let episodes = if mandate_context {
+        let episodes = if mandate_context || !memory_pipeline_allowed {
             vec![]
         } else if inject_personal {
             self.state
@@ -434,7 +414,7 @@ impl Agent {
         // Personal goals/profile remain DM-only. Operational failure patterns are
         // safe to use more broadly because they encode agent-side recovery guidance,
         // not user-private preferences.
-        let goals = if mandate_context {
+        let goals = if mandate_context || !memory_pipeline_allowed {
             vec![]
         } else if inject_personal {
             self.state
@@ -444,7 +424,8 @@ impl Agent {
         } else {
             vec![]
         };
-        let patterns = if mandate_context
+        let patterns = if !memory_pipeline_allowed
+            || mandate_context
             || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
         {
             vec![]
@@ -464,7 +445,8 @@ impl Agent {
         };
         // Procedures, error solutions, and expertise are operational — always load
         // (except on PublicExternal where we restrict everything)
-        let (procedures, error_solutions, expertise) = if mandate_context
+        let (procedures, error_solutions, expertise) = if !memory_pipeline_allowed
+            || mandate_context
             || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
         {
             (vec![], vec![], vec![])
@@ -481,14 +463,14 @@ impl Agent {
                 self.state.get_all_expertise().await.unwrap_or_default(),
             )
         };
-        let profile = if !mandate_context && inject_personal {
+        let profile = if memory_pipeline_allowed && !mandate_context && inject_personal {
             self.state.get_user_profile().await.ok().flatten()
         } else {
             None
         };
 
         // Get trusted command patterns for AI context (skip in public channels)
-        let trusted_patterns = if !mandate_context && inject_personal {
+        let trusted_patterns = if memory_pipeline_allowed && !mandate_context && inject_personal {
             self.state
                 .get_trusted_command_patterns()
                 .await
@@ -498,7 +480,8 @@ impl Agent {
         };
 
         // People context: resolve current speaker and fetch people data (only when enabled)
-        let people_enabled = !mandate_context
+        let people_enabled = memory_pipeline_allowed
+            && !mandate_context
             && self
                 .state
                 .get_setting("people_enabled")
@@ -508,42 +491,43 @@ impl Agent {
                 .as_deref()
                 == Some("true");
 
-        let (people, current_person, current_person_facts) = if mandate_context || !people_enabled {
-            (vec![], None, vec![])
-        } else if inject_personal {
-            // In owner DMs: load full people list for system prompt
-            let all_people = self.state.get_all_people().await.unwrap_or_default();
-            // Also load the owner's personal facts so they appear in the prompt
-            let owner_facts = if let Some(owner) = all_people
-                .iter()
-                .find(|p| p.relationship.as_deref() == Some("owner"))
-            {
-                self.state
-                    .get_person_facts(owner.id, None)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
-            (all_people, None, owner_facts)
-        } else if let Some(ref sender_id) = channel_ctx.sender_id {
-            // Non-owner context: try to resolve who is speaking
-            match self.state.get_person_by_platform_id(sender_id).await {
-                Ok(Some(person)) => {
-                    // Update interaction tracking (fire-and-forget)
-                    let _ = self.state.touch_person_interaction(person.id).await;
-                    let facts = self
-                        .state
-                        .get_person_facts(person.id, None)
+        let (people, current_person, current_person_facts) =
+            if !memory_pipeline_allowed || mandate_context || !people_enabled {
+                (vec![], None, vec![])
+            } else if inject_personal {
+                // In owner DMs: load full people list for system prompt
+                let all_people = self.state.get_all_people().await.unwrap_or_default();
+                // Also load the owner's personal facts so they appear in the prompt
+                let owner_facts = if let Some(owner) = all_people
+                    .iter()
+                    .find(|p| p.relationship.as_deref() == Some("owner"))
+                {
+                    self.state
+                        .get_person_facts(owner.id, None)
                         .await
-                        .unwrap_or_default();
-                    (vec![], Some(person), facts)
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                (all_people, None, owner_facts)
+            } else if let Some(ref sender_id) = channel_ctx.sender_id {
+                // Non-owner context: try to resolve who is speaking
+                match self.state.get_person_by_platform_id(sender_id).await {
+                    Ok(Some(person)) => {
+                        // Update interaction tracking (fire-and-forget)
+                        let _ = self.state.touch_person_interaction(person.id).await;
+                        let facts = self
+                            .state
+                            .get_person_facts(person.id, None)
+                            .await
+                            .unwrap_or_default();
+                        (vec![], Some(person), facts)
+                    }
+                    _ => (vec![], None, vec![]),
                 }
-                _ => (vec![], None, vec![]),
-            }
-        } else {
-            (vec![], None, vec![])
-        };
+            } else {
+                (vec![], None, vec![])
+            };
 
         // Build extended system prompt with all memory components
         let memory_context = MemoryContext {
@@ -780,6 +764,8 @@ impl Agent {
                     memory_render.rendered_procedure_ids.len()
                 ),
                 json!({
+                    "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
+                    "pipeline_suppressed": !memory_pipeline_allowed,
                     "fetched": {
                         "facts": facts.len(),
                         "episodes": episodes.len(),
@@ -865,7 +851,17 @@ impl Agent {
             None
         };
 
-        let tail = Self::build_context_tail(
+        let fresh_tail = Self::build_context_tail(
+            critical_facts_block.as_deref(),
+            project_instructions_block.as_deref(),
+            memory_section,
+            channel_ctx.sender_name.as_deref(),
+            None,
+            "",
+            &date_time_str,
+            resume_section.as_deref(),
+        );
+        let continuation_tail = Self::build_context_tail(
             critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
             memory_section,
@@ -875,6 +871,11 @@ impl Agent {
             &date_time_str,
             resume_section.as_deref(),
         );
+        let tail = if preserve_conversation_context {
+            &continuation_tail
+        } else {
+            &fresh_tail
+        };
 
         if let Some(checkpoint) = resume_checkpoint {
             if self.record_decision_points {
@@ -957,7 +958,8 @@ impl Agent {
 
         Ok((
             core_prompt_bytes,
-            tail,
+            fresh_tail,
+            continuation_tail,
             active_skill_names,
             project_instruction_tracker,
         ))
@@ -1737,6 +1739,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_task_prompt_omits_prior_summary_and_session_activity() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::ConversationSummary;
+        use crate::types::{ChannelContext, UserRole};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup test harness");
+        let emitter = crate::events::EventEmitter::new(
+            harness.agent.event_store().clone(),
+            "new-task-session".to_string(),
+        );
+        let summary = ConversationSummary {
+            session_id: "new-task-session".to_string(),
+            summary: "STALE_OUTPUT_FORMAT phase=OLD package_name=stale".to_string(),
+            message_count: 2,
+            last_message_id: "old-answer".to_string(),
+            last_turn_seq: Some(1),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let (_, tail, continuation_tail, _, _) = harness
+            .agent
+            .build_system_prompt_for_message(
+                &emitter,
+                "new-task",
+                "new-task-session",
+                "Observe the current command result.",
+                UserRole::Owner,
+                &ChannelContext::private("synthetic-owner"),
+                0,
+                None,
+                None,
+                Some(&summary),
+                true,
+                false,
+                None,
+            )
+            .await
+            .expect("build new-task prompt");
+
+        assert!(!tail.contains("STALE_OUTPUT_FORMAT"));
+        assert!(!tail.contains("package_name=stale"));
+        assert!(!tail.contains("Compacted Conversation State"));
+        assert!(!tail.contains("Recent Session Context"));
+        assert!(continuation_tail.contains("STALE_OUTPUT_FORMAT"));
+    }
+
+    #[tokio::test]
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{
@@ -1901,7 +1952,7 @@ mod tests {
             harness.agent.event_store().clone(),
             "mandate-session".to_string(),
         );
-        let (core, tail, active_skills, project_tracker) = harness
+        let (core, tail, continuation_tail, active_skills, project_tracker) = harness
             .agent
             .build_system_prompt_for_message(
                 &emitter,
@@ -1914,11 +1965,14 @@ mod tests {
                 None,
                 Some(std::slice::from_ref(&private_fact)),
                 Some(&summary),
+                false,
+                false,
                 project_dir.path().to_str(),
             )
             .await
             .expect("build mandate prompt");
         let prompt = format!("{core}\n{tail}");
+        assert_eq!(tail, continuation_tail);
         for private_sentinel in [
             "PRIVATE CUSTOM PERSONA SENTINEL",
             "PRIVATE MCP SCHEMA SENTINEL",
@@ -1998,7 +2052,13 @@ mod tests {
             &attempt.id,
             &executor_attempt,
         );
-        let (executor_core, executor_tail, executor_skills, executor_tracker) = harness
+        let (
+            executor_core,
+            executor_tail,
+            executor_continuation_tail,
+            executor_skills,
+            executor_tracker,
+        ) = harness
             .agent
             .build_system_prompt_for_message(
                 &emitter,
@@ -2011,11 +2071,14 @@ mod tests {
                 None,
                 Some(std::slice::from_ref(&private_fact)),
                 Some(&summary),
+                false,
+                false,
                 project_dir.path().to_str(),
             )
             .await
             .expect("build isolated mandate executor prompt");
         let executor_prompt = format!("{executor_core}\n{executor_tail}");
+        assert_eq!(executor_tail, executor_continuation_tail);
         assert!(executor_prompt.contains("role: executor"));
         assert!(executor_prompt.contains("durable current-run successful receipt"));
         assert!(!executor_prompt.contains("role: task_lead"));

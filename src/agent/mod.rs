@@ -1188,6 +1188,8 @@ impl Agent {
                 heartbeat,
                 false,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1225,6 +1227,8 @@ impl Agent {
                 request.heartbeat.clone(),
                 true,
                 request.parent_task_id.as_deref(),
+                request.parent_tool_call_id.as_deref(),
+                request.parent_result_id.as_deref(),
             )
             .await?;
         Ok(Self::sanitize_final_reply_markers(&reply))
@@ -1480,6 +1484,7 @@ mod final_reply_marker_tests {
     fn strips_leaked_tool_protocol_tokens_after_graceful_summary() {
         let learning_ctx = LearningContext {
             user_text: "debug this failure".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec!["terminal(`vendor/bin/drush status`)".to_string()],
             errors: vec![],

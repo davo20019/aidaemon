@@ -43,6 +43,11 @@ pub(super) struct ReplayNote {
 #[derive(Clone)]
 pub(super) struct LearningContext {
     pub(super) user_text: String,
+    /// False when the task's compiled capability policy suppresses all
+    /// automatic memory persistence. Canonical task/event telemetry is still
+    /// recorded; only learned procedures, expertise, and failure patterns are
+    /// skipped.
+    pub(super) memory_persistence_allowed: bool,
     pub(super) intent_domains: Vec<String>,
     pub(super) tool_calls: Vec<String>,     // "tool_name(summary)"
     pub(super) errors: Vec<(String, bool)>, // (error_text, was_recovered)
@@ -104,6 +109,10 @@ pub(super) async fn process_learning(
     ctx: LearningContext,
 ) -> anyhow::Result<()> {
     use crate::memory::{expertise, procedures};
+
+    if !ctx.memory_persistence_allowed {
+        return Ok(());
+    }
 
     let task_success = if let Some(outcome) = ctx.task_outcome {
         outcome.task_success()
@@ -1307,6 +1316,7 @@ mod tests {
     fn test_graceful_budget_response_includes_activity() {
         let ctx = LearningContext {
             user_text: "Create a PDF".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec![
                 "read_file(App.jsx)".to_string(),
@@ -1347,6 +1357,7 @@ mod tests {
             .collect();
         let ctx = LearningContext {
             user_text: "big task".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: calls,
             errors: vec![],
@@ -1367,6 +1378,7 @@ mod tests {
     fn test_graceful_goal_daily_budget_response_mentions_budget_and_reset() {
         let ctx = LearningContext {
             user_text: "run the scheduled build".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec![
                 "system_info({})".to_string(),
@@ -1395,6 +1407,7 @@ mod tests {
     fn test_graceful_partial_stall_response_mentions_progress() {
         let ctx = LearningContext {
             user_text: "fix build".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec![
                 "read_file(Cargo.toml)".to_string(),
@@ -1438,6 +1451,7 @@ mod tests {
     fn make_learning_ctx() -> LearningContext {
         LearningContext {
             user_text: "deploy the app".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec![
                 "read_file(main.rs)".to_string(),
@@ -1531,6 +1545,7 @@ mod tests {
     fn ctx_with_single_error(error: &str) -> LearningContext {
         LearningContext {
             user_text: "do something".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec![],
             tool_calls: vec![],
             errors: vec![(error.to_string(), false)],
@@ -1662,6 +1677,7 @@ mod tests {
 
         let ctx = LearningContext {
             user_text: "deploy the app".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec!["deploy".to_string()],
             tool_calls: vec!["read_file(src/main.rs)".to_string()],
             errors: Vec::new(),
@@ -1828,6 +1844,7 @@ mod tests {
     fn process_learning_uses_task_outcome_for_partial_and_failed() {
         let partial_ctx = LearningContext {
             user_text: "inspect homepage".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: vec!["web".to_string()],
             tool_calls: vec!["browser(navigate)".to_string()],
             errors: vec![],

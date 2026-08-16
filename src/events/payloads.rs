@@ -724,6 +724,27 @@ pub struct LlmPayloadInvalidMetric {
     pub count: u64,
 }
 
+/// Durable capability policy shared by prompt retrieval and every background
+/// memory projection. The reason is a bounded runtime code, never copied user
+/// prose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryPolicyCompiledData {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub access: MemoryPipelineAccess,
+    pub reason_code: String,
+    pub retrieval_suppressed: bool,
+    pub persistence_suppressed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPipelineAccess {
+    Allowed,
+    Suppressed,
+}
+
 /// Data for DecisionPoint event (flight recorder).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionPointData {
@@ -787,6 +808,7 @@ pub enum DecisionType {
     IdempotencyReceiptInvalidated,
     IdempotencyIndeterminateBlock,
     EvidenceGate,
+    FinalizationStateSnapshot,
     ExecutionFailureClassification,
     PostExecutionValidation,
     RepetitiveCallDetection,

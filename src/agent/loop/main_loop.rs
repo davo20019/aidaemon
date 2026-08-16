@@ -20,38 +20,127 @@ fn build_stuck_no_output_fallback(_user_text: &str) -> String {
         .to_string()
 }
 
-/// Build assessment context only when the dialogue lifecycle says the current
-/// request depends on an earlier exchange. New tasks already carry their full
-/// authored request separately; feeding unrelated history into their hard
-/// completion contract can manufacture stale observation or mutation duties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationReceiptAssimilation {
+    outcome_status: crate::traits::ToolOutcomeStatus,
+    matched_requirement_indices: Vec<usize>,
+    matched_contract: bool,
+    observation_credited: bool,
+    mutation_credited: bool,
+}
+
+/// Adopt one exact parent receipt into the child task's proof graph.
+///
+/// This is deliberately independent of notification prose. A receipt can
+/// close child obligations only after typed task-lineage validation by the
+/// caller, exact call/result correlation in EventStore, and semantic matching
+/// against the child's current completion contract.
+fn assimilate_continuation_receipt(
+    contract: &CompletionContract,
+    progress: &mut CompletionProgress,
+    evidence: &crate::events::ContinuationToolEvidence,
+    parent_task_id: &str,
+    parent_result_id: &str,
+) -> Option<ContinuationReceiptAssimilation> {
+    let receipt = evidence.result.receipt.as_ref()?;
+    let reportable = matches!(
+        receipt.outcome_status,
+        crate::traits::ToolOutcomeStatus::Succeeded
+            | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+    );
+    if !reportable {
+        return Some(ContinuationReceiptAssimilation {
+            outcome_status: receipt.outcome_status,
+            matched_requirement_indices: Vec::new(),
+            matched_contract: false,
+            observation_credited: false,
+            mutation_credited: false,
+        });
+    }
+
+    let raw_arguments = serde_json::to_string(&evidence.call.arguments).ok()?;
+    let mut metadata = receipt.to_metadata();
+    super::tool_execution_phase::complete_tool_result_semantics(
+        &evidence.result.name,
+        &raw_arguments,
+        &receipt.semantics,
+        &mut metadata,
+    );
+    let semantics = &metadata.semantics;
+    let receipt_scope = format!(
+        "parent:{parent_task_id}:{}:{parent_result_id}",
+        evidence.call.tool_call_id
+    );
+
+    let mutation_credited =
+        receipt.outcome_status.satisfies_requested_condition() && semantics.mutates_state();
+    if mutation_credited {
+        progress.mark_mutation_receipt(contract, semantics, &receipt_scope);
+    }
+
+    let matched_contract = semantics.observes_state()
+        && super::tool_execution_phase::observation_matches_completion_contract(
+            contract,
+            semantics,
+            &raw_arguments,
+            &evidence.result.result,
+            &metadata,
+        );
+    let matched_requirement_indices = if semantics.observes_state() {
+        super::tool_execution_phase::matching_evidence_requirement_indices(
+            contract,
+            semantics,
+            &raw_arguments,
+            &evidence.result.result,
+            &metadata,
+        )
+    } else {
+        Vec::new()
+    };
+    let requirement_match = if contract.evidence_requirements.is_empty() {
+        matched_contract
+    } else {
+        !matched_requirement_indices.is_empty()
+    };
+    let can_verify = semantics.observes_state()
+        && super::tool_execution_phase::tool_result_or_metadata_contains_verifiable_evidence(
+            semantics,
+            &evidence.result.result,
+            &metadata,
+        );
+    let observation_credited = can_verify && requirement_match;
+    if can_verify {
+        if contract.requires_observation && progress.verification_pending && requirement_match {
+            progress.mark_verification_attempt();
+        }
+        progress.mark_observation_receipt(
+            contract,
+            &matched_requirement_indices,
+            matched_contract,
+            &receipt_scope,
+        );
+    }
+
+    Some(ContinuationReceiptAssimilation {
+        outcome_status: receipt.outcome_status,
+        matched_requirement_indices,
+        matched_contract,
+        observation_credited,
+        mutation_credited,
+    })
+}
+
+#[cfg(test)]
 fn task_assessment_conversation_context(
     followup_mode: Option<FollowupMode>,
     session_summary: Option<&str>,
     recent_messages: &[Value],
 ) -> Option<String> {
-    if !matches!(
+    super::bootstrap_phase::task_planning::task_assessment_conversation_context(
         followup_mode,
-        Some(FollowupMode::Followup | FollowupMode::ClarificationAnswer)
-    ) {
-        return None;
-    }
-
-    let mut ctx_parts = Vec::new();
-    if let Some(summary) = session_summary.filter(|summary| !summary.is_empty()) {
-        ctx_parts.push(format!("[Session Summary] {summary}"));
-    }
-    for msg in recent_messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        if !content.is_empty() {
-            ctx_parts.push(format!(
-                "- {}: {}",
-                role.chars().next().unwrap_or('?').to_uppercase(),
-                content
-            ));
-        }
-    }
-    (!ctx_parts.is_empty()).then(|| ctx_parts.join("\n"))
+        session_summary,
+        recent_messages,
+    )
 }
 
 /// Enter one agent-loop iteration and update the state that is common to every
@@ -153,6 +242,8 @@ impl Agent {
         heartbeat: Option<Arc<AtomicU64>>,
         internal_continuation: bool,
         continuation_parent_task_id: Option<&str>,
+        continuation_parent_tool_call_id: Option<&str>,
+        continuation_parent_result_id: Option<&str>,
     ) -> anyhow::Result<String> {
         touch_heartbeat(&heartbeat);
         info!(session_id, "handle_message_impl: starting bootstrap phase");
@@ -175,6 +266,9 @@ impl Agent {
         let BootstrapData {
             user_text: canonical_user_text,
             task_id,
+            task_plan: bootstrap_task_plan,
+            task_assessment_attempted,
+            memory_pipeline_policy,
             resume_execution_snapshot,
             emitter,
             mut learning_ctx,
@@ -196,7 +290,8 @@ impl Agent {
             mut turn_context,
             mut project_instruction_tracker,
             core_prompt_bytes,
-            mut task_context_tail,
+            fresh_task_context_tail,
+            continuation_task_context_tail,
             session_summary,
             mut harness_eval,
         } = match bootstrap_outcome {
@@ -232,14 +327,6 @@ impl Agent {
         // both the stored raw message and the rewritten copy in the provider
         // transcript. Continuity now comes from normal transcript adjacency.
         let llm_user_text = canonical_user_text.clone();
-        // Conversation continuity is topological, not phrase-classified: every
-        // user turn keeps the immediately preceding assistant exchange intact.
-        // Whether the wording continues that topic or starts a new task remains
-        // for the model to interpret from the raw transcript.
-        let prior_assistant_message_id = dialogue_state
-            .as_ref()
-            .and_then(|state| state.last_assistant_turn.as_ref())
-            .map(|turn| turn.message_id.clone());
         info!(
             session_id,
             followup_mode,
@@ -309,9 +396,9 @@ impl Agent {
         let mut semantic_contract_applied = false;
         let task_plan = {
             use super::bootstrap_phase::task_planning::{
-                generate_task_plan, planned_contract_is_complete, planned_contract_is_confident,
+                planned_contract_is_complete, planned_contract_is_confident,
                 planned_mutation_constraints_are_grounded, planned_tool_constraints_are_grounded,
-                planned_response_fields_are_grounded, planning_skip_reason, TaskAssessmentMode,
+                planned_response_fields_are_grounded, TaskAssessmentMode,
             };
             let model_trust_tier = self.trust_tier_for_model(&model);
             let planner_trust_tier = model_trust_tier.as_str();
@@ -329,69 +416,7 @@ impl Agent {
                 }
                 TaskAssessmentMode::AutonomousRouting => crate::events::DecisionType::IntentGate,
             };
-            let planner_skip_reason = if self.mandate_execution.is_some() {
-                Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
-            } else {
-                planning_skip_reason(user_text, false)
-            };
-            if let Some(reason) = planner_skip_reason {
-                self.emit_decision_point(
-                    &emitter,
-                    &task_id,
-                    0,
-                    assessment_decision_type,
-                    "Task assessment skipped".to_string(),
-                    super::hand_holding_telemetry::planner_skip_metadata(
-                        reason,
-                        &model,
-                        planner_trust_tier,
-                    ),
-                )
-                .await;
-                None
-            } else {
-                // Preserve prior narrative for genuine multi-hop follow-ups,
-                // but keep a lifecycle-classified new request contract-local.
-                let planner_context = task_assessment_conversation_context(
-                    turn_context.followup_mode,
-                    session_summary.as_ref().map(|summary| summary.summary.as_str()),
-                    &turn_context.recent_messages,
-                );
-                let planner_model = llm_router
-                    .as_ref()
-                    .map(|router| router.select(crate::router::Tier::Primary))
-                    .unwrap_or(model.as_str());
-                self.emit_decision_point(
-                    &emitter,
-                    &task_id,
-                    0,
-                    assessment_decision_type,
-                    "Task assessment attempted".to_string(),
-                    super::hand_holding_telemetry::planner_result_metadata(
-                        "attempted",
-                        planner_model,
-                        planner_trust_tier,
-                        super::hand_holding_telemetry::PlannerResultStats::empty(),
-                        None,
-                    ),
-                )
-                .await;
-                // This call classifies obligations only; autonomous models
-                // still choose their own execution approach.
-                let plan_opt = generate_task_plan(
-                    llm_provider.clone(),
-                    planner_model,
-                    user_text,
-                    planner_context.as_deref(),
-                    assessment_mode,
-                    Some(super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
-                        emitter: &emitter,
-                        state: self.state.as_ref(),
-                        session_id,
-                        task_id: &task_id,
-                    }),
-                )
-                .await;
+            let plan_opt = bootstrap_task_plan;
                 if let Some(ref plan) = plan_opt {
                     let mut before_contract = turn_context.completion_contract.clone();
                     if let Some(shape) = plan.task_shape.as_ref().filter(|shape| {
@@ -697,7 +722,7 @@ impl Agent {
                         },
                     )
                     .await;
-                } else {
+                } else if task_assessment_attempted {
                     self.emit_decision_point(
                         &emitter,
                         &task_id,
@@ -715,8 +740,32 @@ impl Agent {
                     .await;
                 }
                 plan_opt
-            }
         };
+
+        // The semantic assessment may refine the bootstrap relationship. Use
+        // the finalized typed relationship—not the request wording or an
+        // earlier provisional value—to decide whether prior turns can enter
+        // the provider transcript.
+        let preserve_archived_context = matches!(
+            turn_context.followup_mode,
+            Some(
+                crate::agent::followup::FollowupMode::Followup
+                    | crate::agent::followup::FollowupMode::ClarificationAnswer
+            )
+        );
+        let mut task_context_tail = if preserve_archived_context {
+            continuation_task_context_tail
+        } else {
+            fresh_task_context_tail
+        };
+        let prior_assistant_message_id = preserve_archived_context
+            .then(|| {
+                dialogue_state
+                    .as_ref()
+                    .and_then(|state| state.last_assistant_turn.as_ref())
+                    .map(|turn| turn.message_id.clone())
+            })
+            .flatten();
 
         if self.mandate_execution.is_none()
             && !semantic_contract_applied
@@ -727,11 +776,113 @@ impl Agent {
             );
         }
 
+        // The bootstrap policy was compiled from this exact assessment before
+        // optional memory access. Reassert the deny edge after contract
+        // installation so no later post-task path can widen it.
+        if turn_context
+            .completion_contract
+            .forbidden_tool_scopes
+            .contains(&crate::traits::ToolSemanticScope::UserMemory)
+        {
+            learning_ctx.memory_persistence_allowed = false;
+        }
+        debug_assert_eq!(
+            learning_ctx.memory_persistence_allowed,
+            memory_pipeline_policy.allows_memory()
+        );
+
         // Derive all contract-dependent state exactly once from that finalized
         // value so loop control, progress tracking, budgets, and telemetry agree.
         debug_assert!(turn_context.completion_contract.belongs_to_task(&task_id));
         let mut completion_progress =
             CompletionProgress::new(&turn_context.completion_contract, &task_id);
+
+        // A background completion re-enters as a child task. Import only the
+        // exact terminal receipt named by that typed continuation edge, and
+        // only when the finalized contract explicitly adopted the parent task.
+        // The notification's natural-language body is never proof.
+        if let Some(parent_task_id) = continuation_parent_task_id {
+            let lineage_adopted = turn_context
+                .completion_contract
+                .adopted_from_task_ids
+                .iter()
+                .any(|candidate| candidate == parent_task_id);
+            let exact_reference = continuation_parent_tool_call_id
+                .zip(continuation_parent_result_id);
+            let mut telemetry = json!({
+                "condition": "continuation_receipt_assimilation",
+                "parent_task_id": parent_task_id,
+                "parent_tool_call_id": continuation_parent_tool_call_id,
+                "parent_result_id": continuation_parent_result_id,
+                "child_task_id": task_id,
+                "lineage_adopted": lineage_adopted,
+                "receipt_found": false,
+                "observation_credited": false,
+                "mutation_credited": false,
+                "reason_code": if lineage_adopted {
+                    if exact_reference.is_some() {
+                        "exact_receipt_not_found"
+                    } else {
+                        "incomplete_receipt_reference"
+                    }
+                } else {
+                    "parent_task_not_adopted"
+                },
+            });
+            if lineage_adopted {
+                if let Some((parent_tool_call_id, parent_result_id)) = exact_reference {
+                    if let Some(evidence) = self
+                        .event_store
+                        .continuation_tool_evidence(
+                            session_id,
+                            parent_task_id,
+                            parent_tool_call_id,
+                            parent_result_id,
+                        )
+                        .await?
+                    {
+                        telemetry["receipt_found"] = json!(true);
+                        if let Some(assimilation) = assimilate_continuation_receipt(
+                            &turn_context.completion_contract,
+                            &mut completion_progress,
+                            &evidence,
+                            parent_task_id,
+                            parent_result_id,
+                        ) {
+                            telemetry["outcome_status"] =
+                                json!(assimilation.outcome_status.as_str());
+                            telemetry["matched_requirement_indices"] =
+                                json!(assimilation.matched_requirement_indices);
+                            telemetry["matched_contract"] = json!(assimilation.matched_contract);
+                            telemetry["observation_credited"] =
+                                json!(assimilation.observation_credited);
+                            telemetry["mutation_credited"] =
+                                json!(assimilation.mutation_credited);
+                            telemetry["reason_code"] = json!(
+                                if assimilation.observation_credited
+                                    || assimilation.mutation_credited
+                                {
+                                    "receipt_assimilated"
+                                } else {
+                                    "receipt_did_not_match_child_obligations"
+                                }
+                            );
+                        } else {
+                            telemetry["reason_code"] = json!("receipt_missing_typed_metadata");
+                        }
+                    }
+                }
+            }
+            self.emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::EvidenceGate,
+                "Evaluated typed parent receipt for continuation".to_string(),
+                telemetry,
+            )
+            .await;
+        }
         if turn_context.completion_contract.forbids_tool_use {
             tool_defs.clear();
             let outstanding_needs = turn_context
@@ -1548,9 +1699,11 @@ impl Agent {
                     model: &model,
                     core_prompt: &core_prompt_bytes,
                     task_context_tail: &task_context_tail,
+                    preserve_archived_context,
                     prior_assistant_message_id: prior_assistant_message_id.as_deref(),
                     summary_last_message_id: session_summary
                         .as_ref()
+                        .filter(|_| preserve_archived_context)
                         .filter(|summary| summary.last_turn_seq.is_some())
                         .map(|summary| summary.last_message_id.as_str()),
                     tool_defs: &tool_defs,
@@ -2030,6 +2183,141 @@ mod characterization_tests;
 #[cfg(test)]
 mod stuck_fallback_tests {
     use super::*;
+
+    fn detached_command_evidence(
+        status: crate::traits::ToolOutcomeStatus,
+        exit_code: i32,
+        result: &str,
+    ) -> crate::events::ContinuationToolEvidence {
+        let arguments = json!({
+            "command": "/usr/bin/false",
+            "working_dir": "/tmp",
+        });
+        let mut metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(status),
+            exit_code: Some(exit_code),
+            semantics: crate::tools::command_semantics::classify_shell_command("/usr/bin/false"),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        super::super::tool_execution_phase::complete_tool_result_semantics(
+            "terminal",
+            &serde_json::to_string(&arguments).unwrap(),
+            &metadata.semantics.clone(),
+            &mut metadata,
+        );
+        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+            &metadata,
+            status,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        receipt.result_provenance.result_id = Some("result:synthetic-negative".to_string());
+        crate::events::ContinuationToolEvidence {
+            call: crate::events::ToolCallData {
+                tool_call_id: "call-parent".to_string(),
+                name: "terminal".to_string(),
+                arguments,
+                summary: None,
+                task_id: Some("task-parent".to_string()),
+                idempotency_key: None,
+                policy_rev: None,
+                risk_score: None,
+                turn_id: None,
+            },
+            result: crate::events::ToolResultData {
+                message_id: None,
+                tool_call_id: "call-parent".to_string(),
+                name: "terminal".to_string(),
+                result: result.to_string(),
+                success: true,
+                duration_ms: 1,
+                error: None,
+                task_id: Some("task-parent".to_string()),
+                annotations: Vec::new(),
+                turn_id: None,
+                attachments: Vec::new(),
+                receipt: Some(receipt),
+            },
+        }
+    }
+
+    #[test]
+    fn adopted_negative_parent_receipt_closes_child_outcome_obligation() {
+        let mut contract = CompletionContract {
+            scope_task_id: Some("task-child".to_string()),
+            adopted_from_task_ids: vec!["task-parent".to_string()],
+            requires_observation: true,
+            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Observed process outcome".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: vec!["exit".to_string()],
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        contract.adopt_for_task("task-child");
+        let mut progress = CompletionProgress::new(&contract, "task-child");
+        let evidence = detached_command_evidence(
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            1,
+            "",
+        );
+
+        let assimilation = assimilate_continuation_receipt(
+            &contract,
+            &mut progress,
+            &evidence,
+            "task-parent",
+            "result:synthetic-negative",
+        )
+        .unwrap();
+
+        assert!(assimilation.observation_credited);
+        assert_eq!(assimilation.matched_requirement_indices, [0]);
+        assert!(progress.all_evidence_requirements_satisfied());
+        assert!(!progress.verification_pending);
+    }
+
+    #[test]
+    fn parent_receipt_cannot_close_an_unrelated_child_requirement() {
+        let contract = CompletionContract {
+            scope_task_id: Some("task-child".to_string()),
+            adopted_from_task_ids: vec!["task-parent".to_string()],
+            requires_observation: true,
+            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Read package edition".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+                purpose: crate::traits::EvidencePurpose::Content,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: vec!["edition".to_string()],
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut progress = CompletionProgress::new(&contract, "task-child");
+        let evidence = detached_command_evidence(
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            1,
+            "",
+        );
+
+        let assimilation = assimilate_continuation_receipt(
+            &contract,
+            &mut progress,
+            &evidence,
+            "task-parent",
+            "result:synthetic-negative",
+        )
+        .unwrap();
+
+        assert!(!assimilation.observation_credited);
+        assert!(progress.verification_pending);
+        assert!(!progress.all_evidence_requirements_satisfied());
+    }
 
     #[test]
     fn new_task_assessment_excludes_unrelated_recent_context() {

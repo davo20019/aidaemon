@@ -357,9 +357,9 @@ impl Agent {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Enrich only genuine follow-ups. New tasks already receive recent
-        // conversation context separately; concatenating the previous request
-        // here leaks stale instructions into contracts, schedules, and goals.
+        // Enrich only genuine follow-ups. New tasks start a fresh provider
+        // transcript floor; concatenating the previous request here would leak
+        // stale instructions into contracts, schedules, goals, and replies.
         if followup_mode != FollowupMode::NewTask {
             let request_anchor = continuation_request_anchor.or_else(|| {
                 unfinished_open_request(dialogue_state.as_ref())
@@ -470,10 +470,11 @@ impl Agent {
         }
         TurnContext {
             goal_user_text,
-            recent_messages: extract_recent_parent_messages(
-                &history,
-                GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
-            ),
+            recent_messages: if followup_mode == FollowupMode::NewTask {
+                Vec::new()
+            } else {
+                extract_recent_parent_messages(&history, GOAL_CONTEXT_RECENT_MESSAGES_LIMIT)
+            },
             primary_project_scope,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),
@@ -537,13 +538,13 @@ impl Agent {
         user_role: crate::types::UserRole,
         channel_ctx: &ChannelContext,
         has_attachments: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         let normalized_msg = normalize_message_resources(msg);
         let execution_origin = self
             .mandate_execution
             .as_ref()
             .map(|_| "mandate".to_string());
-        emitter
+        let event_id = emitter
             .emit(
                 EventType::UserMessage,
                 json!({
@@ -584,7 +585,7 @@ impl Agent {
             &normalized_msg,
         )
         .await?;
-        Ok(())
+        Ok(event_id)
     }
 
     pub(super) async fn append_assistant_message_with_event(
@@ -951,7 +952,7 @@ mod tests {
         }));
     }
     #[tokio::test]
-    async fn build_turn_context_includes_history_for_all_modes() {
+    async fn new_task_context_excludes_unrelated_parent_messages() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
 
@@ -977,11 +978,10 @@ mod tests {
             .build_turn_context_from_recent_history("test-session", "Why?")
             .await;
 
-        // Classification still runs (may be NewTask), but history is always included
-        // because the sliding window handles context unconditionally.
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
         assert!(
-            !turn_context.recent_messages.is_empty(),
-            "recent_messages should always be included regardless of classification"
+            turn_context.recent_messages.is_empty(),
+            "a new task must not copy an unrelated response format into its volatile context"
         );
     }
 

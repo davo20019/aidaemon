@@ -4,6 +4,7 @@
 //! unchanged. Owns [`FollowupMode`], [`TurnContextReason`], and the
 //! `looks_like_*` / `classify_followup_mode` family.
 
+#[cfg(test)]
 use super::completion_contract::looks_like_question_request;
 #[cfg(test)]
 use super::completion_contract::HTTP_URL_RE;
@@ -198,6 +199,7 @@ fn has_strong_followup_indicators(lower_text: &str) -> bool {
     recency_refs.iter().any(|r| lower_text.contains(r))
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
     if !looks_like_question_request(lower_text) || lower_text.chars().count() > 160 {
         return false;
@@ -661,6 +663,7 @@ pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower:
         .any(|anaphor| contains_keyword_as_words(lower, anaphor))
 }
 
+#[cfg(test)]
 pub(super) fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
     phrases
         .iter()

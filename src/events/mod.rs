@@ -25,9 +25,9 @@ pub use model_call_telemetry::{
 pub use payloads::*;
 #[allow(unused_imports)]
 pub use store::{
-    EventEmitter, EventStore, LlmStats, PolicyGraduationReport, SessionWriteDrift, TaskLlmSummary,
-    TaskWindowStats, ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport,
-    WriteConsistencyThresholds,
+    ContinuationToolEvidence, EventEmitter, EventStore, LlmStats, PolicyGraduationReport,
+    SessionWriteDrift, TaskLlmSummary, TaskWindowStats, ToolStats, WriteConsistencyGateStatus,
+    WriteConsistencyReport, WriteConsistencyThresholds,
 };
 #[allow(unused_imports)]
 pub use terminal_state::TerminalState;
@@ -252,6 +252,9 @@ pub enum EventType {
     /// A current-request capability prohibition was attempted. The payload
     /// records whether enforcement prevented any side effect.
     UserConstraintViolation,
+    /// The authoritative task-local policy for automatic memory retrieval and
+    /// persistence, compiled before either pipeline can run.
+    MemoryPolicyCompiled,
     /// A runtime-generated continuation was linked to the background tool
     /// receipt and parent task that caused it.
     BackgroundContinuationLinked,

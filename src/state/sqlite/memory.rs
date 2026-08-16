@@ -485,6 +485,12 @@ impl SqliteStateStore {
                  WHERE e.event_type = 'user_message' AND s.id IS NULL
                    AND json_valid(e.data)
                    AND length(trim(COALESCE(json_extract(e.data, '$.content'), ''))) > 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM events policy
+                       WHERE policy.task_id = e.task_id
+                         AND policy.event_type = 'memory_policy_compiled'
+                         AND json_extract(policy.data, '$.access') = 'suppressed'
+                   )
                  ORDER BY e.id LIMIT ?",
             )
             .bind(BATCH_SIZE)
@@ -1017,8 +1023,14 @@ async fn find_evidence_span(
 
 pub(crate) async fn project_event_span(pool: &SqlitePool, event_id: i64) -> anyhow::Result<()> {
     let Some(row) = sqlx::query(
-        "SELECT id, session_id, data, created_at FROM events
-         WHERE id = ? AND event_type = 'user_message'",
+        "SELECT e.id, e.session_id, e.data, e.created_at FROM events e
+         WHERE e.id = ? AND e.event_type = 'user_message'
+           AND NOT EXISTS (
+               SELECT 1 FROM events policy
+               WHERE policy.task_id = e.task_id
+                 AND policy.event_type = 'memory_policy_compiled'
+                 AND json_extract(policy.data, '$.access') = 'suppressed'
+           )",
     )
     .bind(event_id)
     .fetch_optional(pool)

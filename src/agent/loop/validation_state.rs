@@ -1008,6 +1008,7 @@ mod tests {
         };
         let learning_ctx = LearningContext {
             user_text: "deploy it".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: Vec::new(),
             tool_calls: vec![
                 "terminal(npm run build)".to_string(),
@@ -1091,6 +1092,7 @@ mod tests {
         let turn_context = TurnContext::default();
         let learning_ctx = LearningContext {
             user_text: "Deliver and verify a synthetic announcement.".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: Vec::new(),
             tool_calls: vec![
                 "send_node_audio(synthetic-node-1)".to_string(),
@@ -1132,6 +1134,7 @@ mod tests {
         };
         let learning_ctx = LearningContext {
             user_text: "find trials".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: Vec::new(),
             tool_calls: vec![
                 "http_request(GET https://clinicaltrials.gov/api/v2/studies)".to_string(),

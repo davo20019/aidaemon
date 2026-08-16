@@ -304,6 +304,7 @@ fn test_is_short_user_correction_ignores_new_action_requests() {
 fn test_classify_stall_detects_deferred_no_tool_loop() {
     let learning_ctx = LearningContext {
         user_text: "Can you make the PDF nicer?".to_string(),
+        memory_persistence_allowed: true,
         intent_domains: vec![],
         tool_calls: vec![],
         errors: vec![(DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false)],

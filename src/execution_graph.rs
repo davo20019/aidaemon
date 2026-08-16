@@ -294,6 +294,21 @@ impl ExecutionGraph {
             .collect()
     }
 
+    /// Stable receipt identities currently carrying proof edges. This bounded
+    /// projection is used by finalization telemetry so two otherwise identical
+    /// completion decisions can be compared without serializing the graph or
+    /// any tool output.
+    pub(crate) fn satisfying_receipt_ids(&self) -> Vec<String> {
+        self.edges
+            .iter()
+            .filter(|edge| edge.kind == ExecutionEdgeKind::Satisfies)
+            .filter_map(|edge| edge.evidence_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(MAX_GRAPH_NODES)
+            .collect()
+    }
+
     pub(crate) fn invalidate(
         &mut self,
         invalidator_id: &str,

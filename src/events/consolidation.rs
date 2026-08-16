@@ -142,15 +142,48 @@ impl Consolidator {
             });
         }
 
-        // Get unconsolidated events
-        let events = self.event_store.query_unconsolidated(session_id).await?;
+        // Get unconsolidated events, then remove every task whose durable
+        // capability policy suppresses automatic memory. Canonical events stay
+        // available for history/audit; they are merely retired from learning.
+        let all_events = self.event_store.query_unconsolidated(session_id).await?;
+
+        let suppressed_task_ids: std::collections::HashSet<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'suppressed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        let (suppressed_events, events): (Vec<_>, Vec<_>) =
+            all_events.into_iter().partition(|event| {
+                event
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
+            });
+        if !suppressed_events.is_empty() {
+            let ids = suppressed_events
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>();
+            self.event_store.mark_consolidated(&ids).await?;
+        }
 
         if events.is_empty() {
-            return Ok(ConsolidationResult::empty());
+            return Ok(ConsolidationResult {
+                events_processed: suppressed_events.len(),
+                events_consolidated: suppressed_events.len(),
+                ..Default::default()
+            });
         }
 
         let mut result = ConsolidationResult {
-            events_processed: events.len(),
+            events_processed: events.len() + suppressed_events.len(),
+            events_consolidated: suppressed_events.len(),
             ..Default::default()
         };
 
@@ -177,6 +210,13 @@ impl Consolidator {
         let since = Utc::now() - Duration::hours(24);
         if let Ok(completed_plans) = self.plan_store.get_completed_since(session_id, since).await {
             for plan in completed_plans {
+                if plan
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
+                {
+                    continue;
+                }
                 let steps: Vec<String> = plan
                     .steps
                     .iter()
@@ -270,7 +310,7 @@ impl Consolidator {
         // Note: Episode creation is handled exclusively by MemoryManager (LLM-quality episodes)
         let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         self.event_store.mark_consolidated(&event_ids).await?;
-        result.events_consolidated = event_ids.len();
+        result.events_consolidated = result.events_consolidated.saturating_add(event_ids.len());
 
         info!(
             session_id,

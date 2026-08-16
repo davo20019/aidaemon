@@ -699,7 +699,7 @@ pub(super) fn should_refresh_external_action_ack(
         && should_build_external_action_ack(result_text)
 }
 
-pub(super) fn tool_result_contains_verifiable_evidence(
+pub(in crate::agent) fn tool_result_contains_verifiable_evidence(
     semantics: &ToolCallSemantics,
     result_text: &str,
 ) -> bool {
@@ -714,6 +714,54 @@ pub(super) fn tool_result_contains_verifiable_evidence(
             primary.to_ascii_lowercase().as_str(),
             "ok" | "done" | "success" | "completed" | "completed successfully"
         )
+}
+
+/// A completed observation can be evidenced by either substantive returned
+/// content or authoritative structured outcome metadata. The latter matters
+/// for intentionally negative observations such as a command exiting 1 with
+/// empty stdout/stderr: absence of stream bytes must not erase the exit
+/// receipt, while generic prose alone still cannot manufacture evidence.
+pub(in crate::agent) fn tool_result_or_metadata_contains_verifiable_evidence(
+    semantics: &ToolCallSemantics,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> bool {
+    tool_result_contains_verifiable_evidence(semantics, result_text)
+        || (semantics.can_verify_with_result_content()
+            && metadata.outcome_status.is_some()
+            && (metadata.exit_code.is_some()
+                || metadata.http_status.is_some()
+                || metadata.contract_rejected))
+}
+
+/// Complete adapter-supplied result metadata with the exact semantics compiled
+/// for the dispatched call. Adapters own domain outcomes; the central runtime
+/// owns evidence routing, so neither side may accidentally erase the other.
+pub(in crate::agent) fn complete_tool_result_semantics(
+    tool_name: &str,
+    arguments: &str,
+    registered_call_semantics: &ToolCallSemantics,
+    metadata: &mut crate::traits::ToolCallMetadata,
+) {
+    metadata
+        .semantics
+        .merge_missing_from(registered_call_semantics.clone());
+    if metadata.semantics.evidence.is_empty() {
+        metadata.semantics.evidence =
+            crate::agent::inquiry::evidence_capabilities_for_tool_call(tool_name, arguments);
+    }
+    if metadata.semantics.evidence.is_empty() && metadata.semantics.observes_state() {
+        metadata.semantics.evidence =
+            crate::agent::inquiry::evidence_capabilities_from_target_hints(
+                &metadata.semantics.target_hints,
+            );
+    }
+    if metadata.semantics.observes_state()
+        && !metadata.semantics.evidence.is_empty()
+        && metadata.semantics.verification_mode == crate::traits::ToolVerificationMode::None
+    {
+        metadata.semantics.verification_mode = crate::traits::ToolVerificationMode::ResultContent;
+    }
 }
 
 fn normalized_path_value(value: &str) -> Option<String> {
@@ -837,7 +885,7 @@ pub(super) fn verification_target_matches_haystack(
     false
 }
 
-pub(super) fn observation_matches_completion_contract(
+pub(in crate::agent) fn observation_matches_completion_contract(
     contract: &CompletionContract,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
@@ -940,7 +988,7 @@ fn requirement_target_matches(
 /// observation receipt. Resource identity and requested content markers come
 /// from the typed contract; neither a path mention nor tool capability alone
 /// can close a field-level content obligation.
-pub(super) fn matching_evidence_requirement_indices(
+pub(in crate::agent) fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
@@ -1123,6 +1171,47 @@ fn read_receipt_has_complete_content(read: &crate::traits::ReadFileResultMetadat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_outcome_metadata_retains_registered_observation_semantics() {
+        let arguments = r#"{"action":"search","query":"synthetic pets"}"#;
+        let registered = crate::traits::semantics_for_exact_read_actions(
+            arguments,
+            &["search"],
+            crate::traits::ToolMutationEffects::NONE,
+        );
+        let mut metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        complete_tool_result_semantics("manage_memories", arguments, &registered, &mut metadata);
+
+        assert!(metadata.semantics.observes_state());
+        assert!(metadata.semantics.evidence.iter().any(|capability| {
+            capability.scope == crate::traits::ToolSemanticScope::UserMemory
+        }));
+        assert!(tool_result_or_metadata_contains_verifiable_evidence(
+            &metadata.semantics,
+            "No memories matching 'synthetic pets'.",
+            &metadata,
+        ));
+    }
+
+    #[test]
+    fn structured_negative_process_outcome_is_evidence_without_stream_bytes() {
+        let semantics = crate::tools::command_semantics::classify_shell_command("/usr/bin/false");
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            exit_code: Some(1),
+            semantics: semantics.clone(),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        assert!(tool_result_or_metadata_contains_verifiable_evidence(
+            &semantics, "", &metadata,
+        ));
+    }
     use crate::agent::execution_state::{
         default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
     };

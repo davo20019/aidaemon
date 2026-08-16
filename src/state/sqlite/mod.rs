@@ -251,6 +251,15 @@ impl SqliteStateStore {
               AND id > COALESCE(
                 (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
                 0)
+              AND (
+                turn_id IS NULL
+                OR (SELECT MIN(origin.id)
+                    FROM events origin
+                    WHERE origin.session_id = ?1
+                      AND origin.turn_id = events.turn_id) > COALESCE(
+                    (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                    0)
+              )
             ORDER BY created_at DESC
             LIMIT ?2
             "#,
@@ -1811,6 +1820,103 @@ mod turn_id_hydration_tests {
         let after = store.hydrate(sess).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].content.as_deref(), Some("after-clear"));
+    }
+
+    #[tokio::test]
+    async fn advanced_context_boundary_survives_hydration_and_excludes_late_old_turn_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("advance_ctx.db");
+        let db_path = db_path.to_str().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            .await
+            .unwrap();
+        let events = EventStore::new(store.pool()).await.unwrap();
+        let sess = "sess-advance";
+
+        events
+            .append(Event::new(
+                sess,
+                EventType::UserMessage,
+                serde_json::json!({
+                    "message_id": "old-user",
+                    "content": "old request",
+                    "turn_id": "turn-old"
+                }),
+            ))
+            .await
+            .unwrap();
+        let current_event_id = events
+            .append(Event::new(
+                sess,
+                EventType::UserMessage,
+                serde_json::json!({
+                    "message_id": "current-user",
+                    "content": "current request",
+                    "turn_id": "turn-current"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // Prime the hot window with both turns, then advance the durable floor
+        // to immediately before the current typed turn.
+        assert_eq!(store.get_history(sess, 10).await.unwrap().len(), 2);
+        store
+            .advance_session_context_boundary(
+                sess,
+                current_event_id.saturating_sub(1),
+                "turn-current",
+            )
+            .await
+            .unwrap();
+        let hot = store.get_history(sess, 10).await.unwrap();
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].id, "current-user");
+
+        // A delayed callback from the old task arrives after the boundary. Its
+        // event id is new, but its turn origin is not, so hydration and the
+        // turn-anchored provider transcript must both keep it out.
+        events
+            .append(Event::new(
+                sess,
+                EventType::AssistantResponse,
+                serde_json::json!({
+                    "message_id": "late-old-answer",
+                    "content": "phase=OLD",
+                    "turn_id": "turn-old",
+                    "task_id": "task-old",
+                    "model": "test",
+                    "referenced_receipts": []
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let hydrated = store.hydrate(sess).await.unwrap();
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].id, "current-user");
+        let turns = events.get_turns_from_anchor(sess, 0).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id.as_deref(), Some("turn-current"));
+        let contextual = events
+            .query_context_events(sess, chrono::Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(contextual.iter().any(|event| {
+            event
+                .data
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("current-user")
+        }));
+        assert!(!contextual.iter().any(|event| {
+            event
+                .data
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("late-old-answer")
+        }));
     }
 
     #[tokio::test]

@@ -61,7 +61,10 @@ pub(crate) fn present_notification(notification_type: &str, message: &str) -> St
     let heading = match notification_type {
         "completed" => "✅ **Completed**",
         "failed" => "❌ **Run failed**",
-        "escalation" | "mandate_ask" | "mandate_reconciliation_required" => "⚠️ **Action needed**",
+        "escalation"
+        | "mandate_ask"
+        | "mandate_reconciliation_required"
+        | "mandate_objective_control_required" => "⚠️ **Action needed**",
         "stalled" => "⏸️ **Work paused**",
         "token_alert" => "⚠️ **Budget alert**",
         "evergreen_alert" => "⚠️ **Schedule needs attention**",

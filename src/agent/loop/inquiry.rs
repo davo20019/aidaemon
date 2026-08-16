@@ -355,6 +355,39 @@ pub(in crate::agent) fn capability_supports_requirement(
             .satisfies(requirement.temporal_scope)
 }
 
+/// Whether the typed evidence ontology contains any built-in route capable of
+/// satisfying a proposed requirement. This validates contract coherence, not
+/// current tool availability: an impossible authority/scope/time tuple must
+/// never enter the proof graph and consume retries forever.
+pub(in crate::agent) fn requirement_has_builtin_evidence_route(
+    requirement: &RequestEvidenceRequirement,
+) -> bool {
+    const EVIDENCE_MODELED_TOOLS: &[&str] = &[
+        "goal_trace",
+        "manage_mandates",
+        "manage_goal_tasks",
+        "scheduled_goal_runs",
+        "search_history",
+        "manage_memories",
+        "manage_people",
+        "http_request",
+        "read_node_health",
+        "send_node_audio",
+        "web_search",
+        "read_file",
+        "search_files",
+        "git_info",
+        "terminal",
+        "system_info",
+        "self_diagnose",
+    ];
+    EVIDENCE_MODELED_TOOLS.iter().any(|tool_name| {
+        static_evidence_capabilities(tool_name)
+            .iter()
+            .any(|capability| capability_supports_requirement(capability, requirement))
+    })
+}
+
 pub(in crate::agent) fn tool_call_supports_any_requirement(
     tool_name: &str,
     arguments: &str,
@@ -509,6 +542,25 @@ mod tests {
         assert!(!memory
             .iter()
             .any(|capability| capability_supports_requirement(capability, &need)));
+    }
+
+    #[test]
+    fn evidence_ontology_rejects_impossible_direct_current_memory_requirement() {
+        let impossible = requirement(
+            ToolSemanticScope::UserMemory,
+            EvidencePurpose::CurrentState,
+            EvidenceAuthority::Direct,
+            EvidenceTemporalScope::Current,
+        );
+        assert!(!requirement_has_builtin_evidence_route(&impossible));
+
+        let coherent = requirement(
+            ToolSemanticScope::UserMemory,
+            EvidencePurpose::CurrentState,
+            EvidenceAuthority::Advisory,
+            EvidenceTemporalScope::Current,
+        );
+        assert!(requirement_has_builtin_evidence_route(&coherent));
     }
 
     #[test]

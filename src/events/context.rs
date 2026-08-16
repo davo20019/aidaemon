@@ -252,7 +252,7 @@ impl SessionContextCompiler {
         window: Duration,
     ) -> anyhow::Result<SessionContext> {
         let since = Utc::now() - window;
-        let events = self.store.query_events(session_id, since).await?;
+        let events = self.store.query_context_events(session_id, since).await?;
 
         Ok(self.compile_from_events(&events))
     }

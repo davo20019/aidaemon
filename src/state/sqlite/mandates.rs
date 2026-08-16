@@ -1039,6 +1039,93 @@ async fn reconcile_orphaned_mandate_runs(
     Ok(())
 }
 
+/// Quarantine active autopilot rows created before objective controls became a
+/// mandatory policy invariant. We cannot invent a baseline, target, metric
+/// source, or failure budget on the owner's behalf, so legacy rows fail closed
+/// into an explicit recovery state before any review can be leased.
+async fn quarantine_uncontrolled_autopilot_mandates(
+    connection: &mut sqlx::SqliteConnection,
+    now: &str,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT m.id, m.goal_id, m.version, g.session_id
+         FROM mandates m
+         JOIN goals g ON g.id = m.goal_id
+         WHERE m.status = 'active'
+           AND m.autonomy_mode = 'autopilot'
+           AND m.objective_control_json IS NULL",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+
+    for row in rows {
+        let mandate_id: String = row.get("id");
+        let goal_id: String = row.get("goal_id");
+        let version: i64 = row.get("version");
+        let session_id: String = row.get("session_id");
+        let unresolved_mutations = invalidate_open_mandate_runs(connection, &goal_id, now).await?;
+        let (kind, reason_code, message) = if unresolved_mutations > 0 {
+            (
+                MandateSuspensionKind::AuthorityRevokedWithUnresolvedMutation,
+                "legacy_autopilot_missing_objective_control_with_unresolved_mutation",
+                format!(
+                    "Autopilot mandate {} was paused because its legacy policy lacks objective control and an earlier mutation has no terminal receipt. Reconcile the external target first, then configure an owner-approved baseline, target, measurement source/cadence, experiment window, and failure budget before resuming.",
+                    mandate_id.chars().take(8).collect::<String>()
+                ),
+            )
+        } else {
+            (
+                MandateSuspensionKind::ObjectiveControlRequired,
+                "legacy_autopilot_missing_objective_control",
+                format!(
+                    "Autopilot mandate {} was paused because its legacy policy has no objective control. Configure an owner-approved baseline, target, measurement source/cadence, experiment window, and failure budget before resuming; no values were inferred automatically.",
+                    mandate_id.chars().take(8).collect::<String>()
+                ),
+            )
+        };
+        let suspension = MandateSuspension::new(kind, Some(reason_code.to_string()));
+        let transitioned = sqlx::query(
+            "UPDATE mandates
+             SET status = 'awaiting_input', suspension_json = ?,
+                 review_lease_token = NULL, review_lease_expires_at = NULL,
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND goal_id = ? AND status = 'active'
+               AND autonomy_mode = 'autopilot'
+               AND objective_control_json IS NULL AND version = ?",
+        )
+        .bind(serde_json::to_string(&suspension)?)
+        .bind(now)
+        .bind(&mandate_id)
+        .bind(&goal_id)
+        .bind(version)
+        .execute(&mut *connection)
+        .await?;
+        if transitioned.rows_affected() != 1 {
+            continue;
+        }
+        update_controller_status(connection, &goal_id, MandateStatus::AwaitingInput, now).await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO notification_queue
+                (id, goal_id, session_id, notification_type, priority, message,
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
+             VALUES (?, ?, ?, 'mandate_objective_control_required', 'critical', ?, ?,
+                     NULL, 0, NULL, NULL, NULL)",
+        )
+        .bind(format!(
+            "mandate-objective-control-required:{}:{}",
+            mandate_id,
+            version + 1
+        ))
+        .bind(&goal_id)
+        .bind(&session_id)
+        .bind(message)
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MandateStore for SqliteStateStore {
     async fn create_mandate_controller(
@@ -2024,6 +2111,12 @@ impl MandateStore for SqliteStateStore {
         // externally visible effect before crashing. Never auto-retry that
         // ambiguous cycle: atomically pause it for owner reconciliation.
         reconcile_orphaned_mandate_runs(&mut tx, &now_string).await?;
+
+        // Older rows can predate the objective-control invariant enforced on
+        // every new/update path. Reconcile them at the authoritative lease
+        // boundary so a restart cannot silently keep an unmeasurable autopilot
+        // objective active.
+        quarantine_uncontrolled_autopilot_mandates(&mut tx, &now_string).await?;
 
         // Expiry is a hard authority boundary, not merely a query filter. Keep
         // the visible lifecycle coherent so an expired mandate cannot remain
@@ -3209,9 +3302,10 @@ impl MandateStore for SqliteStateStore {
             serde_json::from_str::<serde_json::Value>(context)?;
         }
         match expected_kind {
-            MandateSuspensionKind::AwaitingAnswer => anyhow::ensure!(
+            MandateSuspensionKind::AwaitingAnswer
+            | MandateSuspensionKind::ObjectiveControlRequired => anyhow::ensure!(
                 reconciliation_resolution.is_none(),
-                "question answers cannot carry a reconciliation resolution"
+                "non-reconciliation suspensions cannot carry a reconciliation resolution"
             ),
             MandateSuspensionKind::ReconciliationRequired
             | MandateSuspensionKind::ExecutionLeaseLost
@@ -3228,7 +3322,7 @@ impl MandateStore for SqliteStateStore {
         let now = chrono::Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
-            "SELECT goal_id, created_by_session, suspension_json
+            "SELECT goal_id, created_by_session, suspension_json, objective_control_json
              FROM mandates
              WHERE id = ? AND version = ? AND status = 'awaiting_input'
                AND confirmed_at IS NOT NULL",
@@ -3254,6 +3348,14 @@ impl MandateStore for SqliteStateStore {
             suspension.kind == expected_kind,
             "mandate suspension changed before it was resolved"
         );
+        if expected_kind == MandateSuspensionKind::ObjectiveControlRequired {
+            anyhow::ensure!(
+                current
+                    .get::<Option<String>, _>("objective_control_json")
+                    .is_some(),
+                "objective control must be configured before this mandate can resume"
+            );
+        }
         let goal_id: String = current.get("goal_id");
 
         if let Some(resolution) = reconciliation_resolution {
@@ -4560,6 +4662,71 @@ mod tests {
             run_failure_budget: 3,
             baseline_observed_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn due_claim_quarantines_legacy_autopilot_without_inventing_objective_control() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 0);
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
+        mandate.objective_control = Some(objective_control());
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        // Simulate a row created before objective_control became mandatory.
+        sqlx::query("UPDATE mandates SET objective_control_json = NULL WHERE id = ?")
+            .bind(&mandate.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(store
+            .claim_due_mandates(10, "synthetic-heartbeat", 300)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut quarantined = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(quarantined.status, MandateStatus::AwaitingInput);
+        assert!(quarantined.objective_control.is_none());
+        assert_eq!(
+            quarantined.suspension.as_ref().map(|value| value.kind),
+            Some(MandateSuspensionKind::ObjectiveControlRequired)
+        );
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "paused"
+        );
+        let notices = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_queue
+             WHERE goal_id = ? AND notification_type = 'mandate_objective_control_required'",
+        )
+        .bind(&goal.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1);
+
+        quarantined.objective_control = Some(objective_control());
+        quarantined.version += 1;
+        store.update_mandate(&quarantined).await.unwrap();
+        assert!(store
+            .resolve_mandate_suspension(
+                &mandate.id,
+                quarantined.version,
+                MandateSuspensionKind::ObjectiveControlRequired,
+                None,
+                None,
+                "Owner configured the validated objective control required for autopilot.",
+                "owner-session",
+            )
+            .await
+            .unwrap());
+        let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, MandateStatus::Active);
+        assert!(resumed.objective_control.is_some());
+        assert!(resumed.suspension.is_none());
     }
 
     #[tokio::test]

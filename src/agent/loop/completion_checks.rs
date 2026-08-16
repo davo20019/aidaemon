@@ -1557,6 +1557,7 @@ Top-level keys: data
         };
         let learning_ctx = LearningContext {
             user_text: "I still don't see the posts.".to_string(),
+            memory_persistence_allowed: true,
             intent_domains: Vec::new(),
             tool_calls: vec!["terminal(vite build)".to_string()],
             errors: Vec::new(),

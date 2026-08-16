@@ -49,7 +49,9 @@ async fn test_memory_episodes_injected_into_prompt() {
 /// owner DM, while the full goal store remains available through tools.
 #[tokio::test]
 async fn test_relevant_active_goal_is_rendered_in_owner_prompt() {
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let provider = MockProvider::new()
+        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let harness = setup_test_agent(provider).await.unwrap();
 
     let mut goal = Goal::new_finite(
         "Migrate the database from PostgreSQL to SQLite",
@@ -303,7 +305,9 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
 /// User profile: communication preferences affect the system prompt.
 #[tokio::test]
 async fn test_memory_user_profile_affects_prompt() {
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let provider = MockProvider::new()
+        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let harness = setup_test_agent(provider).await.unwrap();
 
     let profile = UserProfile {
         id: 1,
@@ -390,7 +394,9 @@ async fn test_guest_dm_does_not_receive_owner_profile() {
 /// Minimal context: system prompt has capability summary + profile, NOT bulk data.
 #[tokio::test]
 async fn test_full_memory_stack_in_system_prompt() {
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let provider = MockProvider::new()
+        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let harness = setup_test_agent(provider).await.unwrap();
 
     // Seed user profile (this SHOULD still appear)
     let profile = UserProfile {

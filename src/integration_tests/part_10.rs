@@ -96,13 +96,8 @@ async fn test_task_boundary_injected_between_turns() {
     );
 }
 
-/// File-upload requests are handled by the sliding window and compaction system.
-/// With the adaptive sliding window, small prior pairs may be retained if they
-/// fit within the token budget. The compaction trigger fires on file uploads
-/// without referential language, producing a summary for subsequent context.
-/// This test verifies that the uploaded-file message is always present in the
-/// Turn 2 context and that a task boundary marker separates it from any
-/// retained prior conversation.
+/// A file-upload request that starts a new task keeps the uploaded-file message
+/// while excluding unrelated earlier conversation.
 #[tokio::test]
 async fn test_uploaded_artifact_request_has_task_boundary() {
     let provider = MockProvider::with_responses(vec![
@@ -110,8 +105,6 @@ async fn test_uploaded_artifact_request_has_task_boundary() {
         MockProvider::text_response(
             "Would you like me to get more detailed information for any specific trial(s)?",
         ),
-        // Compaction LLM call (file upload triggers compaction)
-        MockProvider::text_response("Summary of prior conversation."),
         // Turn 2 response
         MockProvider::text_response("I reviewed the uploaded document and identified the issue."),
     ]);
@@ -159,16 +152,19 @@ async fn test_uploaded_artifact_request_has_task_boundary() {
         "Turn 2 should include the uploaded-file context"
     );
 
-    // A task boundary marker should separate prior history from the current request.
+    // The typed fresh-context marker replaces the legacy archived-task marker,
+    // and the unrelated trial-number task is absent.
     assert!(
         turn2_call.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("[Current Task]"))
+                .is_some_and(|s| s.contains("fresh conversation context"))
         }),
-        "Turn 2 should have a task boundary marker: {:?}",
+        "Turn 2 should have a fresh-context marker: {:?}",
         turn2_call.messages
     );
+    let serialized = serde_json::to_string(&turn2_call.messages).unwrap();
+    assert!(!serialized.contains("NCT06737964"), "{serialized}");
 }
 
 /// Regression: after tool progress exists in the current task, a generic idle
@@ -408,12 +404,11 @@ async fn test_executor_mode_retains_tools() {
     );
 }
 
-/// Scenario: Turn 1 makes tool calls, Turn 2 asks a different question.
-/// The immediately preceding turn keeps bounded receipt-bearing tool evidence
-/// so a follow-up can distinguish observed facts from the assistant's prose.
-/// Older turns are still collapsed by the archived renderer.
+/// Scenario: Turn 1 makes tool calls, then Turn 2 starts a different task.
+/// Typed task isolation must keep the old receipt-bearing tool evidence out of
+/// the new provider transcript.
 #[tokio::test]
-async fn test_immediate_parent_tool_evidence_is_bounded_in_follow_up() {
+async fn test_unrelated_task_drops_immediate_parent_tool_evidence() {
     let provider = MockProvider::with_responses(vec![
         // Turn 1: tool call + final response
         MockProvider::tool_call_response("system_info", "{}"),
@@ -455,8 +450,8 @@ async fn test_immediate_parent_tool_evidence_is_bounded_in_follow_up() {
         .unwrap();
     assert_eq!(r2, "Mia is your cat.");
 
-    // Verify Turn 2's messages: Prior 1 tool results retain their strong
-    // receipt and are bounded. Prior 2+ tool results use compact summaries.
+    // Verify Turn 2's messages: the old task's tool receipts and user request
+    // are not ambient context for the unrelated request.
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = call_log.last().unwrap();
     let turn2_msgs = &turn2_call.messages;
@@ -467,33 +462,20 @@ async fn test_immediate_parent_tool_evidence_is_bounded_in_follow_up() {
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .collect();
-    assert!(!tool_msgs.is_empty(), "adjacent evidence must be retained");
-    for tool_msg in &tool_msgs {
-        let content = tool_msg
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        assert!(
-            content.contains("[Tool receipt v4:"),
-            "Prior 1 tool result should retain its receipt, got: {}",
-            content
-        );
-        assert!(
-            content.chars().count() <= 4_000,
-            "Prior 1 tool evidence should be bounded, got: {}",
-            content
-        );
-    }
+    assert!(
+        tool_msgs.is_empty(),
+        "an unrelated task must not inherit old tool evidence: {tool_msgs:?}"
+    );
 
     // Turn 2 SHOULD still have the user messages from both turns
     let user_msgs: Vec<&serde_json::Value> = turn2_msgs
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .collect();
-    assert!(
-        user_msgs.len() >= 2,
-        "Turn 2 should include user messages from both turns, found {}",
-        user_msgs.len()
+    assert_eq!(user_msgs.len(), 1, "only the current task should remain");
+    assert_eq!(
+        user_msgs[0].get("content").and_then(|value| value.as_str()),
+        Some("Who is mia?")
     );
 }
 
@@ -539,7 +521,10 @@ async fn test_synthesized_done_persisted() {
     // After tool execution with empty final response, the agent recovers from
     // the latest tool output ("Here is the latest tool output:") or synthesizes "Done".
     assert!(
-        r1.starts_with("Done") || r1.starts_with("Here is the latest tool output") || r1.starts_with("Here's the command output") || r1.starts_with("Here are the results"),
+        r1.starts_with("Done")
+            || r1.starts_with("Here is the latest tool output")
+            || r1.starts_with("Here's the command output")
+            || r1.starts_with("Here are the results"),
         "Expected Done synthesis or tool output recovery, got: {}",
         r1
     );
@@ -559,32 +544,42 @@ async fn test_synthesized_done_persisted() {
         .unwrap();
     assert!(!r2.is_empty(), "Turn 2 should produce a non-empty response");
 
-    // Verify: Turn 2's first LLM call should have >= 2 separate user messages (not merged)
+    // The different-topic Turn 2 must not receive Turn 1 as ambient prompt
+    // context, but the synthesized completion must still exist in canonical
+    // event history for explicit lookup and audit.
     let call_log = harness.provider.call_log.lock().await;
-    // Turn 2 starts at the 4th call (Turn 1 consumed 3 calls).
     let turn2_call = &call_log[3];
-    let user_msgs: Vec<&serde_json::Value> = turn2_call
-        .messages
-        .iter()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        .collect();
-    assert!(
-        user_msgs.len() >= 2,
-        "Turn 2 should have at least 2 separate user messages (not merged), found {}",
-        user_msgs.len()
-    );
+    let turn2_serialized = serde_json::to_string(&turn2_call.messages).unwrap();
+    assert!(!turn2_serialized.contains("Check my system info"));
+    drop(call_log);
 
-    // Verify: there should be a completion assistant message between the user messages
-    // (either "Done" synthesis or "Here is the latest tool output" recovery)
-    let completion_assistant = turn2_call.messages.iter().any(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
-            && m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with("Done") || s.starts_with("Here is the latest tool output") || s.starts_with("Here's the command output") || s.starts_with("Here are the results") || s.starts_with("Here's"))
+    let canonical = harness
+        .agent
+        .event_store()
+        .get_conversation_history("done_persist_test", 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        canonical
+            .iter()
+            .filter(|message| message.role == "user")
+            .count(),
+        2,
+        "both user messages must remain in canonical history"
+    );
+    let completion_assistant = canonical.iter().any(|message| {
+        message.role == "assistant"
+            && message.content.as_deref().is_some_and(|content| {
+                content.starts_with("Done")
+                    || content.starts_with("Here is the latest tool output")
+                    || content.starts_with("Here's the command output")
+                    || content.starts_with("Here are the results")
+                    || content.starts_with("Here's")
+            })
     });
     assert!(
         completion_assistant,
-        "Turn 2's history should contain the persisted completion assistant message from Turn 1"
+        "canonical history should contain the persisted completion assistant message from Turn 1"
     );
 }
 
@@ -601,6 +596,25 @@ async fn test_old_interaction_assistant_content_truncated() {
         MockProvider::text_response(&long_response_2),
         // Turn 3: direct text response
         MockProvider::text_response("Short answer."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -706,6 +720,17 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         MockProvider::text_response("It is 4."),
         // Turn 2: different topic
         MockProvider::text_response("Rust 1.82.0"),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -786,7 +811,27 @@ async fn test_compaction_fires_on_window_overflow() {
         .map(|_| MockProvider::text_response("Synthetic response"))
         .collect();
 
-    let provider = MockProvider::with_responses(responses);
+    let assessments = (0..8)
+        .map(|index| {
+            MockProvider::semantic_task_assessment(
+                "answer",
+                false,
+                false,
+                &[],
+                if index == 0 {
+                    "new_request"
+                } else {
+                    "continuation"
+                },
+                if index == 0 {
+                    "none"
+                } else {
+                    "conversation_history"
+                },
+            )
+        })
+        .collect();
+    let provider = MockProvider::with_responses(responses).with_task_assessments(assessments);
     let mut harness = setup_test_agent(provider).await.unwrap();
     harness
         .agent
@@ -870,12 +915,9 @@ async fn test_compaction_fires_on_window_overflow() {
     let has_summary = call_log[tail_start..].iter().any(|call| {
         call.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("system")
-                && m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| {
-                        s.contains("[Context Coverage]")
-                            && s.contains("[Compacted Conversation State]")
-                    })
+                && m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+                    s.contains("[Context Coverage]") && s.contains("[Compacted Conversation State]")
+                })
         })
     });
     assert!(
@@ -947,11 +989,13 @@ async fn test_turn_id_groups_messages_within_a_turn() {
         .await
         .unwrap();
 
-    // Pull persisted messages from working memory. Every message that flowed
-    // through `append_message_canonical` during a turn should carry a turn_id.
+    // Pull canonical event history rather than the prompt hot window: a typed
+    // new-task boundary intentionally removes Turn 1 from implicit context,
+    // but it must never erase the audited messages or their turn IDs.
     let history = harness
-        .state
-        .get_history("turn_id_test", 100)
+        .agent
+        .event_store()
+        .get_conversation_history("turn_id_test", 100)
         .await
         .unwrap();
 
@@ -1015,22 +1059,26 @@ async fn test_turn_id_groups_messages_within_a_turn() {
 fn llm_messages_contain_input_audio(messages: &[serde_json::Value]) -> bool {
     messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_audio"))
-            })
+            && m.get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_audio"))
+                })
     })
 }
 
 fn llm_messages_contain_image_url(messages: &[serde_json::Value]) -> bool {
     messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url"))
-            })
+            && m.get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url"))
+                })
     })
 }
 
@@ -1104,10 +1152,7 @@ async fn test_vision_image_attachment_reaches_provider_as_multimodal() {
             .iter()
             .any(|call| llm_messages_contain_image_url(&call.messages)),
         "expected an agent LLM call with image_url content block, got: {:?}",
-        agent_calls
-            .iter()
-            .map(|c| &c.messages)
-            .collect::<Vec<_>>()
+        agent_calls.iter().map(|c| &c.messages).collect::<Vec<_>>()
     );
 }
 
@@ -1200,10 +1245,7 @@ async fn test_audio_attachment_reaches_provider_as_input_audio() {
         "They asked about the weather.",
     )]);
     let harness = setup_test_agent(provider).await.unwrap();
-    harness
-        .agent
-        .set_test_model("gemini-2.0-flash")
-        .await;
+    harness.agent.set_test_model("gemini-2.0-flash").await;
 
     let _ = harness
         .agent
@@ -1259,10 +1301,7 @@ async fn test_audio_disabled_sends_text_stub_only() {
     harness
         .agent
         .set_test_audio_config(AudioConfig::from_files(&files));
-    harness
-        .agent
-        .set_test_model("gemini-2.0-flash")
-        .await;
+    harness.agent.set_test_model("gemini-2.0-flash").await;
 
     let _ = harness
         .agent
@@ -1487,9 +1526,10 @@ async fn test_non_image_attachment_is_text_stub_only() {
     );
 }
 
-/// File uploads with structured attachments should still trigger compaction on the stub marker.
+/// A structured attachment that starts a new task must not inherit an unrelated
+/// earlier task, even when attachment-triggered compaction bookkeeping runs.
 #[tokio::test]
-async fn test_vision_attachment_still_triggers_compaction() {
+async fn test_vision_attachment_starts_fresh_task_context() {
     use std::io::Write;
 
     use crate::channels::attachments::{build_inbound_text, message_attachment};
@@ -1511,7 +1551,6 @@ async fn test_vision_attachment_still_triggers_compaction() {
         MockProvider::text_response(
             "Would you like me to get more detailed information for any specific trial(s)?",
         ),
-        MockProvider::text_response("Summary of prior conversation."),
         MockProvider::text_response("I reviewed the uploaded document and identified the issue."),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
@@ -1544,20 +1583,20 @@ async fn test_vision_attachment_still_triggers_compaction() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
+    let current_calls: Vec<String> = call_log
+        .iter()
+        .map(|call| serde_json::to_string(&call.messages).unwrap())
+        .filter(|messages| messages.contains("Check the doc and fix the issue."))
+        .collect();
     assert!(
-        call_log.len() >= 3,
-        "file upload with attachment should trigger compaction LLM call; got {} calls",
-        call_log.len()
+        !current_calls.is_empty(),
+        "current attachment task was not sent"
     );
     assert!(
-        call_log.iter().any(|call| {
-            call.messages.iter().any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("Summary of prior conversation."))
-            })
-        }),
-        "expected compaction summary in an LLM call"
+        current_calls
+            .iter()
+            .all(|messages| !messages.contains("NCT06737964")),
+        "fresh attachment task inherited unrelated context: {current_calls:?}"
     );
 }
 
@@ -1583,10 +1622,7 @@ async fn test_attachment_stub_metadata_does_not_force_tool_required_loop() {
     let inbound_text = build_inbound_text("", std::slice::from_ref(&attachment));
 
     let vision_reply = MockProvider::text_response("This image looks like a small PNG file.");
-    let provider = MockProvider::with_responses(vec![
-        vision_reply.clone(),
-        vision_reply,
-    ]);
+    let provider = MockProvider::with_responses(vec![vision_reply.clone(), vision_reply]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let reply = harness

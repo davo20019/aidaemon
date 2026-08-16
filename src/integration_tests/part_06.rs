@@ -209,6 +209,24 @@ async fn test_identity_tool_result_survives_context_collapse() {
         ),
         MockProvider::text_response("Saved."),
         MockProvider::text_response("Continuing with your latest request."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "change",
+            true,
+            false,
+            &[],
+            "new_request",
+            "user_memory",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -411,9 +429,10 @@ async fn test_autonomous_tier_performs_bounded_execution_evidence_pass() {
         "the Autonomous model should receive exactly one evidence-seeking retry"
     );
     let calls = harness.provider.call_log.lock().await;
-    assert!(calls
-        .iter()
-        .any(|call| matches!(call.options.tool_choice, crate::traits::ToolChoiceMode::Required)));
+    assert!(calls.iter().any(|call| matches!(
+        call.options.tool_choice,
+        crate::traits::ToolChoiceMode::Required
+    )));
 }
 
 #[tokio::test]
@@ -456,7 +475,10 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
         .unwrap();
 
     assert_eq!(response, limitation);
-    assert_ne!(response, denial, "the unsupported claim needs an evidence pass");
+    assert_ne!(
+        response, denial,
+        "the unsupported claim needs an evidence pass"
+    );
     let calls = harness.provider.call_log.lock().await;
     assert_eq!(calls.len(), 3);
     let recovery = &calls[1];

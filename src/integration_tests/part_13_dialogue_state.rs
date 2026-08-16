@@ -54,22 +54,8 @@ async fn test_semantic_followup_uses_dialogue_state_projection() {
         MockProvider::text_response("Here is the original answer you asked for."),
     ])
     .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "none",
-        ),
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "continuation", "none"),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -176,22 +162,8 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
         ),
     ])
     .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        ),
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
         MockProvider::semantic_task_assessment(
             "answer",
             false,
@@ -241,7 +213,11 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
     let calls = harness.provider.call_log.lock().await;
     let source_call = calls.last().expect("source-question model call");
     let serialized = serde_json::to_string(&source_call.messages).unwrap();
-    assert_eq!(serialized.matches(source_question).count(), 1, "{serialized}");
+    assert_eq!(
+        serialized.matches(source_question).count(),
+        1,
+        "{serialized}"
+    );
     assert!(!serialized.contains("Original request:"), "{serialized}");
 
     let job_answer_idx = source_call
@@ -263,16 +239,9 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
         serialized.contains("/tmp/synthetic-ai-job-prep/briefing.md"),
         "source-bearing tail of the preceding answer must survive"
     );
-    let location_idx = source_call
-        .messages
-        .iter()
-        .position(|message| {
-            message.get("content").and_then(|content| content.as_str()) == Some(location_answer)
-        })
-        .expect("older location answer remains available as history");
     assert!(
-        location_idx < job_answer_idx,
-        "older Fairfax answer must not replace the structural parent"
+        !serialized.contains(location_answer),
+        "the continuation must retain its structural parent without resurrecting an older unrelated task"
     );
 }
 
@@ -408,13 +377,20 @@ async fn test_new_request_drops_previous_failed_search_exchange_from_prompt() {
         }),
         "current request should still be present in the prompt"
     );
-    // Pillar B (Task 7): under turn-anchored whole-turn history, the prior turn
-    // IS retained as ARCHIVED context (the prior user message survives verbatim),
-    // so we no longer assert its absence. What MUST still be dropped is the
-    // learned-helplessness failure boilerplate: `render_archived` excludes
-    // `is_failure_boilerplate` assistant text and substitutes a terminal-state
-    // placeholder, so the poisoning "I wasn't able to..." reply never re-enters
-    // the prompt to trigger giving-up behavior.
+    // A typed new request starts a fresh provider transcript. Canonical history
+    // remains queryable, but neither the old request nor its failure prose may
+    // become ambient instructions for this task.
+    assert!(
+        !second_call.messages.iter().any(|msg| {
+            msg.get("role").and_then(|role| role.as_str()) != Some("system")
+                && msg
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .is_some_and(|content| content.contains("tallest buildings"))
+        }),
+        "fresh requests should not inherit prior user text: {:?}",
+        second_call.messages
+    );
     assert!(
         !second_call.messages.iter().any(|msg| {
             if msg.get("role").and_then(|role| role.as_str()) == Some("system") {

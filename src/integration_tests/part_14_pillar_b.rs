@@ -64,6 +64,33 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_cross_turn_archived";
@@ -89,7 +116,11 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
     }
 
     let calls = harness.provider.call_log.lock().await;
-    assert!(calls.len() >= 4, "expected one LLM call per turn, got {}", calls.len());
+    assert!(
+        calls.len() >= 4,
+        "expected one LLM call per turn, got {}",
+        calls.len()
+    );
     // Turn 3 carries turn 1 in the stable archived prefix and turn 2 in the
     // transient continuity suffix. Turn 4 extends the stable prefix with turn
     // 2 while keeping turn 1 byte-identical.
@@ -161,6 +192,33 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_fact_between_turns";
@@ -384,12 +442,32 @@ async fn pillar_b_identity_statement_in_archived_turn_survives_verbatim() {
         MockProvider::text_response("Understood, noted."),
         MockProvider::text_response("Okay."),
         MockProvider::text_response("Sure."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_identity_archived";
 
     // Turn 1: the identity-critical statement.
-    let identity_stmt = "My name is Aurelia and I am the system owner; never call me anything else.";
+    let identity_stmt =
+        "My name is Aurelia and I am the system owner; never call me anything else.";
     let _ = harness
         .agent
         .handle_message(

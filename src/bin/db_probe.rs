@@ -134,13 +134,28 @@ struct TelemetryReconciliationCounts {
     legacy_event_rows: usize,
 }
 
+#[cfg(test)]
 fn telemetry_reconciliation_counts(
     token_call_ids: &[Option<String>],
     event_rows: &[(Option<String>, bool)],
 ) -> TelemetryReconciliationCounts {
+    telemetry_reconciliation_counts_windowed(token_call_ids, event_rows, token_call_ids, event_rows)
+}
+
+/// Reconcile a requested diagnostic window against the complete durable
+/// counterpart index. Window membership selects which rows are reported; it
+/// must never decide whether a call is matched. Otherwise widening the window
+/// can relabel the same call from `token_only` to correlated merely because its
+/// counterpart timestamp fell just outside the narrower cutoff.
+fn telemetry_reconciliation_counts_windowed(
+    window_token_call_ids: &[Option<String>],
+    window_event_rows: &[(Option<String>, bool)],
+    all_token_call_ids: &[Option<String>],
+    all_event_rows: &[(Option<String>, bool)],
+) -> TelemetryReconciliationCounts {
     let mut token_frequencies = std::collections::HashMap::<String, usize>::new();
     let mut legacy_token_rows = 0usize;
-    for call_id in token_call_ids {
+    for call_id in window_token_call_ids {
         match call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
             Some(call_id) => *token_frequencies.entry(call_id.to_string()).or_insert(0) += 1,
             None => legacy_token_rows += 1,
@@ -149,7 +164,7 @@ fn telemetry_reconciliation_counts(
 
     let mut event_frequencies = std::collections::HashMap::<String, usize>::new();
     let mut legacy_event_rows = 0usize;
-    for (call_id, usage_present) in event_rows {
+    for (call_id, usage_present) in window_event_rows {
         if call_id.as_deref().is_none_or(str::is_empty) {
             legacy_event_rows += 1;
         }
@@ -163,10 +178,30 @@ fn telemetry_reconciliation_counts(
 
     let token_ids: std::collections::HashSet<&String> = token_frequencies.keys().collect();
     let event_ids: std::collections::HashSet<&String> = event_frequencies.keys().collect();
+    let all_token_ids = all_token_call_ids
+        .iter()
+        .filter_map(|call_id| call_id.as_deref())
+        .filter(|call_id| !call_id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    let all_usage_event_ids = all_event_rows
+        .iter()
+        .filter(|(_, usage_present)| *usage_present)
+        .filter_map(|(call_id, _)| call_id.as_deref())
+        .filter(|call_id| !call_id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
     TelemetryReconciliationCounts {
-        correlated: token_ids.intersection(&event_ids).count(),
-        token_only: token_ids.difference(&event_ids).count(),
-        event_only: event_ids.difference(&token_ids).count(),
+        correlated: token_ids
+            .iter()
+            .filter(|call_id| all_usage_event_ids.contains(call_id.as_str()))
+            .count(),
+        token_only: token_ids
+            .iter()
+            .filter(|call_id| !all_usage_event_ids.contains(call_id.as_str()))
+            .count(),
+        event_only: event_ids
+            .iter()
+            .filter(|call_id| !all_token_ids.contains(call_id.as_str()))
+            .count(),
         duplicate_token_rows: token_frequencies
             .values()
             .map(|count| count.saturating_sub(1))
@@ -404,6 +439,31 @@ mod tests {
         assert_eq!(counts.duplicate_event_rows, 1);
         assert_eq!(counts.legacy_token_rows, 1);
         assert_eq!(counts.legacy_event_rows, 2);
+    }
+
+    #[test]
+    fn reconciliation_category_does_not_depend_on_diagnostic_window() {
+        let narrow_tokens = vec![Some("call-boundary".to_string())];
+        let narrow_events = Vec::new();
+        let all_tokens = narrow_tokens.clone();
+        let all_events = vec![(Some("call-boundary".to_string()), true)];
+
+        let narrow = telemetry_reconciliation_counts_windowed(
+            &narrow_tokens,
+            &narrow_events,
+            &all_tokens,
+            &all_events,
+        );
+        let wide = telemetry_reconciliation_counts_windowed(
+            &narrow_tokens,
+            &all_events,
+            &all_tokens,
+            &all_events,
+        );
+
+        assert_eq!(narrow.token_only, 0);
+        assert_eq!(wide.token_only, 0);
+        assert_eq!(narrow.correlated, wide.correlated);
     }
 
     #[test]
@@ -1650,7 +1710,38 @@ async fn main() -> anyhow::Result<()> {
         }
         event_rows.push((call_id, token_usage_present));
     }
-    let reconciliation = telemetry_reconciliation_counts(&token_call_ids, &event_rows);
+    // Counterpart presence is resolved over the complete durable index. The
+    // requested time window selects the reported cohort only; it cannot change
+    // a call's matched/unmatched category.
+    let all_token_call_ids =
+        sqlx::query_scalar::<_, Option<String>>("SELECT call_id FROM token_usage")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+    let all_event_rows = sqlx::query(
+        "SELECT json_extract(data, '$.call_id') AS call_id,
+                json_extract(data, '$.token_usage_present') AS token_usage_present
+         FROM events WHERE event_type = 'llm_call'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        let call_id = row.try_get::<Option<String>, _>("call_id").unwrap_or(None);
+        let usage_present = row
+            .try_get::<Option<i64>, _>("token_usage_present")
+            .unwrap_or(None)
+            == Some(1);
+        (call_id, usage_present)
+    })
+    .collect::<Vec<_>>();
+    let reconciliation = telemetry_reconciliation_counts_windowed(
+        &token_call_ids,
+        &event_rows,
+        &all_token_call_ids,
+        &all_event_rows,
+    );
     println!(
         "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} unattributed_legacy_token_rows={} unattributed_legacy_event_rows={}",
         token_call_ids.len(),
@@ -1665,7 +1756,7 @@ async fn main() -> anyhow::Result<()> {
         reconciliation.legacy_event_rows,
     );
     if reconciliation.token_only > 0 {
-        let breakdown = token_only_breakdown(&token_rows, &event_rows);
+        let breakdown = token_only_breakdown(&token_rows, &all_event_rows);
         println!(
             "- token_only split: event_missing={} (no llm_call event; likely LLM use outside the agent loop) event_usage_flag_false={}",
             breakdown.event_missing, breakdown.event_usage_flag_false,

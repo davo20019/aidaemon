@@ -912,9 +912,18 @@ pub(crate) async fn refresh_incremental_summarization(
 
     // A legacy cursorless summary may bisect a tool exchange. Rebuild it once
     // from canonical events instead of trying to append to an unsafe boundary.
+    let suppressed_turn_ids = event_store.memory_suppressed_turn_ids(session_id).await?;
     let turns = event_store
         .get_turns_from_anchor(session_id, anchor)
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|turn| {
+            !turn
+                .turn_id
+                .as_ref()
+                .is_some_and(|turn_id| suppressed_turn_ids.contains(turn_id))
+        })
+        .collect::<Vec<_>>();
     let correction = token_estimate_correction(model);
     let raw_token_threshold = ((token_threshold as f64) / correction).ceil() as usize;
     let raw_recent_token_budget = ((recent_token_budget as f64) / correction).ceil() as usize;

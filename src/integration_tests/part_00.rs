@@ -6,11 +6,11 @@
 
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
-    setup_test_agent_with_mandates,
     setup_test_agent_orchestrator, setup_test_agent_root,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
-    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
-    setup_test_agent_with_models_and_policy, setup_test_agent_with_policy, MockProvider, MockTool,
+    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_mandates,
+    setup_test_agent_with_models, setup_test_agent_with_models_and_policy,
+    setup_test_agent_with_policy, MockProvider, MockTool,
 };
 use crate::tools::{EditFileTool, ReadFileTool};
 use crate::traits::store_prelude::*;
@@ -20,6 +20,22 @@ use chrono::Utc;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Opt a memory-focused integration test into the normal automatic-memory
+/// path with an explicit, valid typed assessment. Production deliberately
+/// fail-closes automatic memory when assessment is unavailable; these tests
+/// are about the allowed path, so they must not rely on the mock's historical
+/// "no assessment" fallback.
+fn memory_allowed_task_assessment() -> ProviderResponse {
+    MockProvider::semantic_task_assessment(
+        "answer",
+        false,
+        false,
+        &[],
+        "new_request",
+        "general",
+    )
+}
 
 #[tokio::test]
 async fn test_basic_message_response() {
@@ -173,9 +189,7 @@ where
 async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedule() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fake_x_url = format!(
         "http://localhost:{}/2/tweets",
         listener.local_addr().unwrap().port()
@@ -290,20 +304,19 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
         .unwrap_or_default()
         .to_ascii_lowercase()
         .contains("draft"));
-    assert!(mandate_schema["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|action| action == "draft"));
+    assert!(
+        mandate_schema["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "draft")
+    );
     drop(calls);
 
-    let claimed = retry_test_sqlite_busy(|| {
-        harness
-            .state
-            .claim_due_mandates(1, "e2e-heartbeat", 300)
-    })
-        .await
-        .unwrap();
+    let claimed =
+        retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "e2e-heartbeat", 300))
+            .await
+            .unwrap();
     assert_eq!(claimed.len(), 1);
     let mandate = claimed.into_iter().next().unwrap();
     let root_task_id = uuid::Uuid::new_v4().to_string();
@@ -338,8 +351,8 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
             &root_task,
         )
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let root_attempt = retry_test_sqlite_busy(|| {
         harness.state.claim_task_with_lease(
             &root_task_id,
@@ -348,9 +361,9 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
             7_200,
         )
     })
-        .await
-        .unwrap()
-        .unwrap();
+    .await
+    .unwrap()
+    .unwrap();
     let decision = crate::traits::MandateDecisionCycle::new(
         &mandate.id,
         &run.id,
@@ -366,23 +379,20 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
         "It is within the confirmed target and quota",
     );
     intention.value_criterion = Some(mandate.success_criteria[0].clone());
-    intention.expected_benefit = Some(
-        "The grounded update gives the audience useful current information.".to_string(),
-    );
+    intention.expected_benefit =
+        Some("The grounded update gives the audience useful current information.".to_string());
     intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
     intention.invalidation_criteria = Some(
         "Do not post if the supporting information is stale, duplicated, or unverified."
             .to_string(),
     );
     retry_test_sqlite_busy(|| {
-        harness.state.record_mandate_decision(
-            &decision,
-            Some(&intention),
-            Some(&root_attempt.id),
-        )
+        harness
+            .state
+            .record_mandate_decision(&decision, Some(&intention), Some(&root_attempt.id))
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let worker_task_id = uuid::Uuid::new_v4().to_string();
     let worker_task = crate::traits::Task {
         id: worker_task_id.clone(),
@@ -415,8 +425,8 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
             8,
         )
     })
-        .await
-        .unwrap());
+    .await
+    .unwrap());
     let worker_attempt = retry_test_sqlite_busy(|| {
         harness.state.claim_mandate_task_from_attempt(
             &worker_task_id,
@@ -428,15 +438,17 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
             7_200,
         )
     })
-        .await
-        .unwrap()
-        .unwrap();
+    .await
+    .unwrap()
+    .unwrap();
 
     let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
-    harness.agent.push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
-        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        crate::tools::ApprovalBroker::new(http_approval_tx),
-    )));
+    harness
+        .agent
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            crate::tools::ApprovalBroker::new(http_approval_tx),
+        )));
     harness.agent.set_test_mandate_execution(
         &mandate.id,
         mandate.version,
@@ -624,13 +636,10 @@ async fn test_llm_call_event_emitted_with_telemetry() {
     // A simple conversational turn records both the task-assessment attempt
     // and the main response. The mock response reports 10 input / 5 output
     // tokens; the intercepted empty assessment reports zero.
-    let harness = setup_test_agent_with_models(
-        MockProvider::new(),
-        "gpt-5.6-terra",
-        "gpt-5.6-terra",
-    )
-    .await
-    .unwrap();
+    let harness =
+        setup_test_agent_with_models(MockProvider::new(), "gpt-5.6-terra", "gpt-5.6-terra")
+            .await
+            .unwrap();
 
     harness
         .agent
@@ -654,7 +663,10 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .await
         .expect("llm stats should compute");
 
-    assert_eq!(stats.total_calls, 2, "expected assessment and response events");
+    assert_eq!(
+        stats.total_calls, 2,
+        "expected assessment and response events"
+    );
     assert_eq!(stats.avg_input_tokens, 5);
     assert_eq!(stats.avg_output_tokens, 2);
     assert_eq!(stats.fell_back_count, 0);
@@ -743,7 +755,18 @@ async fn test_memory_persistence() {
 
 #[tokio::test]
 async fn test_multi_turn_conversation() {
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let provider = MockProvider::new().with_task_assessments(vec![
+        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
 
     // First turn
     harness
@@ -1255,7 +1278,9 @@ async fn test_owner_system_prompt_has_no_restrictions() {
 
 #[tokio::test]
 async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
-    let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let provider = MockProvider::new()
+        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let mut harness = setup_test_agent(provider).await.unwrap();
     harness.agent.set_test_orchestrator_mode();
 
     harness

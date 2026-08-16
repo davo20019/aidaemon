@@ -1999,29 +1999,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             }
         }
-        if result_metadata.semantics.evidence.is_empty() {
-            result_metadata.semantics.evidence =
-                crate::agent::inquiry::evidence_capabilities_for_tool_call(
-                    &tc.name,
-                    &effective_arguments,
-                );
-        }
-        if result_metadata.semantics.evidence.is_empty()
-            && result_metadata.semantics.observes_state()
-        {
-            result_metadata.semantics.evidence =
-                crate::agent::inquiry::evidence_capabilities_from_target_hints(
-                    &result_metadata.semantics.target_hints,
-                );
-        }
-        if result_metadata.semantics.observes_state()
-            && !result_metadata.semantics.evidence.is_empty()
-            && result_metadata.semantics.verification_mode
-                == crate::traits::ToolVerificationMode::None
-        {
-            result_metadata.semantics.verification_mode =
-                crate::traits::ToolVerificationMode::ResultContent;
-        }
+        // Tool adapters commonly return only authoritative outcome fields
+        // (exit code, domain status, etc.). Preserve those fields, but always
+        // merge the registered call's exact operation semantics at this shared
+        // boundary. Without this, a successful negative lookup can carry
+        // `completed_with_negative_result` yet lose that it was an
+        // observation, leaving every evidence obligation permanently open.
+        complete_tool_result_semantics(
+            &tc.name,
+            &effective_arguments,
+            &call_semantics,
+            &mut result_metadata,
+        );
         execution_state.record_tool_result_presentation(&result_metadata, &result_text);
         if result_metadata.presentation
             == Some(crate::traits::ToolResultPresentation::NaturalSummary)
@@ -2390,7 +2379,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
         );
         if observation_result_available && semantics.observes_state() {
-            let can_verify = tool_result_contains_verifiable_evidence(semantics, &result_text);
+            let can_verify = tool_result_or_metadata_contains_verifiable_evidence(
+                semantics,
+                &result_text,
+                &result_metadata,
+            );
             verified_observation = can_verify
                 && if turn_context
                     .completion_contract

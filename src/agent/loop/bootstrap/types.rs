@@ -29,6 +29,12 @@ pub(in crate::agent) struct BootstrapData {
     /// pre-bootstrap input so prompt assembly matches durable history.
     pub user_text: String,
     pub task_id: String,
+    /// One semantic assessment compiled before optional memory access. The
+    /// main loop consumes this exact artifact rather than issuing a second
+    /// classifier call that could disagree with the memory gate.
+    pub task_plan: Option<super::task_planning::TaskPlan>,
+    pub task_assessment_attempted: bool,
+    pub memory_pipeline_policy: super::task_planning::MemoryPipelinePolicy,
     /// Durable execution identity recovered from an interrupted run. The new
     /// turn reuses it so operation-derived idempotency keys remain stable.
     pub resume_execution_snapshot: Option<ResumeExecutionSnapshot>,
@@ -60,13 +66,13 @@ pub(in crate::agent) struct BootstrapData {
     /// Pillar A: message-zero bytes (the session-static CORE prompt). Cacheable
     /// prefix; rendered once per task by `render_core_prompt`.
     pub core_prompt_bytes: String,
-    /// Pillar A: the per-task volatile context tail (timestamp, session context,
-    /// memories, matched skill bodies, resume checkpoint, …). Compiled once per
-    /// task and reused across the within-task loop. Just-in-time project
-    /// instructions may be appended once when a tool first enters a deeper
-    /// subtree. Inserted immediately before the structurally preserved
-    /// preceding exchange (or before the current user when none exists).
-    pub task_context_tail: String,
+    /// Pillar A: context tails compiled from one snapshot. The finalized typed
+    /// task relationship selects one after semantic assessment: fresh tasks
+    /// exclude conversation summaries/activity, while continuations retain the
+    /// current task thread. Just-in-time project instructions are appended only
+    /// to the selected tail.
+    pub fresh_task_context_tail: String,
+    pub continuation_task_context_tail: String,
     pub session_summary: Option<ConversationSummary>,
     pub harness_eval: HarnessEvalAccumulator,
 }

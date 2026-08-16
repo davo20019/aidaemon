@@ -262,7 +262,7 @@ fn task_blocks_schedule_fire(task: &crate::traits::Task) -> bool {
         || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
 }
 
-fn task_blocks_later_schedule_fire(
+pub(crate) fn task_blocks_later_schedule_fire(
     run: &crate::traits::GoalRun,
     task: &crate::traits::Task,
 ) -> bool {

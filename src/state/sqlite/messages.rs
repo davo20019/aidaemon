@@ -316,4 +316,68 @@ impl crate::traits::MessageStore for SqliteStateStore {
         }
         Ok(())
     }
+
+    async fn advance_session_context_boundary(
+        &self,
+        session_id: &str,
+        cleared_after_event_id: i64,
+        retained_turn_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cleared_after_event_id >= 0,
+            "context boundary event id cannot be negative"
+        );
+        anyhow::ensure!(
+            !retained_turn_id.trim().is_empty(),
+            "retained context turn id cannot be empty"
+        );
+
+        // Keep the current task's already-appended messages while removing
+        // older hot-window entries. Without this, the durable SQL boundary
+        // would be bypassed until the process restarted or the cache evicted.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.working_memory.write(),
+        )
+        .await
+        {
+            Ok(mut wm) => {
+                if let Some(messages) = wm.get_mut(session_id) {
+                    messages.retain(|message| message.turn_id.as_deref() == Some(retained_turn_id));
+                }
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "advance_session_context_boundary: working_memory write lock timed out"
+                );
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO session_context_boundaries (session_id, cleared_after_id, cleared_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                cleared_after_id = MAX(session_context_boundaries.cleared_after_id, ?2),
+                cleared_at = CASE
+                    WHEN ?2 > session_context_boundaries.cleared_after_id THEN ?3
+                    ELSE session_context_boundaries.cleared_at
+                END",
+        )
+        .bind(session_id)
+        .bind(cleared_after_event_id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        // A cumulative summary describes turns that are now outside implicit
+        // context. Exact older history remains available through its explicit
+        // event-backed retrieval path.
+        sqlx::query("DELETE FROM conversation_summaries WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
 }

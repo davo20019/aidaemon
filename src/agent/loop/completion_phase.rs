@@ -675,6 +675,59 @@ pub(super) async fn run_completion_phase(
             })
             .cloned()
             .collect::<Vec<_>>();
+        let context_floor_result = emitter.session_context_boundary().await;
+        let context_floor_event_id = context_floor_result.as_ref().ok().copied().flatten();
+        let outstanding_requirement_indices = turn_context
+            .completion_contract
+            .evidence_requirements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                completion_progress
+                    .evidence_obligation_ids
+                    .get(index)
+                    .filter(|obligation_id| {
+                        completion_progress.proof_graph.state(obligation_id)
+                            != Some(crate::execution_graph::ExecutionNodeState::Satisfied)
+                    })
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::FinalizationStateSnapshot,
+                "Captured authoritative state before finalization gates".to_string(),
+                json!({
+                    "condition": "finalization_state_snapshot",
+                    "schema_version": 1,
+                    "candidate_source": "current_model_response",
+                    "candidate_chars": reply.chars().count(),
+                    "contract_scope_task_id": turn_context.completion_contract.scope_task_id,
+                    "contract_adopted_from_task_ids": turn_context.completion_contract.adopted_from_task_ids,
+                    "completion_task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
+                    "context_floor_event_id": context_floor_event_id,
+                    "context_floor_available": context_floor_result.is_ok(),
+                    "required_response_fields": turn_context.completion_contract.required_response_fields,
+                    "missing_response_fields": missing_response_fields,
+                    "primary_target_hint": turn_context.completion_contract.primary_target_hint(),
+                    "evidence_requirements_total": turn_context.completion_contract.evidence_requirements.len(),
+                    "evidence_requirements_satisfied": completion_progress.satisfied_evidence_requirements(),
+                    "outstanding_requirement_indices": outstanding_requirement_indices,
+                    "selected_receipt_ids": completion_progress.satisfying_receipt_ids(),
+                    "verification_pending": completion_progress.verification_pending,
+                    "mutation_count": completion_progress.mutation_count,
+                    "observation_count": completion_progress.observation_count,
+                    "verification_count": completion_progress.verification_count,
+                    "verification_attempt_count": completion_progress.verification_attempt_count,
+                    "verification_block_count": completion_progress.verification_block_count,
+                    "decision": "pending_ordered_finalization_gates",
+                    "rejection_reason": Value::Null,
+                }),
+            )
+            .await;
         if !missing_response_fields.is_empty() {
             if completion_progress.response_contract_retry_count == 0 {
                 completion_progress.response_contract_retry_count = 1;

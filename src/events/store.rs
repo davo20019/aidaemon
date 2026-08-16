@@ -15,7 +15,7 @@ use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
 use super::{
     DecisionPointData, DecisionType, Event, EventType, InteractionRequestedData,
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, TaskEndData,
-    TaskStatus, ToolResultData,
+    TaskStatus, ToolCallData, ToolResultData,
 };
 use crate::traits::{Message, TokenUsage};
 
@@ -25,6 +25,18 @@ pub struct GeneratedResponseRef {
     pub task_id: String,
     pub turn_id: Option<String>,
     pub referenced_receipts: Vec<super::CompletionProofReference>,
+}
+
+/// Exact durable execution evidence that caused a runtime continuation.
+///
+/// Both halves are required: the call owns the requested arguments while the
+/// terminal result owns the structured outcome and completion semantics. The
+/// result provenance ID prevents an earlier background-transition receipt for
+/// the same call from being mistaken for the eventual terminal outcome.
+#[derive(Debug, Clone)]
+pub struct ContinuationToolEvidence {
+    pub call: ToolCallData,
+    pub result: ToolResultData,
 }
 
 /// The event store backed by SQLite.
@@ -369,6 +381,35 @@ impl EventStore {
         )
     }
 
+    pub async fn session_context_boundary(&self, session_id: &str) -> anyhow::Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Turn identities whose compiled task policy excludes them from every
+    /// automatic memory pipeline. Canonical history queries intentionally do
+    /// not use this filter; memory consumers opt in explicitly.
+    pub async fn memory_suppressed_turn_ids(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT turn_id FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND turn_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'suppressed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
     /// Return the exact generated-response identity for a completed agent
     /// handoff. The immutable pre-dispatch watermark is the selector; content
     /// is only an integrity check. This prevents an identical historical reply
@@ -466,6 +507,60 @@ impl EventStore {
                     })
             })
             .collect())
+    }
+
+    /// Load the exact parent receipt named by an internal continuation edge.
+    ///
+    /// Correlation is intentionally structural and fail-closed: session,
+    /// parent task, tool-call ID, and result-provenance ID must all agree.
+    pub async fn continuation_tool_evidence(
+        &self,
+        session_id: &str,
+        parent_task_id: &str,
+        parent_tool_call_id: &str,
+        parent_result_id: &str,
+    ) -> anyhow::Result<Option<ContinuationToolEvidence>> {
+        let row = sqlx::query(
+            r#"
+            SELECT call_event.data AS call_data, result_event.data AS result_data
+            FROM events AS result_event
+            JOIN events AS call_event
+              ON call_event.session_id = result_event.session_id
+             AND call_event.task_id = result_event.task_id
+             AND call_event.event_type = 'tool_call'
+             AND json_extract(call_event.data, '$.tool_call_id') =
+                 json_extract(result_event.data, '$.tool_call_id')
+            WHERE result_event.session_id = ?
+              AND result_event.task_id = ?
+              AND result_event.event_type = 'tool_result'
+              AND json_extract(result_event.data, '$.tool_call_id') = ?
+              AND json_extract(
+                    result_event.data,
+                    '$.receipt.result_provenance.result_id'
+                  ) = ?
+            ORDER BY result_event.id DESC, call_event.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(parent_task_id)
+        .bind(parent_tool_call_id)
+        .bind(parent_result_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let call: ToolCallData = serde_json::from_str(&row.get::<String, _>("call_data"))?;
+        let result: ToolResultData = serde_json::from_str(&row.get::<String, _>("result_data"))?;
+        anyhow::ensure!(
+            call.task_id.as_deref() == Some(parent_task_id)
+                && result.task_id.as_deref() == Some(parent_task_id)
+                && call.tool_call_id == parent_tool_call_id
+                && result.tool_call_id == parent_tool_call_id,
+            "continuation receipt correlation changed after query"
+        );
+        Ok(Some(ContinuationToolEvidence { call, result }))
     }
 
     pub async fn task_response_message_ids(&self, task_id: &str) -> anyhow::Result<Vec<String>> {
@@ -566,15 +661,6 @@ impl EventStore {
             );
         }
         tx.commit().await?;
-        if event_type_str == "user_message" {
-            if let Err(error) =
-                crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await
-            {
-                // Event persistence is canonical and must not fail because an
-                // optional derived memory index is absent or temporarily busy.
-                tracing::debug!(%error, event_id, "Deferred user-message span projection");
-            }
-        }
         if matches!(event_type_str, "user_message" | "assistant_response") {
             if let Err(error) =
                 crate::state::sqlite::history_search::project_event(&self.pool, event_id).await
@@ -584,6 +670,16 @@ impl EventStore {
             }
         }
         Ok(event_id)
+    }
+
+    /// Project one canonical user-message event into the derived memory graph.
+    ///
+    /// Callers invoke this only after the task's semantic capability policy has
+    /// been compiled. Keeping projection out of [`append`](Self::append) closes
+    /// the former ordering gap where a no-memory request was persisted to the
+    /// memory graph before its constraint had been assessed.
+    pub async fn project_user_message_memory_span(&self, event_id: i64) -> anyhow::Result<()> {
+        crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await
     }
 
     /// Atomically append the canonical model-call event and its aggregate
@@ -681,6 +777,44 @@ impl EventStore {
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(&since_str)
+        .fetch_all(&self.pool)
+        .await?;
+
+        self.rows_to_events(rows)
+    }
+
+    /// Query events eligible for implicit conversation context. Unlike audit,
+    /// memory, and explicit history queries, this respects the durable task
+    /// boundary and excludes delayed events whose turn originated before it.
+    pub async fn query_context_events(
+        &self,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<Event>> {
+        let since_str = since.to_rfc3339();
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
+            FROM events
+            WHERE session_id = ?1
+              AND created_at >= ?2
+              AND id > COALESCE(
+                (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                0)
+              AND (
+                turn_id IS NULL
+                OR (SELECT MIN(origin.id)
+                    FROM events origin
+                    WHERE origin.session_id = ?1
+                      AND origin.turn_id = events.turn_id) > COALESCE(
+                    (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                    0)
+              )
             ORDER BY created_at ASC
             "#,
         )
@@ -1084,10 +1218,10 @@ impl EventStore {
                 SELECT turn_id, MIN(id) AS turn_seq
                 FROM events
                 WHERE session_id = ?1 AND turn_id IS NOT NULL
-                  AND id > COALESCE(
+                GROUP BY turn_id
+                HAVING MIN(id) > COALESCE(
                     (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
                     0)
-                GROUP BY turn_id
             ) t ON e.turn_id = t.turn_id
             LEFT JOIN (
                 SELECT te.turn_id,
@@ -1134,10 +1268,10 @@ impl EventStore {
                 SELECT turn_id, MIN(id) AS turn_seq
                 FROM events
                 WHERE session_id = ?1 AND turn_id IS NOT NULL
-                  AND id > COALESCE(
+                GROUP BY turn_id
+                HAVING MIN(id) > COALESCE(
                     (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
                     0)
-                GROUP BY turn_id
             ),
             selected_turns AS (
                 SELECT turn_id, turn_seq
@@ -2198,6 +2332,10 @@ impl EventEmitter {
         self.current_task_id.as_deref()
     }
 
+    pub async fn session_context_boundary(&self) -> anyhow::Result<Option<i64>> {
+        self.store.session_context_boundary(&self.session_id).await
+    }
+
     /// Emit an event with the current context
     pub async fn emit<T: serde::Serialize>(
         &self,
@@ -2266,6 +2404,92 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    #[tokio::test]
+    async fn user_message_memory_projection_requires_explicit_allowed_stage() {
+        let (store, _database) = setup_store().await;
+        sqlx::query(
+            "CREATE TABLE memory_spans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                span_kind TEXT NOT NULL,
+                source_event_id INTEGER,
+                source_episode_id INTEGER,
+                session_id TEXT,
+                channel_id TEXT,
+                role TEXT,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                privacy TEXT NOT NULL DEFAULT 'global',
+                observed_from TEXT,
+                observed_to TEXT,
+                valid_from TEXT NOT NULL,
+                valid_to TEXT,
+                deleted_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_memory_spans_source_event
+             ON memory_spans(source_event_id) WHERE source_event_id IS NOT NULL",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let event_id = store
+            .append(Event::new(
+                "session-memory-boundary",
+                EventType::UserMessage,
+                json!({
+                    "task_id": "task-memory-boundary",
+                    "turn_id": "turn-memory-boundary",
+                    "content": "Synthetic content that must stay outside automatic memory"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let before_projection: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
+                .bind(event_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before_projection, 0,
+            "canonical append must not imply memory persistence"
+        );
+
+        store
+            .append(Event::new(
+                "session-memory-boundary",
+                EventType::MemoryPolicyCompiled,
+                json!({
+                    "task_id": "task-memory-boundary",
+                    "turn_id": "turn-memory-boundary",
+                    "access": "suppressed",
+                    "reason_code": "current_assessment_denies_user_memory",
+                    "retrieval_suppressed": true,
+                    "persistence_suppressed": true
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .project_user_message_memory_span(event_id)
+            .await
+            .unwrap();
+
+        let after_suppressed_projection: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
+                .bind(event_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(after_suppressed_projection, 0);
     }
 
     #[tokio::test]
@@ -2358,6 +2582,83 @@ mod tests {
             proof[0].obligation_ids,
             ["task:synthetic-task/obligation:evidence:0"]
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_evidence_requires_exact_task_call_and_result_identity() {
+        let (store, _database) = setup_store().await;
+        let call = ToolCallData {
+            tool_call_id: "call-exact".to_string(),
+            name: "terminal".to_string(),
+            arguments: json!({"command": "/usr/bin/false", "working_dir": "/tmp"}),
+            summary: None,
+            task_id: Some("task-parent".to_string()),
+            idempotency_key: None,
+            policy_rev: None,
+            risk_score: None,
+            turn_id: None,
+        };
+        store
+            .append(Event::new(
+                "session-a",
+                EventType::ToolCall,
+                serde_json::to_value(&call).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            exit_code: Some(1),
+            semantics: crate::tools::command_semantics::classify_shell_command("/usr/bin/false"),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+            &metadata,
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        receipt.result_provenance.result_id = Some("result-exact".to_string());
+        let result = ToolResultData {
+            message_id: None,
+            tool_call_id: "call-exact".to_string(),
+            name: "terminal".to_string(),
+            result: String::new(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some("task-parent".to_string()),
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(receipt),
+        };
+        store
+            .append(Event::new(
+                "session-a",
+                EventType::ToolResult,
+                serde_json::to_value(&result).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let found = store
+            .continuation_tool_evidence("session-a", "task-parent", "call-exact", "result-exact")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.call.arguments["command"], "/usr/bin/false");
+        assert_eq!(found.result.receipt.unwrap().exit_code, Some(1));
+        assert!(store
+            .continuation_tool_evidence("session-a", "task-parent", "call-exact", "result-other",)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .continuation_tool_evidence("session-a", "task-other", "call-exact", "result-exact",)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -646,6 +646,21 @@ impl ScheduledGoalRunsTool {
         }
 
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+        if schedules.is_empty() {
+            out.push_str("- Schedule: unavailable\n");
+        } else {
+            out.push_str("- Schedule state:\n");
+            for schedule in schedules.iter().take(5) {
+                out.push_str(&format!(
+                    "  - id={} next_run={} last_run={} paused={} policy={}\n",
+                    schedule.id,
+                    schedule.next_run_at,
+                    schedule.last_run_at.as_deref().unwrap_or("never"),
+                    schedule.is_paused,
+                    schedule.fire_policy,
+                ));
+            }
+        }
         let coalesces = schedules.iter().any(|s| s.fire_policy != "always_fire");
         let mut tasks_by_run = Vec::with_capacity(runs.len());
         for run in &runs {
@@ -656,14 +671,13 @@ impl ScheduledGoalRunsTool {
                     .unwrap_or_default(),
             );
         }
-        let open_tasks = tasks_by_run
+        let open_tasks = runs
             .iter()
-            .flatten()
-            .filter(|task| {
-                matches!(
-                    task.status.as_str(),
-                    "pending" | "claimed" | "running" | "blocked"
-                )
+            .zip(tasks_by_run.iter())
+            .flat_map(|(run, tasks)| {
+                tasks.iter().filter(move |task| {
+                    crate::heartbeat::task_blocks_later_schedule_fire(run, task)
+                })
             })
             .collect::<Vec<_>>();
         if coalesces && !open_tasks.is_empty() {
@@ -1654,6 +1668,7 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.contains(&format!("next_run={}", schedule.next_run_at)));
         assert!(result.contains("Open task(s) blocking coalesced schedule fires"));
         assert!(result.contains("Analyze fetched engagement metrics"));
     }

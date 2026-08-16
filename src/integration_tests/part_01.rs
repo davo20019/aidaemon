@@ -130,6 +130,24 @@ async fn test_multi_turn_with_tool_use() {
         MockProvider::text_response("You have 16GB RAM."),
         // Turn 2: direct response referencing previous context
         MockProvider::text_response("Yes, 16GB is enough for Docker."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "check",
+            false,
+            true,
+            &[],
+            "new_request",
+            "host_local",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -1106,7 +1124,12 @@ impl crate::traits::Tool for IdempotencyProbeTool {
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
         let value = serde_json::from_str::<serde_json::Value>(arguments)
             .ok()
-            .and_then(|value| value.get("value").and_then(|value| value.as_str()).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::CONFIGURATION,
@@ -1246,8 +1269,7 @@ async fn test_duplicate_mutation_replays_durable_receipt_without_second_side_eff
         receipt.outcome_evidence == crate::events::ToolOutcomeEvidenceSource::DurableReplay
     }));
     assert_eq!(
-        receipts[0].idempotency_key,
-        receipts[1].idempotency_key,
+        receipts[0].idempotency_key, receipts[1].idempotency_key,
         "same operation in one durable execution must keep the same key"
     );
     let decisions = harness
@@ -1264,8 +1286,7 @@ async fn test_duplicate_mutation_replays_durable_receipt_without_second_side_eff
         event
             .parse_data::<crate::events::DecisionPointData>()
             .is_ok_and(|decision| {
-                decision.decision_type
-                    == crate::events::DecisionType::IdempotencyReceiptReplayed
+                decision.decision_type == crate::events::DecisionType::IdempotencyReceiptReplayed
             })
     }));
 }
@@ -1325,8 +1346,7 @@ async fn test_missing_postcondition_invalidates_receipt_and_reexecutes_exact_mut
         event
             .parse_data::<crate::events::DecisionPointData>()
             .is_ok_and(|decision| {
-                decision.decision_type
-                    == crate::events::DecisionType::IdempotencyReceiptInvalidated
+                decision.decision_type == crate::events::DecisionType::IdempotencyReceiptInvalidated
             })
     }));
 }
@@ -1840,8 +1860,10 @@ impl crate::traits::Tool for SpawnAgentMock {
     }
 
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("Resume review found weak impact metrics and excessive task-oriented bullets."
-            .to_string())
+        Ok(
+            "Resume review found weak impact metrics and excessive task-oriented bullets."
+                .to_string(),
+        )
     }
 
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
@@ -2459,6 +2481,10 @@ async fn test_memory_fact_persists_across_turns() {
         MockProvider::text_response("Got it! I'll remember you prefer Rust."),
         // Turn 2: the agent should see the fact in its system prompt
         MockProvider::text_response("Yes, I know you prefer Rust!"),
+    ])
+    .with_task_assessments(vec![
+        memory_allowed_task_assessment(),
+        memory_allowed_task_assessment(),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -2755,10 +2781,8 @@ async fn test_read_only_tool_batch_executes_concurrently() {
         arguments: r#"{"q":"beta"}"#.to_string(),
         extra_content: None,
     });
-    let provider = MockProvider::with_responses(vec![
-        batch,
-        MockProvider::text_response("Both reads done."),
-    ]);
+    let provider =
+        MockProvider::with_responses(vec![batch, MockProvider::text_response("Both reads done.")]);
 
     let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
     let tool = Arc::new(SlowReadTool {

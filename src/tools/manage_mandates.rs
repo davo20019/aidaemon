@@ -1103,7 +1103,10 @@ impl ManageMandatesTool {
             })
             .transpose()?;
 
-        if action == "answer_question" || action == "resolve_reconciliation" {
+        if action == "answer_question"
+            || action == "resolve_reconciliation"
+            || (action == "resume" && mandate.status == MandateStatus::AwaitingInput)
+        {
             anyhow::ensure!(
                 mandate.status == MandateStatus::AwaitingInput,
                 "{action} requires an awaiting-input mandate"
@@ -1113,33 +1116,58 @@ impl ManageMandatesTool {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("awaiting-input mandate has no typed suspension"))?;
             let expected_kind = suspension.kind;
-            let resolution = if action == "answer_question" {
-                anyhow::ensure!(
-                    expected_kind == MandateSuspensionKind::AwaitingAnswer,
-                    "this mandate is awaiting safety reconciliation, not a question answer"
-                );
-                anyhow::ensure!(
-                    guidance.is_some(),
-                    "guidance is required for answer_question"
-                );
-                None
-            } else {
-                anyhow::ensure!(
-                    expected_kind != MandateSuspensionKind::AwaitingAnswer,
-                    "this mandate is awaiting an answer; use answer_question"
-                );
-                let raw = required_trimmed(
-                    args.reconciliation_resolution.as_deref(),
-                    "reconciliation_resolution",
-                )?;
-                Some(MandateReconciliationResolution::parse(raw).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "reconciliation_resolution must be confirmed_effect_occurred, confirmed_no_effect, or abandon_attempt"
-                    )
-                })?)
+            let resolution = match expected_kind {
+                MandateSuspensionKind::AwaitingAnswer => {
+                    anyhow::ensure!(
+                        action == "answer_question",
+                        "this mandate is awaiting an answer; use answer_question"
+                    );
+                    anyhow::ensure!(
+                        guidance.is_some(),
+                        "guidance is required for answer_question"
+                    );
+                    None
+                }
+                MandateSuspensionKind::ObjectiveControlRequired => {
+                    anyhow::ensure!(
+                        action == "resume",
+                        "configure objective_control with update, then use resume"
+                    );
+                    anyhow::ensure!(
+                        mandate.objective_control.is_some(),
+                        "configure a validated objective_control before resuming this legacy autopilot mandate"
+                    );
+                    anyhow::ensure!(
+                        args.reconciliation_resolution.is_none(),
+                        "objective-control recovery does not accept a reconciliation resolution"
+                    );
+                    None
+                }
+                MandateSuspensionKind::OwnerPaused => {
+                    anyhow::bail!("owner-paused mandates must use ordinary resume")
+                }
+                MandateSuspensionKind::ReconciliationRequired
+                | MandateSuspensionKind::ExecutionLeaseLost
+                | MandateSuspensionKind::ReviewFailed
+                | MandateSuspensionKind::AuthorityRevokedWithUnresolvedMutation => {
+                    anyhow::ensure!(
+                        action == "resolve_reconciliation",
+                        "this safety suspension requires resolve_reconciliation"
+                    );
+                    let raw = required_trimmed(
+                        args.reconciliation_resolution.as_deref(),
+                        "reconciliation_resolution",
+                    )?;
+                    Some(MandateReconciliationResolution::parse(raw).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reconciliation_resolution must be confirmed_effect_occurred, confirmed_no_effect, or abandon_attempt"
+                        )
+                    })?)
+                }
             };
-            let guidance =
-                guidance.ok_or_else(|| anyhow::anyhow!("guidance is required for {action}"))?;
+            let guidance = guidance.unwrap_or(
+                "Owner configured the validated objective control required for autopilot.",
+            );
             anyhow::ensure!(
                 self.state
                     .resolve_mandate_suspension(
@@ -1154,14 +1182,21 @@ impl ManageMandatesTool {
                     .await?,
                 "mandate suspension changed before it could be resolved"
             );
-            return Ok(if action == "answer_question" {
-                format!(
+            return Ok(
+                if expected_kind == MandateSuspensionKind::ObjectiveControlRequired {
+                    format!(
+                        "Mandate {} is active with its owner-configured objective control.",
+                        mandate.id
+                    )
+                } else if action == "answer_question" {
+                    format!(
                     "Mandate {} is active after recording bounded owner guidance. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change, and do not claim this answer authorized one.",
                     mandate.id
                 )
-            } else {
-                format!("Mandate {} is active after typed {}.", mandate.id, action)
-            });
+                } else {
+                    format!("Mandate {} is active after typed {}.", mandate.id, action)
+                },
+            );
         }
 
         let (from, to) = match action {

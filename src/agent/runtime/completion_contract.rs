@@ -208,6 +208,19 @@ pub(super) fn persistable_completion_contract(
 pub(super) fn completion_contract_from_persisted(
     contract: &RequestCompletionContract,
 ) -> CompletionContract {
+    // Durable open requests can outlive an evidence-ontology upgrade. Recheck
+    // their typed tuples at hydration so a legacy impossible obligation cannot
+    // survive a restart and keep an otherwise answerable task in validation
+    // forever. This never guesses a replacement requirement; the generic
+    // observation bit remains available as a conservative fallback.
+    let reachable_evidence_requirements = contract
+        .evidence_requirements
+        .iter()
+        .filter(|requirement| {
+            crate::agent::inquiry::requirement_has_builtin_evidence_route(requirement)
+        })
+        .cloned()
+        .collect();
     CompletionContract {
         scope_task_id: contract.scope_task_id.clone(),
         adopted_from_task_ids: contract.adopted_from_task_ids.clone(),
@@ -246,7 +259,7 @@ pub(super) fn completion_contract_from_persisted(
         minimum_sources: contract.minimum_sources,
         requires_primary_sources: contract.requires_primary_sources,
         requires_exact_history: contract.requires_exact_history,
-        evidence_requirements: contract.evidence_requirements.clone(),
+        evidence_requirements: reachable_evidence_requirements,
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets: contract
             .verification_targets
@@ -1347,6 +1360,10 @@ impl CompletionProgress {
             .obligations_satisfied_by_receipt(tool_call_id)
     }
 
+    pub(in crate::agent) fn satisfying_receipt_ids(&self) -> Vec<String> {
+        self.proof_graph.satisfying_receipt_ids()
+    }
+
     pub(in crate::agent) fn all_evidence_requirements_satisfied(&self) -> bool {
         !self.evidence_obligation_ids.is_empty()
             && self.satisfied_evidence_requirements() == self.evidence_obligation_ids.len()
@@ -1533,6 +1550,7 @@ struct CompletionSignals {
     live_state_query: bool,
 }
 
+#[cfg(test)]
 pub(super) fn looks_like_question_request(lower_text: &str) -> bool {
     lower_text.ends_with('?')
         || [
@@ -2462,6 +2480,26 @@ mod tests {
         assert_eq!(contract.evidence_requirements, vec![requirement]);
         let progress = CompletionProgress::new(&contract, "test-task");
         assert!(!progress.verification_pending);
+    }
+
+    #[test]
+    fn persisted_impossible_evidence_is_quarantined_during_hydration() {
+        let mut persisted = persistable_completion_contract(&CompletionContract::default());
+        persisted.requires_observation = true;
+        persisted.evidence_requirements = vec![RequestEvidenceRequirement {
+            summary: "Read a synthetic personal fact".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            target: None,
+        }];
+
+        let hydrated = completion_contract_from_persisted(&persisted);
+        assert!(hydrated.requires_observation);
+        assert!(hydrated.evidence_requirements.is_empty());
+        assert!(CompletionProgress::new(&hydrated, "synthetic-current-task").verification_pending);
     }
 
     #[test]

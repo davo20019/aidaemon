@@ -581,6 +581,7 @@ impl MandateStrategySnapshot {
 pub enum MandateSuspensionKind {
     OwnerPaused,
     AwaitingAnswer,
+    ObjectiveControlRequired,
     ReconciliationRequired,
     ExecutionLeaseLost,
     ReviewFailed,
@@ -592,6 +593,7 @@ impl MandateSuspensionKind {
         match self {
             Self::OwnerPaused => "owner_paused",
             Self::AwaitingAnswer => "awaiting_answer",
+            Self::ObjectiveControlRequired => "objective_control_required",
             Self::ReconciliationRequired => "reconciliation_required",
             Self::ExecutionLeaseLost => "execution_lease_lost",
             Self::ReviewFailed => "review_failed",

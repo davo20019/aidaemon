@@ -21,6 +21,11 @@ pub(super) struct MessageBuildCtx<'a> {
     /// before the current user when there is no prior exchange). The SAME string
     /// is reused every iteration of the within-task loop.
     pub task_context_tail: &'a str,
+    /// Whether archived conversation turns belong to this request's semantic
+    /// thread. A typed new-task boundary starts a fresh transcript floor;
+    /// follow-ups and internal continuations preserve the thread from that
+    /// floor onward.
+    pub preserve_archived_context: bool,
     /// Exact canonical assistant message selected before the model runs. This
     /// is metadata for locating the parent turn; it is never inferred from
     /// assistant text or repeated into the current user message.
@@ -388,6 +393,7 @@ pub(super) async fn run_message_build_phase(
     let model = ctx.model;
     let core_prompt = ctx.core_prompt;
     let task_context_tail = ctx.task_context_tail;
+    let preserve_archived_context = ctx.preserve_archived_context;
     let prior_assistant_message_id = ctx.prior_assistant_message_id;
     let summary_last_message_id = ctx.summary_last_message_id;
     let original_tool_defs = ctx.tool_defs;
@@ -649,6 +655,48 @@ pub(super) async fn run_message_build_phase(
 
     // Split off the current turn (always the last entry now).
     let current_turn = turns.pop().expect("at least the current turn is present");
+    if !preserve_archived_context {
+        let archived_turns_dropped = turns.len();
+        turns.clear();
+
+        let context_boundary_event_id = current_turn.turn_seq.saturating_sub(1);
+        if let Some(retained_turn_id) = current_turn.turn_id.as_deref() {
+            agent
+                .state
+                .advance_session_context_boundary(
+                    session_id,
+                    context_boundary_event_id,
+                    retained_turn_id,
+                )
+                .await?;
+        } else {
+            warn!(
+                session_id,
+                iteration,
+                context_boundary_event_id,
+                "Current turn lacks a canonical turn ID; context floor is process-local"
+            )
+        }
+
+        // Advance the session floor at the same authoritative boundary used
+        // to assemble the provider transcript. The state-store boundary makes
+        // the floor durable across restarts; the in-memory anchor avoids an
+        // unnecessary reverse walk during this process lifetime. Subsequent
+        // typed follow-ups may see this task thread, but cannot resurrect an
+        // older unrelated task merely because there is room in the context.
+        let mut anchors = agent.turn_anchors.write().await;
+        let anchor = anchors
+            .entry(session_id.to_string())
+            .or_insert(current_turn.turn_seq);
+        *anchor = (*anchor).max(current_turn.turn_seq);
+        info!(
+            session_id,
+            iteration,
+            context_floor_turn_seq = current_turn.turn_seq,
+            archived_turns_dropped,
+            "Advanced conversation context floor for new task"
+        );
+    }
     // `turns` now holds only archived turns (oldest→newest).
     if ctx.redact_archived_shared_context {
         redact_archived_shared_turns(&mut turns);
@@ -1985,6 +2033,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2056,6 +2105,7 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2082,6 +2132,7 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2181,6 +2232,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2259,6 +2311,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: &tail,
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2424,6 +2477,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE",
             task_context_tail: &tail,
+            preserve_archived_context: true,
             // No follow-up label is supplied to message assembly: continuity
             // comes solely from the canonical preceding assistant ID.
             prior_assistant_message_id: Some("job-answer"),
@@ -2559,6 +2613,7 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2689,6 +2744,7 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: &system_prompt,
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2768,6 +2824,7 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2892,6 +2949,7 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2918,6 +2976,7 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -2987,6 +3046,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE",
             task_context_tail: "",
+            preserve_archived_context: true,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -3030,6 +3090,16 @@ mod tests {
         user_text: &str,
         iteration: usize,
     ) -> Vec<Value> {
+        build_payload_with_continuity(harness, session, user_text, iteration, true).await
+    }
+
+    async fn build_payload_with_continuity(
+        harness: &TestHarness,
+        session: &str,
+        user_text: &str,
+        iteration: usize,
+        preserve_archived_context: bool,
+    ) -> Vec<Value> {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let tool_defs: Vec<Value> = Vec::new();
         let mut pending_system_messages = Vec::new();
@@ -3043,6 +3113,7 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE-PROMPT-BYTES",
             task_context_tail: "[Task Context] tail",
+            preserve_archived_context,
             prior_assistant_message_id: None,
             summary_last_message_id: None,
             tool_defs: &tool_defs,
@@ -3142,6 +3213,90 @@ mod tests {
             first_q_pos < tail_pos,
             "archived turns must precede the tail"
         );
+    }
+
+    #[tokio::test]
+    async fn new_task_advances_context_floor_and_followup_cannot_resurrect_older_task() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "new-task-floor",
+            "old-task",
+            "Read package metadata and use the old output format.",
+            None,
+            "phase=OLD\npackage_name=stale",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "new-task-floor",
+            "current-task",
+            "Observe a command outcome and report the current receipt.",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "new-task-floor", "current-task").await;
+
+        let current = build_payload_with_continuity(
+            &harness,
+            "new-task-floor",
+            "Observe a command outcome and report the current receipt.",
+            1,
+            false,
+        )
+        .await;
+        let current_json = serde_json::to_string(&current).unwrap();
+        assert!(current_json.contains("Observe a command outcome"));
+        assert!(!current_json.contains("phase=OLD"));
+        assert!(!current_json.contains("package_name=stale"));
+
+        let floor = harness
+            .agent
+            .turn_anchors
+            .read()
+            .await
+            .get("new-task-floor")
+            .copied()
+            .expect("new-task floor recorded");
+        let retained = store
+            .get_turns_from_anchor("new-task-floor", floor)
+            .await
+            .unwrap();
+        assert!(retained
+            .iter()
+            .all(|turn| turn.turn_id.as_deref() != Some("old-task")));
+
+        // Simulate a daemon restart. The in-memory anchor disappears, while
+        // the typed new-task floor must remain authoritative in SQLite.
+        harness.agent.turn_anchors.write().await.clear();
+
+        seed_turn(
+            &store,
+            "new-task-floor",
+            "followup-task",
+            "Use only the immediately preceding receipt.",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "new-task-floor", "followup-task").await;
+        let followup = build_payload_with_continuity(
+            &harness,
+            "new-task-floor",
+            "Use only the immediately preceding receipt.",
+            1,
+            true,
+        )
+        .await;
+        let followup_json = serde_json::to_string(&followup).unwrap();
+        assert!(followup_json.contains("Observe a command outcome"));
+        assert!(!followup_json.contains("phase=OLD"));
+        assert!(!followup_json.contains("package_name=stale"));
     }
 
     #[tokio::test]
@@ -3799,6 +3954,7 @@ mod tests {
                 model: _,
                 core_prompt: _,
                 task_context_tail: _,
+                preserve_archived_context: _,
                 prior_assistant_message_id: _,
                 summary_last_message_id: _,
                 tool_defs: _,
