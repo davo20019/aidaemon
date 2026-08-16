@@ -1968,7 +1968,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             correction_preapproved: false,
                             suppress_trusted_session: false,
                             mandate_authority: None,
-                            mandate_tool_call_id: None,
+                            // A transparent adapter keeps the originating
+                            // invocation identity. Background completion uses
+                            // this exact ID to bind the terminal receipt back
+                            // to the parent request.
+                            tool_call_id: Some(tc.id.as_str()),
                             mutation_forbidden: turn_context.completion_contract.forbids_mutation,
                         },
                     )
@@ -2127,13 +2131,45 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         );
         let outcome_evidence = tool_outcome_evidence_source(&result_metadata);
         let is_error = tool_outcome_status.is_failure();
-        let outcome_satisfied = tool_outcome_status.satisfies_requested_condition();
+        let domain_outcome_satisfied = tool_outcome_status.satisfies_requested_condition();
+        let matched_requested_outcomes = if result_metadata.semantics.observes_state() {
+            matching_evidence_requirement_indices(
+                &turn_context.completion_contract,
+                &tc.name,
+                &result_metadata.semantics,
+                &effective_arguments,
+                &result_text,
+                &result_metadata,
+            )
+        } else {
+            Vec::new()
+        };
+        let expected_observation_satisfied = matched_requested_outcomes.iter().any(|index| {
+            turn_context
+                .completion_contract
+                .evidence_requirements
+                .get(*index)
+                .is_some_and(|requirement| {
+                    requirement.purpose == crate::traits::EvidencePurpose::Outcome
+                        && (tool_outcome_status
+                            == crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+                            || evidence_requirement_accepts_nonstandard_outcome(
+                                requirement,
+                                &result_metadata,
+                            ))
+                })
+        });
+        // `outcome_satisfied` is relative to the current request. The adapter's
+        // domain status remains unchanged in the receipt: an expected nonzero
+        // process result or contract rejection can complete an observation
+        // without being relabeled as a successful mutation.
+        let outcome_satisfied = domain_outcome_satisfied || expected_observation_satisfied;
 
         // Record mutation before any observation carried by the same receipt.
         // A mutation deliberately invalidates older current-state evidence;
         // processing a combined receipt in the opposite order would
         // immediately invalidate its own post-action observation.
-        if outcome_satisfied && result_metadata.semantics.mutates_state() {
+        if domain_outcome_satisfied && result_metadata.semantics.mutates_state() {
             completion_progress.mark_mutation_receipt(
                 &turn_context.completion_contract,
                 &result_metadata.semantics,
@@ -2266,7 +2302,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .map(|plan| plan.plan_version);
             execution_state.record_outcome(OutcomeEntry {
                 tool_name: tc.name.clone(),
-                success: outcome_satisfied,
+                success: if is_external_mutation {
+                    domain_outcome_satisfied
+                } else {
+                    outcome_satisfied
+                },
                 http_status: result_metadata.http_status,
                 is_external_mutation,
                 error_summary,
@@ -2278,7 +2318,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 expected_step_count,
             });
             // Advance linear intent step pointer on successful external mutation
-            if outcome_satisfied && planned_step.is_some() {
+            if domain_outcome_satisfied && planned_step.is_some() {
                 execution_state.advance_linear_intent_step_after_external_success();
             }
             // Retain raw output for the answer-grounding gate (completion
@@ -2372,6 +2412,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let mut matched_requirements = if semantics.observes_state() {
             matching_evidence_requirement_indices(
                 &turn_context.completion_contract,
+                &tc.name,
                 semantics,
                 &effective_arguments,
                 &result_text,
@@ -2415,7 +2456,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tool_outcome_status,
             crate::traits::ToolOutcomeStatus::Succeeded
                 | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
-        );
+        ) || matched_requirements.iter().any(|index| {
+            turn_context
+                .completion_contract
+                .evidence_requirements
+                .get(*index)
+                .is_some_and(|requirement| {
+                    evidence_requirement_accepts_nonstandard_outcome(
+                        requirement,
+                        &result_metadata,
+                    )
+                })
+        });
         if observation_result_available && semantics.observes_state() {
             let can_verify = tool_result_or_metadata_contains_verifiable_evidence(
                 semantics,

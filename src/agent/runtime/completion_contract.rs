@@ -626,6 +626,7 @@ fn structural_evidence_requirement(
         minimum_authority: crate::traits::EvidenceAuthority::Direct,
         temporal_scope: crate::traits::EvidenceTemporalScope::Current,
         required_content_markers: Vec::new(),
+        receipt: None,
         // Target matching remains a separate OR across structural identities.
         // Binding this requirement to one arbitrarily selected path would make
         // incidental working directories or executable names authoritative.
@@ -1220,6 +1221,9 @@ impl CompletionProgress {
             return None;
         }
         let id = self.scoped_node_id(&format!("receipt:{tool_call_id}"));
+        if self.proof_graph.node_kind(&id) == Some(ExecutionNodeKind::Receipt) {
+            return Some(id);
+        }
         match self.proof_graph.add_node(
             id.clone(),
             ExecutionNodeKind::Receipt,
@@ -1230,6 +1234,39 @@ impl CompletionProgress {
                 tracing::warn!(%error, "Completion proof graph rejected a tool receipt");
                 None
             }
+        }
+    }
+
+    /// Retain successful task-local evidence in the durable completion proof
+    /// even when the assessment model omitted a blocking requirement for it.
+    /// This edge is intentionally not a dependency of the request node: it
+    /// improves causal audit coverage without allowing incidental activity to
+    /// decide whether the task is complete.
+    fn record_supporting_receipt(&mut self, tool_call_id: &str) {
+        if !self.proof_graph_initialized {
+            return;
+        }
+        let obligation_id = self.scoped_node_id(&format!("support:evidence:{tool_call_id}"));
+        if self.proof_graph.node_kind(&obligation_id).is_some() {
+            return;
+        }
+        let Some(receipt_id) = self.record_receipt_node(tool_call_id) else {
+            return;
+        };
+        if let Err(error) = self.proof_graph.add_node(
+            obligation_id.clone(),
+            ExecutionNodeKind::Obligation,
+            ExecutionNodeState::Pending,
+        ) {
+            tracing::warn!(%error, "Completion graph rejected supporting evidence obligation");
+            return;
+        }
+        if let Err(error) = self.proof_graph.satisfy_with_evidence(
+            &obligation_id,
+            &receipt_id,
+            Some(tool_call_id.to_string()),
+        ) {
+            tracing::warn!(%error, "Completion graph rejected supporting evidence receipt");
         }
     }
 
@@ -1250,6 +1287,7 @@ impl CompletionProgress {
         tool_call_id: &str,
     ) {
         self.mutation_count = self.mutation_count.saturating_add(1);
+        self.record_supporting_receipt(tool_call_id);
         let effects = if semantics.mutation_effects.is_empty() {
             ToolMutationEffects::UNSPECIFIED
         } else {
@@ -1349,6 +1387,7 @@ impl CompletionProgress {
         tool_call_id: &str,
     ) {
         self.observation_count = self.observation_count.saturating_add(1);
+        self.record_supporting_receipt(tool_call_id);
         if !contract.requires_observation {
             return;
         }
@@ -2560,6 +2599,7 @@ mod tests {
             minimum_authority: crate::traits::EvidenceAuthority::Direct,
             temporal_scope: crate::traits::EvidenceTemporalScope::Current,
             required_content_markers: Vec::new(),
+            receipt: None,
             target: None,
         };
         let mut contract = CompletionContract::default();
@@ -2600,6 +2640,7 @@ mod tests {
             minimum_authority: crate::traits::EvidenceAuthority::Direct,
             temporal_scope: crate::traits::EvidenceTemporalScope::Current,
             required_content_markers: vec!["cargo".to_string()],
+            receipt: None,
             target: None,
         };
         let mut contract = CompletionContract::default();
@@ -2638,6 +2679,7 @@ mod tests {
             minimum_authority: crate::traits::EvidenceAuthority::Canonical,
             temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
             required_content_markers: Vec::new(),
+            receipt: None,
             target: None,
         }];
 
@@ -3026,6 +3068,7 @@ mod tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
                 required_content_markers: vec!["old_field".to_string()],
+                receipt: None,
                 target: None,
             }],
             verification_targets: vec![VerificationTarget {
@@ -3432,6 +3475,7 @@ mod tests {
                     minimum_authority: EvidenceAuthority::Direct,
                     temporal_scope: EvidenceTemporalScope::Current,
                     required_content_markers: Vec::new(),
+                    receipt: None,
                     target: None,
                 },
                 RequestEvidenceRequirement {
@@ -3441,6 +3485,7 @@ mod tests {
                     minimum_authority: EvidenceAuthority::Canonical,
                     temporal_scope: EvidenceTemporalScope::Historical,
                     required_content_markers: Vec::new(),
+                    receipt: None,
                     target: None,
                 },
             ],
@@ -3468,6 +3513,21 @@ mod tests {
     }
 
     #[test]
+    fn successful_observation_remains_auditable_without_assessor_requirement() {
+        let contract = CompletionContract::default();
+        let mut progress = CompletionProgress::new(&contract, "test-task");
+
+        progress.mark_observation_receipt(&contract, &[], false, "read-current-state");
+
+        assert!(!progress.verification_pending);
+        assert_eq!(
+            progress.completion_obligations_for_receipt("read-current-state"),
+            ["task:test-task/support:evidence:read-current-state"]
+        );
+        assert_eq!(progress.satisfying_receipt_ids(), ["read-current-state"]);
+    }
+
+    #[test]
     fn combined_delivery_and_observation_receipt_survives_mutation_invalidation_order() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolEvidenceCapability,
@@ -3488,6 +3548,7 @@ mod tests {
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }],
             ..CompletionContract::default()

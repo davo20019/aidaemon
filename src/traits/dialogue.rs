@@ -44,6 +44,40 @@ pub struct RequestVerificationTarget {
     pub value: String,
 }
 
+/// Machine-checkable facts about the receipt that must support one evidence
+/// requirement. Receipt metadata and observed subject content are deliberately
+/// separate: an exit code must never be encoded as a prose marker that stdout
+/// is then expected to contain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestReceiptPredicate {
+    /// Exact requested or effective tool identifiers that may satisfy this
+    /// need. Empty accepts any tool whose evidence capability is compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_names: Vec<String>,
+    /// Alternative acceptable process exit codes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_codes: Vec<i32>,
+    /// Alternative acceptable typed invocation outcomes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outcome_statuses: Vec<super::tools::ToolOutcomeStatus>,
+    /// Whether some authoritative result content must exist.
+    #[serde(default)]
+    pub requires_output: bool,
+    /// Required pre-I/O invocation-contract disposition when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_rejected: Option<bool>,
+}
+
+impl RequestReceiptPredicate {
+    pub fn is_empty(&self) -> bool {
+        self.tool_names.is_empty()
+            && self.exit_codes.is_empty()
+            && self.outcome_statuses.is_empty()
+            && !self.requires_output
+            && self.contract_rejected.is_none()
+    }
+}
+
 /// One material information need that must be supported before a request can
 /// complete successfully. The natural-language summary guides investigation;
 /// the typed fields are the completion invariant.
@@ -61,6 +95,11 @@ pub struct RequestEvidenceRequirement {
     /// Older persisted contracts omit markers and retain scope-level matching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_content_markers: Vec<String>,
+    /// Typed invocation/result constraints. New outcome requirements must use
+    /// this field; `required_content_markers` remains subject-data matching for
+    /// content and state observations plus legacy persisted contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<RequestReceiptPredicate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<RequestVerificationTarget>,
 }

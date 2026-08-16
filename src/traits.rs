@@ -27,8 +27,8 @@ pub use conversation::{
 pub use dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,
     OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, RequestCompletionContract,
-    RequestEvidenceRequirement, RequestForbiddenAction, RequestTaskKind, RequestVerificationTarget,
-    RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
+    RequestEvidenceRequirement, RequestForbiddenAction, RequestReceiptPredicate, RequestTaskKind,
+    RequestVerificationTarget, RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,

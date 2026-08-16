@@ -30,6 +30,11 @@ pub(super) struct TurnContext {
     /// carry stable message IDs so a continuation must select an exact
     /// antecedent. They never enter a fresh task's provider transcript.
     pub assessment_recent_messages: Vec<Value>,
+    /// Exact prior user message selected by the semantic relationship
+    /// assessment. This binds any provider-visible conversational evidence to
+    /// one persisted antecedent instead of treating the whole recent tail as
+    /// interchangeable proof.
+    pub visible_antecedent_user_message_id: Option<String>,
     pub primary_project_scope: Option<String>,
     pub allow_multi_project_scope: bool,
     pub followup_mode: Option<FollowupMode>,
@@ -511,6 +516,7 @@ impl Agent {
                     .unwrap_or(history.as_slice()),
                 GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
             ),
+            visible_antecedent_user_message_id: None,
             primary_project_scope,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),

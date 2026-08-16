@@ -990,6 +990,7 @@ fn requirement_target_matches(
 /// can close a field-level content obligation.
 pub(in crate::agent) fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
+    requested_tool_name: &str,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
     result_text: &str,
@@ -1007,21 +1008,15 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
             let capability_matches = semantics.evidence.iter().any(|capability| {
                 crate::agent::inquiry::capability_supports_requirement(capability, requirement)
             });
-            // Content predicates are evaluated against typed receipt fields
-            // first and subject data second. A presentation label such as
-            // `exit=1` must never require that label to be echoed in stdout,
-            // but its requested value still has to match the receipt.
-            let content_markers_match = requirement.required_content_markers.iter().all(|marker| {
-                evidence_marker_matches_receipt(
-                    requirement,
-                    marker,
-                    raw_arguments,
-                    result_text,
-                    metadata,
-                )
-            });
+            let receipt_matches =
+                receipt_predicate_matches(requirement, requested_tool_name, result_text, metadata);
+            let content_markers_match = requirement
+                .required_content_markers
+                .iter()
+                .all(|marker| evidence_content_marker_matches_result(marker, result_text));
             (read_receipt_is_compatible
                 && capability_matches
+                && receipt_matches
                 && content_markers_match
                 && requirement_target_matches(requirement, semantics, raw_arguments, metadata))
             .then_some(index)
@@ -1029,99 +1024,57 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
         .collect()
 }
 
-/// Match a requested content token against either subject data or an explicit
-/// typed receipt field. Command identity, stdout presence, and exit status are
-/// properties of the receipt; requiring those labels to be echoed inside
-/// stdout confuses the observation mechanism with the observed value.
-fn evidence_marker_matches_receipt(
+fn receipt_predicate_matches(
     requirement: &RequestEvidenceRequirement,
-    marker: &str,
-    raw_arguments: &str,
+    requested_tool_name: &str,
     result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
 ) -> bool {
-    let marker = marker.trim();
-    let (raw_key, expected_value) = marker
-        .split_once('=')
-        .or_else(|| marker.split_once(':'))
-        .map_or((marker, None), |(key, value)| (key, Some(value.trim())));
-    let typed_receipt_purpose = matches!(
-        requirement.purpose,
-        crate::traits::EvidencePurpose::CurrentState | crate::traits::EvidencePurpose::Outcome
-    );
-    let normalized_key = raw_key.trim().to_ascii_lowercase();
-    if typed_receipt_purpose && matches!(normalized_key.as_str(), "stdout" | "output" | "result") {
-        let has_output = metadata
-            .result_provenance
-            .as_ref()
-            .is_some_and(|provenance| provenance.authoritative_chars > 0)
-            || !result_text.trim().is_empty();
-        return expected_value
-            .filter(|value| !value.is_empty())
-            .map_or(has_output, |value| {
-                has_output && crate::agent::keyword_match(result_text, value)
-            });
-    }
-    if typed_receipt_purpose
-        && metadata.exit_code.is_some()
-        && matches!(normalized_key.as_str(), "exit" | "exit_code" | "exit code")
-    {
-        return match expected_value.filter(|value| !value.is_empty()) {
-            Some(value) => value
-                .parse::<i32>()
-                .ok()
-                .is_some_and(|expected| metadata.exit_code == Some(expected)),
-            None => metadata.exit_code.is_some(),
-        };
-    }
-    if requirement.purpose == crate::traits::EvidencePurpose::Outcome
-        && matches!(normalized_key.as_str(), "outcome" | "outcome_status")
-        && expected_value.is_none_or(is_tool_outcome_status_value)
-    {
-        return expected_value
-            .filter(|value| !value.is_empty())
-            .map(|expected| expected.trim().to_ascii_lowercase())
-            .map_or_else(
-                || metadata.outcome_status.is_some(),
-                |expected| {
-                    metadata
-                        .outcome_status
-                        .is_some_and(|status| status.as_str() == expected)
-                },
-            );
-    }
-    if let Some(command) = extract_command_from_args(raw_arguments) {
-        if normalized_key == "command" {
-            return expected_value.is_some_and(|expected| command.trim() == expected);
-        }
-        if command.trim() == marker {
-            return true;
-        }
-    }
-    if let Some(expected) = expected_value.filter(|value| !value.is_empty()) {
-        if serde_json::from_str::<serde_json::Value>(raw_arguments)
-            .ok()
-            .is_some_and(|value| json_value_matches_marker(&value, raw_key.trim(), Some(expected)))
-        {
-            return true;
-        }
-    }
-    serde_json::from_str::<serde_json::Value>(result_text)
-        .ok()
-        .is_some_and(|value| json_value_matches_marker(&value, raw_key.trim(), expected_value))
-        || crate::agent::keyword_match(result_text, marker)
+    let Some(receipt) = requirement.receipt.as_ref() else {
+        return true;
+    };
+    let tool_matches = receipt.tool_names.is_empty()
+        || receipt.tool_names.iter().any(|name| {
+            name == requested_tool_name || metadata.effective_tool_name.as_deref() == Some(name)
+        });
+    let exit_matches = receipt.exit_codes.is_empty()
+        || metadata
+            .exit_code
+            .is_some_and(|actual| receipt.exit_codes.contains(&actual));
+    let outcome_matches = receipt.outcome_statuses.is_empty()
+        || metadata
+            .outcome_status
+            .is_some_and(|actual| receipt.outcome_statuses.contains(&actual));
+    let rejection_matches = receipt
+        .contract_rejected
+        .is_none_or(|expected| metadata.contract_rejected == expected);
+    let has_output = metadata
+        .result_provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.authoritative_chars > 0)
+        || !result_text.trim().is_empty();
+    let output_matches = !receipt.requires_output || has_output;
+
+    tool_matches && exit_matches && outcome_matches && rejection_matches && output_matches
 }
 
-fn is_tool_outcome_status_value(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "succeeded"
-            | "completed_with_negative_result"
-            | "failed_retryable"
-            | "failed_permanent"
-            | "blocked"
-            | "backgrounded"
-    )
+pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
+    requirement: &RequestEvidenceRequirement,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> bool {
+    requirement.receipt.as_ref().is_some_and(|receipt| {
+        metadata.outcome_status.is_some_and(|actual| {
+            receipt.outcome_statuses.contains(&actual)
+                || (metadata.contract_rejected && receipt.contract_rejected == Some(true))
+        })
+    })
+}
+
+fn evidence_content_marker_matches_result(marker: &str, result_text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result_text)
+        .ok()
+        .is_some_and(|value| json_value_matches_marker(&value, marker.trim(), None))
+        || crate::agent::keyword_match(result_text, marker)
 }
 
 fn json_value_matches_marker(
@@ -1196,15 +1149,7 @@ pub(in crate::agent) fn accumulate_evidence_requirement_marker_matches(
         let observed = requirement
             .required_content_markers
             .iter()
-            .filter(|marker| {
-                evidence_marker_matches_receipt(
-                    requirement,
-                    marker,
-                    raw_arguments,
-                    result_text,
-                    metadata,
-                )
-            })
+            .filter(|marker| evidence_content_marker_matches_result(marker, result_text))
             .cloned()
             .collect::<Vec<_>>();
         progress.record_evidence_content_markers(index, observed);
@@ -1363,7 +1308,7 @@ mod tests {
     fn typed_process_outcome_is_not_vetoed_by_reply_format_markers() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-            ToolSemanticScope,
+            RequestReceiptPredicate, ToolOutcomeStatus, ToolSemanticScope,
         };
         let contract = CompletionContract {
             requires_observation: true,
@@ -1373,10 +1318,14 @@ mod tests {
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
-                required_content_markers: vec![
-                    "exit=1".to_string(),
-                    "outcome=completed_with_negative_result".to_string(),
-                ],
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["run_command".to_string()],
+                    exit_codes: vec![1],
+                    outcome_statuses: vec![ToolOutcomeStatus::CompletedWithNegativeResult],
+                    requires_output: false,
+                    contract_rejected: Some(false),
+                }),
                 target: None,
             }],
             ..CompletionContract::default()
@@ -1393,6 +1342,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
+                "run_command",
                 &metadata.semantics,
                 raw_arguments,
                 "",
@@ -1402,9 +1352,14 @@ mod tests {
         );
 
         let mut mismatched = contract.clone();
-        mismatched.evidence_requirements[0].required_content_markers = vec!["exit=0".to_string()];
+        mismatched.evidence_requirements[0]
+            .receipt
+            .as_mut()
+            .unwrap()
+            .exit_codes = vec![0];
         assert!(matching_evidence_requirement_indices(
             &mismatched,
+            "run_command",
             &metadata.semantics,
             raw_arguments,
             "untrusted process text says exit=0",
@@ -1417,7 +1372,7 @@ mod tests {
     fn command_identity_and_output_presence_are_typed_receipt_fields() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-            ToolSemanticScope,
+            RequestReceiptPredicate, ToolOutcomeStatus, ToolSemanticScope,
         };
         let contract = CompletionContract {
             requires_observation: true,
@@ -1427,7 +1382,14 @@ mod tests {
                 purpose: EvidencePurpose::CurrentState,
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
-                required_content_markers: vec!["/bin/pwd".to_string(), "stdout".to_string()],
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["run_command".to_string()],
+                    exit_codes: vec![0],
+                    outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
+                    requires_output: true,
+                    contract_rejected: Some(false),
+                }),
                 target: None,
             }],
             ..CompletionContract::default()
@@ -1454,6 +1416,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
+                "run_command",
                 &semantics,
                 r#"{"command":"/bin/pwd","working_dir":"/synthetic/project"}"#,
                 "/synthetic/project",
@@ -1484,6 +1447,7 @@ mod tests {
                     minimum_authority: EvidenceAuthority::Direct,
                     temporal_scope: EvidenceTemporalScope::Current,
                     required_content_markers: vec!["state_key".to_string()],
+                    receipt: None,
                     target: None,
                 },
                 RequestEvidenceRequirement {
@@ -1493,6 +1457,7 @@ mod tests {
                     minimum_authority: EvidenceAuthority::Canonical,
                     temporal_scope: EvidenceTemporalScope::Historical,
                     required_content_markers: Vec::new(),
+                    receipt: None,
                     target: None,
                 },
             ],
@@ -1508,6 +1473,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
+                "http_request",
                 &external,
                 "{}",
                 "synthetic state_key current state",
@@ -1517,6 +1483,7 @@ mod tests {
         );
         assert!(matching_evidence_requirement_indices(
             &contract,
+            "http_request",
             &external,
             "{}",
             "synthetic response without the requested field",
@@ -1533,6 +1500,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
+                "goal_trace",
                 &trace,
                 "{}",
                 "synthetic attribution record",
@@ -1560,6 +1528,7 @@ mod tests {
                     "next_run".to_string(),
                     "objective_control".to_string(),
                 ],
+                receipt: None,
                 target: None,
             }],
             ..CompletionContract::default()
@@ -1661,7 +1630,7 @@ mod tests {
     fn rejected_invocation_can_prove_its_typed_outcome_without_proving_content() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-            ToolSemanticScope,
+            RequestReceiptPredicate, ToolSemanticScope,
         };
         let contract = CompletionContract {
             requires_observation: true,
@@ -1671,11 +1640,12 @@ mod tests {
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
-                required_content_markers: vec![
-                    "start_line=1".to_string(),
-                    "end_line=12".to_string(),
-                    "tail_lines=1".to_string(),
-                ],
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["read_file".to_string()],
+                    contract_rejected: Some(true),
+                    ..RequestReceiptPredicate::default()
+                }),
                 target: None,
             }],
             ..CompletionContract::default()
@@ -1693,6 +1663,7 @@ mod tests {
         assert_eq!(
             matching_evidence_requirement_indices(
                 &contract,
+                "read_file",
                 &semantics,
                 arguments,
                 "range modes are mutually exclusive",

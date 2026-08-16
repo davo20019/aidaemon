@@ -395,7 +395,7 @@ fn mandate_tool_ctx<'a>(
         correction_preapproved: false,
         suppress_trusted_session: false,
         mandate_authority: grant,
-        mandate_tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
+        tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
     }
 }
@@ -456,7 +456,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 correction_preapproved: false,
                 suppress_trusted_session: false,
                 mandate_authority: None,
-                mandate_tool_call_id: None,
+                tool_call_id: None,
                 mutation_forbidden: false,
             },
         )
@@ -501,7 +501,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 correction_preapproved: false,
                 suppress_trusted_session: false,
                 mandate_authority: None,
-                mandate_tool_call_id: None,
+                tool_call_id: None,
                 mutation_forbidden: false,
             },
         )
@@ -538,7 +538,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 correction_preapproved: false,
                 suppress_trusted_session: false,
                 mandate_authority: None,
-                mandate_tool_call_id: None,
+                tool_call_id: None,
                 mutation_forbidden: false,
             },
         )
@@ -552,7 +552,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
 }
 
 #[tokio::test]
-async fn execute_tool_watchdog_injects_project_scope_into_spawn_agent() {
+async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
@@ -575,9 +575,9 @@ async fn execute_tool_watchdog_injects_project_scope_into_spawn_agent() {
                 workspace_grant: None,
                 correction_preapproved: false,
                 suppress_trusted_session: false,
-            mandate_authority: None,
-            mandate_tool_call_id: None,
-            mutation_forbidden: false,
+                mandate_authority: None,
+                tool_call_id: Some("call-parent-synthetic"),
+                mutation_forbidden: false,
             },
         )
         .await
@@ -595,6 +595,10 @@ async fn execute_tool_watchdog_injects_project_scope_into_spawn_agent() {
     assert_eq!(
         payload.get("_session_id").and_then(Value::as_str),
         Some("test-session")
+    );
+    assert_eq!(
+        payload.get("_tool_call_id").and_then(Value::as_str),
+        Some("call-parent-synthetic")
     );
 }
 
@@ -627,7 +631,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         correction_preapproved: false,
         suppress_trusted_session: false,
         mandate_authority: grant,
-        mandate_tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
+        tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
     };
 
@@ -908,7 +912,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
                 correction_preapproved: false,
                 suppress_trusted_session: false,
                 mandate_authority: Some(&grant),
-                mandate_tool_call_id: grant.tool_call_id.as_deref(),
+                tool_call_id: grant.tool_call_id.as_deref(),
                 mutation_forbidden: false,
             },
         )

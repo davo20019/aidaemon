@@ -171,7 +171,7 @@ impl MockProvider {
         };
         Self::text_response(
             &json!({
-                "schema_version": 6,
+                "schema_version": 7,
                 "goal": "Synthetic typed task assessment",
                 "steps": [],
                 "success_criteria": [],
@@ -280,6 +280,7 @@ impl ModelProvider for MockProvider {
                 m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
                     s.contains("task planner")
                         || s.contains("task assessment router")
+                        || s.contains("task relationship router")
                         || s.contains("progress evaluator")
                 })
             });

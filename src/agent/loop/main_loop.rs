@@ -29,6 +29,100 @@ struct ContinuationReceiptAssimilation {
     mutation_credited: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisibleContextAssimilation {
+    source_message_ids: Vec<String>,
+    matched_requirement_indices: Vec<usize>,
+}
+
+/// Credit canonical conversation content that is already present in the
+/// provider-visible request context. Only the exact antecedent selected by the
+/// typed relationship edge is eligible; unrelated recent turns and hidden
+/// tool rows can never become proof through this path.
+fn assimilate_visible_antecedent_context(
+    contract: &CompletionContract,
+    progress: &mut CompletionProgress,
+    recent_messages: &[serde_json::Value],
+    antecedent_user_message_id: &str,
+) -> Option<VisibleContextAssimilation> {
+    let antecedent_index = recent_messages.iter().position(|message| {
+        message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && message
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(antecedent_user_message_id)
+    })?;
+
+    let mut source_message_ids = Vec::new();
+    for (offset, message) in recent_messages[antecedent_index..].iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if offset > 0 && role == "user" {
+            break;
+        }
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let Some(message_id) = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(_content) = message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        source_message_ids.push(message_id.to_string());
+    }
+    if source_message_ids.is_empty() {
+        return None;
+    }
+
+    let matched_requirement_indices = contract
+        .evidence_requirements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, requirement)| {
+            let context_compatible = requirement
+                .acceptable_scopes
+                .contains(&crate::traits::ToolSemanticScope::ConversationHistory)
+                && matches!(
+                    requirement.purpose,
+                    crate::traits::EvidencePurpose::HistoricalRecord
+                        | crate::traits::EvidencePurpose::Content
+                )
+                && crate::traits::EvidenceAuthority::Canonical
+                    .satisfies(requirement.minimum_authority)
+                && crate::traits::EvidenceTemporalScope::Historical
+                    .satisfies(requirement.temporal_scope)
+                && requirement.receipt.is_none()
+                && requirement.target.is_none();
+            context_compatible.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if matched_requirement_indices.is_empty() {
+        return None;
+    }
+
+    // The exact projected message IDs are the evidence. Do not inspect or
+    // match their prose to decide lifecycle completion: semantic values and
+    // response formatting remain the model/response-contract layer.
+    let source_id = format!("conversation-context:{}", source_message_ids.join(","));
+    progress.mark_observation_receipt(contract, &matched_requirement_indices, false, &source_id);
+
+    Some(VisibleContextAssimilation {
+        source_message_ids,
+        matched_requirement_indices,
+    })
+}
+
 /// Adopt one exact parent receipt into the child task's proof graph.
 ///
 /// This is deliberately independent of notification prose. A receipt can
@@ -48,16 +142,6 @@ fn assimilate_continuation_receipt(
         crate::traits::ToolOutcomeStatus::Succeeded
             | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
     );
-    if !reportable {
-        return Some(ContinuationReceiptAssimilation {
-            outcome_status: receipt.outcome_status,
-            matched_requirement_indices: Vec::new(),
-            matched_contract: false,
-            observation_credited: false,
-            mutation_credited: false,
-        });
-    }
-
     let raw_arguments = serde_json::to_string(&evidence.call.arguments).ok()?;
     let mut metadata = receipt.to_metadata();
     super::tool_execution_phase::complete_tool_result_semantics(
@@ -89,6 +173,7 @@ fn assimilate_continuation_receipt(
     let mut matched_requirement_indices = if semantics.observes_state() {
         super::tool_execution_phase::matching_evidence_requirement_indices(
             contract,
+            &evidence.call.name,
             semantics,
             &raw_arguments,
             &evidence.result.result,
@@ -116,7 +201,19 @@ fn assimilate_continuation_receipt(
     } else {
         !matched_requirement_indices.is_empty()
     };
-    let can_verify = semantics.observes_state()
+    let expected_nonstandard_outcome = matched_requirement_indices.iter().any(|index| {
+        contract
+            .evidence_requirements
+            .get(*index)
+            .is_some_and(|requirement| {
+                super::tool_execution_phase::evidence_requirement_accepts_nonstandard_outcome(
+                    requirement,
+                    &metadata,
+                )
+            })
+    });
+    let can_verify = (reportable || expected_nonstandard_outcome)
+        && semantics.observes_state()
         && super::tool_execution_phase::tool_result_or_metadata_contains_verifiable_evidence(
             semantics,
             &evidence.result.result,
@@ -445,6 +542,33 @@ impl Agent {
         debug_assert!(turn_context.completion_contract.belongs_to_task(&task_id));
         let mut completion_progress =
             CompletionProgress::new(&turn_context.completion_contract, &task_id);
+
+        if let Some(antecedent_user_message_id) = turn_context
+            .visible_antecedent_user_message_id
+            .as_deref()
+        {
+            if let Some(assimilation) = assimilate_visible_antecedent_context(
+                &turn_context.completion_contract,
+                &mut completion_progress,
+                &turn_context.assessment_recent_messages,
+                antecedent_user_message_id,
+            ) {
+                self.emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    DecisionType::EvidenceGate,
+                    "Credited exact provider-visible conversation antecedent".to_string(),
+                    json!({
+                        "condition": "visible_antecedent_context_assimilation",
+                        "antecedent_user_message_id": antecedent_user_message_id,
+                        "source_message_ids": assimilation.source_message_ids,
+                        "matched_requirement_indices": assimilation.matched_requirement_indices,
+                    }),
+                )
+                .await;
+            }
+        }
 
         // A background completion re-enters as a child task. Import only the
         // exact terminal receipt named by that typed continuation edge, and
@@ -1965,7 +2089,16 @@ mod stuck_fallback_tests {
                 purpose: crate::traits::EvidencePurpose::Outcome,
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-                required_content_markers: vec!["exit".to_string()],
+                required_content_markers: Vec::new(),
+                receipt: Some(crate::traits::RequestReceiptPredicate {
+                    tool_names: vec!["terminal".to_string()],
+                    exit_codes: vec![1],
+                    outcome_statuses: vec![
+                        crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+                    ],
+                    requires_output: false,
+                    contract_rejected: None,
+                }),
                 target: None,
             }],
             ..CompletionContract::default()
@@ -2006,6 +2139,7 @@ mod stuck_fallback_tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
                 required_content_markers: vec!["edition".to_string()],
+                receipt: None,
                 target: None,
             }],
             ..CompletionContract::default()
@@ -2029,6 +2163,98 @@ mod stuck_fallback_tests {
         assert!(!assimilation.observation_credited);
         assert!(progress.verification_pending);
         assert!(!progress.all_evidence_requirements_satisfied());
+    }
+
+    #[test]
+    fn exact_visible_antecedent_can_close_conversation_content_obligation() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Values supplied in the exact preceding setup".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::ConversationHistory],
+                purpose: crate::traits::EvidencePurpose::HistoricalRecord,
+                minimum_authority: crate::traits::EvidenceAuthority::Canonical,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                required_content_markers: vec![
+                    "SILVER COMET".to_string(),
+                    "eighty-three".to_string(),
+                ],
+                receipt: None,
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let recent = vec![
+            json!({
+                "message_id": "unrelated-user",
+                "role": "user",
+                "content": "The unrelated value is eighty-three."
+            }),
+            json!({
+                "message_id": "antecedent-user",
+                "role": "user",
+                "content": "Keep phrase SILVER COMET and quantity eighty-three in volatile context."
+            }),
+            json!({
+                "message_id": "antecedent-assistant",
+                "role": "assistant",
+                "content": "Setup acknowledged."
+            }),
+        ];
+        let mut progress = CompletionProgress::new(&contract, "task-child");
+
+        let assimilation = assimilate_visible_antecedent_context(
+            &contract,
+            &mut progress,
+            &recent,
+            "antecedent-user",
+        )
+        .expect("exact visible context should be canonical evidence");
+
+        assert_eq!(assimilation.source_message_ids.len(), 2);
+        assert_eq!(assimilation.matched_requirement_indices, [0]);
+        assert!(progress.all_evidence_requirements_satisfied());
+        assert!(!progress.verification_pending);
+    }
+
+    #[test]
+    fn missing_exact_antecedent_cannot_close_conversation_obligation() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Exact preceding setup value".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::ConversationHistory],
+                purpose: crate::traits::EvidencePurpose::Content,
+                minimum_authority: crate::traits::EvidenceAuthority::Canonical,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                required_content_markers: Vec::new(),
+                receipt: None,
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let recent = vec![
+            json!({
+                "message_id": "unrelated-user",
+                "role": "user",
+                "content": "VIOLET HARBOR"
+            }),
+            json!({
+                "message_id": "different-user",
+                "role": "user",
+                "content": "This is a different setup."
+            }),
+        ];
+        let mut progress = CompletionProgress::new(&contract, "task-child");
+
+        assert!(assimilate_visible_antecedent_context(
+            &contract,
+            &mut progress,
+            &recent,
+            "antecedent-user",
+        )
+        .is_none());
+        assert!(progress.verification_pending);
     }
 
     #[test]

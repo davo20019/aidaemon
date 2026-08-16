@@ -3570,7 +3570,6 @@ fn default_disabled_tools() -> Vec<String> {
         "git_info".to_string(),
         "git_commit".to_string(),
         "policy_metrics".to_string(),
-        "check_environment".to_string(),
         "service_status".to_string(),
         "project_inspect".to_string(),
         "read_channel_history".to_string(),
@@ -3583,7 +3582,7 @@ fn default_disabled_tools() -> Vec<String> {
 pub struct ToolsConfig {
     /// Built-in tool machine names to omit at daemon startup (requires `/restart`).
     /// Off by default: `git_info`, `git_commit` (use `run_command`/`terminal`), plus
-    /// `policy_metrics`, `check_environment`, `service_status`, `project_inspect` (use
+    /// `policy_metrics`, `service_status`, `project_inspect` (use
     /// `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack opt-in),
     /// `tool_trace` (use `goal_trace` with `action: "tool_trace"` instead). Set `disabled = []`
     /// to register everything. Example extras: `["goal_trace"]` to disable forensics entirely.
@@ -4308,7 +4307,6 @@ mod tests {
             "git_info",
             "git_commit",
             "policy_metrics",
-            "check_environment",
             "service_status",
             "project_inspect",
             "read_channel_history",
@@ -4320,6 +4318,7 @@ mod tests {
             );
         }
         assert!(config.is_enabled("terminal"));
+        assert!(config.is_enabled("check_environment"));
         assert!(config.is_enabled("goal_trace"));
         assert!(!config.is_enabled("tool_trace"));
         assert!(config.is_enabled("search_files"));

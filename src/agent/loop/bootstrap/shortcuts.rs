@@ -50,7 +50,7 @@ pub(super) async fn maybe_handle_stop_command(
                 correction_preapproved: false,
                 suppress_trusted_session: false,
                 mandate_authority: None,
-                mandate_tool_call_id: None,
+                tool_call_id: None,
                 mutation_forbidden: false,
             },
         )

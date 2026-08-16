@@ -347,7 +347,7 @@ pub(super) async fn execute_tool_call_io(
                 correction_preapproved: ctx.correction_preapproved,
                 suppress_trusted_session: ctx.suppress_trusted_session,
                 mandate_authority: ctx.mandate_authority,
-                mandate_tool_call_id: Some(tc.id.as_str()),
+                tool_call_id: Some(tc.id.as_str()),
                 mutation_forbidden: ctx.mutation_forbidden,
             },
         )
@@ -736,7 +736,7 @@ async fn maybe_retry_edit_file_not_found_recovery(
         correction_preapproved: ctx.correction_preapproved,
         suppress_trusted_session: ctx.suppress_trusted_session,
         mandate_authority: None,
-        mandate_tool_call_id: None,
+        tool_call_id: None,
         mutation_forbidden: ctx.mutation_forbidden,
     };
 

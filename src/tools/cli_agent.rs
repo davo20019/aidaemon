@@ -249,9 +249,11 @@ struct CliToolEntry {
     is_dynamic: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum CliWorkspaceMode {
     ReadOnly,
+    #[default]
     ReadWrite,
 }
 
@@ -1999,6 +2001,18 @@ impl CliAgentTool {
             Some(dir) => Some(Self::normalize_working_dir(dir).await?),
             None => None,
         };
+        // A repository-wide diff is useful only when this invocation starts
+        // from a clean baseline. Otherwise it attributes and exposes unrelated
+        // pre-existing work to the child. Read-only runs never need a diff.
+        let diff_capture_working_dir = if workspace_mode == CliWorkspaceMode::ReadWrite {
+            if let Some(dir) = canonical_working_dir.as_deref() {
+                (Self::dirty_worktree_entry_count(dir).await == Some(0)).then(|| dir.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let dedup_prompt = make_dedup_prompt(prompt);
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         let short_summary: String = prompt.chars().take(50).collect();
@@ -2265,7 +2279,7 @@ impl CliAgentTool {
         let notify_session_id = session_id.to_string();
         let notify_async = async_mode;
         let notify_goal_id = goal_id.map(|s| s.to_string()).unwrap_or_default();
-        let notify_working_dir = canonical_working_dir.clone();
+        let notify_working_dir = diff_capture_working_dir.clone();
         let hub_for_completion = self.get_hub();
         let agent_for_completion = self.get_agent();
         let reengagements_for_completion = self.reengagements.clone();
@@ -2862,7 +2876,7 @@ impl CliAgentTool {
 
         // For async_mode, return immediately with task_id
         if async_mode {
-            let working_dir_owned = canonical_working_dir.clone();
+            let working_dir_owned = diff_capture_working_dir.clone();
             let agent = RunningCliAgent {
                 tool_name: tool_name.to_string(),
                 prompt_summary: short_summary.clone(),
@@ -2890,7 +2904,7 @@ impl CliAgentTool {
         }
 
         // Wait for completion with timeout
-        let working_dir_owned = canonical_working_dir;
+        let working_dir_owned = diff_capture_working_dir;
         let result = tokio::time::timeout(timeout, completion_rx).await;
 
         match result {
@@ -3397,6 +3411,9 @@ struct CliAgentArgs {
     /// Optional description paired with `command`.
     description: Option<String>,
     working_dir: Option<String>,
+    /// Typed delegation authority. Prompt prose never narrows the sandbox.
+    #[serde(default)]
+    workspace_mode: CliWorkspaceMode,
     task_id: Option<String>,
     /// Optional system instruction to shape the CLI agent into a specialist
     system_instruction: Option<String>,
@@ -3853,10 +3870,8 @@ impl Tool for CliAgentTool {
         json!({
             "name": "cli_agent",
             "description": format!(
-                "Delegate complex multi-step coding/research/analysis work to an installed CLI agent. \
-                 Available agents: {}. If `tool` is omitted, the runtime auto-selects the first installed \
-                 agent (claude, gemini, codex, copilot, aider). Use manage_memories for scheduling. \
-                 Long runs can be checked or cancelled.",
+                "Delegate coding or research to an installed CLI agent. Available agents: {}. \
+                 Runs can be checked or cancelled.",
                 tools_help
             ),
             "parameters": {
@@ -3878,7 +3893,12 @@ impl Tool for CliAgentTool {
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Absolute working directory. Always set this so the runtime can detect conflicts; two agents must not run concurrently in the same working_dir."
+                        "description": "Absolute working directory; required for run."
+                    },
+                    "workspace_mode": {
+                        "type": "string",
+                        "enum": ["read_only", "read_write"],
+                        "description": "Run authority: enforced read_only or mutation-capable read_write."
                     },
                     "task_id": {
                         "type": "string",
@@ -3897,7 +3917,7 @@ impl Tool for CliAgentTool {
                 "additionalProperties": false,
                 "anyOf": [
                     {
-                        "required": ["action", "prompt"],
+                        "required": ["action", "prompt", "workspace_mode"],
                         "properties": {
                             "action": {
                                 "enum": ["run"]
@@ -3954,10 +3974,20 @@ impl Tool for CliAgentTool {
         let mut semantics = match action {
             "list" | "check" => ToolCallSemantics::observation()
                 .with_verification_mode(ToolVerificationMode::ResultContent),
-            // A delegated run may both inspect and change state. Keep the
-            // effect conservative for preflight policy, but omit a synthetic
-            // mutation-effect bit so a structured pre-launch failure can
-            // authoritatively downgrade the completed outcome to administrative.
+            "run"
+                if parsed
+                    .as_ref()
+                    .and_then(|value| value.get("workspace_mode"))
+                    .and_then(Value::as_str)
+                    == Some("read_only") =>
+            {
+                ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent)
+            }
+            // A read-write delegated run may both inspect and change state.
+            // Keep the effect conservative for preflight policy, but omit a
+            // synthetic mutation-effect bit so a structured pre-launch
+            // failure can authoritatively downgrade to administrative.
             "run" => ToolCallSemantics::observation_and_mutation()
                 .with_verification_mode(ToolVerificationMode::ResultContent),
             "cancel" | "cancel_all" => ToolCallSemantics::mutation(),
@@ -3978,19 +4008,19 @@ impl Tool for CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let action = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
             .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && parsed
+                .as_ref()
+                .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, false)
+            .call_with_status_under_contract(arguments, status_tx, read_only_run)
             .await?;
-        Ok(cli_agent_outcome(&action, output, false))
+        Ok(cli_agent_outcome(&action, output, read_only_run))
     }
 
     async fn call_with_execution_context(
@@ -3999,23 +4029,20 @@ impl Tool for CliAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let action = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
             .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && (exec_ctx.mutation_forbidden
+                || parsed
+                    .as_ref()
+                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, exec_ctx.mutation_forbidden)
+            .call_with_status_under_contract(arguments, status_tx, read_only_run)
             .await?;
-        Ok(cli_agent_outcome(
-            &action,
-            output,
-            exec_ctx.mutation_forbidden && action == "run",
-        ))
+        Ok(cli_agent_outcome(&action, output, read_only_run))
     }
 
     async fn call_with_status(
@@ -4084,7 +4111,7 @@ impl CliAgentTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        mutation_forbidden: bool,
+        read_only_run: bool,
     ) -> anyhow::Result<String> {
         let args: CliAgentArgs = serde_json::from_str(arguments)?;
 
@@ -4229,7 +4256,7 @@ impl CliAgentTool {
                             args._goal_id.as_deref(),
                             args._task_id.as_deref(),
                             args.system_instruction.as_deref(),
-                            if mutation_forbidden {
+                            if read_only_run {
                                 CliWorkspaceMode::ReadOnly
                             } else {
                                 CliWorkspaceMode::ReadWrite
@@ -4351,6 +4378,39 @@ mod tests {
         let error =
             apply_read_only_cli_adapter("/synthetic/bin/opaque-agent", &mut args).unwrap_err();
         assert!(error.contains("no registered hard read-only adapter"));
+    }
+
+    #[tokio::test]
+    async fn typed_workspace_mode_controls_delegation_semantics() {
+        let (tool, _db_file) = setup_echo_tool().await;
+        let read_only = tool.call_semantics(
+            r#"{"action":"run","workspace_mode":"read_only","working_dir":"/tmp","prompt":"inspect"}"#,
+        );
+        let read_write = tool.call_semantics(
+            r#"{"action":"run","workspace_mode":"read_write","working_dir":"/tmp","prompt":"change"}"#,
+        );
+
+        assert!(read_only.observes_state());
+        assert!(!read_only.mutates_state());
+        assert!(read_write.observes_state());
+        assert!(read_write.mutates_state());
+
+        let schema = tool.schema();
+        let run_branch = schema["parameters"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| {
+                branch["properties"]["action"]["enum"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == "run"))
+            })
+            .unwrap();
+        assert!(run_branch["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "workspace_mode"));
     }
 
     #[test]

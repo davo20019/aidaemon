@@ -506,6 +506,7 @@ mod tests {
             minimum_authority: authority,
             temporal_scope,
             required_content_markers: Vec::new(),
+            receipt: None,
             target: None,
         }
     }

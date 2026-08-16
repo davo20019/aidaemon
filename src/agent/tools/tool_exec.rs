@@ -81,9 +81,13 @@ pub(super) struct ToolExecCtx<'a> {
     /// Exact action-bound authority for a call made under an autonomous
     /// mandate. It is issued by the execution loop and never model-visible.
     pub mandate_authority: Option<&'a crate::traits::MandateAuthorityGrant>,
-    /// Actual dispatcher-owned call identity carried independently from the
-    /// grant so the final ledger claim cannot validate a grant against itself.
-    pub mandate_tool_call_id: Option<&'a str>,
+    /// Dispatcher-owned identity of the originating model tool call.
+    ///
+    /// This is general causal lineage, not mandate-specific state: transparent
+    /// adapters and detached work must retain it so their result can be joined
+    /// back to the request. Mandate validation also binds its grant to this
+    /// independently supplied identity.
+    pub tool_call_id: Option<&'a str>,
     /// Rust-side hard boundary inherited from the request contract.
     pub mutation_forbidden: bool,
 }
@@ -419,7 +423,7 @@ impl Agent {
                     let bound_tool_call_id = grant.tool_call_id.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("The mandate grant is not bound to this tool call.")
                     })?;
-                    let actual_tool_call_id = ctx.mandate_tool_call_id.ok_or_else(|| {
+                    let actual_tool_call_id = ctx.tool_call_id.ok_or_else(|| {
                         anyhow::anyhow!(
                             "The mandate dispatch is missing its actual tool call identity."
                         )
@@ -646,7 +650,7 @@ impl Agent {
                 if let Some(tid) = task_id {
                     map.insert("_task_id".to_string(), json!(tid));
                 }
-                if let Some(tool_call_id) = ctx.mandate_tool_call_id {
+                if let Some(tool_call_id) = ctx.tool_call_id {
                     map.insert("_tool_call_id".to_string(), json!(tool_call_id));
                 }
                 if let Some(ref turn_id) = turn_id {

@@ -422,6 +422,7 @@ mod tests {
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }],
             ..CompletionContract::default()

@@ -152,6 +152,18 @@ pub(crate) struct PlannedTaskShape {
     pub semantic_scope: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskRelationshipResponse {
+    schema_version: u16,
+    confidence: String,
+    request_relationship: String,
+    #[serde(default)]
+    antecedent_user_message_id: Option<String>,
+    semantic_scope: String,
+}
+
+const TASK_RELATIONSHIP_SCHEMA_VERSION: u16 = 1;
+
 fn confidence_is_sufficient(value: Option<&str>) -> bool {
     matches!(
         value.map(|value| value.trim().to_ascii_lowercase()),
@@ -256,7 +268,6 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
             && signals.tool_constraint_evidence.is_empty()
         || tool_scope == "forbidden"
             && (signals.tool_constraint_evidence.is_empty()
-                || !signals.forbidden_tool_scopes.is_empty()
                 || !signals.allowed_tool_names.is_empty())
         || tool_scope == "restricted"
             && (signals.tool_constraint_evidence.is_empty()
@@ -291,8 +302,32 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
 
     let evidence_requirements = signals.evidence_requirements.as_deref().unwrap_or_default();
     if evidence_requirements.len() > 8
+        // A check is an evidence-producing lifecycle kind. Treating it as a
+        // zero-observation answer would let the model assert current-run or
+        // current-state facts without any proof edge.
+        || task_kind == crate::agent::CompletionTaskKind::Check
+            && signals.requires_observation != Some(true)
         || signals.requires_observation == Some(true) && evidence_requirements.is_empty()
         || signals.requires_observation == Some(false) && !evidence_requirements.is_empty()
+        || task_kind == crate::agent::CompletionTaskKind::Check
+            && tool_scope == "restricted"
+            && !evidence_requirements.iter().any(|requirement| {
+                requirement.receipt.as_ref().is_some_and(|receipt| {
+                    receipt
+                        .tool_names
+                        .iter()
+                        .any(|name| signals.allowed_tool_names.contains(name))
+                })
+            })
+        || tool_scope == "restricted"
+            && evidence_requirements.iter().any(|requirement| {
+                requirement.receipt.as_ref().is_some_and(|receipt| {
+                    receipt
+                        .tool_names
+                        .iter()
+                        .any(|name| !signals.allowed_tool_names.contains(name))
+                })
+            })
         || evidence_requirements.iter().any(|requirement| {
             let summary_len = requirement.summary.trim().chars().count();
             summary_len == 0
@@ -304,6 +339,30 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                     let trimmed = marker.trim();
                     trimmed.is_empty() || trimmed != marker || marker.chars().count() > 128
                 })
+                || requirement.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.is_empty()
+                        || receipt.tool_names.len() > 8
+                        || receipt.tool_names.iter().any(|name| {
+                            name.is_empty()
+                                || name.len() > 80
+                                || !name.bytes().all(|byte| {
+                                    byte.is_ascii_lowercase()
+                                        || byte.is_ascii_digit()
+                                        || matches!(byte, b'_' | b'-')
+                                })
+                        })
+                        || receipt.exit_codes.len() > 16
+                        || receipt.outcome_statuses.len() > 6
+                })
+                // Outcome observations are receipt facts. Requiring their
+                // labels to appear in returned content recreates a second,
+                // contradictory proof contract.
+                || requirement.purpose == crate::traits::EvidencePurpose::Outcome
+                    && (!requirement.required_content_markers.is_empty()
+                        || requirement
+                            .receipt
+                            .as_ref()
+                            .is_none_or(crate::traits::RequestReceiptPredicate::is_empty))
                 // Exact targets come only from structural request parsing.
                 || requirement.target.is_some()
                 || !crate::agent::inquiry::requirement_has_builtin_evidence_route(requirement)
@@ -476,7 +535,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 6;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 7;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -704,7 +763,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 6,\n\
+           \"schema_version\": 7,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -732,7 +791,14 @@ pub(crate) async fn generate_task_plan(
                  \"purpose\": \"current_state|historical_record|content|outcome|attribution|causal_explanation\",\n\
                  \"minimum_authority\": \"advisory|direct|canonical\",\n\
                  \"temporal_scope\": \"current|historical|both\",\n\
-                 \"required_content_markers\": [\"exact requested field or key token\"]\n\
+                 \"required_content_markers\": [\"exact requested field or key token\"],\n\
+                 \"receipt\": {{\n\
+                   \"tool_names\": [\"exact required tool identifier\"],\n\
+                   \"exit_codes\": [0],\n\
+                   \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
+                   \"requires_output\": false,\n\
+                   \"contract_rejected\": false\n\
+                 }}\n\
                }}\n\
              ],\n\
              \"project_reference\": null\n\
@@ -776,13 +842,16 @@ pub(crate) async fn generate_task_plan(
          - expects_mutation=true only when completion changes files or external state. \
            Text generated in the reply is not a mutation.\n\
          - requires_observation=true whenever completion depends on retrieving evidence: live files, \
-           commands, web pages, APIs, memory, conversation history, task/goal/mandate ledgers, or \
-           current state. It must be true exactly when evidence_requirements is non-empty.\n\
+           commands, web pages, APIs, memory, omitted or exact older conversation history, \
+           task/goal/mandate ledgers, or current state. Ordinary adjacent conversation already shown \
+           in Recent conversation context is request input, not a new observation obligation. It must \
+           be true exactly when evidence_requirements is non-empty.\n\
          - tool_scope=forbidden only when the CURRENT user request explicitly prohibits every \
            tool, lookup, search, browse, or execution path. Preserve requires_observation and \
            evidence_requirements when live evidence would normally be needed; this lets the main \
-           model state the exact evidence limitation without violating the constraint; set \
-           forbidden_tool_scopes=[] and allowed_tool_names=[].\n\
+           model state the exact evidence limitation without violating the constraint. Keep any \
+           independently explicit prohibited capability domains in forbidden_tool_scopes so their \
+           automatic pipelines and related-turn inheritance remain denied; set allowed_tool_names=[].\n\
          - tool_scope=restricted when the CURRENT request authorizes one or more exact named tools \
            while excluding every other tool (for example, \"use only check_environment\"). Copy only \
            exact tool identifiers present in the current request into allowed_tool_names. This is a \
@@ -809,15 +878,26 @@ pub(crate) async fn generate_task_plan(
            only when those sources must be primary.\n\
          - requires_exact_history=true only when completion requires canonical earlier \
            conversation wording rather than ordinary conversational context.\n\
-         - evidence_requirements contains one entry for every independently material fact the \
-           final answer must establish. Return [] exactly when requires_observation=false; otherwise \
-           return 1-8 entries. Describe evidence needs, never tool names or execution steps.\n\
+         - evidence_requirements is the single completion ledger for every independently material \
+           fact or invocation result the final answer must establish. Return [] exactly when \
+           requires_observation=false; otherwise return 1-8 entries. If the current request requires \
+           invoking a named tool, command, check, or deliberately invalid call, requires_observation \
+           must be true and its receipt must be represented here even when rejection or a nonzero \
+           result is the expected successful observation.\n\
          - acceptable_scopes lists alternative authoritative domains for that ONE need. When two \
            domains establish different facts, create two requirements rather than treating them as alternatives.\n\
          - required_content_markers contains exact field names, keys, headings, or stable identifiers from \
            the CURRENT request that must be present in a content observation for that requirement to be \
            satisfied. Use [] when presence of a particular content token is not part of the evidence need. \
-           Do not invent values or use answer prose as markers.\n\
+           Do not put tool names, command identity, exit codes, outcome labels, or final-answer formatting \
+           here; those are receipt facts or required_response_fields. Do not invent values or use answer \
+           prose as markers.\n\
+         - receipt contains only machine-checkable invocation facts explicitly required by the CURRENT \
+           request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
+           outcome_statuses are alternative acceptable results; requires_output means authoritative result \
+           content must be nonempty; contract_rejected is the required pre-I/O validation disposition. \
+           Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
+           nonempty receipt and required_content_markers=[]. Never translate receipt facts into prose markers.\n\
          - A current state observation proves only current state/content/outcome. It does not by itself \
            prove who performed an action, why it happened, what the agent previously decided, or whether \
            a historical claim came from autonomous execution. Attribution, causal explanation, and prior \
@@ -934,6 +1014,103 @@ pub(crate) async fn generate_task_plan(
         contract: parsed.contract,
         task_shape: parsed.task_shape,
         mode,
+    })
+}
+
+/// Recover only the typed dialogue edge when the broad task assessment is
+/// unavailable. This deliberately cannot produce completion obligations,
+/// authority, tool policy, or execution mode. The caller still validates an
+/// exact antecedent against persisted dialogue state before committing it.
+pub(crate) async fn generate_task_relationship(
+    provider: Arc<dyn ModelProvider>,
+    model: &str,
+    user_text: &str,
+    conversation_context: &str,
+    telemetry: Option<PlannerTelemetryCtx<'_>>,
+) -> Option<PlannedTaskShape> {
+    if conversation_context.trim().is_empty() {
+        return None;
+    }
+    let system = "You are a task relationship router. Return only valid JSON. You classify one typed dialogue edge and cannot authorize actions or decide completion.";
+    let prompt = format!(
+        "Recent conversation with stable message IDs:\n{conversation_context}\n\n\
+         Current user request:\n{user_text}\n\n\
+         Return exactly: {{\"schema_version\":1,\"confidence\":\"low|medium|high\",\
+         \"request_relationship\":\"new_request|continuation|clarification_answer|courtesy\",\
+         \"antecedent_user_message_id\":null,\
+         \"semantic_scope\":\"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"}}.\n\
+         Use continuation only when the current request advances, retries, or asks about one prior request shown above; copy that prior USER row's exact message_id. Otherwise use new_request and null. Courtesy and clarification_answer also require null. Judge the whole meaning, not isolated words.",
+        conversation_context = truncate_str(conversation_context, 6000),
+        user_text = truncate_str(user_text, 4000),
+    );
+    let messages = vec![
+        json!({ "role": "system", "content": system }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    let call_start = Instant::now();
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        provider.chat(model, &messages, &[]),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            warn!(%error, "Task relationship fallback failed");
+            return None;
+        }
+        Err(_) => {
+            warn!("Task relationship fallback timed out (8s)");
+            return None;
+        }
+    };
+    record_auxiliary_model_call(
+        telemetry,
+        "task_relationship_fallback",
+        model,
+        &response,
+        call_start.elapsed().as_millis() as u64,
+    )
+    .await;
+
+    let json = crate::utils::extract_json_object(response.content.as_deref().unwrap_or(""))?;
+    let parsed: TaskRelationshipResponse = serde_json::from_str(&json).ok()?;
+    if parsed.schema_version != TASK_RELATIONSHIP_SCHEMA_VERSION
+        || !matches!(parsed.confidence.as_str(), "low" | "medium" | "high")
+        || !matches!(
+            parsed.request_relationship.as_str(),
+            "new_request" | "continuation" | "clarification_answer" | "courtesy"
+        )
+        || !matches!(
+            parsed.semantic_scope.as_str(),
+            "none"
+                | "goal_state"
+                | "user_memory"
+                | "conversation_history"
+                | "external_remote"
+                | "local_workspace"
+                | "host_local"
+        )
+    {
+        return None;
+    }
+    let antecedent = parsed
+        .antecedent_user_message_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if (parsed.request_relationship == "continuation") != antecedent.is_some() {
+        return None;
+    }
+
+    Some(PlannedTaskShape {
+        execution_mode: None,
+        confidence: Some(parsed.confidence),
+        independent_workstreams: None,
+        requires_background_continuation: None,
+        continue_inline_after_background_start: None,
+        request_relationship: Some(parsed.request_relationship),
+        antecedent_user_message_id: antecedent,
+        semantic_scope: Some(parsed.semantic_scope),
     })
 }
 
@@ -1284,6 +1461,7 @@ mod tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }]),
             project_reference: None,
@@ -1297,11 +1475,41 @@ mod tests {
         restricted.tool_scope = Some("restricted".to_string());
         restricted.allowed_tool_names = vec!["check_environment".to_string()];
         restricted.tool_constraint_evidence = vec!["Use only check_environment once".to_string()];
-        assert!(planned_contract_is_complete(&restricted));
+        assert!(
+            !planned_contract_is_complete(&restricted),
+            "a restricted check needs a typed receipt requirement"
+        );
         assert!(planned_tool_constraints_are_grounded(
             &restricted,
             "Use only check_environment once. Do not use other tools."
         ));
+
+        let mut typed_outcome = restricted.clone();
+        typed_outcome.evidence_requirements =
+            Some(vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Observe the required tool invocation outcome".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: Some(crate::traits::RequestReceiptPredicate {
+                    tool_names: vec!["check_environment".to_string()],
+                    outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+                    ..crate::traits::RequestReceiptPredicate::default()
+                }),
+                target: None,
+            }]);
+        assert!(planned_contract_is_complete(&typed_outcome));
+
+        let mut prose_outcome = typed_outcome.clone();
+        prose_outcome.evidence_requirements.as_mut().unwrap()[0].receipt = None;
+        prose_outcome.evidence_requirements.as_mut().unwrap()[0].required_content_markers =
+            vec!["exit code 1".to_string()];
+        assert!(
+            !planned_contract_is_complete(&prose_outcome),
+            "receipt facts must not be reintroduced as lexical content markers"
+        );
 
         let mut observational_mutation = complete.clone();
         observational_mutation.task_kind = Some("check".to_string());
@@ -1332,6 +1540,19 @@ mod tests {
         assert!(!planned_tool_constraints_are_grounded(
             &no_tools,
             "Answer this from live sources"
+        ));
+
+        let mut no_tools_or_memory = no_tools.clone();
+        no_tools_or_memory.forbidden_tool_scopes =
+            vec![crate::traits::ToolSemanticScope::UserMemory];
+        no_tools_or_memory.tool_constraint_evidence = vec![
+            "without using tools".to_string(),
+            "do not use memory on this turn or the related next turn".to_string(),
+        ];
+        assert!(planned_contract_is_complete(&no_tools_or_memory));
+        assert!(planned_tool_constraints_are_grounded(
+            &no_tools_or_memory,
+            "Answer without using tools; do not use memory on this turn or the related next turn"
         ));
 
         let mut no_memory = complete.clone();
@@ -1402,6 +1623,7 @@ mod tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Canonical,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }]);
         assert!(planned_contract_is_complete(&exact_history));
@@ -1416,6 +1638,7 @@ mod tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Canonical,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }]);
         assert!(
@@ -1592,6 +1815,7 @@ mod tests {
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
                 required_content_markers: Vec::new(),
+                receipt: None,
                 target: None,
             }]),
             project_reference: None,
@@ -1654,6 +1878,69 @@ mod tests {
                 .and_then(|shape| shape.execution_mode.as_deref()),
             Some("inline")
         );
+    }
+
+    #[tokio::test]
+    async fn relationship_fallback_returns_only_an_exact_typed_dialogue_edge() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+                "schema_version": 1,
+                "confidence": "high",
+                "request_relationship": "continuation",
+                "antecedent_user_message_id": "message-setup-1",
+                "semantic_scope": "conversation_history"
+            }"#,
+        );
+        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+
+        let shape = generate_task_relationship(
+            Arc::new(provider),
+            "local-model",
+            "Return the values from that setup.",
+            "- [message_id=message-setup-1] USER: Synthetic setup\n\
+             - [message_id=message-reply-1] ASSISTANT: Acknowledged",
+            None,
+        )
+        .await
+        .expect("typed relationship");
+
+        assert_eq!(shape.request_relationship.as_deref(), Some("continuation"));
+        assert_eq!(
+            shape.antecedent_user_message_id.as_deref(),
+            Some("message-setup-1")
+        );
+        assert_eq!(
+            shape.semantic_scope.as_deref(),
+            Some("conversation_history")
+        );
+        assert!(shape.execution_mode.is_none());
+        assert!(shape.independent_workstreams.is_none());
+        assert!(shape.requires_background_continuation.is_none());
+        assert!(shape.continue_inline_after_background_start.is_none());
+    }
+
+    #[tokio::test]
+    async fn relationship_fallback_rejects_continuation_without_exact_antecedent() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+                "schema_version": 1,
+                "confidence": "high",
+                "request_relationship": "continuation",
+                "antecedent_user_message_id": null,
+                "semantic_scope": "conversation_history"
+            }"#,
+        );
+        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+
+        assert!(generate_task_relationship(
+            Arc::new(provider),
+            "local-model",
+            "Continue.",
+            "- [message_id=message-setup-1] USER: Synthetic setup",
+            None,
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]

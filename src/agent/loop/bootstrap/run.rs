@@ -97,6 +97,7 @@ async fn finalize_turn_assessment(
     structural_resume: bool,
     initial_turn_context: &TurnContext,
     plan: Option<&super::task_planning::TaskPlan>,
+    relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
     model: &str,
@@ -108,8 +109,10 @@ async fn finalize_turn_assessment(
         planned_tool_constraints_are_grounded,
     };
 
-    let confident_shape = plan.and_then(|plan| {
-        plan.task_shape.as_ref().filter(|shape| {
+    let confident_shape = plan
+        .and_then(|plan| plan.task_shape.as_ref())
+        .or(relationship_fallback)
+        .filter(|shape| {
             matches!(
                 shape
                     .confidence
@@ -117,9 +120,9 @@ async fn finalize_turn_assessment(
                     .map(|value| value.trim().to_ascii_lowercase()),
                 Some(value) if matches!(value.as_str(), "medium" | "high")
             )
-        })
-    });
+        });
 
+    let mut committed_antecedent_user_message_id = None;
     if !internal_continuation {
         let dialogue_state = agent
             .state
@@ -157,6 +160,9 @@ async fn finalize_turn_assessment(
                 "courtesy" => "courtesy",
                 _ => "new_request",
             };
+            if relationship == "continuation" {
+                committed_antecedent_user_message_id = resolved_antecedent.map(str::to_string);
+            }
             let reason = if requested == "continuation" && !exact_antecedent {
                 "continuation_missing_exact_antecedent"
             } else {
@@ -217,6 +223,7 @@ async fn finalize_turn_assessment(
             internal_continuation,
         )
         .await;
+    turn_context.visible_antecedent_user_message_id = committed_antecedent_user_message_id;
     let before_contract = turn_context.completion_contract.clone();
     let mut semantic_contract_applied = false;
 
@@ -1215,6 +1222,10 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     } else {
         super::task_planning::planning_skip_reason(user_text, false)
     };
+    let planner_model = llm_router
+        .as_ref()
+        .map(|router| router.select(crate::router::Tier::Primary))
+        .unwrap_or(model.as_str());
     let (task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
         agent
             .emit_decision_point(
@@ -1239,10 +1250,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 .map(|summary| summary.summary.as_str()),
             &initial_turn_context.assessment_recent_messages,
         );
-        let planner_model = llm_router
-            .as_ref()
-            .map(|router| router.select(crate::router::Tier::Primary))
-            .unwrap_or(model.as_str());
         agent
             .emit_decision_point(
                 &emitter,
@@ -1277,6 +1284,46 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             true,
         )
     };
+    let relationship_fallback = if task_assessment_attempted
+        && task_plan
+            .as_ref()
+            .and_then(|plan| plan.task_shape.as_ref())
+            .is_none_or(|shape| {
+                !matches!(
+                    shape
+                        .confidence
+                        .as_deref()
+                        .map(|value| value.trim().to_ascii_lowercase()),
+                    Some(value) if matches!(value.as_str(), "medium" | "high")
+                )
+            }) {
+        let planner_context = super::task_planning::task_assessment_conversation_context(
+            initial_turn_context.followup_mode,
+            session_summary
+                .as_ref()
+                .map(|summary| summary.summary.as_str()),
+            &initial_turn_context.assessment_recent_messages,
+        );
+        if let Some(planner_context) = planner_context {
+            super::task_planning::generate_task_relationship(
+                llm_provider.clone(),
+                planner_model,
+                user_text,
+                &planner_context,
+                Some(super::task_planning::PlannerTelemetryCtx {
+                    emitter: &emitter,
+                    state: agent.state.as_ref(),
+                    session_id,
+                    task_id: &task_id,
+                }),
+            )
+            .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let turn_context = finalize_turn_assessment(
         agent,
         &emitter,
@@ -1287,6 +1334,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         resume_checkpoint.is_some(),
         &initial_turn_context,
         task_plan.as_ref(),
+        relationship_fallback.as_ref(),
         task_assessment_attempted,
         assessment_decision_type,
         &model,
