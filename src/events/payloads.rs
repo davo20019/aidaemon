@@ -303,6 +303,11 @@ pub struct ToolReceiptV1 {
     /// Exact task-scoped proof-graph obligations closed by this receipt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completion_obligation_ids: Vec<String>,
+    /// Pending obligations owned by a nonterminal invocation. Background
+    /// transition receipts use this field to carry proof ownership across the
+    /// process boundary without falsely marking the obligation complete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continuation_obligation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
     /// Exact owner-mandate grant checked for this call. This is an audit fact,
@@ -312,7 +317,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 5;
+    pub const SCHEMA_VERSION: u16 = 6;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -340,6 +345,7 @@ impl ToolReceiptV1 {
             result_provenance: metadata.result_provenance.clone().unwrap_or_default(),
             authorization_preflight: metadata.authorization_preflight.clone(),
             completion_obligation_ids: Vec::new(),
+            continuation_obligation_ids: Vec::new(),
             semantics: metadata.semantics.clone(),
             mandate_authority: None,
         }
@@ -610,6 +616,13 @@ pub struct LlmCallData {
     /// Number of messages in the final provider payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_count: Option<usize>,
+    /// Exact persisted source identities whose content survived rendering and
+    /// eviction into this provider call. Internal/synthetic prompt records have
+    /// no source identity and are intentionally absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_source_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_source_turn_ids: Vec<String>,
     /// Whether this call forced text-only mode and omitted tool definitions.
     #[serde(default)]
     pub force_text: bool,
@@ -917,9 +930,10 @@ pub struct BackgroundContinuationLinkedData {
     pub parent_tool_call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_result_id: Option<String>,
-    /// Present on the finalized response edge. The lifecycle edge is emitted
-    /// before response finalization so the child proof graph can already adopt
-    /// the exact parent receipt; both records share the same typed identity.
+    /// Optional response identity retained for backward compatibility. New
+    /// lifecycle edges are emitted before finalization and bind through the
+    /// child task ID; the ordinary assistant-response/delivery events own the
+    /// later response identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_response_id: Option<String>,
 }
@@ -1117,6 +1131,10 @@ pub struct ContractFulfillmentPayload {
     pub forbids_mutation: bool,
     #[serde(default)]
     pub forbidden_mutation_attempts: u32,
+    #[serde(default)]
+    pub mutation_attempt_count: u32,
+    #[serde(default)]
+    pub indeterminate_mutation_count: u32,
     pub mutation_count: u32,
     pub requires_observation: bool,
     pub observation_count: u32,
@@ -1505,6 +1523,8 @@ mod tests {
             prefix_hash_archived: Some("archived-hash".to_string()),
             boundary_pos: Some(12),
             message_count: Some(18),
+            projected_source_message_ids: vec!["message-1".to_string()],
+            projected_source_turn_ids: vec!["turn-1".to_string()],
             force_text: true,
             token_usage_present: true,
             failed: false,
@@ -1865,7 +1885,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
-        assert_eq!(roundtrip.schema_version, 5);
+        assert_eq!(roundtrip.schema_version, 6);
         assert!(roundtrip
             .context_header()
             .contains("durable_view=truncated"));

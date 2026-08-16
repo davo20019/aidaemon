@@ -181,7 +181,15 @@ struct TaskRelationshipResponse {
     semantic_scope: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskContractRecoveryResponse {
+    schema_version: u16,
+    goal: String,
+    contract: PlannedContractSignals,
+}
+
 const TASK_RELATIONSHIP_SCHEMA_VERSION: u16 = 1;
+const TASK_CONTRACT_RECOVERY_SCHEMA_VERSION: u16 = 1;
 
 fn confidence_is_sufficient(value: Option<&str>) -> bool {
     matches!(
@@ -200,6 +208,41 @@ pub(crate) fn planned_contract_is_confident(
             .as_deref()
             .or_else(|| task_shape.and_then(|shape| shape.confidence.as_deref())),
     )
+}
+
+pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) -> bool {
+    let relationship = shape
+        .request_relationship
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let antecedent = shape
+        .antecedent_user_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    confidence_is_sufficient(shape.confidence.as_deref())
+        && shape.semantic_scope.as_deref().is_some_and(|scope| {
+            matches!(
+                scope.trim(),
+                "none"
+                    | "goal_state"
+                    | "user_memory"
+                    | "conversation_history"
+                    | "external_remote"
+                    | "local_workspace"
+                    | "host_local"
+            )
+        })
+        && match relationship {
+            // The semantic compiler owns the relationship class. Exact
+            // identity belongs to the deterministic dialogue-state resolver,
+            // which may bind an omitted ID only when one unambiguous request
+            // antecedent exists and otherwise fails closed to a new request.
+            "continuation" => true,
+            "new_request" | "clarification_answer" | "courtesy" => antecedent.is_none(),
+            _ => false,
+        }
 }
 
 /// Hard completion decisions require a complete semantic contract. This is a
@@ -804,6 +847,8 @@ async fn record_auxiliary_model_call(
                 prefix_hash_archived: None,
                 boundary_pos: None,
                 message_count: None,
+                projected_source_message_ids: Vec::new(),
+                projected_source_turn_ids: Vec::new(),
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
                 failed: false,
@@ -1128,6 +1173,112 @@ pub(crate) async fn generate_task_plan(
     })
 }
 
+/// Recover the authoritative completion/capability contract independently of
+/// dialogue routing when the broad assessment envelope is unavailable.
+///
+/// This intentionally cannot select an antecedent or create a step plan. A
+/// separate relationship assessor owns dialogue edges, while the main model
+/// remains responsible for choosing an approach. The returned contract still
+/// passes the same completeness and grounding checks as the primary path.
+pub(crate) async fn generate_task_contract_recovery(
+    provider: Arc<dyn ModelProvider>,
+    model: &str,
+    user_text: &str,
+    mode: TaskAssessmentMode,
+    telemetry: Option<PlannerTelemetryCtx<'_>>,
+) -> Option<TaskPlan> {
+    let system = "You are a semantic task-contract compiler. Return only valid JSON. Classify obligations and authority from the current request; do not plan an approach, select dialogue history, or infer from isolated keywords.";
+    let prompt = format!(
+        "Current user request:\n{user_text}\n\n\
+         Return exactly one object with this shape (use empty arrays when absent):\n\
+         {{\"schema_version\":1,\"goal\":\"short semantic summary\",\"contract\":{{\
+         \"confidence\":\"low|medium|high\",\
+         \"task_kind\":\"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\
+         \"expects_mutation\":false,\"requires_observation\":false,\"required_effects\":[],\
+         \"mutation_scope\":\"allowed|read_only|scoped\",\"forbidden_actions\":[],\
+         \"constraint_evidence\":[],\"tool_scope\":\"allowed|forbidden|restricted\",\
+         \"allowed_tool_names\":[],\"forbidden_tool_scopes\":[],\
+         \"tool_constraint_evidence\":[],\"required_response_fields\":[],\
+         \"minimum_sources\":0,\"requires_primary_sources\":false,\
+         \"requires_exact_history\":false,\"evidence_requirements\":[],\
+         \"required_invocations\":[],\
+         \"filesystem_access\":{{\"execution_cwd\":null,\"read_paths\":[],\"write_paths\":[]}},\
+         \"project_reference\":null}}}}.\n\n\
+         Each evidence requirement has {{\"summary\":\"material fact\",\
+         \"acceptable_scopes\":[\"goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"],\
+         \"purpose\":\"current_state|historical_record|content|outcome|attribution|causal_explanation\",\
+         \"minimum_authority\":\"advisory|direct|canonical\",\
+         \"temporal_scope\":\"current|historical|both\",\
+         \"required_content_markers\":[],\"receipt\":null}}.\n\
+         Each required invocation is {{\"tool_names\":[\"one exact identifier\"],\
+         \"exit_codes\":[],\"outcome_statuses\":[],\"requires_output\":false,\
+         \"contract_rejected\":null}}.\n\n\
+         Invariants:\n\
+         - A request to perform or observe a named machine invocation creates one required_invocations entry. This lane proves invocation occurrence/result and is separate from subject-matter evidence.\n\
+         - Current-run tests, current state, files, history, or remote facts require observation and at least one evidence requirement or required invocation. Static explanation and ordinary conversation do not.\n\
+         - For an explicitly expected negative process result, encode its exact acceptable exit/outcome in the invocation receipt; do not reinterpret it as task failure.\n\
+         - tool_scope=restricted only when the current request itself limits tools to exact identifiers. tool_scope=forbidden and forbidden_tool_scopes require exact verbatim grounding in tool_constraint_evidence.\n\
+         - read_only/scoped mutation constraints require exact verbatim grounding in constraint_evidence. allowed has no negative evidence.\n\
+         - Copy user-authored response labels into required_response_fields. Do not invent prose markers for evidence.\n\
+         - Filesystem fields contain only exact current-request paths and their actual read/write roles. A working directory is not implicitly writable.\n\
+         - Mutation task kinds are change/deliver/schedule/monitor. They require nonempty required_effects. All other task kinds have expects_mutation=false and required_effects=[].\
+         - Keep source authority and temporal scope faithful to the requested fact. Use canonical for exact daemon history/state ledgers.\n\
+         - Use forbidden action values only from create, delete, deploy, publish, post, send.",
+        user_text = truncate_str(user_text, 4000),
+    );
+    let messages = vec![
+        json!({ "role": "system", "content": system }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    let call_start = Instant::now();
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        provider.chat(model, &messages, &[]),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            warn!(%error, "Task contract recovery call failed");
+            return None;
+        }
+        Err(_) => {
+            warn!("Task contract recovery call timed out (10s)");
+            return None;
+        }
+    };
+    record_auxiliary_model_call(
+        telemetry,
+        "task_contract_recovery",
+        model,
+        &result,
+        call_start.elapsed().as_millis() as u64,
+    )
+    .await;
+    let json_str = crate::utils::extract_json_object(result.content.as_deref().unwrap_or(""))?;
+    let parsed: TaskContractRecoveryResponse = serde_json::from_str(&json_str)
+        .inspect_err(|error| warn!(%error, "Task contract recovery response unparseable"))
+        .ok()?;
+    if parsed.schema_version != TASK_CONTRACT_RECOVERY_SCHEMA_VERSION
+        || !planned_contract_is_confident(&parsed.contract, None)
+        || !planned_contract_is_complete(&parsed.contract)
+    {
+        warn!(
+            schema_version = parsed.schema_version,
+            "Task contract recovery returned an incomplete contract"
+        );
+        return None;
+    }
+    Some(TaskPlan {
+        goal: parsed.goal,
+        steps: Vec::new(),
+        success_criteria: Vec::new(),
+        contract: Some(parsed.contract),
+        task_shape: None,
+        mode,
+    })
+}
+
 /// Recover only the typed dialogue edge when the broad task assessment is
 /// unavailable. This deliberately cannot produce completion obligations,
 /// authority, tool policy, or execution mode. The caller still validates an
@@ -1148,7 +1299,7 @@ pub(crate) async fn generate_task_relationship(
          Current user request:\n{user_text}\n\n\
          Return exactly: {{\"schema_version\":1,\"confidence\":\"low|medium|high\",\
          \"request_relationship\":\"new_request|continuation|clarification_answer|courtesy\",\
-         \"antecedent_user_message_id\":null,\
+         \"antecedent_user_message_id\":null|\"message-id\",\
          \"semantic_scope\":\"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"}}.\n\
          Use continuation only when the current request advances, retries, or asks about one prior request shown above; copy that prior USER row's exact message_id. Otherwise use new_request and null. Courtesy and clarification_answer also require null. Judge the whole meaning, not isolated words.",
         conversation_context = truncate_str(conversation_context, 6000),
@@ -1209,7 +1360,12 @@ pub(crate) async fn generate_task_relationship(
         .antecedent_user_message_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    if (parsed.request_relationship == "continuation") != antecedent.is_some() {
+    // The model owns semantic classification, not graph identity. An exact
+    // message ID is useful evidence when it is available, but omission is not
+    // a classification failure: the deterministic dialogue-state resolver
+    // can bind a continuation only when exactly one persisted request node is
+    // possible. Non-continuations must never carry an adoption edge.
+    if parsed.request_relationship != "continuation" && antecedent.is_some() {
         return None;
     }
 
@@ -1884,6 +2040,67 @@ mod tests {
         assert_eq!(contract.task_kind.as_deref(), Some("answer"));
     }
 
+    #[tokio::test]
+    async fn contract_recovery_preserves_named_invocation_as_typed_obligation() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+              "schema_version": 1,
+              "goal": "Inspect the runtime environment",
+              "contract": {
+                "confidence": "high",
+                "task_kind": "check",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "restricted",
+                "allowed_tool_names": ["check_environment"],
+                "forbidden_tool_scopes": [],
+                "tool_constraint_evidence": ["Use check_environment exactly once"],
+                "required_response_fields": [],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "required_invocations": [{
+                  "tool_names": ["check_environment"],
+                  "exit_codes": [],
+                  "outcome_statuses": ["succeeded"],
+                  "requires_output": true,
+                  "contract_rejected": null
+                }],
+                "filesystem_access": {
+                  "execution_cwd": null,
+                  "read_paths": [],
+                  "write_paths": []
+                },
+                "project_reference": null
+              }
+            }"#,
+        );
+        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+        let plan = generate_task_contract_recovery(
+            std::sync::Arc::new(provider),
+            "synthetic-model",
+            "Use check_environment exactly once and report its result.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("recovered contract");
+
+        let signals = plan.contract.expect("contract");
+        assert!(planned_contract_is_complete(&signals));
+        assert_eq!(
+            signals.required_invocations.as_deref().unwrap()[0].tool_names,
+            ["check_environment"]
+        );
+        assert!(plan.steps.is_empty());
+        assert!(plan.task_shape.is_none());
+    }
+
     #[test]
     fn test_parse_semantic_task_shape_and_scoped_mutation() {
         let json = r#"{
@@ -2059,7 +2276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relationship_fallback_rejects_continuation_without_exact_antecedent() {
+    async fn relationship_fallback_leaves_missing_identity_to_state_resolver() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
                 "schema_version": 1,
@@ -2071,7 +2288,7 @@ mod tests {
         );
         let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
 
-        assert!(generate_task_relationship(
+        let shape = generate_task_relationship(
             Arc::new(provider),
             "local-model",
             "Continue.",
@@ -2079,7 +2296,10 @@ mod tests {
             None,
         )
         .await
-        .is_none());
+        .expect("semantic continuation should survive an omitted optional identity");
+        assert_eq!(shape.request_relationship.as_deref(), Some("continuation"));
+        assert!(shape.antecedent_user_message_id.is_none());
+        assert!(planned_task_relationship_is_complete(&shape));
     }
 
     #[tokio::test]

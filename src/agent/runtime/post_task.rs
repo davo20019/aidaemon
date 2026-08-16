@@ -895,8 +895,7 @@ fn friendly_request_gist(user_request: &str) -> Option<String> {
 /// Categorize tool calls into a human-readable activity summary.
 /// Convert a raw `"tool_name(args)"` entry into a user-friendly display string.
 ///
-/// This avoids the `tool_name(...)` format that `strip_tool_name_references`
-/// would replace with "that".  Output uses "Display Name — args" instead.
+/// Output uses "Display Name — args" so activity summaries remain readable.
 pub(in crate::agent) fn display_tool_call(call: &str) -> String {
     // Failed entries carry a " [FAILED]" suffix after the closing paren —
     // strip it before parsing so it doesn't leak into the displayed args.

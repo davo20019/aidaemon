@@ -103,6 +103,16 @@ pub struct RequestEvidenceRequirement {
     pub target: Option<RequestVerificationTarget>,
 }
 
+/// Stable proof-graph identity retained when a typed continuation adopts an
+/// evidence requirement from another task. The requirement value is stored
+/// with the source ID so hydration, deduplication, and local reordering never
+/// turn a positional index into the wrong obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptedEvidenceBinding {
+    pub source_obligation_id: String,
+    pub requirement: RequestEvidenceRequirement,
+}
+
 /// Durable semantic obligations for an unresolved request. These values come
 /// from a validated task assessment or structural resource identity, never
 /// from replaying natural-language phrase rules on a later turn.
@@ -151,6 +161,11 @@ pub struct RequestCompletionContract {
     /// retain the older generic-observation behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
+    /// Stable cross-task proof bindings. These are lineage metadata, not
+    /// evidence: a matching terminal receipt is still required to satisfy the
+    /// corresponding local obligation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopted_evidence_bindings: Vec<AdoptedEvidenceBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_targets: Vec<RequestVerificationTarget>,
 }

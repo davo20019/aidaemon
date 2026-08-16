@@ -25,10 +25,11 @@ pub use conversation::{
     MessageAnnotation, MessageAttachment, ToolCall,
 };
 pub use dialogue::{
-    ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,
-    OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, RequestCompletionContract,
-    RequestEvidenceRequirement, RequestForbiddenAction, RequestReceiptPredicate, RequestTaskKind,
-    RequestVerificationTarget, RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
+    ActiveTaskRef, ActiveTaskStatus, AdoptedEvidenceBinding, AssistantTurnKind,
+    AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
+    QuestionKind, RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction,
+    RequestReceiptPredicate, RequestTaskKind, RequestVerificationTarget,
+    RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,

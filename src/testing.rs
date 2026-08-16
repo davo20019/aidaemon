@@ -286,6 +286,7 @@ impl ModelProvider for MockProvider {
                 m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
                     s.contains("task planner")
                         || s.contains("task assessment router")
+                        || s.contains("task-contract compiler")
                         || s.contains("task relationship router")
                         || s.contains("progress evaluator")
                 })

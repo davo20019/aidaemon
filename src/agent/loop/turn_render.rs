@@ -30,6 +30,37 @@ use crate::traits::AttachmentProvenance;
 /// tool evidence; ordinary archived turns remain aggressively compact.
 pub(crate) const RENDERER_VERSION: u32 = 6;
 const MAX_ADJACENT_TOOL_RESULT_CHARS: usize = 4_000;
+pub(crate) const SOURCE_MESSAGE_IDS_KEY: &str = "_aidaemon_source_message_ids";
+pub(crate) const SOURCE_TURN_IDS_KEY: &str = "_aidaemon_source_turn_ids";
+
+pub(crate) fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let mut message_ids = Vec::new();
+    let mut turn_ids = Vec::new();
+    for message in messages {
+        if !message.id.is_empty() && !message_ids.contains(&message.id) {
+            message_ids.push(message.id.clone());
+        }
+        if let Some(turn_id) = message.turn_id.as_ref() {
+            if !turn_id.is_empty() && !turn_ids.contains(turn_id) {
+                turn_ids.push(turn_id.clone());
+            }
+        }
+    }
+    if !message_ids.is_empty() {
+        object.insert(SOURCE_MESSAGE_IDS_KEY.to_string(), json!(message_ids));
+    }
+    if !turn_ids.is_empty() {
+        object.insert(SOURCE_TURN_IDS_KEY.to_string(), json!(turn_ids));
+    }
+}
+
+fn push_with_source(out: &mut Vec<Value>, mut value: Value, message: &Message) {
+    attach_source_provenance(&mut value, &[message]);
+    out.push(value);
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
@@ -259,10 +290,12 @@ fn append_tool_observation_messages(
     } else {
         json!(label)
     };
-    out.push(json!({
+    let mut value = json!({
         "role": "user",
         "content": content,
-    }));
+    });
+    attach_source_provenance(&mut value, &[m]);
+    out.push(value);
 }
 
 fn latest_tool_observation_indices(
@@ -388,7 +421,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
         }
 
         attach_tool_routing(&mut obj, m);
-        rendered.push(obj);
+        push_with_source(&mut rendered, obj, m);
         append_tool_observation_messages(
             &mut rendered,
             m,
@@ -494,7 +527,7 @@ fn render_archived(
                 }
             }
             attach_tool_routing(&mut obj, m);
-            out.push(obj);
+            push_with_source(&mut out, obj, m);
             maybe_emit_placeholder(
                 &mut out,
                 idx,
@@ -510,7 +543,7 @@ fn render_archived(
             // 1. user → verbatim full. (A turn may have NO user message — do
             //    not synthesize one.)
             "user" => {
-                out.push(json!({ "role": "user", "content": m.content }));
+                push_with_source(&mut out, json!({ "role": "user", "content": m.content }), m);
             }
 
             // 2. assistant.
@@ -540,7 +573,7 @@ fn render_archived(
                             obj["tool_calls"] = json!(filtered);
                         }
                     }
-                    out.push(obj);
+                    push_with_source(&mut out, obj, m);
                 } else if m.content.as_deref().is_some_and(is_failure_boilerplate) {
                     // Failure boilerplate: do not emit text, do not treat as a
                     // winning response. If it carries tool_calls, retain those.
@@ -569,7 +602,7 @@ fn render_archived(
                 };
                 let mut obj = json!({ "role": "tool", "content": retained });
                 attach_tool_routing(&mut obj, m);
-                out.push(obj);
+                push_with_source(&mut out, obj, m);
                 append_tool_observation_messages(&mut out, m, options, &mut vision_skipped, true);
             }
 
@@ -610,11 +643,15 @@ fn emit_tool_call_only_assistant(
     if let Some(tc_json) = &m.tool_calls_json {
         let filtered = wire_tool_calls(tc_json, result_ids);
         if !filtered.is_empty() {
-            out.push(json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": filtered,
-            }));
+            push_with_source(
+                out,
+                json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": filtered,
+                }),
+                m,
+            );
         }
     }
 }

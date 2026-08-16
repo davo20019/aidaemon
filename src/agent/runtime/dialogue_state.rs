@@ -1113,6 +1113,25 @@ mod tests {
     }
 
     #[test]
+    fn antecedent_resolution_requires_one_persisted_candidate() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("synthetic-session");
+        state.open_request = Some(request_with(OpenRequestStatus::Open, now, None));
+        assert_eq!(
+            unambiguous_request_antecedent(&state).map(|request| request.user_message_id.as_str()),
+            Some("u1")
+        );
+
+        let mut second = request_with(OpenRequestStatus::Open, now, None);
+        second.user_message_id = "u0".to_string();
+        state.antecedent_request = Some(second);
+        assert!(
+            unambiguous_request_antecedent(&state).is_none(),
+            "semantic confidence cannot choose between multiple graph nodes"
+        );
+    }
+
+    #[test]
     fn clarification_answer_stashes_closed_question() {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");

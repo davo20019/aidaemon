@@ -2249,6 +2249,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // without being relabeled as a successful mutation.
         let outcome_satisfied = domain_outcome_satisfied || expected_observation_satisfied;
 
+        if result_metadata.semantics.mutates_state()
+            && !result_metadata.contract_rejected
+            && !result_metadata.receipt_replayed
+        {
+            completion_progress.record_mutation_attempt(tool_outcome_status);
+        }
+
         // Record mutation before any observation carried by the same receipt.
         // A mutation deliberately invalidates older current-state evidence;
         // processing a combined receipt in the opposite order would
@@ -2941,6 +2948,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         );
         receipt.completion_obligation_ids =
             completion_progress.completion_obligations_for_receipt(&tc.id);
+        if background_detached {
+            let pending_indices = pending_evidence_requirement_indices(
+                &turn_context.completion_contract,
+                &tc.name,
+                &result_metadata.semantics,
+                &effective_arguments,
+                &result_metadata,
+            );
+            receipt.continuation_obligation_ids = completion_progress
+                .evidence_obligation_ids_for_indices(&pending_indices);
+        }
         receipt.mandate_authority = mandate_authority_grant.clone();
         let mandate_outcome_projection = mandate_authority_grant
             .as_ref()

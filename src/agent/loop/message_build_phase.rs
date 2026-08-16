@@ -48,9 +48,50 @@ pub(super) struct MessageBuildCtx<'a> {
 pub(super) struct MessageBuildData {
     pub messages: Vec<Value>,
     pub tool_defs: Vec<Value>,
+    /// Exact persisted message/turn identities whose content survived all
+    /// rendering, compaction, and eviction into the provider-visible payload.
+    pub projected_source_message_ids: Vec<String>,
+    pub projected_source_turn_ids: Vec<String>,
     /// Estimated input tokens (messages + tool schemas) for this call, used for
     /// est-vs-actual drift telemetry in the `LlmCall` event.
     pub est_input_tokens: u32,
+}
+
+fn take_projected_source_ids(messages: &mut [Value]) -> (Vec<String>, Vec<String>) {
+    let mut message_ids = Vec::new();
+    let mut turn_ids = Vec::new();
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if let Some(ids) = object
+            .remove(super::turn_render::SOURCE_MESSAGE_IDS_KEY)
+            .and_then(|value| value.as_array().cloned())
+        {
+            for id in ids
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+            {
+                if !message_ids.contains(&id) {
+                    message_ids.push(id);
+                }
+            }
+        }
+        if let Some(ids) = object
+            .remove(super::turn_render::SOURCE_TURN_IDS_KEY)
+            .and_then(|value| value.as_array().cloned())
+        {
+            for id in ids
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+            {
+                if !turn_ids.contains(&id) {
+                    turn_ids.push(id);
+                }
+            }
+        }
+    }
+    (message_ids, turn_ids)
 }
 
 const EMPTY_RETRY_MAX_PARENT_CHARS: usize = 800;
@@ -145,7 +186,7 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
             COMPACT_PARENT_USER_CHARS,
             true,
         );
-        (!content.is_empty()).then_some(content)
+        (!content.is_empty()).then_some((message, content))
     });
     let prior_assistant = turn_messages.iter().rev().find_map(|message| {
         if message.role != "assistant" {
@@ -156,7 +197,7 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
             return None;
         }
         let content = compact_parent_answer(raw, COMPACT_PARENT_ASSISTANT_CHARS);
-        (!content.is_empty()).then_some(content)
+        (!content.is_empty()).then_some((message, content))
     });
     let delivery_evidence = turn_messages.iter().rev().find_map(|message| {
         if message.role != "tool"
@@ -169,9 +210,9 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
         }
         let primary = message.primary_content().unwrap_or_default();
         let content = compact_parent_text(&primary, COMPACT_PARENT_DELIVERY_CHARS, false);
-        (!content.is_empty()).then_some(content)
+        (!content.is_empty()).then_some((message, content))
     });
-    let mut observation_evidence: Vec<(String, String)> = turn_messages
+    let mut observation_evidence: Vec<(&Message, String, String)> = turn_messages
         .iter()
         .rev()
         .filter_map(|message| {
@@ -181,43 +222,55 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
             }
             let primary = message.primary_content().unwrap_or_default();
             let content = compact_parent_text(&primary, COMPACT_PARENT_RETRIEVAL_CHARS, false);
-            (!content.is_empty()).then(|| (tool_name.to_string(), content))
+            (!content.is_empty()).then(|| (message, tool_name.to_string(), content))
         })
         .take(COMPACT_PARENT_RETRIEVAL_ITEMS)
         .collect();
     observation_evidence.reverse();
 
     let mut compact = Vec::with_capacity(2);
-    if let Some(prior_user) = prior_user {
-        compact.push(json!({
+    if let Some((message, prior_user)) = prior_user {
+        let mut value = json!({
             "role": "user",
             "content": prior_user,
-        }));
+        });
+        super::turn_render::attach_source_provenance(&mut value, &[message]);
+        compact.push(value);
     }
 
     let mut assistant_lines = vec![
         "[Immediate prior turn retained in compact form; tool protocol omitted and observations are explicitly bounded.]"
             .to_string(),
     ];
-    if let Some(prior_assistant) = prior_assistant {
+    let mut assistant_sources = Vec::new();
+    if let Some((message, prior_assistant)) = prior_assistant {
+        assistant_sources.push(message);
         assistant_lines.push(prior_assistant);
     }
-    if let Some(delivery_evidence) = delivery_evidence {
+    if let Some((message, delivery_evidence)) = delivery_evidence {
+        assistant_sources.push(message);
         assistant_lines.push(format!("Delivery evidence: {delivery_evidence}"));
     }
     if !observation_evidence.is_empty() {
         assistant_lines.push("Prior bounded tool evidence:".to_string());
         assistant_lines.extend(
             observation_evidence
+                .iter()
+                .map(|(_, tool, evidence)| format!("- {tool}: {evidence}")),
+        );
+        assistant_sources.extend(
+            observation_evidence
                 .into_iter()
-                .map(|(tool, evidence)| format!("- {tool}: {evidence}")),
+                .map(|(message, _, _)| message),
         );
     }
     if assistant_lines.len() > 1 {
-        compact.push(json!({
+        let mut value = json!({
             "role": "assistant",
             "content": assistant_lines.join("\n"),
-        }));
+        });
+        super::turn_render::attach_source_provenance(&mut value, &assistant_sources);
+        compact.push(value);
     }
 
     compact
@@ -1497,6 +1550,11 @@ pub(super) async fn run_message_build_phase(
         send_status(status_tx, StatusUpdate::Thinking(iteration));
     }
 
+    // Internal projection identities are telemetry only. Remove them before
+    // token estimation, fingerprinting, request dumps, or provider dispatch.
+    let (projected_source_message_ids, projected_source_turn_ids) =
+        take_projected_source_ids(&mut messages);
+
     // Debug: log message structure and estimated token count
     {
         let summary: Vec<String> = messages
@@ -1595,6 +1653,8 @@ pub(super) async fn run_message_build_phase(
     Ok(MessageBuildData {
         messages,
         tool_defs: effective_tool_defs,
+        projected_source_message_ids,
+        projected_source_turn_ids,
         est_input_tokens,
     })
 }
@@ -1632,6 +1692,26 @@ get_app_state below. Call get_app_state to re-read the current screen if you nee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_ids_are_extracted_and_removed_before_provider_dispatch() {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": "synthetic",
+            "_aidaemon_source_message_ids": ["message-1"],
+            "_aidaemon_source_turn_ids": ["turn-1"]
+        })];
+
+        let (message_ids, turn_ids) = take_projected_source_ids(&mut messages);
+        assert_eq!(message_ids, ["message-1"]);
+        assert_eq!(turn_ids, ["turn-1"]);
+        assert!(messages[0]
+            .get(super::super::turn_render::SOURCE_MESSAGE_IDS_KEY)
+            .is_none());
+        assert!(messages[0]
+            .get(super::super::turn_render::SOURCE_TURN_IDS_KEY)
+            .is_none());
+    }
     use chrono::Utc;
 
     #[test]

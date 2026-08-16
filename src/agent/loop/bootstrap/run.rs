@@ -206,8 +206,7 @@ async fn finalize_turn_assessment(
                     "relationship": relationship,
                     "semantic_scope": semantic_scope,
                     "reason_code": reason_code,
-                    "antecedent_user_message_id": confident_shape
-                        .and_then(|shape| shape.antecedent_user_message_id.as_deref()),
+                    "antecedent_user_message_id": committed_antecedent_user_message_id,
                 }),
             )
             .await;
@@ -479,6 +478,10 @@ async fn finalize_turn_assessment(
                         "expects_mutation": turn_context.completion_contract.expects_mutation,
                         "requires_observation": turn_context.completion_contract.requires_observation,
                         "evidence_requirements": turn_context.completion_contract.evidence_requirements,
+                        "required_invocations": plan.contract.as_ref()
+                            .and_then(|contract| contract.required_invocations.as_ref())
+                            .cloned()
+                            .unwrap_or_default(),
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
                         "required_response_fields": turn_context.completion_contract.required_response_fields,
                     });
@@ -1292,7 +1295,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .as_ref()
         .map(|router| router.select(crate::router::Tier::Primary))
         .unwrap_or(model.as_str());
-    let (task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
+    let (mut task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
         agent
             .emit_decision_point(
                 &emitter,
@@ -1350,19 +1353,27 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             true,
         )
     };
+    if task_assessment_attempted && task_plan.is_none() {
+        task_plan = super::task_planning::generate_task_contract_recovery(
+            llm_provider.clone(),
+            planner_model,
+            user_text,
+            assessment_mode,
+            Some(super::task_planning::PlannerTelemetryCtx {
+                emitter: &emitter,
+                state: agent.state.as_ref(),
+                session_id,
+                task_id: &task_id,
+            }),
+        )
+        .await;
+    }
     let relationship_fallback = if task_assessment_attempted
         && task_plan
             .as_ref()
             .and_then(|plan| plan.task_shape.as_ref())
-            .is_none_or(|shape| {
-                !matches!(
-                    shape
-                        .confidence
-                        .as_deref()
-                        .map(|value| value.trim().to_ascii_lowercase()),
-                    Some(value) if matches!(value.as_str(), "medium" | "high")
-                )
-            }) {
+            .is_none_or(|shape| !super::task_planning::planned_task_relationship_is_complete(shape))
+    {
         let planner_context = super::task_planning::task_assessment_conversation_context(
             initial_turn_context.followup_mode,
             session_summary
@@ -1443,7 +1454,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
                 "reason_code": memory_pipeline_policy.reason_code(),
                 "retrieval_suppressed": !memory_pipeline_allowed,
-                "message_projection_suppressed": !memory_pipeline_allowed,
+                "memory_message_projection_suppressed": !memory_pipeline_allowed,
                 "post_task_learning_suppressed": !memory_pipeline_allowed,
             }),
         )

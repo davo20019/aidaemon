@@ -164,6 +164,12 @@ pub fn estimate_multimodal_message_tokens(messages: &[Value]) -> usize {
     let mut multimodal_tokens = 0usize;
 
     for msg in surrogate_messages.iter_mut() {
+        // Renderer provenance is an out-of-band telemetry sidecar carried on
+        // the value only until final projection. It must not consume provider
+        // budget or change compaction/eviction decisions.
+        if let Some(object) = msg.as_object_mut() {
+            object.retain(|key, _| !key.starts_with("_aidaemon_"));
+        }
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
             continue;
         }
@@ -1943,6 +1949,22 @@ mod tests {
         assert!(identity_fact_lacks_user_evidence(
             "user", "name", " ", "anything"
         ));
+    }
+
+    #[test]
+    fn internal_projection_metadata_does_not_change_context_budget() {
+        let plain = vec![json!({"role": "user", "content": "synthetic request"})];
+        let annotated = vec![json!({
+            "role": "user",
+            "content": "synthetic request",
+            "_aidaemon_source_message_ids": ["message-1", "message-2"],
+            "_aidaemon_source_turn_ids": ["turn-1"]
+        })];
+
+        assert_eq!(
+            estimate_multimodal_message_tokens(&plain),
+            estimate_multimodal_message_tokens(&annotated)
+        );
     }
 
     #[test]

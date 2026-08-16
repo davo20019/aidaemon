@@ -724,6 +724,8 @@ pub(super) async fn run_completion_phase(
                     "outstanding_requirement_indices": outstanding_requirement_indices,
                     "selected_receipt_ids": completion_progress.satisfying_receipt_ids(),
                     "verification_pending": completion_progress.verification_pending,
+                    "mutation_attempt_count": completion_progress.mutation_attempt_count,
+                    "indeterminate_mutation_count": completion_progress.indeterminate_mutation_count,
                     "mutation_count": completion_progress.mutation_count,
                     "observation_count": completion_progress.observation_count,
                     "verification_count": completion_progress.verification_count,

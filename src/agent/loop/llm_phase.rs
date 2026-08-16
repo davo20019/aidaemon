@@ -544,6 +544,8 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub est_input_tokens: u32,
     /// Wall-clock duration of the message-build phase for this iteration, in ms.
     pub build_ms: u64,
+    pub projected_source_message_ids: &'a [String],
+    pub projected_source_turn_ids: &'a [String],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1101,6 +1103,8 @@ pub(super) async fn run_llm_phase(
         prefix_hash_archived: Some(prefix_fp.prefix_hash_archived.clone()),
         boundary_pos: Some(prefix_fp.boundary_pos),
         message_count: Some(prefix_fp.message_count),
+        projected_source_message_ids: ctx.projected_source_message_ids.to_vec(),
+        projected_source_turn_ids: ctx.projected_source_turn_ids.to_vec(),
         force_text: prefix_fp.force_text,
         token_usage_present: false,
         failed: false,

@@ -1,5 +1,13 @@
 use crate::traits::{ToolCallSemantics, ToolMutationEffects, ToolVerificationMode};
 
+/// True when a shell path is an operating-system discard sink rather than a
+/// durable filesystem target. All command-policy consumers use this shared
+/// resource classification so mutation semantics and access-manifest
+/// extraction cannot disagree about the same redirection.
+pub(crate) fn is_discard_sink_path(path: &str) -> bool {
+    path.trim() == "/dev/null"
+}
+
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }

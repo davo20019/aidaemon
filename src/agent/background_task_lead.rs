@@ -2465,13 +2465,8 @@ pub fn spawn_background_task_lead(
             let run_status =
                 goal_run_terminal_status(status, trigger_status.as_deref(), &final_run_tasks);
             let continuous_controller = initial_goal.goal_type == "continuous";
-            let defer_run_finalization_for_recovery = continuous_controller
-                && matches!(run_status, Some("failed" | "blocked"))
-                && !final_run_tasks.iter().any(is_terminal_recovery_task);
             if let Some(run_id) = goal_run_id.as_deref() {
-                if let Some(run_status) =
-                    run_status.filter(|_| !defer_run_finalization_for_recovery)
-                {
+                if let Some(run_status) = run_status {
                     let summary = build_goal_task_results_summary(
                         &final_run_tasks,
                         if run_status == "completed" {

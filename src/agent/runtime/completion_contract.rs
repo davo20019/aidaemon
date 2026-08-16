@@ -18,7 +18,7 @@ use crate::traits::{
     RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction, RequestTaskKind,
     RequestVerificationTarget, RequestVerificationTargetKind,
 };
-use crate::traits::{ToolCallSemantics, ToolMutationEffects};
+use crate::traits::{ToolCallSemantics, ToolMutationEffects, ToolOutcomeStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum CompletionTaskKind {
@@ -122,6 +122,9 @@ pub(super) struct CompletionContract {
     /// Material information needs whose typed evidence must be closed before
     /// successful completion. Empty retains legacy generic-observation behavior.
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
+    /// Durable source obligation -> semantic requirement bindings for typed
+    /// continuation adoption. Never infer these from local vector positions.
+    pub adopted_evidence_bindings: Vec<crate::traits::AdoptedEvidenceBinding>,
     pub connected_content_mode: super::intent_routing::ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
 }
@@ -194,6 +197,7 @@ pub(super) fn persistable_completion_contract(
         requires_primary_sources: contract.requires_primary_sources,
         requires_exact_history: contract.requires_exact_history,
         evidence_requirements: contract.evidence_requirements.clone(),
+        adopted_evidence_bindings: contract.adopted_evidence_bindings.clone(),
         verification_targets: contract
             .verification_targets
             .iter()
@@ -264,6 +268,17 @@ pub(super) fn completion_contract_from_persisted(
         requires_primary_sources: contract.requires_primary_sources,
         requires_exact_history: contract.requires_exact_history,
         evidence_requirements: reachable_evidence_requirements,
+        adopted_evidence_bindings: contract
+            .adopted_evidence_bindings
+            .iter()
+            .filter(|binding| {
+                crate::agent::inquiry::requirement_has_builtin_evidence_route(&binding.requirement)
+                    && contract
+                        .evidence_requirements
+                        .contains(&binding.requirement)
+            })
+            .cloned()
+            .collect(),
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets: contract
             .verification_targets
@@ -314,9 +329,34 @@ pub(super) fn inherit_unfinished_request_contract(
 
     current.requires_observation |= unfinished.requires_observation;
     current.explicit_verification_requested |= unfinished.explicit_verification_requested;
-    for requirement in &unfinished.evidence_requirements {
+    for (index, requirement) in unfinished.evidence_requirements.iter().enumerate() {
         if !current.evidence_requirements.contains(requirement) {
             current.evidence_requirements.push(requirement.clone());
+        }
+        if let Some(origin) = unfinished.scope_task_id.as_deref() {
+            let source_obligation_id = format!("task:{origin}/obligation:evidence:{index}");
+            if !current
+                .adopted_evidence_bindings
+                .iter()
+                .any(|binding| binding.source_obligation_id == source_obligation_id)
+            {
+                current
+                    .adopted_evidence_bindings
+                    .push(crate::traits::AdoptedEvidenceBinding {
+                        source_obligation_id,
+                        requirement: requirement.clone(),
+                    });
+            }
+        }
+    }
+    for binding in &unfinished.adopted_evidence_bindings {
+        if current.evidence_requirements.contains(&binding.requirement)
+            && !current
+                .adopted_evidence_bindings
+                .iter()
+                .any(|existing| existing.source_obligation_id == binding.source_obligation_id)
+        {
+            current.adopted_evidence_bindings.push(binding.clone());
         }
     }
 
@@ -725,6 +765,7 @@ pub(super) fn install_semantic_completion_contract(
         requires_primary_sources: requirements.requires_primary_sources,
         requires_exact_history: requirements.requires_exact_history,
         evidence_requirements,
+        adopted_evidence_bindings: Vec::new(),
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets,
     };
@@ -1081,6 +1122,13 @@ pub(super) struct CompletionProgress {
     /// because its local obligation label happens to match.
     pub(in crate::agent) task_scope: String,
     pub observation_count: usize,
+    /// Mutation-capable invocations that crossed the adapter's pre-I/O
+    /// contract boundary. Unlike `mutation_count`, this records attempts even
+    /// when their final state cannot be proven successful.
+    pub mutation_attempt_count: usize,
+    /// Mutation attempts whose terminal receipt cannot prove that no partial
+    /// effect occurred. This is epistemic state, not confirmed completion.
+    pub indeterminate_mutation_count: usize,
     pub mutation_count: usize,
     /// Effects observed from successful calls. This is separate from the raw
     /// count so incidental cache writes cannot fulfill source/deploy outcomes.
@@ -1305,6 +1353,21 @@ impl CompletionProgress {
         }
     }
 
+    pub(super) fn record_mutation_attempt(&mut self, outcome: ToolOutcomeStatus) {
+        if outcome == ToolOutcomeStatus::Blocked {
+            return;
+        }
+        self.mutation_attempt_count = self.mutation_attempt_count.saturating_add(1);
+        if matches!(
+            outcome,
+            ToolOutcomeStatus::CompletedWithNegativeResult
+                | ToolOutcomeStatus::FailedRetryable
+                | ToolOutcomeStatus::FailedPermanent
+        ) {
+            self.indeterminate_mutation_count = self.indeterminate_mutation_count.saturating_add(1);
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn mark_mutation(
         &mut self,
@@ -1517,6 +1580,16 @@ impl CompletionProgress {
     ) -> Vec<String> {
         self.proof_graph
             .obligations_satisfied_by_receipt(tool_call_id)
+    }
+
+    pub(in crate::agent) fn evidence_obligation_ids_for_indices(
+        &self,
+        indices: &[usize],
+    ) -> Vec<String> {
+        indices
+            .iter()
+            .filter_map(|index| self.evidence_obligation_ids.get(*index).cloned())
+            .collect()
     }
 
     pub(in crate::agent) fn satisfying_receipt_ids(&self) -> Vec<String> {
@@ -2538,6 +2611,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         requires_primary_sources: false,
         requires_exact_history: false,
         evidence_requirements: Vec::new(),
+        adopted_evidence_bindings: Vec::new(),
         connected_content_mode,
         verification_targets,
     }
@@ -2572,6 +2646,7 @@ mod tests {
             requires_primary_sources: true,
             requires_exact_history: true,
             evidence_requirements: Vec::new(),
+            adopted_evidence_bindings: Vec::new(),
             connected_content_mode: super::super::intent_routing::ConnectedContentMode::DeliverOnly,
             verification_targets: vec![target.clone()],
         };
@@ -3120,6 +3195,57 @@ mod tests {
         assert!(inherited.requires_observation);
         assert!(inherited.requires_reverification_after_mutation);
         assert!(inherited.explicit_verification_requested);
+    }
+
+    #[test]
+    fn inherited_evidence_keeps_stable_source_identity_across_reorder_and_hydration() {
+        let child_only = RequestEvidenceRequirement {
+            summary: "Observe child state".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let parent = RequestEvidenceRequirement {
+            summary: "Observe parent command output".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+            purpose: crate::traits::EvidencePurpose::Content,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let current = CompletionContract {
+            scope_task_id: Some("task-child".to_string()),
+            requires_observation: true,
+            evidence_requirements: vec![child_only],
+            ..CompletionContract::default()
+        };
+        let unfinished = CompletionContract {
+            scope_task_id: Some("task-parent".to_string()),
+            requires_observation: true,
+            evidence_requirements: vec![parent.clone()],
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_unfinished_request_contract(current, &unfinished);
+        assert_eq!(inherited.evidence_requirements[1], parent);
+        assert_eq!(
+            inherited.adopted_evidence_bindings[0].source_obligation_id,
+            "task:task-parent/obligation:evidence:0"
+        );
+        assert_eq!(inherited.adopted_evidence_bindings[0].requirement, parent);
+
+        let hydrated =
+            completion_contract_from_persisted(&persistable_completion_contract(&inherited));
+        assert_eq!(
+            hydrated.adopted_evidence_bindings,
+            inherited.adopted_evidence_bindings
+        );
     }
 
     #[test]
@@ -4177,5 +4303,15 @@ mod tests {
         let before = contract.clone();
         apply_planned_contract_signals(&mut contract, None, None, None);
         assert_eq!(contract, before);
+    }
+
+    #[test]
+    fn failed_mutation_attempt_is_visible_without_claiming_success() {
+        let mut progress = CompletionProgress::default();
+        progress.record_mutation_attempt(ToolOutcomeStatus::CompletedWithNegativeResult);
+
+        assert_eq!(progress.mutation_attempt_count, 1);
+        assert_eq!(progress.indeterminate_mutation_count, 1);
+        assert_eq!(progress.mutation_count, 0);
     }
 }

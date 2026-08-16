@@ -92,6 +92,8 @@ pub struct ContractSnapshot {
     pub expects_mutation: bool,
     pub forbids_mutation: bool,
     pub forbidden_mutation_attempts: u32,
+    pub mutation_attempt_count: u32,
+    pub indeterminate_mutation_count: u32,
     pub mutation_count: u32,
     pub requires_observation: bool,
     pub observation_count: u32,
@@ -299,6 +301,8 @@ impl HarnessEvalAccumulator {
     }
 
     pub fn record_completion_progress(&mut self, progress: &CompletionProgress) {
+        self.contract.mutation_attempt_count = progress.mutation_attempt_count as u32;
+        self.contract.indeterminate_mutation_count = progress.indeterminate_mutation_count as u32;
         self.contract.mutation_count = progress.mutation_count as u32;
         self.contract.observation_count = progress.observation_count as u32;
         self.contract.verification_count = progress.verification_count as u32;
@@ -516,6 +520,8 @@ impl From<ContractSnapshot> for crate::events::ContractFulfillmentPayload {
             expects_mutation: value.expects_mutation,
             forbids_mutation: value.forbids_mutation,
             forbidden_mutation_attempts: value.forbidden_mutation_attempts,
+            mutation_attempt_count: value.mutation_attempt_count,
+            indeterminate_mutation_count: value.indeterminate_mutation_count,
             mutation_count: value.mutation_count,
             requires_observation: value.requires_observation,
             observation_count: value.observation_count,
@@ -605,6 +611,8 @@ mod tests {
                     expects_mutation: false,
                     forbids_mutation: false,
                     forbidden_mutation_attempts: 0,
+                    mutation_attempt_count: 0,
+                    indeterminate_mutation_count: 0,
                     mutation_count: 0,
                     requires_observation: false,
                     observation_count: 0,

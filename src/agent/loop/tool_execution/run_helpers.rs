@@ -1154,6 +1154,46 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
         .collect()
 }
 
+/// Associate a nonterminal invocation with the obligations it may eventually
+/// close. This deliberately ignores terminal outcome fields (exit/status,
+/// output, rejection disposition), because those facts do not exist yet, but
+/// still requires exact tool identity, typed evidence capability, and target
+/// compatibility. The returned IDs are ownership edges, never completion.
+pub(in crate::agent) fn pending_evidence_requirement_indices(
+    contract: &CompletionContract,
+    requested_tool_name: &str,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> Vec<usize> {
+    contract
+        .evidence_requirements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, requirement)| {
+            let capability_matches =
+                crate::agent::inquiry::requirement_is_exact_invocation(requirement)
+                    || semantics.evidence.iter().any(|capability| {
+                        crate::agent::inquiry::capability_supports_requirement(
+                            capability,
+                            requirement,
+                        )
+                    });
+            let tool_matches = requirement.receipt.as_ref().is_none_or(|receipt| {
+                receipt.tool_names.is_empty()
+                    || receipt
+                        .tool_names
+                        .iter()
+                        .any(|name| name == requested_tool_name)
+            });
+            (capability_matches
+                && tool_matches
+                && requirement_target_matches(requirement, semantics, raw_arguments, metadata))
+            .then_some(index)
+        })
+        .collect()
+}
+
 fn receipt_predicate_matches(
     requirement: &RequestEvidenceRequirement,
     requested_tool_name: &str,

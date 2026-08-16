@@ -280,6 +280,33 @@ fn task_is_terminal_schedule_failure(task: &crate::traits::Task) -> bool {
     )
 }
 
+/// Reconcile an open scheduled occurrence from its authoritative task graph.
+/// A failed occurrence is terminal; autonomous recovery is represented by a
+/// later linked run rather than by keeping the failed run indefinitely open.
+fn scheduled_run_reconciliation_status(
+    run: &crate::traits::GoalRun,
+    tasks: &[crate::traits::Task],
+) -> Option<&'static str> {
+    if run.trigger_type != "scheduled"
+        || !matches!(run.status.as_str(), "pending" | "running")
+        || tasks.is_empty()
+    {
+        return None;
+    }
+    if tasks.iter().any(|task| task.status == "blocked") {
+        Some("blocked")
+    } else if tasks.iter().any(task_is_terminal_schedule_failure) {
+        Some("failed")
+    } else if tasks
+        .iter()
+        .all(crate::traits::Task::satisfies_run_completion)
+    {
+        Some("completed")
+    } else {
+        None
+    }
+}
+
 fn stranded_manual_run_matches_pending_tasks(
     run: &crate::traits::GoalRun,
     run_tasks: &[crate::traits::Task],
@@ -2356,13 +2383,35 @@ impl HeartbeatCoordinator {
         // retained as audit records after their run is closed; counting all
         // tasks for the goal would make those records suppress every future
         // coalesced firing forever.
-        let open_runs = self
+        let candidate_open_runs = self
             .state
             .get_goal_runs(&goal.id)
             .await?
             .into_iter()
             .filter(|run| matches!(run.status.as_str(), "pending" | "running" | "blocked"))
             .collect::<Vec<_>>();
+        let mut open_runs = Vec::new();
+        for run in candidate_open_runs {
+            let run_tasks = self.state.get_tasks_for_goal_run(&run.id).await?;
+            if let Some(status) = scheduled_run_reconciliation_status(&run, &run_tasks) {
+                self.state
+                    .finish_goal_run(
+                        &run.id,
+                        status,
+                        Some("Reconciled from the scheduled run's authoritative task graph."),
+                    )
+                    .await?;
+                info!(
+                    goal_id = %goal.id,
+                    run_id = %run.id,
+                    prior_status = %run.status,
+                    reconciled_status = status,
+                    "Reconciled split-brain scheduled run before fire coalescing"
+                );
+                continue;
+            }
+            open_runs.push(run);
+        }
         let mut open_count = 0;
         for run in &open_runs {
             open_count += self
@@ -2814,6 +2863,37 @@ mod tests {
             started_at: None,
             completed_at: None,
         }
+    }
+
+    #[test]
+    fn scheduled_run_reconciliation_terminalizes_split_brain_task_graphs() {
+        let mut run = crate::traits::GoalRun::new("goal-1", "default", "scheduled");
+        run.status = "running".to_string();
+
+        assert_eq!(
+            scheduled_run_reconciliation_status(
+                &run,
+                &[
+                    synthetic_task("root", "completed"),
+                    synthetic_task("child", "blocked")
+                ],
+            ),
+            Some("blocked")
+        );
+        assert_eq!(
+            scheduled_run_reconciliation_status(&run, &[synthetic_task("root", "completed")],),
+            Some("completed")
+        );
+        assert_eq!(
+            scheduled_run_reconciliation_status(
+                &run,
+                &[
+                    synthetic_task("root", "completed"),
+                    synthetic_task("child", "running")
+                ],
+            ),
+            None
+        );
     }
 
     #[test]

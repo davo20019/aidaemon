@@ -233,6 +233,7 @@ fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
         candidate = redirected.trim();
     }
     if candidate.is_empty()
+        || crate::tools::command_semantics::is_discard_sink_path(candidate)
         || candidate.starts_with('-')
         || candidate.contains("://")
         || candidate.contains(['$', '`', '*', '?', '[', ']', '{', '}'])
@@ -281,9 +282,8 @@ pub(super) fn terminal_command_path_targets(
             if candidate.starts_with('/') || candidate == "~" || candidate.starts_with("~/") {
                 candidate
             } else if let Some(base_directory) = base_directory {
-                BackendPath::new(base_directory)
-                    .join(&candidate)
-                    .to_string()
+                let candidate = candidate.strip_prefix("./").unwrap_or(&candidate);
+                BackendPath::new(base_directory).join(candidate).to_string()
             } else {
                 candidate
             };
@@ -704,6 +704,17 @@ mod tests {
         assert!(targets
             .iter()
             .any(|target| target.ends_with("/tmp/repo/crates/widget/src/lib.rs")));
+    }
+
+    #[test]
+    fn terminal_targets_exclude_discard_sink_redirections() {
+        let targets = terminal_command_path_targets(
+            "cargo init disposable --vcs none >/dev/null 2>&1 && ./disposable/run",
+            Some("/tmp"),
+        );
+
+        assert!(!targets.iter().any(|target| target == "/dev/null"));
+        assert!(targets.iter().any(|target| target == "/tmp/disposable/run"));
     }
 
     #[test]

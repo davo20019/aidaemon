@@ -138,6 +138,8 @@ pub async fn record_background_model_call_telemetry(
                 tail_hash: None,
                 prefix_hash_archived: None,
                 boundary_pos: None,
+                projected_source_message_ids: Vec::new(),
+                projected_source_turn_ids: Vec::new(),
                 message_count: None,
                 force_text: false,
                 token_usage_present: response.usage.is_some(),

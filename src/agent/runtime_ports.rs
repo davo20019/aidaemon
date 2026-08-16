@@ -117,23 +117,6 @@ impl ConversationRuntime for Agent {
         .await;
         let text = text?;
         let generated = returned_generated_response(captured, &text)?.response;
-        if let (Some(parent_task_id), Some(parent_tool_call_id)) =
-            (request.parent_task_id, request.parent_tool_call_id)
-        {
-            crate::events::EventEmitter::new(self.event_store.clone(), request.session_id.clone())
-                .with_task_id(generated.task_id.clone())
-                .emit(
-                    crate::events::EventType::BackgroundContinuationLinked,
-                    crate::events::BackgroundContinuationLinkedData {
-                        parent_task_id,
-                        child_task_id: generated.task_id.clone(),
-                        parent_tool_call_id,
-                        parent_result_id: request.parent_result_id,
-                        child_response_id: Some(generated.response_id.clone()),
-                    },
-                )
-                .await?;
-        }
         Ok(crate::runtime_ports::AgentResponseEnvelope {
             response_id: generated.response_id,
             task_id: generated.task_id,

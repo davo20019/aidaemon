@@ -698,6 +698,45 @@ impl EventStore {
         Ok(Some(ContinuationToolEvidence { call, result }))
     }
 
+    /// Return the proof obligations attached to the task-local receipt that
+    /// moved a process into the background. The terminal completion adapter
+    /// uses this to preserve the original proof edge on the later terminal
+    /// receipt instead of reconstructing obligations from mutable session
+    /// state or notification prose.
+    pub async fn tool_completion_obligation_ids(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        tool_call_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT CASE
+                        WHEN json_array_length(COALESCE(
+                            json_extract(data, '$.receipt.continuation_obligation_ids'), '[]')) > 0
+                        THEN json_extract(data, '$.receipt.continuation_obligation_ids')
+                        ELSE json_extract(data, '$.receipt.completion_obligation_ids')
+                    END
+             FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
+               AND json_extract(data, '$.tool_call_id') = ?
+               AND (
+                    json_array_length(COALESCE(
+                        json_extract(data, '$.receipt.continuation_obligation_ids'), '[]')) > 0
+                    OR json_array_length(COALESCE(
+                        json_extract(data, '$.receipt.completion_obligation_ids'), '[]')) > 0
+               )
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .bind(tool_call_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(raw
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default())
+    }
+
     pub async fn task_response_message_ids(&self, task_id: &str) -> anyhow::Result<Vec<String>> {
         Ok(sqlx::query_scalar(
             "SELECT json_extract(data, '$.message_id')
@@ -2874,6 +2913,8 @@ mod tests {
         receipt.result_provenance.result_id = Some("result-exact".to_string());
         receipt.completion_obligation_ids =
             vec!["task:task-child/obligation:background-result".to_string()];
+        receipt.continuation_obligation_ids =
+            vec!["task:task-parent/obligation:evidence:0".to_string()];
         let result = ToolResultData {
             message_id: None,
             tool_call_id: "call-exact".to_string(),
@@ -2896,6 +2937,14 @@ mod tests {
             ))
             .await
             .unwrap();
+
+        assert_eq!(
+            store
+                .tool_completion_obligation_ids("session-a", "task-parent", "call-exact")
+                .await
+                .unwrap(),
+            ["task:task-parent/obligation:evidence:0"]
+        );
 
         let found = store
             .continuation_tool_evidence("session-a", "task-parent", "call-exact", "result-exact")
@@ -3981,6 +4030,8 @@ mod tests {
             prefix_hash_archived: None,
             boundary_pos: None,
             message_count: None,
+            projected_source_message_ids: Vec::new(),
+            projected_source_turn_ids: Vec::new(),
             force_text: false,
             token_usage_present: true,
             failed: false,

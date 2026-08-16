@@ -137,6 +137,9 @@ fn assimilate_continuation_receipt(
     parent_result_id: &str,
 ) -> Option<ContinuationReceiptAssimilation> {
     let receipt = evidence.result.receipt.as_ref()?;
+    if receipt.schema_version != crate::events::ToolReceiptV1::SCHEMA_VERSION {
+        return None;
+    }
     let reportable = matches!(
         receipt.outcome_status,
         crate::traits::ToolOutcomeStatus::Succeeded
@@ -182,11 +185,31 @@ fn assimilate_continuation_receipt(
     } else {
         Vec::new()
     };
+    let causally_bound_indices = receipt
+        .continuation_obligation_ids
+        .iter()
+        .chain(&receipt.completion_obligation_ids)
+        .filter_map(|source_obligation_id| {
+            contract
+                .adopted_evidence_bindings
+                .iter()
+                .find(|binding| binding.source_obligation_id == *source_obligation_id)
+                .and_then(|binding| {
+                    contract
+                        .evidence_requirements
+                        .iter()
+                        .position(|requirement| requirement == &binding.requirement)
+                })
+        })
+        .collect::<Vec<_>>();
     // Cross-task evidence must carry a machine-checkable binding to the
     // adopted obligation. Broad semantic overlap alone (for example, any
     // LocalWorkspace content observation) cannot let an unrelated parent
     // receipt close a child's requirement.
     matched_requirement_indices.retain(|index| {
+        if causally_bound_indices.contains(index) {
+            return true;
+        }
         contract
             .evidence_requirements
             .get(*index)
@@ -194,6 +217,11 @@ fn assimilate_continuation_receipt(
                 requirement.receipt.is_some() || requirement.target.is_some()
             })
     });
+    for index in causally_bound_indices {
+        if !matched_requirement_indices.contains(&index) {
+            matched_requirement_indices.push(index);
+        }
+    }
     if semantics.observes_state() {
         for index in super::tool_execution_phase::accumulate_evidence_requirement_marker_matches(
             contract,
@@ -594,23 +622,6 @@ impl Agent {
                 .any(|candidate| candidate == parent_task_id);
             let exact_reference = continuation_parent_tool_call_id
                 .zip(continuation_parent_result_id);
-            if let Some((parent_tool_call_id, parent_result_id)) = exact_reference {
-                // Persist the proof-bearing lifecycle edge before finalization.
-                // The response-bound edge is added later, but completion proof
-                // must not depend on an event that can only exist afterward.
-                emitter
-                    .emit(
-                        crate::events::EventType::BackgroundContinuationLinked,
-                        crate::events::BackgroundContinuationLinkedData {
-                            parent_task_id: parent_task_id.to_string(),
-                            child_task_id: task_id.clone(),
-                            parent_tool_call_id: parent_tool_call_id.to_string(),
-                            parent_result_id: Some(parent_result_id.to_string()),
-                            child_response_id: None,
-                        },
-                    )
-                    .await?;
-            }
             let mut telemetry = json!({
                 "condition": "continuation_receipt_assimilation",
                 "parent_task_id": parent_task_id,
@@ -644,6 +655,26 @@ impl Agent {
                         .await?
                     {
                         telemetry["receipt_found"] = json!(true);
+                        if evidence.result.receipt.as_ref().is_some_and(|receipt| {
+                            receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+                        }) {
+                            // The runtime lifecycle edge owns correlation; the
+                            // proof graph independently decides whether this
+                            // receipt satisfies any child obligation. Keep one
+                            // canonical link even when the child still has work.
+                            emitter
+                                .emit(
+                                    crate::events::EventType::BackgroundContinuationLinked,
+                                    crate::events::BackgroundContinuationLinkedData {
+                                        parent_task_id: parent_task_id.to_string(),
+                                        child_task_id: task_id.clone(),
+                                        parent_tool_call_id: parent_tool_call_id.to_string(),
+                                        parent_result_id: Some(parent_result_id.to_string()),
+                                        child_response_id: None,
+                                    },
+                                )
+                                .await?;
+                        }
                         if let Some(assimilation) = assimilate_continuation_receipt(
                             &turn_context.completion_contract,
                             &mut completion_progress,
@@ -651,6 +682,8 @@ impl Agent {
                             parent_task_id,
                             parent_result_id,
                         ) {
+                            let proof_credited = assimilation.observation_credited
+                                || assimilation.mutation_credited;
                             telemetry["outcome_status"] =
                                 json!(assimilation.outcome_status.as_str());
                             telemetry["matched_requirement_indices"] =
@@ -661,9 +694,7 @@ impl Agent {
                             telemetry["mutation_credited"] =
                                 json!(assimilation.mutation_credited);
                             telemetry["reason_code"] = json!(
-                                if assimilation.observation_credited
-                                    || assimilation.mutation_credited
-                                {
+                                if proof_credited {
                                     "receipt_assimilated"
                                 } else {
                                     "receipt_did_not_match_child_obligations"
@@ -1553,6 +1584,8 @@ impl Agent {
                 mut messages,
                 tool_defs: effective_tool_defs,
                 est_input_tokens,
+                projected_source_message_ids,
+                projected_source_turn_ids,
             } = super::message_build_phase::run_message_build_phase(
                 &services,
                 &mut MessageBuildCtx {
@@ -1654,6 +1687,8 @@ impl Agent {
                     thinking_truncation_count: llm_recovery.thinking_truncation_count,
                     est_input_tokens,
                     build_ms: message_build_ms,
+                    projected_source_message_ids: &projected_source_message_ids,
+                    projected_source_turn_ids: &projected_source_turn_ids,
                 },
             )
             .await?;
@@ -2192,6 +2227,70 @@ mod stuck_fallback_tests {
         assert!(!assimilation.observation_credited);
         assert!(progress.verification_pending);
         assert!(!progress.all_evidence_requirements_satisfied());
+    }
+
+    #[test]
+    fn detached_receipt_closes_exact_parent_owned_generic_obligation() {
+        let child_requirement = crate::traits::RequestEvidenceRequirement {
+            summary: "Observe an unrelated child-only fact".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let parent_requirement = crate::traits::RequestEvidenceRequirement {
+            summary: "Observe the detached command result".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+            purpose: crate::traits::EvidencePurpose::Content,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let contract = CompletionContract {
+            scope_task_id: Some("task-child".to_string()),
+            adopted_from_task_ids: vec!["task-parent".to_string()],
+            requires_observation: true,
+            // The parent requirement deliberately is not at its source index.
+            // Cross-task proof must use the durable binding, never position.
+            evidence_requirements: vec![child_requirement, parent_requirement.clone()],
+            adopted_evidence_bindings: vec![crate::traits::AdoptedEvidenceBinding {
+                source_obligation_id: "task:task-parent/obligation:evidence:0".to_string(),
+                requirement: parent_requirement,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut progress = CompletionProgress::new(&contract, "task-child");
+        let mut evidence = detached_command_evidence(
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            0,
+            "SYNTHETIC_LONG_OK",
+        );
+        evidence
+            .result
+            .receipt
+            .as_mut()
+            .unwrap()
+            .continuation_obligation_ids =
+            vec!["task:task-parent/obligation:evidence:0".to_string()];
+
+        let assimilation = assimilate_continuation_receipt(
+            &contract,
+            &mut progress,
+            &evidence,
+            "task-parent",
+            "result:synthetic-negative",
+        )
+        .expect("causally bound receipt");
+
+        assert!(assimilation.observation_credited);
+        assert_eq!(assimilation.matched_requirement_indices, [1]);
+        assert_eq!(progress.satisfied_evidence_requirements(), 1);
+        assert!(progress.verification_pending);
     }
 
     #[test]

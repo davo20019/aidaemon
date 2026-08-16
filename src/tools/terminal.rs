@@ -1824,9 +1824,9 @@ pub(crate) async fn confined_terminal_execution_request(
     // credentials. Resolve exact machine invocations and add only registered,
     // read-only runtime roots/caches.
     let runtime_support = native_sandbox_runtime_support(backend, command).await?;
-    for path in runtime_support.read_paths {
-        if !reads.contains(&path) && !writes.contains(&path) {
-            reads.push(path);
+    for path in &runtime_support.read_paths {
+        if !reads.contains(path) && !writes.contains(path) {
+            reads.push(path.clone());
         }
     }
 
@@ -1835,25 +1835,36 @@ pub(crate) async fn confined_terminal_execution_request(
         .map(ToString::to_string)
         .unwrap_or_else(|| "/".to_string());
     let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes)?;
-    let mut args = vec![
-        "sandbox".to_string(),
-        "--sandbox-state-json".to_string(),
-        sandbox_state,
-    ];
-    args.extend([
-        "--".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        command.to_string(),
-    ]);
-    let mut request = ExecutionRequest::argv(codex.to_string(), args);
-    request.cwd = cwd;
+    let mut sandbox_environment = std::collections::BTreeMap::new();
     if !runtime_support.path_prefixes.is_empty() {
-        request.env.insert(
+        sandbox_environment.insert(
             "PATH".to_string(),
             native_sandbox_search_path(&runtime_support.path_prefixes),
         );
     }
+    sandbox_environment.extend(runtime_support.environment);
+
+    let mut args = vec![
+        "sandbox".to_string(),
+        "--sandbox-state-json".to_string(),
+        sandbox_state,
+        "--".to_string(),
+        // The sandbox adapter is a process boundary. Supplying these values
+        // only to the outer adapter does not guarantee that its child keeps
+        // them, so carry the registered runtime profile explicitly into the
+        // confined process as well. These are runtime dependencies, not task
+        // authority or ambient owner configuration.
+        "/usr/bin/env".to_string(),
+    ];
+    args.extend(
+        sandbox_environment
+            .iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
+    let mut request = ExecutionRequest::argv(codex.to_string(), args);
+    request.cwd = cwd;
+    request.env.extend(sandbox_environment);
     Ok(request)
 }
 
@@ -1861,6 +1872,7 @@ pub(crate) async fn confined_terminal_execution_request(
 struct NativeSandboxRuntimeSupport {
     read_paths: Vec<String>,
     path_prefixes: Vec<String>,
+    environment: HashMap<String, String>,
 }
 
 impl NativeSandboxRuntimeSupport {
@@ -1964,14 +1976,29 @@ async fn native_sandbox_runtime_support(
         }
 
         // Cargo requires dependency source caches to compile an already
-        // resolved project. These roots deliberately exclude config and
-        // credentials; network remains denied by the permission profile.
+        // resolved project. These roots deliberately exclude credentials and
+        // broad home access; network remains denied by the permission profile.
         if requested_name == "cargo" {
             let cargo_home = backend.home_hint().join(".cargo");
             for relative in ["registry", "git", ".global-cache", ".rustc_info.json"] {
                 let path = cargo_home.join(relative);
                 if backend.metadata(&path).await.is_ok() {
                     support.add_read(path.to_string());
+                }
+            }
+
+            // Cargo embeds libgit2 and consults Git's ordinary configuration
+            // even for local project initialization. The task did not ask to
+            // read this file as evidence, but it is an exact, read-only
+            // runtime dependency of the selected executable. Keep it in the
+            // runtime-support lane and never broaden the grant to the home
+            // directory or Cargo credentials.
+            for config in [
+                backend.home_hint().join(".gitconfig"),
+                backend.home_hint().join(".config/git/config"),
+            ] {
+                if backend.metadata(&config).await.is_ok() {
+                    support.add_read(config.to_string());
                 }
             }
         }
@@ -2152,44 +2179,16 @@ async fn run_background_continuation_with_timeout(
 /// ends the moment a long-running command detaches: a request like "send me the
 /// file when done" would otherwise be silently dropped, since the model would
 /// just summarize the output instead of completing the requested action.
-fn build_background_reengagement_followup(
-    command_summary: &str,
-    output: &str,
-    unchecked: &[String],
-) -> String {
-    let mut s = format!(
+fn build_background_reengagement_followup(command_summary: &str, output: &str) -> String {
+    format!(
         "[Background command completed]\n\
          Command: `{command_summary}`\n\
          Output:\n{output}\n\n\
-         This command was part of your previous task. Check your session history \
-         for the original user request and continue where you left off, using the \
-         output above to proceed with the remaining steps.\n"
-    );
-    if unchecked.is_empty() {
-        // No durable checklist for this task — fall back to generic deferred-
-        // deliverable steering (the interim behavior from 74324f9).
-        s.push_str(
-            "If the original request asked you to send, share, or deliver a file (or \
-             produce any other deliverable), complete that now — for a file, call the \
-             send_file tool with the produced file's path. Do not just describe the \
-             result; perform the action the user asked for.",
-        );
-    } else {
-        // Persisted checklist exists — list the still-unchecked requirements so
-        // the model completes the exact deferred items, not a guess.
-        s.push_str(
-            "The following tracked requirements for this task are still UNCHECKED — \
-             complete each one now:\n",
-        );
-        for item in unchecked {
-            s.push_str(&format!("- {item}\n"));
-        }
-        s.push_str(
-            "For a file deliverable, call send_file with the produced file's path. After \
-             completing each item, call track_requirements to mark it 'completed'.",
-        );
-    }
-    s
+         Continue the exact parent request identified by the attached runtime \
+         continuation edge. Treat the linked terminal receipt as authoritative \
+         evidence for that invocation and complete only obligations retained by \
+         that parent request."
+    )
 }
 
 impl TerminalTool {
@@ -3887,9 +3886,6 @@ impl TerminalTool {
                 // working on the original task.
                 let mut notifier_started = false;
                 let state_for_notify = self.state.clone();
-                // Pool clone so the notifier can read the durable requirement
-                // checklist and inject still-unchecked items into re-engagement.
-                let pool_for_notify = self.pool.clone();
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 let reengagements_for_notify = self.reengagements.clone();
@@ -4039,6 +4035,8 @@ impl TerminalTool {
                                                 },
                                             );
                                             let mut metadata = foreground_terminal_metadata(exit_code);
+                                            metadata.receipt_kind =
+                                                crate::traits::ToolReceiptKind::Process;
                                             metadata.effective_tool_name = Some("terminal".to_string());
                                             metadata.truncation = truncation.clone();
                                             metadata.semantics =
@@ -4053,12 +4051,22 @@ impl TerminalTool {
                                                 );
                                             completion_parent_result_id = provenance.result_id.clone();
                                             metadata.result_provenance = Some(provenance);
-                                            let receipt = crate::events::ToolReceiptV1::from_metadata(
+                                            let mut receipt = crate::events::ToolReceiptV1::from_metadata(
                                                 &metadata,
                                                 outcome_status,
                                                 crate::events::ToolOutcomeEvidenceSource::ToolReported,
                                                 None,
                                             );
+                                            receipt.completion_obligation_ids = event_store
+                                                .tool_completion_obligation_ids(
+                                                    &session_for_notify,
+                                                    parent_task_id,
+                                                    tool_call_id,
+                                                )
+                                                .await
+                                                .unwrap_or_default();
+                                            receipt.continuation_obligation_ids =
+                                                receipt.completion_obligation_ids.clone();
                                             let emitter = crate::events::EventEmitter::new(
                                                 event_store.clone(),
                                                 session_for_notify.clone(),
@@ -4099,30 +4107,10 @@ impl TerminalTool {
                                             }
                                         }
 
-                                        // Task completion and process completion are different
-                                        // states. Load durable requirements before choosing the
-                                        // user-facing status or deciding whether empty stdout can
-                                        // end the interaction.
-                                        completion_unchecked_requirements = if let Some(ref pool) =
-                                            pool_for_notify
-                                        {
-                                            match crate::plans::PlanStore::new(pool.clone()).await {
-                                                Ok(ps) => match ps
-                                                    .get_incomplete_for_session(&session_for_notify)
-                                                    .await
-                                                {
-                                                    Ok(Some(plan)) => plan
-                                                        .unchecked_steps()
-                                                        .iter()
-                                                        .map(|step| step.description.clone())
-                                                        .collect(),
-                                                    _ => Vec::new(),
-                                                },
-                                                Err(_) => Vec::new(),
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        };
+                                        // This continuation belongs to one immutable parent task.
+                                        // A session-global plan may already belong to an unrelated
+                                        // request and is never a valid source of child obligations.
+                                        completion_unchecked_requirements = Vec::new();
 
                                         // Deliverable attribution: if the command produced exactly
                                         // one safe explicit output file, deliver THAT file directly
@@ -4597,7 +4585,6 @@ impl TerminalTool {
                                         let followup = build_background_reengagement_followup(
                                             &command_summary,
                                             &output,
-                                            &completion_unchecked_requirements,
                                         );
                                         info!(
                                             pid,
@@ -6011,6 +5998,14 @@ mod tests {
         assert!(!serialized.contains("credentials.toml"));
         assert!(!serialized.contains(&format!("\"path\":\"{}\"", backend.home_hint())));
         let sandbox_path = request.env.get("PATH").cloned().unwrap_or_default();
+        let git_config = backend.home_hint().join(".gitconfig").to_string();
+        if backend
+            .metadata(&crate::execution::BackendPath::new(git_config.clone()))
+            .await
+            .is_ok()
+        {
+            assert!(serialized.contains(&git_config));
+        }
         let toolchain_index = sandbox_path.find("/.rustup/toolchains/");
         let shim_index = sandbox_path.find("/.cargo/bin");
         assert!(
@@ -6028,6 +6023,46 @@ mod tests {
             "cargo stderr: {}\nsandbox PATH: {sandbox_path}",
             output.stderr_lossy(),
         );
+    }
+
+    #[tokio::test]
+    async fn confined_cargo_project_creation_uses_exact_runtime_config_grant() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend.resolve_executable("cargo").await.unwrap().is_none()
+        {
+            return;
+        }
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().to_string_lossy().to_string();
+        let request = confined_terminal_execution_request(
+            &backend,
+            "cargo new synthetic-created --quiet",
+            Some(&cwd),
+            &[cwd.clone()],
+            &[cwd.clone()],
+        )
+        .await
+        .expect("confined request");
+        let serialized = match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
+            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+        };
+        let git_config = backend.home_hint().join(".gitconfig").to_string();
+        assert!(serialized.contains(&git_config));
+        assert!(!serialized.contains("credentials.toml"));
+
+        let output = backend
+            .execute(request, Duration::from_secs(60))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(
+            output.exit_code,
+            0,
+            "cargo stderr: {}",
+            output.stderr_lossy()
+        );
+        assert!(root.path().join("synthetic-created/src/main.rs").is_file());
     }
 
     #[tokio::test]
@@ -6311,25 +6346,14 @@ mod tests {
     }
 
     #[test]
-    fn test_reengagement_followup_steers_deferred_file_send() {
-        // Regression (screenshot 2026-06-24): user asked "Send me the file when
-        // done"; the command ran past 30s and was moved to background, so the
-        // original turn ended before the file was sent. The re-engagement
-        // follow-up must explicitly steer the model to complete deferred
-        // deliverables (call send_file), not merely summarize the output.
-        // No persisted checklist → generic deferred-deliverable steering.
+    fn reengagement_followup_uses_typed_parent_edge_not_session_plan() {
         let followup = build_background_reengagement_followup(
             "python3 /tmp/ping_latency.py",
             "latency results written to /tmp/latency.txt",
-            &[],
         );
         assert!(
-            followup.contains("send_file"),
-            "follow-up must steer file delivery: {followup}"
-        );
-        assert!(
-            followup.contains("send, share, or deliver a file"),
-            "follow-up must mention the deferred deliverable: {followup}"
+            followup.contains("attached runtime continuation edge"),
+            "follow-up must name the typed ownership boundary: {followup}"
         );
         assert!(
             followup.contains("latency results written to /tmp/latency.txt"),
@@ -6342,42 +6366,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reengagement_followup_lists_persisted_unchecked_items() {
-        // With a durable checklist, the re-engagement names the exact still-
-        // unchecked requirements instead of the generic hint.
+    fn reengagement_followup_cannot_import_unrelated_checklist_text() {
         let followup = build_background_reengagement_followup(
             "python3 /tmp/ping.py",
             "latency written to /tmp/latency.txt",
-            &["send the latency file to the user".to_string()],
-        );
-        assert!(
-            followup.contains("send the latency file to the user"),
-            "must list the unchecked item: {followup}"
         );
         assert!(
             followup.contains("/tmp/latency.txt"),
             "must include the command output: {followup}"
         );
-        assert!(
-            followup.contains("track_requirements"),
-            "must instruct marking items completed: {followup}"
-        );
-    }
-
-    #[test]
-    fn test_reengagement_followup_keeps_empty_output_requirements_alive() {
-        let followup = build_background_reengagement_followup(
-            "synthetic-background-step",
-            "(no output)",
-            &[
-                "wait for the replacement run".to_string(),
-                "report the publication receipt".to_string(),
-            ],
-        );
-        assert!(followup.contains("(no output)"));
-        assert!(followup.contains("wait for the replacement run"));
-        assert!(followup.contains("report the publication receipt"));
-        assert!(followup.contains("continue where you left off"));
+        assert!(!followup.contains("UNCHECKED"));
+        assert!(!followup.contains("track_requirements"));
     }
 
     #[test]
