@@ -1050,6 +1050,31 @@ impl ToolCallOutcome {
             },
         }
     }
+
+    pub fn blocked(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Blocked),
+                ..ToolCallMetadata::default()
+            },
+        }
+    }
+
+    pub fn completed_negative_result(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                ..ToolCallMetadata::default()
+            },
+        }
+    }
+
+    pub fn with_semantics(mut self, semantics: ToolCallSemantics) -> Self {
+        self.metadata.semantics = semantics;
+        self
+    }
 }
 
 impl Default for ToolCapabilities {
@@ -1675,6 +1700,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(meta.http_status, Some(201));
+    }
+
+    #[test]
+    fn pre_io_policy_blocks_and_expected_rejections_have_distinct_typed_outcomes() {
+        let blocked = ToolCallOutcome::blocked("policy denied execution");
+        assert_eq!(
+            blocked.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
+        assert!(!blocked.metadata.contract_rejected);
+        assert!(!ToolOutcomeStatus::Blocked.satisfies_requested_condition());
+
+        let rejected = ToolCallOutcome::contract_rejection("invalid requested arguments");
+        assert_eq!(
+            rejected.metadata.outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert!(rejected.metadata.contract_rejected);
     }
 
     #[test]

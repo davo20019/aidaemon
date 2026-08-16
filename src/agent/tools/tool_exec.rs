@@ -219,7 +219,7 @@ async fn scoped_workspace_arguments(
     Ok(args)
 }
 
-// impl-Agent justification: tool dispatch with watchdog over tools/state/event_store/verification_tracker.
+// impl-Agent justification: tool dispatch with watchdog over tools/state/event_store.
 impl Agent {
     async fn mandate_goal_id_for_tool_exec(
         &self,
@@ -752,22 +752,6 @@ impl Agent {
             _ => arguments.to_string(),
         };
 
-        // Path verification pre-check: gate file-modifying terminal commands
-        if name == "terminal" {
-            if let Some(ref tracker) = self.verification_tracker {
-                if let Some(cmd) = extract_command_from_args(&enriched_args) {
-                    if let Some(warning) = tracker.check_modifying_command(session_id, &cmd).await {
-                        return Ok(crate::traits::ToolCallOutcome::from_output(format!(
-                            "[VERIFICATION WARNING] {}\nUnverified paths: {}\n\
-                                 Verify targets exist using 'ls' or 'stat' first, then retry.",
-                            warning.message,
-                            warning.unverified_paths.join(", ")
-                        )));
-                    }
-                }
-            }
-        }
-
         if let Some(grant) = active_workspace_grant {
             if !under_mandate && matches!(name, "write_file" | "edit_file") {
                 if let Some(manager) = crate::checkpoints::active_manager() {
@@ -801,15 +785,6 @@ impl Agent {
                 anyhow::anyhow!(sanitize_workspace_tool_text(&error.to_string(), grant))
             });
 
-            if result.is_ok() {
-                if let Some(ref tracker) = self.verification_tracker {
-                    if matches!(name, "read_file" | "write_file" | "edit_file") {
-                        if let Some(path) = extract_file_path_from_args(&enriched_args) {
-                            tracker.record_seen_path(session_id, &path).await;
-                        }
-                    }
-                }
-            }
             return result;
         }
 
@@ -860,25 +835,6 @@ impl Agent {
                                 "mutation continued in a background or detached process",
                             )
                             .await;
-                    }
-                }
-
-                // Post-execution: record seen paths from successful commands
-                if result.is_ok() {
-                    if let Some(ref tracker) = self.verification_tracker {
-                        match name {
-                            "terminal" | "run_command" => {
-                                if let Some(cmd) = extract_command_from_args(&enriched_args) {
-                                    tracker.record_from_command(session_id, &cmd).await;
-                                }
-                            }
-                            "send_file" | "read_file" | "write_file" | "edit_file" => {
-                                if let Some(path) = extract_file_path_from_args(&enriched_args) {
-                                    tracker.record_seen_path(session_id, &path).await;
-                                }
-                            }
-                            _ => {}
-                        }
                     }
                 }
 

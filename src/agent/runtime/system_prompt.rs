@@ -629,33 +629,35 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
-        let (core_profile_str, core_profile_digest) =
-            if inject_personal && user_role == UserRole::Owner && self.depth == 0 {
-                let cached_ids = self
-                    .session_core_profile_ids
-                    .read()
-                    .await
-                    .get(session_id)
-                    .cloned();
-                let (profile_str, new_ids, digest) =
-                    crate::memory::core_profile::build_core_profile(
-                        &self.state,
-                        cached_ids,
-                        people_enabled,
-                    )
-                    .await
-                    .unwrap_or_default();
+        let (core_profile_str, core_profile_digest) = if memory_pipeline_allowed
+            && inject_personal
+            && user_role == UserRole::Owner
+            && self.depth == 0
+        {
+            let cached_ids = self
+                .session_core_profile_ids
+                .read()
+                .await
+                .get(session_id)
+                .cloned();
+            let (profile_str, new_ids, digest) = crate::memory::core_profile::build_core_profile(
+                &self.state,
+                cached_ids,
+                people_enabled,
+            )
+            .await
+            .unwrap_or_default();
 
-                if let Some(ids) = new_ids {
-                    self.session_core_profile_ids
-                        .write()
-                        .await
-                        .insert(session_id.to_string(), ids);
-                }
-                (profile_str, digest)
-            } else {
-                (String::new(), Vec::new())
-            };
+            if let Some(ids) = new_ids {
+                self.session_core_profile_ids
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), ids);
+            }
+            (profile_str, digest)
+        } else {
+            (String::new(), Vec::new())
+        };
 
         // Per-render core_profile selection digest (id + content hash per entity).
         // Emitted as telemetry so a future core_profile churn self-explains: diffing
@@ -1789,6 +1791,86 @@ mod tests {
         assert!(!tail.contains("Compacted Conversation State"));
         assert!(!tail.contains("Recent Session Context"));
         assert!(continuation_tail.contains("STALE_OUTPUT_FORMAT"));
+    }
+
+    #[tokio::test]
+    async fn suppressed_memory_pipeline_removes_core_profile_from_the_same_session() {
+        use crate::testing::{setup_test_agent_root, MockProvider};
+        use crate::traits::{FactStore, StateStore};
+        use crate::types::{ChannelContext, FactPrivacy, UserRole};
+
+        let harness = setup_test_agent_root(MockProvider::new())
+            .await
+            .expect("setup test harness");
+        harness
+            .state
+            .upsert_fact(
+                "personal",
+                "private_profile_sentinel",
+                "SYNTHETIC_CORE_PROFILE_VALUE",
+                "owner_dm",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .expect("seed profile fact");
+        let profile_state: std::sync::Arc<dyn StateStore> = harness.state.clone();
+        let (seeded_profile, _, _) =
+            crate::memory::core_profile::build_core_profile(&profile_state, None, false)
+                .await
+                .expect("build seeded profile");
+        assert!(seeded_profile.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
+        let emitter = crate::events::EventEmitter::new(
+            harness.agent.event_store().clone(),
+            "memory-policy-session".to_string(),
+        );
+        let (allowed_core, _, _, _, _) = harness
+            .agent
+            .build_system_prompt_for_message(
+                &emitter,
+                "memory-allowed-task",
+                "memory-policy-session",
+                "Use the current owner context.",
+                UserRole::Owner,
+                &ChannelContext::private("synthetic-owner"),
+                0,
+                None,
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .await
+            .expect("build memory-allowed prompt");
+        assert!(
+            allowed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"),
+            "memory-allowed core omitted seeded profile; profile_header={} core_bytes={}",
+            allowed_core.contains("## Core Profile"),
+            allowed_core.len()
+        );
+
+        let (suppressed_core, suppressed_tail, _, _, _) = harness
+            .agent
+            .build_system_prompt_for_message(
+                &emitter,
+                "memory-suppressed-task",
+                "memory-policy-session",
+                "Answer without persistent personal context.",
+                UserRole::Owner,
+                &ChannelContext::private("synthetic-owner"),
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("build memory-suppressed prompt");
+        assert!(!suppressed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
+        assert!(!suppressed_tail.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
     }
 
     #[tokio::test]

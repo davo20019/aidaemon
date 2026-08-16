@@ -1679,42 +1679,12 @@ fn extract_verification_filesystem_targets(
     max_targets: usize,
     alias_roots: &[String],
 ) {
-    for raw in text.split_whitespace() {
+    for value in
+        super::project_scope::extract_exact_filesystem_resources_from_text(text, alias_roots)
+    {
         if targets.len() >= max_targets {
             break;
         }
-        let token = raw
-            .trim_matches(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '`' | '\''
-                            | '"'
-                            | ','
-                            | ';'
-                            | ':'
-                            | '.'
-                            | '!'
-                            | '?'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                    )
-            })
-            .trim();
-        if token.is_empty() || token.contains("://") {
-            continue;
-        }
-
-        let Some(path) =
-            crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
-        else {
-            continue;
-        };
-        let value = path.to_string_lossy().to_string();
         if !targets
             .iter()
             .any(|target| target.kind == VerificationTargetKind::Path && target.value == value)

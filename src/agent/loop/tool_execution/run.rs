@@ -3,7 +3,7 @@ use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
     is_file_recheck_tool, maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
-    project_instruction_targets_for_tool_call, terminal_command_path_targets,
+    project_instruction_targets_for_tool_call, terminal_command_resource_targets,
     tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
@@ -1210,9 +1210,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             if let Ok(arguments) = serde_json::from_str::<Value>(&effective_arguments) {
                 if let Some(command) = arguments.get("command").and_then(Value::as_str) {
                     let base = access_manifest.execution_cwd.as_deref();
-                    for path in terminal_command_path_targets(command, base) {
-                        let kind = ToolTargetHintKind::Path;
-                        let Some(target) = ToolTargetHint::new(kind, path) else {
+                    let command_targets = terminal_command_resource_targets(command, base);
+                    for path in command_targets.execution_contexts {
+                        let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)
+                        else {
+                            continue;
+                        };
+                        if !access_manifest.read_targets.contains(&target) {
+                            access_manifest.read_targets.push(target);
+                        }
+                    }
+                    for path in command_targets.data_paths {
+                        let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) else {
                             continue;
                         };
                         let targets = if call_semantics.mutates_state() {

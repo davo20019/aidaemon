@@ -1839,19 +1839,6 @@ pub(super) fn extract_command_from_args(args_json: &str) -> Option<String> {
         .and_then(|v| v.get("command")?.as_str().map(String::from))
 }
 
-/// Extract the file path from tool arguments JSON.  Checks common aliases
-/// used by send_file (`file_path`), write_file/read_file/edit_file (`path`,
-/// `file_path`, `file`, `filename`).
-pub(super) fn extract_file_path_from_args(args_json: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(args_json).ok()?;
-    for key in ["file_path", "path", "file", "filename"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    None
-}
-
 /// Build a stable dedupe key for send_file calls within a single task.
 /// Key format: "{expanded_path}|{trimmed_caption}".
 pub(super) fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<String> {

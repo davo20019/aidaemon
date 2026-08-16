@@ -1295,6 +1295,13 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .as_ref()
         .map(|router| router.select(crate::router::Tier::Primary))
         .unwrap_or(model.as_str());
+    let planner_context = super::task_planning::task_assessment_conversation_context(
+        initial_turn_context.followup_mode,
+        session_summary
+            .as_ref()
+            .map(|summary| summary.summary.as_str()),
+        &initial_turn_context.assessment_recent_messages,
+    );
     let (mut task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
         agent
             .emit_decision_point(
@@ -1312,13 +1319,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .await;
         (None, false)
     } else {
-        let planner_context = super::task_planning::task_assessment_conversation_context(
-            initial_turn_context.followup_mode,
-            session_summary
-                .as_ref()
-                .map(|summary| summary.summary.as_str()),
-            &initial_turn_context.assessment_recent_messages,
-        );
         agent
             .emit_decision_point(
                 &emitter,
@@ -1353,54 +1353,58 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             true,
         )
     };
+    let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
+        emitter: &emitter,
+        state: agent.state.as_ref(),
+        session_id,
+        task_id: &task_id,
+    });
+    let mut relationship_fallback = None;
     if task_assessment_attempted && task_plan.is_none() {
-        task_plan = super::task_planning::generate_task_contract_recovery(
+        // The recovery compilers own independent typed products. Run them
+        // concurrently so a slow contract recovery cannot serially delay the
+        // dialogue edge (or vice versa); neither result can rewrite the other.
+        let contract_recovery = super::task_planning::generate_task_contract_recovery(
             llm_provider.clone(),
             planner_model,
             user_text,
             assessment_mode,
-            Some(super::task_planning::PlannerTelemetryCtx {
-                emitter: &emitter,
-                state: agent.state.as_ref(),
-                session_id,
-                task_id: &task_id,
-            }),
-        )
-        .await;
+            planner_telemetry,
+        );
+        let relationship_recovery = async {
+            let planner_context = planner_context.as_deref()?;
+            super::task_planning::generate_task_relationship(
+                llm_provider.clone(),
+                planner_model,
+                user_text,
+                planner_context,
+                planner_telemetry,
+            )
+            .await
+        };
+        let (recovered_contract, recovered_relationship) =
+            tokio::join!(contract_recovery, relationship_recovery);
+        task_plan = recovered_contract;
+        relationship_fallback = recovered_relationship;
     }
-    let relationship_fallback = if task_assessment_attempted
+    if relationship_fallback.is_none()
+        && task_assessment_attempted
         && task_plan
             .as_ref()
             .and_then(|plan| plan.task_shape.as_ref())
             .is_none_or(|shape| !super::task_planning::planned_task_relationship_is_complete(shape))
     {
-        let planner_context = super::task_planning::task_assessment_conversation_context(
-            initial_turn_context.followup_mode,
-            session_summary
-                .as_ref()
-                .map(|summary| summary.summary.as_str()),
-            &initial_turn_context.assessment_recent_messages,
-        );
-        if let Some(planner_context) = planner_context {
-            super::task_planning::generate_task_relationship(
+        if let Some(planner_context) = planner_context.as_deref() {
+            relationship_fallback = super::task_planning::generate_task_relationship(
                 llm_provider.clone(),
                 planner_model,
                 user_text,
-                &planner_context,
-                Some(super::task_planning::PlannerTelemetryCtx {
-                    emitter: &emitter,
-                    state: agent.state.as_ref(),
-                    session_id,
-                    task_id: &task_id,
-                }),
+                planner_context,
+                planner_telemetry,
             )
-            .await
-        } else {
-            None
+            .await;
         }
-    } else {
-        None
-    };
+    }
     let turn_context = finalize_turn_assessment(
         agent,
         &emitter,

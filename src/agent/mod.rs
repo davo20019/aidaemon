@@ -28,7 +28,6 @@ use crate::router::{self, Router};
 use crate::runtime_ports::OutboundRouter;
 use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::VerificationTracker;
 use crate::traits::{
     AgentRole, ChatOptions, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
     ToolCapabilities, ToolChoiceMode, ToolRole,
@@ -201,11 +200,10 @@ mod recall_guardrails;
 pub(crate) mod trust_tier;
 use loop_utils::{
     build_task_boundary_hint, classify_execution_failure_kind, classify_tool_outcome_status,
-    extract_command_from_args, extract_file_path_from_args, extract_key_error_line,
-    extract_send_file_dedupe_key_from_args, failure_class_from_outcome_status,
-    fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
-    strip_appended_diagnostics, tool_outcome_evidence_source, ExecutionFailureKind,
-    ToolFailureClass,
+    extract_command_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
+    failure_class_from_outcome_status, fixup_message_ordering, hash_tool_call, is_trigger_session,
+    semantic_failure_limit, strip_appended_diagnostics, tool_outcome_evidence_source,
+    ExecutionFailureKind, ToolFailureClass,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
@@ -450,9 +448,6 @@ pub struct Agent {
     limits: AgentLimits,
     /// When true, the user has manually set a model via /model — skip auto-routing.
     model_override: RwLock<bool>,
-    /// Path verification tracker — gates file-modifying commands on unverified paths.
-    /// None for sub-agents (they inherit parent context).
-    verification_tracker: Option<Arc<VerificationTracker>>,
     /// Optional MCP server registry for dynamic, context-aware MCP tool injection.
     mcp_registry: Option<McpRegistry>,
     /// Role for this agent instance.

@@ -35,7 +35,6 @@ use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{approval_floor_reason, hard_block_reason, PermissionMode, RiskLevel};
-use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::process_control::{send_sigkill, send_sigterm};
 use super::semantic_command_risk::assess_command;
@@ -326,6 +325,7 @@ pub struct ApprovalRequest {
 /// 3. **Detached** (`detached=true`): survives task-end and notifier. Requires explicit kill.
 struct RunningProcess {
     command: String,
+    semantics: ToolCallSemantics,
     dedupe_key: Option<String>,
     owner_task_id: Option<String>,
     detached: bool,
@@ -1917,6 +1917,163 @@ fn parsed_command_programs(command: &str) -> Vec<String> {
     programs
 }
 
+/// Return the immutable installation root that owns an executable managed by a
+/// recognized toolchain/package layout. Runtime support is granted read-only
+/// to this root; it never becomes task-data authority.
+fn managed_executable_runtime_root(executable: &crate::execution::BackendPath) -> Option<String> {
+    let path = PathBuf::from(executable.as_str());
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let root_depth = components
+        .windows(1)
+        .position(|parts| parts[0] == "Cellar")
+        .map(|index| index + 3)
+        .or_else(|| {
+            components
+                .windows(2)
+                .position(|parts| parts == [".rustup", "toolchains"])
+                .map(|index| index + 3)
+        })
+        .or_else(|| {
+            components
+                .windows(3)
+                .position(|parts| parts == [".nvm", "versions", "node"])
+                .map(|index| index + 4)
+        })
+        .or_else(|| {
+            components
+                .windows(2)
+                .position(|parts| parts == [".pyenv", "versions"])
+                .map(|index| index + 3)
+        })?;
+    if components.len() <= root_depth {
+        return None;
+    }
+
+    let mut root = PathBuf::from("/");
+    for component in components.iter().take(root_depth) {
+        root.push(component);
+    }
+    Some(root.to_string_lossy().into_owned())
+}
+
+fn homebrew_stable_runtime_alias(executable: &crate::execution::BackendPath) -> Option<String> {
+    let path = PathBuf::from(executable.as_str());
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let cellar_index = components.iter().position(|part| part == "Cellar")?;
+    let formula = components.get(cellar_index + 1)?;
+    let mut alias = PathBuf::from("/");
+    for component in components.iter().take(cellar_index) {
+        alias.push(component);
+    }
+    alias.push("opt");
+    alias.push(formula);
+    Some(alias.to_string_lossy().into_owned())
+}
+
+/// macOS sandbox path rules canonicalize a Homebrew formula symlink before
+/// applying an exact grant. A process which later opens the stable
+/// `/opt/homebrew/opt/<formula>` spelling therefore also needs read access to
+/// the alias namespace directory, while the canonical Cellar root remains the
+/// boundary that authorizes the formula's actual contents. Granting the
+/// namespace alone does not expose another formula's Cellar files.
+fn homebrew_alias_namespace(executable: &crate::execution::BackendPath) -> Option<String> {
+    let alias = PathBuf::from(homebrew_stable_runtime_alias(executable)?);
+    alias
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_developer_root_from_sdk_root(sdk_root: &str) -> Option<String> {
+    ["/Platforms/", "/SDKs/"]
+        .into_iter()
+        .find_map(|marker| {
+            sdk_root
+                .split_once(marker)
+                .map(|(root, _)| root.to_string())
+        })
+        .filter(|root| !root.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+async fn add_macos_developer_runtime_support(
+    backend: &SharedExecutionBackend,
+    support: &mut NativeSandboxRuntimeSupport,
+) {
+    let mut sdk_root = std::env::var("SDKROOT")
+        .ok()
+        .filter(|path| path.starts_with('/'));
+    if sdk_root.is_none() {
+        let xcrun = crate::execution::BackendPath::new("/usr/bin/xcrun");
+        if backend.metadata(&xcrun).await.is_ok() {
+            if let Ok(output) = backend
+                .execute(
+                    ExecutionRequest::argv(
+                        xcrun.to_string(),
+                        vec![
+                            "--sdk".to_string(),
+                            "macosx".to_string(),
+                            "--show-sdk-path".to_string(),
+                        ],
+                    ),
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                if output.exit_code == 0 {
+                    sdk_root = output
+                        .stdout_lossy()
+                        .lines()
+                        .map(str::trim)
+                        .find(|path| path.starts_with('/'))
+                        .map(str::to_string);
+                }
+            }
+        }
+    }
+    if sdk_root.is_none() {
+        for candidate in [
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+        ] {
+            if backend
+                .metadata(&crate::execution::BackendPath::new(candidate))
+                .await
+                .is_ok()
+            {
+                sdk_root = Some(candidate.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(sdk_root) = sdk_root {
+        let sdk_path = crate::execution::BackendPath::new(sdk_root.clone());
+        if backend.metadata(&sdk_path).await.is_ok() {
+            if let Some(developer_root) = macos_developer_root_from_sdk_root(&sdk_root) {
+                support.add_read(developer_root.clone());
+                support
+                    .environment
+                    .insert("DEVELOPER_DIR".to_string(), developer_root);
+            }
+            support.add_read(sdk_root.clone());
+            support.environment.insert("SDKROOT".to_string(), sdk_root);
+        }
+    }
+}
+
 async fn native_sandbox_runtime_support(
     backend: &SharedExecutionBackend,
     command: &str,
@@ -1926,6 +2083,10 @@ async fn native_sandbox_runtime_support(
         let Some(resolved) = backend.resolve_executable(&program).await? else {
             continue;
         };
+        if let Some(parent) = resolved.parent() {
+            support.add_read(parent.to_string());
+            support.add_path_prefix(parent.to_string());
+        }
         let canonical = backend
             .canonicalize(&resolved)
             .await
@@ -1933,6 +2094,18 @@ async fn native_sandbox_runtime_support(
         if let Some(parent) = canonical.parent() {
             support.add_read(parent.to_string());
             support.add_path_prefix(parent.to_string());
+        }
+        if let Some(runtime_root) = managed_executable_runtime_root(&canonical) {
+            support.add_read(runtime_root);
+        }
+        if let Some(runtime_alias) = homebrew_stable_runtime_alias(&canonical) {
+            let alias_path = crate::execution::BackendPath::new(runtime_alias.clone());
+            if backend.metadata(&alias_path).await.is_ok() {
+                support.add_read(runtime_alias);
+                if let Some(namespace) = homebrew_alias_namespace(&canonical) {
+                    support.add_read(namespace);
+                }
+            }
         }
 
         let requested_name = std::path::Path::new(&program)
@@ -2003,6 +2176,12 @@ async fn native_sandbox_runtime_support(
             }
         }
     }
+    // Compiler drivers and system language launchers can resolve through the
+    // selected Apple developer tree even when the top-level command is not
+    // Cargo. Register it once as platform runtime support for every confined
+    // command instead of maintaining per-language exceptions.
+    #[cfg(target_os = "macos")]
+    add_macos_developer_runtime_support(backend, &mut support).await;
     Ok(support)
 }
 
@@ -2982,6 +3161,7 @@ impl TerminalTool {
 
         for (pid, proc) in finished {
             self.remove_indexes_for_process(pid, &proc).await;
+            let semantics = proc.semantics.clone();
             let exit_code = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
             let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
@@ -3000,6 +3180,7 @@ impl TerminalTool {
 
             let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
             metadata.truncation = truncation;
+            metadata.semantics = semantics;
             let mut completed = self.completed.lock().await;
             completed.insert(
                 pid,
@@ -3710,15 +3891,28 @@ impl TerminalTool {
             detach,
             status_tx,
         } = request;
+        let command_semantics = crate::tools::command_semantics::classify_confined_shell_command(
+            command,
+            working_dir.is_some() || !read_paths.is_empty() || !write_paths.is_empty(),
+            !write_paths.is_empty(),
+        );
         let dedupe_identity = format!("cwd={}\0{command}", working_dir.unwrap_or_default());
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
-            return Ok(ToolCallOutcome::from_output(format!(
-                "Equivalent command is already running in this scope (pid={}). \
-                 Use action=\"check\" pid={} to inspect progress or action=\"kill\" pid={} to stop it.",
-                existing_pid, existing_pid, existing_pid
-            )));
+            return Ok(ToolCallOutcome {
+                output: format!(
+                    "Equivalent command is already running in this scope (pid={}). \
+                     Use action=\"check\" pid={} to inspect progress or action=\"kill\" pid={} to stop it.",
+                    existing_pid, existing_pid, existing_pid
+                ),
+                metadata: ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+                    background_started: true,
+                    semantics: command_semantics,
+                    ..ToolCallMetadata::default()
+                },
+            });
         }
 
         let execution_request = confined_terminal_execution_request(
@@ -3780,6 +3974,7 @@ impl TerminalTool {
                 }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
+                metadata.semantics = command_semantics.clone();
                 Ok(ToolCallOutcome { metadata, output })
             }
             Err(_) => {
@@ -3816,6 +4011,7 @@ impl TerminalTool {
                             timed_out: false,
                             completion_notifications_enabled: false,
                             truncation,
+                            semantics: command_semantics.clone(),
                             ..ToolCallMetadata::default()
                         },
                         output,
@@ -3850,6 +4046,7 @@ impl TerminalTool {
 
                 let proc = RunningProcess {
                     command: command.to_string(),
+                    semantics: command_semantics.clone(),
                     dedupe_key: Some(dedupe_key.clone()),
                     owner_task_id: owner_task_id.clone(),
                     detached: detach,
@@ -3908,6 +4105,7 @@ impl TerminalTool {
                 let owner_task_id_for_notify = owner_task_id.clone();
                 let tool_call_id_for_notify = tool_call_id.map(str::to_string);
                 let event_store_for_notify = self.event_store.clone();
+                let command_semantics_for_notify = command_semantics.clone();
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -4039,10 +4237,7 @@ impl TerminalTool {
                                                 crate::traits::ToolReceiptKind::Process;
                                             metadata.effective_tool_name = Some("terminal".to_string());
                                             metadata.truncation = truncation.clone();
-                                            metadata.semantics =
-                                                crate::tools::command_semantics::classify_shell_command(
-                                                    &command_for_notify,
-                                                );
+                                            metadata.semantics = command_semantics_for_notify.clone();
                                             let provenance =
                                                 crate::traits::ToolResultProvenance::from_authoritative_result(
                                                     &with_notice,
@@ -4925,6 +5120,7 @@ impl TerminalTool {
                         timed_out: true,
                         detached: detach,
                         completion_notifications_enabled: !detach && notifier_started,
+                        semantics: command_semantics,
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
@@ -4946,7 +5142,7 @@ impl TerminalTool {
                     metadata: done.metadata,
                 });
             }
-            return Ok(ToolCallOutcome::from_output(format!(
+            return Ok(ToolCallOutcome::completed_negative_result(format!(
                 "No tracked process with pid={}. It may have already finished and been reaped.",
                 pid
             )));
@@ -4957,6 +5153,7 @@ impl TerminalTool {
             let proc = running.remove(&pid).unwrap();
             self.remove_indexes_for_process(pid, &proc).await;
             proc.notify_on_completion.store(false, Ordering::Relaxed);
+            let semantics = proc.semantics.clone();
             let exit_code = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
             let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
@@ -4974,6 +5171,7 @@ impl TerminalTool {
             }
             let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
             metadata.truncation = truncation;
+            metadata.semantics = semantics;
             Ok(ToolCallOutcome { output, metadata })
         } else {
             // Still running — return tail of buffer.
@@ -5009,14 +5207,13 @@ impl TerminalTool {
                 "\n\nUse action=\"check\" pid={} to check again, or action=\"kill\" pid={} to stop.",
                 pid, pid
             ));
-            Ok(ToolCallOutcome {
-                output,
-                metadata: tracked_background_metadata(
-                    proc.detached,
-                    proc.notifier_active && !proc.detached,
-                    None,
-                ),
-            })
+            let mut metadata = tracked_background_metadata(
+                proc.detached,
+                proc.notifier_active && !proc.detached,
+                None,
+            );
+            metadata.semantics = proc.semantics.clone();
+            Ok(ToolCallOutcome { output, metadata })
         }
     }
 
@@ -5025,7 +5222,7 @@ impl TerminalTool {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.remove(&pid) else {
-            return Ok(ToolCallOutcome::from_output(format!(
+            return Ok(ToolCallOutcome::completed_negative_result(format!(
                 "No tracked process with pid={}. It may have already finished.",
                 pid
             )));
@@ -5107,30 +5304,25 @@ impl TerminalTool {
                 }
 
                 let command_semantics =
-                    crate::tools::command_semantics::classify_shell_command(command);
+                    crate::tools::command_semantics::classify_confined_shell_command(
+                        command,
+                        args.working_dir.is_some()
+                            || !args.read_paths.is_empty()
+                            || !args.write_paths.is_empty(),
+                        !args.write_paths.is_empty(),
+                    );
                 let mut precomputed_semantic_assessment = None;
-                if mutation_forbidden && command_semantics.mutates_state() {
-                    let opaque =
-                        command_semantics.mutation_effects == ToolMutationEffects::UNSPECIFIED;
+                if mutation_forbidden
+                    && (command_semantics.mutates_state()
+                        || command_semantics.effect == crate::traits::ToolCallEffect::Unknown)
+                {
+                    let opaque = command_semantics.effect == crate::traits::ToolCallEffect::Unknown
+                        || command_semantics.mutation_effects == ToolMutationEffects::UNSPECIFIED;
                     if !opaque {
-                        return Ok(ToolCallOutcome {
-                            output: "Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.".to_string(),
-                            metadata: ToolCallMetadata {
-                                outcome_status: Some(ToolOutcomeStatus::Blocked),
-                                semantics: command_semantics,
-                                ..ToolCallMetadata::default()
-                            },
-                        });
+                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                     }
                     let Some(runtime) = self.command_risk_runtime.get() else {
-                        return Ok(ToolCallOutcome {
-                            output: "Blocked by the explicit read-only contract: this command's effects are ambiguous and semantic assessment is unavailable.".to_string(),
-                            metadata: ToolCallMetadata {
-                                outcome_status: Some(ToolOutcomeStatus::Blocked),
-                                semantics: command_semantics,
-                                ..ToolCallMetadata::default()
-                            },
-                        });
+                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: this command's effects are ambiguous and semantic assessment is unavailable.").with_semantics(command_semantics));
                     };
                     match assess_command(
                         runtime,
@@ -5146,36 +5338,22 @@ impl TerminalTool {
                             precomputed_semantic_assessment = Some(semantic);
                         }
                         Ok(_) => {
-                            return Ok(ToolCallOutcome {
-                                output: "Blocked by the explicit read-only contract: semantic effect assessment did not prove that every command effect is observational.".to_string(),
-                                metadata: ToolCallMetadata {
-                                    outcome_status: Some(ToolOutcomeStatus::Blocked),
-                                    semantics: command_semantics,
-                                    ..ToolCallMetadata::default()
-                                },
-                            });
+                            return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: semantic effect assessment did not prove that every command effect is observational.").with_semantics(command_semantics));
                         }
                         Err(error) => {
-                            return Ok(ToolCallOutcome {
-                                output: format!("Blocked by the explicit read-only contract: semantic effect assessment failed closed ({error})."),
-                                metadata: ToolCallMetadata {
-                                    outcome_status: Some(ToolOutcomeStatus::Blocked),
-                                    semantics: command_semantics,
-                                    ..ToolCallMetadata::default()
-                                },
-                            });
+                            return Ok(ToolCallOutcome::blocked(format!("Blocked by the explicit read-only contract: semantic effect assessment failed closed ({error}).")).with_semantics(command_semantics));
                         }
                     }
                 }
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
-                    return Ok(ToolCallOutcome::from_output(recursive_grep_block_message(
+                    return Ok(ToolCallOutcome::blocked(recursive_grep_block_message(
                         &pattern, &path,
                     )));
                 }
 
                 if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
-                    return Ok(ToolCallOutcome::from_output(unbounded_scan_block_message(
+                    return Ok(ToolCallOutcome::blocked(unbounded_scan_block_message(
                         &tool_name, &root,
                     )));
                 }
@@ -5191,7 +5369,7 @@ impl TerminalTool {
                         || command.contains("<<\"")
                         || command.contains("<< \"");
                     if !uses_quoted_heredoc {
-                        return Ok(ToolCallOutcome::from_output(
+                        return Ok(ToolCallOutcome::blocked(
                             "Large heredoc file creation is unreliable through the terminal. \
                              Use the `write_file` tool instead — it writes files atomically \
                              and avoids shell quoting issues. If write_file fails with JSON \
@@ -5206,7 +5384,7 @@ impl TerminalTool {
                 // Read-only operations (ast.parse, open().read(), json.load) are allowed
                 // since there's no dedicated tool for validation/syntax checks.
                 if is_python_c_with_file_write_io(command) {
-                    return Ok(ToolCallOutcome::from_output(
+                    return Ok(ToolCallOutcome::blocked(
                         "Blocked: `python3 -c` with file write I/O is not allowed through terminal.\n\n\
                          Use dedicated tools instead:\n\
                          - `write_file` to create or overwrite files\n\
@@ -5222,7 +5400,7 @@ impl TerminalTool {
                 // apps, action confirmation, lock detection) and System Events
                 // input fails against a locked screen exactly like synthetic input.
                 if is_system_events_ui_scripting(command) {
-                    return Ok(ToolCallOutcome::from_output(
+                    return Ok(ToolCallOutcome::blocked(
                         "Blocked: AppleScript System Events UI scripting (click/keystroke) \
                          through the terminal bypasses the computer_use safety layer and \
                          cannot deliver input when the screen is locked.\n\n\
@@ -5243,14 +5421,14 @@ impl TerminalTool {
                         .as_deref()
                         .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
                     if !is_owner {
-                        return Ok(ToolCallOutcome::from_output(format!(
+                        return Ok(ToolCallOutcome::blocked(format!(
                             "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
                             daemon_hits.join(", ")
                         )));
                     }
 
                     if !args.detach {
-                        return Ok(ToolCallOutcome::from_output(format!(
+                        return Ok(ToolCallOutcome::blocked(format!(
                             "Blocked: daemonization primitives detected ({}). \
                              Set `detach=true` explicitly for intentional long-lived background execution.",
                             daemon_hits.join(", ")
@@ -5282,12 +5460,12 @@ impl TerminalTool {
                             daemonization_approved = true;
                         }
                         Ok(ApprovalResponse::Deny) => {
-                            return Ok(ToolCallOutcome::from_output(
+                            return Ok(ToolCallOutcome::blocked(
                                 "Daemonizing command denied by owner.".to_string(),
                             ));
                         }
                         Err(e) => {
-                            return Ok(ToolCallOutcome::from_output(format!(
+                            return Ok(ToolCallOutcome::blocked(format!(
                                 "Could not get owner approval for daemonizing command: {}",
                                 e
                             )));
@@ -5310,7 +5488,7 @@ impl TerminalTool {
                         reason = %reason,
                         "Blocked dangerous irreversible command"
                     );
-                    return Ok(ToolCallOutcome::from_output(format!(
+                    return Ok(ToolCallOutcome::blocked(format!(
                         "{} Use scoped, non-destructive commands instead.",
                         reason
                     )));
@@ -5322,7 +5500,7 @@ impl TerminalTool {
                 if args.detach && is_trusted_session {
                     // Intentional: trusted scheduled sessions are auto-approved, so
                     // disallow detached long-lived processes in that mode.
-                    return Ok(ToolCallOutcome::from_output(
+                    return Ok(ToolCallOutcome::blocked(
                         "Blocked: detach=true is not allowed for trusted scheduled sessions."
                             .to_string(),
                     ));
@@ -5489,12 +5667,12 @@ impl TerminalTool {
                             if let Some(ref pool) = self.pool {
                                 let _ = record_denial(pool, command).await;
                             }
-                            return Ok(ToolCallOutcome::from_output(
+                            return Ok(ToolCallOutcome::blocked(
                                 "Command denied by user.".to_string(),
                             ));
                         }
                         Err(e) => {
-                            return Ok(ToolCallOutcome::from_output(format!(
+                            return Ok(ToolCallOutcome::blocked(format!(
                                 "Could not get approval: {}",
                                 e
                             )));
@@ -5690,12 +5868,44 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
             .with_verification_mode(ToolVerificationMode::ResultContent),
         "kill" => ToolCallSemantics::mutation(),
         "trust_all" => ToolCallSemantics::administrative(),
-        _ => args
-            .as_ref()
-            .and_then(|value| value.get("command"))
-            .and_then(Value::as_str)
-            .map(classify_shell_command)
-            .unwrap_or_else(ToolCallSemantics::mutation),
+        _ => {
+            let command = args
+                .as_ref()
+                .and_then(|value| value.get("command"))
+                .and_then(Value::as_str);
+            let confinement_active = args.as_ref().is_some_and(|value| {
+                value
+                    .get("working_dir")
+                    .or_else(|| value.get("cwd"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.trim().is_empty())
+                    || value
+                        .get("read_paths")
+                        .and_then(Value::as_array)
+                        .is_some_and(|paths| !paths.is_empty())
+                    || value
+                        .get("write_paths")
+                        .and_then(Value::as_array)
+                        .is_some_and(|paths| !paths.is_empty())
+            });
+            let has_write_targets = args.as_ref().is_some_and(|value| {
+                value
+                    .get("write_paths")
+                    .and_then(Value::as_array)
+                    .is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                    })
+            });
+            command.map_or_else(ToolCallSemantics::default, |command| {
+                crate::tools::command_semantics::classify_confined_shell_command(
+                    command,
+                    confinement_active,
+                    has_write_targets,
+                )
+            })
+        }
     }
 }
 
@@ -6063,6 +6273,140 @@ mod tests {
             output.stderr_lossy()
         );
         assert!(root.path().join("synthetic-created/src/main.rs").is_file());
+    }
+
+    #[tokio::test]
+    async fn confined_cargo_lifecycle_can_create_and_remove_exact_absent_root() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend.resolve_executable("cargo").await.unwrap().is_none()
+        {
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let cwd = parent.path().to_string_lossy().to_string();
+        let created = parent.path().join("synthetic-lifecycle");
+        assert!(!created.exists());
+        let request = confined_terminal_execution_request(
+            &backend,
+            "root=\"$PWD/synthetic-lifecycle\"; trap 'rm -rf -- \"$root\"' EXIT; cargo new --vcs none synthetic-lifecycle --quiet && cd synthetic-lifecycle && cargo build --quiet && cargo test --quiet && test \"$(cargo run --quiet)\" = 'Hello, world!'",
+            Some(&cwd),
+            &[cwd.clone()],
+            &[created.to_string_lossy().to_string()],
+        )
+        .await
+        .expect("confined request");
+
+        let output = backend
+            .execute(request, Duration::from_secs(90))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(
+            output.exit_code,
+            0,
+            "cargo stderr: {}",
+            output.stderr_lossy()
+        );
+        assert!(!created.exists(), "cleanup trap must remove the exact root");
+    }
+
+    #[test]
+    fn managed_runtime_root_is_derived_from_installation_layout_not_tool_name() {
+        assert_eq!(
+            managed_executable_runtime_root(&crate::execution::BackendPath::new(
+                "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
+            )),
+            Some("/opt/homebrew/Cellar/python@3.14/3.14.6".to_string())
+        );
+        assert_eq!(
+            homebrew_stable_runtime_alias(&crate::execution::BackendPath::new(
+                "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
+            )),
+            Some("/opt/homebrew/opt/python@3.14".to_string())
+        );
+        assert_eq!(
+            homebrew_alias_namespace(&crate::execution::BackendPath::new(
+                "/opt/homebrew/Cellar/python@3.14/3.14.6/bin/python3.14"
+            )),
+            Some("/opt/homebrew/opt".to_string())
+        );
+        assert_eq!(
+            managed_executable_runtime_root(&crate::execution::BackendPath::new(
+                "/synthetic/user/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc"
+            )),
+            Some("/synthetic/user/.rustup/toolchains/stable-aarch64-apple-darwin".to_string())
+        );
+        assert_eq!(
+            managed_executable_runtime_root(&crate::execution::BackendPath::new("/usr/bin/false")),
+            None
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                macos_developer_root_from_sdk_root(
+                    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+                ),
+                Some("/Library/Developer/CommandLineTools".to_string())
+            );
+            assert_eq!(
+                macos_developer_root_from_sdk_root(
+                    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+                ),
+                Some("/Applications/Xcode.app/Contents/Developer".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn confined_managed_python_can_create_run_and_remove_exact_venv_root() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend
+                .resolve_executable("python3")
+                .await
+                .unwrap()
+                .is_none()
+        {
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let cwd = parent.path().to_string_lossy().to_string();
+        let created = parent.path().join("synthetic-python-lifecycle");
+        let request = confined_terminal_execution_request(
+            &backend,
+            "root=\"$PWD/synthetic-python-lifecycle\"; trap 'rm -rf -- \"$root\"' EXIT; mkdir \"$root\" && printf 'VALUE = 42\\n' > \"$root/module.py\" && python3 -m venv \"$root/.venv\" && \"$root/.venv/bin/python\" -c 'import sys; sys.path.insert(0, sys.argv[1]); import module; assert module.VALUE == 42' \"$root\"",
+            Some(&cwd),
+            &[cwd.clone()],
+            &[created.to_string_lossy().to_string()],
+        )
+        .await
+        .expect("confined request");
+
+        let output = backend
+            .execute(request, Duration::from_secs(90))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(
+            output.exit_code,
+            0,
+            "python stderr: {}",
+            output.stderr_lossy()
+        );
+        assert!(!created.exists(), "cleanup trap must remove the exact root");
+    }
+
+    #[test]
+    fn terminal_semantics_resolve_unknown_syntax_from_confinement_capabilities() {
+        let read_only = terminal_call_semantics(
+            r#"{"action":"run","command":"/bin/sh -c 'printf \\'SYNTHETIC\\n\\''","working_dir":"/tmp","read_paths":[],"write_paths":[]}"#,
+        );
+        assert!(read_only.observes_state());
+        assert!(!read_only.mutates_state());
+
+        let writable = terminal_call_semantics(
+            r#"{"action":"run","command":"opaque 'unterminated","working_dir":"/tmp","read_paths":[],"write_paths":["/tmp/synthetic-output"]}"#,
+        );
+        assert!(writable.mutates_state());
     }
 
     #[tokio::test]
@@ -6952,12 +7296,20 @@ mod tests {
         )
         .await;
 
-        let response = tool
-            .call(r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#)
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#,
+                None,
+                ToolExecutionContext::default(),
+            )
             .await
             .unwrap();
-        assert!(response.contains("Blocked irreversible delete"));
-        assert!(response.contains("scoped, non-destructive"));
+        assert!(outcome.output.contains("Blocked irreversible delete"));
+        assert!(outcome.output.contains("scoped, non-destructive"));
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
     }
 
     #[tokio::test]

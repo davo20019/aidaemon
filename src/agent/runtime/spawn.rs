@@ -1478,7 +1478,6 @@ impl Agent {
             self.limits.task_token_budget,
             self.limits.llm_call_timeout,
             child_mcp_registry,
-            self.verification_tracker.clone(),
             role,
             task_id,
             goal_id,

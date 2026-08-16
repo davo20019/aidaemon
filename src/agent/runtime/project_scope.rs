@@ -304,31 +304,9 @@ pub(super) fn extract_exact_filesystem_resources_from_text(
     alias_roots: &[String],
 ) -> Vec<String> {
     let mut resources = Vec::new();
-    for raw in text.split_whitespace() {
-        let token = raw
-            .trim_matches(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '`' | '\''
-                            | '"'
-                            | ','
-                            | ';'
-                            | ':'
-                            | '!'
-                            | '?'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                    )
-            })
-            .trim()
-            .trim_end_matches('.');
+    for token in structural_filesystem_reference_tokens(text) {
         let Some(path) =
-            crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
+            crate::tools::fs_utils::resolve_structural_filesystem_reference(&token, alias_roots)
         else {
             continue;
         };
@@ -340,43 +318,65 @@ pub(super) fn extract_exact_filesystem_resources_from_text(
     resources
 }
 
+/// Return path-shaped resource tokens from ordinary whitespace-delimited text
+/// and from generic `key=value` structural notation. This extracts identity
+/// only; semantic read/write/cwd roles remain owned by the task contract.
+fn structural_filesystem_reference_tokens(text: &str) -> Vec<String> {
+    let clean = |raw: &str| {
+        raw.trim_matches(|c: char| {
+            c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    '`' | '\''
+                        | '"'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '.'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                )
+        })
+        .trim()
+        .to_string()
+    };
+    let mut tokens = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = clean(raw);
+        if !token.is_empty() && !tokens.contains(&token) {
+            tokens.push(token.clone());
+        }
+        if let Some((key, value)) = token.split_once('=') {
+            let value = clean(value);
+            if !key.trim().is_empty() && !value.is_empty() && !tokens.contains(&value) {
+                tokens.push(value);
+            }
+        }
+    }
+    tokens
+}
+
 fn extract_project_scopes_from_text_inner(
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    for raw in text.split_whitespace() {
+    for token in structural_filesystem_reference_tokens(text) {
         if scopes.len() >= max_scopes {
             break;
         }
-        let token = raw
-            .trim_matches(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '`' | '\''
-                            | '"'
-                            | ','
-                            | ';'
-                            | ':'
-                            | '.'
-                            | '!'
-                            | '?'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                    )
-            })
-            .trim();
         if token.is_empty() || token.contains("://") {
             continue;
         }
-        let scope = if token_looks_like_project_scope_path(token, alias_roots) {
-            normalize_project_scope_path_with_aliases(token, alias_roots)
+        let scope = if token_looks_like_project_scope_path(&token, alias_roots) {
+            normalize_project_scope_path_with_aliases(&token, alias_roots)
         } else {
             None
         };
@@ -920,6 +920,26 @@ mod tests {
         assert!(resources.contains(&file.to_string_lossy().to_string()));
         assert!(!resources.contains(&root.to_string_lossy().to_string()));
         assert!(resources.contains(&"/tmp/synthetic-output".to_string()));
+    }
+
+    #[test]
+    fn structural_resource_extraction_accepts_generic_key_value_notation() {
+        let resources = extract_exact_filesystem_resources_from_text(
+            "Use working_dir=/tmp with executable=/bin/sh and target=/tmp/synthetic-output",
+            &[],
+        );
+        assert_eq!(
+            resources,
+            vec![
+                "/tmp".to_string(),
+                "/bin/sh".to_string(),
+                "/tmp/synthetic-output".to_string()
+            ]
+        );
+
+        let mut scopes = Vec::new();
+        extract_explicit_path_scopes_from_text("Use working_dir=/tmp", &mut scopes, 4, &[]);
+        assert_eq!(scopes, vec!["/tmp".to_string()]);
     }
     #[test]
     fn project_scope_extraction_resolves_exact_project_paths() {

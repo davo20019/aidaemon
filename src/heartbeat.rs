@@ -281,8 +281,9 @@ fn task_is_terminal_schedule_failure(task: &crate::traits::Task) -> bool {
 }
 
 /// Reconcile an open scheduled occurrence from its authoritative task graph.
-/// A failed occurrence is terminal; autonomous recovery is represented by a
-/// later linked run rather than by keeping the failed run indefinitely open.
+/// A blocked child is a terminal failure of this occurrence, not a second
+/// meaning for the run's `blocked` waiting state. Autonomous recovery is a
+/// later linked run rather than an indefinitely open scheduled occurrence.
 fn scheduled_run_reconciliation_status(
     run: &crate::traits::GoalRun,
     tasks: &[crate::traits::Task],
@@ -293,9 +294,7 @@ fn scheduled_run_reconciliation_status(
     {
         return None;
     }
-    if tasks.iter().any(|task| task.status == "blocked") {
-        Some("blocked")
-    } else if tasks.iter().any(task_is_terminal_schedule_failure) {
+    if tasks.iter().any(task_is_terminal_schedule_failure) {
         Some("failed")
     } else if tasks
         .iter()
@@ -823,7 +822,12 @@ impl HeartbeatCoordinator {
         // acquire scheduled-run provenance.
         self.check_due_mandates().await;
 
-        // Phase 2b: Fire due schedules (recurring + one-shot)
+        // Phase 2b: Reconcile scheduled lifecycle state independently of the
+        // next fire time. A completed/failed task graph must not remain
+        // observably "running" until tomorrow's recurrence happens to wake it.
+        self.reconcile_open_scheduled_runs().await;
+
+        // Phase 2c: Fire due schedules (recurring + one-shot)
         self.check_due_goal_schedules().await;
 
         // Phase 3: Detect stuck tasks
@@ -2304,6 +2308,57 @@ impl HeartbeatCoordinator {
         }
     }
 
+    async fn reconcile_open_scheduled_runs(&self) {
+        let goals = match self.state.get_scheduled_goals().await {
+            Ok(goals) => goals,
+            Err(error) => {
+                error!(%error, "Failed to enumerate scheduled goals for lifecycle reconciliation");
+                return;
+            }
+        };
+        for goal in goals {
+            if let Err(error) = self.reconcile_open_scheduled_runs_for_goal(&goal.id).await {
+                error!(goal_id = %goal.id, %error, "Failed to reconcile scheduled goal lifecycle");
+            }
+        }
+    }
+
+    async fn reconcile_open_scheduled_runs_for_goal(
+        &self,
+        goal_id: &str,
+    ) -> anyhow::Result<Vec<crate::traits::GoalRun>> {
+        let candidate_open_runs = self
+            .state
+            .get_goal_runs(goal_id)
+            .await?
+            .into_iter()
+            .filter(|run| matches!(run.status.as_str(), "pending" | "running" | "blocked"))
+            .collect::<Vec<_>>();
+        let mut open_runs = Vec::new();
+        for run in candidate_open_runs {
+            let run_tasks = self.state.get_tasks_for_goal_run(&run.id).await?;
+            if let Some(status) = scheduled_run_reconciliation_status(&run, &run_tasks) {
+                self.state
+                    .finish_goal_run(
+                        &run.id,
+                        status,
+                        Some("Reconciled from the scheduled run's authoritative task graph."),
+                    )
+                    .await?;
+                info!(
+                    goal_id,
+                    run_id = %run.id,
+                    prior_status = %run.status,
+                    reconciled_status = status,
+                    "Reconciled split-brain scheduled run from task lifecycle"
+                );
+                continue;
+            }
+            open_runs.push(run);
+        }
+        Ok(open_runs)
+    }
+
     async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
         // Guardrails (unknown policy/tz -> treat as coalesce/local-only).
         if schedule.tz != "local" {
@@ -2383,35 +2438,9 @@ impl HeartbeatCoordinator {
         // retained as audit records after their run is closed; counting all
         // tasks for the goal would make those records suppress every future
         // coalesced firing forever.
-        let candidate_open_runs = self
-            .state
-            .get_goal_runs(&goal.id)
-            .await?
-            .into_iter()
-            .filter(|run| matches!(run.status.as_str(), "pending" | "running" | "blocked"))
-            .collect::<Vec<_>>();
-        let mut open_runs = Vec::new();
-        for run in candidate_open_runs {
-            let run_tasks = self.state.get_tasks_for_goal_run(&run.id).await?;
-            if let Some(status) = scheduled_run_reconciliation_status(&run, &run_tasks) {
-                self.state
-                    .finish_goal_run(
-                        &run.id,
-                        status,
-                        Some("Reconciled from the scheduled run's authoritative task graph."),
-                    )
-                    .await?;
-                info!(
-                    goal_id = %goal.id,
-                    run_id = %run.id,
-                    prior_status = %run.status,
-                    reconciled_status = status,
-                    "Reconciled split-brain scheduled run before fire coalescing"
-                );
-                continue;
-            }
-            open_runs.push(run);
-        }
+        let open_runs = self
+            .reconcile_open_scheduled_runs_for_goal(&goal.id)
+            .await?;
         let mut open_count = 0;
         for run in &open_runs {
             open_count += self
@@ -2878,7 +2907,7 @@ mod tests {
                     synthetic_task("child", "blocked")
                 ],
             ),
-            Some("blocked")
+            Some("failed")
         );
         assert_eq!(
             scheduled_run_reconciliation_status(&run, &[synthetic_task("root", "completed")],),
@@ -4158,6 +4187,84 @@ mod tests {
                 .id,
             blocked_run.id
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_lifecycle_reconciles_before_the_next_fire_is_due() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Synthetic future schedule", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 6 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("0 6 * * *".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: Some(now_ts.clone()),
+                next_run_at: (now + chrono::Duration::days(1)).to_rfc3339(),
+                created_at: now_ts.clone(),
+                updated_at: now_ts.clone(),
+            })
+            .await
+            .unwrap();
+        let run = state
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let completed_root = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Synthetic scheduled root".to_string(),
+            status: "completed".to_string(),
+            priority: "normal".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some("root finished".to_string()),
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: Some(now_ts.clone()),
+            completed_at: Some(now_ts.clone()),
+        };
+        state.create_task(&completed_root).await.unwrap();
+        let blocked_child = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: "Synthetic blocked child".to_string(),
+            status: "blocked".to_string(),
+            task_order: 1,
+            result: None,
+            blocker: Some("Typed terminal blocker".to_string()),
+            ..completed_root
+        };
+        state.create_task(&blocked_child).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.reconcile_open_scheduled_runs().await;
+
+        let reconciled = state
+            .get_goal_runs(&goal.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run.id)
+            .unwrap();
+        assert_eq!(reconciled.status, "failed");
+        assert!(reconciled.completed_at.is_some());
     }
 
     #[tokio::test]

@@ -20,7 +20,6 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
-use crate::tools::VerificationTracker;
 use crate::traits::{AgentRole, StateStore, Tool};
 
 #[cfg(test)]
@@ -162,7 +161,6 @@ impl Agent {
                 task_token_budget,
             },
             model_override: RwLock::new(false),
-            verification_tracker: Some(Arc::new(VerificationTracker::new())),
             mcp_registry,
             role: AgentRole::Orchestrator,
             task_id: None,
@@ -350,7 +348,6 @@ impl Agent {
         task_token_budget: Option<u64>,
         llm_call_timeout: Option<Duration>,
         mcp_registry: Option<McpRegistry>,
-        verification_tracker: Option<Arc<VerificationTracker>>,
         role: AgentRole,
         task_id: Option<String>,
         goal_id: Option<String>,
@@ -405,7 +402,6 @@ impl Agent {
                 task_token_budget,
             },
             model_override: RwLock::new(false),
-            verification_tracker,
             mcp_registry,
             role,
             task_id,

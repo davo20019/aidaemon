@@ -771,6 +771,9 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
+const TASK_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TASK_CONTRACT_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerTelemetryCtx<'a> {
@@ -855,6 +858,67 @@ async fn record_auxiliary_model_call(
                 error: None,
             },
             token_usage: response.usage.clone(),
+        },
+    )
+    .await;
+}
+
+async fn record_auxiliary_model_failure(
+    telemetry: Option<PlannerTelemetryCtx<'_>>,
+    call_purpose: &str,
+    model: &str,
+    latency_ms: u64,
+    error: impl Into<String>,
+) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
+    crate::events::record_model_call_telemetry(
+        telemetry.emitter,
+        telemetry.state,
+        crate::events::ModelCallTelemetryInput {
+            session_id: telemetry.session_id.to_string(),
+            task_id: telemetry.task_id.to_string(),
+            call_purpose: Some(call_purpose.to_string()),
+            iteration: Some(0),
+            llm_call: crate::events::LlmCallData {
+                call_id: None,
+                call_purpose: Some(call_purpose.to_string()),
+                task_id: telemetry.task_id.to_string(),
+                iteration: Some(0),
+                model: model.to_string(),
+                final_model: Some(model.to_string()),
+                fell_back: false,
+                attempts: 1,
+                latency_ms,
+                prompt_ms: None,
+                decode_ms: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                fresh_input_tokens: None,
+                est_input_tokens: None,
+                tool_calls_count: 0,
+                offered_tools: Vec::new(),
+                chosen_tools: Vec::new(),
+                build_ms: None,
+                prefix_hash_system: None,
+                prefix_hash_pre_boundary: None,
+                tool_defs_hash: None,
+                session_summary_hash: None,
+                tail_hash: None,
+                prefix_hash_archived: None,
+                boundary_pos: None,
+                message_count: None,
+                projected_source_message_ids: Vec::new(),
+                projected_source_turn_ids: Vec::new(),
+                force_text: false,
+                token_usage_present: false,
+                failed: true,
+                error: Some(error.into()),
+            },
+            token_usage: None,
         },
     )
     .await;
@@ -1091,18 +1155,37 @@ pub(crate) async fn generate_task_plan(
 
     let call_start = Instant::now();
     let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        TASK_ASSESSMENT_TIMEOUT,
         provider.chat(model, &messages, &[]),
     )
     .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_assessment",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                format!("provider_error: {e}"),
+            )
+            .await;
             warn!(error = %e, "Task assessment call failed");
             return None;
         }
         Err(_) => {
-            warn!("Task assessment call timed out (15s)");
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_assessment",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                "timeout",
+            )
+            .await;
+            warn!(
+                timeout_secs = TASK_ASSESSMENT_TIMEOUT.as_secs(),
+                "Task assessment call timed out"
+            );
             return None;
         }
     };
@@ -1232,18 +1315,37 @@ pub(crate) async fn generate_task_contract_recovery(
     ];
     let call_start = Instant::now();
     let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        TASK_CONTRACT_RECOVERY_TIMEOUT,
         provider.chat(model, &messages, &[]),
     )
     .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_contract_recovery",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                format!("provider_error: {error}"),
+            )
+            .await;
             warn!(%error, "Task contract recovery call failed");
             return None;
         }
         Err(_) => {
-            warn!("Task contract recovery call timed out (10s)");
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_contract_recovery",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                "timeout",
+            )
+            .await;
+            warn!(
+                timeout_secs = TASK_CONTRACT_RECOVERY_TIMEOUT.as_secs(),
+                "Task contract recovery call timed out"
+            );
             return None;
         }
     };
@@ -1311,18 +1413,37 @@ pub(crate) async fn generate_task_relationship(
     ];
     let call_start = Instant::now();
     let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+        TASK_RELATIONSHIP_TIMEOUT,
         provider.chat(model, &messages, &[]),
     )
     .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_relationship_fallback",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                format!("provider_error: {error}"),
+            )
+            .await;
             warn!(%error, "Task relationship fallback failed");
             return None;
         }
         Err(_) => {
-            warn!("Task relationship fallback timed out (8s)");
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_relationship_fallback",
+                model,
+                call_start.elapsed().as_millis() as u64,
+                "timeout",
+            )
+            .await;
+            warn!(
+                timeout_secs = TASK_RELATIONSHIP_TIMEOUT.as_secs(),
+                "Task relationship fallback timed out"
+            );
             return None;
         }
     };

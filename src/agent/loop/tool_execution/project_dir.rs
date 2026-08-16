@@ -257,41 +257,154 @@ fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
     looks_like_path.then(|| candidate.to_string())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct TerminalCommandPathTargets {
+    pub execution_contexts: Vec<String>,
+    pub data_paths: Vec<String>,
+}
+
+impl TerminalCommandPathTargets {
+    fn push_execution_context(&mut self, path: String) {
+        if !self.execution_contexts.contains(&path) {
+            self.execution_contexts.push(path);
+        }
+    }
+
+    fn push_data_path(&mut self, path: String) {
+        if !self.data_paths.contains(&path) {
+            self.data_paths.push(path);
+        }
+    }
+
+    fn all_paths(self) -> Vec<String> {
+        let mut paths = self.execution_contexts;
+        for path in self.data_paths {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+}
+
+fn shell_token_is_environment_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, ch)| {
+            ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
+        })
+}
+
+fn shell_executable_name(token: &str) -> &str {
+    std::path::Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token)
+}
+
+fn collect_terminal_command_resource_targets(
+    command: &str,
+    base_directory: Option<&str>,
+    depth: usize,
+    targets: &mut TerminalCommandPathTargets,
+) {
+    if depth > 4 {
+        return;
+    }
+    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
+        let Ok(tokens) = shell_words::split(&segment) else {
+            continue;
+        };
+        let mut executable_index = 0;
+        while tokens.get(executable_index).is_some_and(|token| {
+            shell_token_is_environment_assignment(token)
+                || matches!(token.as_str(), "command" | "builtin" | "env")
+        }) {
+            executable_index += 1;
+        }
+        let Some(executable) = tokens.get(executable_index) else {
+            continue;
+        };
+        let executable_name = shell_executable_name(executable);
+
+        // These arguments are shell programs, not path tokens. Recurse into
+        // the grammar so a quoted trap body cannot become one fabricated
+        // compound pathname while its real nested resources remain visible.
+        if executable_name == "trap" {
+            if let Some(script) = tokens.get(executable_index + 1) {
+                collect_terminal_command_resource_targets(
+                    script,
+                    base_directory,
+                    depth + 1,
+                    targets,
+                );
+            }
+            continue;
+        }
+        if matches!(executable_name, "sh" | "bash" | "zsh") {
+            if let Some(command_index) = tokens
+                .iter()
+                .skip(executable_index + 1)
+                .position(|token| token == "-c")
+                .map(|index| executable_index + index + 2)
+            {
+                if let Some(script) = tokens.get(command_index) {
+                    collect_terminal_command_resource_targets(
+                        script,
+                        base_directory,
+                        depth + 1,
+                        targets,
+                    );
+                }
+            }
+            continue;
+        }
+
+        for index in executable_index + 1..tokens.len() {
+            let token = &tokens[index];
+            let Some(candidate) = shell_path_candidate(
+                token,
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| tokens.get(previous))
+                    .map(String::as_str),
+            ) else {
+                continue;
+            };
+            let target =
+                if candidate.starts_with('/') || candidate == "~" || candidate.starts_with("~/") {
+                    candidate
+                } else if let Some(base_directory) = base_directory {
+                    let candidate = candidate.strip_prefix("./").unwrap_or(&candidate);
+                    BackendPath::new(base_directory).join(candidate).to_string()
+                } else {
+                    candidate
+                };
+            if executable_name == "cd" && index == executable_index + 1 {
+                targets.push_execution_context(target);
+            } else {
+                targets.push_data_path(target);
+            }
+        }
+    }
+}
+
+pub(super) fn terminal_command_resource_targets(
+    command: &str,
+    base_directory: Option<&str>,
+) -> TerminalCommandPathTargets {
+    let mut targets = TerminalCommandPathTargets::default();
+    collect_terminal_command_resource_targets(command, base_directory, 0, &mut targets);
+    targets
+}
+
 pub(super) fn terminal_command_path_targets(
     command: &str,
     base_directory: Option<&str>,
 ) -> Vec<String> {
-    let tokens = shell_words::split(command).unwrap_or_else(|_| {
-        command
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
-    let mut targets = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
-        let Some(candidate) = shell_path_candidate(
-            token,
-            index
-                .checked_sub(1)
-                .and_then(|i| tokens.get(i))
-                .map(String::as_str),
-        ) else {
-            continue;
-        };
-        let target =
-            if candidate.starts_with('/') || candidate == "~" || candidate.starts_with("~/") {
-                candidate
-            } else if let Some(base_directory) = base_directory {
-                let candidate = candidate.strip_prefix("./").unwrap_or(&candidate);
-                BackendPath::new(base_directory).join(candidate).to_string()
-            } else {
-                candidate
-            };
-        if !targets.iter().any(|existing| existing == &target) {
-            targets.push(target);
-        }
-    }
-    targets
+    terminal_command_resource_targets(command, base_directory).all_paths()
 }
 
 /// Return filesystem locations whose first access should trigger nested
@@ -714,7 +827,45 @@ mod tests {
         );
 
         assert!(!targets.iter().any(|target| target == "/dev/null"));
-        assert!(targets.iter().any(|target| target == "/tmp/disposable/run"));
+        assert!(!targets.iter().any(|target| target == "/tmp/disposable/run"));
+    }
+
+    #[test]
+    fn terminal_resources_separate_execution_context_and_executable_identity() {
+        let resources = terminal_command_resource_targets(
+            "/bin/sh -c 'sleep 1; printf SYNTHETIC_OK'",
+            Some("/tmp"),
+        );
+        assert!(resources.execution_contexts.is_empty());
+        assert!(resources.data_paths.is_empty());
+
+        let resources = terminal_command_resource_targets(
+            "cd /tmp && cargo new synthetic-package && stat /tmp/synthetic-package",
+            Some("/tmp"),
+        );
+        assert_eq!(resources.execution_contexts, vec!["/tmp".to_string()]);
+        assert_eq!(
+            resources.data_paths,
+            vec!["/tmp/synthetic-package".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_resources_parse_nested_shell_programs_without_compound_pseudo_paths() {
+        let resources = terminal_command_resource_targets(
+            "trap 'cd /tmp && rm -rf -- /tmp/synthetic-package' EXIT; /bin/sh -c 'cd /tmp && stat /tmp/synthetic-package'",
+            Some("/tmp"),
+        );
+        assert_eq!(resources.execution_contexts, vec!["/tmp".to_string()]);
+        assert_eq!(
+            resources.data_paths,
+            vec!["/tmp/synthetic-package".to_string()]
+        );
+        assert!(resources
+            .execution_contexts
+            .iter()
+            .chain(&resources.data_paths)
+            .all(|target| !target.contains("&&") && !target.contains("cd /tmp")));
     }
 
     #[test]

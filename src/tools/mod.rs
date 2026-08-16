@@ -90,8 +90,6 @@ pub mod command_patterns;
 pub mod command_risk;
 pub mod daemon_guard;
 mod semantic_command_risk;
-pub mod verification;
-pub use verification::VerificationTracker;
 
 // Deterministic tools
 pub(crate) mod fs_utils;

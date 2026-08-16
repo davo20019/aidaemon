@@ -143,10 +143,11 @@ fn classify_shell_command_with_depth(command: &str, depth: usize) -> ToolCallSem
     }
     let command = strip_non_mutating_redirections(command);
     let Some(structure) = parse_shell_structure(&command) else {
-        return ToolCallSemantics::mutation();
+        return ToolCallSemantics::default();
     };
     let mut observes = false;
     let mut mutates = structure.has_output_redirection;
+    let mut unknown = false;
     let mut mutation_effects = if structure.has_output_redirection {
         ToolMutationEffects::LOCAL_SOURCE_WRITE
     } else {
@@ -156,6 +157,7 @@ fn classify_shell_command_with_depth(command: &str, depth: usize) -> ToolCallSem
         let semantics = classify_simple_shell_command(&segment, depth);
         observes |= semantics.observes_state();
         mutates |= semantics.mutates_state();
+        unknown |= semantics.effect == crate::traits::ToolCallEffect::Unknown;
         mutation_effects = mutation_effects.union(semantics.mutation_effects);
     }
     match (observes, mutates) {
@@ -164,7 +166,28 @@ fn classify_shell_command_with_depth(command: &str, depth: usize) -> ToolCallSem
         (true, false) => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
         (false, true) => ToolCallSemantics::mutation_with(mutation_effects),
+        (false, false) if unknown => ToolCallSemantics::default(),
         (false, false) => ToolCallSemantics::administrative(),
+    }
+}
+
+/// Resolve static uncertainty from the capability boundary actually enforced
+/// for one terminal call. An unknown command is observational only when a
+/// native confinement profile is active and exposes no writable task target;
+/// a declared write capability remains a conservative unknown mutation.
+pub(crate) fn classify_confined_shell_command(
+    command: &str,
+    confinement_active: bool,
+    has_write_targets: bool,
+) -> ToolCallSemantics {
+    let semantics = classify_shell_command(command);
+    if semantics.effect != crate::traits::ToolCallEffect::Unknown || !confinement_active {
+        return semantics;
+    }
+    if has_write_targets {
+        ToolCallSemantics::mutation()
+    } else {
+        ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
     }
 }
 
@@ -525,7 +548,7 @@ fn classify_simple_shell_command(command: &str, depth: usize) -> ToolCallSemanti
     // this normalization for direct callers and malformed-but-recoverable input.
     let command = strip_leading_cd(command);
     let Ok(tokens) = shell_words::split(&command) else {
-        return ToolCallSemantics::mutation();
+        return ToolCallSemantics::default();
     };
     let mut command_index = 0;
     while tokens
@@ -549,10 +572,11 @@ fn classify_simple_shell_command(command: &str, depth: usize) -> ToolCallSemanti
         let script_index = args.iter().enumerate().find_map(|(index, arg)| {
             (arg == "-c" || arg.starts_with('-') && arg[1..].contains('c')).then_some(index + 1)
         });
-        return script_index.and_then(|index| args.get(index)).map_or_else(
-            || mutation_with(ToolMutationEffects::UNSPECIFIED),
-            |script| classify_shell_command_with_depth(script, depth + 1),
-        );
+        return script_index
+            .and_then(|index| args.get(index))
+            .map_or_else(ToolCallSemantics::mutation, |script| {
+                classify_shell_command_with_depth(script, depth + 1)
+            });
     }
 
     if executable == "env" {
@@ -581,16 +605,15 @@ fn classify_simple_shell_command(command: &str, depth: usize) -> ToolCallSemanti
             }
         }
         let nested = (index < args.len()).then_some(index);
-        return nested.map_or_else(
-            || mutation_with(ToolMutationEffects::UNSPECIFIED),
-            |index| classify_simple_shell_command(&args[index..].join(" "), depth),
-        );
+        return nested.map_or_else(ToolCallSemantics::mutation, |index| {
+            classify_simple_shell_command(&args[index..].join(" "), depth)
+        });
     }
     if executable == "pnpm" && args.first().is_some_and(|arg| arg == "dlx") {
         return if args.len() > 1 {
             classify_simple_shell_command(&args[1..].join(" "), depth)
         } else {
-            mutation_with(ToolMutationEffects::UNSPECIFIED)
+            ToolCallSemantics::mutation()
         };
     }
     if is_inert_introspection(executable, args) {
@@ -858,6 +881,24 @@ mod tests {
     }
 
     #[test]
+    fn shell_launcher_observation_survives_literal_escaped_quotes() {
+        let command = r#"/bin/sh -c 'sleep 35; printf \'SYNTHETIC_OK\\n\''"#;
+        let observation = classify_confined_shell_command(command, true, false);
+        assert!(observation.observes_state());
+        assert!(!observation.mutates_state());
+
+        assert_eq!(
+            classify_shell_command(command).effect,
+            crate::traits::ToolCallEffect::Unknown
+        );
+        assert!(classify_confined_shell_command(command, true, true).mutates_state());
+        assert_eq!(
+            classify_confined_shell_command(command, false, false).effect,
+            crate::traits::ToolCallEffect::Unknown
+        );
+    }
+
+    #[test]
     fn dev_null_redirect_does_not_count_as_mutation() {
         // `find ... 2>/dev/null` is the canonical noise-suppressed lookup;
         // discarding output mutates nothing.
@@ -993,9 +1034,9 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_shell_expression_is_conservatively_mutating() {
+    fn ambiguous_shell_expression_remains_typed_unknown() {
         let semantics = classify_shell_command("echo 'unterminated");
-        assert!(semantics.mutates_state());
+        assert_eq!(semantics.effect, crate::traits::ToolCallEffect::Unknown);
         assert!(!semantics.observes_state());
     }
 
