@@ -19,14 +19,14 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
+    semantics_for_exact_read_actions, SkillsStore, Tool, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects,
 };
 use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn SkillsStore>,
     approval_tx: ApprovalBroker,
     client: reqwest::Client,
     http_profiles: Option<SharedHttpProfiles>,
@@ -179,7 +179,7 @@ struct ExternalRefOccurrence {
 impl ManageSkillsTool {
     pub fn new(
         skills_dir: PathBuf,
-        state: Arc<dyn StateStore>,
+        state: Arc<dyn SkillsStore>,
         approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
@@ -3320,7 +3320,7 @@ mod tests {
         let approval_tx = ApprovalBroker::new(approval_tx);
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
-            sqlite_state.clone() as Arc<dyn StateStore>,
+            sqlite_state.clone() as Arc<dyn crate::traits::SkillsStore>,
             approval_tx,
         );
 
@@ -3348,7 +3348,7 @@ mod tests {
         let approval_tx = ApprovalBroker::new(approval_tx);
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
-            sqlite_state.clone() as Arc<dyn StateStore>,
+            sqlite_state.clone() as Arc<dyn crate::traits::SkillsStore>,
             approval_tx,
         );
 

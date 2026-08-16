@@ -1298,7 +1298,6 @@ impl Tool for ManageOAuthTool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::traits::StateStore;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1356,7 +1355,7 @@ mod tests {
         let profiles: SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let gateway = OAuthGateway::new(
-            state.clone() as Arc<dyn StateStore>,
+            state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
             profiles,
             "http://localhost:8080".to_string(),
         );

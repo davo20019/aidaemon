@@ -6,13 +6,13 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::tools::ApprovalBroker;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
-use crate::traits::Tool;
+use crate::traits::{SkillsStore, Tool};
 
 pub async fn register_skills_tools(
     config: &AppConfig,
     config_path: &Path,
     http_profiles: crate::oauth::SharedHttpProfiles,
-    state: Arc<dyn crate::traits::StateStore>,
+    state: Arc<dyn SkillsStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
     approval_tx: ApprovalBroker,
 ) -> anyhow::Result<Option<PathBuf>> {

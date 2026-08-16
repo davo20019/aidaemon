@@ -6,19 +6,21 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::traits::{
-    semantics_for_exact_read_actions, Goal, StateStore, Task, TaskActivity, Tool, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolResultPresentation,
+    semantics_for_exact_read_actions, Goal, ScheduledGoalRunsStore, StateStore, Task, TaskActivity,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolResultPresentation,
 };
 use crate::types::StatusUpdate;
 
 pub struct ScheduledGoalRunsTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn ScheduledGoalRunsStore>,
 }
 
 impl ScheduledGoalRunsTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+        Self {
+            state: state as Arc<dyn ScheduledGoalRunsStore>,
+        }
     }
 
     const RUN_INSTRUCTIONS_MARKER: &'static str = "\n\nLATEST RUN INSTRUCTIONS:\n";

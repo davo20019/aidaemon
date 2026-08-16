@@ -9,6 +9,7 @@ mod conversation;
 mod dialogue;
 mod dynamic;
 mod goals;
+mod history;
 mod mandates;
 mod memory;
 mod people;
@@ -42,6 +43,10 @@ pub use goals::{
     ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff,
     TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
     DEFAULT_PROJECT_ID,
+};
+pub use history::{
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, ProjectionStats,
+    TaskBookends,
 };
 #[allow(unused_imports)]
 pub use mandates::{
@@ -99,10 +104,12 @@ pub mod store_prelude {
     pub use super::{
         ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
         DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
-        GoalScheduleStore, GoalStore, HealthCheckStore, LearningStore, MandateStore, MessageStore,
-        NotificationStore, OAuthStore, PeopleStore, PromptSnapshotStore, ScheduledRunStore,
-        SessionChannelStore, SettingsStore, SkillStore, StateStore, TaskDispatchStore, TaskStore,
-        TokenUsageStore, WorkCoordinationStore,
+        GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore, HistorySearchStore,
+        LearningStore, MandateStore, MandateToolStore, McpRegistryStore, MessageStore,
+        NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore, PeopleToolStore,
+        PromptSnapshotStore, ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore,
+        SessionChannelStore, SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore,
+        TaskStore, TokenUsageStore, WorkCoordinationStore,
     };
 }
 

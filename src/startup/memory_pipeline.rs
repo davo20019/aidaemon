@@ -7,7 +7,8 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::manager::MemoryManager;
 use crate::plans::PlanStore;
-use crate::state::SqliteStateStore;
+use crate::traits::StateStore;
+use sqlx::SqlitePool;
 
 pub struct MemoryPipelineBundle {
     pub consolidator: Arc<Consolidator>,
@@ -17,7 +18,8 @@ pub struct MemoryPipelineBundle {
 
 pub fn build_memory_pipeline(
     config: &AppConfig,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
+    pool: SqlitePool,
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
     llm_runtime: SharedLlmRuntime,
@@ -27,7 +29,7 @@ pub fn build_memory_pipeline(
         Consolidator::new(
             event_store.clone(),
             plan_store,
-            state.pool(),
+            pool.clone(),
             Some(llm_runtime.clone()),
             Some(embedding_service.clone()),
         )
@@ -45,7 +47,7 @@ pub fn build_memory_pipeline(
         Duration::from_secs(config.state.consolidation_interval_hours * 3600);
     let memory_manager = Arc::new(
         MemoryManager::new(
-            state.pool(),
+            pool,
             embedding_service,
             llm_runtime,
             consolidation_interval,

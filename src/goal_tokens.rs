@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use serde::{Deserialize, Serialize};
 
-use crate::traits::{Goal, ScheduledRunHealth, StateStore};
+use crate::traits::{Goal, ScheduledRunHealth, SettingsStore};
 
 const DAILY_BUDGET_OVERRIDE_PREFIX: &str = "goal_daily_budget_override:";
 
@@ -30,7 +30,7 @@ fn daily_budget_override_key(goal_id: &str) -> String {
 }
 
 pub async fn load_goal_daily_budget_override(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     goal_id: &str,
     configured_budget: i64,
     hard_token_cap: i64,
@@ -50,7 +50,7 @@ pub async fn load_goal_daily_budget_override(
 }
 
 pub async fn persist_goal_daily_budget_override(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     goal_id: &str,
     budget_daily: i64,
     extensions_count: usize,
@@ -70,7 +70,7 @@ pub async fn persist_goal_daily_budget_override(
 }
 
 pub async fn clear_goal_daily_budget_override(
-    state: &dyn StateStore,
+    state: &dyn SettingsStore,
     goal_id: &str,
 ) -> anyhow::Result<()> {
     // StateStore intentionally exposes an upsert-only settings interface.

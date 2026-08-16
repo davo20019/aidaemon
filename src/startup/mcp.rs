@@ -4,11 +4,11 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::mcp::{self, McpRegistry};
-use crate::traits::StateStore;
+use crate::traits::McpRegistryStore;
 
 pub async fn setup_mcp_registry(
     config: &AppConfig,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn McpRegistryStore>,
 ) -> anyhow::Result<McpRegistry> {
     let mcp_registry = mcp::McpRegistry::new(state);
 

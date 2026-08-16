@@ -13,7 +13,6 @@ use crate::mcp::McpRegistry;
 use crate::nodes::tool::{
     ManageNodeMonitorsTool, ReadNodeHealthTool, ReadNodeSensorsTool, SendNodeAudioTool,
 };
-use crate::state::SqliteStateStore;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 #[cfg(feature = "browser")]
@@ -35,6 +34,7 @@ use crate::tools::{
 use crate::traits::store_prelude::*;
 use crate::traits::Tool;
 use crate::types::MediaMessage;
+use sqlx::SqlitePool;
 
 /// Complete tool subsystem assembled during startup.
 ///
@@ -57,22 +57,41 @@ pub struct ToolSetup {
     pub cli_agent_tool: Option<Arc<CliAgentTool>>,
 }
 
+/// Domain-facing dependencies required to assemble tools.
+///
+/// The tool layer receives the state contract and the shared database handle,
+/// not the concrete persistence implementation. This keeps SQLite-specific
+/// construction inside `startup::stores` while still allowing infrastructure
+/// tools to use the pool directly where their APIs require it.
+pub struct ToolSetupDependencies {
+    pub state: Arc<dyn StateStore>,
+    pub pool: SqlitePool,
+    pub event_store: Arc<EventStore>,
+    pub llm_runtime: SharedLlmRuntime,
+    pub health_store: Option<Arc<HealthProbeStore>>,
+    pub approval_capacity: usize,
+    pub media_capacity: usize,
+}
+
 /// Assemble all tools and their startup-only dependencies.
 ///
 /// This is intentionally the only function that coordinates the individual
 /// tool registration phases. Callers should treat the result as a capability
 /// bundle instead of reaching into the registration details.
-#[allow(clippy::too_many_arguments)]
 pub async fn setup_tools(
     config: &AppConfig,
     config_path: &Path,
-    state: Arc<SqliteStateStore>,
-    event_store: Arc<EventStore>,
-    llm_runtime: SharedLlmRuntime,
-    health_store: Option<Arc<HealthProbeStore>>,
-    approval_capacity: usize,
-    media_capacity: usize,
+    dependencies: ToolSetupDependencies,
 ) -> anyhow::Result<ToolSetup> {
+    let ToolSetupDependencies {
+        state,
+        pool,
+        event_store,
+        llm_runtime,
+        health_store,
+        approval_capacity,
+        media_capacity,
+    } = dependencies;
     let BaseToolsBundle {
         mut tools,
         execution_backend,
@@ -85,6 +104,7 @@ pub async fn setup_tools(
         config,
         config_path.to_path_buf(),
         state.clone(),
+        pool.clone(),
         event_store.clone(),
         approval_capacity,
         media_capacity,
@@ -103,6 +123,7 @@ pub async fn setup_tools(
         &mut tools,
         config,
         state.clone(),
+        pool.clone(),
         event_store,
         llm_runtime.clone(),
         health_store,
@@ -113,7 +134,7 @@ pub async fn setup_tools(
 
     let mcp_registry = crate::startup::mcp::setup_mcp_registry(
         config,
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state.clone() as Arc<dyn crate::traits::McpRegistryStore>,
     )
     .await?;
     let http_profiles: crate::oauth::SharedHttpProfiles =
@@ -123,7 +144,7 @@ pub async fn setup_tools(
         config,
         config_path,
         http_profiles.clone(),
-        state.clone() as Arc<dyn crate::traits::StateStore>,
+        state.clone() as Arc<dyn crate::traits::SkillsStore>,
         &mut tools,
         approval_tx.clone(),
     )
@@ -580,7 +601,8 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
 pub async fn build_base_tools(
     config: &AppConfig,
     config_path: PathBuf,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
+    pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
@@ -597,7 +619,7 @@ pub async fn build_base_tools(
     );
     let checkpoint_manager = crate::checkpoints::install_manager(
         &config.checkpoints,
-        state.pool(),
+        pool.clone(),
         event_store.clone(),
         execution_backend.clone(),
     )
@@ -623,6 +645,7 @@ pub async fn build_base_tools(
             config,
             &config_path,
             state.clone(),
+            pool.clone(),
             event_store.clone(),
             approval_tx.clone(),
         )
@@ -661,7 +684,8 @@ struct BuiltBaseTool {
 pub async fn register_optional_tools(
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
+    pool: SqlitePool,
     event_store: Arc<EventStore>,
     llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
@@ -695,20 +719,20 @@ pub async fn register_optional_tools(
                 if !config.tools.is_enabled("read_node_sensors") {
                     continue;
                 }
-                tools.push(Arc::new(ReadNodeSensorsTool::new(state.pool())));
+                tools.push(Arc::new(ReadNodeSensorsTool::new(pool.clone())));
             }
             OptionalToolId::NodeHealth => {
                 if !config.tools.is_enabled("read_node_health") {
                     continue;
                 }
-                tools.push(Arc::new(ReadNodeHealthTool::new(state.pool())));
+                tools.push(Arc::new(ReadNodeHealthTool::new(pool.clone())));
             }
             OptionalToolId::NodeAudio => {
                 if !config.tools.is_enabled("send_node_audio") {
                     continue;
                 }
                 let store = Arc::new(crate::nodes::NodeStore::new(
-                    state.pool(),
+                    pool.clone(),
                     crate::nodes::auth::load_or_create_instance_key()?,
                 ));
                 let speech = crate::nodes::speech::configured_synthesizer(&config.nodes.speech)?;
@@ -724,7 +748,7 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 let monitoring = crate::nodes::monitoring::NodeMonitoringService::new(
-                    state.pool(),
+                    pool.clone(),
                     config.nodes.monitoring.clone(),
                 );
                 tools.push(Arc::new(ManageNodeMonitorsTool::new(monitoring)));
@@ -871,7 +895,7 @@ pub async fn register_runtime_tools(
     config: &AppConfig,
     config_path: &Path,
     http_profiles: crate::oauth::SharedHttpProfiles,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
     mcp_registry: McpRegistry,
     approval_tx: ApprovalBroker,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
@@ -949,7 +973,7 @@ async fn register_runtime_tool_by_id(
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
     config_path: &Path,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
     mcp_registry: McpRegistry,
     approval_tx: ApprovalBroker,
     http_profiles: crate::oauth::SharedHttpProfiles,
@@ -997,8 +1021,11 @@ async fn register_runtime_tool_by_id(
                 .callback_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", config.daemon.health_port));
-            let gateway =
-                crate::oauth::OAuthGateway::new(state.clone(), http_profiles, callback_url);
+            let gateway = crate::oauth::OAuthGateway::new(
+                state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
+                http_profiles,
+                callback_url,
+            );
 
             // Register built-in providers.
             for name in crate::oauth::providers::builtin_provider_names() {
@@ -1075,7 +1102,8 @@ async fn build_base_tool(
     tool_id: BaseToolId,
     config: &AppConfig,
     config_path: &Path,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
+    pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_tx: ApprovalBroker,
 ) -> anyhow::Result<BuiltBaseTool> {
@@ -1102,11 +1130,11 @@ async fn build_base_tool(
                     config.terminal.initial_timeout_secs,
                     config.terminal.max_output_chars,
                     config.terminal.permission_mode,
-                    state.pool(),
+                    pool,
                 )
                 .await
                 .with_event_store(event_store)
-                .with_state(state as Arc<dyn crate::traits::StateStore>)
+                .with_state(state)
                 .with_self_correction(config.self_correction.clone())
                 .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
@@ -1229,7 +1257,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
-    use crate::traits::{ModelProvider, StateStore};
+    use crate::traits::ModelProvider;
     use proptest::prelude::*;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1275,6 +1303,7 @@ mod tests {
             &config,
             config_file.path().to_path_buf(),
             state.clone(),
+            state.pool(),
             event_store.clone(),
             32,
             8,
@@ -1290,6 +1319,7 @@ mod tests {
             &mut bundle.tools,
             &config,
             state.clone(),
+            state.pool(),
             event_store.clone(),
             llm_runtime,
             None,
@@ -1298,7 +1328,8 @@ mod tests {
         )
         .await?;
 
-        let mcp_registry = McpRegistry::new(state.clone() as Arc<dyn StateStore>);
+        let mcp_registry =
+            McpRegistry::new(state.clone() as Arc<dyn crate::traits::McpRegistryStore>);
         let http_profiles: crate::oauth::SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
         let _runtime = register_runtime_tools(
@@ -1614,7 +1645,8 @@ mod tests {
         let bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
-            state,
+            state.clone(),
+            state.pool(),
             event_store,
             8,
             8,

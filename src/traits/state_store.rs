@@ -1888,6 +1888,82 @@ pub trait PromptSnapshotStore: Send + Sync {
     }
 }
 
+/// Focused persistence contract used by goal-trace tooling.
+pub trait GoalTraceStore:
+    GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore
+{
+}
+
+impl<T> GoalTraceStore for T where
+    T: GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore
+{
+}
+
+/// Focused persistence contract used by mandate management.
+pub trait MandateToolStore:
+    MandateStore + GoalStore + WorkCoordinationStore + SessionChannelStore + GoalBudgetStore
+{
+}
+
+impl<T> MandateToolStore for T where
+    T: MandateStore + GoalStore + WorkCoordinationStore + SessionChannelStore + GoalBudgetStore
+{
+}
+
+/// Focused persistence contract used by people management.
+pub trait PeopleToolStore: PeopleStore + FactStore + SettingsStore {}
+
+impl<T> PeopleToolStore for T where T: PeopleStore + FactStore + SettingsStore {}
+
+/// Focused persistence contract used by the dynamic MCP registry.
+pub trait McpRegistryStore: DynamicMcpServerStore {}
+
+impl<T> McpRegistryStore for T where T: DynamicMcpServerStore {}
+
+/// Focused persistence contract used by skill startup and management.
+pub trait SkillsStore: SkillStore + SettingsStore {}
+
+impl<T> SkillsStore for T where T: SkillStore + SettingsStore {}
+
+/// Focused persistence contract used by blocker reporting.
+pub trait ReportBlockerStore:
+    TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
+{
+}
+
+impl<T> ReportBlockerStore for T where
+    T: TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
+{
+}
+
+/// Focused persistence contract used by scheduled-goal tooling.
+pub trait ScheduledGoalRunsStore:
+    GoalStore
+    + GoalScheduleStore
+    + ScheduledRunStore
+    + GoalBudgetStore
+    + TaskStore
+    + WorkCoordinationStore
+    + SettingsStore
+{
+}
+
+impl<T> ScheduledGoalRunsStore for T where
+    T: GoalStore
+        + GoalScheduleStore
+        + ScheduledRunStore
+        + GoalBudgetStore
+        + TaskStore
+        + WorkCoordinationStore
+        + SettingsStore
+{
+}
+
+/// OAuth flows only need OAuth connection and pending-flow persistence.
+pub trait OAuthGatewayStore: OAuthStore {}
+
+impl<T> OAuthGatewayStore for T where T: OAuthStore {}
+
 /// Facade trait kept for backwards compatibility.
 ///
 /// This lets call sites keep using `Arc<dyn StateStore>`, while new code can
@@ -1899,6 +1975,15 @@ pub trait StateStore:
     + DialogueStateStore
     + FactStore
     + EpisodeStore
+    + super::HistorySearchStore
+    + GoalTraceStore
+    + MandateToolStore
+    + PeopleToolStore
+    + McpRegistryStore
+    + SkillsStore
+    + ReportBlockerStore
+    + ScheduledGoalRunsStore
+    + OAuthGatewayStore
     + TokenUsageStore
     + LearningStore
     + SkillStore
@@ -1932,6 +2017,15 @@ impl<T> StateStore for T where
         + DialogueStateStore
         + FactStore
         + EpisodeStore
+        + super::HistorySearchStore
+        + GoalTraceStore
+        + MandateToolStore
+        + PeopleToolStore
+        + McpRegistryStore
+        + SkillsStore
+        + ReportBlockerStore
+        + ScheduledGoalRunsStore
+        + OAuthGatewayStore
         + TokenUsageStore
         + LearningStore
         + SkillStore

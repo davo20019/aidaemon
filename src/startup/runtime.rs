@@ -20,10 +20,9 @@ use crate::health::HealthProbeManager;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::QueueTelemetry;
-use crate::state::SqliteStateStore;
-use crate::traits::store_prelude::*;
 use crate::traits::{MandateStore, SessionChannelStore, SettingsStore};
 use crate::triggers;
+use sqlx::SqlitePool;
 
 fn cleanup_inbox(dir: &str, retention: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -47,22 +46,41 @@ pub(crate) struct HeartbeatSetup {
     pub(crate) telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct HeartbeatDependencies {
+    pub(crate) state: Arc<dyn crate::traits::StateStore>,
+    pub(crate) pool: SqlitePool,
+    pub(crate) event_store: Arc<crate::events::EventStore>,
+    pub(crate) pruner: Arc<crate::events::Pruner>,
+    pub(crate) memory_manager: Arc<crate::memory::manager::MemoryManager>,
+    pub(crate) wake_rx: tokio::sync::mpsc::Receiver<()>,
+    pub(crate) inbox_dir: String,
+    pub(crate) skills_dir: Option<std::path::PathBuf>,
+    pub(crate) llm_runtime: SharedLlmRuntime,
+    pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    pub(crate) watchdog_stale_threshold_secs: u64,
+    pub(crate) goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
+    pub(crate) terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
+}
+
 pub(crate) async fn init_heartbeat_coordinator(
     config: &AppConfig,
-    state: Arc<SqliteStateStore>,
-    event_store: Arc<crate::events::EventStore>,
-    pruner: Arc<crate::events::Pruner>,
-    memory_manager: Arc<crate::memory::manager::MemoryManager>,
-    wake_rx: tokio::sync::mpsc::Receiver<()>,
-    inbox_dir: String,
-    skills_dir: Option<std::path::PathBuf>,
-    llm_runtime: SharedLlmRuntime,
-    oauth_gateway: Option<crate::oauth::OAuthGateway>,
-    watchdog_stale_threshold_secs: u64,
-    goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
-    terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
+    dependencies: HeartbeatDependencies,
 ) -> HeartbeatSetup {
+    let HeartbeatDependencies {
+        state,
+        pool,
+        event_store,
+        pruner,
+        memory_manager,
+        wake_rx,
+        inbox_dir,
+        skills_dir,
+        llm_runtime,
+        oauth_gateway,
+        watchdog_stale_threshold_secs,
+        goal_token_registry,
+        terminal_tool,
+    } = dependencies;
     let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
 
@@ -85,7 +103,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         if config.nodes.monitoring.enabled {
             let monitoring = crate::nodes::monitoring::NodeMonitoringService::new(
-                state.pool(),
+                pool.clone(),
                 config.nodes.monitoring.clone(),
             );
             let interval = Duration::from_secs(config.nodes.monitoring.scan_interval_seconds);
@@ -206,7 +224,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         // Repairable exact-history projection (hourly). Canonical appends never
         // depend on this succeeding, so transient FTS/busy failures converge.
-        let history_projection_pool = state.pool();
+        let history_projection_pool = pool.clone();
         heartbeat.register_job(
             "history_projection_repair",
             Duration::from_secs(3600),
@@ -235,7 +253,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         );
 
         // Retention cleanup (daily)
-        let retention_pool = state.pool();
+        let retention_pool = pool.clone();
         let retention_config = config.state.retention.clone();
         heartbeat.register_job(
             "retention_cleanup",
@@ -583,18 +601,33 @@ pub(crate) async fn init_health_probe_manager(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct DashboardDependencies {
+    pub(crate) state: Arc<dyn crate::traits::StateStore>,
+    pub(crate) pool: SqlitePool,
+    pub(crate) event_store: Arc<crate::events::EventStore>,
+    pub(crate) health_store: Option<Arc<crate::health::HealthProbeStore>>,
+    pub(crate) heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
+    pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    pub(crate) write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
+    pub(crate) queue_telemetry: Arc<QueueTelemetry>,
+    pub(crate) heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
+}
+
 pub(crate) fn spawn_dashboard_or_health_server(
     config: &AppConfig,
-    state: Arc<SqliteStateStore>,
-    event_store: Arc<crate::events::EventStore>,
-    health_store: Option<Arc<crate::health::HealthProbeStore>>,
-    heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
-    oauth_gateway: Option<crate::oauth::OAuthGateway>,
-    write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
-    queue_telemetry: Arc<QueueTelemetry>,
-    heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
+    dependencies: DashboardDependencies,
 ) {
+    let DashboardDependencies {
+        state,
+        pool,
+        event_store,
+        health_store,
+        heartbeat_telemetry,
+        oauth_gateway,
+        write_consistency_thresholds,
+        queue_telemetry,
+        heartbeat_wake_tx,
+    } = dependencies;
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
 
@@ -602,7 +635,7 @@ pub(crate) fn spawn_dashboard_or_health_server(
         match crate::dashboard::get_or_create_dashboard_token() {
             Ok(dashboard_token_info) => {
                 let dashboard_state = crate::dashboard::DashboardState {
-                    pool: state.pool(),
+                    pool,
                     mandate_store: state.clone(),
                     heartbeat_wake_tx,
                     event_store: Some(event_store),
@@ -681,17 +714,28 @@ pub(crate) fn collect_notify_session_ids(config: &AppConfig) -> Vec<String> {
     session_ids
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_trigger_event_listener(
-    mut event_rx: triggers::EventReceiver,
-    hub: Arc<ChannelHub>,
-    agent: Arc<Agent>,
-    state: Arc<dyn MandateStore>,
-    heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
-    notify_session_ids: Vec<String>,
-    queue_telemetry: Arc<QueueTelemetry>,
-    queue_policy: crate::config::QueuePolicyConfig,
-) {
+pub(crate) struct TriggerListenerDependencies {
+    pub(crate) event_rx: triggers::EventReceiver,
+    pub(crate) hub: Arc<ChannelHub>,
+    pub(crate) agent: Arc<Agent>,
+    pub(crate) state: Arc<dyn MandateStore>,
+    pub(crate) heartbeat_wake_tx: tokio::sync::mpsc::Sender<()>,
+    pub(crate) notify_session_ids: Vec<String>,
+    pub(crate) queue_telemetry: Arc<QueueTelemetry>,
+    pub(crate) queue_policy: crate::config::QueuePolicyConfig,
+}
+
+pub(crate) fn spawn_trigger_event_listener(dependencies: TriggerListenerDependencies) {
+    let TriggerListenerDependencies {
+        mut event_rx,
+        hub,
+        agent,
+        state,
+        heartbeat_wake_tx,
+        notify_session_ids,
+        queue_telemetry,
+        queue_policy,
+    } = dependencies;
     tokio::spawn(async move {
         let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {

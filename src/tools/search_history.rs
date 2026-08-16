@@ -9,12 +9,10 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use crate::state::sqlite::history_search::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, TaskBookends,
-};
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus, ToolVerificationMode,
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, TaskBookends, Tool,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolOutcomeStatus,
+    ToolVerificationMode,
 };
 use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
 

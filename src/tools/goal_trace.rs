@@ -5,15 +5,17 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Goal, StateStore, TaskActivity, Tool, ToolCapabilities};
+use crate::traits::{Goal, GoalTraceStore, StateStore, TaskActivity, Tool, ToolCapabilities};
 
 pub struct GoalTraceTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn GoalTraceStore>,
 }
 
 impl GoalTraceTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+        Self {
+            state: state as Arc<dyn GoalTraceStore>,
+        }
     }
 
     async fn resolve_goal_id(&self, input_id: &str) -> anyhow::Result<String> {

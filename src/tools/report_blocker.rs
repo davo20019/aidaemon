@@ -11,15 +11,15 @@ use crate::agent::{
     TaskValidationOutcome,
 };
 use crate::traits::{
-    HandoffArtifact, StateStore, TaskAttempt, TaskAttemptPatch, TaskHandoff, Tool,
-    ToolCallSemantics, ToolCapabilities, ToolRole,
+    HandoffArtifact, ReportBlockerStore, StateStore, TaskAttempt, TaskAttemptPatch, TaskHandoff,
+    Tool, ToolCallSemantics, ToolCapabilities, ToolRole,
 };
 
 /// Tool for executors to report they are blocked and cannot proceed.
 ///
 pub struct ReportBlockerTool {
     task_id: String,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn ReportBlockerStore>,
     attempt: Option<TaskAttempt>,
     mandate_execution: bool,
 }
@@ -29,7 +29,7 @@ impl ReportBlockerTool {
     pub fn new(task_id: String, state: Arc<dyn StateStore>) -> Self {
         Self {
             task_id,
-            state,
+            state: state as Arc<dyn ReportBlockerStore>,
             attempt: None,
             mandate_execution: false,
         }
@@ -43,7 +43,7 @@ impl ReportBlockerTool {
     ) -> Self {
         Self {
             task_id,
-            state,
+            state: state as Arc<dyn ReportBlockerStore>,
             attempt: Some(attempt),
             mandate_execution,
         }

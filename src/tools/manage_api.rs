@@ -11,7 +11,7 @@ use crate::oauth::{OAuthGateway, SharedHttpProfiles};
 use crate::tools::web_search::{SearchBackend, SearchResult};
 use crate::tools::ApprovalBroker;
 use crate::tools::{HttpRequestTool, ManageHttpAuthTool, ManageOAuthTool, ManageSkillsTool};
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{SkillsStore, StateStore, Tool, ToolCapabilities};
 use crate::types::StatusUpdate;
 
 use super::manage_skills::{ApiSafeProbe, LearnedApiArtifact};
@@ -76,9 +76,13 @@ impl ManageApiTool {
         oauth_gateway: OAuthGateway,
     ) -> Self {
         let manage_skills = skills_dir.map(|dir| {
-            ManageSkillsTool::new(dir, state_store.clone(), approval_tx.clone())
-                .with_http_profiles(profiles.clone())
-                .with_registries(skill_registry_urls)
+            ManageSkillsTool::new(
+                dir,
+                state_store.clone() as Arc<dyn SkillsStore>,
+                approval_tx.clone(),
+            )
+            .with_http_profiles(profiles.clone())
+            .with_registries(skill_registry_urls)
         });
         let search_backend =
             crate::tools::web_search::build_backend(&search_config.backend, &search_config);

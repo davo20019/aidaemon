@@ -8,10 +8,17 @@ use crate::health::HealthProbeStore;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::PlanStore;
 use crate::state::SqliteStateStore;
+use crate::traits::StateStore;
+use sqlx::SqlitePool;
 
 pub struct StoreBundle {
+    /// Domain-facing state contract. The concrete SQLite implementation stays
+    /// inside this adapter module and is not leaked through startup wiring.
+    pub state: Arc<dyn StateStore>,
+    /// Shared relational handle used by infrastructure components that need a
+    /// pool directly (events, plans, health, nodes, and checkpoints).
+    pub pool: SqlitePool,
     pub embedding_service: Arc<EmbeddingService>,
-    pub state: Arc<SqliteStateStore>,
     pub event_store: Arc<EventStore>,
     pub plan_store: Arc<PlanStore>,
     pub health_store: Option<Arc<HealthProbeStore>>,
@@ -162,7 +169,8 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
 
     Ok(StoreBundle {
         embedding_service,
-        state,
+        pool: state.pool(),
+        state: state as Arc<dyn StateStore>,
         event_store,
         plan_store,
         health_store,

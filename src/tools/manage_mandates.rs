@@ -16,8 +16,9 @@ use crate::traits::{
     MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationScope,
     MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
     MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
-    MandateTerminationKind, StateStore, Tool, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
+    MandateTerminationKind, MandateToolStore, StateStore, Tool, ToolCallMetadata,
+    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolOutcomeStatus, ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
@@ -123,7 +124,7 @@ impl ResolvedReviewCapacity {
 /// owner's authority envelope and the task lead's ACT/WAIT/ASK/STOP choice; the
 /// dispatcher enforces the envelope when an action is attempted.
 pub struct ManageMandatesTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn MandateToolStore>,
     approval_tx: ApprovalBroker,
     skills_dir: Option<PathBuf>,
 }
@@ -131,7 +132,7 @@ pub struct ManageMandatesTool {
 impl ManageMandatesTool {
     pub fn new(state: Arc<dyn StateStore>, approval_tx: ApprovalBroker) -> Self {
         Self {
-            state,
+            state: state as Arc<dyn MandateToolStore>,
             approval_tx,
             skills_dir: None,
         }

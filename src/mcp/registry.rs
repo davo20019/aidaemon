@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
 use crate::mcp::{capabilities_from_tool_definition, McpClient, McpTool};
-use crate::traits::{DynamicMcpServer, MandateAuthority, StateStore, Tool};
+use crate::traits::{DynamicMcpServer, MandateAuthority, McpRegistryStore, Tool};
 
 /// A running MCP server entry in the registry.
 pub struct McpServerEntry {
@@ -37,12 +37,12 @@ pub struct ServerInfo {
 #[derive(Clone)]
 pub struct McpRegistry {
     servers: Arc<RwLock<HashMap<String, McpServerEntry>>>,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn McpRegistryStore>,
     mandate_authority: Option<Arc<MandateAuthority>>,
 }
 
 impl McpRegistry {
-    pub fn new(state: Arc<dyn StateStore>) -> Self {
+    pub fn new(state: Arc<dyn McpRegistryStore>) -> Self {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             state,

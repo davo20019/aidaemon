@@ -11,7 +11,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{HttpAuthProfile, HttpAuthType, OAuthProviderConfig};
-use crate::traits::StateStore;
+use crate::traits::OAuthGatewayStore;
 
 /// Timeout for OAuth flow completion (10 minutes).
 const FLOW_TIMEOUT_SECS: u64 = 600;
@@ -102,7 +102,7 @@ pub struct OAuthGateway {
     providers: Arc<RwLock<HashMap<String, OAuthProvider>>>,
     pending_flows: Arc<RwLock<HashMap<String, PendingFlow>>>,
     recent_flow_results: Arc<RwLock<HashMap<String, RecentFlowResult>>>,
-    state_store: Arc<dyn StateStore>,
+    state_store: Arc<dyn OAuthGatewayStore>,
     http_profiles: SharedHttpProfiles,
     callback_base_url: String,
     /// Serializes token exchanges so concurrent authenticated requests cannot
@@ -113,7 +113,7 @@ pub struct OAuthGateway {
 
 impl OAuthGateway {
     pub fn new(
-        state_store: Arc<dyn StateStore>,
+        state_store: Arc<dyn OAuthGatewayStore>,
         http_profiles: SharedHttpProfiles,
         callback_base_url: String,
     ) -> Self {
@@ -1063,7 +1063,7 @@ mod tests {
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::StateStore;
+    use crate::traits::OAuthGatewayStore;
 
     static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
@@ -1091,7 +1091,7 @@ mod tests {
         std::mem::forget(db_file);
         let profiles: SharedHttpProfiles = Arc::new(RwLock::new(HashMap::new()));
         Ok(OAuthGateway::new(
-            state as Arc<dyn StateStore>,
+            state as Arc<dyn OAuthGatewayStore>,
             profiles,
             "http://localhost:8080".to_string(),
         ))

@@ -7,17 +7,19 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::traits::{
-    semantics_for_exact_read_actions, Person, PersonFact, StateStore, Tool, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, PeopleToolStore, Person, PersonFact, StateStore, Tool,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
 
 pub struct ManagePeopleTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn PeopleToolStore>,
 }
 
 impl ManagePeopleTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+        Self {
+            state: state as Arc<dyn PeopleToolStore>,
+        }
     }
 }
 
