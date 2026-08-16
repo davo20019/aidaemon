@@ -100,6 +100,46 @@ pub(in crate::agent) fn resolved_followup_mode(
     })
 }
 
+/// Validate a model-classified continuation against one exact request node.
+/// A relationship label without this stable edge is advisory only and cannot
+/// inherit context, policy, targets, or completion obligations.
+pub(in crate::agent) fn has_exact_request_antecedent(
+    state: &DialogueState,
+    user_message_id: &str,
+) -> bool {
+    let candidate = user_message_id.trim();
+    !candidate.is_empty()
+        && state
+            .open_request
+            .as_ref()
+            .into_iter()
+            .chain(state.antecedent_request.as_ref())
+            .any(|request| request.user_message_id == candidate)
+}
+
+/// Resolve the only structurally possible antecedent for the current user
+/// turn. This is used when the semantic assessor identifies a continuation
+/// but omits the optional stable ID. The fallback is deliberately narrow: it
+/// may select only a persisted request node other than the current ingress
+/// message, and it refuses ambiguity. The relationship still comes from the
+/// semantic assessment; no request wording is classified here.
+pub(in crate::agent) fn unambiguous_request_antecedent(
+    state: &DialogueState,
+) -> Option<&OpenRequest> {
+    let current_message_id = state
+        .last_user_turn
+        .as_ref()
+        .map(|turn| turn.message_id.as_str());
+    let mut candidates = state
+        .open_request
+        .as_ref()
+        .into_iter()
+        .chain(state.antecedent_request.as_ref())
+        .filter(|request| Some(request.user_message_id.as_str()) != current_message_id);
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
 fn classify_user_turn(
     state: &DialogueState,
     text: &str,
@@ -174,8 +214,22 @@ fn apply_task_start(state: &mut DialogueState, task_id: &str, started_at: chrono
     });
     if let Some(open_request) = state.open_request.as_mut() {
         open_request.task_id = Some(task_id.to_string());
-        if open_request.status == OpenRequestStatus::Open {
+        let semantic_followup = state
+            .last_user_turn
+            .as_ref()
+            .is_some_and(|turn| turn.kind == UserTurnKind::Followup);
+        if open_request.status == OpenRequestStatus::Open
+            || semantic_followup
+                && matches!(
+                    open_request.status,
+                    OpenRequestStatus::Answered
+                        | OpenRequestStatus::Superseded
+                        | OpenRequestStatus::Blocked
+                        | OpenRequestStatus::PartiallyAnswered
+                )
+        {
             open_request.status = OpenRequestStatus::InProgress;
+            open_request.resolved_at = None;
         }
     }
     state.touch();
@@ -251,6 +305,11 @@ fn apply_user_message(
                     open_request.resolved_at = Some(observed_at);
                 }
             }
+            // This relationship is provisional until semantic task
+            // assessment. Keep the exact prior request and its typed contract
+            // so a genuine continuation can restore it without reconstructing
+            // policy or obligations from prose.
+            state.antecedent_request = state.open_request.take();
             state.open_question = None;
             state.last_closed_question = None;
             state.open_request = Some(OpenRequest {
@@ -324,6 +383,7 @@ fn apply_semantic_user_turn_assessment(
                 .as_ref()
                 .is_none_or(|request| request.user_message_id != message_id)
             {
+                state.antecedent_request = state.open_request.take();
                 state.open_request = Some(OpenRequest {
                     user_message_id: message_id,
                     text: text.trim().to_string(),
@@ -351,6 +411,19 @@ fn apply_semantic_user_turn_assessment(
             }
         }
         UserTurnKind::Followup => {
+            // A topology-only ingress classification may have provisionally
+            // opened a new request. The semantic relationship names this turn
+            // as a continuation, so restore the retained typed antecedent
+            // atomically before any task is bound to it.
+            if state
+                .open_request
+                .as_ref()
+                .is_some_and(|request| request.user_message_id == message_id)
+            {
+                if let Some(antecedent) = state.antecedent_request.take() {
+                    state.open_request = Some(antecedent);
+                }
+            }
             if let Some(request) = state.open_request.as_mut() {
                 if semantic_scope.is_some() {
                     request.semantic_scope = semantic_scope;
@@ -993,6 +1066,50 @@ mod tests {
             awaiting_user_reply: awaiting,
             asked_at,
         }
+    }
+
+    #[test]
+    fn semantic_continuation_restores_exact_provisional_antecedent() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("synthetic-session");
+        state.open_request = Some(request_with(
+            OpenRequestStatus::Answered,
+            now - chrono::Duration::minutes(1),
+            Some(now - chrono::Duration::seconds(30)),
+        ));
+
+        apply_user_message(
+            &mut state,
+            "u2",
+            "Return the values from that setup.",
+            &[],
+            now,
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .map(|request| request.user_message_id.as_str()),
+            Some("u2")
+        );
+        assert!(has_exact_request_antecedent(&state, "u1"));
+
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "Return the values from that setup.",
+            UserTurnKind::Followup,
+            None,
+            now,
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .map(|request| request.user_message_id.as_str()),
+            Some("u1"),
+            "semantic adoption restores the exact typed request rather than reparsing prose"
+        );
+        assert!(state.antecedent_request.is_none());
     }
 
     #[test]

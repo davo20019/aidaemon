@@ -227,6 +227,7 @@ impl SqliteStateStore {
 
         migrations::migrate_state(&pool).await?;
         crate::nodes::store::migrate(&pool).await?;
+        mandates::enforce_mandate_invariants_on_startup(&pool).await?;
 
         Ok(Self {
             pool,

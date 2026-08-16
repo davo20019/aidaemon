@@ -817,6 +817,7 @@ impl Agent {
                         name,
                         "write_file" | "edit_file" | "run_command" | "cli_agent"
                     )
+                    && !(name == "cli_agent" && ctx.mutation_forbidden)
                 {
                     if let Some(manager) = crate::checkpoints::active_manager() {
                         manager.begin_for_tool(name, &enriched_args).await?;

@@ -33,7 +33,6 @@ pub(in crate::agent) struct BootstrapData {
     /// main loop consumes this exact artifact rather than issuing a second
     /// classifier call that could disagree with the memory gate.
     pub task_plan: Option<super::task_planning::TaskPlan>,
-    pub task_assessment_attempted: bool,
     pub memory_pipeline_policy: super::task_planning::MemoryPipelinePolicy,
     /// Durable execution identity recovered from an interrupted run. The new
     /// turn reuses it so operation-derived idempotency keys remain stable.

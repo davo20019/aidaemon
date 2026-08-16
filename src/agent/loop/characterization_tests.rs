@@ -1196,14 +1196,17 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
         MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
         MockProvider::text_response("This model text should be ignored."),
     ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["process_state"],
-        "new_request",
-        "host_local",
-    )]);
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment_with_inline_continuation(
+            "change",
+            true,
+            false,
+            &["process_state"],
+            "new_request",
+            "host_local",
+            true,
+        ),
+    ]);
 
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
@@ -1231,7 +1234,7 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
     assert_eq!(
         call_log.len(),
         2,
-        "background detach currently runs one forced text summary pass after the tool call"
+        "background detach with inline work should continue through one normal model pass"
     );
     assert!(
         call_log.last().is_some_and(|call| !call.tools.is_empty()
@@ -1246,12 +1249,12 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
                         .get("content")
                         .and_then(|v| v.as_str())
                         .is_some_and(|content| {
-                            content.contains("A background task is now running")
-                                && content.contains("completion notifications are enabled")
+                            content.contains("A background process was launched successfully")
+                                && content.contains("Continue with the remaining steps")
                         })
             })
         }),
-        "background detach should carry a handoff directive into the forced text pass"
+        "background detach should carry a typed continuation directive into the next pass"
     );
 }
 
@@ -1983,11 +1986,17 @@ Target Roles: GenAI engineer and AI product manager. Interview Edge: prepare con
 examples of evaluation, deployment, and agent reliability work.",
         ),
     ]);
-    let spawn_tool: Arc<dyn Tool> = Arc::new(MockTool::new(
-        "spawn_agent",
-        "Mock failed specialist delegation",
-        "Error: specialist timed out after 300 seconds",
-    ));
+    let spawn_tool: Arc<dyn Tool> = Arc::new(
+        MockTool::new(
+            "spawn_agent",
+            "Mock failed specialist delegation",
+            "Error: specialist timed out after 300 seconds",
+        )
+        .with_metadata(ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::FailedRetryable),
+            ..ToolCallMetadata::default()
+        }),
+    );
     let harness =
         setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![spawn_tool], None)
             .await

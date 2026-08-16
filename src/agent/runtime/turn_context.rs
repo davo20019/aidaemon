@@ -26,6 +26,10 @@ pub(super) struct TurnContext {
     #[allow(dead_code)] // Retained as an inspectable trace of contract-inference input.
     pub goal_user_text: String,
     pub recent_messages: Vec<Value>,
+    /// Bounded prior messages exposed only to the relationship assessor. They
+    /// carry stable message IDs so a continuation must select an exact
+    /// antecedent. They never enter a fresh task's provider transcript.
+    pub assessment_recent_messages: Vec<Value>,
     pub primary_project_scope: Option<String>,
     pub allow_multi_project_scope: bool,
     pub followup_mode: Option<FollowupMode>,
@@ -38,18 +42,23 @@ pub(super) struct TurnContext {
     /// Assessment failure may retain this contract instead of demoting it to
     /// structural resource identity alone.
     pub inherited_completion_contract: bool,
+    /// Distinguishes an unfinished request's outstanding proof obligations
+    /// from a completed antecedent whose durable safety constraints alone may
+    /// carry into a related turn.
+    pub inherited_outstanding_obligations: bool,
 }
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
 const GOAL_CONTEXT_HINT_HISTORY_LIMIT: usize = 30;
 const GOAL_CONTEXT_MAX_PROJECT_SCOPES: usize = 6;
 
-fn unfinished_open_request(
+fn related_open_request(
     state: Option<&crate::traits::DialogueState>,
+    followup_mode: FollowupMode,
 ) -> Option<&crate::traits::OpenRequest> {
-    state
-        .filter(|state| state.has_unresolved_request_obligation())
-        .and_then(|state| state.open_request.as_ref())
+    (followup_mode != FollowupMode::NewTask)
+        .then(|| state.and_then(|state| state.open_request.as_ref()))
+        .flatten()
 }
 
 fn normalize_message_resources(msg: &Message) -> Message {
@@ -217,6 +226,7 @@ fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> V
                     continue;
                 }
                 Some(json!({
+                    "message_id": msg.id,
                     "role": msg.role,
                     "content": truncate_for_resume(raw, 500),
                 }))
@@ -233,6 +243,7 @@ fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> V
                     continue;
                 }
                 Some(json!({
+                    "message_id": msg.id,
                     "role": msg.role,
                     "content": truncate_for_resume(content.trim(), 500),
                 }))
@@ -240,6 +251,7 @@ fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> V
             "tool" if recent_tool_rows < 2 => summarize_recent_tool_context(msg).map(|content| {
                 recent_tool_rows += 1;
                 json!({
+                    "message_id": msg.id,
                     "role": "tool",
                     "content": content,
                 })
@@ -327,7 +339,7 @@ impl Agent {
         };
         let continuation_request_anchor = internal_continuation
             .then(|| {
-                unfinished_open_request(dialogue_state.as_ref())
+                related_open_request(dialogue_state.as_ref(), followup_mode)
                     .map(|request| request.text.as_str())
                     .or(prev_user.as_deref())
             })
@@ -335,7 +347,7 @@ impl Agent {
         // Mismatch preflight: still used for project scope divergence detection
         // (affects scope extraction below), but no longer gates goal_user_text enrichment.
         if !internal_continuation && followup_mode != FollowupMode::NewTask {
-            let request_anchor = unfinished_open_request(dialogue_state.as_ref())
+            let request_anchor = related_open_request(dialogue_state.as_ref(), followup_mode)
                 .map(|request| request.text.as_str())
                 .or(prev_user.as_deref());
             let mismatch_preflight_drop = request_anchor.is_some_and(|prev| {
@@ -362,7 +374,7 @@ impl Agent {
         // stale instructions into contracts, schedules, goals, and replies.
         if followup_mode != FollowupMode::NewTask {
             let request_anchor = continuation_request_anchor.or_else(|| {
-                unfinished_open_request(dialogue_state.as_ref())
+                related_open_request(dialogue_state.as_ref(), followup_mode)
                     .map(|request| request.text.as_str())
                     .or(prev_user.as_deref())
             });
@@ -442,8 +454,9 @@ impl Agent {
         let mut completion_contract =
             infer_structural_completion_contract(contract_text, &self.path_aliases.projects);
         let mut inherited_completion_contract = false;
+        let mut inherited_outstanding_obligations = false;
         if followup_mode != FollowupMode::NewTask {
-            if let Some(request) = unfinished_open_request(dialogue_state.as_ref()) {
+            if let Some(request) = related_open_request(dialogue_state.as_ref(), followup_mode) {
                 let mut unfinished_contract = request
                     .completion_contract
                     .as_ref()
@@ -461,8 +474,17 @@ impl Agent {
                     unfinished_contract.scope_task_id = request.task_id.clone();
                 }
                 inherited_completion_contract = request.completion_contract.is_some();
-                completion_contract =
-                    inherit_unfinished_request_contract(completion_contract, &unfinished_contract);
+                inherited_outstanding_obligations = dialogue_state
+                    .as_ref()
+                    .is_some_and(|state| state.has_unresolved_request_obligation());
+                completion_contract = if !inherited_outstanding_obligations {
+                    super::completion_contract::inherit_request_constraints(
+                        completion_contract,
+                        &unfinished_contract,
+                    )
+                } else {
+                    inherit_unfinished_request_contract(completion_contract, &unfinished_contract)
+                };
             }
         }
         if self.role() == crate::traits::AgentRole::Executor {
@@ -475,6 +497,20 @@ impl Agent {
             } else {
                 extract_recent_parent_messages(&history, GOAL_CONTEXT_RECENT_MESSAGES_LIMIT)
             },
+            assessment_recent_messages: extract_recent_parent_messages(
+                history
+                    .iter()
+                    .rposition(|message| {
+                        message.role == "user"
+                            && message
+                                .content
+                                .as_deref()
+                                .is_some_and(|content| content.trim() == stored_current)
+                    })
+                    .map(|index| &history[..index])
+                    .unwrap_or(history.as_slice()),
+                GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
+            ),
             primary_project_scope,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),
@@ -482,6 +518,7 @@ impl Agent {
             completion_contract,
             continue_inline_after_background_start: false,
             inherited_completion_contract,
+            inherited_outstanding_obligations,
         }
     }
 
@@ -1013,6 +1050,7 @@ mod tests {
                 required_mutation_effects: crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
                 forbids_mutation: false,
                 forbids_tool_use: false,
+                allowed_tool_names: Vec::new(),
                 forbidden_tool_scopes: Vec::new(),
                 required_response_fields: Vec::new(),
                 forbidden_actions: Vec::new(),
@@ -1087,6 +1125,7 @@ mod tests {
                 required_mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 forbids_mutation: false,
                 forbids_tool_use: false,
+                allowed_tool_names: Vec::new(),
                 forbidden_tool_scopes: Vec::new(),
                 required_response_fields: Vec::new(),
                 forbidden_actions: Vec::new(),

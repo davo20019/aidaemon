@@ -485,12 +485,12 @@ impl SqliteStateStore {
                  WHERE e.event_type = 'user_message' AND s.id IS NULL
                    AND json_valid(e.data)
                    AND length(trim(COALESCE(json_extract(e.data, '$.content'), ''))) > 0
-                   AND NOT EXISTS (
+                   AND (e.task_id IS NULL OR EXISTS (
                        SELECT 1 FROM events policy
                        WHERE policy.task_id = e.task_id
                          AND policy.event_type = 'memory_policy_compiled'
-                         AND json_extract(policy.data, '$.access') = 'suppressed'
-                   )
+                         AND json_extract(policy.data, '$.access') = 'allowed'
+                   ))
                  ORDER BY e.id LIMIT ?",
             )
             .bind(BATCH_SIZE)
@@ -1025,12 +1025,12 @@ pub(crate) async fn project_event_span(pool: &SqlitePool, event_id: i64) -> anyh
     let Some(row) = sqlx::query(
         "SELECT e.id, e.session_id, e.data, e.created_at FROM events e
          WHERE e.id = ? AND e.event_type = 'user_message'
-           AND NOT EXISTS (
+           AND (e.task_id IS NULL OR EXISTS (
                SELECT 1 FROM events policy
                WHERE policy.task_id = e.task_id
                  AND policy.event_type = 'memory_policy_compiled'
-                 AND json_extract(policy.data, '$.access') = 'suppressed'
-           )",
+                 AND json_extract(policy.data, '$.access') = 'allowed'
+           ))",
     )
     .bind(event_id)
     .fetch_optional(pool)

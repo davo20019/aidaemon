@@ -102,6 +102,8 @@ pub(super) struct CompletionContract {
     pub forbids_mutation: bool,
     /// Explicit, grounded prohibition on every tool call for this request.
     pub forbids_tool_use: bool,
+    /// Explicit allow-only tool boundary. Empty means no name-level allowlist.
+    pub allowed_tool_names: Vec<String>,
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
@@ -170,6 +172,7 @@ pub(super) fn persistable_completion_contract(
         required_mutation_effects: contract.required_mutation_effects,
         forbids_mutation: contract.forbids_mutation,
         forbids_tool_use: contract.forbids_tool_use,
+        allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
         required_response_fields: contract.required_response_fields.clone(),
         forbidden_actions: contract
@@ -239,6 +242,7 @@ pub(super) fn completion_contract_from_persisted(
         required_mutation_effects: contract.required_mutation_effects,
         forbids_mutation: contract.forbids_mutation,
         forbids_tool_use: contract.forbids_tool_use,
+        allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
         required_response_fields: contract.required_response_fields.clone(),
         forbidden_mutation_actions: contract
@@ -283,12 +287,16 @@ pub(super) fn inherit_unfinished_request_contract(
     unfinished: &CompletionContract,
 ) -> CompletionContract {
     if let Some(origin) = unfinished.scope_task_id.as_ref() {
-        if !current.adopted_from_task_ids.contains(origin) {
+        if current.scope_task_id.as_ref() != Some(origin)
+            && !current.adopted_from_task_ids.contains(origin)
+        {
             current.adopted_from_task_ids.push(origin.clone());
         }
     }
     for origin in &unfinished.adopted_from_task_ids {
-        if !current.adopted_from_task_ids.contains(origin) {
+        if current.scope_task_id.as_ref() != Some(origin)
+            && !current.adopted_from_task_ids.contains(origin)
+        {
             current.adopted_from_task_ids.push(origin.clone());
         }
     }
@@ -329,6 +337,13 @@ pub(super) fn inherit_unfinished_request_contract(
     // only while this related continuation has no positive execution request.
     if !current_requires_execution {
         current.forbids_tool_use |= unfinished.forbids_tool_use;
+        if current.allowed_tool_names.is_empty() {
+            current.allowed_tool_names = unfinished.allowed_tool_names.clone();
+        } else if !unfinished.allowed_tool_names.is_empty() {
+            current
+                .allowed_tool_names
+                .retain(|name| unfinished.allowed_tool_names.contains(name));
+        }
     }
     for scope in &unfinished.forbidden_tool_scopes {
         if !current.forbidden_tool_scopes.contains(scope) {
@@ -341,6 +356,7 @@ pub(super) fn inherit_unfinished_request_contract(
         }
     }
     if current.forbids_tool_use {
+        current.allowed_tool_names.clear();
         current.requires_observation = false;
         current.explicit_verification_requested = false;
     }
@@ -355,6 +371,67 @@ pub(super) fn inherit_unfinished_request_contract(
         }
     }
 
+    current
+}
+
+/// Carry only durable authority and safety constraints from a completed
+/// antecedent into a semantically related new turn. Satisfied response fields,
+/// evidence requirements, mutation effects, and verification targets belong
+/// to the completed lifecycle and must never become fresh obligations.
+pub(super) fn inherit_request_constraints(
+    mut current: CompletionContract,
+    antecedent: &CompletionContract,
+) -> CompletionContract {
+    if let Some(origin) = antecedent.scope_task_id.as_ref() {
+        if current.scope_task_id.as_ref() != Some(origin)
+            && !current.adopted_from_task_ids.contains(origin)
+        {
+            current.adopted_from_task_ids.push(origin.clone());
+        }
+    }
+    for origin in &antecedent.adopted_from_task_ids {
+        if current.scope_task_id.as_ref() != Some(origin)
+            && !current.adopted_from_task_ids.contains(origin)
+        {
+            current.adopted_from_task_ids.push(origin.clone());
+        }
+    }
+
+    let current_requires_execution = current.expects_mutation || current.requires_observation;
+    // Blanket execution constraints are request-local. A later, semantically
+    // related turn may explicitly authorize a new observation or mutation;
+    // that current contract outranks a completed antecedent. Specific denied
+    // scopes/actions still carry unless the policy gains an explicit typed
+    // representation for revoking them.
+    if !current_requires_execution {
+        current.forbids_tool_use |= antecedent.forbids_tool_use;
+        if current.allowed_tool_names.is_empty() {
+            current.allowed_tool_names = antecedent.allowed_tool_names.clone();
+        } else if !antecedent.allowed_tool_names.is_empty() {
+            current
+                .allowed_tool_names
+                .retain(|name| antecedent.allowed_tool_names.contains(name));
+        }
+    }
+    if !current.expects_mutation {
+        current.forbids_mutation |= antecedent.forbids_mutation;
+    }
+    for scope in &antecedent.forbidden_tool_scopes {
+        if !current.forbidden_tool_scopes.contains(scope) {
+            current.forbidden_tool_scopes.push(*scope);
+        }
+    }
+    for action in &antecedent.forbidden_mutation_actions {
+        if !current.forbidden_mutation_actions.contains(action) {
+            current.forbidden_mutation_actions.push(*action);
+        }
+    }
+    if current.forbids_tool_use {
+        current.allowed_tool_names.clear();
+        current.requires_observation = false;
+        current.explicit_verification_requested = false;
+        current.evidence_requirements.clear();
+    }
     current
 }
 
@@ -518,6 +595,7 @@ pub(super) struct SemanticCompletionRequirements<'a> {
     pub requires_exact_history: bool,
     pub evidence_requirements: &'a [RequestEvidenceRequirement],
     pub forbids_tool_use: bool,
+    pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
     pub required_response_fields: &'a [String],
 }
@@ -585,6 +663,7 @@ pub(super) fn install_semantic_completion_contract(
         },
         forbids_mutation,
         forbids_tool_use: requirements.forbids_tool_use,
+        allowed_tool_names: requirements.allowed_tool_names.to_vec(),
         forbidden_tool_scopes: requirements.forbidden_tool_scopes.to_vec(),
         required_response_fields: requirements.required_response_fields.to_vec(),
         forbidden_mutation_actions: if scope == "scoped" {
@@ -1035,6 +1114,11 @@ pub(super) struct CompletionProgress {
     /// One proof-graph obligation per `CompletionContract::evidence_requirements`
     /// entry, preserving index alignment for receipt matching.
     pub(in crate::agent) evidence_obligation_ids: Vec<String>,
+    /// Content tokens observed across compatible receipts for each material
+    /// need. A management answer often requires joining multiple canonical
+    /// reads; no single receipt is required to contain the whole response
+    /// schema, but every requested marker must be present in the aggregate.
+    pub(in crate::agent) evidence_content_markers: Vec<std::collections::HashSet<String>>,
 }
 
 impl CompletionProgress {
@@ -1100,6 +1184,7 @@ impl CompletionProgress {
                 self.proof_graph
                     .add_edge(&request_id, &id, ExecutionEdgeKind::Requires, None)?;
                 self.evidence_obligation_ids.push(id);
+                self.evidence_content_markers.push(Default::default());
             }
         } else if contract.requires_observation {
             let id = self.scoped_node_id("obligation:verification");
@@ -1293,6 +1378,26 @@ impl CompletionProgress {
                 .collect::<Vec<_>>();
             self.record_verification_evidence(tool_call_id, &obligation_ids);
         }
+    }
+
+    pub(in crate::agent) fn record_evidence_content_markers(
+        &mut self,
+        requirement_index: usize,
+        markers: impl IntoIterator<Item = String>,
+    ) {
+        if let Some(observed) = self.evidence_content_markers.get_mut(requirement_index) {
+            observed.extend(markers);
+        }
+    }
+
+    pub(in crate::agent) fn evidence_content_markers_satisfied(
+        &self,
+        requirement_index: usize,
+        required: &[String],
+    ) -> bool {
+        self.evidence_content_markers
+            .get(requirement_index)
+            .is_some_and(|observed| required.iter().all(|marker| observed.contains(marker)))
     }
 
     pub(super) fn mark_verification_attempt(&mut self) {
@@ -2368,6 +2473,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         required_mutation_effects,
         forbids_mutation,
         forbids_tool_use: false,
+        allowed_tool_names: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
         required_response_fields: Vec::new(),
         forbidden_mutation_actions,
@@ -2401,6 +2507,7 @@ mod tests {
             required_mutation_effects: ToolMutationEffects::REMOTE_DEPLOY,
             forbids_mutation: true,
             forbids_tool_use: false,
+            allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             required_response_fields: Vec::new(),
             forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
@@ -2429,6 +2536,7 @@ mod tests {
                 requires_exact_history: false,
                 evidence_requirements: &[],
                 forbids_tool_use: false,
+                allowed_tool_names: &[],
                 forbidden_tool_scopes: &[],
                 required_response_fields: &[],
             },
@@ -2469,6 +2577,7 @@ mod tests {
                 requires_exact_history: false,
                 evidence_requirements: std::slice::from_ref(&requirement),
                 forbids_tool_use: true,
+                allowed_tool_names: &[],
                 forbidden_tool_scopes: &[],
                 required_response_fields: &[],
             },
@@ -2483,15 +2592,51 @@ mod tests {
     }
 
     #[test]
+    fn restricted_tool_contract_preserves_observation_obligation() {
+        let requirement = RequestEvidenceRequirement {
+            summary: "Inspect the execution environment".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: vec!["cargo".to_string()],
+            target: None,
+        };
+        let mut contract = CompletionContract::default();
+        install_semantic_completion_contract(
+            &mut contract,
+            SemanticCompletionRequirements {
+                expects_mutation: false,
+                requires_observation: true,
+                task_kind: CompletionTaskKind::Check,
+                required_mutation_effects: ToolMutationEffects::NONE,
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+                evidence_requirements: std::slice::from_ref(&requirement),
+                forbids_tool_use: false,
+                allowed_tool_names: &["check_environment".to_string()],
+                forbidden_tool_scopes: &[],
+                required_response_fields: &[],
+            },
+        );
+        assert_eq!(contract.allowed_tool_names, ["check_environment"]);
+        assert!(contract.requires_observation);
+        assert!(!contract.forbids_tool_use);
+    }
+
+    #[test]
     fn persisted_impossible_evidence_is_quarantined_during_hydration() {
         let mut persisted = persistable_completion_contract(&CompletionContract::default());
         persisted.requires_observation = true;
         persisted.evidence_requirements = vec![RequestEvidenceRequirement {
-            summary: "Read a synthetic personal fact".to_string(),
+            summary: "Establish a canonical historical cause from personal memory".to_string(),
             acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            purpose: crate::traits::EvidencePurpose::CausalExplanation,
+            minimum_authority: crate::traits::EvidenceAuthority::Canonical,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
             required_content_markers: Vec::new(),
             target: None,
         }];
@@ -2859,6 +3004,68 @@ mod tests {
         assert!(inherited.requires_observation);
         assert!(inherited.requires_reverification_after_mutation);
         assert!(inherited.explicit_verification_requested);
+    }
+
+    #[test]
+    fn completed_antecedent_carries_constraints_without_reopening_satisfied_obligations() {
+        let current = CompletionContract {
+            scope_task_id: Some("task-current".to_string()),
+            required_response_fields: vec!["current_field".to_string()],
+            ..CompletionContract::default()
+        };
+        let antecedent = CompletionContract {
+            scope_task_id: Some("task-prior".to_string()),
+            forbids_tool_use: true,
+            forbidden_tool_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
+            required_response_fields: vec!["old_field".to_string()],
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Satisfied prior evidence".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: vec!["old_field".to_string()],
+                target: None,
+            }],
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value: "/tmp/prior".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_request_constraints(current, &antecedent);
+        assert!(inherited.forbids_tool_use);
+        assert!(inherited
+            .forbidden_tool_scopes
+            .contains(&crate::traits::ToolSemanticScope::UserMemory));
+        assert_eq!(inherited.required_response_fields, ["current_field"]);
+        assert!(inherited.evidence_requirements.is_empty());
+        assert!(inherited.verification_targets.is_empty());
+        assert_eq!(inherited.adopted_from_task_ids, ["task-prior"]);
+    }
+
+    #[test]
+    fn explicit_current_mutation_outranks_completed_read_only_antecedent() {
+        let current = CompletionContract {
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            requires_observation: true,
+            ..CompletionContract::default()
+        };
+        let antecedent = CompletionContract {
+            forbids_mutation: true,
+            forbids_tool_use: true,
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_request_constraints(current, &antecedent);
+
+        assert!(!inherited.forbids_mutation);
+        assert!(!inherited.forbids_tool_use);
+        assert!(inherited.expects_mutation);
+        assert!(inherited.requires_observation);
     }
 
     #[test]

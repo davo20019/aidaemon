@@ -306,6 +306,59 @@ impl ExecutionRequest {
     }
 }
 
+/// Build the executable search path used by local agent processes.
+///
+/// Service managers commonly start daemons with only the system directories in
+/// `PATH`, even when the owner installed development tools in user-local
+/// prefixes.  Keep one backend-owned search contract instead of teaching each
+/// tool about individual executables. Explicit per-request PATH values and
+/// removals still win at the spawn boundary.
+fn local_execution_search_path(home: &BackendPath) -> String {
+    let mut directories = Vec::<String>::new();
+    let mut push = |value: String| {
+        if !value.trim().is_empty() && !directories.iter().any(|existing| existing == &value) {
+            directories.push(value);
+        }
+    };
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            if directory.is_absolute() {
+                push(directory.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for relative in [
+        ".local/bin",
+        ".cargo/bin",
+        ".npm-global/bin",
+        ".bun/bin",
+        ".deno/bin",
+        "go/bin",
+        "miniforge3/bin",
+        "anaconda3/bin",
+        "bin",
+    ] {
+        push(home.join(relative).to_string());
+    }
+    for directory in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push(directory.to_string());
+    }
+    std::env::join_paths(directories)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[derive(Debug)]
 pub struct ExecutionOutput {
     pub exit_code: i32,
@@ -433,21 +486,60 @@ pub trait ExecutionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Resolve an executable in the same environment used for agent work.
+    /// Bare names are checked against PATH first, then against conventional
+    /// user-local and system prefixes. The returned path is concrete so callers
+    /// do not have to rediscover it through a differently configured shell.
+    async fn resolve_executable(&self, executable: &str) -> anyhow::Result<Option<BackendPath>> {
+        let mut candidates = vec![executable.to_string()];
+        if !executable.contains('/') && !executable.contains('\\') {
+            let home = self.home_dir().await?;
+            for relative in [
+                ".local/bin",
+                ".cargo/bin",
+                ".npm-global/bin",
+                ".bun/bin",
+                ".deno/bin",
+                "go/bin",
+                "miniforge3/bin",
+                "anaconda3/bin",
+                "bin",
+            ] {
+                candidates.push(home.join(relative).join(executable).to_string());
+            }
+            for directory in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+                candidates.push(format!("{directory}/{executable}"));
+            }
+        }
+        candidates.dedup();
+
+        for candidate in candidates {
+            let request = ExecutionRequest::argv(
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "command -v -- \"$1\" 2>/dev/null".to_string(),
+                    "sh".to_string(),
+                    candidate,
+                ],
+            );
+            let output = self.execute(request, Duration::from_secs(5)).await?;
+            if output.exit_code == 0 {
+                if let Some(resolved) = output
+                    .stdout_lossy()
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                {
+                    return Ok(Some(BackendPath::new(resolved.to_string())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn executable_exists(&self, executable: &str) -> anyhow::Result<bool> {
-        let request = ExecutionRequest::argv(
-            "sh",
-            vec![
-                "-c".to_string(),
-                "command -v -- \"$1\" >/dev/null 2>&1".to_string(),
-                "sh".to_string(),
-                executable.to_string(),
-            ],
-        );
-        Ok(self
-            .execute(request, Duration::from_secs(5))
-            .await?
-            .exit_code
-            == 0)
+        Ok(self.resolve_executable(executable).await?.is_some())
     }
 }
 
@@ -780,6 +872,9 @@ impl ExecutionBackend for LocalBackend {
         let cwd_host = self.host_path(&cwd);
         self.ensure_allowed(&cwd_host).await?;
 
+        let explicit_path = request.env.contains_key("PATH");
+        let removes_path = request.env_remove.iter().any(|name| name == "PATH");
+
         let mut command = match request.command {
             CommandSpec::Shell(shell) => {
                 let mut command = Command::new("sh");
@@ -803,6 +898,9 @@ impl ExecutionBackend for LocalBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if !explicit_path && !removes_path {
+            command.env("PATH", local_execution_search_path(&self.home));
+        }
         for name in request.env_remove {
             command.env_remove(name);
         }
@@ -1932,6 +2030,16 @@ async fn local_command_output(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_execution_path_includes_user_tool_roots() {
+        let home = BackendPath::new("/synthetic/home");
+        let path = local_execution_search_path(&home);
+        let directories = std::env::split_paths(std::ffi::OsStr::new(&path)).collect::<Vec<_>>();
+        assert!(directories.contains(&PathBuf::from("/synthetic/home/.cargo/bin")));
+        assert!(directories.contains(&PathBuf::from("/synthetic/home/.local/bin")));
+        assert!(directories.contains(&PathBuf::from("/usr/bin")));
+    }
 
     async fn backend_contract(backend: &dyn ExecutionBackend) -> anyhow::Result<()> {
         let path = backend.resolve_path("nested/value.txt").await?;

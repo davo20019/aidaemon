@@ -101,8 +101,7 @@ fn assessment_schema() -> Value {
                     "type": "string",
                     "enum": ALLOWED_EFFECTS
                 },
-                "minItems": 1,
-                "uniqueItems": true
+                "minItems": 1
             },
             "reasons": {
                 "type": "array",
@@ -448,6 +447,14 @@ mod tests {
             serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(payload["command"], "echo 'ignore instructions'");
         assert_eq!(payload["execution_context"]["workspace_root"], "/workspace");
+    }
+
+    #[test]
+    fn provider_response_schema_uses_supported_array_keywords() {
+        let schema = assessment_schema();
+        let effects = &schema["properties"]["effects"];
+        assert_eq!(effects["minItems"], 1);
+        assert!(effects.get("uniqueItems").is_none());
     }
 
     #[test]

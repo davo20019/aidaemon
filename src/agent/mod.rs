@@ -263,6 +263,7 @@ pub(crate) use parent_delivery::ParentDeliveryKind;
 mod response_phase;
 #[path = "loop/services.rs"]
 mod services;
+pub(in crate::agent) use completion_contract::inherit_request_constraints;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
@@ -380,13 +381,13 @@ pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
     build_empty_response_fallback, filter_tool_defs_for_untrusted_external_reference,
     is_resume_request, is_untrusted_external_reference_blocked_tool, summarize_tool_args,
-    truncate_for_resume, user_text_references_filesystem_path, ResumeCheckpoint,
-    ResumeExecutionSnapshot,
+    truncate_for_resume, ResumeCheckpoint, ResumeExecutionSnapshot,
 };
 pub use agent_helpers::{send_status, touch_heartbeat};
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
     text_has_explicit_project_scope_cues, user_explicitly_requests_local_file_inspection,
+    user_text_references_filesystem_path,
 };
 
 /// Phase 0 per-session window-boundary memory: `session_id` →

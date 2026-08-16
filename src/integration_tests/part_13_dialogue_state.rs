@@ -98,7 +98,7 @@ async fn test_semantic_followup_uses_dialogue_state_projection() {
             .open_request
             .as_ref()
             .map(|request| request.text.as_str()),
-        Some("You didn't answer my question")
+        Some("What were the deployment regressions in yesterday's rollout?")
     );
     assert_eq!(
         dialogue_state.last_user_turn.as_ref().map(|turn| turn.kind),
@@ -316,9 +316,25 @@ async fn test_schedule_trigger_followup_blocks_off_topic_web_search() {
         .unwrap();
 
     assert!(
-        response.contains("without verified success")
-            && !response.contains("What I need from you"),
-        "an unavailable in-scope observation must fail honestly without asking the user to manufacture a receipt: {response}"
+        !response.contains("What I need from you"),
+        "an unavailable in-scope observation must not ask the user to manufacture a receipt: {response}"
+    );
+    let event_store = crate::events::EventStore::new(harness.state.pool())
+        .await
+        .expect("event store from harness pool");
+    let events = event_store
+        .query_recent_events(session_id, 100)
+        .await
+        .expect("recent events");
+    assert!(
+        events.iter().any(|event| {
+            event
+                .parse_data::<crate::events::TaskEndData>()
+                .ok()
+                .and_then(|data| data.outcome)
+                == Some(crate::events::TaskOutcome::Failed)
+        }),
+        "the unavailable observation must end with a typed failed outcome"
     );
     assert!(
         queries.lock().await.is_empty(),

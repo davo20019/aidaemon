@@ -169,17 +169,21 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
             Some("list" | "search") | None => vec![capability(
                 UserMemory,
                 &[CurrentState, Content, Attribution],
-                Advisory,
+                // This operation reads the canonical persisted memory ledger.
+                // The stored claim may itself be user-supplied, but whether it
+                // exists (or does not exist) is an authoritative store fact.
+                Canonical,
                 Current,
             )],
             _ => Vec::new(),
         },
-        "manage_people" | "remember_fact" | "share_memory" => vec![capability(
+        "manage_people" => vec![capability(
             UserMemory,
             &[CurrentState, HistoricalRecord, Content, Attribution],
-            Advisory,
+            Canonical,
             Both,
         )],
+        "remember_fact" | "share_memory" => Vec::new(),
         "http_request" | "web_fetch" | "browser" => vec![capability(
             ExternalRemote,
             &[CurrentState, Content, Outcome],
@@ -545,19 +549,19 @@ mod tests {
     }
 
     #[test]
-    fn evidence_ontology_rejects_impossible_direct_current_memory_requirement() {
-        let impossible = requirement(
+    fn canonical_memory_store_can_report_current_presence_or_absence() {
+        let direct = requirement(
             ToolSemanticScope::UserMemory,
             EvidencePurpose::CurrentState,
             EvidenceAuthority::Direct,
             EvidenceTemporalScope::Current,
         );
-        assert!(!requirement_has_builtin_evidence_route(&impossible));
+        assert!(requirement_has_builtin_evidence_route(&direct));
 
         let coherent = requirement(
             ToolSemanticScope::UserMemory,
             EvidencePurpose::CurrentState,
-            EvidenceAuthority::Advisory,
+            EvidenceAuthority::Canonical,
             EvidenceTemporalScope::Current,
         );
         assert!(requirement_has_builtin_evidence_route(&coherent));

@@ -86,7 +86,7 @@ fn assimilate_continuation_receipt(
             &evidence.result.result,
             &metadata,
         );
-    let matched_requirement_indices = if semantics.observes_state() {
+    let mut matched_requirement_indices = if semantics.observes_state() {
         super::tool_execution_phase::matching_evidence_requirement_indices(
             contract,
             semantics,
@@ -97,6 +97,20 @@ fn assimilate_continuation_receipt(
     } else {
         Vec::new()
     };
+    if semantics.observes_state() {
+        for index in super::tool_execution_phase::accumulate_evidence_requirement_marker_matches(
+            contract,
+            progress,
+            semantics,
+            &raw_arguments,
+            &evidence.result.result,
+            &metadata,
+        ) {
+            if !matched_requirement_indices.contains(&index) {
+                matched_requirement_indices.push(index);
+            }
+        }
+    }
     let requirement_match = if contract.evidence_requirements.is_empty() {
         matched_contract
     } else {
@@ -267,7 +281,6 @@ impl Agent {
             user_text: canonical_user_text,
             task_id,
             task_plan: bootstrap_task_plan,
-            task_assessment_attempted,
             memory_pipeline_policy,
             resume_execution_snapshot,
             emitter,
@@ -287,7 +300,7 @@ impl Agent {
             llm_router,
             mut model,
             route_failsafe_active,
-            mut turn_context,
+            turn_context,
             mut project_instruction_tracker,
             core_prompt_bytes,
             fresh_task_context_tail,
@@ -302,11 +315,6 @@ impl Agent {
         // From this point onward, use exactly what was persisted so matching,
         // rendering, routing, and dialogue projection share one source of truth.
         let user_text = canonical_user_text.as_str();
-        // Bind the complete obligation container to this task before planning,
-        // tool selection, or finalization can consume it. A genuine follow-up
-        // records the prior task as explicit adoption lineage; a new request
-        // receives a fresh, single-task scope below.
-        turn_context.completion_contract.adopt_for_task(&task_id);
         let followup_mode = turn_context
             .followup_mode
             .map(|mode| mode.as_str())
@@ -389,359 +397,9 @@ impl Agent {
             harness_eval: None,
             eval: None,
         };
-        // Task-start semantic assessment is authoritative for language-derived
-        // completion obligations. Autonomous models receive classification
-        // without step scaffolding and retain control of their approach.
-        // In tests, MockProvider silently intercepts assessment calls.
-        let mut semantic_contract_applied = false;
-        let task_plan = {
-            use super::bootstrap_phase::task_planning::{
-                planned_contract_is_complete, planned_contract_is_confident,
-                planned_mutation_constraints_are_grounded, planned_tool_constraints_are_grounded,
-                planned_response_fields_are_grounded, TaskAssessmentMode,
-            };
-            let model_trust_tier = self.trust_tier_for_model(&model);
-            let planner_trust_tier = model_trust_tier.as_str();
-            let assessment_mode = match model_trust_tier {
-                crate::agent::trust_tier::ModelTrustTier::Guided => {
-                    TaskAssessmentMode::GuidedPlan
-                }
-                crate::agent::trust_tier::ModelTrustTier::Autonomous => {
-                    TaskAssessmentMode::AutonomousRouting
-                }
-            };
-            let assessment_decision_type = match assessment_mode {
-                TaskAssessmentMode::GuidedPlan => {
-                    crate::events::DecisionType::HandHoldingTelemetry
-                }
-                TaskAssessmentMode::AutonomousRouting => crate::events::DecisionType::IntentGate,
-            };
-            let plan_opt = bootstrap_task_plan;
-                if let Some(ref plan) = plan_opt {
-                    let mut before_contract = turn_context.completion_contract.clone();
-                    if let Some(shape) = plan.task_shape.as_ref().filter(|shape| {
-                        matches!(
-                            shape
-                                .confidence
-                                .as_deref()
-                                .map(|value| value.trim().to_ascii_lowercase()),
-                            Some(value) if matches!(value.as_str(), "medium" | "high")
-                        )
-                    }) {
-                        turn_context.continue_inline_after_background_start = shape
-                            .continue_inline_after_background_start
-                            .unwrap_or(false);
-                        if let (Some(relationship), Some(semantic_scope)) = (
-                            shape.request_relationship.as_deref(),
-                            shape.semantic_scope.as_deref(),
-                        ) {
-                            match crate::agent::dialogue_state::record_dialogue_semantic_user_turn(
-                                self,
-                                session_id,
-                                user_text,
-                                relationship,
-                                semantic_scope,
-                            )
-                            .await
-                            {
-                                Ok(Some(crate::traits::UserTurnKind::NewRequest)) => {
-                                    turn_context.followup_mode = Some(
-                                        crate::agent::followup::FollowupMode::NewTask,
-                                    );
-                                    // Bootstrap deliberately treats an unresolved
-                                    // request as a provisional antecedent. Once the
-                                    // typed semantic assessment says this is a new
-                                    // request, rebuild every hard obligation from
-                                    // the current authored turn. Merely changing the
-                                    // mode is insufficient: otherwise response
-                                    // fields, targets, and evidence requirements
-                                    // inferred from the old request remain executable.
-                                    turn_context.completion_contract =
-                                        crate::agent::completion_contract::infer_structural_completion_contract(
-                                            user_text,
-                                            &self.path_aliases.projects,
-                                        );
-                                    turn_context
-                                        .completion_contract
-                                        .adopt_for_task(&task_id);
-                                    turn_context.goal_user_text = user_text.to_string();
-                                    turn_context.inherited_completion_contract = false;
-                                    before_contract =
-                                        turn_context.completion_contract.clone();
-                                    if plan
-                                        .contract
-                                        .as_ref()
-                                        .and_then(|contract| contract.project_reference.as_deref())
-                                        .is_none()
-                                        && !crate::agent::user_text_references_filesystem_path(
-                                            user_text,
-                                        )
-                                    {
-                                        turn_context.primary_project_scope = None;
-                                    }
-                                }
-                                Ok(Some(crate::traits::UserTurnKind::Followup)) => {
-                                    turn_context.followup_mode =
-                                        Some(crate::agent::followup::FollowupMode::Followup);
-                                }
-                                Ok(Some(crate::traits::UserTurnKind::ClarificationAnswer)) => {
-                                    turn_context.followup_mode = Some(
-                                        crate::agent::followup::FollowupMode::ClarificationAnswer,
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(error) => warn!(
-                                    session_id,
-                                    %error,
-                                    "Failed to persist semantic dialogue classification"
-                                ),
-                            }
-                        }
-                    }
-                    // Install only a complete, grounded semantic contract.
-                    // Partial output cannot refine a hard decision.
-                    if let Some(ref signals) = plan.contract {
-                        let scope = signals
-                            .mutation_scope
-                            .as_deref()
-                            .map(|value| value.trim().to_ascii_lowercase())
-                            .unwrap_or_default();
-                        let declares_negative_scope =
-                            matches!(scope.as_str(), "read_only" | "read-only" | "scoped");
-                        let forbids_tool_use = signals
-                            .tool_scope
-                            .as_deref()
-                            .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"));
-                        let has_tool_constraints =
-                            forbids_tool_use || !signals.forbidden_tool_scopes.is_empty();
-                        let confident = planned_contract_is_confident(
-                            signals,
-                            plan.task_shape.as_ref(),
-                        );
-                        let complete = planned_contract_is_complete(signals);
-                        let grounded = planned_mutation_constraints_are_grounded(
-                            signals,
-                            user_text,
-                        );
-                        let tool_constraint_grounded =
-                            planned_tool_constraints_are_grounded(signals, user_text);
-                        let response_fields_grounded =
-                            planned_response_fields_are_grounded(signals, user_text);
-
-                        if confident
-                            && complete
-                            && (!declares_negative_scope || grounded)
-                            && (!has_tool_constraints || tool_constraint_grounded)
-                            && response_fields_grounded
-                        {
-                            let planned_kind = signals
-                                .task_kind
-                                .as_deref()
-                                .and_then(crate::agent::parse_planned_task_kind)
-                                .expect("complete semantic contract has a valid task kind");
-                            let forbidden_actions = signals
-                                .forbidden_actions
-                                .iter()
-                                .filter_map(|action| {
-                                    crate::agent::parse_planned_forbidden_action(action)
-                                })
-                                .collect::<Vec<_>>();
-                            let required_effects = if signals.expects_mutation == Some(true) {
-                                crate::agent::parse_planned_mutation_effects(
-                                    signals
-                                        .required_effects
-                                        .as_deref()
-                                        .expect("complete semantic contract has effects"),
-                                )
-                                .expect("complete semantic contract has valid effects")
-                            } else {
-                                crate::traits::ToolMutationEffects::NONE
-                            };
-                            crate::agent::install_semantic_completion_contract(
-                                &mut turn_context.completion_contract,
-                                crate::agent::SemanticCompletionRequirements {
-                                    expects_mutation: signals
-                                        .expects_mutation
-                                        .expect("complete semantic contract"),
-                                    requires_observation: signals
-                                        .requires_observation
-                                        .expect("complete semantic contract"),
-                                    task_kind: planned_kind,
-                                    required_mutation_effects: required_effects,
-                                    mutation_scope: signals
-                                        .mutation_scope
-                                        .as_deref()
-                                        .unwrap_or("allowed"),
-                                    forbidden_actions: &forbidden_actions,
-                                    minimum_sources: signals.minimum_sources.unwrap_or_default()
-                                        as usize,
-                                    requires_primary_sources: signals
-                                        .requires_primary_sources
-                                        .unwrap_or(false),
-                                    requires_exact_history: signals
-                                        .requires_exact_history
-                                        .unwrap_or(false),
-                                    evidence_requirements: signals
-                                        .evidence_requirements
-                                        .as_deref()
-                                        .unwrap_or_default(),
-                                    forbids_tool_use,
-                                    forbidden_tool_scopes: &signals.forbidden_tool_scopes,
-                                    required_response_fields: &signals.required_response_fields,
-                                },
-                            );
-                            if turn_context.inherited_completion_contract
-                                && turn_context.followup_mode
-                                    != Some(crate::agent::followup::FollowupMode::NewTask)
-                            {
-                                turn_context.completion_contract =
-                                    crate::agent::inherit_unfinished_request_contract(
-                                        turn_context.completion_contract.clone(),
-                                        &before_contract,
-                                    );
-                            }
-                            if let Some(reference) = signals
-                                .project_reference
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|reference| !reference.is_empty())
-                                .filter(|reference| {
-                                    user_text
-                                        .to_ascii_lowercase()
-                                        .contains(&reference.to_ascii_lowercase())
-                                })
-                            {
-                                if let Some(scope) =
-                                    crate::tools::fs_utils::resolve_project_scope_reference(
-                                        reference,
-                                        &self.path_aliases.projects,
-                                    )
-                                {
-                                    turn_context.primary_project_scope =
-                                        Some(scope.to_string_lossy().to_string());
-                                }
-                            }
-                            semantic_contract_applied = true;
-                            if let Err(error) = crate::agent::dialogue_state::record_dialogue_completion_contract(
-                                self,
-                                session_id,
-                                user_text,
-                                &turn_context.completion_contract,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    session_id,
-                                    %error,
-                                    "Failed to persist semantic completion contract"
-                                );
-                            }
-                        } else {
-                            warn!(
-                                session_id,
-                                confident,
-                                complete,
-                                grounded,
-                                mutation_scope = %scope,
-                                "Ignored incomplete or untrusted semantic contract"
-                            );
-                        }
-                        if turn_context.completion_contract != before_contract {
-                            info!(
-                                session_id,
-                                task_kind = ?turn_context.completion_contract.task_kind,
-                                expects_mutation =
-                                    turn_context.completion_contract.expects_mutation,
-                                requires_observation =
-                                    turn_context.completion_contract.requires_observation,
-                                "Installed semantic completion contract"
-                            );
-                        }
-                    }
-                    let contract_changed = turn_context.completion_contract != before_contract;
-                    self.emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        assessment_decision_type,
-                        "Task assessment succeeded".to_string(),
-                        {
-                            let mut metadata =
-                                super::hand_holding_telemetry::planner_result_metadata(
-                                    "succeeded",
-                                    &model,
-                                    planner_trust_tier,
-                                    super::hand_holding_telemetry::PlannerResultStats {
-                                        step_count: plan.steps.len(),
-                                        success_criteria_count: plan.success_criteria.len(),
-                                        contract_present: plan.contract.is_some(),
-                                        contract_changed,
-                                    },
-                                    None,
-                                );
-                            metadata["assessment_mode"] = json!(plan.mode.as_str());
-                            metadata["task_shape"] = json!(plan.task_shape.as_ref());
-                            metadata["completion_contract"] = json!({
-                                "task_kind": format!(
-                                    "{:?}",
-                                    turn_context.completion_contract.task_kind
-                                )
-                                .to_ascii_lowercase(),
-                                "expects_mutation": turn_context
-                                    .completion_contract
-                                    .expects_mutation,
-                                "required_mutation_effects": turn_context
-                                    .completion_contract
-                                    .required_mutation_effects,
-                                "requires_observation": turn_context
-                                    .completion_contract
-                                    .requires_observation,
-                                "requires_reverification_after_mutation": turn_context
-                                    .completion_contract
-                                    .requires_reverification_after_mutation,
-                                "explicit_verification_requested": turn_context
-                                    .completion_contract
-                                    .explicit_verification_requested,
-                                "evidence_requirements": turn_context
-                                    .completion_contract
-                                    .evidence_requirements,
-                                "forbidden_actions": turn_context
-                                    .completion_contract
-                                    .forbidden_mutation_actions
-                                    .iter()
-                                    .map(|action| action.as_str())
-                                    .collect::<Vec<_>>(),
-                                "forbidden_tool_scopes": turn_context
-                                    .completion_contract
-                                    .forbidden_tool_scopes,
-                                "required_response_fields": turn_context
-                                    .completion_contract
-                                    .required_response_fields,
-                            });
-                            metadata
-                        },
-                    )
-                    .await;
-                } else if task_assessment_attempted {
-                    self.emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        assessment_decision_type,
-                        "Task assessment returned no result".to_string(),
-                        super::hand_holding_telemetry::planner_result_metadata(
-                            "no_plan",
-                            &model,
-                            planner_trust_tier,
-                            super::hand_holding_telemetry::PlannerResultStats::empty(),
-                            Some("assessment_returned_none"),
-                        ),
-                    )
-                    .await;
-                }
-                plan_opt
-        };
-
+        // Bootstrap finalized the immutable relationship, contract, memory policy,
+        // and prompt context before this execution loop was constructed.
+        let task_plan = bootstrap_task_plan;
         // The semantic assessment may refine the bootstrap relationship. Use
         // the finalized typed relationship—not the request wording or an
         // earlier provisional value—to decide whether prior turns can enter
@@ -766,15 +424,6 @@ impl Agent {
                     .map(|turn| turn.message_id.clone())
             })
             .flatten();
-
-        if self.mandate_execution.is_none()
-            && !semantic_contract_applied
-            && !turn_context.inherited_completion_contract
-        {
-            crate::agent::retain_structural_completion_contract(
-                &mut turn_context.completion_contract,
-            );
-        }
 
         // The bootstrap policy was compiled from this exact assessment before
         // optional memory access. Reassert the deny edge after contract
@@ -894,11 +543,26 @@ impl Agent {
             turn_state.directives.push_system_message(
                 SystemDirective::ToolUseForbiddenByRequest { outstanding_needs },
             );
-        } else if !turn_context
-            .completion_contract
-            .forbidden_tool_scopes
-            .is_empty()
-        {
+        } else {
+            if !turn_context
+                .completion_contract
+                .allowed_tool_names
+                .is_empty()
+            {
+                let allowed_tool_names = &turn_context.completion_contract.allowed_tool_names;
+                tool_defs.retain(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| allowed_tool_names.iter().any(|allowed| allowed == name))
+                });
+            }
+            if !turn_context
+                .completion_contract
+                .forbidden_tool_scopes
+                .is_empty()
+            {
             let forbidden_scopes = &turn_context.completion_contract.forbidden_tool_scopes;
             tool_defs.retain(|definition| {
                 let Some(name) = definition
@@ -921,6 +585,7 @@ impl Agent {
                     });
                 !scope.is_some_and(|scope| forbidden_scopes.contains(&scope))
             });
+            }
         }
         let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(
             &turn_context.completion_contract.evidence_requirements,
@@ -975,6 +640,53 @@ impl Agent {
                 }),
             )
             .await;
+        }
+        // Policy filtering may rebuild definitions from `base_tool_defs`.
+        // Reapply the task's hard capability boundary afterward so an
+        // uncertainty-driven policy refresh cannot widen an allow-only or
+        // denied-scope contract.
+        if turn_context.completion_contract.forbids_tool_use {
+            tool_defs.clear();
+        } else if !turn_context
+            .completion_contract
+            .allowed_tool_names
+            .is_empty()
+        {
+            let allowed = &turn_context.completion_contract.allowed_tool_names;
+            tool_defs.retain(|definition| {
+                definition
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| allowed.iter().any(|candidate| candidate == name))
+            });
+        }
+        if !turn_context
+            .completion_contract
+            .forbidden_tool_scopes
+            .is_empty()
+        {
+            let forbidden = &turn_context.completion_contract.forbidden_tool_scopes;
+            tool_defs.retain(|definition| {
+                let Some(name) = definition
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return false;
+                };
+                self.tools
+                    .iter()
+                    .find(|tool| tool.name() == name && tool.is_available())
+                    .and_then(|tool| {
+                        tool.semantic_affordances()
+                            .map(|affordances| affordances.scope)
+                    })
+                    .or_else(|| {
+                        super::tool_execution_phase::fallback_tool_semantic_scope(name)
+                    })
+                    .is_none_or(|scope| !forbidden.contains(&scope))
+            });
         }
         if !turn_context.completion_contract.forbids_tool_use
             && !turn_context
@@ -2320,24 +2032,26 @@ mod stuck_fallback_tests {
     }
 
     #[test]
-    fn new_task_assessment_excludes_unrelated_recent_context() {
+    fn provisional_new_task_assessment_can_name_but_not_adopt_an_antecedent() {
         let recent = vec![json!({
+            "message_id": "synthetic-prior-user",
             "role": "assistant",
             "content": "The previous device check requires live health evidence."
         })];
-        assert_eq!(
-            task_assessment_conversation_context(
-                Some(FollowupMode::NewTask),
-                Some("Prior device discussion"),
-                &recent,
-            ),
-            None
-        );
+        let context = task_assessment_conversation_context(
+            Some(FollowupMode::NewTask),
+            Some("Prior device discussion"),
+            &recent,
+        )
+        .expect("bounded relationship context");
+        assert!(context.contains("message_id=synthetic-prior-user"));
+        assert!(context.contains("Prior device discussion"));
     }
 
     #[test]
     fn followup_assessment_retains_the_preceding_exchange() {
         let recent = vec![json!({
+            "message_id": "synthetic-user-1",
             "role": "user",
             "content": "Check the first device."
         })];

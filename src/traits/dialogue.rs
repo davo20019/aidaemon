@@ -56,9 +56,9 @@ pub struct RequestEvidenceRequirement {
     pub minimum_authority: EvidenceAuthority,
     pub temporal_scope: EvidenceTemporalScope,
     /// Exact field/key tokens whose presence must be proven by a content
-    /// observation. These are typed evidence constraints, not completion
-    /// phrases. Older persisted contracts omit them and retain scope-level
-    /// matching behavior.
+    /// observation. Outcome requirements are closed by typed receipt fields;
+    /// their reply formatting belongs in `required_response_fields` instead.
+    /// Older persisted contracts omit markers and retain scope-level matching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_content_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +86,11 @@ pub struct RequestCompletionContract {
     /// The current request explicitly forbids every tool/lookup path.
     #[serde(default)]
     pub forbids_tool_use: bool,
+    /// When non-empty, only these explicitly authorized tool identifiers may
+    /// execute for the request. This represents "use only X" without
+    /// collapsing the contract into an all-tools prohibition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tool_names: Vec<String>,
     /// Capability domains the current request explicitly excludes while
     /// leaving unrelated tools available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -227,6 +232,12 @@ pub struct DialogueState {
     pub revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_request: Option<OpenRequest>,
+    /// Request that immediately preceded a provisionally independent user
+    /// turn. Ingress cannot know whether ordinary language is a new request or
+    /// a continuation, so it retains (rather than destroys) the exact typed
+    /// antecedent until task assessment commits the relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antecedent_request: Option<OpenRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_question: Option<OpenQuestion>,
     /// The most recent open question that a user reply closed. Kept so the
@@ -252,6 +263,7 @@ impl DialogueState {
             schema_version: Self::SCHEMA_VERSION,
             revision: 1,
             open_request: None,
+            antecedent_request: None,
             open_question: None,
             last_closed_question: None,
             last_assistant_turn: None,

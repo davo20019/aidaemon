@@ -362,6 +362,23 @@ pub(super) async fn execute_tool_call_io(
     let mut result_text = match result {
         Ok(outcome) => {
             result_metadata = outcome.metadata;
+            // A successful typed observation boundary is authoritative even
+            // when the observed subject describes failed jobs, blocked tasks,
+            // or errors. Do not extend that rule to legacy mutation/admin
+            // adapters: some still return `Ok("Error: ...")` and must remain on
+            // the compatibility classifier until they emit an explicit status.
+            let registered_semantics = agent
+                .tools
+                .iter()
+                .find(|tool| tool.name() == tc.name && tool.is_available())
+                .map(|tool| tool.call_semantics(ctx.effective_arguments));
+            if result_metadata.outcome_status.is_none()
+                && registered_semantics.as_ref().is_some_and(|semantics| {
+                    semantics.observes_state() && !semantics.mutates_state()
+                })
+            {
+                result_metadata.outcome_status = Some(crate::traits::ToolOutcomeStatus::Succeeded);
+            }
             let text = outcome.output;
             if result_metadata.result_provenance.is_none() {
                 result_metadata.result_provenance = Some(

@@ -8,6 +8,21 @@ use crate::runtime_ports::{
 };
 use crate::traits::AgentRole;
 
+fn returned_generated_response(
+    captured: Vec<crate::events::CapturedGeneratedResponse>,
+    returned_text: &str,
+) -> anyhow::Result<crate::events::CapturedGeneratedResponse> {
+    captured
+        .into_iter()
+        .rev()
+        .find(|candidate| Agent::sanitize_final_reply_markers(&candidate.content) == returned_text)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "returned assistant response lacks an identity from its ingress lifecycle"
+            )
+        })
+}
+
 #[async_trait]
 impl ChildAgentRuntime for Agent {
     fn depth(&self) -> usize {
@@ -101,15 +116,13 @@ impl ConversationRuntime for Agent {
         &self,
         request: ConversationRequest,
     ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
-        let response_event_watermark = self.event_store.event_watermark().await?;
-        let text = self.handle_internal_continuation(&request).await?;
-        let generated = self
-            .event_store
-            .generated_response_after(&request.session_id, response_event_watermark, &text)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("background continuation response lacks a durable identity")
-            })?;
+        let (text, captured) = crate::events::capture_generated_responses(
+            &request.session_id,
+            self.handle_internal_continuation(&request),
+        )
+        .await;
+        let text = text?;
+        let generated = returned_generated_response(captured, &text)?.response;
         if let (Some(parent_task_id), Some(parent_tool_call_id)) =
             (request.parent_task_id, request.parent_tool_call_id)
         {
@@ -151,9 +164,9 @@ impl AgentIngress for Agent {
         &self,
         request: InboundMessageRequest,
     ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
-        let response_event_watermark = self.event_store.event_watermark().await?;
-        let text = self
-            .handle_message_with_attachments(
+        let (text, captured) = crate::events::capture_generated_responses(
+            &request.session_id,
+            self.handle_message_with_attachments(
                 &request.session_id,
                 &request.user_text,
                 &request.attachments,
@@ -161,13 +174,11 @@ impl AgentIngress for Agent {
                 request.user_role,
                 request.channel_ctx,
                 request.heartbeat,
-            )
-            .await?;
-        let generated = self
-            .event_store
-            .generated_response_after(&request.session_id, response_event_watermark, &text)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("generated response lacks a durable identity"))?;
+            ),
+        )
+        .await;
+        let text = text?;
+        let generated = returned_generated_response(captured, &text)?.response;
         Ok(crate::runtime_ports::AgentResponseEnvelope {
             response_id: generated.response_id,
             task_id: generated.task_id,

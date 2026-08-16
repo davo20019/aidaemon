@@ -95,14 +95,22 @@ fi
 codesign -f -s "$SIGN_AS" --identifier "$BUNDLE_ID" --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
 
-# launchd hands a process a minimal PATH (/usr/bin:/bin:…), so user-installed
-# tools (npm/node/wrangler via conda/homebrew) aren't found — `npm run deploy`
-# style tasks fail with "command not found". Derive a PATH from the build env
-# (node's bin dir + homebrew) so the daemon's terminal tool can find them.
-# Portable: no hardcoded user path; resolves whatever node is installed.
-NODE_BIN_DIR=""
-if command -v node >/dev/null 2>&1; then NODE_BIN_DIR="$(dirname "$(command -v node)")"; fi
-DAEMON_PATH="${NODE_BIN_DIR:+$NODE_BIN_DIR:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd hands a process a minimal PATH (/usr/bin:/bin:…). Preserve every
+# absolute search directory from the trusted packaging environment, then add
+# portable user-local and system fallbacks. This is executable-agnostic: new
+# language runtimes do not require another package-script special case.
+DAEMON_PATH=""
+OLD_IFS="$IFS"
+IFS=:
+for path_dir in ${PATH:-}; do
+  case "$path_dir" in
+    /*) case ":$DAEMON_PATH:" in *":$path_dir:"*) ;; *) DAEMON_PATH="${DAEMON_PATH:+$DAEMON_PATH:}$path_dir" ;; esac ;;
+  esac
+done
+IFS="$OLD_IFS"
+for path_dir in "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.npm-global/bin" "$HOME/.bun/bin" "$HOME/.deno/bin" "$HOME/go/bin" "$HOME/bin" /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin /usr/bin /bin /usr/sbin /sbin; do
+  case ":$DAEMON_PATH:" in *":$path_dir:"*) ;; *) DAEMON_PATH="${DAEMON_PATH:+$DAEMON_PATH:}$path_dir" ;; esac
+done
 
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>

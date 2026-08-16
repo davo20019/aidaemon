@@ -14,8 +14,9 @@ pub(in crate::agent) use project_dir::project_instruction_targets_for_tool_call;
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::run_tool_execution_phase;
 pub(in crate::agent) use run_helpers::{
-    complete_tool_result_semantics, fallback_tool_semantic_scope,
-    matching_evidence_requirement_indices, observation_matches_completion_contract,
-    tool_result_or_metadata_contains_verifiable_evidence, user_facing_external_action_ack,
+    accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,
+    fallback_tool_semantic_scope, matching_evidence_requirement_indices,
+    observation_matches_completion_contract, tool_result_or_metadata_contains_verifiable_evidence,
+    user_facing_external_action_ack,
 };
 pub(in crate::agent) use types::ToolExecutionCtx;

@@ -27,6 +27,91 @@ pub struct GeneratedResponseRef {
     pub referenced_receipts: Vec<super::CompletionProofReference>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedGeneratedResponse {
+    pub content: String,
+    pub response: GeneratedResponseRef,
+}
+
+#[derive(Clone)]
+struct GeneratedResponseCapture {
+    session_id: String,
+    responses: Arc<std::sync::Mutex<Vec<CapturedGeneratedResponse>>>,
+}
+
+tokio::task_local! {
+    static GENERATED_RESPONSE_CAPTURE: GeneratedResponseCapture;
+}
+
+/// Execute one ingress lifecycle with a causal response-identity collector.
+/// Tokio task locals are intentionally not inherited by spawned background
+/// tasks, so their later responses cannot race the channel handoff.
+pub(crate) async fn capture_generated_responses<F, T>(
+    session_id: &str,
+    future: F,
+) -> (T, Vec<CapturedGeneratedResponse>)
+where
+    F: std::future::Future<Output = T>,
+{
+    let responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = GeneratedResponseCapture {
+        session_id: session_id.to_string(),
+        responses: Arc::clone(&responses),
+    };
+    let output = GENERATED_RESPONSE_CAPTURE.scope(capture, future).await;
+    let captured = responses
+        .lock()
+        .map(|responses| responses.clone())
+        .unwrap_or_default();
+    (output, captured)
+}
+
+fn generated_response_from_event(event: &Event) -> Option<CapturedGeneratedResponse> {
+    if event.event_type != EventType::AssistantResponse {
+        return None;
+    }
+    let content = event.data.get("content")?.as_str()?.to_string();
+    let response_id = event
+        .data
+        .get("message_id")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let task_id = event
+        .task_id
+        .clone()
+        .or_else(|| {
+            event
+                .data
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())?;
+    let turn_id = event.turn_id.clone().or_else(|| {
+        event
+            .data
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    let referenced_receipts = event
+        .data
+        .get("referenced_receipts")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    Some(CapturedGeneratedResponse {
+        content,
+        response: GeneratedResponseRef {
+            response_id,
+            task_id,
+            turn_id,
+            referenced_receipts,
+        },
+    })
+}
+
 /// Exact durable execution evidence that caused a runtime continuation.
 ///
 /// Both halves are required: the call owns the requested arguments while the
@@ -411,9 +496,11 @@ impl EventStore {
     }
 
     /// Return the exact generated-response identity for a completed agent
-    /// handoff. The immutable pre-dispatch watermark is the selector; content
-    /// is only an integrity check. This prevents an identical historical reply
-    /// from being attributed to the current delivery.
+    /// handoff. The immutable pre-dispatch watermark bounds the candidate set;
+    /// the returned content selects the response inside that set. A later
+    /// internal response may legitimately be persisted before the transport
+    /// regains control, so assuming the newest row is the returned row can turn
+    /// a successful task into a user-visible dispatch diagnostic.
     pub async fn generated_response_after(
         &self,
         session_id: &str,
@@ -425,10 +512,12 @@ impl EventStore {
              FROM events
              WHERE session_id = ? AND id > ? AND event_type = 'assistant_response'
                AND json_type(data, '$.message_id') = 'text'
+               AND json_extract(data, '$.content') = ?
              ORDER BY id DESC LIMIT 1",
         )
         .bind(session_id)
         .bind(event_watermark)
+        .bind(content)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
@@ -436,10 +525,6 @@ impl EventStore {
         };
         let raw: String = row.get("data");
         let data: serde_json::Value = serde_json::from_str(&raw)?;
-        anyhow::ensure!(
-            data.get("content").and_then(serde_json::Value::as_str) == Some(content),
-            "latest generated response after dispatch does not match returned content"
-        );
         let response_id = data
             .get("message_id")
             .and_then(serde_json::Value::as_str)
@@ -600,6 +685,7 @@ impl EventStore {
 
     /// Append a new event to the store. Returns the assigned event ID.
     pub async fn append(&self, event: Event) -> anyhow::Result<i64> {
+        let generated_response = generated_response_from_event(&event);
         let data_json = serde_json::to_string(&event.data)?;
         let event_type_str = event.event_type.as_str();
         let created_at_str = event.created_at.to_rfc3339();
@@ -668,6 +754,15 @@ impl EventStore {
                 // Never couple the canonical append transaction to FTS health.
                 tracing::debug!(%error, event_id, "Deferred exact-history projection");
             }
+        }
+        if let Some(generated_response) = generated_response {
+            let _ = GENERATED_RESPONSE_CAPTURE.try_with(|capture| {
+                if capture.session_id == event.session_id {
+                    if let Ok(mut responses) = capture.responses.lock() {
+                        responses.push(generated_response);
+                    }
+                }
+            });
         }
         Ok(event_id)
     }
@@ -2462,6 +2557,20 @@ mod tests {
             before_projection, 0,
             "canonical append must not imply memory persistence"
         );
+        store
+            .project_user_message_memory_span(event_id)
+            .await
+            .unwrap();
+        let while_policy_pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
+                .bind(event_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            while_policy_pending, 0,
+            "projection fails closed until the task has a durable allowed policy"
+        );
 
         store
             .append(Event::new(
@@ -2538,6 +2647,100 @@ mod tests {
         assert_eq!(generated.response_id, "response-current");
         assert_eq!(generated.task_id, "task-current");
         assert_eq!(generated.turn_id.as_deref(), Some("turn-current"));
+    }
+
+    #[tokio::test]
+    async fn generated_response_selection_ignores_later_internal_response() {
+        let (store, _database) = setup_store().await;
+        let watermark = store.event_watermark().await.unwrap();
+        for (task_id, message_id, content) in [
+            (
+                "task-returned",
+                "response-returned",
+                "returned to transport",
+            ),
+            (
+                "task-internal",
+                "response-internal",
+                "later internal response",
+            ),
+        ] {
+            store
+                .append(Event::new(
+                    "session-a",
+                    EventType::AssistantResponse,
+                    json!({
+                        "task_id": task_id,
+                        "turn_id": format!("turn-{task_id}"),
+                        "message_id": message_id,
+                        "content": content,
+                        "model": "test",
+                        "referenced_receipts": []
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let generated = store
+            .generated_response_after("session-a", watermark, "returned to transport")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generated.response_id, "response-returned");
+        assert_eq!(generated.task_id, "task-returned");
+    }
+
+    #[tokio::test]
+    async fn ingress_capture_collects_only_causally_scoped_session_responses() {
+        let (store, _database) = setup_store().await;
+        let store = Arc::new(store);
+        let ((), captured) = capture_generated_responses("session-a", async {
+            for (session_id, task_id, message_id, content) in [
+                ("session-a", "task-a", "response-a", "returned response"),
+                ("session-b", "task-b", "response-b", "unrelated response"),
+            ] {
+                store
+                    .append(Event::new(
+                        session_id,
+                        EventType::AssistantResponse,
+                        json!({
+                            "task_id": task_id,
+                            "turn_id": format!("turn-{task_id}"),
+                            "message_id": message_id,
+                            "content": content,
+                            "referenced_receipts": []
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let background_store = Arc::clone(&store);
+            tokio::spawn(async move {
+                background_store
+                    .append(Event::new(
+                        "session-a",
+                        EventType::AssistantResponse,
+                        json!({
+                            "task_id": "task-background",
+                            "turn_id": "turn-background",
+                            "message_id": "response-background",
+                            "content": "background response",
+                            "referenced_receipts": []
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "returned response");
+        assert_eq!(captured[0].response.response_id, "response-a");
+        assert_eq!(captured[0].response.task_id, "task-a");
     }
 
     #[tokio::test]

@@ -312,6 +312,14 @@ fn negative_contract_block_reason(
     tool_call: &ToolCall,
     is_side_effecting: bool,
 ) -> Option<String> {
+    if !contract.allowed_tool_names.is_empty()
+        && !contract
+            .allowed_tool_names
+            .iter()
+            .any(|name| name == &tool_call.name)
+    {
+        return Some("tool outside the explicit allow-only set".to_string());
+    }
     if contract.forbids_tool_use {
         return Some("all tool use".to_string());
     }
@@ -338,7 +346,15 @@ fn negative_contract_block_reason(
         if opaque_shell_observation_candidate {
             return None;
         }
-        if is_side_effecting || matches!(tool_call.name.as_str(), "spawn_agent" | "cli_agent") {
+        // `cli_agent` consumes the dispatcher-owned mutation-forbidden bit and
+        // may proceed only through a registered provider-native read-only
+        // sandbox. It is therefore safe to reach the tool boundary; unsupported
+        // adapters fail before process launch. In-process `spawn_agent` remains
+        // opaque here and stays blocked.
+        if tool_call.name == "cli_agent" {
+            return None;
+        }
+        if is_side_effecting || tool_call.name == "spawn_agent" {
             return Some("all mutation".to_string());
         }
         return None;
@@ -1865,6 +1881,16 @@ mod tests {
         assert_eq!(
             negative_contract_block_reason(&contract, &delegated, false).as_deref(),
             Some("all mutation")
+        );
+
+        let cli = tool_call(
+            "cli_agent",
+            r#"{"action":"run","tool":"codex","prompt":"Inspect only"}"#,
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &cli, true),
+            None,
+            "the CLI adapter owns the hard read-only sandbox decision"
         );
     }
 

@@ -1126,6 +1126,20 @@ async fn quarantine_uncontrolled_autopilot_mandates(
     Ok(())
 }
 
+/// Reconcile persisted authority invariants before any background dispatcher or
+/// management surface can observe legacy rows. Waiting until the next due
+/// lease leaves an unmeasurable autopilot mandate visibly `active` after a
+/// restart, even though no safe controller run can execute it.
+pub(super) async fn enforce_mandate_invariants_on_startup(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    quarantine_uncontrolled_autopilot_mandates(&mut transaction, &now).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 #[async_trait]
 impl MandateStore for SqliteStateStore {
     async fn create_mandate_controller(
@@ -4662,6 +4676,41 @@ mod tests {
             run_failure_budget: 3,
             baseline_observed_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn startup_quarantines_legacy_autopilot_before_any_lease_claim() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 0);
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
+        mandate.objective_control = Some(objective_control());
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        // Reproduce a legacy active row without the now-mandatory controller.
+        sqlx::query("UPDATE mandates SET objective_control_json = NULL WHERE id = ?")
+            .bind(&mandate.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        enforce_mandate_invariants_on_startup(&store.pool)
+            .await
+            .unwrap();
+
+        let quarantined = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(quarantined.status, MandateStatus::AwaitingInput);
+        assert!(quarantined.objective_control.is_none());
+        assert_eq!(
+            quarantined.suspension.as_ref().map(|value| value.kind),
+            Some(MandateSuspensionKind::ObjectiveControlRequired)
+        );
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "paused"
+        );
     }
 
     #[tokio::test]

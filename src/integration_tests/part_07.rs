@@ -480,16 +480,13 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         "completion was accepted on the first iteration (calls={})",
         calls.len()
     );
-    let nudged = calls.iter().skip(1).any(|c| {
-        c.messages.iter().any(|m| {
-            m["content"]
-                .as_str()
-                .is_some_and(|t| t.contains("MUST include at least one tool call"))
-        })
+    let recovery_retained_execution = calls.iter().skip(1).any(|call| {
+        !call.tools.is_empty()
+            && call.options.tool_choice != crate::traits::ToolChoiceMode::None
     });
     assert!(
-        nudged,
-        "DeferredToolCallRequired directive was not injected after the fabricated claim"
+        recovery_retained_execution,
+        "the typed mutation gate did not retain execution capability after the fabricated claim"
     );
 
     let event_store = crate::events::EventStore::new(harness.state.pool())

@@ -122,6 +122,29 @@ impl MockProvider {
         request_relationship: &str,
         semantic_scope: &str,
     ) -> ProviderResponse {
+        Self::semantic_task_assessment_with_inline_continuation(
+            task_kind,
+            expects_mutation,
+            requires_observation,
+            required_effects,
+            request_relationship,
+            semantic_scope,
+            false,
+        )
+    }
+
+    /// Helper variant for a typed background edge that leaves independent
+    /// inline work outstanding after the detach receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_task_assessment_with_inline_continuation(
+        task_kind: &str,
+        expects_mutation: bool,
+        requires_observation: bool,
+        required_effects: &[&str],
+        request_relationship: &str,
+        semantic_scope: &str,
+        continue_inline_after_background_start: bool,
+    ) -> ProviderResponse {
         let evidence_requirements = if requires_observation {
             let (scope, purpose, authority, temporal_scope) = match semantic_scope {
                 "conversation_history" => (
@@ -175,6 +198,7 @@ impl MockProvider {
                     "confidence": "high",
                     "independent_workstreams": 1,
                     "requires_background_continuation": false,
+                    "continue_inline_after_background_start": continue_inline_after_background_start,
                     "request_relationship": request_relationship,
                     "semantic_scope": semantic_scope
                 }

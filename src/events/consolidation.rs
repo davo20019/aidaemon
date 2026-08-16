@@ -158,13 +158,33 @@ impl Consolidator {
         .await?
         .into_iter()
         .collect();
-        let (suppressed_events, events): (Vec<_>, Vec<_>) =
+        let allowed_task_ids: std::collections::HashSet<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM events
+             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
+               AND task_id IS NOT NULL
+               AND json_extract(data, '$.access') = 'allowed'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        let (suppressed_events, policy_eligible): (Vec<_>, Vec<_>) =
             all_events.into_iter().partition(|event| {
                 event
                     .task_id
                     .as_ref()
                     .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
             });
+        let events = policy_eligible
+            .into_iter()
+            .filter(|event| {
+                event
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|task_id| allowed_task_ids.contains(task_id))
+            })
+            .collect::<Vec<_>>();
         if !suppressed_events.is_empty() {
             let ids = suppressed_events
                 .iter()
@@ -1756,12 +1776,25 @@ mod tests {
         }
 
         let events = vec![
-            (EventType::UserMessage, user_data),
+            {
+                user_data["task_id"] = json!(task_id);
+                (EventType::UserMessage, user_data)
+            },
             (
                 EventType::TaskStart,
                 json!({
                     "task_id": task_id,
                     "description": format!("release workflow for {task_id}")
+                }),
+            ),
+            (
+                EventType::MemoryPolicyCompiled,
+                json!({
+                    "task_id": task_id,
+                    "access": "allowed",
+                    "reason_code": "synthetic_test_policy",
+                    "retrieval_suppressed": false,
+                    "persistence_suppressed": false
                 }),
             ),
             (
@@ -1945,6 +1978,21 @@ mod tests {
             .await
             .expect("append task start");
 
+        event_store
+            .append(Event::new(
+                "session-failure-pattern",
+                EventType::MemoryPolicyCompiled,
+                json!({
+                    "task_id": task_id,
+                    "access": "allowed",
+                    "reason_code": "synthetic_test_policy",
+                    "retrieval_suppressed": false,
+                    "persistence_suppressed": false
+                }),
+            ))
+            .await
+            .expect("append memory policy");
+
         let mut decision = Event::new(
             "session-failure-pattern",
             EventType::DecisionPoint,
@@ -2037,6 +2085,21 @@ mod tests {
             .append(task_start)
             .await
             .expect("append task start");
+
+        event_store
+            .append(Event::new(
+                "session-evidence-pattern",
+                EventType::MemoryPolicyCompiled,
+                json!({
+                    "task_id": task_id,
+                    "access": "allowed",
+                    "reason_code": "synthetic_test_policy",
+                    "retrieval_suppressed": false,
+                    "persistence_suppressed": false
+                }),
+            ))
+            .await
+            .expect("append memory policy");
 
         let mut decision = Event::new(
             "session-evidence-pattern",

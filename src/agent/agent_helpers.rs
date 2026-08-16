@@ -484,6 +484,7 @@ pub(in crate::agent) fn is_resume_request(text: &str) -> bool {
         || normalized.starts_with("next step ")
 }
 
+#[cfg(test)]
 pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {
     let user_text = crate::channels::attachments::user_authored_text(user_text);
     if user_text.trim().is_empty() {

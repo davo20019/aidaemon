@@ -514,23 +514,23 @@ impl Tool for SpawnAgentTool {
         // are deduplicated per task_id so the same work is not launched twice.
         let executor_task_id = if child_role == Some(AgentRole::Executor) {
             let Some(task_id) = task_id_ref.clone() else {
-                return Ok(
-                    "Blocked: TaskLead must pass task_id when spawning an executor. Claim a task first with manage_goal_tasks(action='claim_task')."
-                        .to_string(),
-                );
+                return Err(anyhow::anyhow!(
+                    "TaskLead must pass task_id when spawning an executor. Claim a task first with manage_goal_tasks(action='claim_task')."
+                ));
             };
             if let Err(e) = agent
                 .validate_executor_task_for_spawn(&task_id, goal_id_ref.as_deref())
                 .await
             {
-                return Ok(format!(
+                return Err(anyhow::anyhow!(
                     "Blocked executor spawn for task {}: {}",
-                    task_id, e
+                    task_id,
+                    e
                 ));
             }
             if !self.try_begin_executor_task(&task_id).await {
-                return Ok(format!(
-                    "Blocked: task {} already has an executor running. Wait for it to finish before spawning another.",
+                return Err(anyhow::anyhow!(
+                    "Task {} already has an executor running. Wait for it to finish before spawning another.",
                     task_id
                 ));
             }
@@ -865,7 +865,7 @@ impl SpawnAgentTool {
                         format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
                     }
                     TaskOutcome::Failed => {
-                        format!("\u{274c} Sub-agent failed\n\n{}", run.response)
+                        return Err(anyhow::anyhow!("Sub-agent failed: {}", run.response));
                     }
                 };
                 let max_len = self.max_response_chars;
@@ -879,7 +879,7 @@ impl SpawnAgentTool {
                     Ok(response)
                 }
             }
-            Ok(Err(e)) => Ok(format!("Error: specialist failed: {}", e)),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
             Err(_) => {
                 if let Some(task_id) = task_id {
                     // The child may have persisted a terminal outcome (e.g.
@@ -902,8 +902,8 @@ impl SpawnAgentTool {
                             .await;
                     }
                 }
-                Ok(format!(
-                    "Error: specialist timed out after {} seconds",
+                Err(anyhow::anyhow!(
+                    "Specialist timed out after {} seconds",
                     self.timeout_secs
                 ))
             }

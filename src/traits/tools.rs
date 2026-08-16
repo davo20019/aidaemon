@@ -505,6 +505,15 @@ impl ToolCallSemantics {
         }
     }
 
+    /// Apply a dispatcher-owned hard observation boundary while retaining
+    /// target and evidence metadata from the original call. Use only when the
+    /// adapter itself enforces that boundary before I/O.
+    pub fn constrained_to_observation(mut self) -> Self {
+        self.effect = ToolCallEffect::Observation;
+        self.mutation_effects = ToolMutationEffects::NONE;
+        self
+    }
+
     pub fn mutation() -> Self {
         Self {
             effect: ToolCallEffect::Mutation,
@@ -595,7 +604,12 @@ impl ToolCallSemantics {
         if self.verification_mode == ToolVerificationMode::None {
             self.verification_mode = fallback.verification_mode;
         }
-        if self.mutation_effects.is_empty() {
+        // An explicit observational effect is authoritative. Filling its empty
+        // mutation bitset from a conservative pre-dispatch fallback would turn
+        // a tool-enforced read-only execution back into a mutation receipt.
+        if self.mutation_effects.is_empty()
+            && (self.effect == ToolCallEffect::Unknown || self.effect.mutates_state())
+        {
             self.mutation_effects = fallback.mutation_effects;
         }
         if self.target_hints.is_empty() {
@@ -1486,6 +1500,14 @@ mod tests {
         );
         assert!(ToolMutationEffects::LOCAL_SOURCE_WRITE.satisfies(ToolMutationEffects::UNSPECIFIED));
         assert!(ToolMutationEffects::REMOTE_DEPLOY.satisfies(ToolMutationEffects::REMOTE_DEPLOY));
+    }
+
+    #[test]
+    fn explicit_observation_is_not_widened_by_conservative_fallback() {
+        let mut actual = ToolCallSemantics::observation();
+        actual.merge_missing_from(ToolCallSemantics::observation_and_mutation());
+        assert!(actual.observes_state());
+        assert!(!actual.mutates_state());
     }
 
     struct RememberTool;

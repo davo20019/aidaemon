@@ -32,8 +32,8 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
-    ToolVerificationMode,
+    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
@@ -247,6 +247,70 @@ struct CliToolEntry {
     max_output_chars: usize,
     /// Whether this was dynamically added (vs discovered at startup)
     is_dynamic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliWorkspaceMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Convert a configured CLI launch into a provider-native, enforceable
+/// read-only invocation. Prompt text is deliberately not part of this
+/// decision: if the adapter cannot establish a hard sandbox, delegation is
+/// rejected before the child process starts.
+fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<(), String> {
+    let program_index = is_env_launcher(command)
+        .then(|| env_wrapped_program_index(args))
+        .flatten();
+    let program = program_index
+        .and_then(|index| args.get(index).map(String::as_str))
+        .unwrap_or(command);
+    let program_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+
+    if !program_name.eq_ignore_ascii_case("codex") {
+        return Err(format!(
+            "CLI agent executable '{program_name}' has no registered hard read-only adapter"
+        ));
+    }
+
+    let mut constrained = Vec::with_capacity(args.len().saturating_add(3));
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let drops_value = matches!(
+            argument.as_str(),
+            "--sandbox" | "-s" | "--add-dir" | "--output-last-message" | "-o"
+        );
+        let drops_flag = matches!(
+            argument.as_str(),
+            "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+                | "--full-auto"
+                | "--ignore-user-config"
+        ) || argument.starts_with("--sandbox=")
+            || argument.starts_with("-s=")
+            || argument.starts_with("--add-dir=")
+            || argument.starts_with("--output-last-message=");
+        if drops_value {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if drops_flag {
+            index = index.saturating_add(1);
+            continue;
+        }
+        constrained.push(argument.clone());
+        index = index.saturating_add(1);
+    }
+    constrained.push("--ignore-user-config".to_string());
+    constrained.push("--sandbox".to_string());
+    constrained.push("read-only".to_string());
+    *args = constrained;
+    Ok(())
 }
 
 /// A running CLI agent being tracked.
@@ -1843,6 +1907,7 @@ impl CliAgentTool {
         goal_id: Option<&str>,
         delegated_task_id: Option<&str>,
         system_instruction: Option<&str>,
+        workspace_mode: CliWorkspaceMode,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
@@ -1919,6 +1984,14 @@ impl CliAgentTool {
                     message,
                 }
                 .into());
+            }
+        }
+
+        if workspace_mode == CliWorkspaceMode::ReadOnly {
+            if let Err(error) = apply_read_only_cli_adapter(&command, &mut args) {
+                return Ok(format!(
+                    "Blocked: read-only CLI delegation was not started because {error}. Select a CLI agent with a registered native read-only sandbox."
+                ));
             }
         }
 
@@ -2048,7 +2121,8 @@ impl CliAgentTool {
             prompt_len = final_prompt.len(),
             working_dir = canonical_working_dir.as_deref().unwrap_or("(default)"),
             async_mode,
-            "CLI agent invocation — runs with auto-approve flags"
+            workspace_mode = ?workspace_mode,
+            "CLI agent invocation"
         );
 
         // Log invocation start
@@ -3913,56 +3987,104 @@ impl Tool for CliAgentTool {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "run".to_string());
-        let output = CliAgentTool::call_with_status(self, arguments, status_tx).await?;
-        let exit_code = cli_agent_exit_code(&output);
-        let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
-        let policy_block = output.trim_start().starts_with("Blocked:");
-        let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
-        let metadata =
-            if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
-                ToolCallMetadata {
-                    outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
-                    exit_code,
-                    transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
-                    semantics: if prelaunch_failure || policy_block || reported_failure {
-                        ToolCallSemantics::administrative()
-                    } else {
-                        ToolCallSemantics::default()
-                    },
-                    ..ToolCallMetadata::default()
-                }
-            } else if output.contains("started in background")
-                || output.contains("Moved to background")
-                || output.contains("still running")
-                || output.contains("only active CLI task for this session")
-            {
-                ToolCallMetadata {
-                    outcome_status: Some(ToolOutcomeStatus::Backgrounded),
-                    background_started: true,
-                    completion_notifications_enabled: action == "run",
-                    ..ToolCallMetadata::default()
-                }
-            } else if action == "check"
-                && (output.starts_with("No CLI agent task matched")
-                    || output.starts_with("No running CLI agent"))
-            {
-                ToolCallMetadata {
-                    outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
-                    ..ToolCallMetadata::default()
-                }
-            } else {
-                ToolCallMetadata {
-                    outcome_status: Some(ToolOutcomeStatus::Succeeded),
-                    ..ToolCallMetadata::default()
-                }
-            };
-        Ok(ToolCallOutcome { output, metadata })
+        let output = self
+            .call_with_status_under_contract(arguments, status_tx, false)
+            .await?;
+        Ok(cli_agent_outcome(&action, output, false))
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "run".to_string());
+        let output = self
+            .call_with_status_under_contract(arguments, status_tx, exec_ctx.mutation_forbidden)
+            .await?;
+        Ok(cli_agent_outcome(
+            &action,
+            output,
+            exec_ctx.mutation_forbidden && action == "run",
+        ))
     }
 
     async fn call_with_status(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_under_contract(arguments, status_tx, false)
+            .await
+    }
+}
+
+fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolCallOutcome {
+    let exit_code = cli_agent_exit_code(&output);
+    let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
+    let policy_block = output.trim_start().starts_with("Blocked:");
+    let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
+    let metadata = if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
+            exit_code,
+            transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
+            semantics: if prelaunch_failure || policy_block || reported_failure {
+                ToolCallSemantics::administrative()
+            } else {
+                ToolCallSemantics::default()
+            },
+            ..ToolCallMetadata::default()
+        }
+    } else if output.contains("started in background")
+        || output.contains("Moved to background")
+        || output.contains("still running")
+        || output.contains("only active CLI task for this session")
+    {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+            background_started: true,
+            completion_notifications_enabled: action == "run",
+            ..ToolCallMetadata::default()
+        }
+    } else if action == "check"
+        && (output.starts_with("No CLI agent task matched")
+            || output.starts_with("No running CLI agent"))
+    {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+            ..ToolCallMetadata::default()
+        }
+    } else {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Succeeded),
+            semantics: if read_only_run {
+                ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent)
+            } else {
+                ToolCallSemantics::default()
+            },
+            ..ToolCallMetadata::default()
+        }
+    };
+    ToolCallOutcome { output, metadata }
+}
+
+impl CliAgentTool {
+    async fn call_with_status_under_contract(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        mutation_forbidden: bool,
     ) -> anyhow::Result<String> {
         let args: CliAgentArgs = serde_json::from_str(arguments)?;
 
@@ -4107,6 +4229,11 @@ impl Tool for CliAgentTool {
                             args._goal_id.as_deref(),
                             args._task_id.as_deref(),
                             args.system_instruction.as_deref(),
+                            if mutation_forbidden {
+                                CliWorkspaceMode::ReadOnly
+                            } else {
+                                CliWorkspaceMode::ReadWrite
+                            },
                             async_mode,
                             status_tx.clone(),
                         )
@@ -4193,6 +4320,37 @@ mod tests {
             "--print".to_string(),
         ];
         assert_eq!(env_wrapped_program_index(&args), Some(2));
+    }
+
+    #[test]
+    fn codex_read_only_adapter_replaces_unrestricted_launch_mode() {
+        let mut args = vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "--sandbox=workspace-write".to_string(),
+            "--add-dir".to_string(),
+            "/synthetic/extra".to_string(),
+        ];
+        apply_read_only_cli_adapter("/synthetic/bin/codex", &mut args).unwrap();
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!args.iter().any(|arg| arg.contains("workspace-write")));
+        assert!(!args.iter().any(|arg| arg == "--add-dir"));
+        assert!(!args.iter().any(|arg| arg == "/synthetic/extra"));
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "read-only"]));
+    }
+
+    #[test]
+    fn unknown_cli_cannot_claim_read_only_delegation() {
+        let mut args = vec!["--auto-approve".to_string()];
+        let error =
+            apply_read_only_cli_adapter("/synthetic/bin/opaque-agent", &mut args).unwrap_err();
+        assert!(error.contains("no registered hard read-only adapter"));
     }
 
     #[test]

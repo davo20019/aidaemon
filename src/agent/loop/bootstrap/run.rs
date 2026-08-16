@@ -81,6 +81,360 @@ fn build_tool_filter_gate_telemetry(
     )
 }
 
+/// Commit one authoritative task envelope before any optional memory access,
+/// tool filtering, project-instruction loading, or prompt construction.
+/// Relationship, contract, and task ownership are deliberately finalized in
+/// that order so a provisional ingress classification cannot leak an older
+/// request into the new task or erase a background parent's lineage.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_turn_assessment(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    user_text: &str,
+    internal_continuation: bool,
+    structural_resume: bool,
+    initial_turn_context: &TurnContext,
+    plan: Option<&super::task_planning::TaskPlan>,
+    task_assessment_attempted: bool,
+    assessment_decision_type: crate::events::DecisionType,
+    model: &str,
+    planner_trust_tier: &str,
+) -> TurnContext {
+    use super::task_planning::{
+        planned_contract_is_complete, planned_contract_is_confident,
+        planned_mutation_constraints_are_grounded, planned_response_fields_are_grounded,
+        planned_tool_constraints_are_grounded,
+    };
+
+    let confident_shape = plan.and_then(|plan| {
+        plan.task_shape.as_ref().filter(|shape| {
+            matches!(
+                shape
+                    .confidence
+                    .as_deref()
+                    .map(|value| value.trim().to_ascii_lowercase()),
+                Some(value) if matches!(value.as_str(), "medium" | "high")
+            )
+        })
+    });
+
+    if !internal_continuation {
+        let dialogue_state = agent
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .ok()
+            .flatten();
+        let typed_clarification = initial_turn_context.followup_mode
+            == Some(crate::agent::followup::FollowupMode::ClarificationAnswer);
+        let (relationship, semantic_scope, reason_code) = if structural_resume {
+            ("continuation", "none", "runtime_resume_edge")
+        } else if let Some(shape) = confident_shape {
+            let requested = shape
+                .request_relationship
+                .as_deref()
+                .unwrap_or("new_request");
+            let requested_antecedent = shape
+                .antecedent_user_message_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|message_id| !message_id.is_empty());
+            let resolved_antecedent = dialogue_state.as_ref().and_then(|state| {
+                if let Some(message_id) = requested_antecedent {
+                    crate::agent::dialogue_state::has_exact_request_antecedent(state, message_id)
+                        .then_some(message_id)
+                } else {
+                    crate::agent::dialogue_state::unambiguous_request_antecedent(state)
+                        .map(|request| request.user_message_id.as_str())
+                }
+            });
+            let exact_antecedent = resolved_antecedent.is_some();
+            let relationship = match requested {
+                "continuation" if exact_antecedent => "continuation",
+                "clarification_answer" if typed_clarification => "clarification_answer",
+                "courtesy" => "courtesy",
+                _ => "new_request",
+            };
+            let reason = if requested == "continuation" && !exact_antecedent {
+                "continuation_missing_exact_antecedent"
+            } else {
+                "assessment_committed"
+            };
+            (
+                relationship,
+                shape.semantic_scope.as_deref().unwrap_or("none"),
+                reason,
+            )
+        } else if typed_clarification {
+            ("clarification_answer", "none", "typed_clarification_edge")
+        } else {
+            // A failed/unavailable language assessment cannot authorize an
+            // adoption edge. Ordinary ingress therefore fails closed to a
+            // fresh request; only runtime continuations and typed pending
+            // questions bypass this rule.
+            ("new_request", "none", "assessment_unavailable_fresh_task")
+        };
+
+        if let Err(error) = crate::agent::dialogue_state::record_dialogue_semantic_user_turn(
+            agent,
+            session_id,
+            user_text,
+            relationship,
+            semantic_scope,
+        )
+        .await
+        {
+            warn!(session_id, %error, "Failed to persist finalized dialogue relationship");
+        }
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                0,
+                crate::events::DecisionType::IntentGate,
+                "Finalized task relationship".to_string(),
+                json!({
+                    "condition": "task_relationship_finalized",
+                    "relationship": relationship,
+                    "semantic_scope": semantic_scope,
+                    "reason_code": reason_code,
+                    "antecedent_user_message_id": confident_shape
+                        .and_then(|shape| shape.antecedent_user_message_id.as_deref()),
+                }),
+            )
+            .await;
+    }
+
+    // Rebuild after relationship commit. This second pass is intentional: it
+    // is the first point at which context, contract inheritance, and project
+    // carryover share the same authoritative relationship.
+    let mut turn_context = agent
+        .build_turn_context_from_recent_history_with_origin(
+            session_id,
+            user_text,
+            internal_continuation,
+        )
+        .await;
+    let before_contract = turn_context.completion_contract.clone();
+    let mut semantic_contract_applied = false;
+
+    if let Some(shape) = confident_shape {
+        turn_context.continue_inline_after_background_start = shape
+            .continue_inline_after_background_start
+            .unwrap_or(false);
+    }
+
+    if let Some(signals) = plan.and_then(|plan| plan.contract.as_ref()) {
+        let scope = signals
+            .mutation_scope
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let declares_negative_scope =
+            matches!(scope.as_str(), "read_only" | "read-only" | "scoped");
+        let tool_scope = signals
+            .tool_scope
+            .as_deref()
+            .map(|scope| scope.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let forbids_tool_use = tool_scope == "forbidden";
+        let has_tool_constraints = forbids_tool_use
+            || tool_scope == "restricted"
+            || !signals.forbidden_tool_scopes.is_empty();
+        let confident =
+            planned_contract_is_confident(signals, plan.and_then(|p| p.task_shape.as_ref()));
+        let complete = planned_contract_is_complete(signals);
+        let grounded = planned_mutation_constraints_are_grounded(signals, user_text);
+        let tool_constraint_grounded = planned_tool_constraints_are_grounded(signals, user_text);
+        let response_fields_grounded = planned_response_fields_are_grounded(signals, user_text);
+
+        if confident
+            && complete
+            && (!declares_negative_scope || grounded)
+            && (!has_tool_constraints || tool_constraint_grounded)
+            && response_fields_grounded
+        {
+            let planned_kind = signals
+                .task_kind
+                .as_deref()
+                .and_then(crate::agent::parse_planned_task_kind)
+                .expect("complete semantic contract has a valid task kind");
+            let forbidden_actions = signals
+                .forbidden_actions
+                .iter()
+                .filter_map(|action| crate::agent::parse_planned_forbidden_action(action))
+                .collect::<Vec<_>>();
+            let required_effects = if signals.expects_mutation == Some(true) {
+                crate::agent::parse_planned_mutation_effects(
+                    signals
+                        .required_effects
+                        .as_deref()
+                        .expect("complete semantic contract has effects"),
+                )
+                .expect("complete semantic contract has valid effects")
+            } else {
+                crate::traits::ToolMutationEffects::NONE
+            };
+            crate::agent::install_semantic_completion_contract(
+                &mut turn_context.completion_contract,
+                crate::agent::SemanticCompletionRequirements {
+                    expects_mutation: signals
+                        .expects_mutation
+                        .expect("complete semantic contract"),
+                    requires_observation: signals
+                        .requires_observation
+                        .expect("complete semantic contract"),
+                    task_kind: planned_kind,
+                    required_mutation_effects: required_effects,
+                    mutation_scope: signals.mutation_scope.as_deref().unwrap_or("allowed"),
+                    forbidden_actions: &forbidden_actions,
+                    minimum_sources: signals.minimum_sources.unwrap_or_default() as usize,
+                    requires_primary_sources: signals.requires_primary_sources.unwrap_or(false),
+                    requires_exact_history: signals.requires_exact_history.unwrap_or(false),
+                    evidence_requirements: signals
+                        .evidence_requirements
+                        .as_deref()
+                        .unwrap_or_default(),
+                    forbids_tool_use,
+                    allowed_tool_names: &signals.allowed_tool_names,
+                    forbidden_tool_scopes: &signals.forbidden_tool_scopes,
+                    required_response_fields: &signals.required_response_fields,
+                },
+            );
+            if turn_context.inherited_completion_contract {
+                turn_context.completion_contract = if turn_context.inherited_outstanding_obligations
+                {
+                    crate::agent::inherit_unfinished_request_contract(
+                        turn_context.completion_contract,
+                        &before_contract,
+                    )
+                } else {
+                    crate::agent::inherit_request_constraints(
+                        turn_context.completion_contract,
+                        &before_contract,
+                    )
+                };
+            }
+            if let Some(reference) = signals
+                .project_reference
+                .as_deref()
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty())
+                .filter(|reference| {
+                    user_text
+                        .to_ascii_lowercase()
+                        .contains(&reference.to_ascii_lowercase())
+                })
+            {
+                if let Some(scope) = crate::tools::fs_utils::resolve_project_scope_reference(
+                    reference,
+                    &agent.path_aliases.projects,
+                ) {
+                    turn_context.primary_project_scope = Some(scope.to_string_lossy().to_string());
+                }
+            }
+            semantic_contract_applied = true;
+        } else {
+            warn!(
+                session_id,
+                confident,
+                complete,
+                grounded,
+                mutation_scope = %scope,
+                "Ignored incomplete or untrusted semantic contract"
+            );
+        }
+    }
+
+    if agent.mandate_execution.is_none()
+        && !semantic_contract_applied
+        && !turn_context.inherited_completion_contract
+    {
+        crate::agent::retain_structural_completion_contract(&mut turn_context.completion_contract);
+    }
+    turn_context.completion_contract.adopt_for_task(task_id);
+
+    // Task ownership is bound only after the relationship and inherited
+    // contract are frozen. This prevents a new or internal child TaskStart
+    // from rewriting the antecedent before it can be adopted.
+    if let Err(error) =
+        crate::agent::dialogue_state::record_dialogue_task_start(agent, session_id, task_id).await
+    {
+        warn!(session_id, task_id, %error, "Failed to bind finalized dialogue task");
+    }
+    if !internal_continuation {
+        if let Err(error) = crate::agent::dialogue_state::record_dialogue_completion_contract(
+            agent,
+            session_id,
+            user_text,
+            &turn_context.completion_contract,
+        )
+        .await
+        {
+            warn!(session_id, %error, "Failed to persist finalized completion contract");
+        }
+    }
+
+    if let Some(plan) = plan {
+        let contract_changed = turn_context.completion_contract != before_contract;
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                0,
+                assessment_decision_type,
+                "Task assessment succeeded".to_string(),
+                {
+                    let mut metadata = crate::agent::hand_holding_telemetry::planner_result_metadata(
+                        "succeeded",
+                        model,
+                        planner_trust_tier,
+                        crate::agent::hand_holding_telemetry::PlannerResultStats {
+                            step_count: plan.steps.len(),
+                            success_criteria_count: plan.success_criteria.len(),
+                            contract_present: plan.contract.is_some(),
+                            contract_changed,
+                        },
+                        None,
+                    );
+                    metadata["assessment_mode"] = json!(plan.mode.as_str());
+                    metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                    metadata["completion_contract"] = json!({
+                        "task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_ascii_lowercase(),
+                        "expects_mutation": turn_context.completion_contract.expects_mutation,
+                        "requires_observation": turn_context.completion_contract.requires_observation,
+                        "evidence_requirements": turn_context.completion_contract.evidence_requirements,
+                        "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
+                        "required_response_fields": turn_context.completion_contract.required_response_fields,
+                    });
+                    metadata
+                },
+            )
+            .await;
+    } else if task_assessment_attempted {
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                0,
+                assessment_decision_type,
+                "Task assessment returned no result".to_string(),
+                crate::agent::hand_holding_telemetry::planner_result_metadata(
+                    "no_plan",
+                    model,
+                    planner_trust_tier,
+                    crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
+                    Some("assessment_returned_none"),
+                ),
+            )
+            .await;
+    }
+
+    turn_context
+}
+
 /// Build mandate worker bootstrap state without consulting any owner-turn
 /// routing surface. Mandate child agents already carry an immutable execution
 /// fence and a role/authority-scoped registered tool set from spawn. Their
@@ -191,7 +545,7 @@ async fn build_isolated_mandate_bootstrap(
         task_outcome: None,
         replay_notes: Vec::new(),
     };
-    let turn_context = TurnContext {
+    let mut turn_context = TurnContext {
         // This fixed daemon string prevents a model-authored task from becoming
         // a generic follow-up, project, or completion-routing instruction.
         goal_user_text:
@@ -203,6 +557,7 @@ async fn build_isolated_mandate_bootstrap(
         },
         ..Default::default()
     };
+    turn_context.completion_contract.adopt_for_task(&task_id);
     let policy_bundle = crate::execution_policy::PolicyBundle {
         // The generic policy is retained only because downstream loop state has
         // a common shape. Strong keeps the already-scoped roster intact; it does
@@ -217,7 +572,6 @@ async fn build_isolated_mandate_bootstrap(
         user_text: user_text.to_string(),
         task_id,
         task_plan: None,
-        task_assessment_attempted: false,
         memory_pipeline_policy:
             super::task_planning::MemoryPipelinePolicy::SuppressedByCurrentContract,
         resume_execution_snapshot: None,
@@ -352,20 +706,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             },
         )
         .await;
-    if !is_mandate_execution {
-        if let Err(err) =
-            crate::agent::dialogue_state::record_dialogue_task_start(agent, session_id, &task_id)
-                .await
-        {
-            warn!(
-                session_id,
-                task_id,
-                error = %err,
-                "Failed to record dialogue task start"
-            );
-        }
-    }
-
     // 1. Persist the user message
     //
     // The user message's own id is also the turn_id for this conversation
@@ -841,7 +1181,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
 
     // Resolve turn/project context before task assessment and prompt
     // construction. The main loop reuses this exact snapshot.
-    let turn_context = agent
+    let initial_turn_context = agent
         .build_turn_context_from_recent_history_with_origin(
             session_id,
             user_text,
@@ -866,7 +1206,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             crate::events::DecisionType::IntentGate
         }
     };
-    let planner_skip_reason = if agent.mandate_execution.is_some() {
+    let planner_skip_reason = if ctx.internal_continuation {
+        Some("internal_continuation_uses_parent_contract")
+    } else if resume_checkpoint.is_some() {
+        Some("runtime_resume_uses_parent_contract")
+    } else if agent.mandate_execution.is_some() {
         Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
     } else {
         super::task_planning::planning_skip_reason(user_text, false)
@@ -889,11 +1233,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         (None, false)
     } else {
         let planner_context = super::task_planning::task_assessment_conversation_context(
-            turn_context.followup_mode,
+            initial_turn_context.followup_mode,
             session_summary
                 .as_ref()
                 .map(|summary| summary.summary.as_str()),
-            &turn_context.recent_messages,
+            &initial_turn_context.assessment_recent_messages,
         );
         let planner_model = llm_router
             .as_ref()
@@ -933,6 +1277,22 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             true,
         )
     };
+    let turn_context = finalize_turn_assessment(
+        agent,
+        &emitter,
+        session_id,
+        &task_id,
+        user_text,
+        ctx.internal_continuation,
+        resume_checkpoint.is_some(),
+        &initial_turn_context,
+        task_plan.as_ref(),
+        task_assessment_attempted,
+        assessment_decision_type,
+        &model,
+        planner_trust_tier,
+    )
+    .await;
     let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
         &turn_context.completion_contract,
         task_plan.as_ref(),
@@ -1205,7 +1565,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         user_text: user_text.to_string(),
         task_id,
         task_plan,
-        task_assessment_attempted,
         memory_pipeline_policy,
         resume_execution_snapshot: resume_checkpoint
             .as_ref()

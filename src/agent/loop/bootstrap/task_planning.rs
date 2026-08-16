@@ -7,22 +7,15 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Build assessment context only for a lifecycle-typed continuation. New
-/// requests never receive archived prose in the classifier input.
+/// Build bounded relationship-assessment context. This is not provider
+/// transcript carryover: stable message IDs let the assessor identify one
+/// exact antecedent, while fresh tasks still discard all archived prose after
+/// the relationship is finalized.
 pub(crate) fn task_assessment_conversation_context(
-    followup_mode: Option<crate::agent::FollowupMode>,
+    _followup_mode: Option<crate::agent::FollowupMode>,
     session_summary: Option<&str>,
     recent_messages: &[serde_json::Value],
 ) -> Option<String> {
-    if !matches!(
-        followup_mode,
-        Some(
-            crate::agent::FollowupMode::Followup | crate::agent::FollowupMode::ClarificationAnswer
-        )
-    ) {
-        return None;
-    }
-
     let mut parts = Vec::new();
     if let Some(summary) = session_summary.filter(|summary| !summary.is_empty()) {
         parts.push(format!("[Session Summary] {summary}"));
@@ -37,8 +30,12 @@ pub(crate) fn task_assessment_conversation_context(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if !content.is_empty() {
+            let message_id = message
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
             parts.push(format!(
-                "- {}: {}",
+                "- [message_id={message_id}] {}: {}",
                 role.chars().next().unwrap_or('?').to_uppercase(),
                 content
             ));
@@ -91,6 +88,9 @@ pub(crate) struct PlannedContractSignals {
     /// prohibiting every tool call.
     #[serde(default)]
     pub tool_scope: Option<String>,
+    /// Exact tool identifiers authorized when `tool_scope=restricted`.
+    #[serde(default)]
+    pub allowed_tool_names: Vec<String>,
     /// Capability domains explicitly forbidden for this request while other
     /// tools remain allowed. This is a typed deny-set, not a tool-name list.
     #[serde(default)]
@@ -143,6 +143,10 @@ pub(crate) struct PlannedTaskShape {
     /// Relationship of this turn to persisted dialogue state.
     #[serde(default)]
     pub request_relationship: Option<String>,
+    /// Exact prior user-message ID selected from relationship-assessment
+    /// context. Required for `continuation`; null for independent requests.
+    #[serde(default)]
+    pub antecedent_user_message_id: Option<String>,
     /// Typed tool/resource domain for the request.
     #[serde(default)]
     pub semantic_scope: Option<String>,
@@ -242,16 +246,31 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         .as_deref()
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    if !matches!(tool_scope.as_str(), "allowed" | "forbidden")
+    if !matches!(tool_scope.as_str(), "allowed" | "forbidden" | "restricted")
         || tool_scope == "allowed"
             && signals.forbidden_tool_scopes.is_empty()
-            && !signals.tool_constraint_evidence.is_empty()
+            && (!signals.tool_constraint_evidence.is_empty()
+                || !signals.allowed_tool_names.is_empty())
         || tool_scope == "allowed"
             && !signals.forbidden_tool_scopes.is_empty()
             && signals.tool_constraint_evidence.is_empty()
         || tool_scope == "forbidden"
             && (signals.tool_constraint_evidence.is_empty()
-                || !signals.forbidden_tool_scopes.is_empty())
+                || !signals.forbidden_tool_scopes.is_empty()
+                || !signals.allowed_tool_names.is_empty())
+        || tool_scope == "restricted"
+            && (signals.tool_constraint_evidence.is_empty()
+                || signals.allowed_tool_names.is_empty())
+        || signals.allowed_tool_names.len() > 8
+        || signals.allowed_tool_names.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 80
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        })
     {
         return false;
     }
@@ -381,15 +400,22 @@ pub(crate) fn planned_tool_constraints_are_grounded(
     signals: &PlannedContractSignals,
     current_user_text: &str,
 ) -> bool {
-    let forbids_all = signals
+    let tool_scope = signals
         .tool_scope
         .as_deref()
-        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"));
-    if !forbids_all && signals.forbidden_tool_scopes.is_empty() {
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let has_name_allowlist = tool_scope == "restricted" && !signals.allowed_tool_names.is_empty();
+    if tool_scope != "forbidden" && !has_name_allowlist && signals.forbidden_tool_scopes.is_empty()
+    {
         return false;
     }
     let current_lower = current_user_text.to_lowercase();
-    !signals.tool_constraint_evidence.is_empty()
+    signals
+        .allowed_tool_names
+        .iter()
+        .all(|name| current_lower.contains(name))
+        && !signals.tool_constraint_evidence.is_empty()
         && signals.tool_constraint_evidence.iter().all(|evidence| {
             let evidence = evidence.trim();
             !evidence.is_empty()
@@ -522,6 +548,7 @@ pub(crate) fn compile_memory_pipeline_policy(
         .tool_scope
         .as_deref()
         .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"))
+        || !signals.allowed_tool_names.is_empty()
         || !signals.forbidden_tool_scopes.is_empty();
     let accepted = planned_contract_is_confident(signals, plan.task_shape.as_ref())
         && planned_contract_is_complete(signals)
@@ -533,6 +560,13 @@ pub(crate) fn compile_memory_pipeline_policy(
     if signals
         .forbidden_tool_scopes
         .contains(&crate::traits::ToolSemanticScope::UserMemory)
+        || !signals.allowed_tool_names.is_empty()
+            && !signals.allowed_tool_names.iter().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "manage_memories" | "manage_people" | "remember_fact" | "share_memory"
+                )
+            })
     {
         MemoryPipelinePolicy::SuppressedByAssessment
     } else {
@@ -683,7 +717,8 @@ pub(crate) async fn generate_task_plan(
              \"mutation_scope\": \"allowed|read_only|scoped\",\n\
              \"forbidden_actions\": [\"deploy\"],\n\
              \"constraint_evidence\": [\"exact verbatim span from the current user request\"],\n\
-             \"tool_scope\": \"allowed|forbidden\",\n\
+             \"tool_scope\": \"allowed|forbidden|restricted\",\n\
+             \"allowed_tool_names\": [\"check_environment\"],\n\
              \"forbidden_tool_scopes\": [\"user_memory\"],\n\
              \"tool_constraint_evidence\": [\"exact verbatim span prohibiting all tools or a capability domain\"],\n\
              \"required_response_fields\": [\"exact user-authored output label\"],\n\
@@ -709,6 +744,7 @@ pub(crate) async fn generate_task_plan(
              \"requires_background_continuation\": false,\n\
              \"continue_inline_after_background_start\": false,\n\
              \"request_relationship\": \"new_request|continuation|clarification_answer|courtesy\",\n\
+             \"antecedent_user_message_id\": null,\n\
              \"semantic_scope\": \"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"\n\
            }}\n\
          }}\n\n\
@@ -730,8 +766,10 @@ pub(crate) async fn generate_task_plan(
            turn without waiting for that process to finish. Otherwise set it false and let \
            the durable completion notification resume dependent work.\n\
          - request_relationship is semantic: use continuation only when this turn advances, \
-           retries, or asks about an unresolved prior request; clarification_answer only when \
-           it answers the currently pending assistant question; otherwise use new_request.\n\
+           retries, or asks about one prior request shown in Recent conversation context; then \
+           copy that prior USER row's exact message_id into antecedent_user_message_id. A \
+           continuation without that exact ID is invalid. Use null for new_request, courtesy, \
+           and clarification_answer. Otherwise use new_request.\n\
          - semantic_scope names the primary typed resource domain, or none. It is independent of \
            request_relationship and must reflect the current request rather than keyword overlap. \
            Multi-domain evidence belongs in evidence_requirements, not in this singular routing hint.\n\
@@ -744,13 +782,17 @@ pub(crate) async fn generate_task_plan(
            tool, lookup, search, browse, or execution path. Preserve requires_observation and \
            evidence_requirements when live evidence would normally be needed; this lets the main \
            model state the exact evidence limitation without violating the constraint; set \
-           forbidden_tool_scopes=[].\n\
+           forbidden_tool_scopes=[] and allowed_tool_names=[].\n\
+         - tool_scope=restricted when the CURRENT request authorizes one or more exact named tools \
+           while excluding every other tool (for example, \"use only check_environment\"). Copy only \
+           exact tool identifiers present in the current request into allowed_tool_names. This is a \
+           hard runtime allowlist, not a suggestion. Otherwise allowed_tool_names=[].\n\
          - When the CURRENT request prohibits only a capability domain, keep tool_scope=allowed \
            and add its typed scope to forbidden_tool_scopes. For example, a no-memory constraint \
            denies user_memory without denying conversation_history or local_workspace. Never infer \
            a deny-set from the topic or an older turn. tool_constraint_evidence must quote exact \
            current-user spans for either kind of prohibition. Otherwise use tool_scope=allowed, \
-           forbidden_tool_scopes=[], and tool_constraint_evidence=[].\n\
+           forbidden_tool_scopes=[], allowed_tool_names=[], and tool_constraint_evidence=[].\n\
          - required_response_fields contains exact, short labels from the CURRENT user request \
            that must appear in the final answer (requested report keys, columns, verdict labels, \
            or fixed line prefixes). Do not paraphrase, invent, or copy labels from prior tasks; \
@@ -1228,6 +1270,7 @@ mod tests {
             forbidden_actions: Vec::new(),
             constraint_evidence: Vec::new(),
             tool_scope: Some("allowed".to_string()),
+            allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),
@@ -1246,6 +1289,19 @@ mod tests {
             project_reference: None,
         };
         assert!(planned_contract_is_complete(&complete));
+
+        let mut restricted = complete.clone();
+        restricted.expects_mutation = Some(false);
+        restricted.required_effects = Some(Vec::new());
+        restricted.task_kind = Some("check".to_string());
+        restricted.tool_scope = Some("restricted".to_string());
+        restricted.allowed_tool_names = vec!["check_environment".to_string()];
+        restricted.tool_constraint_evidence = vec!["Use only check_environment once".to_string()];
+        assert!(planned_contract_is_complete(&restricted));
+        assert!(planned_tool_constraints_are_grounded(
+            &restricted,
+            "Use only check_environment once. Do not use other tools."
+        ));
 
         let mut observational_mutation = complete.clone();
         observational_mutation.task_kind = Some("check".to_string());
@@ -1350,20 +1406,20 @@ mod tests {
             }]);
         assert!(planned_contract_is_complete(&exact_history));
 
-        let mut impossible_memory_authority = exact_history.clone();
-        impossible_memory_authority.requires_exact_history = Some(false);
-        impossible_memory_authority.evidence_requirements =
+        let mut impossible_memory_causality = exact_history.clone();
+        impossible_memory_causality.requires_exact_history = Some(false);
+        impossible_memory_causality.evidence_requirements =
             Some(vec![crate::traits::RequestEvidenceRequirement {
-                summary: "Whether a personal fact is present in memory".to_string(),
+                summary: "Establish a canonical historical cause from personal memory".to_string(),
                 acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
-                purpose: crate::traits::EvidencePurpose::CurrentState,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                purpose: crate::traits::EvidencePurpose::CausalExplanation,
+                minimum_authority: crate::traits::EvidenceAuthority::Canonical,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
                 target: None,
             }]);
         assert!(
-            !planned_contract_is_complete(&impossible_memory_authority),
+            !planned_contract_is_complete(&impossible_memory_causality),
             "an impossible authority/scope tuple must not enter the completion graph"
         );
 
@@ -1414,6 +1470,7 @@ mod tests {
             forbidden_actions: Vec::new(),
             constraint_evidence: Vec::new(),
             tool_scope: Some("allowed".to_string()),
+            allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
             tool_constraint_evidence: vec!["do not use memory".to_string()],
             required_response_fields: Vec::new(),
@@ -1521,6 +1578,7 @@ mod tests {
             forbidden_actions: vec!["deploy".to_string()],
             constraint_evidence: vec!["do not deploy".to_string()],
             tool_scope: Some("allowed".to_string()),
+            allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),

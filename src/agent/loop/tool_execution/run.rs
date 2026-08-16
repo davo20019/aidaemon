@@ -1142,6 +1142,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             ToolCallSemantics::default()
         };
+        let call_semantics = if tc.name == "cli_agent"
+            && turn_context.completion_contract.forbids_mutation
+        {
+            // The CLI adapter consumes the same dispatcher-owned contract bit
+            // and either installs a provider-native read-only sandbox or
+            // rejects before launch. Plan/approval/evidence logic must use that
+            // effective contract rather than the tool's conservative default.
+            call_semantics.constrained_to_observation()
+        } else {
+            call_semantics
+        };
         let tool_caps = available_capabilities
             .get(&tc.name)
             .copied()
@@ -2021,15 +2032,28 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
 
         if background_detached {
-            pending_background_ack = Some(build_background_detach_ack(
-                &tc.name,
-                &result_text,
-                &result_metadata,
-            ));
-            force_text_response = true;
-            let notifications_active = result_metadata.completion_notifications_enabled;
-            let system_msg = SystemDirective::BackgroundHandoff {
-                notifications_active,
+            // Decide the detach transition at the typed tool-receipt boundary.
+            // A background receipt only ends the inline run when the task shape
+            // says the detached work is the handoff. If independent inline work
+            // remains, forcing a text-only pass here would discard the parent's
+            // still-open execution capability before any later lifecycle gate
+            // can recover it.
+            let continue_inline = turn_context.continue_inline_after_background_start
+                || execution_state.linear_intent_plan_has_remaining_steps();
+            let system_msg = if continue_inline {
+                pending_background_ack = None;
+                force_text_response = false;
+                SystemDirective::BackgroundProcessContinue
+            } else {
+                pending_background_ack = Some(build_background_detach_ack(
+                    &tc.name,
+                    &result_text,
+                    &result_metadata,
+                ));
+                force_text_response = true;
+                SystemDirective::BackgroundHandoff {
+                    notifications_active: result_metadata.completion_notifications_enabled,
+                }
             };
             pending_system_messages.push(system_msg.clone());
             result_text = format!("{}\n\n{}", result_text, system_msg.render());
@@ -2345,7 +2369,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &result_text,
                 &result_metadata,
             );
-        let matched_requirements = if semantics.observes_state() {
+        let mut matched_requirements = if semantics.observes_state() {
             matching_evidence_requirement_indices(
                 &turn_context.completion_contract,
                 semantics,
@@ -2356,6 +2380,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             Vec::new()
         };
+        if semantics.observes_state() {
+            for index in accumulate_evidence_requirement_marker_matches(
+                &turn_context.completion_contract,
+                &mut completion_progress,
+                semantics,
+                &effective_arguments,
+                &result_text,
+                &result_metadata,
+            ) {
+                if !matched_requirements.contains(&index) {
+                    matched_requirements.push(index);
+                }
+            }
+        }
         let compatible_verification_attempt = turn_context
             .completion_contract
             .requires_observation

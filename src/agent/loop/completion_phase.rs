@@ -191,12 +191,12 @@ fn build_terminal_verification_request(
     }
 
     let mut request = build_abandon_request(
-            turn_context,
-            learning_ctx,
-            "No concrete tool or verification step completed, so there is no partial result to preserve.",
-            exact_need,
-            next_step,
-        );
+        turn_context,
+        learning_ctx,
+        "No concrete tool or verification step completed, so there is no partial result to preserve.",
+        exact_need,
+        next_step,
+    );
     request.user_action_required = false;
     request.consequence_if_not_provided = None;
     (request, Some(TaskTerminalCause::HardFailure))
@@ -229,11 +229,12 @@ fn build_agent_side_partial_failure(
 /// per-run token lease.
 fn post_completion_memory_plan(
     mandate_execution: bool,
+    memory_pipeline_allowed: bool,
     progressive_facts_enabled: bool,
     fact_extraction_eligible: bool,
     summarization_enabled: bool,
 ) -> (bool, bool) {
-    if mandate_execution {
+    if mandate_execution || !memory_pipeline_allowed {
         return (false, false);
     }
     (
@@ -332,12 +333,17 @@ mod gate_telemetry_tests {
     #[test]
     fn mandate_completion_disables_fact_extraction_and_summarization() {
         assert_eq!(
-            post_completion_memory_plan(true, true, true, true),
+            post_completion_memory_plan(true, true, true, true, true),
             (false, false)
         );
         assert_eq!(
-            post_completion_memory_plan(false, true, true, true),
+            post_completion_memory_plan(false, true, true, true, true),
             (true, true)
+        );
+        assert_eq!(
+            post_completion_memory_plan(false, false, true, true, true),
+            (false, false),
+            "a task-local no-memory policy suppresses every post-turn pipeline"
         );
     }
 
@@ -2730,6 +2736,7 @@ pub(super) async fn run_completion_phase(
 
         let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
             agent.mandate_execution.is_some(),
+            learning_ctx.memory_persistence_allowed,
             agent.context_window_config.progressive_facts,
             crate::memory::context_window::should_extract_facts(user_text),
             agent.context_window_config.enabled,

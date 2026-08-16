@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, BackendPath, SharedExecutionBackend};
+use crate::execution::{
+    active_execution_backend, BackendPath, ExecutionRequest, SharedExecutionBackend,
+};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
-
-use super::fs_utils;
 
 pub struct CheckEnvironmentTool;
 
@@ -138,14 +138,19 @@ impl Tool for CheckEnvironmentTool {
         for (i, result) in results.into_iter().enumerate() {
             let (tool_name, _) = TOOLS_TO_CHECK[i];
             match result {
-                Ok(Some(version)) => found.push((tool_name, version)),
+                Ok(Some((path, version))) => found.push((tool_name, path, version)),
                 Ok(None) => not_found.push(tool_name),
                 Err(_) => not_found.push(tool_name),
             }
         }
 
-        for (name, version) in &found {
-            output.push_str(&format!("  {} {}\n", pad_right(name, 18), version));
+        for (name, path, version) in &found {
+            output.push_str(&format!(
+                "  {} {}\n    path: {}\n",
+                pad_right(name, 18),
+                version,
+                path
+            ));
         }
 
         if !not_found.is_empty() {
@@ -216,35 +221,47 @@ where
     }
 }
 
-async fn check_tool(backend: SharedExecutionBackend, name: &str, flag: &str) -> Option<String> {
-    if !backend.executable_exists(name).await.ok()? {
-        return None;
-    }
-
-    // Get version
-    let cmd = format!("{} {}", name, flag);
-    match fs_utils::run_cmd(&cmd, None, 5).await {
+async fn check_tool(
+    backend: SharedExecutionBackend,
+    name: &str,
+    flag: &str,
+) -> Option<(String, String)> {
+    let executable = backend.resolve_executable(name).await.ok()??;
+    let request = ExecutionRequest::argv(executable.as_str(), vec![flag.to_string()]);
+    match backend
+        .execute(request, std::time::Duration::from_secs(5))
+        .await
+    {
         Ok(out) => {
             if out.exit_code == 0 {
                 // Some tools output to stderr (java -version)
-                let version_str = if out.stdout.trim().is_empty() {
-                    out.stderr.trim().to_string()
+                let stdout = out.stdout_lossy();
+                let stderr = out.stderr_lossy();
+                let version_str = if stdout.trim().is_empty() {
+                    stderr.trim().to_string()
                 } else {
-                    out.stdout.trim().to_string()
+                    stdout.trim().to_string()
                 };
                 // Take first line only
-                Some(
+                Some((
+                    executable.to_string(),
                     version_str
                         .lines()
                         .next()
                         .unwrap_or(&version_str)
                         .to_string(),
-                )
+                ))
             } else {
-                Some("(installed, version unknown)".to_string())
+                Some((
+                    executable.to_string(),
+                    "(installed, version unknown)".to_string(),
+                ))
             }
         }
-        Err(_) => Some("(installed, version check timed out)".to_string()),
+        Err(_) => Some((
+            executable.to_string(),
+            "(installed, version check timed out)".to_string(),
+        )),
     }
 }
 
@@ -346,7 +363,9 @@ mod tests {
     async fn test_check_tool_git() {
         let result = check_tool(active_execution_backend(), "git", "--version").await;
         assert!(result.is_some());
-        assert!(result.unwrap().contains("git"));
+        let (path, version) = result.unwrap();
+        assert!(path.contains("git"));
+        assert!(version.contains("git"));
     }
 
     #[tokio::test]
