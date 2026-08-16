@@ -114,10 +114,29 @@ pub(crate) struct PlannedContractSignals {
     /// evidence; it never chooses or authorizes a tool.
     #[serde(default)]
     pub evidence_requirements: Option<Vec<crate::traits::RequestEvidenceRequirement>>,
+    /// Machine invocations whose occurrence/result is itself part of the
+    /// requested outcome. This remains separate from subject-matter evidence.
+    #[serde(default)]
+    pub required_invocations: Option<Vec<crate::traits::RequestReceiptPredicate>>,
+    /// Least-privilege local filesystem authority for the task. Paths are
+    /// structural resource identifiers; read/write roles are semantic output,
+    /// not inferred later from command prose.
+    #[serde(default)]
+    pub filesystem_access: Option<PlannedFilesystemAccess>,
     /// Exact user-authored path or project name selected semantically for this
     /// turn. The runtime resolves and validates it before changing scope.
     #[serde(default)]
     pub project_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PlannedFilesystemAccess {
+    #[serde(default)]
+    pub execution_cwd: Option<String>,
+    #[serde(default)]
+    pub read_paths: Vec<String>,
+    #[serde(default)]
+    pub write_paths: Vec<String>,
 }
 
 /// Semantic task shape used by the orchestration router. The route decision is
@@ -201,6 +220,8 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         || signals.requires_primary_sources.is_none()
         || signals.requires_exact_history.is_none()
         || signals.evidence_requirements.is_none()
+        || signals.required_invocations.is_none()
+        || signals.filesystem_access.is_none()
         || signals.tool_scope.is_none()
     {
         return false;
@@ -301,14 +322,32 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     }
 
     let evidence_requirements = signals.evidence_requirements.as_deref().unwrap_or_default();
+    let required_invocations = signals.required_invocations.as_deref().unwrap_or_default();
+    let filesystem_access = signals.filesystem_access.as_ref().expect("checked above");
     if evidence_requirements.len() > 8
+        || required_invocations.len() > 8
+        || filesystem_access.read_paths.len() > 8
+        || filesystem_access.write_paths.len() > 8
+        || filesystem_access
+            .execution_cwd
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty() || path.chars().count() > 1000)
+        || filesystem_access
+            .read_paths
+            .iter()
+            .chain(&filesystem_access.write_paths)
+            .any(|path| path.trim().is_empty() || path.chars().count() > 1000)
+        || !expects_mutation && !filesystem_access.write_paths.is_empty()
         // A check is an evidence-producing lifecycle kind. Treating it as a
         // zero-observation answer would let the model assert current-run or
         // current-state facts without any proof edge.
         || task_kind == crate::agent::CompletionTaskKind::Check
             && signals.requires_observation != Some(true)
-        || signals.requires_observation == Some(true) && evidence_requirements.is_empty()
-        || signals.requires_observation == Some(false) && !evidence_requirements.is_empty()
+        || signals.requires_observation == Some(true)
+            && evidence_requirements.is_empty()
+            && required_invocations.is_empty()
+        || signals.requires_observation == Some(false)
+            && (!evidence_requirements.is_empty() || !required_invocations.is_empty())
         || task_kind == crate::agent::CompletionTaskKind::Check
             && tool_scope == "restricted"
             && !evidence_requirements.iter().any(|requirement| {
@@ -318,6 +357,12 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                         .iter()
                         .any(|name| signals.allowed_tool_names.contains(name))
                 })
+            })
+            && !required_invocations.iter().any(|receipt| {
+                receipt
+                    .tool_names
+                    .iter()
+                    .any(|name| signals.allowed_tool_names.contains(name))
             })
         || tool_scope == "restricted"
             && evidence_requirements.iter().any(|requirement| {
@@ -334,11 +379,7 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                 || summary_len > 240
                 || requirement.acceptable_scopes.is_empty()
                 || requirement.acceptable_scopes.len() > 3
-                || requirement.required_content_markers.len() > 16
-                || requirement.required_content_markers.iter().any(|marker| {
-                    let trimmed = marker.trim();
-                    trimmed.is_empty() || trimmed != marker || marker.chars().count() > 128
-                })
+                || !requirement.required_content_markers.is_empty()
                 || requirement.receipt.as_ref().is_some_and(|receipt| {
                     receipt.is_empty()
                         || receipt.tool_names.len() > 8
@@ -366,6 +407,26 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                 // Exact targets come only from structural request parsing.
                 || requirement.target.is_some()
                 || !crate::agent::inquiry::requirement_has_builtin_evidence_route(requirement)
+        })
+        || required_invocations.iter().any(|receipt| {
+            receipt.is_empty()
+                || receipt.tool_names.len() != 1
+                || receipt.tool_names.iter().any(|name| {
+                    name.is_empty()
+                        || name.len() > 80
+                        || !name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
+                || receipt.exit_codes.len() > 16
+                || receipt.outcome_statuses.len() > 6
+                || tool_scope == "restricted"
+                    && receipt
+                        .tool_names
+                        .iter()
+                        .any(|name| !signals.allowed_tool_names.contains(name))
         })
     {
         return false;
@@ -535,10 +596,43 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 7;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 9;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
+}
+
+fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
+    match parsed.schema_version {
+        TASK_CONTRACT_SCHEMA_VERSION => Some(parsed),
+        7 | 8 => {
+            if let Some(contract) = parsed.contract.as_mut() {
+                let invocations = contract.required_invocations.get_or_insert_with(Vec::new);
+                for requirement in contract
+                    .evidence_requirements
+                    .as_mut()
+                    .into_iter()
+                    .flatten()
+                {
+                    // Schema 7/8 combined subject evidence and requested
+                    // invocation evidence. Preserve the typed receipt in the
+                    // new lane, while retiring prose-marker authority.
+                    if let Some(receipt) = requirement.receipt.clone() {
+                        if !invocations.contains(&receipt) {
+                            invocations.push(receipt);
+                        }
+                    }
+                    requirement.required_content_markers.clear();
+                }
+                contract
+                    .filesystem_access
+                    .get_or_insert_with(PlannedFilesystemAccess::default);
+            }
+            parsed.schema_version = TASK_CONTRACT_SCHEMA_VERSION;
+            Some(parsed)
+        }
+        _ => None,
+    }
 }
 
 /// Result of the task-start assessment call.
@@ -763,7 +857,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 7,\n\
+           \"schema_version\": 9,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -791,7 +885,7 @@ pub(crate) async fn generate_task_plan(
                  \"purpose\": \"current_state|historical_record|content|outcome|attribution|causal_explanation\",\n\
                  \"minimum_authority\": \"advisory|direct|canonical\",\n\
                  \"temporal_scope\": \"current|historical|both\",\n\
-                 \"required_content_markers\": [\"exact requested field or key token\"],\n\
+                 \"required_content_markers\": [],\n\
                  \"receipt\": {{\n\
                    \"tool_names\": [\"exact required tool identifier\"],\n\
                    \"exit_codes\": [0],\n\
@@ -801,6 +895,20 @@ pub(crate) async fn generate_task_plan(
                  }}\n\
                }}\n\
              ],\n\
+             \"required_invocations\": [\n\
+               {{\n\
+                 \"tool_names\": [\"exact required tool identifier\"],\n\
+                 \"exit_codes\": [0],\n\
+                 \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
+                 \"requires_output\": false,\n\
+                 \"contract_rejected\": false\n\
+               }}\n\
+             ],\n\
+             \"filesystem_access\": {{\n\
+               \"execution_cwd\": null,\n\
+               \"read_paths\": [],\n\
+               \"write_paths\": []\n\
+             }},\n\
              \"project_reference\": null\n\
            }},\n\
            \"task_shape\": {{\n\
@@ -878,26 +986,28 @@ pub(crate) async fn generate_task_plan(
            only when those sources must be primary.\n\
          - requires_exact_history=true only when completion requires canonical earlier \
            conversation wording rather than ordinary conversational context.\n\
-         - evidence_requirements is the single completion ledger for every independently material \
-           fact or invocation result the final answer must establish. Return [] exactly when \
-           requires_observation=false; otherwise return 1-8 entries. If the current request requires \
-           invoking a named tool, command, check, or deliberately invalid call, requires_observation \
-           must be true and its receipt must be represented here even when rejection or a nonzero \
-           result is the expected successful observation.\n\
+         - evidence_requirements is the completion ledger for independently material subject facts. \
+           required_invocations separately lists calls whose occurrence/result is itself requested. \
+           Return both [] exactly when requires_observation=false; otherwise at least one list is \
+           nonempty. If the current request requires invoking a named tool, command, check, or \
+           deliberately invalid call, put its exact machine predicate in required_invocations even \
+           when the task is otherwise conversational or rejection/nonzero is the expected result.\n\
          - acceptable_scopes lists alternative authoritative domains for that ONE need. When two \
            domains establish different facts, create two requirements rather than treating them as alternatives.\n\
-         - required_content_markers contains exact field names, keys, headings, or stable identifiers from \
-           the CURRENT request that must be present in a content observation for that requirement to be \
-           satisfied. Use [] when presence of a particular content token is not part of the evidence need. \
-           Do not put tool names, command identity, exit codes, outcome labels, or final-answer formatting \
-           here; those are receipt facts or required_response_fields. Do not invent values or use answer \
-           prose as markers.\n\
+         - required_content_markers is a legacy compatibility field and must be []. Subject words and \
+           response prose are not lifecycle proof. Put exact user-authored output labels in \
+           required_response_fields and machine invocation facts in receipt.\n\
          - receipt contains only machine-checkable invocation facts explicitly required by the CURRENT \
            request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
            outcome_statuses are alternative acceptable results; requires_output means authoritative result \
            content must be nonempty; contract_rejected is the required pre-I/O validation disposition. \
            Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
            nonempty receipt and required_content_markers=[]. Never translate receipt facts into prose markers.\n\
+         - filesystem_access is the task's least-privilege local access manifest. Put exact local paths \
+           the request permits inspecting in read_paths, exact local paths it permits changing in \
+           write_paths, and an explicitly requested process working directory in execution_cwd. Paths \
+           may appear in both lists. Do not widen a file to its repository, make cwd writable implicitly, \
+           or include paths absent from the current request. For non-filesystem tasks use null/[]/[].\n\
          - A current state observation proves only current state/content/outcome. It does not by itself \
            prove who performed an action, why it happened, what the agent previously decided, or whether \
            a historical claim came from autonomous execution. Attribution, causal explanation, and prior \
@@ -978,14 +1088,15 @@ pub(crate) async fn generate_task_plan(
         }
     };
 
-    if parsed.schema_version != TASK_CONTRACT_SCHEMA_VERSION {
+    let received_schema_version = parsed.schema_version;
+    let Some(parsed) = migrate_task_plan_response(parsed) else {
         warn!(
-            received = parsed.schema_version,
+            received = received_schema_version,
             supported = TASK_CONTRACT_SCHEMA_VERSION,
             "Task assessment response used an unsupported schema version"
         );
         return None;
-    }
+    };
 
     if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return None;
@@ -1464,6 +1575,8 @@ mod tests {
                 receipt: None,
                 target: None,
             }]),
+            required_invocations: Some(Vec::new()),
+            filesystem_access: Some(PlannedFilesystemAccess::default()),
             project_reference: None,
         };
         assert!(planned_contract_is_complete(&complete));
@@ -1502,6 +1615,18 @@ mod tests {
             }]);
         assert!(planned_contract_is_complete(&typed_outcome));
 
+        let mut invocation_outcome = restricted.clone();
+        invocation_outcome.required_invocations =
+            Some(vec![crate::traits::RequestReceiptPredicate {
+                tool_names: vec!["check_environment".to_string()],
+                outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+                ..crate::traits::RequestReceiptPredicate::default()
+            }]);
+        assert!(
+            planned_contract_is_complete(&invocation_outcome),
+            "a named invocation is a formal receipt obligation independent of task prose"
+        );
+
         let mut prose_outcome = typed_outcome.clone();
         prose_outcome.evidence_requirements.as_mut().unwrap()[0].receipt = None;
         prose_outcome.evidence_requirements.as_mut().unwrap()[0].required_content_markers =
@@ -1524,6 +1649,16 @@ mod tests {
         assert!(
             !planned_contract_is_complete(&effectless_change),
             "a change task cannot declare that no mutation outcome is required"
+        );
+
+        let mut observational_write_grant = restricted.clone();
+        observational_write_grant.filesystem_access = Some(PlannedFilesystemAccess {
+            write_paths: vec!["/tmp/synthetic-output".to_string()],
+            ..PlannedFilesystemAccess::default()
+        });
+        assert!(
+            !planned_contract_is_complete(&observational_write_grant),
+            "an observational task cannot receive a filesystem write capability"
         );
 
         let mut no_tools = complete.clone();
@@ -1701,6 +1836,8 @@ mod tests {
             requires_primary_sources: Some(false),
             requires_exact_history: Some(false),
             evidence_requirements: Some(Vec::new()),
+            required_invocations: Some(Vec::new()),
+            filesystem_access: Some(PlannedFilesystemAccess::default()),
             project_reference: None,
         };
         let denied_plan = TaskPlan {
@@ -1818,6 +1955,8 @@ mod tests {
                 receipt: None,
                 target: None,
             }]),
+            required_invocations: Some(Vec::new()),
+            filesystem_access: Some(PlannedFilesystemAccess::default()),
             project_reference: None,
         };
         assert!(!planned_mutation_constraints_are_grounded(

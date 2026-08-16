@@ -23,6 +23,8 @@ pub use model_call_telemetry::{
     record_background_model_call_telemetry, record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use payloads::*;
+#[cfg(test)]
+pub(crate) use store::GeneratedResponseRef;
 pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]
 pub use store::{

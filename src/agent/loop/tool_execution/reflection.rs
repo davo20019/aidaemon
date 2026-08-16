@@ -558,9 +558,11 @@ mod tests {
             .expect("history should exist");
         assert_eq!(entries.len(), 5);
         assert_eq!(entries.first().map(|entry| entry.iteration), Some(2));
-        assert!(entries.iter().all(|entry| !entry
-            .arguments_summary
-            .contains("sk-abcdefghijklmnopqrstuvwxyz")));
+        assert!(entries.iter().all(|entry| {
+            !entry
+                .arguments_summary
+                .contains("sk-abcdefghijklmnopqrstuvwxyz")
+        }));
         assert!(entries
             .iter()
             .all(|entry| !entry.error_text.contains("abcdefghijklmnopqrstuvwxyz")));

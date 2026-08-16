@@ -71,6 +71,7 @@ fn compile_step_plan_uses_scope_and_idempotency_for_mutations() {
         "edit_file",
         r#"{"path":"src/main.rs"}"#,
         &semantics,
+        &Default::default(),
         ToolCapabilities {
             read_only: false,
             external_side_effect: false,
@@ -78,7 +79,7 @@ fn compile_step_plan_uses_scope_and_idempotency_for_mutations() {
             idempotent: false,
             high_impact_write: false,
         },
-        Some("/repo"),
+        &[String::from("/repo")],
     );
 
     assert_eq!(plan.primary_tool.as_deref(), Some("edit_file"));
@@ -110,6 +111,7 @@ fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
         "http_request",
         r#"{"url":"https://clinicaltrials.gov/api/v2/studies"}"#,
         &semantics,
+        &Default::default(),
         ToolCapabilities {
             read_only: true,
             external_side_effect: true,
@@ -117,7 +119,7 @@ fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
             idempotent: true,
             high_impact_write: false,
         },
-        Some("/repo"),
+        &[String::from("/repo")],
     );
 
     assert_eq!(plan.target_scope.allowed_targets.len(), 1);
@@ -141,6 +143,7 @@ fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
         "terminal",
         r#"{"command":"node --version"}"#,
         &ToolCallSemantics::observation(),
+        &Default::default(),
         ToolCapabilities {
             read_only: false,
             external_side_effect: true,
@@ -148,7 +151,7 @@ fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
             idempotent: false,
             high_impact_write: true,
         },
-        Some("/repo"),
+        &[String::from("/repo")],
     );
     assert_eq!(plan.approval_requirement, ApprovalRequirement::NotNeeded);
     assert!(plan.idempotency_key.is_none());

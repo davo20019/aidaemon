@@ -2700,18 +2700,6 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(reply.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
         validation_state.refresh_success_criteria_matches(&reply);
         if !validation_state.active_success_criteria.is_empty()
             && validation_state.matched_success_criteria.is_empty()
@@ -2719,67 +2707,6 @@ pub(super) async fn run_completion_phase(
             validation_state.record_failure(ValidationFailure::SuccessCriteriaUnmatched);
         }
         validation_state.clear_loop_repetition_reason();
-        agent
-            .append_assistant_message_with_event(
-                emitter,
-                &assistant_msg,
-                &model,
-                resp.usage.as_ref().map(|u| u.input_tokens),
-                resp.usage.as_ref().map(|u| u.output_tokens),
-            )
-            .await?;
-
-        let fast_model = llm_router
-            .as_ref()
-            .map(|r| r.select(crate::router::Tier::Fast).to_string())
-            .unwrap_or_else(|| model.clone());
-
-        let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
-            agent.mandate_execution.is_some(),
-            learning_ctx.memory_persistence_allowed,
-            agent.context_window_config.progressive_facts,
-            crate::memory::context_window::should_extract_facts(user_text),
-            agent.context_window_config.enabled,
-        );
-
-        // Progressive fact extraction: extract durable facts immediately for
-        // ordinary conversations only. Mandates cannot write global memory.
-        if spawn_progressive_facts {
-            crate::memory::context_window::spawn_progressive_extraction(
-                llm_provider.clone(),
-                fast_model.clone(),
-                agent.state.clone(),
-                agent.event_store.clone(),
-                user_text.to_string(),
-                reply.clone(),
-                channel_ctx.channel_id.clone(),
-                channel_ctx.visibility,
-                user_role,
-            );
-        }
-
-        // Summary maintenance is independent of fact-extraction eligibility:
-        // short acknowledgements and follow-ups still advance conversation
-        // history and must not leave the summary cursor frozen.
-        if spawn_summary_maintenance {
-            let summary_token_threshold = agent
-                .context_window_config
-                .summarize_token_threshold_for(&fast_model);
-            let summary_recent_tokens = agent
-                .context_window_config
-                .summary_recent_tokens_for(&fast_model);
-            crate::memory::context_window::spawn_incremental_summarization(
-                llm_provider.clone(),
-                fast_model,
-                agent.state.clone(),
-                agent.event_store.clone(),
-                session_id.to_string(),
-                summary_token_threshold,
-                summary_recent_tokens,
-                user_role,
-            );
-        }
-
         let reply_is_model_authored = reply == model_authored_reply;
         // Degeneration guard: collapse runaway repetition loops before anything
         // else. Models (especially local ones) sometimes collapse into emitting
@@ -3337,6 +3264,77 @@ pub(super) async fn run_completion_phase(
                 sanitization_metadata,
             )
             .await;
+
+        // Finalization is a single commit boundary: persist exactly the text
+        // that will be returned to ingress after every rewrite, safety gate,
+        // channel redaction, and fallback has finished. Response identity is
+        // therefore stable across persistence and delivery without recovering
+        // it by comparing transformed prose.
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(reply.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            ..Message::runtime_defaults()
+        };
+        agent
+            .append_assistant_message_with_event(
+                emitter,
+                &assistant_msg,
+                &model,
+                resp.usage.as_ref().map(|usage| usage.input_tokens),
+                resp.usage.as_ref().map(|usage| usage.output_tokens),
+            )
+            .await?;
+
+        let fast_model = llm_router
+            .as_ref()
+            .map(|router| router.select(crate::router::Tier::Fast).to_string())
+            .unwrap_or_else(|| model.clone());
+        let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
+            agent.mandate_execution.is_some(),
+            learning_ctx.memory_persistence_allowed,
+            agent.context_window_config.progressive_facts,
+            crate::memory::context_window::should_extract_facts(user_text),
+            agent.context_window_config.enabled,
+        );
+        if spawn_progressive_facts {
+            crate::memory::context_window::spawn_progressive_extraction(
+                llm_provider.clone(),
+                fast_model.clone(),
+                agent.state.clone(),
+                agent.event_store.clone(),
+                user_text.to_string(),
+                reply.clone(),
+                channel_ctx.channel_id.clone(),
+                channel_ctx.visibility,
+                user_role,
+            );
+        }
+        if spawn_summary_maintenance {
+            let summary_token_threshold = agent
+                .context_window_config
+                .summarize_token_threshold_for(&fast_model);
+            let summary_recent_tokens = agent
+                .context_window_config
+                .summary_recent_tokens_for(&fast_model);
+            crate::memory::context_window::spawn_incremental_summarization(
+                llm_provider.clone(),
+                fast_model,
+                agent.state.clone(),
+                agent.event_store.clone(),
+                session_id.to_string(),
+                summary_token_threshold,
+                summary_recent_tokens,
+                user_role,
+            );
+        }
+
         let outcome = TaskOutcomeDerivation::from_completion_state(
             &validation_state,
             execution_state,

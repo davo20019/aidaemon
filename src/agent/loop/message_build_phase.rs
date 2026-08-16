@@ -2089,8 +2089,7 @@ mod tests {
             .await
             .expect("append user");
 
-        let system_prompt =
-            "## Identity\nStable identity.\n\n## Tools\nVerbose tool guidance.\n\n## Behavior\nBe precise.";
+        let system_prompt = "## Identity\nStable identity.\n\n## Tools\nVerbose tool guidance.\n\n## Behavior\nBe precise.";
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let tool_defs: Vec<Value> = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;

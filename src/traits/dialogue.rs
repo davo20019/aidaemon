@@ -89,10 +89,9 @@ pub struct RequestEvidenceRequirement {
     pub purpose: EvidencePurpose,
     pub minimum_authority: EvidenceAuthority,
     pub temporal_scope: EvidenceTemporalScope,
-    /// Exact field/key tokens whose presence must be proven by a content
-    /// observation. Outcome requirements are closed by typed receipt fields;
-    /// their reply formatting belongs in `required_response_fields` instead.
-    /// Older persisted contracts omit markers and retain scope-level matching.
+    /// Legacy advisory field/key hints. These remain for persisted schema
+    /// compatibility and investigation guidance, but never decide lifecycle
+    /// completion. Hard proof uses typed receipts and structural identities.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_content_markers: Vec<String>,
     /// Typed invocation/result constraints. New outcome requirements must use

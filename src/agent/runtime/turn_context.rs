@@ -36,6 +36,15 @@ pub(super) struct TurnContext {
     /// interchangeable proof.
     pub visible_antecedent_user_message_id: Option<String>,
     pub primary_project_scope: Option<String>,
+    /// Exact path authorities named by the current request (or inherited from
+    /// its structurally-linked open request). Unlike `primary_project_scope`,
+    /// this list is never widened to a common ancestor and is therefore safe
+    /// to compile into write confinement.
+    pub authorized_project_scopes: Vec<String>,
+    /// Semantic least-privilege task authority. When absent, the dispatcher
+    /// falls back to structurally named scopes while still confining each call
+    /// to its explicit access manifest.
+    pub filesystem_access: Option<crate::traits::ToolCallAccessManifest>,
     pub allow_multi_project_scope: bool,
     pub followup_mode: Option<FollowupMode>,
     pub reasons: Vec<TurnContextReason>,
@@ -455,6 +464,11 @@ impl Agent {
             allow_multi_project_scope,
             allow_scope_carryover,
         );
+        let authorized_project_scopes = if current_project_scopes.is_empty() {
+            primary_project_scope.iter().cloned().collect()
+        } else {
+            current_project_scopes.clone()
+        };
         let contract_text = continuation_request_anchor.unwrap_or(&goal_user_text);
         let mut completion_contract =
             infer_structural_completion_contract(contract_text, &self.path_aliases.projects);
@@ -518,6 +532,8 @@ impl Agent {
             ),
             visible_antecedent_user_message_id: None,
             primary_project_scope,
+            authorized_project_scopes,
+            filesystem_access: None,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),
             reasons,

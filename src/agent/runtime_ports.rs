@@ -10,17 +10,11 @@ use crate::traits::AgentRole;
 
 fn returned_generated_response(
     captured: Vec<crate::events::CapturedGeneratedResponse>,
-    returned_text: &str,
+    _returned_text: &str,
 ) -> anyhow::Result<crate::events::CapturedGeneratedResponse> {
-    captured
-        .into_iter()
-        .rev()
-        .find(|candidate| Agent::sanitize_final_reply_markers(&candidate.content) == returned_text)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "returned assistant response lacks an identity from its ingress lifecycle"
-            )
-        })
+    captured.into_iter().next_back().ok_or_else(|| {
+        anyhow::anyhow!("returned assistant response lacks an identity from its ingress lifecycle")
+    })
 }
 
 #[async_trait]
@@ -135,7 +129,7 @@ impl ConversationRuntime for Agent {
                         child_task_id: generated.task_id.clone(),
                         parent_tool_call_id,
                         parent_result_id: request.parent_result_id,
-                        child_response_id: generated.response_id.clone(),
+                        child_response_id: Some(generated.response_id.clone()),
                     },
                 )
                 .await?;
@@ -256,5 +250,31 @@ impl ChannelAgentRuntime for Agent {
 impl AssistantNoteSink for Agent {
     async fn record_assistant_note(&self, session_id: &str, note: &str) -> anyhow::Result<()> {
         self.record_auxiliary_assistant_note(session_id, note).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_response_identity_survives_final_text_transformation() {
+        let captured = crate::events::CapturedGeneratedResponse {
+            content: "pre-transform response".to_string(),
+            response: crate::events::GeneratedResponseRef {
+                response_id: "response-synthetic".to_string(),
+                task_id: "task-synthetic".to_string(),
+                turn_id: Some("turn-synthetic".to_string()),
+                referenced_receipts: Vec::new(),
+            },
+        };
+
+        let selected = returned_generated_response(
+            vec![captured],
+            "sanitized user-facing response with different text",
+        )
+        .expect("causal identity");
+        assert_eq!(selected.response.response_id, "response-synthetic");
+        assert_eq!(selected.response.task_id, "task-synthetic");
     }
 }

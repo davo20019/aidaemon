@@ -183,9 +183,8 @@ pub fn assess_pre_execution_evidence_gate(
             } else {
                 Some(EvidenceGateViolation {
                     kind: EvidenceKind::FileRead,
-                    reason:
-                        "overwriting an existing file requires direct file-read evidence first"
-                            .to_string(),
+                    reason: "overwriting an existing file requires direct file-read evidence first"
+                        .to_string(),
                     coaching: format!(
                         "Before overwriting {}, use `read_file` on that path, then retry `write_file`.",
                         target.value

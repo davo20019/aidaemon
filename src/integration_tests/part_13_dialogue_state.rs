@@ -176,12 +176,14 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
     let harness = setup_test_agent(provider).await.unwrap();
     let session_id = "exact_source_question_adjacency";
 
+    let mut delivered_replies = Vec::new();
     for message in [
         "Where do I live?",
         "Remind me what we've mainly been working on together.",
         source_question,
     ] {
-        harness
+        delivered_replies.push(
+            harness
             .agent
             .handle_message(
                 session_id,
@@ -192,7 +194,8 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
                 None,
             )
             .await
-            .unwrap();
+            .unwrap(),
+        );
     }
 
     // This exact wording intentionally has no source-question phrase rule. The
@@ -220,12 +223,17 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
     );
     assert!(!serialized.contains("Original request:"), "{serialized}");
 
+    // Continuity is bound to the finalized, persisted response—not the raw
+    // provider draft. Finalization may redact or normalize channel-visible
+    // content, and response identity requires history to retain that exact
+    // delivered representation.
+    let finalized_job_answer = &delivered_replies[1];
     let job_answer_idx = source_call
         .messages
         .iter()
         .position(|message| {
             message.get("content").and_then(|content| content.as_str())
-                == Some(job_prep_answer.as_str())
+                == Some(finalized_job_answer.as_str())
         })
         .expect("immediately preceding job-preparation answer");
     assert_eq!(

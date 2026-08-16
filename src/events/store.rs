@@ -575,7 +575,7 @@ impl EventStore {
         .fetch_all(&self.pool)
         .await?;
         let mut seen = std::collections::HashSet::new();
-        Ok(rows
+        let mut references = rows
             .into_iter()
             .filter_map(|row| {
                 let receipt_id = row.try_get::<String, _>("receipt_id").ok()?;
@@ -591,7 +591,57 @@ impl EventStore {
                             .unwrap_or_default(),
                     })
             })
-            .collect())
+            .collect::<Vec<_>>();
+
+        // A continuation adopts a receipt; it does not copy or re-author it.
+        // Resolve the exact typed parent edge and include that canonical
+        // receipt in the same projection used by AssistantResponse and TaskEnd.
+        let linked_rows = sqlx::query(
+            "SELECT session_id, data
+             FROM events
+             WHERE event_type = 'background_continuation_linked' AND task_id = ?
+             ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in linked_rows {
+            let session_id: String = row.get("session_id");
+            let raw: String = row.get("data");
+            let Ok(link) = serde_json::from_str::<super::BackgroundContinuationLinkedData>(&raw)
+            else {
+                continue;
+            };
+            let Some(parent_result_id) = link.parent_result_id.as_deref() else {
+                continue;
+            };
+            let Some(evidence) = self
+                .continuation_tool_evidence(
+                    &session_id,
+                    &link.parent_task_id,
+                    &link.parent_tool_call_id,
+                    parent_result_id,
+                )
+                .await?
+            else {
+                continue;
+            };
+            let Some(receipt) = evidence.result.receipt else {
+                continue;
+            };
+            if receipt.schema_version != super::ToolReceiptV1::SCHEMA_VERSION
+                || receipt.completion_obligation_ids.is_empty()
+                || !seen.insert(link.parent_tool_call_id.clone())
+            {
+                continue;
+            }
+            references.push(super::CompletionProofReference {
+                receipt_id: link.parent_tool_call_id,
+                result_id: receipt.result_provenance.result_id,
+                obligation_ids: receipt.completion_obligation_ids,
+            });
+        }
+        Ok(references)
     }
 
     /// Load the exact parent receipt named by an internal continuation edge.
@@ -2822,6 +2872,8 @@ mod tests {
             None,
         );
         receipt.result_provenance.result_id = Some("result-exact".to_string());
+        receipt.completion_obligation_ids =
+            vec!["task:task-child/obligation:background-result".to_string()];
         let result = ToolResultData {
             message_id: None,
             tool_call_id: "call-exact".to_string(),
@@ -2862,6 +2914,35 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        let mut link = serde_json::to_value(crate::events::BackgroundContinuationLinkedData {
+            parent_task_id: "task-parent".to_string(),
+            child_task_id: "task-child".to_string(),
+            parent_tool_call_id: "call-exact".to_string(),
+            parent_result_id: Some("result-exact".to_string()),
+            child_response_id: Some("response-child".to_string()),
+        })
+        .unwrap();
+        link["task_id"] = json!("task-child");
+        store
+            .append(Event::new(
+                "session-a",
+                EventType::BackgroundContinuationLinked,
+                link,
+            ))
+            .await
+            .unwrap();
+        let proof = store
+            .task_completion_proof_references("task-child")
+            .await
+            .unwrap();
+        assert_eq!(proof.len(), 1);
+        assert_eq!(proof[0].receipt_id, "call-exact");
+        assert_eq!(proof[0].result_id.as_deref(), Some("result-exact"));
+        assert_eq!(
+            proof[0].obligation_ids,
+            ["task:task-child/obligation:background-result"]
+        );
     }
 
     #[tokio::test]

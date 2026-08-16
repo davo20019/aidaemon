@@ -256,12 +256,69 @@ async fn finalize_turn_assessment(
         let grounded = planned_mutation_constraints_are_grounded(signals, user_text);
         let tool_constraint_grounded = planned_tool_constraints_are_grounded(signals, user_text);
         let response_fields_grounded = planned_response_fields_are_grounded(signals, user_text);
+        let filesystem_access = signals.filesystem_access.as_ref().and_then(|access| {
+            let grounded =
+                crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
+                    user_text,
+                    &agent.path_aliases.projects,
+                );
+            let resolve = |raw: &str| {
+                crate::tools::fs_utils::resolve_structural_filesystem_reference(
+                    raw,
+                    &agent.path_aliases.projects,
+                )
+                .map(|path| path.to_string_lossy().to_string())
+                .filter(|path| grounded.iter().any(|item| item == path))
+            };
+            let execution_cwd = access.execution_cwd.as_deref().and_then(resolve);
+            if access.execution_cwd.is_some() && execution_cwd.is_none() {
+                return None;
+            }
+            let read_paths = access
+                .read_paths
+                .iter()
+                .map(|path| resolve(path))
+                .collect::<Option<Vec<_>>>()?;
+            let write_paths = access
+                .write_paths
+                .iter()
+                .map(|path| resolve(path))
+                .collect::<Option<Vec<_>>>()?;
+            Some(crate::traits::ToolCallAccessManifest {
+                execution_cwd,
+                read_targets: read_paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        crate::traits::ToolTargetHint::new(
+                            crate::traits::ToolTargetHintKind::Path,
+                            path,
+                        )
+                    })
+                    .collect(),
+                write_targets: write_paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        crate::traits::ToolTargetHint::new(
+                            crate::traits::ToolTargetHintKind::Path,
+                            path,
+                        )
+                    })
+                    .collect(),
+            })
+        });
+        let filesystem_access_grounded = signals.filesystem_access.as_ref().is_some_and(|access| {
+            filesystem_access.is_some()
+                || access.execution_cwd.is_none()
+                    && access.read_paths.is_empty()
+                    && access.write_paths.is_empty()
+        });
 
         if confident
             && complete
             && (!declares_negative_scope || grounded)
             && (!has_tool_constraints || tool_constraint_grounded)
             && response_fields_grounded
+            && filesystem_access_grounded
         {
             let planned_kind = signals
                 .task_kind
@@ -304,6 +361,10 @@ async fn finalize_turn_assessment(
                         .evidence_requirements
                         .as_deref()
                         .unwrap_or_default(),
+                    required_invocations: signals
+                        .required_invocations
+                        .as_deref()
+                        .unwrap_or_default(),
                     forbids_tool_use,
                     allowed_tool_names: &signals.allowed_tool_names,
                     forbidden_tool_scopes: &signals.forbidden_tool_scopes,
@@ -342,6 +403,11 @@ async fn finalize_turn_assessment(
                     turn_context.primary_project_scope = Some(scope.to_string_lossy().to_string());
                 }
             }
+            turn_context.filesystem_access = filesystem_access.filter(|access| {
+                access.execution_cwd.is_some()
+                    || !access.read_targets.is_empty()
+                    || !access.write_targets.is_empty()
+            });
             semantic_contract_applied = true;
         } else {
             warn!(

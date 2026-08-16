@@ -666,8 +666,7 @@ mod tool_output_paste_tests {
 
     #[test]
     fn allows_short_answer_that_cites_a_path() {
-        let tool =
-            "/Users/davidloor/projects/resume/david-loor-resume.md\n/Users/davidloor/projects/resume/other.pdf\n/Users/davidloor/projects/resume/third.pdf";
+        let tool = "/Users/davidloor/projects/resume/david-loor-resume.md\n/Users/davidloor/projects/resume/other.pdf\n/Users/davidloor/projects/resume/third.pdf";
         let reply = "I've sent your resume (david-loor-resume.md).";
         assert!(!reply_duplicates_tool_output(reply, tool));
     }

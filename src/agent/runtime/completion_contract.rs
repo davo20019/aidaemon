@@ -594,6 +594,7 @@ pub(super) struct SemanticCompletionRequirements<'a> {
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
     pub evidence_requirements: &'a [RequestEvidenceRequirement],
+    pub required_invocations: &'a [crate::traits::RequestReceiptPredicate],
     pub forbids_tool_use: bool,
     pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
@@ -647,7 +648,45 @@ pub(super) fn install_semantic_completion_contract(
     // content obligation. Paths also represent execution scope (for example a
     // command's working directory), and treating those as requested evidence
     // creates validation loops unrelated to the user's objective.
-    let evidence_requirements = requirements.evidence_requirements.to_vec();
+    // Free-form summaries and subject tokens guide investigation but do not
+    // decide completion. Keep the typed scope/purpose/authority/time contract,
+    // normalize it, and collapse duplicate obligations that differ only in
+    // prose. This preserves the subject boundary (for example user memory vs.
+    // host state) without creating one proof node per paraphrase.
+    let mut evidence_requirements = Vec::new();
+    for mut requirement in requirements.evidence_requirements.iter().cloned() {
+        requirement.required_content_markers.clear();
+        requirement
+            .acceptable_scopes
+            .sort_by_key(|scope| scope.as_str());
+        requirement.acceptable_scopes.dedup();
+        let duplicate =
+            evidence_requirements
+                .iter()
+                .any(|existing: &RequestEvidenceRequirement| {
+                    existing.acceptable_scopes == requirement.acceptable_scopes
+                        && existing.purpose == requirement.purpose
+                        && existing.minimum_authority == requirement.minimum_authority
+                        && existing.temporal_scope == requirement.temporal_scope
+                        && existing.receipt == requirement.receipt
+                        && existing.target == requirement.target
+                });
+        if !duplicate {
+            evidence_requirements.push(requirement);
+        }
+    }
+    evidence_requirements.extend(requirements.required_invocations.iter().cloned().map(
+        |receipt| RequestEvidenceRequirement {
+            summary: "Complete the exact requested machine invocation".to_string(),
+            acceptable_scopes: Vec::new(),
+            purpose: crate::traits::EvidencePurpose::Outcome,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: Some(receipt),
+            target: None,
+        },
+    ));
     let scope = requirements.mutation_scope.trim().to_ascii_lowercase();
     let forbids_mutation = matches!(scope.as_str(), "read_only" | "read-only");
     let expects_mutation = requirements.expects_mutation && !forbids_mutation;
@@ -673,7 +712,9 @@ pub(super) fn install_semantic_completion_contract(
             Vec::new()
         },
         requires_observation: !requirements.forbids_tool_use
-            && (requirements.requires_observation || !evidence_requirements.is_empty()),
+            && (requirements.requires_observation
+                || !requirements.evidence_requirements.is_empty()
+                || !requirements.required_invocations.is_empty()),
         requires_reverification_after_mutation: expects_mutation
             && requirements.requires_observation,
         // This now records a semantic observation obligation, not an English
@@ -1115,11 +1156,6 @@ pub(super) struct CompletionProgress {
     /// One proof-graph obligation per `CompletionContract::evidence_requirements`
     /// entry, preserving index alignment for receipt matching.
     pub(in crate::agent) evidence_obligation_ids: Vec<String>,
-    /// Content tokens observed across compatible receipts for each material
-    /// need. A management answer often requires joining multiple canonical
-    /// reads; no single receipt is required to contain the whole response
-    /// schema, but every requested marker must be present in the aggregate.
-    pub(in crate::agent) evidence_content_markers: Vec<std::collections::HashSet<String>>,
 }
 
 impl CompletionProgress {
@@ -1185,7 +1221,6 @@ impl CompletionProgress {
                 self.proof_graph
                     .add_edge(&request_id, &id, ExecutionEdgeKind::Requires, None)?;
                 self.evidence_obligation_ids.push(id);
-                self.evidence_content_markers.push(Default::default());
             }
         } else if contract.requires_observation {
             let id = self.scoped_node_id("obligation:verification");
@@ -1417,26 +1452,6 @@ impl CompletionProgress {
                 .collect::<Vec<_>>();
             self.record_verification_evidence(tool_call_id, &obligation_ids);
         }
-    }
-
-    pub(in crate::agent) fn record_evidence_content_markers(
-        &mut self,
-        requirement_index: usize,
-        markers: impl IntoIterator<Item = String>,
-    ) {
-        if let Some(observed) = self.evidence_content_markers.get_mut(requirement_index) {
-            observed.extend(markers);
-        }
-    }
-
-    pub(in crate::agent) fn evidence_content_markers_satisfied(
-        &self,
-        requirement_index: usize,
-        required: &[String],
-    ) -> bool {
-        self.evidence_content_markers
-            .get(requirement_index)
-            .is_some_and(|observed| required.iter().all(|marker| observed.contains(marker)))
     }
 
     pub(super) fn mark_verification_attempt(&mut self) {
@@ -2574,6 +2589,7 @@ mod tests {
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: &[],
+                required_invocations: &[],
                 forbids_tool_use: false,
                 allowed_tool_names: &[],
                 forbidden_tool_scopes: &[],
@@ -2616,6 +2632,7 @@ mod tests {
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: std::slice::from_ref(&requirement),
+                required_invocations: &[],
                 forbids_tool_use: true,
                 allowed_tool_names: &[],
                 forbidden_tool_scopes: &[],
@@ -2657,6 +2674,7 @@ mod tests {
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: std::slice::from_ref(&requirement),
+                required_invocations: &[],
                 forbids_tool_use: false,
                 allowed_tool_names: &["check_environment".to_string()],
                 forbidden_tool_scopes: &[],
@@ -2666,6 +2684,62 @@ mod tests {
         assert_eq!(contract.allowed_tool_names, ["check_environment"]);
         assert!(contract.requires_observation);
         assert!(!contract.forbids_tool_use);
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert!(contract.evidence_requirements[0]
+            .required_content_markers
+            .is_empty());
+        assert_eq!(
+            contract.evidence_requirements[0].acceptable_scopes,
+            [crate::traits::ToolSemanticScope::HostLocal]
+        );
+    }
+
+    #[test]
+    fn semantic_contract_deduplicates_prose_variants_but_keeps_subject_scope() {
+        let make = |summary: &str, marker: &str| RequestEvidenceRequirement {
+            summary: summary.to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: vec![marker.to_string()],
+            receipt: None,
+            target: None,
+        };
+        let requirements = vec![
+            make("Find the user's pet information", "pets"),
+            make("Determine whether animals are recorded", "animals"),
+        ];
+        let mut contract = CompletionContract::default();
+        install_semantic_completion_contract(
+            &mut contract,
+            SemanticCompletionRequirements {
+                expects_mutation: false,
+                requires_observation: true,
+                task_kind: CompletionTaskKind::Answer,
+                required_mutation_effects: ToolMutationEffects::NONE,
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+                evidence_requirements: &requirements,
+                required_invocations: &[],
+                forbids_tool_use: false,
+                allowed_tool_names: &[],
+                forbidden_tool_scopes: &[],
+                required_response_fields: &[],
+            },
+        );
+
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert_eq!(
+            contract.evidence_requirements[0].acceptable_scopes,
+            [crate::traits::ToolSemanticScope::UserMemory]
+        );
+        assert!(contract.evidence_requirements[0]
+            .required_content_markers
+            .is_empty());
     }
 
     #[test]

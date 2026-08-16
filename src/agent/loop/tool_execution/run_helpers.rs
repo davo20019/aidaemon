@@ -310,8 +310,63 @@ pub(super) fn deterministic_tool_contract_violation(
     match tool_name {
         "scheduled_goal_runs" => scheduled_goal_runs_missing_goal_id_violation(raw_arguments),
         "manage_memories" => manage_memories_missing_goal_id_violation(raw_arguments),
+        "terminal" => {
+            let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+            let command = parsed.get("command").and_then(Value::as_str)?;
+            let has_write_paths = parsed
+                .get("write_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                });
+            (crate::tools::command_semantics::classify_shell_command(command).mutates_state()
+                && !has_write_paths)
+                .then(|| DeterministicToolContractViolation {
+                    reason: "mutating terminal runs require an explicit non-empty write_paths access manifest".to_string(),
+                    coaching: "Retry the same operation with execution working_dir kept separate from the exact write_paths it may change.".to_string(),
+                })
+        }
+        "cli_agent" => {
+            let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+            let is_read_write = parsed.get("action").and_then(Value::as_str) == Some("run")
+                && parsed.get("workspace_mode").and_then(Value::as_str) == Some("read_write");
+            let has_write_paths = parsed
+                .get("write_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                });
+            (is_read_write && !has_write_paths).then(|| DeterministicToolContractViolation {
+                reason: "read-write CLI delegation requires an explicit non-empty write_paths access manifest".to_string(),
+                coaching: "Retry with working_dir/read_paths for readable context and exact write_paths for mutation authority.".to_string(),
+            })
+        }
         _ => None,
     }
+}
+
+/// Keep only the most-specific exact paths. If both a cwd ancestor and an
+/// artifact below it were named, the ancestor is execution context rather than
+/// an implicit blanket write grant.
+pub(super) fn narrowest_authorized_path_scopes(scopes: &[String]) -> Vec<String> {
+    let mut result = scopes
+        .iter()
+        .filter(|scope| !scope.trim().is_empty())
+        .filter(|scope| {
+            !scopes.iter().any(|other| {
+                scope != &other
+                    && std::path::Path::new(other).starts_with(std::path::Path::new(scope))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    result.sort();
+    result.dedup();
+    result
 }
 
 pub(super) fn tool_is_currently_exposed(tool_defs: &[Value], tool_name: &str) -> bool {
@@ -451,10 +506,15 @@ pub(super) fn target_scope_violation_for_tool_call(
         return None;
     }
 
-    let candidate_targets = extract_target_hints_from_arguments(effective_arguments);
-    if candidate_targets.is_empty() {
-        return None;
-    }
+    // The compiled plan owns the prepared write set. Re-extracting every path
+    // argument here would turn execution cwd and readable context into implied
+    // mutation targets. Legacy/test plans without a prepared set retain the
+    // conservative argument fallback.
+    let candidate_targets = if step_plan.expected_targets.is_empty() {
+        extract_target_hints_from_arguments(effective_arguments)
+    } else {
+        step_plan.expected_targets.clone()
+    };
 
     let violations: Vec<String> = candidate_targets
         .iter()
@@ -485,6 +545,101 @@ pub(super) fn target_scope_violation_for_tool_call(
             violations.join(", ")
         ))
     }
+}
+
+/// Verify a call's declared read/write capability request against the task's
+/// authority before I/O. Mixed operations must satisfy both sets; execution
+/// cwd is readable context and is never an implicit write grant.
+pub(super) fn access_manifest_scope_violation(
+    _tool_name: &str,
+    call: &crate::traits::ToolCallAccessManifest,
+    task: Option<&crate::traits::ToolCallAccessManifest>,
+    fallback_scopes: &[String],
+) -> Option<String> {
+    // This layer attenuates an existing capability; it does not create the
+    // authority boundary itself. If neither the semantic task contract nor a
+    // channel workspace supplied a boundary, leave authorization to the
+    // ordinary tool policy/approval layer. Treating an absent optional
+    // manifest as an empty grant turns this composable check into deny-all.
+    if task.is_none() && fallback_scopes.is_empty() {
+        return None;
+    }
+
+    let fallback = fallback_scopes
+        .iter()
+        .filter_map(|scope| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope.clone()))
+        .collect::<Vec<_>>();
+    let (read_grants, write_grants) = if let Some(task) = task {
+        let mut reads = task.read_targets.clone();
+        if let Some(cwd) = task.execution_cwd.as_deref() {
+            if let Some(cwd) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
+                if !reads.contains(&cwd) {
+                    reads.push(cwd);
+                }
+            }
+        }
+        (reads, task.write_targets.clone())
+    } else {
+        (fallback.clone(), fallback)
+    };
+
+    // Filesystem capabilities are monotone: a directory grant may authorize
+    // descendants, while an exact-path grant never authorizes its parent or a
+    // sibling. Project discovery has a separate near-ancestor convenience
+    // rule; reusing it here would widen write authority.
+    let capability_grant_allows =
+        |grant: &ToolTargetHint, candidate: &ToolTargetHint| match (&grant.kind, &candidate.kind) {
+            (ToolTargetHintKind::ResourceId, ToolTargetHintKind::ResourceId) => {
+                grant.value == candidate.value
+            }
+            (ToolTargetHintKind::Url, ToolTargetHintKind::Url) => {
+                grant.value.eq_ignore_ascii_case(&candidate.value)
+            }
+            (ToolTargetHintKind::Path, ToolTargetHintKind::Path) => grant.value == candidate.value,
+            (
+                ToolTargetHintKind::ProjectScope,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
+            ) => {
+                let grant = std::path::Path::new(&grant.value);
+                let candidate = std::path::Path::new(&candidate.value);
+                candidate == grant || candidate.starts_with(grant)
+            }
+            _ => false,
+        };
+    let outside = |candidate: &ToolTargetHint, grants: &[ToolTargetHint]| {
+        grants.is_empty()
+            || !grants
+                .iter()
+                .any(|grant| capability_grant_allows(grant, candidate))
+    };
+    let invalid_reads = call
+        .read_targets
+        .iter()
+        .filter(|candidate| outside(candidate, &read_grants))
+        .map(|target| target.value.clone())
+        .collect::<Vec<_>>();
+    let invalid_writes = call
+        .write_targets
+        .iter()
+        .filter(|candidate| outside(candidate, &write_grants))
+        .map(|target| target.value.clone())
+        .collect::<Vec<_>>();
+    if invalid_reads.is_empty() && invalid_writes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "task filesystem capability violation (unauthorized reads: {}; unauthorized writes: {})",
+        if invalid_reads.is_empty() {
+            "none".to_string()
+        } else {
+            invalid_reads.join(", ")
+        },
+        if invalid_writes.is_empty() {
+            "none".to_string()
+        } else {
+            invalid_writes.join(", ")
+        }
+    ))
 }
 
 pub(super) fn is_hard_policy_tool_budget_reached(
@@ -543,23 +698,6 @@ pub(super) fn run_command_policy_block_requires_terminal(result_text: &str) -> b
         || lower.contains("daemonization primitives are blocked in run_command")
 }
 
-pub(super) fn shell_single_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 pub(super) fn build_terminal_fallback_arguments_from_run_command(
     raw_arguments: &str,
 ) -> Option<String> {
@@ -574,22 +712,14 @@ pub(super) fn build_terminal_fallback_arguments_from_run_command(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty());
-    let terminal_command = if let Some(dir) = working_dir {
-        // Routing must preserve effects. Creating a missing working directory
-        // here would turn an observational command into a mutation. Commands
-        // that intend to create their workspace must say so explicitly.
-        let quoted = shell_single_quote(dir);
-        format!("cd {quoted} && {command}")
-    } else {
-        command.to_string()
-    };
-    Some(
-        json!({
-            "action": "run",
-            "command": terminal_command,
-        })
-        .to_string(),
-    )
+    let mut terminal_args = json!({
+        "action": "run",
+        "command": command,
+    });
+    if let Some(working_dir) = working_dir {
+        terminal_args["working_dir"] = json!(working_dir);
+    }
+    Some(terminal_args.to_string())
 }
 
 pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
@@ -984,10 +1114,10 @@ fn requirement_target_matches(
         .any(|haystack| verification_target_matches_haystack(&contract_target, haystack))
 }
 
-/// Return the exact material evidence obligations supported by one successful
-/// observation receipt. Resource identity and requested content markers come
-/// from the typed contract; neither a path mention nor tool capability alone
-/// can close a field-level content obligation.
+/// Return the exact machine-checkable evidence obligations supported by one
+/// successful observation receipt. Free-form subject words never decide task
+/// completion; only typed capabilities, receipt fields, and structural target
+/// identity participate here.
 pub(in crate::agent) fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
     requested_tool_name: &str,
@@ -1005,19 +1135,19 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
         .iter()
         .enumerate()
         .filter_map(|(index, requirement)| {
-            let capability_matches = semantics.evidence.iter().any(|capability| {
-                crate::agent::inquiry::capability_supports_requirement(capability, requirement)
-            });
+            let capability_matches =
+                crate::agent::inquiry::requirement_is_exact_invocation(requirement)
+                    || semantics.evidence.iter().any(|capability| {
+                        crate::agent::inquiry::capability_supports_requirement(
+                            capability,
+                            requirement,
+                        )
+                    });
             let receipt_matches =
                 receipt_predicate_matches(requirement, requested_tool_name, result_text, metadata);
-            let content_markers_match = requirement
-                .required_content_markers
-                .iter()
-                .all(|marker| evidence_content_marker_matches_result(marker, result_text));
             (read_receipt_is_compatible
                 && capability_matches
                 && receipt_matches
-                && content_markers_match
                 && requirement_target_matches(requirement, semantics, raw_arguments, metadata))
             .then_some(index)
         })
@@ -1037,7 +1167,11 @@ fn receipt_predicate_matches(
         || receipt.tool_names.iter().any(|name| {
             name == requested_tool_name || metadata.effective_tool_name.as_deref() == Some(name)
         });
+    // Exit codes are meaningful only for process receipts. An assessor adding
+    // a process-only field to a management/API receipt must not make an
+    // otherwise valid named invocation impossible to prove.
     let exit_matches = receipt.exit_codes.is_empty()
+        || metadata.receipt_kind != crate::traits::ToolReceiptKind::Process
         || metadata
             .exit_code
             .is_some_and(|actual| receipt.exit_codes.contains(&actual));
@@ -1070,95 +1204,17 @@ pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
     })
 }
 
-fn evidence_content_marker_matches_result(marker: &str, result_text: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(result_text)
-        .ok()
-        .is_some_and(|value| json_value_matches_marker(&value, marker.trim(), None))
-        || crate::agent::keyword_match(result_text, marker)
-}
-
-fn json_value_matches_marker(
-    value: &serde_json::Value,
-    marker_key: &str,
-    expected_value: Option<&str>,
-) -> bool {
-    match value {
-        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
-            if key.eq_ignore_ascii_case(marker_key)
-                && expected_value.is_none_or(|expected| json_scalar_matches(value, expected))
-            {
-                return true;
-            }
-            json_value_matches_marker(value, marker_key, expected_value)
-        }),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_value_matches_marker(value, marker_key, expected_value)),
-        _ => false,
-    }
-}
-
-fn json_scalar_matches(value: &serde_json::Value, expected: &str) -> bool {
-    let expected = expected.trim();
-    match value {
-        serde_json::Value::Null => expected.eq_ignore_ascii_case("null"),
-        serde_json::Value::Bool(value) => expected.eq_ignore_ascii_case(&value.to_string()),
-        serde_json::Value::Number(value) => expected == value.to_string(),
-        serde_json::Value::String(value) => value.eq_ignore_ascii_case(expected),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::from_str::<serde_json::Value>(expected)
-                .ok()
-                .as_ref()
-                == Some(value)
-        }
-    }
-}
-
-/// Accumulate field/key evidence across compatible receipts. This is the
-/// response-data counterpart to the proof graph: one canonical read may carry
-/// schedule state while another carries mandate state, and the material need
-/// closes only after the aggregate contains every requested content marker.
+/// Compatibility shim for persisted schema-v7 marker state. Content markers
+/// are advisory and cannot close a lifecycle obligation.
 pub(in crate::agent) fn accumulate_evidence_requirement_marker_matches(
-    contract: &CompletionContract,
-    progress: &mut CompletionProgress,
-    semantics: &ToolCallSemantics,
-    raw_arguments: &str,
-    result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    _contract: &CompletionContract,
+    _progress: &mut CompletionProgress,
+    _semantics: &ToolCallSemantics,
+    _raw_arguments: &str,
+    _result_text: &str,
+    _metadata: &crate::traits::ToolCallMetadata,
 ) -> Vec<usize> {
-    let read_receipt_is_compatible = metadata
-        .read_file
-        .as_ref()
-        .is_none_or(|read| read_receipt_covers_requested_selection(raw_arguments, read));
-    let mut satisfied = Vec::new();
-    for (index, requirement) in contract.evidence_requirements.iter().enumerate() {
-        if requirement.purpose == crate::traits::EvidencePurpose::Outcome
-            || requirement.required_content_markers.is_empty()
-        {
-            continue;
-        }
-        let capability_matches = semantics.evidence.iter().any(|capability| {
-            crate::agent::inquiry::capability_supports_requirement(capability, requirement)
-        });
-        if !read_receipt_is_compatible
-            || !capability_matches
-            || !requirement_target_matches(requirement, semantics, raw_arguments, metadata)
-        {
-            continue;
-        }
-        let observed = requirement
-            .required_content_markers
-            .iter()
-            .filter(|marker| evidence_content_marker_matches_result(marker, result_text))
-            .cloned()
-            .collect::<Vec<_>>();
-        progress.record_evidence_content_markers(index, observed);
-        if progress.evidence_content_markers_satisfied(index, &requirement.required_content_markers)
-        {
-            satisfied.push(index);
-        }
-    }
-    satisfied
+    Vec::new()
 }
 
 /// A read receipt may close a content obligation only when the tool actually
@@ -1333,6 +1389,7 @@ mod tests {
         let raw_arguments = r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#;
         let registered = crate::tools::command_semantics::classify_shell_command("/usr/bin/false");
         let mut metadata = crate::traits::ToolCallMetadata {
+            receipt_kind: crate::traits::ToolReceiptKind::Process,
             outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
             ..crate::traits::ToolCallMetadata::default()
@@ -1403,6 +1460,7 @@ mod tests {
             ),
         ]);
         let metadata = crate::traits::ToolCallMetadata {
+            receipt_kind: crate::traits::ToolReceiptKind::Process,
             outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
             result_provenance: Some(crate::traits::ToolResultProvenance {
@@ -1425,13 +1483,71 @@ mod tests {
             [0]
         );
     }
+
+    #[test]
+    fn process_only_predicate_fields_do_not_reject_nonprocess_receipts() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            RequestReceiptPredicate, ToolOutcomeStatus, ToolReceiptKind, ToolSemanticScope,
+        };
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Read canonical mandate state".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::GoalState],
+                purpose: EvidencePurpose::CurrentState,
+                minimum_authority: EvidenceAuthority::Canonical,
+                temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["manage_mandates".to_string()],
+                    exit_codes: vec![0],
+                    outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
+                    requires_output: true,
+                    contract_rejected: Some(false),
+                }),
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation().with_evidence(vec![
+            crate::traits::ToolEvidenceCapability::new(
+                ToolSemanticScope::GoalState,
+                &[EvidencePurpose::CurrentState],
+                EvidenceAuthority::Canonical,
+                EvidenceTemporalScope::Current,
+            ),
+        ]);
+        let metadata = crate::traits::ToolCallMetadata {
+            receipt_kind: ToolReceiptKind::Generic,
+            outcome_status: Some(ToolOutcomeStatus::Succeeded),
+            result_provenance: Some(crate::traits::ToolResultProvenance {
+                authoritative_chars: 42,
+                ..crate::traits::ToolResultProvenance::default()
+            }),
+            semantics: semantics.clone(),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        assert_eq!(
+            matching_evidence_requirement_indices(
+                &contract,
+                "manage_mandates",
+                &semantics,
+                r#"{"action":"get","id":"synthetic"}"#,
+                "opaque canonical state",
+                &metadata,
+            ),
+            [0]
+        );
+    }
     use crate::agent::execution_state::{
         default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
     };
     use crate::traits::ToolCallEffect;
 
     #[test]
-    fn receipt_matching_separates_current_state_from_historical_attribution() {
+    fn typed_receipt_matching_is_independent_of_result_prose() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             ToolSemanticScope,
@@ -1481,15 +1597,18 @@ mod tests {
             ),
             [0]
         );
-        assert!(matching_evidence_requirement_indices(
-            &contract,
-            "http_request",
-            &external,
-            "{}",
-            "synthetic response without the requested field",
-            &crate::traits::ToolCallMetadata::default(),
-        )
-        .is_empty());
+        assert_eq!(
+            matching_evidence_requirement_indices(
+                &contract,
+                "http_request",
+                &external,
+                "{}",
+                "synthetic response without the requested field",
+                &crate::traits::ToolCallMetadata::default(),
+            ),
+            [0],
+            "typed scope, purpose, authority, and time decide evidence routing"
+        );
 
         let trace = ToolCallSemantics::observation().with_evidence(
             crate::agent::inquiry::evidence_capabilities_for_tool_call(
@@ -1511,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_receipts_can_jointly_close_one_multi_field_content_need() {
+    fn typed_evidence_scope_closes_without_matching_response_prose() {
         use crate::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             ToolSemanticScope,
@@ -1533,7 +1652,6 @@ mod tests {
             }],
             ..CompletionContract::default()
         };
-        let mut progress = CompletionProgress::new(&contract, "synthetic-task");
         let semantics = ToolCallSemantics::observation().with_evidence(vec![
             crate::traits::ToolEvidenceCapability {
                 scope: ToolSemanticScope::GoalState,
@@ -1544,22 +1662,13 @@ mod tests {
         ]);
         let metadata = crate::traits::ToolCallMetadata::default();
 
-        assert!(accumulate_evidence_requirement_marker_matches(
-            &contract,
-            &mut progress,
-            &semantics,
-            "{}",
-            r#"{"next_run":"tomorrow"}"#,
-            &metadata,
-        )
-        .is_empty());
         assert_eq!(
-            accumulate_evidence_requirement_marker_matches(
+            matching_evidence_requirement_indices(
                 &contract,
-                &mut progress,
+                "manage_goal_tasks",
                 &semantics,
                 "{}",
-                r#"{"objective_control":null}"#,
+                "opaque authoritative payload",
                 &metadata,
             ),
             [0]
@@ -2179,6 +2288,72 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     }
 
     #[test]
+    fn mixed_access_manifest_checks_read_and_write_grants_independently() {
+        let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![hint(
+                ToolTargetHintKind::Path,
+                "/workspace/project/Cargo.toml",
+            )],
+            write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
+        };
+        let valid = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![
+                hint(ToolTargetHintKind::ProjectScope, "/tmp"),
+                hint(ToolTargetHintKind::Path, "/workspace/project/Cargo.toml"),
+            ],
+            write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
+        };
+        assert!(access_manifest_scope_violation("cli_agent", &valid, Some(&task), &[]).is_none());
+
+        let invalid = crate::traits::ToolCallAccessManifest {
+            write_targets: vec![hint(ToolTargetHintKind::Path, "/workspace/project")],
+            ..valid
+        };
+        let violation = access_manifest_scope_violation("cli_agent", &invalid, Some(&task), &[])
+            .expect("write must be rejected");
+        assert!(violation.contains("/workspace/project"));
+    }
+
+    #[test]
+    fn execution_cwd_is_readable_but_never_an_implicit_write_grant() {
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: Vec::new(),
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/result.txt").expect("target"),
+            ],
+        };
+        let call = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
+            ],
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
+            ],
+        };
+        assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_some());
+    }
+
+    #[test]
+    fn absent_access_boundary_does_not_invent_a_global_denial() {
+        let call = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/input.txt").expect("read"),
+            ],
+            write_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/output.txt").expect("write"),
+            ],
+        };
+
+        assert!(access_manifest_scope_violation("synthetic", &call, None, &[]).is_none());
+    }
+
+    #[test]
     fn target_scope_violation_skips_non_hard_fail_observation_steps() {
         let step_plan = StepExecutionPlan {
             step_id: "step-1".to_string(),
@@ -2228,20 +2403,22 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         assert_eq!(parsed["action"], "run");
         assert_eq!(
             parsed["command"],
-            "cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
+            "npm create vite@latest whatsapp-site -- --template react"
         );
+        assert_eq!(parsed["working_dir"], "/tmp/my folder");
     }
 
     #[test]
-    fn build_terminal_fallback_arguments_escapes_single_quotes() {
+    fn build_terminal_fallback_arguments_keeps_cwd_out_of_shell_program() {
         let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/david's projects"}"#;
         let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
             .expect("fallback args expected");
         let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
-        assert_eq!(
-            parsed["command"],
-            "cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
-        );
+        assert_eq!(parsed["working_dir"], "/tmp/david's projects");
+        assert!(!parsed["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cd "));
     }
 
     #[test]

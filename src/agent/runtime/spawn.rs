@@ -2341,14 +2341,30 @@ impl Agent {
                         };
                     }
                     _ = heartbeat.tick() => {
-                        let renewed = self
+                        let renewed = match self
                             .state
                             .heartbeat_task_attempt(
                                 &attempt.id,
                                 &attempt.lease_token,
                                 180,
                             )
-                            .await?;
+                            .await
+                        {
+                            Ok(renewed) => renewed,
+                            Err(error) => {
+                                // A transient store failure must not be
+                                // promoted to lease loss. The next heartbeat
+                                // still has a chance to renew the live lease;
+                                // an actual expiry/revocation is the explicit
+                                // Ok(false) result below.
+                                warn!(
+                                    attempt_id = %attempt.id,
+                                    %error,
+                                    "Child-agent heartbeat could not renew; will retry"
+                                );
+                                continue;
+                            }
+                        };
                         if !renewed {
                             join.abort();
                             break Err(anyhow::anyhow!(

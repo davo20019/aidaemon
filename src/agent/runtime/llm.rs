@@ -544,8 +544,7 @@ impl Agent {
                                         warn!(
                                             model,
                                             reduced,
-                                            timeout_secs =
-                                                Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
+                                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
                                             "Reduced max_tokens retry timed out; cascading to fallback"
                                         );
                                     }

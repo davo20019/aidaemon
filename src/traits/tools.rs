@@ -490,6 +490,22 @@ pub struct ToolCallSemantics {
     pub evidence: Vec<ToolEvidenceCapability>,
 }
 
+/// Prepared filesystem access requested by one exact tool call.
+///
+/// Execution location, readable context, and mutation authority are different
+/// roles. Keeping them separate prevents a read-only working directory from
+/// becoming an implied write grant and gives adapters one canonical contract
+/// to enforce and persist.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallAccessManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_targets: Vec<ToolTargetHint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_targets: Vec<ToolTargetHint>,
+}
+
 impl ToolCallSemantics {
     pub fn administrative() -> Self {
         Self {
@@ -848,6 +864,21 @@ pub enum ToolOutcomeStatus {
     Backgrounded,
 }
 
+/// Shape of the machine receipt produced by a tool invocation.
+///
+/// Completion predicates are compiled against this protocol type instead of
+/// assuming every tool is a subprocess. In particular, an absent exit code on
+/// a management/API receipt means "not applicable", not "the invocation did
+/// not happen".
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReceiptKind {
+    #[default]
+    Generic,
+    Process,
+    Http,
+}
+
 impl ToolOutcomeStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -890,6 +921,15 @@ pub enum ToolResultPresentation {
 /// returning plain text while selectively populating structured fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallMetadata {
+    /// Protocol family for fields whose applicability differs by adapter.
+    /// The dispatcher stamps this from the registered tool before completion
+    /// evaluation; tools do not need to repeat the declaration per result.
+    #[serde(default)]
+    pub receipt_kind: ToolReceiptKind,
+    /// Effective filesystem access contract enforced for this invocation.
+    /// This is an audit receipt, not a reusable authority grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_manifest: Option<ToolCallAccessManifest>,
     /// Authoritative domain outcome when the tool can provide one. Older tools
     /// may omit it; the loop then derives a conservative status from structured
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.
@@ -1049,6 +1089,7 @@ fn string_to_target_hint(key: &str, value: &str) -> Option<ToolTargetHint> {
         "path"
             | "file_path"
             | "working_dir"
+            | "cwd"
             | "directory"
             | "dir"
             | "repo_path"
@@ -1100,6 +1141,56 @@ fn collect_common_target_hints(arguments: &str) -> Vec<ToolTargetHint> {
         }
     }
     hints
+}
+
+fn default_access_manifest(
+    arguments: &str,
+    semantics: &ToolCallSemantics,
+) -> ToolCallAccessManifest {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let execution_cwd = parsed.as_ref().and_then(|value| {
+        value
+            .get("working_dir")
+            .or_else(|| value.get("cwd"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    let targets = if semantics.target_hints.is_empty() {
+        collect_common_target_hints(arguments)
+    } else {
+        semantics.target_hints.clone()
+    };
+    let non_cwd_targets = targets
+        .into_iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+            )
+        })
+        .filter(|target| execution_cwd.as_deref() != Some(target.value.as_str()))
+        .collect::<Vec<_>>();
+    let mut read_targets = Vec::new();
+    if let Some(cwd) = execution_cwd.as_deref() {
+        if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
+            read_targets.push(target);
+        }
+    }
+    if semantics.observes_state() {
+        read_targets.extend(non_cwd_targets.iter().cloned());
+    }
+    let write_targets = if semantics.mutates_state() {
+        non_cwd_targets
+    } else {
+        Vec::new()
+    };
+    ToolCallAccessManifest {
+        execution_cwd,
+        read_targets,
+        write_targets,
+    }
 }
 
 /// Classify a mixed-operation tool from the exact `action` enum in its schema.
@@ -1274,6 +1365,14 @@ pub trait Tool: Send + Sync {
         ToolCapabilities::default()
     }
 
+    /// Machine-receipt protocol emitted by this adapter.
+    ///
+    /// Keep this independent from natural-language descriptions and call
+    /// semantics: it exists solely to type-check completion predicates.
+    fn receipt_kind(&self, _arguments: &str) -> ToolReceiptKind {
+        ToolReceiptKind::Generic
+    }
+
     /// Structured completion semantics for a specific call.
     ///
     /// Default behavior derives a conservative fallback from `capabilities()`.
@@ -1284,6 +1383,13 @@ pub trait Tool: Send + Sync {
             arguments,
             self.capabilities(),
         )
+    }
+
+    /// Filesystem access roles for this exact call. Open-ended adapters should
+    /// override this when their schema exposes explicit read/write grants.
+    fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
+        let semantics = self.call_semantics(arguments);
+        default_access_manifest(arguments, &semantics)
     }
 
     /// Reconcile a successful durable receipt with current state before replay.
@@ -1439,6 +1545,16 @@ mod tests {
         let remove = tool.call_semantics(r#"{"action":"remove","path":"/tmp/demo"}"#);
         assert!(remove.mutates_state());
         assert!(!remove.observes_state());
+    }
+
+    #[test]
+    fn default_filesystem_manifest_excludes_remote_and_resource_targets() {
+        let tool = ManageTool;
+        let manifest = tool.call_access_manifest(
+            r#"{"url":"https://example.test/status","resource_id":"remote-1"}"#,
+        );
+        assert!(manifest.read_targets.is_empty());
+        assert!(manifest.write_targets.is_empty());
     }
 
     #[test]

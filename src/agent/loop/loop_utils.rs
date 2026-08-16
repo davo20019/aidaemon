@@ -257,7 +257,7 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
                         return Some(ToolFailureClass::Semantic);
                     }
                     Value::Object(obj) if !obj.is_empty() => {
-                        return Some(ToolFailureClass::Semantic)
+                        return Some(ToolFailureClass::Semantic);
                     }
                     Value::String(s) if !s.trim().is_empty() => {
                         let lower = s.to_ascii_lowercase();
@@ -1148,11 +1148,7 @@ mod tool_error_detection_tests {
                 "{result}"
             );
             assert_eq!(
-                classify_execution_failure_kind(
-                    ToolOutcomeStatus::FailedRetryable,
-                    None,
-                    false,
-                ),
+                classify_execution_failure_kind(ToolOutcomeStatus::FailedRetryable, None, false,),
                 Some(ExecutionFailureKind::ToolInvocationFailure),
                 "{result}"
             );

@@ -1236,10 +1236,19 @@ pub fn compile_step_execution_plan(
     tool_name: &str,
     effective_arguments: &str,
     semantics: &ToolCallSemantics,
+    access_manifest: &crate::traits::ToolCallAccessManifest,
     capabilities: ToolCapabilities,
-    allowed_project_scope: Option<&str>,
+    allowed_project_scopes: &[String],
 ) -> StepExecutionPlan {
-    let expected_targets = if semantics.target_hints.is_empty() {
+    let expected_targets = if semantics.mutates_state()
+        && (access_manifest.execution_cwd.is_some()
+            || !access_manifest.read_targets.is_empty()
+            || !access_manifest.write_targets.is_empty())
+    {
+        access_manifest.write_targets.clone()
+    } else if !semantics.mutates_state() && !access_manifest.read_targets.is_empty() {
+        access_manifest.read_targets.clone()
+    } else if semantics.target_hints.is_empty() {
         extract_target_hints_from_arguments(effective_arguments)
     } else {
         semantics.target_hints.clone()
@@ -1253,14 +1262,15 @@ pub fn compile_step_execution_plan(
             )
         });
 
-    let allowed_targets =
-        if let Some(scope) = allowed_project_scope.filter(|_| scope_applies_to_expected_targets) {
-            ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope)
-                .into_iter()
-                .collect()
-        } else {
-            expected_targets.clone()
-        };
+    let allowed_targets = if scope_applies_to_expected_targets && !allowed_project_scopes.is_empty()
+    {
+        allowed_project_scopes
+            .iter()
+            .filter_map(|scope| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope))
+            .collect()
+    } else {
+        expected_targets.clone()
+    };
 
     let target_label = expected_targets
         .first()

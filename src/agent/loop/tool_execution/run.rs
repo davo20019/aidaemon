@@ -3,7 +3,8 @@ use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
     is_file_recheck_tool, maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
-    project_instruction_targets_for_tool_call, tool_call_includes_project_path,
+    project_instruction_targets_for_tool_call, terminal_command_path_targets,
+    tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::run_helpers::*;
@@ -21,7 +22,9 @@ use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::self_correction::AttemptDecision;
 use crate::agent::*;
 use crate::events::TaskOutcome;
-use crate::traits::{MandateDecisionOutcome, ToolCallSemantics};
+use crate::traits::{
+    MandateDecisionOutcome, ToolCallSemantics, ToolTargetHint, ToolTargetHintKind,
+};
 
 // ── Correction gate (P2.4) ───────────────────────────────────────────────────
 
@@ -636,11 +639,26 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let workspace_project_root = channel_ctx
         .active_workspace_grant(user_role)
         .map(|grant| grant.project_root.clone());
-    if known_project_dir.is_none() {
-        known_project_dir = workspace_project_root
+    if let Some(execution_cwd) = turn_context
+        .filesystem_access
+        .as_ref()
+        .and_then(|access| access.execution_cwd.clone())
+    {
+        known_project_dir = Some(execution_cwd);
+    } else if known_project_dir.is_none() {
+        // Current-request authority wins over an ambient channel workspace.
+        // This is especially important for disposable work: a named /tmp
+        // target must not inherit the daemon repository as its execution cwd.
+        known_project_dir = turn_context
+            .primary_project_scope
             .clone()
-            .or_else(|| turn_context.primary_project_scope.clone());
+            .or_else(|| workspace_project_root.clone());
     }
+    let task_authorized_project_scopes = if turn_context.authorized_project_scopes.is_empty() {
+        workspace_project_root.iter().cloned().collect::<Vec<_>>()
+    } else {
+        turn_context.authorized_project_scopes.clone()
+    };
 
     let mut successful_tool_calls = 0;
     let mut iteration_had_tool_failures = false;
@@ -1126,22 +1144,56 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let allowed_project_scope = (!turn_context.allow_multi_project_scope)
             .then_some(turn_context.primary_project_scope.as_deref())
             .flatten();
-        let registered_call_semantics = agent
+        let registered_tool = agent
             .tools
             .iter()
-            .find(|tool| tool.name() == tc.name && tool.is_available())
-            .map(|tool| tool.call_semantics(&effective_arguments));
-        let call_semantics = if let Some(semantics) = registered_call_semantics {
-            semantics
+            .find(|tool| tool.name() == tc.name && tool.is_available());
+        let (mut call_semantics, mut access_manifest) = if let Some(tool) = registered_tool {
+            (
+                tool.call_semantics(&effective_arguments),
+                tool.call_access_manifest(&effective_arguments),
+            )
         } else if let Some(registry) = agent.mcp_registry.as_ref() {
-            registry
-                .find_tool(&tc.name)
-                .await
-                .map(|tool| tool.call_semantics(&effective_arguments))
-                .unwrap_or_default()
+            if let Some(tool) = registry.find_tool(&tc.name).await {
+                (
+                    tool.call_semantics(&effective_arguments),
+                    tool.call_access_manifest(&effective_arguments),
+                )
+            } else {
+                Default::default()
+            }
         } else {
-            ToolCallSemantics::default()
+            Default::default()
         };
+        if call_semantics.mutates_state()
+            && matches!(tc.name.as_str(), "terminal" | "cli_agent")
+            && access_manifest.write_targets.is_empty()
+        {
+            let write_authorities = turn_context
+                .filesystem_access
+                .as_ref()
+                .map(|access| {
+                    access
+                        .write_targets
+                        .iter()
+                        .map(|target| target.value.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| task_authorized_project_scopes.clone());
+            let narrow_scopes = narrowest_authorized_path_scopes(&write_authorities);
+            if narrow_scopes.len() == 1 {
+                if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
+                    if let Some(object) = arguments.as_object_mut() {
+                        object.insert("write_paths".to_string(), json!(narrow_scopes));
+                        effective_arguments = serde_json::to_string(&arguments)?;
+                        if let Some(tool) = registered_tool {
+                            call_semantics = tool.call_semantics(&effective_arguments);
+                            access_manifest = tool.call_access_manifest(&effective_arguments);
+                        }
+                    }
+                }
+            }
+        }
         let call_semantics = if tc.name == "cli_agent"
             && turn_context.completion_contract.forbids_mutation
         {
@@ -1149,10 +1201,32 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             // and either installs a provider-native read-only sandbox or
             // rejects before launch. Plan/approval/evidence logic must use that
             // effective contract rather than the tool's conservative default.
+            access_manifest.write_targets.clear();
             call_semantics.constrained_to_observation()
         } else {
             call_semantics
         };
+        if matches!(tc.name.as_str(), "terminal" | "run_command") {
+            if let Ok(arguments) = serde_json::from_str::<Value>(&effective_arguments) {
+                if let Some(command) = arguments.get("command").and_then(Value::as_str) {
+                    let base = access_manifest.execution_cwd.as_deref();
+                    for path in terminal_command_path_targets(command, base) {
+                        let kind = ToolTargetHintKind::Path;
+                        let Some(target) = ToolTargetHint::new(kind, path) else {
+                            continue;
+                        };
+                        let targets = if call_semantics.mutates_state() {
+                            &mut access_manifest.write_targets
+                        } else {
+                            &mut access_manifest.read_targets
+                        };
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
+                }
+            }
+        }
         let tool_caps = available_capabilities
             .get(&tc.name)
             .copied()
@@ -1246,8 +1320,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             &tc.name,
             &effective_arguments,
             &call_semantics,
+            &access_manifest,
             tool_caps,
-            allowed_project_scope,
+            &task_authorized_project_scopes,
         );
         execution_state.stage_step(step_plan.clone());
         if matches!(
@@ -1274,9 +1349,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }),
             )
             .await;
+        let access_scope_violation = access_manifest_scope_violation(
+            &tc.name,
+            &access_manifest,
+            turn_context.filesystem_access.as_ref(),
+            &task_authorized_project_scopes,
+        );
         let step_scope_violation =
             target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
-        if let Some(scope_reason) = internal_scope_violation.or(step_scope_violation) {
+        if let Some(scope_reason) = internal_scope_violation
+            .or(access_scope_violation)
+            .or(step_scope_violation)
+        {
             POLICY_METRICS
                 .cross_scope_blocked_total
                 .fetch_add(1, Ordering::Relaxed);

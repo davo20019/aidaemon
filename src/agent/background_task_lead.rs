@@ -1243,18 +1243,40 @@ pub fn spawn_background_task_lead(
                     let _ = keepalive_cancel_rx.await;
                     return;
                 };
+                let mut keepalive_interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(45),
+                    Duration::from_secs(45),
+                );
+                keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        _ = keepalive_interval.tick() => {
                             if let Some(attempt) = keepalive_attempt.as_ref() {
-                                let renewed = keepalive_state
+                                let renewed = match keepalive_state
                                     .heartbeat_task_attempt(
                                         &attempt.id,
                                         &attempt.lease_token,
                                         180,
                                     )
                                     .await
-                                    .unwrap_or(false);
+                                {
+                                    Ok(renewed) => renewed,
+                                    Err(error) => {
+                                        // A transient pool/SQLite failure is not
+                                        // evidence that ownership was revoked.
+                                        // Keep trying; an actual expired or
+                                        // superseded lease is reported as Ok(false)
+                                        // by heartbeat_task_attempt and remains a
+                                        // hard stop.
+                                        warn!(
+                                            task_id = %task_id,
+                                            attempt_id = %attempt.id,
+                                            %error,
+                                            "Task-lead keepalive could not renew; will retry"
+                                        );
+                                        continue;
+                                    }
+                                };
                                 if !renewed {
                                     keepalive_lease_lost.store(true, Ordering::Release);
                                     warn!(
@@ -1563,11 +1585,35 @@ pub fn spawn_background_task_lead(
             // response or dispatching any tasks it planned. The conditional
             // heartbeat is both a renewal and an authoritative ownership read.
             if let Some(attempt) = dispatch_attempt.as_ref() {
-                let lease_live = !task_lead_lease_lost.load(Ordering::Acquire)
-                    && state
-                        .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
-                        .await
-                        .unwrap_or(false);
+                let mut lease_live = !task_lead_lease_lost.load(Ordering::Acquire);
+                if lease_live {
+                    // A final read error is not enough to discard a completed
+                    // task-lead result. Retry briefly so transient SQLite/pool
+                    // contention cannot strand the run with an expiring root
+                    // lease; Ok(false) remains the authoritative loss signal.
+                    lease_live = false;
+                    for retry in 0..3 {
+                        match state
+                            .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                            .await
+                        {
+                            Ok(live) => {
+                                lease_live = live;
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    goal_id = %goal_id,
+                                    attempt_id = %attempt.id,
+                                    retry,
+                                    %error,
+                                    "Could not revalidate task-lead lease; retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                        }
+                    }
+                }
                 if !lease_live {
                     warn!(
                         goal_id = %goal_id,
@@ -2905,16 +2951,16 @@ pub fn spawn_background_task_lead(
                                 let total =
                                     summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                                 (
-                                "failed",
-                                format!(
-                                    "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
-                                    completed,
-                                    total,
-                                    failed,
-                                    blocked,
-                                    task_results_summary.chars().take(4000).collect::<String>()
-                                ),
-                            )
+                                    "failed",
+                                    format!(
+                                        "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
+                                        completed,
+                                        total,
+                                        failed,
+                                        blocked,
+                                        task_results_summary.chars().take(4000).collect::<String>()
+                                    ),
+                                )
                             } else {
                                 (
                                     "completed",
@@ -3643,9 +3689,11 @@ mod tests {
             completed_at: Some(chrono::Utc::now().to_rfc3339()),
         };
 
-        assert!(task_failed_only_due_to_provider_infrastructure(&failed_task(
-            "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
-        )));
+        assert!(task_failed_only_due_to_provider_infrastructure(
+            &failed_task(
+                "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
+            )
+        ));
         assert!(!task_failed_only_due_to_provider_infrastructure(
             &failed_task("Verification failed: the public URL returned HTTP 404")
         ));

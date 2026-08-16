@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 use crate::execution::active_execution_backend;
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus, ToolRole,
+    Tool, ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolOutcomeStatus, ToolRole, ToolTargetHint, ToolTargetHintKind,
 };
 use crate::types::StatusUpdate;
 
@@ -115,6 +116,44 @@ const SAFE_PREFIXES: &[&str] = &[
     "/bin/false",
 ];
 
+fn run_command_semantics(arguments: &str) -> ToolCallSemantics {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(Value::as_str)
+                .map(classify_shell_command)
+        })
+        .unwrap_or_else(ToolCallSemantics::mutation)
+}
+
+fn run_command_access_manifest(arguments: &str) -> ToolCallAccessManifest {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let execution_cwd = parsed
+        .as_ref()
+        .and_then(|value| value.get("working_dir"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let cwd_target = execution_cwd
+        .as_deref()
+        .and_then(|cwd| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd));
+    let semantics = run_command_semantics(arguments);
+    ToolCallAccessManifest {
+        execution_cwd,
+        read_targets: cwd_target.iter().cloned().collect(),
+        // Build/test/format commands legitimately create derived output in
+        // their cwd. Observational commands never inherit that write grant.
+        write_targets: if semantics.mutates_state() {
+            cwd_target.into_iter().collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
 #[async_trait]
 impl Tool for RunCommandTool {
     fn name(&self) -> &str {
@@ -128,7 +167,7 @@ impl Tool for RunCommandTool {
     fn schema(&self) -> Value {
         json!({
             "name": "run_command",
-            "description": "Run safe build, test, lint, and inspection commands without approval flow. Only allows whitelisted command prefixes (cargo build/test/check/clippy/fmt/doc, pytest, go build/test, git read-only, ls, etc.). Excludes anything that runs arbitrary repo-defined scripts: `cargo run`, `cargo bench`, `npm run`, `npx`, `yarn run`, `bun run`, `make`, `cmake`, `gradle`, `mvn`. For installs and arbitrary commands, use terminal instead.",
+            "description": "Run allowlisted build, test, lint, and read-only inspection commands. Repository-defined scripts, installs, and arbitrary commands require terminal.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -170,16 +209,16 @@ impl Tool for RunCommandTool {
         }
     }
 
+    fn receipt_kind(&self, _arguments: &str) -> crate::traits::ToolReceiptKind {
+        crate::traits::ToolReceiptKind::Process
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("command")
-                    .and_then(|command| command.as_str())
-                    .map(classify_shell_command)
-            })
-            .unwrap_or_else(ToolCallSemantics::mutation)
+        run_command_semantics(arguments)
+    }
+
+    fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
+        run_command_access_manifest(arguments)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -258,7 +297,36 @@ impl RunCommandTool {
             }
         }
 
-        let result = fs_utils::run_cmd_backend(trimmed, Some(&dir), timeout).await?;
+        let semantics = self.call_semantics(arguments);
+        let started = Instant::now();
+        let execution = if semantics.mutates_state() {
+            let request = crate::tools::terminal::confined_terminal_execution_request(
+                &backend,
+                trimmed,
+                Some(dir.as_str()),
+                &[],
+                &[dir.to_string()],
+            )
+            .await?;
+            backend
+                .execute(request, Duration::from_secs(timeout))
+                .await?
+        } else {
+            let mut request = crate::execution::ExecutionRequest::shell(trimmed);
+            request.cwd = Some(dir.clone());
+            backend
+                .execute(request, Duration::from_secs(timeout))
+                .await?
+        };
+        if execution.timed_out {
+            anyhow::bail!("Command timed out after {}s", timeout);
+        }
+        let result = fs_utils::CommandOutput {
+            exit_code: execution.exit_code,
+            stdout: execution.stdout_lossy(),
+            stderr: execution.stderr_lossy(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
         let output = format_output(&result, trimmed, parse_format)?;
         Ok(ToolCallOutcome {
             output,

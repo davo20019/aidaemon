@@ -31,9 +31,9 @@ use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRou
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode,
+    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolCallAccessManifest,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolExecutionContext,
+    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
@@ -313,6 +313,114 @@ fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<
     constrained.push("read-only".to_string());
     *args = constrained;
     Ok(())
+}
+
+/// Install a provider-native split read/write profile for one delegated run.
+/// The generated config is invocation-local (`--ignore-user-config`) and the
+/// provider refuses unsupported profiles instead of silently widening access.
+fn apply_scoped_cli_adapter(
+    command: &str,
+    args: &mut Vec<String>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> Result<(), String> {
+    let program_index = is_env_launcher(command)
+        .then(|| env_wrapped_program_index(args))
+        .flatten();
+    let program = program_index
+        .and_then(|index| args.get(index).map(String::as_str))
+        .unwrap_or(command);
+    let program_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if !program_name.eq_ignore_ascii_case("codex") {
+        return Err(format!(
+            "CLI agent executable '{program_name}' has no registered split read/write sandbox adapter"
+        ));
+    }
+    if write_paths.is_empty() {
+        return Err(
+            "a read-write delegation requires at least one explicit write path".to_string(),
+        );
+    }
+
+    let mut constrained = Vec::with_capacity(args.len().saturating_add(12));
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let drops_value = matches!(
+            argument.as_str(),
+            "--sandbox" | "-s" | "--add-dir" | "--output-last-message" | "-o"
+        );
+        let drops_flag = matches!(
+            argument.as_str(),
+            "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+                | "--full-auto"
+                | "--ignore-user-config"
+        ) || argument.starts_with("--sandbox=")
+            || argument.starts_with("-s=")
+            || argument.starts_with("--add-dir=")
+            || argument.starts_with("--output-last-message=");
+        if drops_value {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if drops_flag {
+            index = index.saturating_add(1);
+            continue;
+        }
+        constrained.push(argument.clone());
+        index = index.saturating_add(1);
+    }
+
+    const PROFILE: &str = "aidaemon-task";
+    let toml_string =
+        |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    let mut filesystem_entries = vec![(":minimal", "read")];
+    for path in read_paths {
+        filesystem_entries.push((permission_profile_path_key(path)?, "read"));
+    }
+    for path in write_paths {
+        let path = permission_profile_path_key(path)?;
+        if let Some(entry) = filesystem_entries
+            .iter_mut()
+            .find(|(existing, _)| *existing == path)
+        {
+            entry.1 = "write";
+        } else {
+            filesystem_entries.push((path, "write"));
+        }
+    }
+    let filesystem = filesystem_entries
+        .into_iter()
+        .map(|(path, access)| format!("{}={}", toml_string(path), toml_string(access)))
+        .collect::<Vec<_>>()
+        .join(",");
+    constrained.push("--ignore-user-config".to_string());
+    constrained.extend([
+        "-c".to_string(),
+        format!("default_permissions={}", toml_string(PROFILE)),
+        "-c".to_string(),
+        format!("permissions.{PROFILE}.filesystem={{{filesystem}}}"),
+        "-c".to_string(),
+        format!("permissions.{PROFILE}.network.enabled=false"),
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+    ]);
+    *args = constrained;
+    Ok(())
+}
+
+fn permission_profile_path_key(path: &str) -> Result<&str, String> {
+    if path.contains(['\n', '\r', '=']) {
+        Err(format!(
+            "path cannot be represented safely in a permission profile: {path:?}"
+        ))
+    } else {
+        Ok(path)
+    }
 }
 
 /// A running CLI agent being tracked.
@@ -939,6 +1047,37 @@ impl CliAgentTool {
             .then(|| name.to_string())
     }
 
+    /// Select a configured provider with a native split read/write adapter.
+    /// Adapter capability—not prompt wording or preference order—controls the
+    /// choice for least-privilege delegated mutation.
+    fn scoped_read_write_tool_name(&self, preferred: Option<&str>) -> Option<String> {
+        let tools = self.tools.read().ok()?;
+        let supports_split_access = |entry: &CliToolEntry| {
+            let program_index = is_env_launcher(&entry.command)
+                .then(|| env_wrapped_program_index(&entry.args))
+                .flatten();
+            let program = program_index
+                .and_then(|index| entry.args.get(index).map(String::as_str))
+                .unwrap_or(&entry.command);
+            std::path::Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
+        };
+        if let Some(preferred) = preferred {
+            if tools.get(preferred).is_some_and(&supports_split_access) {
+                return Some(preferred.to_string());
+            }
+        }
+        let mut compatible = tools
+            .iter()
+            .filter(|(_, entry)| supports_split_access(entry))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        compatible.sort();
+        compatible.into_iter().next()
+    }
+
     fn is_owner_role(user_role: Option<&str>) -> bool {
         user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
     }
@@ -949,6 +1088,31 @@ impl CliAgentTool {
     async fn normalize_working_dir(dir: &str) -> anyhow::Result<String> {
         let backend = active_execution_backend();
         let resolved = backend.resolve_path(dir).await?;
+        Ok(backend
+            .canonicalize(&resolved)
+            .await
+            .unwrap_or(resolved)
+            .to_string())
+    }
+
+    /// Normalize an access target against the call's execution cwd. Unlike a
+    /// working directory, a write target may not exist yet; canonicalization
+    /// is therefore best-effort after backend policy resolution.
+    async fn normalize_access_path(
+        path: &str,
+        working_dir: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let backend = active_execution_backend();
+        let path = path.trim();
+        anyhow::ensure!(!path.is_empty(), "CLI access path cannot be empty");
+        let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
+            path.to_string()
+        } else if let Some(working_dir) = working_dir {
+            BackendPath::new(working_dir).join(path).to_string()
+        } else {
+            path.to_string()
+        };
+        let resolved = backend.resolve_path(&prepared).await?;
         Ok(backend
             .canonicalize(&resolved)
             .await
@@ -1910,6 +2074,9 @@ impl CliAgentTool {
         delegated_task_id: Option<&str>,
         system_instruction: Option<&str>,
         workspace_mode: CliWorkspaceMode,
+        read_paths: &[String],
+        write_paths: &[String],
+        enforce_native_access: bool,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
@@ -1989,18 +2156,44 @@ impl CliAgentTool {
             }
         }
 
-        if workspace_mode == CliWorkspaceMode::ReadOnly {
-            if let Err(error) = apply_read_only_cli_adapter(&command, &mut args) {
-                return Ok(format!(
-                    "Blocked: read-only CLI delegation was not started because {error}. Select a CLI agent with a registered native read-only sandbox."
-                ));
-            }
-        }
-
         let canonical_working_dir = match working_dir {
             Some(dir) => Some(Self::normalize_working_dir(dir).await?),
             None => None,
         };
+        let mut canonical_read_paths = Vec::new();
+        if let Some(working_dir) = canonical_working_dir.as_ref() {
+            canonical_read_paths.push(working_dir.clone());
+        }
+        for path in read_paths {
+            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            if !canonical_read_paths.contains(&path) {
+                canonical_read_paths.push(path);
+            }
+        }
+        let mut canonical_write_paths = Vec::new();
+        for path in write_paths {
+            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            if !canonical_write_paths.contains(&path) {
+                canonical_write_paths.push(path);
+            }
+        }
+        if enforce_native_access {
+            let adapter_result = if workspace_mode == CliWorkspaceMode::ReadOnly {
+                apply_read_only_cli_adapter(&command, &mut args)
+            } else {
+                apply_scoped_cli_adapter(
+                    &command,
+                    &mut args,
+                    &canonical_read_paths,
+                    &canonical_write_paths,
+                )
+            };
+            if let Err(error) = adapter_result {
+                return Ok(format!(
+                    "Blocked: CLI delegation was not started because {error}. Select an agent with a registered native sandbox adapter or provide a narrower access manifest."
+                ));
+            }
+        }
         // A repository-wide diff is useful only when this invocation starts
         // from a clean baseline. Otherwise it attributes and exposes unrelated
         // pre-existing work to the child. Read-only runs never need a diff.
@@ -3411,6 +3604,14 @@ struct CliAgentArgs {
     /// Optional description paired with `command`.
     description: Option<String>,
     working_dir: Option<String>,
+    /// Additional readable paths for a split access manifest. The working
+    /// directory is always readable context.
+    #[serde(default)]
+    read_paths: Vec<String>,
+    /// Exact writable files/directories for a read-write run. When omitted,
+    /// legacy single-root runs grant writes only to `working_dir`.
+    #[serde(default)]
+    write_paths: Vec<String>,
     /// Typed delegation authority. Prompt prose never narrows the sandbox.
     #[serde(default)]
     workspace_mode: CliWorkspaceMode,
@@ -3893,7 +4094,17 @@ impl Tool for CliAgentTool {
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Absolute working directory; required for run."
+                        "description": "Absolute execution directory; readable but not implicitly writable."
+                    },
+                    "read_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Additional exact readable files/directories for run."
+                    },
+                    "write_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact writable files/directories for read_write run. Required and non-empty for read_write; working_dir never implies write authority."
                     },
                     "workspace_mode": {
                         "type": "string",
@@ -3914,33 +4125,7 @@ impl Tool for CliAgentTool {
                     }
                 },
                 "required": ["action"],
-                "additionalProperties": false,
-                "anyOf": [
-                    {
-                        "required": ["action", "prompt", "workspace_mode"],
-                        "properties": {
-                            "action": {
-                                "enum": ["run"]
-                            }
-                        }
-                    },
-                    {
-                        "required": ["action", "task_id"],
-                        "properties": {
-                            "action": {
-                                "enum": ["check", "cancel"]
-                            }
-                        }
-                    },
-                    {
-                        "required": ["action"],
-                        "properties": {
-                            "action": {
-                                "enum": ["list"]
-                            }
-                        }
-                    }
-                ]
+                "additionalProperties": false
             }
         })
     }
@@ -3952,6 +4137,23 @@ impl Tool for CliAgentTool {
             needs_approval: true,
             idempotent: false,
             high_impact_write: true,
+        }
+    }
+
+    fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "run".to_string());
+        if action == "run" {
+            crate::traits::ToolReceiptKind::Process
+        } else {
+            crate::traits::ToolReceiptKind::Generic
         }
     }
 
@@ -4003,6 +4205,79 @@ impl Tool for CliAgentTool {
         semantics
     }
 
+    fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let execution_cwd = parsed
+            .as_ref()
+            .and_then(|value| value.get("working_dir"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let workspace_mode = parsed
+            .as_ref()
+            .and_then(|value| value.get("workspace_mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("read_write");
+        let mut read_targets = Vec::new();
+        if let Some(cwd) = execution_cwd.as_deref() {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
+                read_targets.push(target);
+            }
+        }
+        for path in parsed
+            .as_ref()
+            .and_then(|value| value.get("read_paths"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let path = execution_cwd
+                .as_deref()
+                .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+                .map(|cwd| {
+                    crate::execution::BackendPath::new(cwd)
+                        .join(path)
+                        .to_string()
+                })
+                .unwrap_or_else(|| path.to_string());
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
+                if !read_targets.contains(&target) {
+                    read_targets.push(target);
+                }
+            }
+        }
+        let mut write_targets = parsed
+            .as_ref()
+            .and_then(|value| value.get("write_paths"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|path| {
+                execution_cwd
+                    .as_deref()
+                    .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+                    .map(|cwd| {
+                        crate::execution::BackendPath::new(cwd)
+                            .join(path)
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| path.to_string())
+            })
+            .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+            .collect::<Vec<_>>();
+        if workspace_mode == "read_only" {
+            write_targets.clear();
+        }
+        ToolCallAccessManifest {
+            execution_cwd,
+            read_targets,
+            write_targets,
+        }
+    }
+
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
@@ -4018,7 +4293,7 @@ impl Tool for CliAgentTool {
                 .as_ref()
                 .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run)
+            .call_with_status_under_contract(arguments, status_tx, read_only_run, false)
             .await?;
         Ok(cli_agent_outcome(&action, output, read_only_run))
     }
@@ -4040,7 +4315,7 @@ impl Tool for CliAgentTool {
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run)
+            .call_with_status_under_contract(arguments, status_tx, read_only_run, true)
             .await?;
         Ok(cli_agent_outcome(&action, output, read_only_run))
     }
@@ -4050,7 +4325,7 @@ impl Tool for CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        self.call_with_status_under_contract(arguments, status_tx, false)
+        self.call_with_status_under_contract(arguments, status_tx, false, false)
             .await
     }
 }
@@ -4112,6 +4387,7 @@ impl CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         read_only_run: bool,
+        enforce_native_access: bool,
     ) -> anyhow::Result<String> {
         let args: CliAgentArgs = serde_json::from_str(arguments)?;
 
@@ -4135,12 +4411,28 @@ impl CliAgentTool {
 
         match action {
             "run" => {
-                let mut tool = args
-                    .tool
-                    .as_deref()
-                    .and_then(|name| self.configured_tool(name))
-                    .or_else(|| self.default_tool_name())
-                    .ok_or_else(|| anyhow::anyhow!("No CLI agents available for action=run"))?;
+                let mut tool = if !enforce_native_access {
+                    args.tool
+                        .as_deref()
+                        .and_then(|name| self.configured_tool(name))
+                        .or_else(|| self.default_tool_name())
+                } else if read_only_run {
+                    args.tool
+                        .as_deref()
+                        .and_then(|name| self.configured_tool(name))
+                        .or_else(|| self.default_tool_name())
+                } else {
+                    self.scoped_read_write_tool_name(args.tool.as_deref())
+                }
+                .ok_or_else(|| {
+                    if enforce_native_access {
+                        anyhow::anyhow!(
+                            "No configured CLI agent has a native adapter for this access contract"
+                        )
+                    } else {
+                        anyhow::anyhow!("No CLI agents available")
+                    }
+                })?;
                 let prompt = if let Some(prompt) = args.run_prompt() {
                     prompt
                 } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
@@ -4261,6 +4553,9 @@ impl CliAgentTool {
                             } else {
                                 CliWorkspaceMode::ReadWrite
                             },
+                            &args.read_paths,
+                            &args.write_paths,
+                            enforce_native_access,
                             async_mode,
                             status_tx.clone(),
                         )
@@ -4380,6 +4675,44 @@ mod tests {
         assert!(error.contains("no registered hard read-only adapter"));
     }
 
+    #[test]
+    fn codex_split_access_adapter_keeps_read_and_write_grants_distinct() {
+        let mut args = vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--sandbox=workspace-write".to_string(),
+            "--add-dir".to_string(),
+            "/synthetic/broad".to_string(),
+        ];
+        apply_scoped_cli_adapter(
+            "/synthetic/bin/codex",
+            &mut args,
+            &["/synthetic/source/Cargo.toml".to_string()],
+            &["/tmp/synthetic-result".to_string()],
+        )
+        .unwrap();
+        let joined = args.join("\n");
+        assert!(!joined.contains("workspace-write"));
+        assert!(!joined.contains("/synthetic/broad"));
+        assert!(joined.contains(
+            "permissions.aidaemon-task.filesystem={\":minimal\"=\"read\",\"/synthetic/source/Cargo.toml\"=\"read\",\"/tmp/synthetic-result\"=\"write\"}"
+        ));
+        assert!(joined.contains("permissions.aidaemon-task.network.enabled=false"));
+    }
+
+    #[tokio::test]
+    async fn relative_cli_access_target_resolves_against_execution_cwd() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let expected = cwd.path().join("output.txt");
+        let normalized = CliAgentTool::normalize_access_path(
+            "output.txt",
+            Some(cwd.path().to_string_lossy().as_ref()),
+        )
+        .await
+        .expect("normalized target");
+        assert_eq!(normalized, expected.to_string_lossy());
+    }
+
     #[tokio::test]
     async fn typed_workspace_mode_controls_delegation_semantics() {
         let (tool, _db_file) = setup_echo_tool().await;
@@ -4396,21 +4729,15 @@ mod tests {
         assert!(read_write.mutates_state());
 
         let schema = tool.schema();
-        let run_branch = schema["parameters"]["anyOf"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|branch| {
-                branch["properties"]["action"]["enum"]
-                    .as_array()
-                    .is_some_and(|values| values.iter().any(|value| value == "run"))
-            })
-            .unwrap();
-        assert!(run_branch["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "workspace_mode"));
+        assert_eq!(
+            schema["parameters"]["properties"]["workspace_mode"]["enum"],
+            json!(["read_only", "read_write"])
+        );
+        assert!(
+            schema["parameters"]["properties"]["write_paths"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Required and non-empty"))
+        );
     }
 
     #[test]

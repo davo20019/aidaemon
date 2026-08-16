@@ -1771,8 +1771,11 @@ async fn test_inferred_text_only_turn_does_not_override_model_tool_decision() {
             tool_calls: vec![crate::traits::ToolCall {
                 id: "text_only_side_effecting_drift".to_string(),
                 name: "terminal".to_string(),
-                arguments: json!({"command": format!("touch {}", temp_path.display())})
-                    .to_string(),
+                arguments: json!({
+                    "command": format!("touch {}", temp_path.display()),
+                    "write_paths": [temp_path.to_string_lossy()]
+                })
+                .to_string(),
                 extra_content: None,
             }],
             usage: Some(crate::traits::TokenUsage {
@@ -1962,7 +1965,8 @@ async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
                 id: "account_scoped_social_post".to_string(),
                 name: "terminal".to_string(),
                 arguments: serde_json::json!({
-                    "command": format!("touch {}", temp_path.display())
+                    "command": format!("touch {}", temp_path.display()),
+                    "write_paths": [temp_path.to_string_lossy()]
                 })
                 .to_string(),
                 extra_content: None,

@@ -358,10 +358,21 @@ pub(super) async fn execute_tool_call_io(
     drop(_heartbeat_keeper);
     touch_heartbeat(ctx.heartbeat);
     let mut result_metadata = crate::traits::ToolCallMetadata::default();
+    let registered_tool = agent
+        .tools
+        .iter()
+        .find(|tool| tool.name() == tc.name && tool.is_available());
+    let registered_receipt_kind = registered_tool
+        .map(|tool| tool.receipt_kind(ctx.effective_arguments))
+        .unwrap_or_default();
+    let registered_access_manifest =
+        registered_tool.map(|tool| tool.call_access_manifest(ctx.effective_arguments));
     let mut result_is_err = result.is_err();
     let mut result_text = match result {
         Ok(outcome) => {
             result_metadata = outcome.metadata;
+            result_metadata.receipt_kind = registered_receipt_kind;
+            result_metadata.access_manifest = registered_access_manifest.clone();
             // A successful typed observation boundary is authoritative even
             // when the observed subject describes failed jobs, blocked tasks,
             // or errors. Do not extend that rule to legacy mutation/admin
@@ -404,6 +415,8 @@ pub(super) async fn execute_tool_call_io(
             }
         }
         Err(e) => {
+            result_metadata.receipt_kind = registered_receipt_kind;
+            result_metadata.access_manifest = registered_access_manifest;
             result_metadata.transport_error = Some(e.to_string());
             // A legacy tool returning `Err` has made an explicit typed Rust
             // failure. Classify it once at this adapter boundary instead of

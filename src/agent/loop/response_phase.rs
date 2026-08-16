@@ -116,11 +116,10 @@ pub(super) async fn run_response_phase(
     )
     .await?;
     if let Some(outcome) = completion_outcome {
-        // Soft requirement-checklist verification: when the model is finishing
-        // but its self-registered checklist still has unchecked items, nudge once
-        // and continue the loop; otherwise allow the finish (and post the recap).
+        // Checklists are a projection of the typed completion graph, not a
+        // second completion authority.
         if matches!(outcome, ResponsePhaseOutcome::Return(Ok(_))) {
-            if let Some(directive) = checklist_completion_gate(
+            reconcile_checklist_projection(
                 services.agent,
                 ctx.emitter,
                 ctx.session_id,
@@ -128,11 +127,7 @@ pub(super) async fn run_response_phase(
                 ctx.iteration,
                 ctx.model,
             )
-            .await
-            {
-                ctx.pending_system_messages.push(directive);
-                return Ok(ResponsePhaseOutcome::ContinueLoop);
-            }
+            .await;
         }
         return Ok(outcome);
     }
@@ -140,76 +135,60 @@ pub(super) async fn run_response_phase(
     Ok(ResponsePhaseOutcome::ProceedToToolExecution)
 }
 
-/// Soft completion verification for the requirement checklist. Returns
-/// `Some(directive)` to inject and block finishing when the current turn's
-/// checklist still has unchecked items and this is the first such encounter for
-/// the task; otherwise posts the done-vs-deferred recap once and returns `None`.
-/// Degrades to `None` (current behavior) when no plan store / checklist exists.
-async fn checklist_completion_gate(
+/// Reconcile the display checklist after the authoritative task proof closes.
+/// Untyped prose-only steps are deferred rather than promoted to evidence or
+/// allowed to trigger another model/validation cycle.
+async fn reconcile_checklist_projection(
     agent: &crate::agent::Agent,
     emitter: &crate::events::EventEmitter,
     session_id: &str,
     task_id: &str,
     iteration: usize,
-    model: &str,
-) -> Option<super::system_directives::SystemDirective> {
+    _model: &str,
+) {
     use crate::plans::StepStatus;
     if task_id.is_empty() {
-        return None;
+        return;
     }
-    let plan_store = agent.plan_store.read().await.clone()?;
+    let Some(plan_store) = agent.plan_store.read().await.clone() else {
+        return;
+    };
     // Most recent checklist for this session, scoped to the current turn.
-    let plan = plan_store
+    let Some(mut plan) = plan_store
         .get_recent_for_session(session_id, 1)
         .await
-        .ok()?
-        .into_iter()
-        .next()
-        .filter(|p| p.task_id.as_deref() == Some(task_id))?;
+        .ok()
+        .and_then(|plans| plans.into_iter().next())
+        .filter(|p| p.task_id.as_deref() == Some(task_id))
+    else {
+        return;
+    };
+    let projection_changed = reconcile_plan_projection(&mut plan);
+    if projection_changed {
+        if let Err(error) = plan_store.update(&plan).await {
+            tracing::warn!(task_id, %error, "Failed to reconcile checklist projection");
+        }
+    }
     let unchecked: Vec<String> = plan
         .unchecked_steps()
         .iter()
         .map(|s| s.description.clone())
         .collect();
-    let first_unchecked_completion = !unchecked.is_empty()
-        && agent
-            .checklist_turn_flags
-            .write()
-            .await
-            .insert(format!("{task_id}:nudged"));
-    if first_unchecked_completion
-        && agent
-            .supervision_gate_enforced_with_context(
-                "checklist_completion_nudge",
-                model,
-                emitter,
-                task_id,
-                iteration,
-                serde_json::json!({ "unchecked_count": unchecked.len() }),
-            )
-            .await
-    {
-        // Telemetry: the soft-verification nudge fired (model tried to finish
-        // with items still unchecked). Joinable to TaskEnd by task_id.
+    if !unchecked.is_empty() {
         agent
             .emit_decision_point(
                 emitter,
                 task_id,
                 iteration,
                 crate::events::DecisionType::GateTelemetry,
-                "checklist soft-verification nudge fired",
+                "checklist projection remains incomplete",
                 serde_json::json!({
-                    "event": "checklist_nudge",
+                    "event": "checklist_projection_incomplete",
                     "unchecked_count": unchecked.len(),
                     "items": unchecked,
                 }),
             )
             .await;
-        return Some(
-            super::system_directives::SystemDirective::ChecklistVerificationRequired {
-                items: unchecked,
-            },
-        );
     }
     // Allow finishing — emit completion stats + post the recap once per task.
     if agent
@@ -245,5 +224,60 @@ async fn checklist_completion_gate(
         // as the checklist evolves. Final-answer delivery is owned elsewhere, so
         // this phase no longer posts/edits channel messages directly.
     }
-    None
+}
+
+fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bool {
+    use crate::plans::StepStatus;
+    let mut projection_changed = false;
+    for step in &mut plan.steps {
+        if matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+            && step.required_mutation_effects.is_empty()
+            && !step.requires_observation
+        {
+            step.status = StepStatus::Deferred;
+            step.result_summary = Some(
+                "Advisory checklist item; authoritative completion is owned by the typed task proof"
+                    .to_string(),
+            );
+            step.completed_at = Some(chrono::Utc::now());
+            projection_changed = true;
+        }
+    }
+    if projection_changed {
+        plan.sync_active_step();
+    }
+    projection_changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisory_checklist_cannot_reopen_a_closed_typed_task() {
+        let mut plan = crate::plans::TaskPlan::new(
+            "telegram:synthetic",
+            "synthetic request",
+            "synthetic plan",
+            vec!["Summarize the already proven result".to_string()],
+            "test",
+        );
+        assert!(reconcile_plan_projection(&mut plan));
+        assert_eq!(plan.steps[0].status, crate::plans::StepStatus::Deferred);
+        assert!(plan.is_finished());
+    }
+
+    #[test]
+    fn typed_checklist_step_remains_telemetry_incomplete_without_gating() {
+        let mut plan = crate::plans::TaskPlan::new(
+            "telegram:synthetic",
+            "synthetic request",
+            "synthetic plan",
+            vec!["Observe canonical state".to_string()],
+            "test",
+        );
+        plan.steps[0].requires_observation = true;
+        assert!(!reconcile_plan_projection(&mut plan));
+        assert_eq!(plan.steps[0].status, crate::plans::StepStatus::InProgress);
+    }
 }

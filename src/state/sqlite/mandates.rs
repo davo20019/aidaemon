@@ -951,13 +951,185 @@ async fn invalidate_open_mandate_runs(
     Ok(claimed_unresolved)
 }
 
+async fn mandate_run_proof_counts_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    goal_run_id: &str,
+    root_task_id: Option<&str>,
+) -> anyhow::Result<MandateRunProofCounts> {
+    let task_counts = sqlx::query(
+        "SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status = 'completed'
+                    AND COALESCE(NULLIF(trim(error), ''), '') = ''
+                    AND COALESCE(NULLIF(trim(blocker), ''), '') = ''
+                    THEN 1 ELSE 0 END), 0) AS completed,
+                COALESCE(SUM(CASE WHEN status IN ('failed', 'blocked', 'interrupted')
+                    OR COALESCE(NULLIF(trim(error), ''), '') != ''
+                    OR COALESCE(NULLIF(trim(blocker), ''), '') != ''
+                    THEN 1 ELSE 0 END), 0) AS failed_or_blocked
+         FROM tasks
+         WHERE goal_run_id = ? AND id != COALESCE(?, '')",
+    )
+    .bind(goal_run_id)
+    .bind(root_task_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let non_root_tasks: i64 = task_counts.get("total");
+    let completed_tasks: i64 = task_counts.get("completed");
+    let failed_or_blocked_tasks: i64 = task_counts.get("failed_or_blocked");
+
+    let mutation_counts = sqlx::query(
+        "SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0)
+                    AS succeeded,
+                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                COALESCE(SUM(CASE WHEN status = 'never_dispatched' THEN 1 ELSE 0 END), 0)
+                    AS never_dispatched,
+                COALESCE(SUM(CASE WHEN status IN ('reserved', 'ambiguous') THEN 1 ELSE 0 END), 0)
+                    AS ambiguous_or_reserved
+         FROM mandate_mutation_attempts
+         WHERE goal_run_id = ?",
+    )
+    .bind(goal_run_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let mutation_total: i64 = mutation_counts.get("total");
+    let mutation_succeeded: i64 = mutation_counts.get("succeeded");
+    let mutation_failed: i64 = mutation_counts.get("failed");
+    let mutation_never_dispatched: i64 = mutation_counts.get("never_dispatched");
+    let mutation_ambiguous: i64 = mutation_counts.get("ambiguous_or_reserved");
+    let count = |value: i64| u32::try_from(value.max(0)).unwrap_or(u32::MAX);
+
+    Ok(MandateRunProofCounts {
+        non_root_tasks: count(non_root_tasks),
+        completed_tasks: count(completed_tasks),
+        incomplete_tasks: count(non_root_tasks.saturating_sub(completed_tasks)),
+        failed_or_blocked_tasks: count(failed_or_blocked_tasks),
+        mutation_reservations: count(mutation_total),
+        succeeded_mutations: count(mutation_succeeded),
+        failed_mutations: count(mutation_failed),
+        never_dispatched_mutations: count(mutation_never_dispatched),
+        ambiguous_or_reserved_mutations: count(mutation_ambiguous),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retry_orphaned_mandate_review_without_dispatch(
+    connection: &mut sqlx::SqliteConnection,
+    mandate_id: &str,
+    goal_id: &str,
+    mandate_version: i64,
+    owner_session_id: &str,
+    goal_run_id: &str,
+    min_review_secs: i64,
+    max_review_secs: i64,
+    review_failures: i32,
+    now: &str,
+) -> anyhow::Result<()> {
+    let reason = MandateFinalizationRejectReason::DecisionMissing;
+    sqlx::query(
+        "UPDATE task_attempts
+         SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
+         WHERE goal_run_id = ? AND status IN ('claimed', 'running')",
+    )
+    .bind(now)
+    .bind(goal_run_id)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "UPDATE tasks
+         SET status = 'cancelled', current_attempt_id = NULL,
+             completed_at = COALESCE(completed_at, ?), updated_at = ?, version = version + 1
+         WHERE goal_run_id = ?
+           AND status IN ('pending', 'claimed', 'running', 'blocked')",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(goal_run_id)
+    .execute(&mut *connection)
+    .await?;
+    let run_updated = sqlx::query(
+        "UPDATE goal_runs
+         SET status = 'failed', outcome_summary = ?, completed_at = ?, updated_at = ?
+         WHERE id = ? AND status IN ('pending', 'running', 'blocked')
+           AND trigger_type = 'mandate'",
+    )
+    .bind(format!("mandate_review_failed:{}", reason.as_str()))
+    .bind(now)
+    .bind(now)
+    .bind(goal_run_id)
+    .execute(&mut *connection)
+    .await?;
+
+    let finalized_at = chrono::DateTime::parse_from_rfc3339(now)
+        .map_err(|error| anyhow::anyhow!("invalid orphaned review timestamp: {error}"))?
+        .with_timezone(&chrono::Utc);
+    let next_review_failures = review_failures.saturating_add(1);
+    let backoff_shift = u32::try_from(next_review_failures.saturating_sub(1))
+        .unwrap_or(0)
+        .min(6);
+    let retry_delay_secs = min_review_secs
+        .saturating_mul(1_i64 << backoff_shift)
+        .min(max_review_secs);
+    let retry_at = (finalized_at + chrono::Duration::seconds(retry_delay_secs)).to_rfc3339();
+    let mandate_updated = sqlx::query(
+        "UPDATE mandates
+         SET next_review_at = ?, review_lease_token = NULL,
+             review_lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND goal_id = ? AND version = ? AND status = 'active'",
+    )
+    .bind(&retry_at)
+    .bind(now)
+    .bind(mandate_id)
+    .bind(goal_id)
+    .bind(mandate_version)
+    .execute(&mut *connection)
+    .await?;
+    anyhow::ensure!(
+        run_updated.rows_affected() == 1 && mandate_updated.rows_affected() == 1,
+        "orphaned mandate review changed during no-dispatch recovery"
+    );
+    update_controller_status(connection, goal_id, MandateStatus::Active, now).await?;
+    sqlx::query("UPDATE goals SET dispatch_failures = ?, updated_at = ? WHERE id = ?")
+        .bind(next_review_failures)
+        .bind(now)
+        .bind(goal_id)
+        .execute(&mut *connection)
+        .await?;
+
+    let notice = crate::traits::MandateRunNotification::new(
+        mandate_id,
+        mandate_version,
+        goal_id,
+        goal_run_id,
+        owner_session_id,
+        crate::traits::MandateRunNotificationKind::ReviewFailed { reason },
+        MandateRunProofCounts::default(),
+        now,
+    );
+    super::notifications::enqueue_mandate_run_notification_on_connection(&mut *connection, &notice)
+        .await?;
+    Ok(())
+}
+
 async fn reconcile_orphaned_mandate_runs(
     connection: &mut sqlx::SqliteConnection,
     now: &str,
 ) -> anyhow::Result<()> {
     let rows = sqlx::query(
         "SELECT m.id AS mandate_id, m.goal_id, m.version, g.session_id,
-                gr.id AS goal_run_id
+                g.dispatch_failures AS review_failures,
+                m.min_review_secs, m.max_review_secs,
+                gr.id AS goal_run_id, gr.root_task_id,
+                (SELECT COUNT(*) FROM mandate_decision_cycles dc
+                 WHERE dc.mandate_id = m.id AND dc.goal_run_id = gr.id)
+                    AS decision_count,
+                (SELECT COUNT(*) FROM mandate_mutation_attempts ma
+                 WHERE ma.mandate_id = m.id AND ma.goal_run_id = gr.id)
+                    AS mutation_reservation_count,
+                (SELECT COUNT(*) FROM mandate_mutation_attempts ma
+                 WHERE ma.mandate_id = m.id AND ma.goal_run_id = gr.id
+                   AND ma.dispatch_claimed_at IS NOT NULL)
+                    AS dispatch_claim_count
          FROM mandates m
          JOIN goals g ON g.id = m.goal_id
          JOIN goal_runs gr ON gr.goal_id = m.goal_id AND gr.trigger_type = 'mandate'
@@ -992,7 +1164,37 @@ async fn reconcile_orphaned_mandate_runs(
         let goal_id: String = row.get("goal_id");
         let version: i64 = row.get("version");
         let session_id: String = row.get("session_id");
+        let review_failures: i32 = row.get("review_failures");
+        let min_review_secs: i64 = row.get("min_review_secs");
+        let max_review_secs: i64 = row.get("max_review_secs");
         let goal_run_id: String = row.get("goal_run_id");
+        let root_task_id: Option<String> = row.get("root_task_id");
+        let decision_count: i64 = row.get("decision_count");
+        let mutation_reservation_count: i64 = row.get("mutation_reservation_count");
+        let dispatch_claim_count: i64 = row.get("dispatch_claim_count");
+
+        // A mandate mutation can only cross the external I/O boundary after
+        // both a durable decision and a one-use dispatch claim exist. If the
+        // worker died before any of those proofs were written, there is no
+        // external effect to reconcile and pausing the mandate would turn a
+        // recoverable review interruption into a false safety incident.
+        if decision_count == 0 && mutation_reservation_count == 0 && dispatch_claim_count == 0 {
+            retry_orphaned_mandate_review_without_dispatch(
+                connection,
+                &mandate_id,
+                &goal_id,
+                version,
+                &session_id,
+                &goal_run_id,
+                min_review_secs,
+                max_review_secs,
+                review_failures,
+                now,
+            )
+            .await?;
+            continue;
+        }
+
         let mut suspension = MandateSuspension::new(
             MandateSuspensionKind::ExecutionLeaseLost,
             Some("orphaned_mandate_run".to_string()),
@@ -1019,6 +1221,12 @@ async fn reconcile_orphaned_mandate_runs(
         let claimed_unresolved = invalidate_open_mandate_runs(connection, &goal_id, now).await?;
         update_controller_status(connection, &goal_id, MandateStatus::AwaitingInput, now).await?;
         if claimed_unresolved == 0 {
+            let counts = mandate_run_proof_counts_on_connection(
+                connection,
+                &goal_run_id,
+                root_task_id.as_deref(),
+            )
+            .await?;
             let notice = crate::traits::MandateRunNotification::new(
                 &mandate_id,
                 version + 1,
@@ -1026,7 +1234,7 @@ async fn reconcile_orphaned_mandate_runs(
                 &goal_run_id,
                 &session_id,
                 crate::traits::MandateRunNotificationKind::ExecutionLeaseLost,
-                crate::traits::MandateRunProofCounts::default(),
+                counts,
                 now,
             );
             super::notifications::enqueue_mandate_run_notification_on_connection(
@@ -5783,16 +5991,88 @@ mod tests {
             store.get_goal_runs(&goal.id).await.unwrap()[0].status,
             "cancelled"
         );
-        let notifications: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM notification_queue
+        let notification_message: String = sqlx::query_scalar(
+            "SELECT message FROM notification_queue
              WHERE goal_id = ? AND notification_type = 'mandate_reconciliation_required'
-               AND priority = 'critical' AND expires_at IS NULL",
+               AND priority = 'critical' AND expires_at IS NULL
+             LIMIT 1",
         )
         .bind(&goal.id)
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(notifications, 1);
+        assert!(notification_message.contains("work_tasks=1"));
+        assert!(notification_message.contains("mutation_reservations=0"));
+    }
+
+    #[tokio::test]
+    async fn orphaned_review_without_decision_retries_without_reconciliation_pause() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let root_attempt = store
+            .claim_task_with_lease(
+                run.root_task_id.as_deref().unwrap(),
+                "crashing-reviewer",
+                Some("profile-task-lead"),
+                180,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE task_attempts SET lease_expires_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+            .bind(&root_attempt.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(store
+            .claim_due_mandates(1, "orphan-recovery", 300)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let recovered_mandate = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(recovered_mandate.status, MandateStatus::Active);
+        assert!(recovered_mandate.next_review_at > chrono::Utc::now().to_rfc3339());
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        let recovered_run = store
+            .get_goal_runs(&goal.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run.id)
+            .unwrap();
+        assert_eq!(recovered_run.status, "failed");
+        assert_eq!(
+            recovered_run.outcome_summary.as_deref(),
+            Some("mandate_review_failed:decision_missing")
+        );
+
+        let root = store
+            .get_task(run.root_task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.status, "cancelled");
+        let notification: (String, String) = sqlx::query_as(
+            "SELECT notification_type, message FROM notification_queue
+             WHERE id = ?",
+        )
+        .bind(format!("mandate-run-notice:{}", run.id))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(notification.0, "mandate_review_failed");
+        assert!(notification.1.contains("reason=decision_missing"));
+        assert!(notification
+            .1
+            .contains("No action was authorized or executed"));
+        assert!(!notification.1.contains("Inspect the external target"));
     }
 
     #[tokio::test]

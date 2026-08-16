@@ -448,9 +448,9 @@ pub(super) async fn apply_result_learning(
                     let observed_count = *pattern_count;
                     tokio::spawn(async move {
                         let description = format!(
-                                "Repeated {} failures for {} on '{}'; pivot to a different approach earlier.",
-                                observed_count, tool_name, error_pattern
-                            );
+                            "Repeated {} failures for {} on '{}'; pivot to a different approach earlier.",
+                            observed_count, tool_name, error_pattern
+                        );
                         let confidence = (0.5 + (observed_count as f32 * 0.05)).min(0.9);
                         if let Err(e) = state_store
                             .record_behavior_pattern(

@@ -296,6 +296,50 @@ pub(super) fn extract_explicit_path_scopes_from_text(
     extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots);
 }
 
+/// Extract exact filesystem resource identities without promoting a file or
+/// subdirectory to its repository root. Project selection may deliberately
+/// broaden a resource to its workspace; permission grounding must not.
+pub(super) fn extract_exact_filesystem_resources_from_text(
+    text: &str,
+    alias_roots: &[String],
+) -> Vec<String> {
+    let mut resources = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\''
+                            | '"'
+                            | ','
+                            | ';'
+                            | ':'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+            })
+            .trim()
+            .trim_end_matches('.');
+        let Some(path) =
+            crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
+        else {
+            continue;
+        };
+        let path = path.to_string_lossy().to_string();
+        if !resources.contains(&path) {
+            resources.push(path);
+        }
+    }
+    resources
+}
+
 fn extract_project_scopes_from_text_inner(
     text: &str,
     scopes: &mut Vec<String>,
@@ -859,6 +903,23 @@ mod tests {
         )
         .expect("normalized");
         assert_eq!(normalized, root.to_string_lossy());
+    }
+
+    #[test]
+    fn permission_resource_extraction_preserves_exact_file_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("repo");
+        let file = root.join("Cargo.toml");
+        std::fs::write(&file, "[package]\nname='synthetic'\n").expect("file");
+
+        let resources = extract_exact_filesystem_resources_from_text(
+            &format!("Read {} and write /tmp/synthetic-output", file.display()),
+            &[],
+        );
+        assert!(resources.contains(&file.to_string_lossy().to_string()));
+        assert!(!resources.contains(&root.to_string_lossy().to_string()));
+        assert!(resources.contains(&"/tmp/synthetic-output".to_string()));
     }
     #[test]
     fn project_scope_extraction_resolves_exact_project_paths() {

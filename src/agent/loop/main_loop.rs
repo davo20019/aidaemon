@@ -182,6 +182,18 @@ fn assimilate_continuation_receipt(
     } else {
         Vec::new()
     };
+    // Cross-task evidence must carry a machine-checkable binding to the
+    // adopted obligation. Broad semantic overlap alone (for example, any
+    // LocalWorkspace content observation) cannot let an unrelated parent
+    // receipt close a child's requirement.
+    matched_requirement_indices.retain(|index| {
+        contract
+            .evidence_requirements
+            .get(*index)
+            .is_some_and(|requirement| {
+                requirement.receipt.is_some() || requirement.target.is_some()
+            })
+    });
     if semantics.observes_state() {
         for index in super::tool_execution_phase::accumulate_evidence_requirement_marker_matches(
             contract,
@@ -582,6 +594,23 @@ impl Agent {
                 .any(|candidate| candidate == parent_task_id);
             let exact_reference = continuation_parent_tool_call_id
                 .zip(continuation_parent_result_id);
+            if let Some((parent_tool_call_id, parent_result_id)) = exact_reference {
+                // Persist the proof-bearing lifecycle edge before finalization.
+                // The response-bound edge is added later, but completion proof
+                // must not depend on an event that can only exist afterward.
+                emitter
+                    .emit(
+                        crate::events::EventType::BackgroundContinuationLinked,
+                        crate::events::BackgroundContinuationLinkedData {
+                            parent_task_id: parent_task_id.to_string(),
+                            child_task_id: task_id.clone(),
+                            parent_tool_call_id: parent_tool_call_id.to_string(),
+                            parent_result_id: Some(parent_result_id.to_string()),
+                            child_response_id: None,
+                        },
+                    )
+                    .await?;
+            }
             let mut telemetry = json!({
                 "condition": "continuation_receipt_assimilation",
                 "parent_task_id": parent_task_id,

@@ -775,6 +775,31 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
         }
+
+        fn capabilities(&self) -> crate::traits::ToolCapabilities {
+            crate::traits::ToolCapabilities {
+                read_only: false,
+                external_side_effect: true,
+                needs_approval: false,
+                idempotent: false,
+                high_impact_write: false,
+            }
+        }
+
+        fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|args| {
+                    args.get("file_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            crate::traits::ToolCallSemantics::mutation_with(
+                crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+            )
+            .with_target_hint(crate::traits::ToolTargetHintKind::Path, path)
+        }
     }
 
     let send_file_args = r#"{"file_path":"/Users/testuser/projects/acme-corp/proposal/sow-project-plan.pdf","caption":"Here is the SOW PDF from the Acme project."}"#;
@@ -878,6 +903,31 @@ async fn test_duplicate_send_file_forces_text_closeout() {
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
+        }
+
+        fn capabilities(&self) -> crate::traits::ToolCapabilities {
+            crate::traits::ToolCapabilities {
+                read_only: false,
+                external_side_effect: true,
+                needs_approval: false,
+                idempotent: false,
+                high_impact_write: false,
+            }
+        }
+
+        fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|args| {
+                    args.get("file_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            crate::traits::ToolCallSemantics::mutation_with(
+                crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+            )
+            .with_target_hint(crate::traits::ToolTargetHintKind::Path, path)
         }
     }
 

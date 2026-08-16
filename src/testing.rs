@@ -171,7 +171,7 @@ impl MockProvider {
         };
         Self::text_response(
             &json!({
-                "schema_version": 7,
+                "schema_version": 9,
                 "goal": "Synthetic typed task assessment",
                 "steps": [],
                 "success_criteria": [],
@@ -191,6 +191,12 @@ impl MockProvider {
                     "requires_primary_sources": false,
                     "requires_exact_history": false,
                     "evidence_requirements": evidence_requirements,
+                    "required_invocations": [],
+                    "filesystem_access": {
+                        "execution_cwd": null,
+                        "read_paths": [],
+                        "write_paths": []
+                    },
                     "project_reference": null
                 },
                 "task_shape": {

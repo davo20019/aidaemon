@@ -215,6 +215,7 @@ pub(crate) trait OutboundRouter: Send + Sync {
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
     async fn send_media_strict(&self, session_id: &str, media: &MediaMessage)
         -> anyhow::Result<()>;
+    async fn background_status_surface(&self, session_id: &str) -> Option<String>;
     async fn take_background_status_surface(&self, session_id: &str) -> Option<String>;
     async fn request_inline_approval(
         &self,

@@ -1020,6 +1020,7 @@ impl Agent {
     /// `heartbeat` is an optional atomic timestamp updated on each activity point.
     /// Channels pass `Some(heartbeat)` so the typing indicator can detect stalls;
     /// sub-agents, triggers, and tests pass `None`.
+    #[cfg(test)]
     fn sanitize_final_reply_markers(reply: &str) -> String {
         // NOTE: The primary sanitization pass already runs in completion_phase.rs.
         // This second pass is a lightweight safety net that only strips control
@@ -1201,12 +1202,9 @@ impl Agent {
             clear_scheduled_run_state(&self.state, goal_id).await;
         }
 
-        let reply = reply?;
-
-        // Strip control markers that may have leaked through model echoing.
-        let reply = Self::sanitize_final_reply_markers(&reply);
-
-        Ok(reply)
+        // The loop's response-finalization phase is the sole owner of all
+        // user-facing transforms and persists that exact finalized text.
+        reply
     }
 
     /// Re-enter an unfinished conversation with runtime-produced evidence.
@@ -1217,22 +1215,20 @@ impl Agent {
         request: &crate::runtime_ports::ConversationRequest,
     ) -> anyhow::Result<String> {
         let _activity = activity_gate::AgentActivityGuard::acquire();
-        let reply = self
-            .handle_message_impl(
-                &request.session_id,
-                &request.user_text,
-                &[],
-                request.status_tx.clone(),
-                request.user_role,
-                request.channel_ctx.clone(),
-                request.heartbeat.clone(),
-                true,
-                request.parent_task_id.as_deref(),
-                request.parent_tool_call_id.as_deref(),
-                request.parent_result_id.as_deref(),
-            )
-            .await?;
-        Ok(Self::sanitize_final_reply_markers(&reply))
+        self.handle_message_impl(
+            &request.session_id,
+            &request.user_text,
+            &[],
+            request.status_tx.clone(),
+            request.user_role,
+            request.channel_ctx.clone(),
+            request.heartbeat.clone(),
+            true,
+            request.parent_task_id.as_deref(),
+            request.parent_tool_call_id.as_deref(),
+            request.parent_result_id.as_deref(),
+        )
+        .await
     }
 
     /// Cancel all active/pending goals for a session.

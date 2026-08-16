@@ -858,21 +858,20 @@ fn redact_error_line_for_summary(key_line: &str) -> String {
 /// The Telegram handler uses this to register the delivered handoff message
 /// as the session's background status surface, so the terminal notifier can
 /// EDIT it into the completion ping instead of stacking a third message.
-/// The prefix below is our own generated text (never user/model content), so
+/// The heading below is our own generated text (never user/model content), so
 /// prefix-matching it is a stable structural contract, pinned by test.
 pub(crate) fn is_friendly_background_handoff(reply: &str) -> bool {
-    reply.trim_start().starts_with("⏳ Still on it — ")
+    reply.trim_start().starts_with("⏳ **Still on it**")
 }
 
 pub(in crate::agent) fn build_friendly_background_handoff(user_request: &str) -> String {
     let mut msg = String::from(
-        "⏳ Still on it — this is taking a bit longer, so it's running in the background now. \
-         I'll send the result the moment it's ready.",
+        "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the \
+         background now. I'll send the result as soon as it's ready.",
     );
     if let Some(gist) = friendly_request_gist(user_request) {
-        msg.push_str("\n\nWorking on: \"");
+        msg.push_str("\n\n**Request:** ");
         msg.push_str(&gist);
-        msg.push('"');
     }
     msg
 }
@@ -1124,9 +1123,10 @@ mod tests {
         let msg =
             build_friendly_background_handoff("How many PDF files are in my projects folder?");
         // Warm reassurance + a quoted gist of the user's own request.
+        assert!(msg.starts_with("⏳ **Still on it**"));
         assert!(msg.contains("running in the background"));
-        assert!(msg.contains("I'll send the result the moment it's ready"));
-        assert!(msg.contains("Working on: \"How many PDF files are in my projects folder?\""));
+        assert!(msg.contains("I'll send the result as soon as it's ready"));
+        assert!(msg.contains("**Request:** How many PDF files are in my projects folder?"));
         // No internals leaked into chat.
         assert!(!msg.contains("pid="));
         assert!(!msg.contains("Moved to background"));
@@ -1142,12 +1142,12 @@ mod tests {
         let synthetic = build_friendly_background_handoff(
             "[Background command completed]\nCommand: `ls`\nOutput:\n5",
         );
-        assert!(!synthetic.contains("Working on:"));
+        assert!(!synthetic.contains("**Request:**"));
         assert!(synthetic.contains("running in the background"));
 
         // Empty request → no gist line either.
         let empty = build_friendly_background_handoff("   ");
-        assert!(!empty.contains("Working on:"));
+        assert!(!empty.contains("**Request:**"));
     }
 
     #[test]

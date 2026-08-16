@@ -1866,8 +1866,7 @@ Top-level keys: data
 
     #[test]
     fn fallback_reply_strips_iteration_numbers() {
-        let reconciliation =
-            "[SYSTEM] External mutation: 0 of 2 succeeded, 2 failed.\n  - terminal at iteration 32: SyntaxError\n  - terminal at iteration 33: SyntaxError";
+        let reconciliation = "[SYSTEM] External mutation: 0 of 2 succeeded, 2 failed.\n  - terminal at iteration 32: SyntaxError\n  - terminal at iteration 33: SyntaxError";
         let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
         assert!(!fallback.contains("at iteration"));
         assert!(!fallback.contains("[SYSTEM]"));

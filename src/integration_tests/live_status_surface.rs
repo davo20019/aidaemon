@@ -155,11 +155,10 @@ mod live_status_surface_tests {
         }
     }
 
-    /// Background completion pings EDIT the registered "⏳ Still on it —"
-    /// handoff bubble in place (one evolving status message); when no surface
-    /// is registered (or it was already consumed) they fall back to a fresh
-    /// message. Exercises the real ChannelHub registry + the terminal
-    /// notifier's delivery helper end to end.
+    /// Background progress and completion EDIT the registered handoff bubble
+    /// in place. Progress preserves the surface for later updates; completion
+    /// consumes it. When no surface remains, delivery falls back to a fresh
+    /// message. Exercises the real ChannelHub registry + terminal helpers.
     #[tokio::test]
     async fn background_completion_ping_edits_registered_handoff_bubble() {
         let channel = Arc::new(EditableChannel {
@@ -181,7 +180,20 @@ mod live_status_surface_tests {
         hub.register_background_status_surface("telegram:synthetic-user-1", "m1")
             .await;
 
-        let ping = "⏳ Background step finished in 1m 3s. Preparing your result now…";
+        let progress = "⏳ **Still working** · 35s\n\nOutput is still arriving.\n\n_12 lines received so far._";
+        crate::tools::terminal::deliver_background_progress_update(
+            Some(&outbound),
+            None,
+            "telegram:synthetic-user-1",
+            "goal-1",
+            progress,
+            4241,
+        )
+        .await;
+
+        // Completion can still reuse the same surface because progress did not
+        // consume its registry entry.
+        let ping = "⏳ **Preparing your result**\n\nThe background step finished in 1m 3s.";
         crate::tools::terminal::deliver_background_completion_ping(
             Some(&outbound),
             None,
@@ -195,10 +207,12 @@ mod live_status_surface_tests {
         {
             let edits = channel.edits.lock().await;
             let messages = channel.messages.lock().await;
-            assert_eq!(edits.len(), 1, "ping must edit the handoff bubble");
+            assert_eq!(edits.len(), 2, "progress and completion must edit in place");
             assert_eq!(edits[0].0, "m1");
-            assert!(edits[0].1.contains("Background step finished in"));
-            assert!(!edits[0].1.contains("Done"));
+            assert!(edits[0].1.contains("Still working"));
+            assert_eq!(edits[1].0, "m1");
+            assert!(edits[1].1.contains("background step finished in"));
+            assert!(!edits[1].1.contains("Done"));
             assert!(messages.is_empty(), "no fresh message when the edit works");
         }
 
@@ -216,7 +230,7 @@ mod live_status_surface_tests {
         .await;
         let edits = channel.edits.lock().await;
         let messages = channel.messages.lock().await;
-        assert_eq!(edits.len(), 1, "no second edit — registry entry consumed");
+        assert_eq!(edits.len(), 2, "no third edit — registry entry consumed");
         assert_eq!(messages.len(), 1, "fallback fresh message delivered");
     }
 }

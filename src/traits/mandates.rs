@@ -2393,10 +2393,22 @@ impl MandateRunNotification {
                 reason.as_str(),
             ),
             MandateRunNotificationKind::ExecutionLeaseLost => format!(
-                "Mandate {mandate_ref} review {run_ref} lost its execution lease before its effects could be reconciled. The mandate is paused for safety. Inspect the external target for a partial or duplicate action before resuming. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}"
+                "Mandate {mandate_ref} review {run_ref} lost its execution lease before its effects could be reconciled; work_tasks={}; mutation_reservations={}; verified_mutations={}; failed_mutations={}; never_dispatched_mutations={}; unresolved_mutations={}. The mandate is paused for safety. Inspect the external target for a partial or duplicate action before resuming. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
+                self.counts.non_root_tasks,
+                self.counts.mutation_reservations,
+                self.counts.succeeded_mutations,
+                self.counts.failed_mutations,
+                self.counts.never_dispatched_mutations,
+                self.counts.ambiguous_or_reserved_mutations,
             ),
             MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation => format!(
-                "Mandate {mandate_ref} review {run_ref} was invalidated after one or more external mutations crossed the final dispatch boundary without a durable outcome. Inspect the external target for a partial or duplicate action. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}"
+                "Mandate {mandate_ref} review {run_ref} was invalidated after one or more external mutations crossed the final dispatch boundary without a durable outcome; work_tasks={}; mutation_reservations={}; verified_mutations={}; failed_mutations={}; never_dispatched_mutations={}; unresolved_mutations={}. Inspect the external target for a partial or duplicate action. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
+                self.counts.non_root_tasks,
+                self.counts.mutation_reservations,
+                self.counts.succeeded_mutations,
+                self.counts.failed_mutations,
+                self.counts.never_dispatched_mutations,
+                self.counts.ambiguous_or_reserved_mutations,
             ),
         }
     }

@@ -48,10 +48,11 @@ pub struct ChannelHub {
     /// files (different paths) are never suppressed. Photos are never deduped.
     recent_media_deliveries: RwLock<HashMap<String, tokio::time::Instant>>,
     /// Per-session editable message id of a delivered background-handoff reply
-    /// ("⏳ Still on it — …"). The terminal notifier consumes it (take) so the
-    /// completion ping EDITS that message in place instead of stacking a new
-    /// one. Last writer wins per session; take() removes the entry, so a
-    /// second concurrent background command degrades to a fresh ping message.
+    /// ("⏳ **Still on it**"). Progress updates read it without consuming it,
+    /// while the completion ping consumes it (take), so the full background
+    /// lifecycle can reuse one message instead of stacking status bubbles.
+    /// Last writer wins per session; take() removes the entry, so a second
+    /// concurrent background command degrades to a fresh ping message.
     background_status_surfaces: RwLock<HashMap<String, String>>,
 }
 
@@ -77,6 +78,17 @@ impl ChannelHub {
             .write()
             .await
             .insert(session_id.to_string(), message_id.to_string());
+    }
+
+    /// Return the registered background status surface without consuming it.
+    /// Periodic progress updates use this to keep editing the original handoff;
+    /// completion still owns the terminal `take` transition below.
+    pub async fn background_status_surface(&self, session_id: &str) -> Option<String> {
+        self.background_status_surfaces
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
     }
 
     /// Take (and remove) the registered background-handoff message id for this
@@ -814,6 +826,10 @@ impl OutboundRouter for ChannelHub {
         media: &MediaMessage,
     ) -> anyhow::Result<()> {
         ChannelHub::send_media_strict(self, session_id, media).await
+    }
+
+    async fn background_status_surface(&self, session_id: &str) -> Option<String> {
+        ChannelHub::background_status_surface(self, session_id).await
     }
 
     async fn take_background_status_surface(&self, session_id: &str) -> Option<String> {

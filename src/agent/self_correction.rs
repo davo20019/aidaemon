@@ -807,8 +807,7 @@ mod tests {
 
         // The raw signature the gate would produce for a terminal command embedding
         // an API key (sk- prefix, ≥20 alphanum chars → matches SECRET_PATTERNS).
-        let raw_sig =
-            "tool=terminal cmd=curl -H Authorization: Bearer sk-ABCDEF1234567890XYZ0 https://api.example.com method= host=api.example.com auth_profile=false auth_header=false detach=false path_scope=none mutating=false external=false high_impact=false";
+        let raw_sig = "tool=terminal cmd=curl -H Authorization: Bearer sk-ABCDEF1234567890XYZ0 https://api.example.com method= host=api.example.com auth_profile=false auth_header=false detach=false path_scope=none mutating=false external=false high_impact=false";
 
         // Step 1: gate pre-redacts (mirrors normalized_attempt_signature's redact_secrets call).
         let prospective = crate::tools::sanitize::redact_secrets(raw_sig);

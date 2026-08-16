@@ -118,10 +118,6 @@ fn extract_terminal_cd_dirs(command: &str) -> Vec<String> {
     dirs
 }
 
-fn quote_shell_token(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 fn resolve_injected_working_dir(project_dir: &str) -> String {
     if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
         return project_dir.to_string();
@@ -260,7 +256,10 @@ fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
     looks_like_path.then(|| candidate.to_string())
 }
 
-fn terminal_command_path_targets(command: &str, base_directory: Option<&str>) -> Vec<String> {
+pub(super) fn terminal_command_path_targets(
+    command: &str,
+    base_directory: Option<&str>,
+) -> Vec<String> {
     let tokens = shell_words::split(command).unwrap_or_else(|_| {
         command
             .split_whitespace()
@@ -383,11 +382,11 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     let mut parsed = serde_json::from_str::<Value>(args_json).ok()?;
     let obj = parsed.as_object_mut()?;
     if tool_name == "terminal" {
-        if obj
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
-        {
+        if ["working_dir", "cwd"].iter().any(|key| {
+            obj.get(*key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        }) {
             return None;
         }
         let command = obj.get("command").and_then(|v| v.as_str())?.trim();
@@ -402,14 +401,10 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
         if !active_workspace_policy_allows_injected_working_dir(&injected_dir) {
             return None;
         }
-        obj.insert(
-            "command".to_string(),
-            json!(format!(
-                "cd {} && {}",
-                quote_shell_token(&injected_dir),
-                command
-            )),
-        );
+        // Execution cwd is first-class authority. Never hide it by rewriting
+        // the shell program with `cd`: authorization, receipts, relative-path
+        // resolution, cleanup, and replay must all see the same prepared cwd.
+        obj.insert("working_dir".to_string(), json!(injected_dir));
         let updated = serde_json::to_string(&parsed).ok()?;
         return Some((updated, injected_dir));
     }
@@ -724,10 +719,9 @@ mod tests {
         )
         .expect("injection");
         assert_eq!(injected, project.to_string_lossy());
-        assert!(updated.contains(&format!(
-            "cd '{}' && pwd && ls dist",
-            project.to_string_lossy()
-        )));
+        let parsed: Value = serde_json::from_str(&updated).expect("valid arguments");
+        assert_eq!(parsed["working_dir"], project.to_string_lossy().as_ref());
+        assert_eq!(parsed["command"], "pwd && ls dist");
     }
 
     #[test]

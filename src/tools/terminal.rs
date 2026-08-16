@@ -27,8 +27,8 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
-    ToolVerificationMode,
+    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -716,11 +716,44 @@ async fn deliver_attributed_background_file(
     }
 }
 
-/// Send a background status/failure line to the session's channel, falling back
-/// to the durable notification queue when no live channel is available. Mirrors
-/// the hub-then-enqueue pattern used throughout the completion notifier.
+/// Update the reusable background status card, falling back to a fresh message
+/// (or the durable notification queue) when the channel cannot edit. Unlike the
+/// completion transition below, progress only reads the surface id so later
+/// updates can continue to reuse the same bubble.
+pub(crate) async fn deliver_background_progress_update(
+    hub: Option<&Arc<dyn OutboundRouter>>,
+    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    session_id: &str,
+    goal_id: &str,
+    message: &str,
+    pid: u32,
+) {
+    if let Some(hub) = hub {
+        if let Some(surface_id) = hub.background_status_surface(session_id).await {
+            match hub.edit_text(session_id, &surface_id, message).await {
+                Ok(true) => {
+                    info!(
+                        pid,
+                        session_id, "Background progress updated in the handoff status message"
+                    );
+                    return;
+                }
+                other => {
+                    info!(
+                        pid,
+                        session_id,
+                        ?other,
+                        "Handoff status edit unavailable; falling back to fresh progress message"
+                    );
+                }
+            }
+        }
+    }
+    deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
+}
+
 /// Deliver the background completion ping, preferring to EDIT the session's
-/// registered "⏳ Still on it — …" handoff message in place (single evolving
+/// registered "⏳ **Still on it**" handoff message in place (single evolving
 /// status bubble) over stacking a new message. Falls back to the plain
 /// send/enqueue path on any miss or edit failure, so the ping is never lost.
 /// The final ANSWER (re-engagement reply) intentionally stays a separate
@@ -1582,30 +1615,35 @@ fn humanize_elapsed(secs: u64) -> String {
     )
 }
 
-/// Condense in-flight background output for a user-facing progress ping.
-/// Chatty commands (e.g. `ls -R`) accumulate thousands of lines; the chat
-/// ping only needs proof of life, so report a line count plus the most
-/// recent lines. The full output still reaches the agent on completion.
-fn summarize_progress_output(output: &str) -> String {
-    const MAX_PING_LINES: usize = 3;
-    const MAX_PING_LINE_CHARS: usize = 160;
-    let lines: Vec<&str> = output
+/// Count non-empty in-flight output lines for a user-facing status card.
+/// Raw process output belongs in the final agent interpretation, not in chat:
+/// partial terminal lines are noisy, can wrap badly on mobile, and may expose
+/// implementation details that have no value before the command completes.
+fn progress_output_line_count(output: &str) -> usize {
+    output
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let total = lines.len();
-    let tail = lines
-        .iter()
-        .skip(total.saturating_sub(MAX_PING_LINES))
-        .map(|l| truncate_str(l, MAX_PING_LINE_CHARS))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if total > MAX_PING_LINES {
-        format!("{} lines of output so far. Latest:\n{}", total, tail)
-    } else {
-        tail
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+fn output_count_note(output: &str) -> Option<String> {
+    match progress_output_line_count(output) {
+        0 => None,
+        1 => Some("_1 line received so far._".to_string()),
+        count => Some(format!("_{count} lines received so far._")),
     }
+}
+
+fn format_background_progress_message(elapsed_secs: u64, output: &str) -> String {
+    let mut message = format!(
+        "⏳ **Still working** · {}\n\nOutput is still arriving. I'll share the useful result when it's ready.",
+        humanize_elapsed(elapsed_secs)
+    );
+    if let Some(note) = output_count_note(output) {
+        message.push_str("\n\n");
+        message.push_str(&note);
+    }
+    message
 }
 
 /// One deterministic transition after the frequent progress-ping budget is
@@ -1614,13 +1652,12 @@ fn summarize_progress_output(output: &str) -> String {
 /// the process exit and could strand the promised final result.
 fn format_background_monitoring_notice(elapsed_secs: u64, output: &str) -> String {
     let mut message = format!(
-        "ℹ️ Still running after {}. Frequent progress updates are now paused, but completion monitoring remains active. The process may be stalled or long-lived; when it exits—or if the watchdog stops it—you'll receive a final closeout.",
+        "⏳ **Taking longer than expected** · {}\n\nIt's still running and I'm still monitoring it. I'll let you know when it finishes or if it needs attention.",
         humanize_elapsed(elapsed_secs)
     );
-    let latest = summarize_progress_output(output);
-    if !latest.trim().is_empty() {
-        message.push_str(" Latest output:\n");
-        message.push_str(&latest);
+    if let Some(note) = output_count_note(output) {
+        message.push_str("\n\n");
+        message.push_str(&note);
     }
     message
 }
@@ -1702,44 +1739,333 @@ fn background_completion_ping_message(
     next: BackgroundCompletionNext,
 ) -> String {
     if exit_code == Some(0) {
-        let mut m = format!(
-            "Background step finished in {}.",
-            humanize_elapsed(elapsed_secs)
-        );
         match next {
-            BackgroundCompletionNext::Nothing => {
-                m.push_str(" It returned no output.");
-            }
-            BackgroundCompletionNext::PrepareResult => {
-                m.insert_str(0, "⏳ ");
-                m.push_str(" Preparing your result now…");
-            }
-            BackgroundCompletionNext::ContinueRequirements => {
-                m.insert_str(0, "⏳ ");
-                m.push_str(" Continuing with the remaining request now…");
-            }
+            BackgroundCompletionNext::Nothing => format!(
+                "ℹ️ **Background step finished** · {}\n\nIt didn't return any output.",
+                humanize_elapsed(elapsed_secs)
+            ),
+            BackgroundCompletionNext::PrepareResult => format!(
+                "⏳ **Preparing your result**\n\nThe background step finished in {}. I'm turning it into a clear answer now.",
+                humanize_elapsed(elapsed_secs)
+            ),
+            BackgroundCompletionNext::ContinueRequirements => format!(
+                "⏳ **Continuing your request**\n\nThe background step finished in {}. I'm moving on to the remaining work now.",
+                humanize_elapsed(elapsed_secs)
+            ),
         }
-        m
     } else {
-        let mut m = format!(
-            "⚠️ Background command finished with errors in {}",
-            humanize_elapsed(elapsed_secs)
-        );
+        let mut detail = format!("It finished after {}", humanize_elapsed(elapsed_secs));
         if let Some(code) = exit_code {
-            m.push_str(&format!(" (exit code {})", code));
+            detail.push_str(&format!(" with exit code {code}"));
         }
-        m.push('.');
+        detail.push('.');
         match next {
             BackgroundCompletionNext::Nothing => {}
             BackgroundCompletionNext::PrepareResult => {
-                m.push_str(" Reviewing what happened now…");
+                detail.push_str(" I'm checking what happened now.");
             }
             BackgroundCompletionNext::ContinueRequirements => {
-                m.push_str(" Reviewing the error and continuing the remaining request now…");
+                detail.push_str(" I'm checking the error and continuing the remaining work now.");
             }
         }
-        m
+        format!("⚠️ **Background step needs review**\n\n{detail}")
     }
+}
+
+pub(crate) async fn confined_terminal_execution_request(
+    backend: &SharedExecutionBackend,
+    command: &str,
+    working_dir: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> anyhow::Result<ExecutionRequest> {
+    let cwd = match working_dir {
+        Some(path) => {
+            let resolved = backend.resolve_path(path).await?;
+            Some(backend.canonicalize(&resolved).await.unwrap_or(resolved))
+        }
+        None => None,
+    };
+    if cwd.is_none() && read_paths.is_empty() && write_paths.is_empty() {
+        return Ok(ExecutionRequest::shell(command));
+    }
+
+    let codex = backend
+        .resolve_executable("codex")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(
+            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
+        ))?;
+    let mut reads = Vec::new();
+    if let Some(cwd) = cwd.as_ref() {
+        reads.push(cwd.to_string());
+    }
+    for path in read_paths {
+        let path = resolve_access_path(backend, path, cwd.as_ref())
+            .await?
+            .to_string();
+        if !reads.contains(&path) {
+            reads.push(path);
+        }
+    }
+    let mut writes = Vec::new();
+    for path in write_paths {
+        let path = resolve_access_path(backend, path, cwd.as_ref())
+            .await?
+            .to_string();
+        if !writes.contains(&path) {
+            writes.push(path);
+        }
+    }
+
+    // Task data authority and executable runtime support are separate lanes.
+    // A native sandbox still needs to execute owner-installed toolchains, but
+    // granting their entire home directory would expose unrelated data and
+    // credentials. Resolve exact machine invocations and add only registered,
+    // read-only runtime roots/caches.
+    let runtime_support = native_sandbox_runtime_support(backend, command).await?;
+    for path in runtime_support.read_paths {
+        if !reads.contains(&path) && !writes.contains(&path) {
+            reads.push(path);
+        }
+    }
+
+    let sandbox_cwd = cwd
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "/".to_string());
+    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes)?;
+    let mut args = vec![
+        "sandbox".to_string(),
+        "--sandbox-state-json".to_string(),
+        sandbox_state,
+    ];
+    args.extend([
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]);
+    let mut request = ExecutionRequest::argv(codex.to_string(), args);
+    request.cwd = cwd;
+    if !runtime_support.path_prefixes.is_empty() {
+        request.env.insert(
+            "PATH".to_string(),
+            native_sandbox_search_path(&runtime_support.path_prefixes),
+        );
+    }
+    Ok(request)
+}
+
+#[derive(Debug, Default)]
+struct NativeSandboxRuntimeSupport {
+    read_paths: Vec<String>,
+    path_prefixes: Vec<String>,
+}
+
+impl NativeSandboxRuntimeSupport {
+    fn add_read(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !path.trim().is_empty() && !self.read_paths.contains(&path) {
+            self.read_paths.push(path);
+        }
+    }
+
+    fn add_path_prefix(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !path.trim().is_empty() && !self.path_prefixes.contains(&path) {
+            self.path_prefixes.push(path);
+        }
+    }
+
+    fn prefer_path_prefix(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.path_prefixes.retain(|existing| existing != &path);
+        if !path.trim().is_empty() {
+            self.path_prefixes.insert(0, path);
+        }
+    }
+}
+
+fn parsed_command_programs(command: &str) -> Vec<String> {
+    let mut programs = Vec::new();
+    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
+        let Ok(tokens) = shell_words::split(&segment) else {
+            continue;
+        };
+        let Some(index) = tokens.iter().position(|token| {
+            !token.contains('=') && !matches!(token.as_str(), "command" | "builtin" | "env")
+        }) else {
+            continue;
+        };
+        if !programs.contains(&tokens[index]) {
+            programs.push(tokens[index].clone());
+        }
+    }
+    programs
+}
+
+async fn native_sandbox_runtime_support(
+    backend: &SharedExecutionBackend,
+    command: &str,
+) -> anyhow::Result<NativeSandboxRuntimeSupport> {
+    let mut support = NativeSandboxRuntimeSupport::default();
+    for program in parsed_command_programs(command) {
+        let Some(resolved) = backend.resolve_executable(&program).await? else {
+            continue;
+        };
+        let canonical = backend
+            .canonicalize(&resolved)
+            .await
+            .unwrap_or(resolved.clone());
+        if let Some(parent) = canonical.parent() {
+            support.add_read(parent.to_string());
+            support.add_path_prefix(parent.to_string());
+        }
+
+        let requested_name = std::path::Path::new(&program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program.as_str());
+        let canonical_name = std::path::Path::new(canonical.as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if canonical_name == "rustup" && requested_name != "rustup" {
+            let output = backend
+                .execute(
+                    ExecutionRequest::argv(
+                        canonical.to_string(),
+                        vec!["which".to_string(), requested_name.to_string()],
+                    ),
+                    Duration::from_secs(5),
+                )
+                .await?;
+            if output.exit_code == 0 {
+                if let Some(actual) = output
+                    .stdout_lossy()
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with('/'))
+                {
+                    let actual = crate::execution::BackendPath::new(actual.to_string());
+                    if let Some(bin_dir) = actual.parent() {
+                        support.prefer_path_prefix(bin_dir.to_string());
+                        // Rust compiler tools load libraries and target data
+                        // from the sibling toolchain tree, not just `bin/`.
+                        if let Some(toolchain_root) = bin_dir.parent() {
+                            support.add_read(toolchain_root.to_string());
+                        } else {
+                            support.add_read(bin_dir.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cargo requires dependency source caches to compile an already
+        // resolved project. These roots deliberately exclude config and
+        // credentials; network remains denied by the permission profile.
+        if requested_name == "cargo" {
+            let cargo_home = backend.home_hint().join(".cargo");
+            for relative in ["registry", "git", ".global-cache", ".rustc_info.json"] {
+                let path = cargo_home.join(relative);
+                if backend.metadata(&path).await.is_ok() {
+                    support.add_read(path.to_string());
+                }
+            }
+        }
+    }
+    Ok(support)
+}
+
+fn native_sandbox_search_path(prefixes: &[String]) -> String {
+    let mut paths = prefixes
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<std::path::PathBuf>>();
+    if let Some(current) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&current) {
+            if path.is_absolute() && !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    for path in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        let path = PathBuf::from(path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    std::env::join_paths(paths)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn codex_sandbox_state_json(
+    cwd: &str,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> anyhow::Result<String> {
+    let mut filesystem_entries = vec![json!({
+        "path": {
+            "type": "special",
+            "value": { "kind": "minimal" }
+        },
+        "access": "read"
+    })];
+    filesystem_entries.extend(read_paths.iter().map(|path| {
+        json!({
+            "path": { "type": "path", "path": path },
+            "access": "read"
+        })
+    }));
+    filesystem_entries.extend(write_paths.iter().map(|path| {
+        json!({
+            "path": { "type": "path", "path": path },
+            "access": "write"
+        })
+    }));
+    let sandbox_cwd = reqwest::Url::from_file_path(cwd)
+        .map_err(|_| anyhow::anyhow!("sandbox working directory must be an absolute local path"))?;
+    Ok(serde_json::to_string(&json!({
+        "permissionProfile": {
+            "type": "managed",
+            "file_system": {
+                "type": "restricted",
+                "entries": filesystem_entries
+            },
+            "network": "restricted"
+        },
+        "codexLinuxSandboxExe": Value::Null,
+        "sandboxCwd": sandbox_cwd.as_str(),
+        "useLegacyLandlock": false
+    }))?)
+}
+
+async fn resolve_access_path(
+    backend: &SharedExecutionBackend,
+    path: &str,
+    cwd: Option<&crate::execution::BackendPath>,
+) -> anyhow::Result<crate::execution::BackendPath> {
+    let path = path.trim();
+    anyhow::ensure!(!path.is_empty(), "execution access path cannot be empty");
+    let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
+        path.to_string()
+    } else if let Some(cwd) = cwd {
+        cwd.join(path).to_string()
+    } else {
+        path.to_string()
+    };
+    backend.resolve_path(&prepared).await
 }
 
 /// Friendly, pid-free delivery message for a short background result. Inline
@@ -3375,6 +3701,9 @@ impl TerminalTool {
     async fn handle_run(&self, request: TerminalRunRequest<'_>) -> anyhow::Result<ToolCallOutcome> {
         let TerminalRunRequest {
             command,
+            working_dir,
+            read_paths,
+            write_paths,
             notify_session_id,
             notify_goal_id,
             task_id,
@@ -3382,8 +3711,9 @@ impl TerminalTool {
             detach,
             status_tx,
         } = request;
+        let dedupe_identity = format!("cwd={}\0{command}", working_dir.unwrap_or_default());
         let dedupe_key =
-            Self::dedupe_key_for_run(command, notify_session_id, notify_goal_id, task_id);
+            Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
             return Ok(ToolCallOutcome::from_output(format!(
                 "Equivalent command is already running in this scope (pid={}). \
@@ -3392,7 +3722,15 @@ impl TerminalTool {
             )));
         }
 
-        let mut spawned = self.backend.spawn(ExecutionRequest::shell(command)).await?;
+        let execution_request = confined_terminal_execution_request(
+            &self.backend,
+            command,
+            working_dir,
+            read_paths,
+            write_paths,
+        )
+        .await?;
+        let mut spawned = self.backend.spawn(execution_request).await?;
         let process_handle = spawned.handle().clone();
         let pid = process_handle.display_id();
         let stdout_pipe = spawned.take_stdout().expect("stdout piped");
@@ -3630,11 +3968,11 @@ impl TerminalTool {
                             // the notifier goes silent waiting for an exit that
                             // may never come and the conversation dead-ends.
                             let mut still_running_notice_sent = false;
-                            // Last output already shown to the user in a periodic
-                            // ping. Used to suppress redundant "still running, no
-                            // new output" channel messages (the agent already told
-                            // the user the command is running).
-                            let mut last_pinged_output: Option<String> = None;
+                            // Last output-line count shown to the user. Raw output
+                            // stays out of the status card; a changed count is
+                            // enough to prove forward progress without exposing a
+                            // partial terminal transcript.
+                            let mut last_pinged_output_lines: Option<usize> = None;
                             // Set in the completion arm. Attributed deliverables suppress
                             // the generic "finished" ping and resolve to direct delivery
                             // or an honest ambiguity/failure message.
@@ -3914,7 +4252,7 @@ impl TerminalTool {
                                             next,
                                         );
 
-                                        // Prefer editing the "⏳ Still on it —" handoff bubble
+                                        // Prefer editing the reusable background handoff bubble
                                         // in place (one evolving status message); fall back to
                                         // the plain send/enqueue path inside the helper.
                                         completion_status_surface_id = deliver_background_completion_ping(
@@ -3975,46 +4313,15 @@ impl TerminalTool {
                                                         elapsed_secs,
                                                         &combined,
                                                     );
-                                                    let mut fallback_delivered = false;
-                                                    if let Some(ref hub) = hub_for_notify {
-                                                        match hub
-                                                            .send_text(
-                                                                &session_for_notify,
-                                                                &fallback,
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(()) => fallback_delivered = true,
-                                                            Err(e) => warn!(
-                                                                pid,
-                                                                error = %e,
-                                                                session_id = %session_for_notify,
-                                                                "Failed to deliver still-running fallback notice"
-                                                            ),
-                                                        }
-                                                    }
-                                                    if !fallback_delivered {
-                                                        if let Some(ref state) = state_for_notify {
-                                                            let entry =
-                                                                crate::traits::NotificationEntry::new(
-                                                                    &goal_id_for_notify,
-                                                                    &session_for_notify,
-                                                                    "progress",
-                                                                    &fallback,
-                                                                );
-                                                            if let Err(e) = state
-                                                                .enqueue_notification(&entry)
-                                                                .await
-                                                            {
-                                                                warn!(
-                                                                    pid,
-                                                                    error = %e,
-                                                                    session_id = %session_for_notify,
-                                                                    "Failed to enqueue still-running fallback notice"
-                                                                );
-                                                            }
-                                                        }
-                                                    }
+                                                    deliver_background_progress_update(
+                                                        hub_for_notify.as_ref(),
+                                                        state_for_notify.as_ref(),
+                                                        &session_for_notify,
+                                                        &goal_id_for_notify,
+                                                        &fallback,
+                                                        pid,
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         } else {
@@ -4029,10 +4336,11 @@ impl TerminalTool {
                                             }
                                             combined.push_str(&stderr);
                                         }
-                                        // Chat pings get a condensed view (line count + tail),
-                                        // never the raw output — the agent receives the full
-                                        // output via re-engagement on completion.
-                                        let latest_output = summarize_progress_output(&combined);
+                                        // Chat pings get only a line count, never raw process
+                                        // output. The agent receives the full output through
+                                        // re-engagement after completion.
+                                        let output_line_count =
+                                            progress_output_line_count(&combined);
                                         // Internal progress signal (typing indicator + logs).
                                         // pid and the raw command belong here, not in the chat.
                                         if let Some(ref tx) = status_tx_for_notify {
@@ -4056,59 +4364,23 @@ impl TerminalTool {
                                         // NEW output to report. The agent already told the user the
                                         // command is running, so repeated "still running, no output"
                                         // pings are noise. pid and the raw command stay out of chat.
-                                        let output_trimmed = latest_output.trim();
-                                        let has_new_output = !output_trimmed.is_empty()
-                                            && last_pinged_output.as_deref() != Some(output_trimmed);
+                                        let has_new_output = output_line_count > 0
+                                            && last_pinged_output_lines != Some(output_line_count);
                                         if has_new_output {
-                                            last_pinged_output = Some(output_trimmed.to_string());
-                                            let message = format!(
-                                                "⏳ Still working on it — running for {}. Latest update:\n{}",
-                                                humanize_elapsed(elapsed_secs),
-                                                latest_output
+                                            last_pinged_output_lines = Some(output_line_count);
+                                            let message = format_background_progress_message(
+                                                elapsed_secs,
+                                                &combined,
                                             );
-
-                                            let mut delivered = false;
-                                            if let Some(ref hub) = hub_for_notify {
-                                                if let Err(e) = hub.send_text(&session_for_notify, &message).await {
-                                                    warn!(
-                                                        pid,
-                                                        error = %e,
-                                                        session_id = %session_for_notify,
-                                                        command = %command_for_notify,
-                                                        "Terminal background notifier failed direct hub periodic delivery"
-                                                    );
-                                                } else {
-                                                    delivered = true;
-                                                }
-                                            }
-
-                                            if !delivered {
-                                                if let Some(ref state) = state_for_notify {
-                                                    let entry = crate::traits::NotificationEntry::new(
-                                                        &goal_id_for_notify,
-                                                        &session_for_notify,
-                                                        "progress",
-                                                        &message,
-                                                    );
-                                                    if let Err(e) = state.enqueue_notification(&entry).await {
-                                                        warn!(
-                                                            pid,
-                                                            error = %e,
-                                                            session_id = %session_for_notify,
-                                                            goal_id = %goal_id_for_notify,
-                                                            command = %command_for_notify,
-                                                            "Terminal background notifier failed to enqueue periodic progress notification"
-                                                        );
-                                                    }
-                                                } else {
-                                                    warn!(
-                                                        pid,
-                                                        session_id = %session_for_notify,
-                                                        command = %command_for_notify,
-                                                        "Terminal background notifier has no fallback queue; periodic update dropped"
-                                                    );
-                                                }
-                                            }
+                                            deliver_background_progress_update(
+                                                hub_for_notify.as_ref(),
+                                                state_for_notify.as_ref(),
+                                                &session_for_notify,
+                                                &goal_id_for_notify,
+                                                &message,
+                                                pid,
+                                            )
+                                            .await;
                                         }
                                         } // close else for ping_count cap
                                     }
@@ -5251,6 +5523,9 @@ impl TerminalTool {
 
                 self.handle_run(TerminalRunRequest {
                     command,
+                    working_dir: args.working_dir.as_deref(),
+                    read_paths: &args.read_paths,
+                    write_paths: &args.write_paths,
                     notify_session_id: &notify_session_id,
                     notify_goal_id: args._goal_id.as_deref(),
                     task_id: args._task_id.as_deref(),
@@ -5272,6 +5547,9 @@ impl TerminalTool {
 
 struct TerminalRunRequest<'a> {
     command: &'a str,
+    working_dir: Option<&'a str>,
+    read_paths: &'a [String],
+    write_paths: &'a [String],
     notify_session_id: &'a str,
     notify_goal_id: Option<&'a str>,
     task_id: Option<&'a str>,
@@ -5297,6 +5575,12 @@ impl Drop for TerminalTool {
 #[derive(Deserialize)]
 struct TerminalArgs {
     command: Option<String>,
+    #[serde(alias = "cwd")]
+    working_dir: Option<String>,
+    #[serde(default)]
+    read_paths: Vec<String>,
+    #[serde(default)]
+    write_paths: Vec<String>,
     #[serde(default = "default_action")]
     action: String,
     pid: Option<u32>,
@@ -5389,6 +5673,101 @@ fn tracked_background_metadata(
     }
 }
 
+fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
+    let action = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "run".to_string());
+    if action == "run" {
+        crate::traits::ToolReceiptKind::Process
+    } else {
+        crate::traits::ToolReceiptKind::Generic
+    }
+}
+
+fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
+    let args = serde_json::from_str::<Value>(arguments).ok();
+    let action = args
+        .as_ref()
+        .and_then(|value| value.get("action"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "run".to_string());
+    match action.as_str() {
+        "check" => ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        "kill" => ToolCallSemantics::mutation(),
+        "trust_all" => ToolCallSemantics::administrative(),
+        _ => args
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            .map(classify_shell_command)
+            .unwrap_or_else(ToolCallSemantics::mutation),
+    }
+}
+
+fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessManifest {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let execution_cwd = parsed
+        .as_ref()
+        .and_then(|value| value.get("working_dir").or_else(|| value.get("cwd")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let resolve = |path: &str| {
+        execution_cwd
+            .as_deref()
+            .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+            .map(|cwd| {
+                crate::execution::BackendPath::new(cwd)
+                    .join(path)
+                    .to_string()
+            })
+            .unwrap_or_else(|| path.to_string())
+    };
+    let mut read_targets = execution_cwd
+        .as_deref()
+        .and_then(|cwd| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd))
+        .into_iter()
+        .collect::<Vec<_>>();
+    for path in parsed
+        .as_ref()
+        .and_then(|value| value.get("read_paths"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(resolve)
+        .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+    {
+        if !read_targets.contains(&path) {
+            read_targets.push(path);
+        }
+    }
+    let write_targets = parsed
+        .as_ref()
+        .and_then(|value| value.get("write_paths"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(resolve)
+        .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+        .collect();
+    crate::traits::ToolCallAccessManifest {
+        execution_cwd,
+        read_targets,
+        write_targets,
+    }
+}
+
 #[async_trait]
 impl Tool for TerminalTool {
     fn name(&self) -> &str {
@@ -5409,6 +5788,20 @@ impl Tool for TerminalTool {
                     "command": {
                         "type": "string",
                         "description": "Shell command for action=run"
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Explicit execution directory for action=run; relative command paths resolve from this directory"
+                    },
+                    "read_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Additional exact readable files/directories for a confined run"
+                    },
+                    "write_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact writable files/directories for a confined mutating run"
                     },
                     "action": {
                         "type": "string",
@@ -5440,27 +5833,16 @@ impl Tool for TerminalTool {
         }
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let args = serde_json::from_str::<Value>(arguments).ok();
-        let action = args
-            .as_ref()
-            .and_then(|value| value.get("action"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "run".to_string());
+    fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
+        terminal_receipt_kind(arguments)
+    }
 
-        match action.as_str() {
-            "check" => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-            "kill" => ToolCallSemantics::mutation(),
-            "trust_all" => ToolCallSemantics::administrative(),
-            _ => args
-                .as_ref()
-                .and_then(|value| value.get("command"))
-                .and_then(|value| value.as_str())
-                .map(classify_shell_command)
-                .unwrap_or_else(ToolCallSemantics::mutation),
-        }
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        terminal_call_semantics(arguments)
+    }
+
+    fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
+        terminal_access_manifest(arguments)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -5548,6 +5930,104 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             "mock-semantic-risk".to_string(),
         )
+    }
+
+    #[test]
+    fn terminal_receipt_protocol_is_selected_per_action() {
+        assert_eq!(
+            terminal_receipt_kind(r#"{"action":"run","command":"/usr/bin/false"}"#),
+            crate::traits::ToolReceiptKind::Process
+        );
+        assert_eq!(
+            terminal_receipt_kind(r#"{"action":"trust_all"}"#),
+            crate::traits::ToolReceiptKind::Generic
+        );
+    }
+
+    #[test]
+    fn native_sandbox_state_preserves_exact_dotted_and_split_paths() {
+        let state = codex_sandbox_state_json(
+            "/synthetic/work.tree",
+            &["/synthetic/read.only/.cache".to_string()],
+            &["/synthetic/output.file".to_string()],
+        )
+        .expect("sandbox state");
+        let state: Value = serde_json::from_str(&state).expect("valid JSON");
+        assert_eq!(
+            state.pointer("/sandboxCwd").and_then(Value::as_str),
+            Some("file:///synthetic/work.tree")
+        );
+        let entries = state
+            .pointer("/permissionProfile/file_system/entries")
+            .and_then(Value::as_array)
+            .expect("filesystem entries");
+        assert!(entries.iter().any(|entry| {
+            entry.pointer("/path/path").and_then(Value::as_str)
+                == Some("/synthetic/read.only/.cache")
+                && entry.get("access").and_then(Value::as_str) == Some("read")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.pointer("/path/path").and_then(Value::as_str) == Some("/synthetic/output.file")
+                && entry.get("access").and_then(Value::as_str) == Some("write")
+        }));
+        assert_eq!(
+            state
+                .pointer("/permissionProfile/network")
+                .and_then(Value::as_str),
+            Some("restricted")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_sandbox_runtime_supports_local_rust_toolchain_without_home_access() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend.resolve_executable("cargo").await.unwrap().is_none()
+        {
+            return;
+        }
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"synthetic-sandbox-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(project.path().join("src/main.rs"), "fn main() {}\n").expect("source");
+        let cwd = project.path().to_string_lossy().to_string();
+        let request = confined_terminal_execution_request(
+            &backend,
+            "cargo check --offline --quiet",
+            Some(&cwd),
+            &[cwd.clone()],
+            &[cwd.clone()],
+        )
+        .await
+        .expect("confined request");
+        let serialized = match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
+            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+        };
+        assert!(!serialized.contains("credentials.toml"));
+        assert!(!serialized.contains(&format!("\"path\":\"{}\"", backend.home_hint())));
+        let sandbox_path = request.env.get("PATH").cloned().unwrap_or_default();
+        let toolchain_index = sandbox_path.find("/.rustup/toolchains/");
+        let shim_index = sandbox_path.find("/.cargo/bin");
+        assert!(
+            toolchain_index.is_some() && (shim_index.is_none() || toolchain_index < shim_index),
+            "resolved toolchain must precede rustup shims: {sandbox_path}"
+        );
+
+        let output = backend
+            .execute(request, Duration::from_secs(60))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(
+            output.exit_code,
+            0,
+            "cargo stderr: {}\nsandbox PATH: {sandbox_path}",
+            output.stderr_lossy(),
+        );
     }
 
     #[tokio::test]
@@ -5780,10 +6260,12 @@ mod tests {
     #[test]
     fn monitoring_notice_is_terminally_honest() {
         let notice = format_background_monitoring_notice(170, "192.0.2.31\n192.0.2.32\n192.0.2.45");
-        assert!(notice.contains("Frequent progress updates are now paused"));
-        assert!(notice.contains("completion monitoring remains active"));
-        assert!(notice.contains("192.0.2.45"));
-        assert!(!notice.contains("running in the background now"));
+        assert!(notice.contains("**Taking longer than expected** · 2m 50s"));
+        assert!(notice.contains("I'm still monitoring it"));
+        assert!(notice.contains("if it needs attention"));
+        assert!(notice.contains("_3 lines received so far._"));
+        assert!(!notice.contains("192.0.2.45"));
+        assert!(!notice.contains("watchdog"));
     }
 
     #[tokio::test]
@@ -6265,59 +6747,37 @@ mod tests {
     }
 
     #[test]
-    fn test_summarize_progress_output_short_passthrough() {
+    fn progress_output_line_count_ignores_blank_lines() {
+        assert_eq!(progress_output_line_count("working-update"), 1);
         assert_eq!(
-            summarize_progress_output("working-update"),
-            "working-update"
+            progress_output_line_count("line one\n\nline two\nline three"),
+            3
         );
-        assert_eq!(
-            summarize_progress_output("line one\nline two\nline three"),
-            "line one\nline two\nline three"
-        );
-        assert_eq!(summarize_progress_output(""), "");
-        assert_eq!(summarize_progress_output("  \n \n"), "");
+        assert_eq!(progress_output_line_count(""), 0);
+        assert_eq!(progress_output_line_count("  \n \n"), 0);
     }
 
     #[test]
-    fn test_summarize_progress_output_long_shows_count_and_tail() {
-        // Chatty commands (ls -R) must not dump their full output into chat —
-        // the ping shows a line count plus the most recent lines only.
+    fn background_progress_card_reports_count_without_raw_output() {
+        // Chatty commands (ls -R) must not dump even a tail into chat. The
+        // complete output reaches the agent after the process exits.
         let output = (1..=500)
             .map(|i| format!("file_{}.txt", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let summary = summarize_progress_output(&output);
-        assert!(
-            summary.contains("500 lines of output so far"),
-            "summary should report total line count: {}",
-            summary
-        );
-        assert!(
-            summary.contains("file_500.txt"),
-            "summary should include the latest line: {}",
-            summary
-        );
-        assert!(
-            !summary.contains("file_1.txt\n"),
-            "summary must not include early output lines: {}",
-            summary
-        );
-        assert!(
-            summary.lines().count() <= 4,
-            "summary should be at most a header plus 3 tail lines: {}",
-            summary
-        );
+        let card = format_background_progress_message(65, &output);
+        assert!(card.contains("⏳ **Still working** · 1m 5s"));
+        assert!(card.contains("_500 lines received so far._"));
+        assert!(!card.contains("file_1.txt"));
+        assert!(!card.contains("file_500.txt"));
     }
 
     #[test]
-    fn test_summarize_progress_output_truncates_long_lines() {
+    fn background_progress_card_does_not_echo_long_lines() {
         let long_line = "x".repeat(5000);
-        let summary = summarize_progress_output(&long_line);
-        assert!(
-            summary.chars().count() <= 200,
-            "individual lines must be capped: {} chars",
-            summary.chars().count()
-        );
+        let card = format_background_progress_message(40, &long_line);
+        assert!(card.contains("_1 line received so far._"));
+        assert!(!card.contains(&"x".repeat(20)));
     }
 
     #[test]
@@ -6350,8 +6810,9 @@ mod tests {
             63,
             BackgroundCompletionNext::PrepareResult,
         );
-        assert!(preparing.contains("Background step finished in 1m 3s"));
-        assert!(preparing.contains("Preparing your result now"));
+        assert!(preparing.contains("**Preparing your result**"));
+        assert!(preparing.contains("background step finished in 1m 3s"));
+        assert!(preparing.contains("turning it into a clear answer"));
         assert!(!preparing.contains("Done"));
         assert!(!preparing.contains('✅'));
 
@@ -6360,7 +6821,8 @@ mod tests {
             63,
             BackgroundCompletionNext::ContinueRequirements,
         );
-        assert!(continuing.contains("Continuing with the remaining request now"));
+        assert!(continuing.contains("**Continuing your request**"));
+        assert!(continuing.contains("moving on to the remaining work"));
         assert!(!continuing.contains("Done"));
 
         // With no agent, output, or outstanding requirement, report the exact
@@ -6369,7 +6831,7 @@ mod tests {
             background_completion_ping_message(Some(0), 63, BackgroundCompletionNext::Nothing);
         assert_eq!(
             no_followup,
-            "Background step finished in 1m 3s. It returned no output."
+            "ℹ️ **Background step finished** · 1m 3s\n\nIt didn't return any output."
         );
 
         let err = background_completion_ping_message(
@@ -6377,9 +6839,9 @@ mod tests {
             40,
             BackgroundCompletionNext::PrepareResult,
         );
-        assert!(err.contains("finished with errors in 40s"));
-        assert!(err.contains("(exit code 2)"));
-        assert!(err.contains("Reviewing what happened now"));
+        assert!(err.contains("**Background step needs review**"));
+        assert!(err.contains("finished after 40s with exit code 2"));
+        assert!(err.contains("checking what happened now"));
     }
 
     #[test]
@@ -6623,13 +7085,15 @@ mod tests {
             for entry in pending.iter().filter(|entry| {
                 entry.session_id == "sess_seq" && entry.notification_type == "progress"
             }) {
-                if entry.message.contains("Still working on it")
-                    && entry.message.contains("working-update")
+                if entry.message.contains("**Still working**")
+                    && entry.message.contains("1 line received so far")
+                    && !entry.message.contains("working-update")
                 {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Background step finished in")
-                    || entry.message.contains("finished with errors in")
+                if entry.message.contains("**Preparing your result**")
+                    || entry.message.contains("**Background step needs review**")
+                    || entry.message.contains("**Background step finished**")
                 {
                     saw_completion = true;
                 }
@@ -6693,11 +7157,12 @@ mod tests {
             for entry in pending.iter().filter(|entry| {
                 entry.session_id == "sess_quiet" && entry.notification_type == "progress"
             }) {
-                if entry.message.contains("Still working on it") {
+                if entry.message.contains("**Still working**") {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Background step finished in")
-                    || entry.message.contains("finished with errors in")
+                if entry.message.contains("**Preparing your result**")
+                    || entry.message.contains("**Background step needs review**")
+                    || entry.message.contains("**Background step finished**")
                 {
                     saw_completion = true;
                 }
@@ -7433,9 +7898,7 @@ mod tests {
             saw_still_running_notice |= pending.iter().any(|entry| {
                 entry.session_id == "sess_server"
                     && entry.notification_type == "progress"
-                    && entry
-                        .message
-                        .contains("completion monitoring remains active")
+                    && entry.message.contains("**Taking longer than expected**")
             });
             saw_final_output |= pending.iter().any(|entry| {
                 entry.session_id == "sess_server"

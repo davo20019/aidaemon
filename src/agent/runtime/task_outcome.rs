@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn friendly_background_handoff_cannot_persist_an_unfinished_task_as_succeeded() {
-        let handoff = "⏳ Still on it — this is taking a bit longer, so it's running in the background now. I'll send the result the moment it's ready.";
+        let handoff = "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the background now. I'll send the result as soon as it's ready.";
         let mut d = base_derivation();
         d.deferred_to_background = true;
         d.response_has_user_value = response_has_user_value(handoff, 5);
@@ -779,7 +779,7 @@ mod tests {
         assert!(!response_has_user_value("Done.", 3));
         assert!(!response_has_user_value("", 0));
         assert!(!response_has_user_value(
-            "⏳ Still on it — this is taking a bit longer, so it's running in the background now. I'll send the result the moment it's ready.",
+            "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the background now. I'll send the result as soon as it's ready.",
             4
         ));
         assert!(response_has_user_value(

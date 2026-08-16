@@ -269,6 +269,10 @@ pub struct ToolReceiptV1 {
     pub outcome_status: ToolOutcomeStatus,
     pub outcome_evidence: ToolOutcomeEvidenceSource,
     #[serde(default)]
+    pub receipt_kind: crate::traits::ToolReceiptKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_manifest: Option<crate::traits::ToolCallAccessManifest>,
+    #[serde(default)]
     pub contract_rejected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_tool_name: Option<String>,
@@ -308,7 +312,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 4;
+    pub const SCHEMA_VERSION: u16 = 5;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -320,6 +324,8 @@ impl ToolReceiptV1 {
             schema_version: Self::SCHEMA_VERSION,
             outcome_status,
             outcome_evidence,
+            receipt_kind: metadata.receipt_kind,
+            access_manifest: metadata.access_manifest.clone(),
             contract_rejected: metadata.contract_rejected,
             effective_tool_name: metadata.effective_tool_name.clone(),
             idempotency_key,
@@ -341,6 +347,8 @@ impl ToolReceiptV1 {
 
     pub fn to_metadata(&self) -> ToolCallMetadata {
         ToolCallMetadata {
+            receipt_kind: self.receipt_kind,
+            access_manifest: self.access_manifest.clone(),
             outcome_status: Some(self.outcome_status),
             receipt_replayed: true,
             contract_rejected: self.contract_rejected,
@@ -909,7 +917,11 @@ pub struct BackgroundContinuationLinkedData {
     pub parent_tool_call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_result_id: Option<String>,
-    pub child_response_id: String,
+    /// Present on the finalized response edge. The lifecycle edge is emitted
+    /// before response finalization so the child proof graph can already adopt
+    /// the exact parent receipt; both records share the same typed identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_response_id: Option<String>,
 }
 
 /// Data for TaskEnd event
@@ -1853,7 +1865,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
-        assert_eq!(roundtrip.schema_version, 4);
+        assert_eq!(roundtrip.schema_version, 5);
         assert!(roundtrip
             .context_header()
             .contains("durable_view=truncated"));

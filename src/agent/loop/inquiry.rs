@@ -359,6 +359,20 @@ pub(in crate::agent) fn capability_supports_requirement(
             .satisfies(requirement.temporal_scope)
 }
 
+pub(in crate::agent) fn requirement_is_exact_invocation(
+    requirement: &RequestEvidenceRequirement,
+) -> bool {
+    requirement.acceptable_scopes.is_empty()
+        && requirement.purpose == EvidencePurpose::Outcome
+        && requirement.minimum_authority == EvidenceAuthority::Direct
+        && requirement.temporal_scope == EvidenceTemporalScope::Current
+        && requirement.target.is_none()
+        && requirement
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.tool_names.len() == 1 && !receipt.is_empty())
+}
+
 /// Whether the typed evidence ontology contains any built-in route capable of
 /// satisfying a proposed requirement. This validates contract coherence, not
 /// current tool availability: an impossible authority/scope/time tuple must
@@ -366,6 +380,9 @@ pub(in crate::agent) fn capability_supports_requirement(
 pub(in crate::agent) fn requirement_has_builtin_evidence_route(
     requirement: &RequestEvidenceRequirement,
 ) -> bool {
+    if requirement_is_exact_invocation(requirement) {
+        return true;
+    }
     const EVIDENCE_MODELED_TOOLS: &[&str] = &[
         "goal_trace",
         "manage_mandates",
@@ -399,9 +416,14 @@ pub(in crate::agent) fn tool_call_supports_any_requirement(
 ) -> bool {
     let capabilities = evidence_capabilities_for_tool_call(tool_name, arguments);
     requirements.iter().any(|requirement| {
-        capabilities
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, requirement))
+        requirement_is_exact_invocation(requirement)
+            && requirement
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.tool_names.iter().any(|name| name == tool_name))
+            || capabilities
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, requirement))
     })
 }
 
@@ -416,9 +438,13 @@ pub(in crate::agent) fn candidate_tools_for_requirements<'a>(
             let coverage = requirements
                 .iter()
                 .filter(|requirement| {
-                    capabilities
-                        .iter()
-                        .any(|capability| capability_supports_requirement(capability, requirement))
+                    requirement_is_exact_invocation(requirement)
+                        && requirement.receipt.as_ref().is_some_and(|receipt| {
+                            receipt.tool_names.iter().any(|required| required == name)
+                        })
+                        || capabilities.iter().any(|capability| {
+                            capability_supports_requirement(capability, requirement)
+                        })
                 })
                 .count();
             (coverage > 0).then(|| (coverage, name.to_string()))
