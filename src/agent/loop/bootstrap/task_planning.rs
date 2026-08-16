@@ -133,18 +133,35 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     let Some(expects_mutation) = signals.expects_mutation else {
         return false;
     };
+    let Some(task_kind) = signals
+        .task_kind
+        .as_deref()
+        .and_then(crate::agent::parse_planned_task_kind)
+    else {
+        return false;
+    };
     if signals.requires_observation.is_none()
         || signals.minimum_sources.is_none()
         || signals.requires_primary_sources.is_none()
         || signals.requires_exact_history.is_none()
         || signals.evidence_requirements.is_none()
         || signals.tool_scope.is_none()
-        || signals
-            .task_kind
-            .as_deref()
-            .and_then(crate::agent::parse_planned_task_kind)
-            .is_none()
     {
+        return false;
+    }
+
+    // The task kind and effect contract describe the same lifecycle. Reject a
+    // planner result that asks the runtime to wait for mutation on an
+    // observational task (or declares a change complete without any mutation).
+    // This is a typed schema invariant, independent of the request's wording.
+    let mutation_capable_kind = matches!(
+        task_kind,
+        crate::agent::CompletionTaskKind::Change
+            | crate::agent::CompletionTaskKind::Deliver
+            | crate::agent::CompletionTaskKind::Schedule
+            | crate::agent::CompletionTaskKind::Monitor
+    );
+    if expects_mutation != mutation_capable_kind {
         return false;
     }
 
@@ -272,11 +289,7 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     {
         return false;
     }
-    if signals
-        .task_kind
-        .as_deref()
-        .and_then(crate::agent::parse_planned_task_kind)
-        == Some(crate::agent::CompletionTaskKind::Deliver)
+    if task_kind == crate::agent::CompletionTaskKind::Deliver
         && !effects.contains(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
     {
         return false;
@@ -1120,6 +1133,21 @@ mod tests {
             project_reference: None,
         };
         assert!(planned_contract_is_complete(&complete));
+
+        let mut observational_mutation = complete.clone();
+        observational_mutation.task_kind = Some("check".to_string());
+        assert!(
+            !planned_contract_is_complete(&observational_mutation),
+            "an observation task cannot install an unfulfillable mutation obligation"
+        );
+
+        let mut effectless_change = complete.clone();
+        effectless_change.expects_mutation = Some(false);
+        effectless_change.required_effects = Some(Vec::new());
+        assert!(
+            !planned_contract_is_complete(&effectless_change),
+            "a change task cannot declare that no mutation outcome is required"
+        );
 
         let mut no_tools = complete.clone();
         no_tools.expects_mutation = Some(false);

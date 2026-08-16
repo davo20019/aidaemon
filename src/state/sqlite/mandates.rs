@@ -1192,10 +1192,10 @@ impl MandateStore for SqliteStateStore {
         );
         if session_id.is_some() {
             query.push_str(
-                " AND EXISTS (
+                " AND (EXISTS (
                     SELECT 1 FROM mandate_principal_sessions ps
                     WHERE ps.principal_id = m.owner_principal_id AND ps.session_id = ?
-                )",
+                ) OR m.owner_principal_id = ?)",
             );
         }
         if !include_terminal {
@@ -1203,8 +1203,11 @@ impl MandateStore for SqliteStateStore {
         }
         query.push_str(" ORDER BY julianday(m.updated_at) DESC, m.id DESC");
         let rows = if let Some(session_id) = session_id {
+            let stable_principal =
+                crate::session::stable_private_owner_principal_id(session_id).unwrap_or_default();
             sqlx::query(&query)
                 .bind(session_id)
+                .bind(stable_principal)
                 .fetch_all(&self.pool)
                 .await?
         } else {
@@ -1218,16 +1221,23 @@ impl MandateStore for SqliteStateStore {
         mandate_id: &str,
         session_id: &str,
     ) -> anyhow::Result<bool> {
+        let stable_principal =
+            crate::session::stable_private_owner_principal_id(session_id).unwrap_or_default();
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS (
                 SELECT 1 FROM mandates m
-                JOIN mandate_principal_sessions ps
-                  ON ps.principal_id = m.owner_principal_id
-                WHERE m.id = ? AND ps.session_id = ?
+                WHERE m.id = ? AND (
+                    EXISTS (
+                        SELECT 1 FROM mandate_principal_sessions ps
+                        WHERE ps.principal_id = m.owner_principal_id
+                          AND ps.session_id = ?
+                    ) OR m.owner_principal_id = ?
+                )
             )",
         )
         .bind(mandate_id)
         .bind(session_id)
+        .bind(stable_principal)
         .fetch_one(&self.pool)
         .await?
             != 0)
@@ -4956,6 +4966,50 @@ mod tests {
             .await
             .is_err());
         assert!(store.get_goal(&foreign_goal.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn verified_private_owner_is_authorized_across_bot_routes() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("alpha_bot:12345", 1);
+        assert_eq!(mandate.owner_principal_id, "principal:telegram:12345");
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        assert!(store
+            .is_mandate_session_authorized(&mandate.id, "beta_bot:12345")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .list_mandates(Some("beta_bot:12345"), false)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [mandate.id.as_str()]
+        );
+        assert!(!store
+            .is_mandate_session_authorized(&mandate.id, "beta_bot:67890")
+            .await
+            .unwrap());
+
+        let (group_goal, group_mandate) = controller("alpha_bot:-10012345", 1);
+        assert_ne!(
+            group_mandate.owner_principal_id,
+            "principal:telegram:-10012345"
+        );
+        store
+            .create_mandate_controller(&group_goal, &group_mandate)
+            .await
+            .unwrap();
+        assert!(!store
+            .is_mandate_session_authorized(&group_mandate.id, "beta_bot:-10012345")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

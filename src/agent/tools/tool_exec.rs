@@ -646,6 +646,9 @@ impl Agent {
                 if let Some(tid) = task_id {
                     map.insert("_task_id".to_string(), json!(tid));
                 }
+                if let Some(tool_call_id) = ctx.mandate_tool_call_id {
+                    map.insert("_tool_call_id".to_string(), json!(tool_call_id));
+                }
                 if let Some(ref turn_id) = turn_id {
                     map.insert("_turn_id".to_string(), json!(turn_id));
                 }

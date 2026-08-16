@@ -132,24 +132,25 @@ impl ReadFileTool {
             .or_else(|| args.get("last_lines"))
             .or_else(|| args.get("last_n_lines"));
         let has_tail = tail_value.is_some_and(|value| !value.is_null());
-        anyhow::ensure!(
-            !(has_tail && (has_start || has_end)),
-            "read_file range modes are mutually exclusive: use start_line/end_line or tail_lines, not both"
-        );
+        if has_tail && (has_start || has_end) {
+            return Ok(ToolCallOutcome::contract_rejection(
+                "read_file range modes are mutually exclusive: use start_line/end_line or tail_lines, not both",
+            ));
+        }
         let requested_start = args.get("start_line").and_then(Value::as_u64);
         let requested_end = args.get("end_line").and_then(Value::as_u64);
-        anyhow::ensure!(
-            requested_start.is_none_or(|line| line > 0)
-                && requested_end.is_none_or(|line| line > 0),
-            "read_file line numbers are 1-based and must be positive"
-        );
-        anyhow::ensure!(
-            match (requested_start, requested_end) {
-                (Some(start), Some(end)) => end >= start,
-                _ => true,
-            },
-            "read_file end_line must be greater than or equal to start_line"
-        );
+        if requested_start.is_some_and(|line| line == 0)
+            || requested_end.is_some_and(|line| line == 0)
+        {
+            return Ok(ToolCallOutcome::contract_rejection(
+                "read_file line numbers are 1-based and must be positive",
+            ));
+        }
+        if matches!((requested_start, requested_end), (Some(start), Some(end)) if end < start) {
+            return Ok(ToolCallOutcome::contract_rejection(
+                "read_file end_line must be greater than or equal to start_line",
+            ));
+        }
 
         let backend = active_execution_backend();
         let path = backend.resolve_path(path_str).await?;
@@ -849,8 +850,19 @@ mod tests {
         })
         .to_string();
 
-        let error = ReadFileTool.call(&args).await.unwrap_err().to_string();
-        assert!(error.contains("range modes are mutually exclusive"));
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        assert!(outcome
+            .output
+            .contains("range modes are mutually exclusive"));
+        assert!(outcome.metadata.contract_rejected);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert!(outcome.metadata.read_file.is_none());
     }
 
     #[tokio::test]

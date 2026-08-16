@@ -252,6 +252,9 @@ pub enum EventType {
     /// A current-request capability prohibition was attempted. The payload
     /// records whether enforcement prevented any side effect.
     UserConstraintViolation,
+    /// A runtime-generated continuation was linked to the background tool
+    /// receipt and parent task that caused it.
+    BackgroundContinuationLinked,
 
     // === Task Lifecycle ===
     /// A task (user request) started processing

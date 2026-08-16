@@ -17,6 +17,9 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
     /// True for runtime-generated background-result continuations. These turns
     /// carry evidence for the existing request, not fresh user intent.
     pub internal_continuation: bool,
+    /// Explicit parent for a runtime-generated continuation. Ordinary ingress
+    /// and language-classified follow-ups leave this empty.
+    pub parent_task_id: Option<&'a str>,
 }
 
 pub(in crate::agent) struct BootstrapData {

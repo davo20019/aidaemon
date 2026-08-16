@@ -88,12 +88,26 @@ pub(crate) struct ConversationRequest {
     pub user_role: UserRole,
     pub channel_ctx: ChannelContext,
     pub heartbeat: Option<Arc<AtomicU64>>,
+    /// Typed lifecycle edge back to the task whose background receipt caused
+    /// this continuation.
+    pub parent_task_id: Option<String>,
+    pub parent_tool_call_id: Option<String>,
+    pub parent_result_id: Option<String>,
 }
 
 /// Minimal agent surface needed by background command/CLI completion paths.
 #[async_trait]
 pub(crate) trait ConversationRuntime: Send + Sync {
-    async fn continue_conversation(&self, request: ConversationRequest) -> anyhow::Result<String>;
+    async fn continue_conversation(
+        &self,
+        request: ConversationRequest,
+    ) -> anyhow::Result<AgentResponseEnvelope>;
+
+    async fn record_continuation_delivery(
+        &self,
+        session_id: &str,
+        delivery: crate::events::ResponseDeliveryData,
+    ) -> anyhow::Result<()>;
 }
 
 /// Owned inbound turn delivered by a chat transport.

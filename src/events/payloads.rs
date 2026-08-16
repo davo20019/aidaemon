@@ -268,6 +268,10 @@ pub struct ToolReceiptV1 {
     pub schema_version: u16,
     pub outcome_status: ToolOutcomeStatus,
     pub outcome_evidence: ToolOutcomeEvidenceSource,
+    #[serde(default)]
+    pub contract_rejected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,7 +308,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 3;
+    pub const SCHEMA_VERSION: u16 = 4;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -316,6 +320,8 @@ impl ToolReceiptV1 {
             schema_version: Self::SCHEMA_VERSION,
             outcome_status,
             outcome_evidence,
+            contract_rejected: metadata.contract_rejected,
+            effective_tool_name: metadata.effective_tool_name.clone(),
             idempotency_key,
             exit_code: metadata.exit_code,
             timed_out: metadata.timed_out,
@@ -337,6 +343,8 @@ impl ToolReceiptV1 {
         ToolCallMetadata {
             outcome_status: Some(self.outcome_status),
             receipt_replayed: true,
+            contract_rejected: self.contract_rejected,
+            effective_tool_name: self.effective_tool_name.clone(),
             exit_code: self.exit_code,
             timed_out: self.timed_out,
             background_started: self.background_started,
@@ -870,6 +878,16 @@ pub struct UserConstraintViolationData {
     pub attempted_tool: String,
     pub prevented: bool,
     pub side_effect_outcome: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundContinuationLinkedData {
+    pub parent_task_id: String,
+    pub child_task_id: String,
+    pub parent_tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_result_id: Option<String>,
+    pub child_response_id: String,
 }
 
 /// Data for TaskEnd event
@@ -1780,6 +1798,8 @@ mod tests {
             outcome_status: Some(ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
             http_status: Some(201),
+            contract_rejected: true,
+            effective_tool_name: Some("terminal".to_string()),
             result_provenance: Some(crate::traits::ToolResultProvenance {
                 result_id: Some("sha256:synthetic".to_string()),
                 sha256: Some("synthetic".to_string()),
@@ -1811,7 +1831,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
-        assert_eq!(roundtrip.schema_version, 3);
+        assert_eq!(roundtrip.schema_version, 4);
         assert!(roundtrip
             .context_header()
             .contains("durable_view=truncated"));
@@ -1824,6 +1844,8 @@ mod tests {
         let replay = roundtrip.to_metadata();
         assert!(replay.receipt_replayed);
         assert_eq!(replay.outcome_status, Some(ToolOutcomeStatus::Succeeded));
+        assert!(replay.contract_rejected);
+        assert_eq!(replay.effective_tool_name.as_deref(), Some("terminal"));
         assert!(replay
             .semantics
             .mutation_effects

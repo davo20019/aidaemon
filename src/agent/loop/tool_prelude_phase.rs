@@ -946,22 +946,27 @@ pub(super) async fn run_tool_prelude_phase(
                 }),
             )
             .await;
-        if turn_context.completion_contract.forbids_tool_use {
-            emitter
-                .emit(
-                    crate::events::EventType::UserConstraintViolation,
-                    crate::events::UserConstraintViolationData {
-                        task_id: task_id.to_string(),
-                        turn_id: None,
-                        constraint_kind: "all_tool_use_forbidden".to_string(),
-                        prohibited_scope: None,
-                        attempted_tool: blocked.name.clone(),
-                        prevented: true,
-                        side_effect_outcome: "not_started".to_string(),
-                    },
-                )
-                .await?;
-        }
+        let constraint_kind = if turn_context.completion_contract.forbids_tool_use {
+            "all_tool_use_forbidden"
+        } else if turn_context.completion_contract.forbids_mutation {
+            "mutation_forbidden"
+        } else {
+            "operation_forbidden"
+        };
+        emitter
+            .emit(
+                crate::events::EventType::UserConstraintViolation,
+                crate::events::UserConstraintViolationData {
+                    task_id: task_id.to_string(),
+                    turn_id: None,
+                    constraint_kind: constraint_kind.to_string(),
+                    prohibited_scope: None,
+                    attempted_tool: blocked.name.clone(),
+                    prevented: true,
+                    side_effect_outcome: "not_started".to_string(),
+                },
+            )
+            .await?;
         let notice = if turn_context.completion_contract.forbids_tool_use {
             format!(
                 "[SYSTEM] Blocked `{}` before execution: the current request explicitly forbids all tool use. No side effect started. Answer directly from available context or state the exact unavailable evidence.",

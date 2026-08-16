@@ -1969,6 +1969,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 result_text = match terminal_result {
                     Ok(outcome) => {
                         result_metadata = outcome.metadata;
+                        result_metadata.effective_tool_name = Some("terminal".to_string());
+                        result_metadata.result_provenance = Some(
+                            crate::traits::ToolResultProvenance::from_authoritative_result(
+                                &outcome.output,
+                                &result_metadata,
+                                crate::traits::ToolResultContentSource::ToolOutput,
+                            ),
+                        );
                         format!("{}\n\n{}", outcome.output, fallback_note.render())
                     }
                     Err(e) => {
@@ -1977,11 +1985,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     }
                 };
                 if agent.context_window_config.enabled {
-                    result_text = crate::memory::context_window::compress_tool_result(
+                    let compressed = crate::memory::context_window::compress_tool_result(
                         "terminal",
                         &result_text,
                         agent.context_window_config.tool_result_chars_for(model),
                     );
+                    if compressed.chars().count() < result_text.chars().count() {
+                        if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+                            provenance.mark_model_view_truncated(&compressed);
+                        }
+                    }
+                    result_text = compressed;
                 }
             }
         }
@@ -2158,7 +2172,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tc.name,
             summarize_tool_args(&tc.name, &effective_arguments)
         );
-        if is_error {
+        if result_metadata.contract_rejected {
+            learning_ctx
+                .tool_calls
+                .push(format!("{} [REJECTED]", tool_summary));
+        } else if is_error {
             learning_ctx
                 .tool_calls
                 .push(format!("{} [FAILED]", tool_summary));
@@ -2336,6 +2354,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 semantics,
                 &effective_arguments,
                 &result_text,
+                &result_metadata,
             );
         let matched_requirements = if semantics.observes_state() {
             matching_evidence_requirement_indices(

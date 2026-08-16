@@ -71,6 +71,15 @@ pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
     telegram_session_namespace_and_chat_id(session_id).map(|(_, chat_id)| chat_id)
 }
 
+/// Stable authorization principal for a verified one-to-one channel identity.
+/// Bot namespaces are delivery routes and deliberately do not participate in
+/// the principal. Group/channel identities are not people and are never
+/// inferred as owner principals.
+pub fn stable_private_owner_principal_id(session_id: &str) -> Option<String> {
+    let chat_id = telegram_chat_id_from_session(session_id)?;
+    (chat_id > 0).then(|| format!("principal:telegram:{chat_id}"))
+}
+
 fn telegram_channel_namespace_and_chat_id(channel_id: &str) -> Option<(Option<&str>, i64)> {
     let stripped = channel_id.strip_prefix("telegram:")?;
     if let Ok(chat_id) = stripped.trim().parse::<i64>() {
@@ -215,6 +224,23 @@ mod tests {
             telegram_chat_id_from_session("bot:telegram:12345"),
             Some(12345)
         );
+    }
+
+    #[test]
+    fn stable_private_principal_ignores_bot_route_and_rejects_groups() {
+        assert_eq!(
+            stable_private_owner_principal_id("alpha_bot:12345"),
+            Some("principal:telegram:12345".to_string())
+        );
+        assert_eq!(
+            stable_private_owner_principal_id("beta_bot:telegram:12345"),
+            Some("principal:telegram:12345".to_string())
+        );
+        assert_eq!(
+            stable_private_owner_principal_id("alpha_bot:-10012345"),
+            None
+        );
+        assert_eq!(stable_private_owner_principal_id("alpha:slack:D123"), None);
     }
 
     #[test]

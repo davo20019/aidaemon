@@ -1794,6 +1794,37 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // Older mandates were assigned one random principal per mandate. Migrate
+    // only channel identities whose platform semantics prove they are the
+    // same private owner across bot routes; never infer group or arbitrary
+    // session-name equivalence.
+    let mandate_owner_rows = sqlx::query("SELECT id, created_by_session FROM mandates")
+        .fetch_all(pool)
+        .await?;
+    for row in mandate_owner_rows {
+        let mandate_id: String = row.get("id");
+        let created_by_session: String = row.get("created_by_session");
+        let Some(principal_id) =
+            crate::session::stable_private_owner_principal_id(&created_by_session)
+        else {
+            continue;
+        };
+        sqlx::query("UPDATE mandates SET owner_principal_id = ? WHERE id = ?")
+            .bind(&principal_id)
+            .bind(&mandate_id)
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO mandate_principal_sessions
+                (principal_id, session_id, linked_at, linked_by_session)
+             VALUES (?, ?, datetime('now'), ?)",
+        )
+        .bind(&principal_id)
+        .bind(&created_by_session)
+        .bind(&created_by_session)
+        .execute(pool)
+        .await?;
+    }
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_mandate_principal_sessions_session
          ON mandate_principal_sessions(session_id, principal_id)",

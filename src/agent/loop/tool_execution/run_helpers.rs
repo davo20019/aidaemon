@@ -575,12 +575,11 @@ pub(super) fn build_terminal_fallback_arguments_from_run_command(
         .map(str::trim)
         .filter(|v| !v.is_empty());
     let terminal_command = if let Some(dir) = working_dir {
-        // Create the working dir before cd-ing: the declared working_dir may
-        // not exist yet (the command itself may be about to create it), and
-        // a failing `cd` wastes whole agent iterations on EnvironmentFailure.
-        // `mkdir -p` is idempotent, so this is a no-op for existing dirs.
+        // Routing must preserve effects. Creating a missing working directory
+        // here would turn an observational command into a mutation. Commands
+        // that intend to create their workspace must say so explicitly.
         let quoted = shell_single_quote(dir);
-        format!("mkdir -p {quoted} && cd {quoted} && {command}")
+        format!("cd {quoted} && {command}")
     } else {
         command.to_string()
     };
@@ -843,6 +842,7 @@ pub(super) fn observation_matches_completion_contract(
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
     _result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
 ) -> bool {
     if contract.verification_targets.is_empty() {
         return true;
@@ -855,6 +855,24 @@ pub(super) fn observation_matches_completion_contract(
             .any(|target| tool_target_hint_matches_contract_target(hint, target))
     }) {
         return true;
+    }
+
+    // A tool may be called with a workspace-relative spelling while the
+    // structural contract stores the resolved absolute identity. The typed
+    // read receipt is the authoritative reconciliation point; do not infer it
+    // from the returned prose or from the daemon process cwd.
+    if let Some(read) = metadata.read_file.as_ref() {
+        let receipt_targets = [&read.canonical_path, &read.display_path];
+        if receipt_targets.iter().any(|value| {
+            ToolTargetHint::new(ToolTargetHintKind::Path, value.as_str()).is_some_and(|hint| {
+                contract
+                    .verification_targets
+                    .iter()
+                    .any(|target| tool_target_hint_matches_contract_target(&hint, target))
+            })
+        }) {
+            return true;
+        }
     }
 
     // Arguments are harness-controlled structured evidence. Free-form result
@@ -877,6 +895,7 @@ fn requirement_target_matches(
     requirement: &RequestEvidenceRequirement,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
+    metadata: &crate::traits::ToolCallMetadata,
 ) -> bool {
     let Some(target) = requirement.target.as_ref() else {
         return true;
@@ -894,6 +913,18 @@ fn requirement_target_matches(
         .any(|hint| tool_target_hint_matches_contract_target(hint, &contract_target))
     {
         return true;
+    }
+    if let Some(read) = metadata.read_file.as_ref() {
+        if [&read.canonical_path, &read.display_path]
+            .iter()
+            .any(|value| {
+                ToolTargetHint::new(ToolTargetHintKind::Path, value.as_str()).is_some_and(|hint| {
+                    tool_target_hint_matches_contract_target(&hint, &contract_target)
+                })
+            })
+        {
+            return true;
+        }
     }
 
     let mut haystacks = vec![raw_arguments.to_string()];
@@ -928,16 +959,67 @@ pub(super) fn matching_evidence_requirement_indices(
             let capability_matches = semantics.evidence.iter().any(|capability| {
                 crate::agent::inquiry::capability_supports_requirement(capability, requirement)
             });
+            let content_markers_match = requirement.required_content_markers.iter().all(|marker| {
+                if requirement.purpose == crate::traits::EvidencePurpose::Outcome {
+                    outcome_marker_matches(marker, raw_arguments, result_text, metadata)
+                } else {
+                    crate::agent::keyword_match(result_text, marker)
+                }
+            });
             (read_receipt_is_compatible
                 && capability_matches
-                && requirement
-                    .required_content_markers
-                    .iter()
-                    .all(|marker| crate::agent::keyword_match(result_text, marker))
-                && requirement_target_matches(requirement, semantics, raw_arguments))
+                && content_markers_match
+                && requirement_target_matches(requirement, semantics, raw_arguments, metadata))
             .then_some(index)
         })
         .collect()
+}
+
+/// Outcome requirements can name either a returned field or an exact input
+/// parameter whose accepted/rejected behavior is being tested. Resolve those
+/// markers against typed metadata and parsed arguments before consulting the
+/// rendered result. This makes empty stdout/stderr and pre-I/O rejection
+/// observable without fabricating textual stream content.
+fn outcome_marker_matches(
+    marker: &str,
+    raw_arguments: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> bool {
+    let normalized = marker.trim().to_ascii_lowercase().replace('-', "_");
+    if matches!(
+        normalized.as_str(),
+        "exit" | "exit_code" | "exit status" | "status code"
+    ) && metadata.exit_code.is_some()
+    {
+        return true;
+    }
+    // Process adapters capture both streams even when one or both are empty;
+    // an exit code is emitted only after that capture boundary completes.
+    if matches!(normalized.as_str(), "stdout" | "stderr") && metadata.exit_code.is_some() {
+        return true;
+    }
+
+    if let Some((key, expected)) = marker.split_once('=') {
+        let key = key.trim();
+        let expected = expected.trim();
+        if !key.is_empty() && !expected.is_empty() {
+            if let Ok(serde_json::Value::Object(arguments)) =
+                serde_json::from_str::<serde_json::Value>(raw_arguments)
+            {
+                if arguments.get(key).is_some_and(|actual| match actual {
+                    serde_json::Value::String(value) => value == expected,
+                    serde_json::Value::Number(value) => value.to_string() == expected,
+                    serde_json::Value::Bool(value) => value.to_string() == expected,
+                    _ => false,
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    crate::agent::keyword_match(result_text, marker)
 }
 
 /// A read receipt may close a content obligation only when the tool actually
@@ -1142,6 +1224,88 @@ mod tests {
                 .collect(),
             truncated,
         }
+    }
+
+    #[test]
+    fn canonical_read_receipt_reconciles_relative_call_with_absolute_contract() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value: "/tmp/synthetic.toml".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+        let arguments = r#"{"path":"synthetic.toml","start_line":1,"end_line":12}"#;
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Path, "synthetic.toml");
+        let metadata = crate::traits::ToolCallMetadata {
+            read_file: Some(read_receipt(
+                crate::traits::ReadFileSelectionMetadata::BoundedRange {
+                    start_line: 1,
+                    end_line: 12,
+                },
+                1,
+                12,
+                40,
+                false,
+            )),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        assert!(observation_matches_completion_contract(
+            &contract,
+            &semantics,
+            arguments,
+            "synthetic content",
+            &metadata,
+        ));
+    }
+
+    #[test]
+    fn rejected_invocation_can_prove_its_typed_outcome_without_proving_content() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            ToolSemanticScope,
+        };
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Observe parameter-contract outcome".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::HostLocal],
+                purpose: EvidencePurpose::Outcome,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: vec![
+                    "start_line=1".to_string(),
+                    "end_line=12".to_string(),
+                    "tail_lines=1".to_string(),
+                ],
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let arguments = r#"{"path":"synthetic.toml","start_line":1,"end_line":12,"tail_lines":1}"#;
+        let semantics = ToolCallSemantics::observation().with_evidence(
+            crate::agent::inquiry::evidence_capabilities_for_tool_call("read_file", arguments),
+        );
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            contract_rejected: true,
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        assert_eq!(
+            matching_evidence_requirement_indices(
+                &contract,
+                &semantics,
+                arguments,
+                "range modes are mutually exclusive",
+                &metadata,
+            ),
+            [0]
+        );
     }
 
     #[test]
@@ -1505,7 +1669,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             &contract,
             &semantics,
             "{}",
-            "Latest post title: Scheduled reflection"
+            "Latest post title: Scheduled reflection",
+            &crate::traits::ToolCallMetadata::default(),
         ));
     }
 
@@ -1545,7 +1710,11 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         .to_string();
 
         assert!(observation_matches_completion_contract(
-            &contract, &semantics, &arguments, "213"
+            &contract,
+            &semantics,
+            &arguments,
+            "213",
+            &crate::traits::ToolCallMetadata::default(),
         ));
     }
 
@@ -1685,10 +1854,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
 
     #[test]
     fn build_terminal_fallback_arguments_preserves_working_dir() {
-        // `mkdir -p` precedes the cd: the declared working_dir may not exist
-        // yet (e.g. the command itself was going to create it — observed
-        // 2026-06-06: `cd '~/tmp/attrib-run' && mkdir -p ~/tmp/attrib-run`
-        // failed twice because cd ran before the directory existed).
+        // Routing cannot create a working directory as an incidental effect.
+        // A command that needs to create it must carry that mutation itself.
         let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/my folder"}"#;
         let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
             .expect("fallback args expected");
@@ -1696,7 +1863,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         assert_eq!(parsed["action"], "run");
         assert_eq!(
             parsed["command"],
-            "mkdir -p '/tmp/my folder' && cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
+            "cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
         );
     }
 
@@ -1708,7 +1875,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
         assert_eq!(
             parsed["command"],
-            "mkdir -p '/tmp/david'\"'\"'s projects' && cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
+            "cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
         );
     }
 

@@ -253,7 +253,10 @@ impl Mandate {
             // controller must explicitly clear this proof before persistence.
             confirmed_at: Some(now.clone()),
             version: 1,
-            owner_principal_id: format!("principal:{}", uuid::Uuid::new_v4()),
+            owner_principal_id: crate::session::stable_private_owner_principal_id(
+                created_by_session,
+            )
+            .unwrap_or_else(|| format!("principal:{}", uuid::Uuid::new_v4())),
             created_by_session: created_by_session.to_string(),
             created_at: now.clone(),
             updated_at: now,

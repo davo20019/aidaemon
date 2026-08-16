@@ -332,7 +332,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             TaskStartData {
                 task_id: task_id.clone(),
                 description: task_description.chars().take(200).collect(),
-                parent_task_id: resumed_from_task_id,
+                parent_task_id: resumed_from_task_id
+                    .or_else(|| ctx.parent_task_id.map(str::to_string)),
                 user_message: Some(user_text.to_string()),
                 turn_id: Some(user_msg_id.clone()),
             },
@@ -1113,6 +1114,7 @@ mod mandate_bootstrap_isolation_tests {
                 user_role: UserRole::Owner,
                 channel_ctx: &ChannelContext::internal(),
                 internal_continuation: false,
+                parent_task_id: None,
             },
         )
         .await

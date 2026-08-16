@@ -509,41 +509,37 @@ pub(super) struct SemanticCompletionRequirements<'a> {
     pub required_response_fields: &'a [String],
 }
 
-fn structural_evidence_requirements(
+fn structural_evidence_requirement(
     targets: &[VerificationTarget],
-) -> Vec<RequestEvidenceRequirement> {
-    targets
+) -> Option<RequestEvidenceRequirement> {
+    if targets.is_empty() {
+        return None;
+    }
+    let mut acceptable_scopes = Vec::new();
+    if targets
         .iter()
-        .map(|target| {
-            let (summary, scope, purpose) = match target.kind {
-                VerificationTargetKind::Url => (
-                    "Observe the exact external resource named by the request",
-                    crate::traits::ToolSemanticScope::ExternalRemote,
-                    crate::traits::EvidencePurpose::CurrentState,
-                ),
-                VerificationTargetKind::Path => (
-                    "Observe the exact workspace resource named by the request",
-                    crate::traits::ToolSemanticScope::LocalWorkspace,
-                    crate::traits::EvidencePurpose::Content,
-                ),
-            };
-            RequestEvidenceRequirement {
-                summary: summary.to_string(),
-                acceptable_scopes: vec![scope],
-                purpose,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-                required_content_markers: Vec::new(),
-                target: Some(RequestVerificationTarget {
-                    kind: match target.kind {
-                        VerificationTargetKind::Url => RequestVerificationTargetKind::Url,
-                        VerificationTargetKind::Path => RequestVerificationTargetKind::Path,
-                    },
-                    value: target.value.clone(),
-                }),
-            }
-        })
-        .collect()
+        .any(|target| target.kind == VerificationTargetKind::Path)
+    {
+        acceptable_scopes.push(crate::traits::ToolSemanticScope::LocalWorkspace);
+    }
+    if targets
+        .iter()
+        .any(|target| target.kind == VerificationTargetKind::Url)
+    {
+        acceptable_scopes.push(crate::traits::ToolSemanticScope::ExternalRemote);
+    }
+    Some(RequestEvidenceRequirement {
+        summary: "Observe the current state of one exact resource named by the request".to_string(),
+        acceptable_scopes,
+        purpose: crate::traits::EvidencePurpose::CurrentState,
+        minimum_authority: crate::traits::EvidenceAuthority::Direct,
+        temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+        required_content_markers: Vec::new(),
+        // Target matching remains a separate OR across structural identities.
+        // Binding this requirement to one arbitrarily selected path would make
+        // incidental working directories or executable names authoritative.
+        target: None,
+    })
 }
 
 pub(super) fn install_semantic_completion_contract(
@@ -601,13 +597,24 @@ pub(super) fn install_semantic_completion_contract(
 }
 
 /// Remove language-derived obligations when semantic assessment was skipped or
-/// failed. Exact URLs and structurally resolved paths remain observable.
+/// failed. Exact URLs and structurally resolved paths remain target hints for
+/// one generic observation obligation.
+///
+/// A resource identity is not itself a material information need. A request can
+/// mention a working directory, an executable path, an earlier comparison
+/// location, and the resource to inspect. Promoting every extracted identity to
+/// a separate proof node made incidental and historical paths authoritative.
+/// The successful observation must still match at least one exact target, but
+/// the fallback creates only one evidence need regardless of how many
+/// identities were extracted.
 pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let scope_task_id = contract.scope_task_id.take();
     let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
     let requires_observation = !verification_targets.is_empty();
-    let evidence_requirements = structural_evidence_requirements(&verification_targets);
+    let evidence_requirements = structural_evidence_requirement(&verification_targets)
+        .into_iter()
+        .collect();
     *contract = CompletionContract {
         scope_task_id,
         adopted_from_task_ids,
@@ -2481,6 +2488,38 @@ mod tests {
         assert!(!contract.expects_mutation);
         assert!(!contract.forbids_mutation);
         assert_eq!(contract.verification_targets, vec![target]);
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert!(contract.evidence_requirements[0].target.is_none());
+    }
+
+    #[test]
+    fn incidental_structural_paths_share_one_generic_observation_obligation() {
+        let mut contract = CompletionContract {
+            verification_targets: vec![
+                VerificationTarget {
+                    kind: VerificationTargetKind::Path,
+                    value: "/tmp".to_string(),
+                },
+                VerificationTarget {
+                    kind: VerificationTargetKind::Path,
+                    value: "/synthetic/project".to_string(),
+                },
+                VerificationTarget {
+                    kind: VerificationTargetKind::Path,
+                    value: "/bin/pwd".to_string(),
+                },
+            ],
+            ..CompletionContract::default()
+        };
+        retain_structural_completion_contract(&mut contract);
+        let progress = CompletionProgress::new(&contract, "synthetic-task");
+
+        assert!(contract.requires_observation);
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert!(contract.evidence_requirements[0].target.is_none());
+        assert!(progress.verification_obligation_id.is_none());
+        assert_eq!(progress.evidence_obligation_ids.len(), 1);
+        assert!(progress.mutation_obligation_ids.is_empty());
     }
 
     #[test]

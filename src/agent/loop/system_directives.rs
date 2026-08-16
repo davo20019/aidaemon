@@ -698,7 +698,7 @@ impl SystemDirective {
                 evidence
             ),
             Self::TaskPlanContext(plan) => plan.clone(),
-            Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
+            Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: The requested side effect does not yet have a successful typed mutation receipt. Use the appropriate available tool to perform the remaining action, or report the concrete blocker honestly. Do not claim completion until the required effect is recorded.".to_string(),
             Self::UndeliveredArtifactRecoveryRequired => "[SYSTEM] INCOMPLETE: The user asked you to DELIVER a file. You created a local artifact, but no delivery tool succeeded, so a local pathname or converter failure is not completion. Take ONE recovery pass now. Do not repeat the same failing conversion command. For local HTML-to-PDF work, use the browser tool's bounded `render_pdf` action (it preserves print backgrounds and CSS page sizing); do not route designed HTML through office, PostScript, ImageMagick, or Quick Look converters. For other formats, enumerate available export options independently (do not short-circuit capability checks with `||`) and choose a genuinely different path. Verify that the final file exists and has the requested type, then use the appropriate delivery tool (`send_file` for a chat attachment). If no different approach can work, report the exact blocker honestly after this recovery pass.".to_string(),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
@@ -1007,11 +1007,12 @@ mod tests {
     }
 
     #[test]
-    fn mutation_still_required_render_mentions_write_file() {
+    fn mutation_still_required_render_is_effect_generic() {
         let rendered = SystemDirective::MutationStillRequired.render();
         assert!(rendered.contains("[SYSTEM]"));
-        assert!(rendered.contains("write_file"));
-        assert!(rendered.contains("NOT called"));
+        assert!(rendered.contains("typed mutation receipt"));
+        assert!(rendered.contains("appropriate available tool"));
+        assert!(!rendered.contains("write_file"));
     }
 
     #[test]

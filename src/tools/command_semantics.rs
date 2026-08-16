@@ -124,6 +124,15 @@ fn strip_non_mutating_redirections(command: &str) -> String {
 }
 
 pub(crate) fn classify_shell_command(command: &str) -> ToolCallSemantics {
+    classify_shell_command_with_depth(command, 0)
+}
+
+const MAX_NESTED_SHELL_CLASSIFICATION_DEPTH: usize = 8;
+
+fn classify_shell_command_with_depth(command: &str, depth: usize) -> ToolCallSemantics {
+    if depth > MAX_NESTED_SHELL_CLASSIFICATION_DEPTH {
+        return ToolCallSemantics::mutation();
+    }
     let command = strip_non_mutating_redirections(command);
     let Some(structure) = parse_shell_structure(&command) else {
         return ToolCallSemantics::mutation();
@@ -136,7 +145,7 @@ pub(crate) fn classify_shell_command(command: &str) -> ToolCallSemantics {
         ToolMutationEffects::NONE
     };
     for segment in structure.segments {
-        let semantics = classify_simple_shell_command(&segment);
+        let semantics = classify_simple_shell_command(&segment, depth);
         observes |= semantics.observes_state();
         mutates |= semantics.mutates_state();
         mutation_effects = mutation_effects.union(semantics.mutation_effects);
@@ -491,7 +500,7 @@ fn wrangler_semantics(args: &[String]) -> ToolCallSemantics {
     }
 }
 
-fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
+fn classify_simple_shell_command(command: &str, depth: usize) -> ToolCallSemantics {
     let command = command.trim();
     if command.is_empty() {
         return ToolCallSemantics::administrative();
@@ -524,12 +533,26 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
     let executable = executable.as_str();
     let args = &tokens[command_index + 1..];
 
+    // Shell launchers are transport, not the operation being authorized. Parse
+    // the script passed to `-c` using the same compound-command classifier so
+    // sequencing, pipes, and redirections retain their real aggregate effects.
+    // Unknown invocation shapes and excessive nesting remain fail-closed.
+    if matches!(executable, "sh" | "bash" | "dash" | "ksh" | "zsh") {
+        let script_index = args.iter().enumerate().find_map(|(index, arg)| {
+            (arg == "-c" || arg.starts_with('-') && arg[1..].contains('c')).then_some(index + 1)
+        });
+        return script_index.and_then(|index| args.get(index)).map_or_else(
+            || mutation_with(ToolMutationEffects::UNSPECIFIED),
+            |script| classify_shell_command_with_depth(script, depth + 1),
+        );
+    }
+
     if executable == "env" {
         let nested = args
             .iter()
             .position(|arg| !arg.starts_with('-') && !looks_like_env_assignment(arg));
         return nested.map_or_else(observation, |index| {
-            classify_simple_shell_command(&args[index..].join(" "))
+            classify_simple_shell_command(&args[index..].join(" "), depth)
         });
     }
     if executable == "cd" {
@@ -552,12 +575,12 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
         let nested = (index < args.len()).then_some(index);
         return nested.map_or_else(
             || mutation_with(ToolMutationEffects::UNSPECIFIED),
-            |index| classify_simple_shell_command(&args[index..].join(" ")),
+            |index| classify_simple_shell_command(&args[index..].join(" "), depth),
         );
     }
     if executable == "pnpm" && args.first().is_some_and(|arg| arg == "dlx") {
         return if args.len() > 1 {
-            classify_simple_shell_command(&args[1..].join(" "))
+            classify_simple_shell_command(&args[1..].join(" "), depth)
         } else {
             mutation_with(ToolMutationEffects::UNSPECIFIED)
         };
@@ -699,6 +722,7 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
             | "printf"
             | "true"
             | "false"
+            | "sleep"
             | "test"
             | "["
             | "tree"
@@ -812,6 +836,17 @@ mod tests {
         // `pdftotext report.pdf` writes report.txt next to the input.
         let semantics = classify_shell_command("pdftotext report.pdf");
         assert!(semantics.mutates_state());
+    }
+
+    #[test]
+    fn shell_launcher_inherits_compound_script_effects() {
+        let observation =
+            classify_shell_command("/bin/sh -lc 'sleep 1; printf SYNTHETIC_OK\\n; /usr/bin/false'");
+        assert!(observation.observes_state());
+        assert!(!observation.mutates_state());
+
+        let mutation = classify_shell_command("bash -lc 'printf x > synthetic-output.txt'");
+        assert!(mutation.mutates_state());
     }
 
     #[test]

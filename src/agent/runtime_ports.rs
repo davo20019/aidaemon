@@ -97,16 +97,51 @@ impl ChildAgentRuntime for Agent {
 
 #[async_trait]
 impl ConversationRuntime for Agent {
-    async fn continue_conversation(&self, request: ConversationRequest) -> anyhow::Result<String> {
-        self.handle_internal_continuation(
-            &request.session_id,
-            &request.user_text,
-            request.status_tx,
-            request.user_role,
-            request.channel_ctx,
-            request.heartbeat,
-        )
-        .await
+    async fn continue_conversation(
+        &self,
+        request: ConversationRequest,
+    ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+        let response_event_watermark = self.event_store.event_watermark().await?;
+        let text = self.handle_internal_continuation(&request).await?;
+        let generated = self
+            .event_store
+            .generated_response_after(&request.session_id, response_event_watermark, &text)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("background continuation response lacks a durable identity")
+            })?;
+        if let (Some(parent_task_id), Some(parent_tool_call_id)) =
+            (request.parent_task_id, request.parent_tool_call_id)
+        {
+            crate::events::EventEmitter::new(self.event_store.clone(), request.session_id.clone())
+                .with_task_id(generated.task_id.clone())
+                .emit(
+                    crate::events::EventType::BackgroundContinuationLinked,
+                    crate::events::BackgroundContinuationLinkedData {
+                        parent_task_id,
+                        child_task_id: generated.task_id.clone(),
+                        parent_tool_call_id,
+                        parent_result_id: request.parent_result_id,
+                        child_response_id: generated.response_id.clone(),
+                    },
+                )
+                .await?;
+        }
+        Ok(crate::runtime_ports::AgentResponseEnvelope {
+            response_id: generated.response_id,
+            task_id: generated.task_id,
+            turn_id: generated.turn_id,
+            text,
+            referenced_receipts: generated.referenced_receipts,
+        })
+    }
+
+    async fn record_continuation_delivery(
+        &self,
+        session_id: &str,
+        delivery: crate::events::ResponseDeliveryData,
+    ) -> anyhow::Result<()> {
+        <Self as AgentIngress>::record_response_delivery(self, session_id, delivery).await
     }
 }
 

@@ -1187,6 +1187,7 @@ impl Agent {
                 channel_ctx,
                 heartbeat,
                 false,
+                None,
             )
             .await;
 
@@ -1210,24 +1211,20 @@ impl Agent {
     /// owner intent or let worker output broaden the request's target scope.
     pub(crate) async fn handle_internal_continuation(
         &self,
-        session_id: &str,
-        continuation_text: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        user_role: UserRole,
-        channel_ctx: ChannelContext,
-        heartbeat: Option<Arc<AtomicU64>>,
+        request: &crate::runtime_ports::ConversationRequest,
     ) -> anyhow::Result<String> {
         let _activity = activity_gate::AgentActivityGuard::acquire();
         let reply = self
             .handle_message_impl(
-                session_id,
-                continuation_text,
+                &request.session_id,
+                &request.user_text,
                 &[],
-                status_tx,
-                user_role,
-                channel_ctx,
-                heartbeat,
+                request.status_tx.clone(),
+                request.user_role,
+                request.channel_ctx.clone(),
+                request.heartbeat.clone(),
                 true,
+                request.parent_task_id.as_deref(),
             )
             .await?;
         Ok(Self::sanitize_final_reply_markers(&reply))

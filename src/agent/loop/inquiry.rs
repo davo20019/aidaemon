@@ -199,7 +199,18 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
             Advisory,
             Current,
         )],
-        "read_file" | "search_files" | "project_inspect" => vec![capability(
+        "read_file" => vec![
+            capability(
+                LocalWorkspace,
+                &[CurrentState, Content, Outcome, CausalExplanation],
+                Direct,
+                Current,
+            ),
+            // Argument acceptance/rejection happens in the local adapter
+            // before filesystem I/O and is therefore a host-local outcome.
+            capability(HostLocal, &[Outcome], Direct, Current),
+        ],
+        "search_files" | "project_inspect" => vec![capability(
             LocalWorkspace,
             &[CurrentState, Content, CausalExplanation],
             Direct,

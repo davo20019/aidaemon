@@ -474,7 +474,7 @@ async fn test_immediate_parent_tool_evidence_is_bounded_in_follow_up() {
             .and_then(|c| c.as_str())
             .unwrap_or("");
         assert!(
-            content.contains("[Tool receipt v3:"),
+            content.contains("[Tool receipt v4:"),
             "Prior 1 tool result should retain its receipt, got: {}",
             content
         );

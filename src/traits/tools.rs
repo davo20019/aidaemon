@@ -881,6 +881,15 @@ pub struct ToolCallMetadata {
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_status: Option<ToolOutcomeStatus>,
+    /// The adapter deterministically rejected the invocation contract before
+    /// performing domain I/O. This is an authoritative negative outcome, not
+    /// evidence that the requested read/write itself occurred.
+    #[serde(default)]
+    pub contract_rejected: bool,
+    /// Actual adapter that produced the result when dispatch was routed from
+    /// the requested tool through another implementation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tool_name: Option<String>,
     /// True when the dispatcher reconstructed this outcome from a prior
     /// durable receipt instead of invoking the side effect again.
     #[serde(default)]
@@ -974,6 +983,17 @@ impl ToolCallOutcome {
         Self {
             output,
             metadata: ToolCallMetadata::default(),
+        }
+    }
+
+    pub fn contract_rejection(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                contract_rejected: true,
+                ..ToolCallMetadata::default()
+            },
         }
     }
 }

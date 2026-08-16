@@ -2145,7 +2145,14 @@ pub(super) async fn run_completion_phase(
                 .saturating_add(1);
             stall_count = stall_count.saturating_add(1);
             consecutive_clean_iterations = 0;
-            pending_system_messages.push(SystemDirective::MutationStillRequired);
+            pending_system_messages.push(if has_tool_attempts {
+                SystemDirective::MutationStillRequired
+            } else {
+                // A zero-tool side-effect claim has no adapter identity yet.
+                // Require execution generically instead of steering every
+                // mutation toward file-edit tools.
+                SystemDirective::DeferredToolCallRequired
+            });
             agent
                 .emit_decision_point(
                     emitter,

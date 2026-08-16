@@ -1790,7 +1790,7 @@ pub(crate) async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'stat
 pub(crate) async fn run_background_continuation(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
     run_background_continuation_with_timeout(agent, request, BACKGROUND_CONTINUATION_TIMEOUT).await
 }
 
@@ -1798,7 +1798,7 @@ async fn run_background_continuation_with_timeout(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
     timeout: Duration,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
     let session_id = request.session_id.clone();
     let deadline = tokio::time::Instant::now() + timeout;
     let _slot = tokio::time::timeout_at(deadline, REENGAGE_SERIALIZER.lock())
@@ -3372,15 +3372,16 @@ impl TerminalTool {
     }
 
     /// Run a command: spawn, wait up to initial_timeout, return output or move to background.
-    async fn handle_run(
-        &self,
-        command: &str,
-        notify_session_id: &str,
-        notify_goal_id: Option<&str>,
-        task_id: Option<&str>,
-        detach: bool,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
+    async fn handle_run(&self, request: TerminalRunRequest<'_>) -> anyhow::Result<ToolCallOutcome> {
+        let TerminalRunRequest {
+            command,
+            notify_session_id,
+            notify_goal_id,
+            task_id,
+            tool_call_id,
+            detach,
+            status_tx,
+        } = request;
         let dedupe_key =
             Self::dedupe_key_for_run(command, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
@@ -3571,6 +3572,8 @@ impl TerminalTool {
                 let task_processes_for_notify = self.task_processes.clone();
                 let dedupe_key_for_notify = dedupe_key.clone();
                 let owner_task_id_for_notify = owner_task_id.clone();
+                let tool_call_id_for_notify = tool_call_id.map(str::to_string);
+                let event_store_for_notify = self.event_store.clone();
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -3611,6 +3614,7 @@ impl TerminalTool {
                             // Capture completion output for agent re-engagement
                             #[allow(unused_assignments)]
                             let mut completion_output_for_agent: Option<String> = None;
+                            let mut completion_parent_result_id: Option<String> = None;
                             let completion_unchecked_requirements: Vec<String>;
                             let mut completion_status_surface_id: Option<String> = None;
                             let mut ping_interval = tokio::time::interval(Duration::from_secs(
@@ -3671,13 +3675,91 @@ impl TerminalTool {
                                         let (formatted, truncation) =
                                             format_output(&stdout, &stderr, max_output_chars);
                                         let mut with_notice = formatted;
-                                        if let Some(info) = truncation {
+                                        if let Some(ref info) = truncation {
                                             with_notice.push('\n');
                                             with_notice
-                                                .push_str(&crate::utils::render_truncation_notice(&info));
+                                                .push_str(&crate::utils::render_truncation_notice(info));
                                         }
                                         let output = truncate_with_note(&with_notice, 2500);
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
+
+                                        // The background transition receipt is nonterminal. Persist
+                                        // a second, terminal receipt on actual process completion so
+                                        // recovery and continuation never have to infer success from
+                                        // a notification sentence.
+                                        if let (Some(event_store), Some(parent_task_id), Some(tool_call_id)) = (
+                                            event_store_for_notify.as_ref(),
+                                            owner_task_id_for_notify.as_ref(),
+                                            tool_call_id_for_notify.as_ref(),
+                                        ) {
+                                            let outcome_status = exit_code.map_or(
+                                                ToolOutcomeStatus::FailedPermanent,
+                                                |code| if code == 0 {
+                                                    ToolOutcomeStatus::Succeeded
+                                                } else {
+                                                    ToolOutcomeStatus::CompletedWithNegativeResult
+                                                },
+                                            );
+                                            let mut metadata = foreground_terminal_metadata(exit_code);
+                                            metadata.effective_tool_name = Some("terminal".to_string());
+                                            metadata.truncation = truncation.clone();
+                                            metadata.semantics =
+                                                crate::tools::command_semantics::classify_shell_command(
+                                                    &command_for_notify,
+                                                );
+                                            let provenance =
+                                                crate::traits::ToolResultProvenance::from_authoritative_result(
+                                                    &with_notice,
+                                                    &metadata,
+                                                    crate::traits::ToolResultContentSource::ToolOutput,
+                                                );
+                                            completion_parent_result_id = provenance.result_id.clone();
+                                            metadata.result_provenance = Some(provenance);
+                                            let receipt = crate::events::ToolReceiptV1::from_metadata(
+                                                &metadata,
+                                                outcome_status,
+                                                crate::events::ToolOutcomeEvidenceSource::ToolReported,
+                                                None,
+                                            );
+                                            let emitter = crate::events::EventEmitter::new(
+                                                event_store.clone(),
+                                                session_for_notify.clone(),
+                                            )
+                                            .with_task_id(parent_task_id.clone());
+                                            if let Err(error) = emitter
+                                                .emit(
+                                                    crate::events::EventType::ToolResult,
+                                                    crate::events::ToolResultData {
+                                                        message_id: None,
+                                                        tool_call_id: tool_call_id.clone(),
+                                                        name: "terminal".to_string(),
+                                                        result: with_notice.clone(),
+                                                        success: matches!(
+                                                            outcome_status,
+                                                            ToolOutcomeStatus::Succeeded
+                                                                | ToolOutcomeStatus::CompletedWithNegativeResult
+                                                        ),
+                                                        duration_ms: elapsed_secs.saturating_mul(1000),
+                                                        error: (outcome_status == ToolOutcomeStatus::FailedPermanent)
+                                                            .then(|| "background process ended without an exit status".to_string()),
+                                                        task_id: Some(parent_task_id.clone()),
+                                                        annotations: Vec::new(),
+                                                        turn_id: None,
+                                                        attachments: Vec::new(),
+                                                        receipt: Some(receipt),
+                                                    },
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    pid,
+                                                    %error,
+                                                    task_id = %parent_task_id,
+                                                    tool_call_id = %tool_call_id,
+                                                    "Failed to persist terminal background completion receipt"
+                                                );
+                                            }
+                                        }
 
                                         // Task completion and process completion are different
                                         // states. Load durable requirements before choosing the
@@ -4089,8 +4171,9 @@ impl TerminalTool {
                                 } else if !is_trivial
                                     && completion_unchecked_requirements.is_empty()
                                     && is_short_complete_output(output_trimmed)
+                                    && owner_task_id_for_notify.is_none()
                                 {
-                                    // SHORT, complete result (a `wc -l` count, a path, a
+                                    // SHORT, unowned utility result (a `wc -l` count, a path, a
                                     // one-line status). Do NOT re-enter the full agent loop:
                                     // with small models it tends to RE-RUN the command,
                                     // re-detaching to the background and emitting duplicate
@@ -4098,7 +4181,9 @@ impl TerminalTool {
                                     // interpretation via a TOOL-LESS call (it can only reply
                                     // in text — it cannot re-run anything), so the user gets a
                                     // contextual answer ("345 raw matches, not files") with no
-                                    // churn. If that call is unavailable, fall back to the raw
+                                    // churn. Task-owned completions always use the typed
+                                    // continuation path below so response/proof/delivery lineage
+                                    // is durable. If this unowned call is unavailable, fall back to the raw
                                     // result so the answer is never lost.
                                     let interpreted = match agent_for_notify {
                                         Some(ref agent) => match tokio::time::timeout(
@@ -4258,11 +4343,16 @@ impl TerminalTool {
                                                 channel_ctx: crate::types::ChannelContext::internal(
                                                 ),
                                                 heartbeat: None,
+                                                parent_task_id: owner_task_id_for_notify.clone(),
+                                                parent_tool_call_id: tool_call_id_for_notify
+                                                    .clone(),
+                                                parent_result_id: completion_parent_result_id
+                                                    .clone(),
                                             },
                                         )
                                         .await
                                         {
-                                            Ok(reply) => {
+                                            Ok(envelope) => {
                                                 // Defense-in-depth: the re-engaged loop reads session
                                                 // history containing this command's "moved to background"
                                                 // tool result and sometimes regurgitates that internal
@@ -4271,7 +4361,7 @@ impl TerminalTool {
                                                 // never leak scaffolding regardless of upstream changes.
                                                 let reply =
                                                     crate::tools::sanitize::sanitize_user_facing_reply(
-                                                        &reply,
+                                                        &envelope.text,
                                                     );
                                                 followup_still_working =
                                                     crate::agent::is_friendly_background_handoff(
@@ -4293,22 +4383,76 @@ impl TerminalTool {
                                                     };
                                                     if !delivery_allowed {
                                                         formatted_delivered = true;
+                                                        let _ = agent
+                                                            .record_continuation_delivery(
+                                                                &session_for_notify,
+                                                                envelope.delivery(
+                                                                    "background_router",
+                                                                    crate::events::ResponseDeliveryState::Failed,
+                                                                    Vec::new(),
+                                                                    Some("duplicate_suppressed".to_string()),
+                                                                ),
+                                                            )
+                                                            .await;
                                                         info!(
                                                             pid,
                                                             session_id = %session_for_notify,
                                                             "Suppressed duplicate agent follow-up for background command"
                                                         );
                                                     } else if let Some(ref hub) = hub_for_notify {
+                                                        let _ = agent
+                                                            .record_continuation_delivery(
+                                                                &session_for_notify,
+                                                                envelope.delivery(
+                                                                    "background_router",
+                                                                    crate::events::ResponseDeliveryState::Queued,
+                                                                    Vec::new(),
+                                                                    None,
+                                                                ),
+                                                            )
+                                                            .await;
                                                         match hub
-                                                            .send_text(&session_for_notify, &reply)
+                                                            .send_text_tracked(
+                                                                &session_for_notify,
+                                                                &reply,
+                                                            )
                                                             .await
                                                         {
-                                                            Ok(()) => formatted_delivered = true,
-                                                            Err(e) => warn!(
-                                                                pid,
-                                                                error = %e,
-                                                                "Failed to deliver agent follow-up for background command"
-                                                            ),
+                                                            Ok(platform_id) => {
+                                                                formatted_delivered = true;
+                                                                let ids = platform_id
+                                                                    .into_iter()
+                                                                    .collect();
+                                                                let _ = agent
+                                                                    .record_continuation_delivery(
+                                                                        &session_for_notify,
+                                                                        envelope.delivery(
+                                                                            "background_router",
+                                                                            crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                                                                            ids,
+                                                                            None,
+                                                                        ),
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = agent
+                                                                    .record_continuation_delivery(
+                                                                        &session_for_notify,
+                                                                        envelope.delivery(
+                                                                            "background_router",
+                                                                            crate::events::ResponseDeliveryState::Failed,
+                                                                            Vec::new(),
+                                                                            Some("transport_error".to_string()),
+                                                                        ),
+                                                                    )
+                                                                    .await;
+                                                                warn!(
+                                                                    pid,
+                                                                    error = %e,
+                                                                    "Failed to deliver agent follow-up for background command"
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -5105,14 +5249,15 @@ impl TerminalTool {
                     manager.begin_for_tool("terminal", arguments).await?;
                 }
 
-                self.handle_run(
+                self.handle_run(TerminalRunRequest {
                     command,
-                    &notify_session_id,
-                    args._goal_id.as_deref(),
-                    args._task_id.as_deref(),
-                    args.detach,
+                    notify_session_id: &notify_session_id,
+                    notify_goal_id: args._goal_id.as_deref(),
+                    task_id: args._task_id.as_deref(),
+                    tool_call_id: args._tool_call_id.as_deref(),
+                    detach: args.detach,
                     status_tx,
-                )
+                })
                 .await?
             }
         };
@@ -5123,6 +5268,16 @@ impl TerminalTool {
 
         Ok(outcome)
     }
+}
+
+struct TerminalRunRequest<'a> {
+    command: &'a str,
+    notify_session_id: &'a str,
+    notify_goal_id: Option<&'a str>,
+    task_id: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
+    detach: bool,
+    status_tx: Option<mpsc::Sender<StatusUpdate>>,
 }
 
 impl Drop for TerminalTool {
@@ -5156,6 +5311,9 @@ struct TerminalArgs {
     _session_id: String,
     #[serde(default)]
     _task_id: Option<String>,
+    /// Injected by the dispatcher; never accepted from model-supplied input.
+    #[serde(default)]
+    _tool_call_id: Option<String>,
     /// Injected by agent - goal context for routing background notifications.
     #[serde(default)]
     _goal_id: Option<String>,
@@ -5583,8 +5741,16 @@ mod tests {
         async fn continue_conversation(
             &self,
             _request: ConversationRequest,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
             std::future::pending().await
+        }
+
+        async fn record_continuation_delivery(
+            &self,
+            _session_id: &str,
+            _delivery: crate::events::ResponseDeliveryData,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -5597,6 +5763,9 @@ mod tests {
             user_role: crate::types::UserRole::Owner,
             channel_ctx: crate::types::ChannelContext::internal(),
             heartbeat: None,
+            parent_task_id: Some("synthetic-parent".to_string()),
+            parent_tool_call_id: Some("synthetic-call".to_string()),
+            parent_result_id: None,
         };
         let error = run_background_continuation_with_timeout(
             &PendingConversationRuntime,

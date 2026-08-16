@@ -152,6 +152,7 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
         internal_continuation: bool,
+        continuation_parent_task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         touch_heartbeat(&heartbeat);
         info!(session_id, "handle_message_impl: starting bootstrap phase");
@@ -167,6 +168,7 @@ impl Agent {
                 user_role,
                 channel_ctx: &channel_ctx,
                 internal_continuation,
+                parent_task_id: continuation_parent_task_id,
             },
         )
         .await?;

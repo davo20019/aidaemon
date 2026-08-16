@@ -966,11 +966,14 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
     for entry in tool_calls {
         // Detect and strip [FAILED] suffix — failed tool calls are tracked
         // separately so activity summaries don't claim success on failures.
-        let (clean_entry, is_failed) = if let Some(stripped) = entry.strip_suffix(" [FAILED]") {
-            (stripped, true)
-        } else {
-            (entry.as_str(), false)
-        };
+        let (clean_entry, is_failed, was_rejected) =
+            if let Some(stripped) = entry.strip_suffix(" [FAILED]") {
+                (stripped, true, false)
+            } else if let Some(stripped) = entry.strip_suffix(" [REJECTED]") {
+                (stripped, false, true)
+            } else {
+                (entry.as_str(), false, false)
+            };
 
         // Parse "tool_name(summary)" format
         let (name, args) = match clean_entry.find('(') {
@@ -987,6 +990,13 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
             if !args.is_empty() {
                 failed_mutations.push(args);
             }
+            continue;
+        }
+        // A failed or pre-I/O-rejected invocation is an attempted operation,
+        // not completed activity. Its concrete outcome remains in the tool
+        // receipt/model context and must not become “Files read” or “Commands
+        // run” in a fallback completion card.
+        if is_failed || was_rejected {
             continue;
         }
 
@@ -1192,6 +1202,16 @@ mod tests {
     fn test_categorize_tool_calls_empty() {
         let result = categorize_tool_calls(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn failed_and_rejected_attempts_are_not_completed_activity() {
+        let calls = vec![
+            "read_file(synthetic.toml) [REJECTED]".to_string(),
+            "terminal(`/usr/bin/false`) [FAILED]".to_string(),
+        ];
+        assert!(categorize_tool_calls(&calls).is_empty());
+        assert!(categorize_tool_calls_user_facing(&calls).is_empty());
     }
 
     #[test]

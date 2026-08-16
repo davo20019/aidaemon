@@ -2632,6 +2632,9 @@ impl CliAgentTool {
                                         user_role: crate::types::UserRole::Owner,
                                         channel_ctx: crate::types::ChannelContext::internal(),
                                         heartbeat: None,
+                                        parent_task_id: None,
+                                        parent_tool_call_id: None,
+                                        parent_result_id: None,
                                     },
                                 )
                             );
@@ -2659,12 +2662,40 @@ impl CliAgentTool {
                                 }
                             };
                             match continuation_result {
-                                Ok(reply) if !reply.trim().is_empty() => {
-                                    let reply =
-                                        crate::tools::sanitize::sanitize_user_facing_reply(&reply);
+                                Ok(envelope) if !envelope.text.trim().is_empty() => {
+                                    let reply = crate::tools::sanitize::sanitize_user_facing_reply(
+                                        &envelope.text,
+                                    );
                                     if let Some(ref hub) = hub_for_completion {
-                                        match hub.send_text(&notify_session_id, &reply).await {
-                                            Ok(()) => delivered = true,
+                                        let _ = agent
+                                            .record_continuation_delivery(
+                                                &notify_session_id,
+                                                envelope.delivery(
+                                                    "background_router",
+                                                    crate::events::ResponseDeliveryState::Queued,
+                                                    Vec::new(),
+                                                    None,
+                                                ),
+                                            )
+                                            .await;
+                                        match hub
+                                            .send_text_tracked(&notify_session_id, &reply)
+                                            .await
+                                        {
+                                            Ok(platform_id) => {
+                                                delivered = true;
+                                                let _ = agent
+                                                    .record_continuation_delivery(
+                                                        &notify_session_id,
+                                                        envelope.delivery(
+                                                            "background_router",
+                                                            crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                                                            platform_id.into_iter().collect(),
+                                                            None,
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
                                             Err(e) => warn!(
                                                 task_id = %task_id_for_notify,
                                                 session_id = %notify_session_id,
