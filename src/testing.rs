@@ -615,10 +615,12 @@ async fn setup_test_agent_internal(
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let mut agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model: "mock-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
         config_path: PathBuf::from("config.toml"),
@@ -738,10 +740,12 @@ pub async fn setup_test_agent_with_models_and_policy(
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model: primary_model.to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
         config_path: PathBuf::from("config.toml"),
@@ -830,10 +834,12 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model: "primary-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
         config_path: PathBuf::from("config.toml"),
@@ -1089,10 +1095,12 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let mut agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model: "mock-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
         config_path: PathBuf::from("config.toml"),

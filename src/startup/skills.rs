@@ -4,17 +4,15 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::config::AppConfig;
-use crate::state::SqliteStateStore;
 use crate::tools::ApprovalBroker;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
-use crate::traits::store_prelude::*;
 use crate::traits::Tool;
 
 pub async fn register_skills_tools(
     config: &AppConfig,
     config_path: &Path,
     http_profiles: crate::oauth::SharedHttpProfiles,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn crate::traits::StateStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
     approval_tx: ApprovalBroker,
 ) -> anyhow::Result<Option<PathBuf>> {

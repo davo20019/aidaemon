@@ -135,10 +135,12 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     );
 
     let agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model,
         system_prompt:
             "You are a helpful assistant. Use terminal commands to gather information when asked."
@@ -337,10 +339,12 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     );
 
     let agent = Agent::new(crate::agent::AgentConstruction {
-        llm_runtime,
-        state: state.clone() as Arc<dyn crate::traits::StateStore>,
-        event_store,
-        tools,
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store,
+            tools,
+        },
         model,
         system_prompt: system_prompt.to_string(),
         config_path,

@@ -36,6 +36,137 @@ use crate::traits::store_prelude::*;
 use crate::traits::Tool;
 use crate::types::MediaMessage;
 
+/// Complete tool subsystem assembled during startup.
+///
+/// Keeping this bundle in the startup layer means the application composition
+/// root does not need to know how base, optional, runtime, MCP, or skill tools
+/// are constructed. The runtime only consumes the capabilities it needs after
+/// this point.
+pub struct ToolSetup {
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub execution_backend: crate::execution::SharedExecutionBackend,
+    pub approval_tx: ApprovalBroker,
+    pub approval_rx: mpsc::Receiver<ApprovalRequest>,
+    pub media_rx: mpsc::Receiver<MediaMessage>,
+    pub terminal_tool: Option<Arc<TerminalTool>>,
+    pub spawn_tool: Option<Arc<SpawnAgentTool>>,
+    pub oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    pub mcp_registry: McpRegistry,
+    pub skills_dir: Option<PathBuf>,
+    pub inbox_dir: String,
+    pub cli_agent_tool: Option<Arc<CliAgentTool>>,
+}
+
+/// Assemble all tools and their startup-only dependencies.
+///
+/// This is intentionally the only function that coordinates the individual
+/// tool registration phases. Callers should treat the result as a capability
+/// bundle instead of reaching into the registration details.
+#[allow(clippy::too_many_arguments)]
+pub async fn setup_tools(
+    config: &AppConfig,
+    config_path: &Path,
+    state: Arc<SqliteStateStore>,
+    event_store: Arc<EventStore>,
+    llm_runtime: SharedLlmRuntime,
+    health_store: Option<Arc<HealthProbeStore>>,
+    approval_capacity: usize,
+    media_capacity: usize,
+) -> anyhow::Result<ToolSetup> {
+    let BaseToolsBundle {
+        mut tools,
+        execution_backend,
+        approval_tx,
+        approval_rx,
+        media_tx,
+        media_rx,
+        terminal_tool,
+    } = build_base_tools(
+        config,
+        config_path.to_path_buf(),
+        state.clone(),
+        event_store.clone(),
+        approval_capacity,
+        media_capacity,
+    )
+    .await?;
+
+    if let Some(terminal) = &terminal_tool {
+        terminal.set_command_risk_runtime(llm_runtime.clone());
+    }
+
+    let OptionalToolsOutcome {
+        has_cli_agents: _has_cli_agents,
+        inbox_dir,
+        cli_agent_tool,
+    } = register_optional_tools(
+        &mut tools,
+        config,
+        state.clone(),
+        event_store,
+        llm_runtime.clone(),
+        health_store,
+        approval_tx.clone(),
+        media_tx.clone(),
+    )
+    .await?;
+
+    let mcp_registry = crate::startup::mcp::setup_mcp_registry(
+        config,
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+    )
+    .await?;
+    let http_profiles: crate::oauth::SharedHttpProfiles =
+        Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
+
+    let skills_dir = crate::startup::skills::register_skills_tools(
+        config,
+        config_path,
+        http_profiles.clone(),
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+        &mut tools,
+        approval_tx.clone(),
+    )
+    .await?;
+
+    let RuntimeToolsOutcome {
+        spawn_tool,
+        oauth_gateway,
+    } = register_runtime_tools(
+        &mut tools,
+        config,
+        config_path,
+        http_profiles,
+        state,
+        mcp_registry.clone(),
+        approval_tx.clone(),
+    )
+    .await?;
+
+    for tool in &tools {
+        info!(
+            name = tool.name(),
+            desc = tool.description(),
+            "Registered tool"
+        );
+    }
+
+    Ok(ToolSetup {
+        tools,
+        execution_backend,
+        approval_tx,
+        approval_rx,
+        media_rx,
+        terminal_tool,
+        spawn_tool,
+        oauth_gateway,
+        mcp_registry,
+        skills_dir,
+        inbox_dir,
+        cli_agent_tool,
+    })
+}
+
 pub struct BaseToolsBundle {
     pub tools: Vec<Arc<dyn Tool>>,
     pub execution_backend: crate::execution::SharedExecutionBackend,

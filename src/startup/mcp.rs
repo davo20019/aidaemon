@@ -4,11 +4,11 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::mcp::{self, McpRegistry};
-use crate::state::SqliteStateStore;
+use crate::traits::StateStore;
 
 pub async fn setup_mcp_registry(
     config: &AppConfig,
-    state: Arc<SqliteStateStore>,
+    state: Arc<dyn StateStore>,
 ) -> anyhow::Result<McpRegistry> {
     let mcp_registry = mcp::McpRegistry::new(state);
 

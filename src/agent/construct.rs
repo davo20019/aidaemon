@@ -26,13 +26,22 @@ use crate::traits::{AgentRole, StateStore, Tool};
 use super::execution_state::ExecutionBudget;
 use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
 
-/// Named root-agent construction contract. Keeping startup inputs as data
-/// prevents positional argument drift as dependencies evolve.
-pub(crate) struct AgentConstruction {
+/// Runtime services shared by every agent instance.
+///
+/// Keeping these infrastructure dependencies together prevents the startup
+/// layer from having to know the internal shape of the agent's construction
+/// contract. Agent policy and per-instance configuration remain separate data.
+pub(crate) struct AgentRuntimeDependencies {
     pub llm_runtime: SharedLlmRuntime,
     pub state: Arc<dyn StateStore>,
     pub event_store: Arc<EventStore>,
     pub tools: Vec<Arc<dyn Tool>>,
+}
+
+/// Named root-agent construction contract. Keeping startup inputs as data
+/// prevents positional argument drift as dependencies evolve.
+pub(crate) struct AgentConstruction {
+    pub dependencies: AgentRuntimeDependencies,
     pub model: String,
     pub system_prompt: String,
     pub config_path: PathBuf,
@@ -68,10 +77,13 @@ pub(crate) struct AgentConstruction {
 impl Agent {
     pub(crate) fn new(input: AgentConstruction) -> Self {
         let AgentConstruction {
-            llm_runtime,
-            state,
-            event_store,
-            tools,
+            dependencies:
+                AgentRuntimeDependencies {
+                    llm_runtime,
+                    state,
+                    event_store,
+                    tools,
+                },
             model,
             system_prompt,
             config_path,

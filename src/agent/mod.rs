@@ -670,7 +670,7 @@ pub mod self_correction;
 // `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
 #[path = "construct.rs"]
 mod construct;
-pub(crate) use construct::AgentConstruction;
+pub(crate) use construct::{AgentConstruction, AgentRuntimeDependencies};
 
 // impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
