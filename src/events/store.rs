@@ -1910,7 +1910,7 @@ impl EventStore {
 
             total_calls += 1;
             duration_sum_ms += tr.duration_ms as u128;
-            if tr.success {
+            if tr.completed_observation() {
                 successful += 1;
                 continue;
             }
@@ -2501,7 +2501,7 @@ fn normalize_tool_error_text(raw: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn is_synthetic_tool_result(tr: &ToolResultData) -> bool {
-    tr.success
+    tr.succeeded()
         && tr.duration_ms == 0
         && tr.error.is_none()
         && crate::traits::message_content_is_structural_only(&tr.result, &tr.annotations)

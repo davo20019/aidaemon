@@ -27,6 +27,10 @@ pub(crate) struct CompiledCompletionCore {
     pub requires_observation: bool,
     pub task_kind: CompletionTaskKind,
     pub required_mutation_effects: ToolMutationEffects,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompiledEvidencePolicy {
     pub minimum_sources: usize,
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
@@ -57,6 +61,7 @@ impl Default for CompiledAuthority {
 pub(crate) struct CompiledTaskContract {
     pub core: Option<CompiledCompletionCore>,
     pub authority: CompiledAuthority,
+    pub evidence_policy: CompiledEvidencePolicy,
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     pub required_invocations: Vec<RequestReceiptPredicate>,
     pub filesystem_access: Option<ToolCallAccessManifest>,
@@ -140,23 +145,85 @@ fn compile_core(signals: &PlannedContractSignals) -> Result<CompiledCompletionCo
         ToolMutationEffects::NONE
     };
 
-    let minimum_sources = signals.minimum_sources.ok_or("missing_minimum_sources")? as usize;
-    let requires_primary_sources = signals
-        .requires_primary_sources
-        .ok_or("missing_primary_source_policy")?;
-    if minimum_sources > 20 || requires_primary_sources && minimum_sources == 0 {
-        return Err("invalid_source_policy");
-    }
-
     Ok(CompiledCompletionCore {
         expects_mutation,
         requires_observation,
         task_kind,
         required_mutation_effects,
-        minimum_sources,
-        requires_primary_sources,
-        requires_exact_history: signals.requires_exact_history.unwrap_or(false),
     })
+}
+
+fn compile_evidence_policy(
+    signals: &PlannedContractSignals,
+    evidence_requirements: &[RequestEvidenceRequirement],
+) -> (CompiledEvidencePolicy, Vec<ContractLaneDecision>) {
+    let mut policy = CompiledEvidencePolicy::default();
+    let mut decisions = Vec::new();
+    let minimum_sources = signals.minimum_sources.map(usize::from);
+    let requires_primary_sources = signals.requires_primary_sources;
+    let has_remote_subject_evidence = evidence_requirements.iter().any(|requirement| {
+        requirement
+            .acceptable_scopes
+            .contains(&ToolSemanticScope::ExternalRemote)
+            && matches!(
+                requirement.purpose,
+                EvidencePurpose::CurrentState
+                    | EvidencePurpose::HistoricalRecord
+                    | EvidencePurpose::Content
+                    | EvidencePurpose::Attribution
+                    | EvidencePurpose::CausalExplanation
+            )
+    });
+    match (minimum_sources, requires_primary_sources) {
+        (Some(0), Some(false)) => {
+            decisions.push(decision("research_evidence_policy", true, "empty", 0, 0))
+        }
+        (Some(minimum), Some(primary))
+            if (1..=20).contains(&minimum) && has_remote_subject_evidence =>
+        {
+            policy.minimum_sources = minimum;
+            policy.requires_primary_sources = primary;
+            decisions.push(decision("research_evidence_policy", true, "accepted", 1, 1));
+        }
+        (Some(_), Some(_)) => decisions.push(decision(
+            "research_evidence_policy",
+            false,
+            "missing_remote_subject_evidence",
+            1,
+            0,
+        )),
+        _ => decisions.push(decision(
+            "research_evidence_policy",
+            false,
+            "missing_typed_policy",
+            usize::from(minimum_sources.is_some() || requires_primary_sources.is_some()),
+            0,
+        )),
+    }
+
+    let requested_exact_history = signals.requires_exact_history.unwrap_or(false);
+    let has_exact_history_evidence = evidence_requirements.iter().any(|requirement| {
+        requirement
+            .acceptable_scopes
+            .contains(&ToolSemanticScope::ConversationHistory)
+            && requirement.purpose == EvidencePurpose::HistoricalRecord
+            && requirement.minimum_authority == EvidenceAuthority::Canonical
+    });
+    if requested_exact_history && has_exact_history_evidence {
+        policy.requires_exact_history = true;
+        decisions.push(decision("exact_history_policy", true, "accepted", 1, 1));
+    } else if requested_exact_history {
+        decisions.push(decision(
+            "exact_history_policy",
+            false,
+            "missing_canonical_history_obligation",
+            1,
+            0,
+        ));
+    } else {
+        decisions.push(decision("exact_history_policy", true, "empty", 0, 0));
+    }
+    (policy, decisions)
 }
 
 fn valid_receipt(receipt: &RequestReceiptPredicate, available_tool_names: &[String]) -> bool {
@@ -527,6 +594,11 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     compiled.required_invocations = invocations;
     compiled.decisions.push(obligation_decision);
 
+    let (evidence_policy, evidence_policy_decisions) =
+        compile_evidence_policy(input.signals, &compiled.evidence_requirements);
+    compiled.evidence_policy = evidence_policy;
+    compiled.decisions.extend(evidence_policy_decisions);
+
     let (authority, authority_decisions) =
         compile_authority(input.signals, input.available_tool_names);
     compiled.authority = authority;
@@ -576,24 +648,6 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     if let Some(core) = compiled.core.as_mut() {
         core.requires_observation |=
             !compiled.evidence_requirements.is_empty() || !compiled.required_invocations.is_empty();
-        if core.requires_exact_history
-            && !compiled.evidence_requirements.iter().any(|requirement| {
-                requirement
-                    .acceptable_scopes
-                    .contains(&ToolSemanticScope::ConversationHistory)
-                    && requirement.purpose == EvidencePurpose::HistoricalRecord
-                    && requirement.minimum_authority == EvidenceAuthority::Canonical
-            })
-        {
-            core.requires_exact_history = false;
-            compiled.decisions.push(decision(
-                "exact_history",
-                false,
-                "missing_canonical_history_obligation",
-                1,
-                0,
-            ));
-        }
     }
 
     // Ensure the helper remains the sole canonical constructor for receipt
@@ -754,5 +808,61 @@ mod tests {
             left.authority.forbids_tool_use,
             right.authority.forbids_tool_use
         );
+    }
+
+    #[test]
+    fn research_policy_cannot_attach_to_host_local_process_evidence() {
+        let mut signals = base_signals();
+        signals.minimum_sources = Some(1);
+        signals.requires_primary_sources = Some(false);
+        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
+            summary: "Observe the synthetic process outcome".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::HostLocal],
+            purpose: EvidencePurpose::Outcome,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+
+        let compiled = compile(&signals);
+
+        assert_eq!(compiled.evidence_policy.minimum_sources, 0);
+        assert!(!compiled.evidence_policy.requires_primary_sources);
+        assert_eq!(compiled.evidence_requirements.len(), 1);
+        assert!(compiled.core.is_some());
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "research_evidence_policy"
+                && !decision.accepted
+                && decision.reason_code == "missing_remote_subject_evidence"
+        }));
+    }
+
+    #[test]
+    fn research_policy_composes_with_external_subject_evidence() {
+        let mut signals = base_signals();
+        signals.minimum_sources = Some(2);
+        signals.requires_primary_sources = Some(true);
+        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
+            summary: "Establish the synthetic release state".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+
+        let compiled = compile(&signals);
+
+        assert_eq!(compiled.evidence_policy.minimum_sources, 2);
+        assert!(compiled.evidence_policy.requires_primary_sources);
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "research_evidence_policy"
+                && decision.accepted
+                && decision.reason_code == "accepted"
+        }));
     }
 }

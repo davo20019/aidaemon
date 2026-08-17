@@ -243,6 +243,47 @@ pub struct ToolResultData {
     pub receipt: Option<ToolReceiptV1>,
 }
 
+impl ToolResultData {
+    /// Canonical adapter outcome for control-plane decisions. New events carry
+    /// a receipt; the boolean is consulted only for legacy rows that predate
+    /// typed outcomes.
+    pub fn outcome_status(&self) -> ToolOutcomeStatus {
+        self.receipt.as_ref().map_or(
+            if self.success {
+                ToolOutcomeStatus::Succeeded
+            } else {
+                ToolOutcomeStatus::FailedPermanent
+            },
+            |receipt| receipt.outcome_status,
+        )
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.outcome_status() == ToolOutcomeStatus::Succeeded
+    }
+
+    /// The invocation reached a terminal, usable observation. A negative
+    /// domain result is complete evidence, but is deliberately not relabeled
+    /// as adapter success.
+    pub fn completed_observation(&self) -> bool {
+        matches!(
+            self.outcome_status(),
+            ToolOutcomeStatus::Succeeded | ToolOutcomeStatus::CompletedWithNegativeResult
+        )
+    }
+
+    pub fn failed(&self) -> bool {
+        self.outcome_status().is_failure()
+    }
+
+    /// Projection retained solely for old event readers and serialized schema
+    /// compatibility. It must always be derived from the typed receipt when a
+    /// receipt exists.
+    pub fn compatibility_success(&self) -> bool {
+        self.succeeded()
+    }
+}
+
 /// How the daemon obtained the durable outcome recorded in a tool receipt.
 ///
 /// `LegacyText` is deliberately explicit: compatibility parsing can guide a
@@ -1914,6 +1955,39 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.receipt.is_none());
+        assert!(legacy.succeeded());
+        assert!(legacy.completed_observation());
+
+        let negative_metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+            exit_code: Some(1),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let negative = ToolResultData {
+            message_id: None,
+            tool_call_id: "call-negative".to_string(),
+            name: "terminal".to_string(),
+            result: "[exit code: 1]".to_string(),
+            // Deliberately contradictory legacy projection: the receipt must
+            // remain authoritative for every new reader.
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: None,
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(ToolReceiptV1::from_metadata(
+                &negative_metadata,
+                ToolOutcomeStatus::CompletedWithNegativeResult,
+                ToolOutcomeEvidenceSource::StructuredMetadata,
+                None,
+            )),
+        };
+        assert!(!negative.succeeded());
+        assert!(!negative.failed());
+        assert!(negative.completed_observation());
+        assert!(!negative.compatibility_success());
     }
 
     #[test]

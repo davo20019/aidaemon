@@ -175,7 +175,7 @@ impl DiagnoseTool {
             }
             EventType::ToolResult => {
                 if let Ok(data) = event.parse_data::<ToolResultData>() {
-                    let status = if data.success { "ok" } else { "err" };
+                    let status = data.outcome_status().as_str();
                     let detail = if let Some(err) = data.error {
                         truncate_str(&err, 140)
                     } else {
@@ -523,7 +523,7 @@ impl DiagnoseTool {
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<ToolResultData>() {
-                        if !data.success {
+                        if data.failed() {
                             if first_error.is_none() {
                                 first_error = Some(ev.clone());
                             }
@@ -1735,7 +1735,7 @@ Rules: no invented event IDs; confidence 0..1.",
             }
             EventType::ToolResult => {
                 if let Ok(tr) = event.parse_data::<ToolResultData>() {
-                    format!("tool_result:{}:{}", tr.name, tr.success)
+                    format!("tool_result:{}:{}", tr.name, tr.outcome_status().as_str())
                 } else {
                     "tool_result".to_string()
                 }

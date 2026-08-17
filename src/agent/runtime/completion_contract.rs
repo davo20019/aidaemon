@@ -330,6 +330,13 @@ pub(super) fn inherit_unfinished_request_contract(
 
     current.requires_observation |= unfinished.requires_observation;
     current.explicit_verification_requested |= unfinished.explicit_verification_requested;
+    // Evidence-quality policy belongs to the same unfinished lifecycle as its
+    // proof obligations. Carry it monotonically with those obligations so a
+    // partial continuation assessment cannot retain the work while silently
+    // weakening the standard that closes it.
+    current.minimum_sources = current.minimum_sources.max(unfinished.minimum_sources);
+    current.requires_primary_sources |= unfinished.requires_primary_sources;
+    current.requires_exact_history |= unfinished.requires_exact_history;
     for (index, requirement) in unfinished.evidence_requirements.iter().enumerate() {
         if !current.evidence_requirements.contains(requirement) {
             current.evidence_requirements.push(requirement.clone());
@@ -624,16 +631,33 @@ pub(super) fn apply_planned_required_mutation_effects(
 /// Replace advisory text inference with a complete, validated semantic task
 /// contract. Exact resource identities survive because they are structural
 /// evidence extracted from the request; lexical obligation guesses do not.
-pub(super) struct SemanticCompletionRequirements<'a> {
+pub(super) struct SemanticCompletionRequirements {
     pub expects_mutation: bool,
     pub requires_observation: bool,
     pub task_kind: CompletionTaskKind,
     pub required_mutation_effects: ToolMutationEffects,
+}
+
+/// Evidence-quality policy is deliberately separate from task lifecycle.
+/// A malformed or inapplicable research threshold must not rewrite whether a
+/// task mutates state, requires an observation, or is complete.
+pub(super) struct SemanticEvidencePolicy {
     pub minimum_sources: usize,
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
-    pub evidence_requirements: &'a [RequestEvidenceRequirement],
-    pub required_invocations: &'a [crate::traits::RequestReceiptPredicate],
+}
+
+pub(super) fn apply_semantic_evidence_policy(
+    contract: &mut CompletionContract,
+    policy: SemanticEvidencePolicy,
+) {
+    // Evidence policy is monotonic within one unfinished request lifecycle.
+    // A related continuation may add a stronger requirement, but a partial or
+    // empty assessment lane must never erase a persisted outstanding one.
+    // Installing a genuinely new semantic lifecycle resets these fields first.
+    contract.minimum_sources = contract.minimum_sources.max(policy.minimum_sources);
+    contract.requires_primary_sources |= policy.requires_primary_sources;
+    contract.requires_exact_history |= policy.requires_exact_history;
 }
 
 /// Restrictive capability and response-shape policy compiled independently
@@ -720,56 +744,11 @@ fn structural_evidence_requirement(
 
 pub(super) fn install_semantic_completion_contract(
     contract: &mut CompletionContract,
-    requirements: SemanticCompletionRequirements<'_>,
+    requirements: SemanticCompletionRequirements,
 ) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let scope_task_id = contract.scope_task_id.take();
     let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
-    // A complete semantic assessment is authoritative about material
-    // information needs. Keep exact resource identities as matching hints, but
-    // do not promote every path mentioned by the request into an independent
-    // content obligation. Paths also represent execution scope (for example a
-    // command's working directory), and treating those as requested evidence
-    // creates validation loops unrelated to the user's objective.
-    // Free-form summaries and subject tokens guide investigation but do not
-    // decide completion. Keep the typed scope/purpose/authority/time contract,
-    // normalize it, and collapse duplicate obligations that differ only in
-    // prose. This preserves the subject boundary (for example user memory vs.
-    // host state) without creating one proof node per paraphrase.
-    let mut evidence_requirements = Vec::new();
-    for mut requirement in requirements.evidence_requirements.iter().cloned() {
-        requirement.required_content_markers.clear();
-        requirement
-            .acceptable_scopes
-            .sort_by_key(|scope| scope.as_str());
-        requirement.acceptable_scopes.dedup();
-        let duplicate =
-            evidence_requirements
-                .iter()
-                .any(|existing: &RequestEvidenceRequirement| {
-                    existing.acceptable_scopes == requirement.acceptable_scopes
-                        && existing.purpose == requirement.purpose
-                        && existing.minimum_authority == requirement.minimum_authority
-                        && existing.temporal_scope == requirement.temporal_scope
-                        && existing.receipt == requirement.receipt
-                        && existing.target == requirement.target
-                });
-        if !duplicate {
-            evidence_requirements.push(requirement);
-        }
-    }
-    evidence_requirements.extend(requirements.required_invocations.iter().cloned().map(
-        |receipt| RequestEvidenceRequirement {
-            summary: "Complete the exact requested machine invocation".to_string(),
-            acceptable_scopes: Vec::new(),
-            purpose: crate::traits::EvidencePurpose::Outcome,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: Vec::new(),
-            receipt: Some(receipt),
-            target: None,
-        },
-    ));
     let expects_mutation = requirements.expects_mutation;
 
     *contract = CompletionContract {
@@ -788,18 +767,16 @@ pub(super) fn install_semantic_completion_contract(
         forbidden_tool_scopes: Vec::new(),
         required_response_fields: Vec::new(),
         forbidden_mutation_actions: Vec::new(),
-        requires_observation: requirements.requires_observation
-            || !requirements.evidence_requirements.is_empty()
-            || !requirements.required_invocations.is_empty(),
+        requires_observation: requirements.requires_observation,
         requires_reverification_after_mutation: expects_mutation
             && requirements.requires_observation,
         // This now records a semantic observation obligation, not an English
         // verification-phrase match.
         explicit_verification_requested: requirements.requires_observation,
-        minimum_sources: requirements.minimum_sources,
-        requires_primary_sources: requirements.requires_primary_sources,
-        requires_exact_history: requirements.requires_exact_history,
-        evidence_requirements,
+        minimum_sources: 0,
+        requires_primary_sources: false,
+        requires_exact_history: false,
+        evidence_requirements: Vec::new(),
         adopted_evidence_bindings: Vec::new(),
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets,
@@ -2736,11 +2713,6 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Check,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                minimum_sources: 0,
-                requires_primary_sources: false,
-                requires_exact_history: false,
-                evidence_requirements: &[],
-                required_invocations: &[],
             },
         );
 
@@ -2773,13 +2745,9 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Answer,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                minimum_sources: 0,
-                requires_primary_sources: false,
-                requires_exact_history: false,
-                evidence_requirements: std::slice::from_ref(&requirement),
-                required_invocations: &[],
             },
         );
+        append_evidence_obligations(&mut contract, std::slice::from_ref(&requirement));
         apply_semantic_authority(
             &mut contract,
             SemanticAuthorityRequirements {
@@ -2819,13 +2787,9 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Check,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                minimum_sources: 0,
-                requires_primary_sources: false,
-                requires_exact_history: false,
-                evidence_requirements: std::slice::from_ref(&requirement),
-                required_invocations: &[],
             },
         );
+        append_evidence_obligations(&mut contract, std::slice::from_ref(&requirement));
         apply_semantic_authority(
             &mut contract,
             SemanticAuthorityRequirements {
@@ -2873,13 +2837,9 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Answer,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                minimum_sources: 0,
-                requires_primary_sources: false,
-                requires_exact_history: false,
-                evidence_requirements: &requirements,
-                required_invocations: &[],
             },
         );
+        append_evidence_obligations(&mut contract, &requirements);
 
         assert_eq!(contract.evidence_requirements.len(), 1);
         assert_eq!(
@@ -3292,6 +3252,28 @@ mod tests {
         assert!(inherited.requires_observation);
         assert!(inherited.requires_reverification_after_mutation);
         assert!(inherited.explicit_verification_requested);
+    }
+
+    #[test]
+    fn unfinished_contract_inheritance_preserves_evidence_policy_monotonically() {
+        let current = CompletionContract {
+            requires_observation: true,
+            minimum_sources: 1,
+            ..CompletionContract::default()
+        };
+        let unfinished = CompletionContract {
+            requires_observation: true,
+            minimum_sources: 3,
+            requires_primary_sources: true,
+            requires_exact_history: true,
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_unfinished_request_contract(current, &unfinished);
+
+        assert_eq!(inherited.minimum_sources, 3);
+        assert!(inherited.requires_primary_sources);
+        assert!(inherited.requires_exact_history);
     }
 
     #[test]

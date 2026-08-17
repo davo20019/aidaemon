@@ -249,83 +249,7 @@ fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSig
     })
 }
 
-/// Independently compiled products recovered after the broad assessment is
-/// unavailable. A malformed authority/evidence envelope must not erase a
-/// valid machine-invocation obligation, but the salvaged obligation is
-/// deliberately non-authorizing: it can require proof of a call, never grant
-/// tool, mutation, or filesystem access.
-#[derive(Debug, Default)]
-pub(crate) struct TaskContractRecoveryOutcome {
-    pub plan: Option<TaskPlan>,
-    pub required_invocations: Vec<crate::traits::RequestReceiptPredicate>,
-}
-
 const TASK_RELATIONSHIP_SCHEMA_VERSION: u16 = 1;
-const TASK_CONTRACT_RECOVERY_SCHEMA_VERSION: u16 = 1;
-
-fn valid_required_invocation(
-    receipt: &crate::traits::RequestReceiptPredicate,
-    available_tool_names: &[String],
-) -> bool {
-    receipt.tool_names.len() == 1
-        && receipt.tool_names.iter().all(|name| {
-            !name.is_empty()
-                && name.len() <= 80
-                && name.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'_' | b'-')
-                })
-                // Capability grounding is structural. The recovery compiler
-                // may choose only an exact identifier registered for this turn;
-                // no request wording or phrase matcher participates.
-                && available_tool_names.contains(name)
-        })
-        && receipt.exit_codes.len() <= 16
-        && receipt.outcome_statuses.len() <= 6
-}
-
-fn recover_required_invocations(
-    envelope: &Value,
-    available_tool_names: &[String],
-) -> Vec<crate::traits::RequestReceiptPredicate> {
-    if envelope.get("schema_version").and_then(Value::as_u64)
-        != Some(TASK_CONTRACT_RECOVERY_SCHEMA_VERSION.into())
-        || !confidence_is_sufficient(
-            envelope
-                .get("contract")
-                .and_then(|contract| contract.get("confidence"))
-                .and_then(Value::as_str),
-        )
-    {
-        return Vec::new();
-    }
-    let Some(items) = envelope
-        .get("contract")
-        .and_then(|contract| contract.get("required_invocations"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    if items.len() > 8 {
-        return Vec::new();
-    }
-
-    let mut recovered = Vec::new();
-    for item in items {
-        let Ok(receipt) =
-            serde_json::from_value::<crate::traits::RequestReceiptPredicate>(item.clone())
-        else {
-            continue;
-        };
-        if valid_required_invocation(&receipt, available_tool_names)
-            && !recovered.contains(&receipt)
-        {
-            recovered.push(receipt);
-        }
-    }
-    recovered
-}
 
 fn confidence_is_sufficient(value: Option<&str>) -> bool {
     matches!(
@@ -750,6 +674,47 @@ pub(crate) struct TaskPlan {
     pub mode: TaskAssessmentMode,
 }
 
+fn decode_task_plan_result(
+    response: &ProviderResponse,
+    mode: TaskAssessmentMode,
+) -> Result<TaskPlan, String> {
+    let content = response
+        .content
+        .as_deref()
+        .ok_or_else(|| "empty_structured_response".to_string())?;
+    let json_str = crate::utils::extract_json_object(content)
+        .ok_or_else(|| "missing_json_object".to_string())?;
+    let envelope: Value =
+        serde_json::from_str(&json_str).map_err(|error| format!("invalid_json: {error}"))?;
+    let parsed =
+        decode_task_plan_response(&envelope).ok_or_else(|| "response_not_object".to_string())?;
+    let received_schema_version = parsed.schema_version;
+    let parsed = migrate_task_plan_response(parsed).ok_or_else(|| {
+        format!(
+            "unsupported_schema_version:{received_schema_version};supported:{TASK_CONTRACT_SCHEMA_VERSION}"
+        )
+    })?;
+    if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
+        return Err("empty_semantic_envelope".to_string());
+    }
+
+    let mut steps = parsed.steps;
+    let mut success_criteria = parsed.success_criteria;
+    if !mode.includes_step_plan() {
+        steps.clear();
+        success_criteria.clear();
+    }
+    steps.truncate(MAX_PLAN_STEPS);
+    Ok(TaskPlan {
+        goal: parsed.goal,
+        steps,
+        success_criteria,
+        contract: parsed.contract,
+        task_shape: parsed.task_shape,
+        mode,
+    })
+}
+
 /// Compiled policy for automatic memory access and persistence during one task.
 ///
 /// This is deliberately derived from the same grounded semantic assessment
@@ -814,8 +779,8 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
-const TASK_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const TASK_CONTRACT_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TASK_ASSESSMENT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 #[derive(Clone, Copy)]
@@ -826,12 +791,19 @@ pub(crate) struct PlannerTelemetryCtx<'a> {
     pub task_id: &'a str,
 }
 
+struct AuxiliaryAttemptTelemetry {
+    attempt: u32,
+    fell_back: bool,
+    validation_error: Option<String>,
+}
+
 async fn record_auxiliary_model_call(
     telemetry: Option<PlannerTelemetryCtx<'_>>,
     call_purpose: &str,
     model: &str,
     response: &ProviderResponse,
     latency_ms: u64,
+    attempt_telemetry: AuxiliaryAttemptTelemetry,
 ) {
     let Some(telemetry) = telemetry else {
         return;
@@ -870,8 +842,8 @@ async fn record_auxiliary_model_call(
                 iteration: Some(0),
                 model: model.to_string(),
                 final_model: Some(model.to_string()),
-                fell_back: false,
-                attempts: 1,
+                fell_back: attempt_telemetry.fell_back,
+                attempts: attempt_telemetry.attempt,
                 latency_ms,
                 prompt_ms: None,
                 decode_ms: None,
@@ -897,8 +869,8 @@ async fn record_auxiliary_model_call(
                 projected_source_turn_ids: Vec::new(),
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
-                failed: false,
-                error: None,
+                failed: attempt_telemetry.validation_error.is_some(),
+                error: attempt_telemetry.validation_error,
             },
             token_usage: response.usage.clone(),
         },
@@ -911,6 +883,8 @@ async fn record_auxiliary_model_failure(
     call_purpose: &str,
     model: &str,
     latency_ms: u64,
+    attempt: u32,
+    fell_back: bool,
     error: impl Into<String>,
 ) {
     let Some(telemetry) = telemetry else {
@@ -931,8 +905,8 @@ async fn record_auxiliary_model_failure(
                 iteration: Some(0),
                 model: model.to_string(),
                 final_model: Some(model.to_string()),
-                fell_back: false,
-                attempts: 1,
+                fell_back,
+                attempts: attempt,
                 latency_ms,
                 prompt_ms: None,
                 decode_ms: None,
@@ -975,7 +949,7 @@ async fn record_auxiliary_model_failure(
 #[allow(dead_code)]
 pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
-    model: &str,
+    model_candidates: &[String],
     user_text: &str,
     conversation_context: Option<&str>,
     mode: TaskAssessmentMode,
@@ -1187,269 +1161,112 @@ pub(crate) async fn generate_task_plan(
         json!({ "role": "user", "content": user_prompt }),
     ];
 
-    let call_start = Instant::now();
-    let result = match tokio::time::timeout(
-        TASK_ASSESSMENT_TIMEOUT,
-        provider.chat(model, &messages, &[]),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_assessment",
-                model,
-                call_start.elapsed().as_millis() as u64,
-                format!("provider_error: {e}"),
-            )
-            .await;
-            warn!(error = %e, "Task assessment call failed");
-            return None;
-        }
-        Err(_) => {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_assessment",
-                model,
-                call_start.elapsed().as_millis() as u64,
-                "timeout",
-            )
-            .await;
-            warn!(
-                timeout_secs = TASK_ASSESSMENT_TIMEOUT.as_secs(),
-                "Task assessment call timed out"
-            );
-            return None;
-        }
+    let options = crate::traits::ChatOptions {
+        response_mode: crate::traits::ResponseMode::JsonObject,
+        tool_choice: crate::traits::ToolChoiceMode::None,
+        max_tokens_override: Some(4096),
+        reasoning_effort_override: Some("low".to_string()),
+        // Retries and model failover are owned here so the aggregate deadline
+        // covers every physical attempt rather than hiding retries inside a
+        // provider adapter.
+        single_attempt_fail_closed: true,
+        ..crate::traits::ChatOptions::default()
     };
-    record_auxiliary_model_call(
-        telemetry,
-        "task_assessment",
-        model,
-        &result,
-        call_start.elapsed().as_millis() as u64,
-    )
-    .await;
-
-    let content = result.content.as_deref().unwrap_or("");
-
-    let json_str = match crate::utils::extract_json_object(content) {
-        Some(s) => s,
-        None => {
-            warn!("Task assessment response: no valid JSON found");
-            return None;
-        }
-    };
-
-    let envelope: Value = match serde_json::from_str(&json_str) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            warn!(%error, "Task assessment response unparseable");
-            return None;
-        }
-    };
-    let Some(parsed) = decode_task_plan_response(&envelope) else {
-        warn!("Task assessment response is not a JSON object");
-        return None;
-    };
-
-    let received_schema_version = parsed.schema_version;
-    let Some(parsed) = migrate_task_plan_response(parsed) else {
-        warn!(
-            received = received_schema_version,
-            supported = TASK_CONTRACT_SCHEMA_VERSION,
-            "Task assessment response used an unsupported schema version"
-        );
-        return None;
-    };
-
-    if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
-        return None;
-    }
-
-    let mut steps = parsed.steps;
-    let mut success_criteria = parsed.success_criteria;
-    if !mode.includes_step_plan() {
-        steps.clear();
-        success_criteria.clear();
-    }
-
-    steps.truncate(MAX_PLAN_STEPS);
-
-    info!(
-        goal = %parsed.goal,
-        step_count = steps.len(),
-        assessment_mode = mode.as_str(),
-        "Task assessment generated"
-    );
-
-    Some(TaskPlan {
-        goal: parsed.goal,
-        steps,
-        success_criteria,
-        contract: parsed.contract,
-        task_shape: parsed.task_shape,
-        mode,
-    })
-}
-
-/// Recover the authoritative completion/capability contract independently of
-/// dialogue routing when the broad assessment envelope is unavailable.
-///
-/// This intentionally cannot select an antecedent or create a step plan. A
-/// separate relationship assessor owns dialogue edges, while the main model
-/// remains responsible for choosing an approach. The returned contract still
-/// passes the same completeness and grounding checks as the primary path.
-pub(crate) async fn generate_task_contract_recovery(
-    provider: Arc<dyn ModelProvider>,
-    model: &str,
-    user_text: &str,
-    available_tool_names: &[String],
-    mode: TaskAssessmentMode,
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
-) -> TaskContractRecoveryOutcome {
-    let system = "You are a semantic task-contract compiler. Return only valid JSON. Classify obligations and authority from the current request; do not plan an approach, select dialogue history, or infer from isolated keywords.";
-    let prompt = format!(
-        "Current user request:\n{user_text}\n\n\
-         Return exactly one object with this shape (use empty arrays when absent):\n\
-         {{\"schema_version\":1,\"goal\":\"short semantic summary\",\"contract\":{{\
-         \"confidence\":\"low|medium|high\",\
-         \"task_kind\":\"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\
-         \"expects_mutation\":false,\"requires_observation\":false,\"required_effects\":[],\
-         \"mutation_scope\":\"allowed|read_only|scoped\",\"forbidden_actions\":[],\
-         \"tool_scope\":\"allowed|forbidden|restricted\",\
-         \"allowed_tool_names\":[],\"forbidden_tool_scopes\":[],\
-         \"minimum_sources\":0,\"requires_primary_sources\":false,\
-         \"requires_exact_history\":false,\"evidence_requirements\":[],\
-         \"required_invocations\":[],\
-         \"filesystem_access\":{{\"execution_cwd\":null,\"read_paths\":[],\"write_paths\":[]}},\
-         \"project_reference\":null}}}}.\n\n\
-         Each evidence requirement has {{\"summary\":\"material fact\",\
-         \"acceptable_scopes\":[\"goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"],\
-         \"purpose\":\"current_state|historical_record|content|outcome|attribution|causal_explanation\",\
-         \"minimum_authority\":\"advisory|direct|canonical\",\
-         \"temporal_scope\":\"current|historical|both\",\
-         \"required_content_markers\":[],\"receipt\":null}}.\n\
-         Each required invocation is {{\"tool_names\":[\"one exact identifier\"],\
-         \"exit_codes\":[],\"outcome_statuses\":[],\"requires_output\":false,\
-         \"contract_rejected\":null}}.\n\n\
-         Invariants:\n\
-         - A request to perform or observe a named machine invocation creates one required_invocations entry. This lane proves invocation occurrence/result and is separate from subject-matter evidence.\n\
-         - Current-run tests, current state, files, history, or remote facts require observation and at least one evidence requirement or required invocation. Static explanation and ordinary conversation do not.\n\
-         - For an explicitly expected negative process result, encode its exact acceptable exit/outcome in the invocation receipt; do not reinterpret it as task failure.\n\
-         - tool_scope=restricted only when the current request itself limits tools to exact registered identifiers. Tool policies are typed restrictions, never prose-match rules.\n\
-         - read_only/scoped mutation constraints are typed restrictions. Do not emit source phrases, keywords, or prose markers.\n\
-         - required_response_fields is retired and must be []. Do not invent prose markers.\n\
-         - Filesystem fields contain only exact current-request paths and their actual read/write roles. A working directory is not implicitly writable.\n\
-         - Mutation task kinds are change/deliver/schedule/monitor. They require nonempty required_effects. All other task kinds have expects_mutation=false and required_effects=[].\
-         - Keep source authority and temporal scope faithful to the requested fact. Use canonical for exact daemon history/state ledgers.\n\
-         - Use forbidden action values only from create, delete, deploy, publish, post, send.",
-        user_text = truncate_str(user_text, 4000),
-    );
-    let messages = vec![
-        json!({ "role": "system", "content": system }),
-        json!({ "role": "user", "content": prompt }),
-    ];
-    let call_start = Instant::now();
-    let result = match tokio::time::timeout(
-        TASK_CONTRACT_RECOVERY_TIMEOUT,
-        provider.chat(model, &messages, &[]),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_contract_recovery",
-                model,
-                call_start.elapsed().as_millis() as u64,
-                format!("provider_error: {error}"),
-            )
-            .await;
-            warn!(%error, "Task contract recovery call failed");
-            return TaskContractRecoveryOutcome::default();
-        }
-        Err(_) => {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_contract_recovery",
-                model,
-                call_start.elapsed().as_millis() as u64,
-                "timeout",
-            )
-            .await;
-            warn!(
-                timeout_secs = TASK_CONTRACT_RECOVERY_TIMEOUT.as_secs(),
-                "Task contract recovery call timed out"
-            );
-            return TaskContractRecoveryOutcome::default();
-        }
-    };
-    record_auxiliary_model_call(
-        telemetry,
-        "task_contract_recovery",
-        model,
-        &result,
-        call_start.elapsed().as_millis() as u64,
-    )
-    .await;
-    let Some(json_str) = crate::utils::extract_json_object(result.content.as_deref().unwrap_or(""))
-    else {
-        return TaskContractRecoveryOutcome::default();
-    };
-    let Ok(envelope) = serde_json::from_str::<Value>(&json_str)
-        .inspect_err(|error| warn!(%error, "Task contract recovery response is not a JSON object"))
-    else {
-        return TaskContractRecoveryOutcome::default();
-    };
-    let required_invocations = recover_required_invocations(&envelope, available_tool_names);
-    let schema_version = envelope
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        .and_then(|version| u16::try_from(version).ok())
-        .unwrap_or_default();
-    let contract = envelope
-        .get("contract")
-        .and_then(decode_planned_contract_candidate);
-    let Some(contract) = contract else {
-        warn!(
-            salvaged_invocation_count = required_invocations.len(),
-            "Task contract recovery contains no typed contract object"
-        );
-        return TaskContractRecoveryOutcome {
-            plan: None,
-            required_invocations,
+    let assessment_start = Instant::now();
+    for (candidate_index, model) in model_candidates.iter().enumerate() {
+        let Some(remaining) = TASK_ASSESSMENT_TOTAL_TIMEOUT.checked_sub(assessment_start.elapsed())
+        else {
+            break;
         };
-    };
-    if schema_version != TASK_CONTRACT_RECOVERY_SCHEMA_VERSION
-        || !planned_contract_is_confident(&contract, None)
-    {
-        warn!(
-            schema_version,
-            "Task contract recovery returned an untrusted contract candidate"
-        );
-        return TaskContractRecoveryOutcome {
-            plan: None,
-            required_invocations,
+        let attempt_timeout = TASK_ASSESSMENT_ATTEMPT_TIMEOUT.min(remaining);
+        if attempt_timeout.is_zero() {
+            break;
+        }
+        let call_start = Instant::now();
+        let result = match tokio::time::timeout(
+            attempt_timeout,
+            provider.chat_with_options(model, &messages, &[], &options),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_assessment",
+                    model,
+                    call_start.elapsed().as_millis() as u64,
+                    (candidate_index + 1) as u32,
+                    candidate_index > 0,
+                    format!("provider_error: {error}"),
+                )
+                .await;
+                warn!(%error, %model, "Task assessment attempt failed");
+                continue;
+            }
+            Err(_) => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_assessment",
+                    model,
+                    call_start.elapsed().as_millis() as u64,
+                    (candidate_index + 1) as u32,
+                    candidate_index > 0,
+                    "timeout",
+                )
+                .await;
+                warn!(
+                    %model,
+                    timeout_ms = attempt_timeout.as_millis(),
+                    "Task assessment attempt timed out"
+                );
+                continue;
+            }
         };
+        match decode_task_plan_result(&result, mode) {
+            Ok(plan) => {
+                record_auxiliary_model_call(
+                    telemetry,
+                    "task_assessment",
+                    model,
+                    &result,
+                    call_start.elapsed().as_millis() as u64,
+                    AuxiliaryAttemptTelemetry {
+                        attempt: (candidate_index + 1) as u32,
+                        fell_back: candidate_index > 0,
+                        validation_error: None,
+                    },
+                )
+                .await;
+                info!(
+                    goal = %plan.goal,
+                    step_count = plan.steps.len(),
+                    assessment_mode = mode.as_str(),
+                    %model,
+                    fallback = candidate_index > 0,
+                    "Task assessment generated"
+                );
+                return Some(plan);
+            }
+            Err(error) => {
+                record_auxiliary_model_call(
+                    telemetry,
+                    "task_assessment",
+                    model,
+                    &result,
+                    call_start.elapsed().as_millis() as u64,
+                    AuxiliaryAttemptTelemetry {
+                        attempt: (candidate_index + 1) as u32,
+                        fell_back: candidate_index > 0,
+                        validation_error: Some(error.clone()),
+                    },
+                )
+                .await;
+                warn!(%model, %error, "Task assessment response rejected");
+            }
+        }
     }
-    TaskContractRecoveryOutcome {
-        plan: Some(TaskPlan {
-            goal: envelope
-                .get("goal")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            steps: Vec::new(),
-            success_criteria: Vec::new(),
-            contract: Some(contract),
-            task_shape: None,
-            mode,
-        }),
-        required_invocations,
-    }
+    None
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -1496,6 +1313,8 @@ pub(crate) async fn generate_task_relationship(
                 "task_relationship_fallback",
                 model,
                 call_start.elapsed().as_millis() as u64,
+                1,
+                false,
                 format!("provider_error: {error}"),
             )
             .await;
@@ -1508,6 +1327,8 @@ pub(crate) async fn generate_task_relationship(
                 "task_relationship_fallback",
                 model,
                 call_start.elapsed().as_millis() as u64,
+                1,
+                false,
                 "timeout",
             )
             .await;
@@ -1524,6 +1345,11 @@ pub(crate) async fn generate_task_relationship(
         model,
         &response,
         call_start.elapsed().as_millis() as u64,
+        AuxiliaryAttemptTelemetry {
+            attempt: 1,
+            fell_back: false,
+            validation_error: None,
+        },
     )
     .await;
 
@@ -1673,6 +1499,11 @@ pub(crate) async fn evaluate_step_completion(
         &model,
         &result,
         call_start.elapsed().as_millis() as u64,
+        AuxiliaryAttemptTelemetry {
+            attempt: 1,
+            fell_back: false,
+            validation_error: None,
+        },
     )
     .await;
 
@@ -2211,132 +2042,6 @@ mod tests {
         assert_eq!(contract.task_kind.as_deref(), Some("answer"));
     }
 
-    #[tokio::test]
-    async fn contract_recovery_preserves_named_invocation_as_typed_obligation() {
-        let response = crate::testing::MockProvider::text_response(
-            r#"{
-              "schema_version": 1,
-              "goal": "Inspect the runtime environment",
-              "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["check_environment"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Use check_environment exactly once"],
-                "required_response_fields": [],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "required_invocations": [{
-                  "tool_names": ["check_environment"],
-                  "exit_codes": [],
-                  "outcome_statuses": ["succeeded"],
-                  "requires_output": true,
-                  "contract_rejected": null
-                }],
-                "filesystem_access": {
-                  "execution_cwd": null,
-                  "read_paths": [],
-                  "write_paths": []
-                },
-                "project_reference": null
-              }
-            }"#,
-        );
-        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
-        let recovered = generate_task_contract_recovery(
-            std::sync::Arc::new(provider),
-            "synthetic-model",
-            "Use check_environment exactly once and report its result.",
-            &["check_environment".to_string()],
-            TaskAssessmentMode::AutonomousRouting,
-            None,
-        )
-        .await;
-        let plan = recovered.plan.expect("recovered contract");
-
-        let signals = plan.contract.expect("contract");
-        assert!(planned_contract_is_complete(&signals));
-        assert_eq!(
-            signals.required_invocations.as_deref().unwrap()[0].tool_names,
-            ["check_environment"]
-        );
-        assert!(plan.steps.is_empty());
-        assert!(plan.task_shape.is_none());
-    }
-
-    #[tokio::test]
-    async fn contract_recovery_salvages_obligation_from_malformed_authority_lane() {
-        let response = crate::testing::MockProvider::text_response(
-            r#"{
-              "schema_version": 1,
-              "goal": "Observe a management call",
-              "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["manage_mandates"],
-                "forbidden_tool_scopes": ["no other tool"],
-                "tool_constraint_evidence": ["Use manage_mandates exactly once"],
-                "required_response_fields": [],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "required_invocations": [{
-                  "tool_names": ["manage_mandates"],
-                  "exit_codes": [],
-                  "outcome_statuses": ["succeeded"],
-                  "requires_output": true,
-                  "contract_rejected": false
-                }],
-                "filesystem_access": {
-                  "execution_cwd": null,
-                  "read_paths": [],
-                  "write_paths": []
-                },
-                "project_reference": null
-              }
-            }"#,
-        );
-        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
-        let recovered = generate_task_contract_recovery(
-            std::sync::Arc::new(provider),
-            "synthetic-model",
-            "Use manage_mandates exactly once and report the receipt.",
-            &["manage_mandates".to_string()],
-            TaskAssessmentMode::AutonomousRouting,
-            None,
-        )
-        .await;
-
-        let plan = recovered
-            .plan
-            .expect("valid lifecycle lanes survive a malformed authority item");
-        let contract = plan.contract.expect("typed contract");
-        assert!(contract.forbidden_tool_scopes.is_empty());
-        assert_eq!(contract.allowed_tool_names, ["manage_mandates"]);
-        assert_eq!(recovered.required_invocations.len(), 1);
-        assert_eq!(
-            recovered.required_invocations[0].tool_names,
-            ["manage_mandates"]
-        );
-    }
-
     #[test]
     fn test_parse_semantic_task_shape_and_scoped_mutation() {
         let json = r#"{
@@ -2403,9 +2108,10 @@ mod tests {
         let mut provider = crate::testing::MockProvider::with_responses(vec![response]);
         provider.skip_planning_calls = false;
 
+        let models = vec!["gpt-5".to_string()];
         let assessment = generate_task_plan(
             Arc::new(provider),
-            "gpt-5",
+            &models,
             "Update the file and verify it.",
             None,
             TaskAssessmentMode::AutonomousRouting,
@@ -2424,6 +2130,98 @@ mod tests {
                 .and_then(|shape| shape.execution_mode.as_deref()),
             Some("inline")
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_compiler_fails_over_after_invalid_structured_response() {
+        let invalid = crate::testing::MockProvider::text_response("");
+        let valid = crate::testing::MockProvider::text_response(
+            r#"{
+                "schema_version": 9,
+                "goal": "Observe one synthetic process result",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true,
+                    "required_effects": [],
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": [],
+                    "tool_scope": "restricted",
+                    "allowed_tool_names": ["terminal"],
+                    "forbidden_tool_scopes": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [{
+                        "tool_names": ["terminal"],
+                        "exit_codes": [1],
+                        "outcome_statuses": ["completed_with_negative_result"],
+                        "requires_output": false,
+                        "contract_rejected": false
+                    }],
+                    "filesystem_access": {
+                        "execution_cwd": "/tmp",
+                        "read_paths": [],
+                        "write_paths": []
+                    },
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "continue_inline_after_background_start": false,
+                    "request_relationship": "new_request",
+                    "antecedent_user_message_id": null,
+                    "semantic_scope": "host_local"
+                }
+            }"#,
+        );
+        let mut mock = crate::testing::MockProvider::with_responses(vec![invalid, valid]);
+        mock.skip_planning_calls = false;
+        let provider = Arc::new(mock);
+        let models = vec![
+            "synthetic-primary".to_string(),
+            "synthetic-fallback".to_string(),
+        ];
+
+        let assessment = generate_task_plan(
+            provider.clone(),
+            &models,
+            "Observe the requested synthetic process result.",
+            None,
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("fallback assessment");
+
+        assert_eq!(
+            assessment
+                .contract
+                .as_ref()
+                .and_then(|contract| contract.required_invocations.as_ref())
+                .expect("typed invocation")[0]
+                .outcome_statuses,
+            [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
+        );
+        let calls = provider.call_log.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].model, "synthetic-primary");
+        assert_eq!(calls[1].model, "synthetic-fallback");
+        assert!(calls.iter().all(|call| {
+            matches!(
+                call.options.response_mode,
+                crate::traits::ResponseMode::JsonObject
+            ) && call.options.reasoning_effort_override.as_deref() == Some("low")
+                && call.options.tool_choice == crate::traits::ToolChoiceMode::None
+                && call.options.single_attempt_fail_closed
+        }));
     }
 
     #[tokio::test]
@@ -2521,9 +2319,10 @@ mod tests {
         let mut provider = crate::testing::MockProvider::with_responses(vec![response]);
         provider.skip_planning_calls = false;
 
+        let models = vec!["local-model".to_string()];
         let assessment = generate_task_plan(
             Arc::new(provider),
-            "local-model",
+            &models,
             "Update the file.",
             None,
             TaskAssessmentMode::GuidedPlan,

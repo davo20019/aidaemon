@@ -61,7 +61,7 @@ pub(in crate::agent) async fn build_resume_checkpoint(
                 if let Ok(data) = event.parse_data::<ToolResultData>() {
                     tool_results_count = tool_results_count.saturating_add(1);
                     pending_tool_calls.remove(&data.tool_call_id);
-                    let detail = if data.success {
+                    let detail = if !data.failed() {
                         data.result
                     } else {
                         data.error.unwrap_or(data.result)

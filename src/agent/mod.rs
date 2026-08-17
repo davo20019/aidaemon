@@ -273,10 +273,10 @@ pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
 pub(in crate::agent) use history::{
     append_evidence_obligations, append_required_invocation_obligations, apply_semantic_authority,
-    inherit_unfinished_request_contract, install_semantic_completion_contract,
-    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
-    retain_structural_completion_contract, SemanticAuthorityRequirements,
-    SemanticCompletionRequirements,
+    apply_semantic_evidence_policy, inherit_unfinished_request_contract,
+    install_semantic_completion_contract, parse_planned_forbidden_action,
+    parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
+    SemanticAuthorityRequirements, SemanticCompletionRequirements, SemanticEvidencePolicy,
 };
 pub(in crate::agent) use history::{
     authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,

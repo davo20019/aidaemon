@@ -318,10 +318,11 @@ impl SessionContextCompiler {
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<ToolResultData>() {
+                        let success = data.succeeded();
                         recent_tools.push(RecentTool {
                             name: data.name,
                             summary: truncate_str(&data.result, 50).to_string(),
-                            success: data.success,
+                            success,
                             timestamp: event.created_at,
                         });
                     }

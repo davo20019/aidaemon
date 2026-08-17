@@ -166,7 +166,7 @@ pub(super) fn duplicate_successful_tool_result_count(
                 let Ok(result) = event.parse_data::<ToolResultData>() else {
                     continue;
                 };
-                if result.success
+                if result.completed_observation()
                     && result.name == tool_name
                     && matching_call_ids.contains(&result.tool_call_id)
                     && normalized_tool_result_for_duplicate_detection(&result.result)

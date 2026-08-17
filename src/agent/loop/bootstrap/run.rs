@@ -97,7 +97,6 @@ async fn finalize_turn_assessment(
     structural_resume: bool,
     initial_turn_context: &TurnContext,
     plan: Option<&super::task_planning::TaskPlan>,
-    recovered_required_invocations: &[crate::traits::RequestReceiptPredicate],
     available_tool_names: &[String],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
@@ -225,6 +224,7 @@ async fn finalize_turn_assessment(
     let mut compiled_evidence_requirements = Vec::new();
     let mut compiled_required_invocations = Vec::new();
     let mut compiled_authority = None;
+    let mut compiled_evidence_policy = None;
     let mut compiled_filesystem_access = None;
     let mut compiled_project_scope = None;
 
@@ -261,6 +261,7 @@ async fn finalize_turn_assessment(
         compiled_evidence_requirements = compiled.evidence_requirements.clone();
         compiled_required_invocations = compiled.required_invocations.clone();
         compiled_authority = Some(compiled.authority.clone());
+        compiled_evidence_policy = Some(compiled.evidence_policy.clone());
         compiled_filesystem_access = compiled.filesystem_access.clone();
         compiled_project_scope = compiled.project_scope.clone();
 
@@ -272,11 +273,6 @@ async fn finalize_turn_assessment(
                     requires_observation: core.requires_observation,
                     task_kind: core.task_kind,
                     required_mutation_effects: core.required_mutation_effects,
-                    minimum_sources: core.minimum_sources,
-                    requires_primary_sources: core.requires_primary_sources,
-                    requires_exact_history: core.requires_exact_history,
-                    evidence_requirements: &compiled.evidence_requirements,
-                    required_invocations: &compiled.required_invocations,
                 },
             );
             if turn_context.inherited_completion_contract {
@@ -297,12 +293,7 @@ async fn finalize_turn_assessment(
         }
     }
 
-    let mut effective_required_invocations = compiled_required_invocations.clone();
-    for receipt in recovered_required_invocations {
-        if !effective_required_invocations.contains(receipt) {
-            effective_required_invocations.push(receipt.clone());
-        }
-    }
+    let effective_required_invocations = compiled_required_invocations.clone();
     let typed_obligation_pending =
         !compiled_evidence_requirements.is_empty() || !effective_required_invocations.is_empty();
     if agent.mandate_execution.is_none()
@@ -323,6 +314,16 @@ async fn finalize_turn_assessment(
                 forbids_tool_use: authority.forbids_tool_use,
                 allowed_tool_names: &authority.allowed_tool_names,
                 forbidden_tool_scopes: &authority.forbidden_tool_scopes,
+            },
+        );
+    }
+    if let Some(policy) = compiled_evidence_policy {
+        crate::agent::apply_semantic_evidence_policy(
+            &mut turn_context.completion_contract,
+            crate::agent::SemanticEvidencePolicy {
+                minimum_sources: policy.minimum_sources,
+                requires_primary_sources: policy.requires_primary_sources,
+                requires_exact_history: policy.requires_exact_history,
             },
         );
     }
@@ -1235,10 +1236,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     } else {
         super::task_planning::planning_skip_reason(user_text, false)
     };
-    let planner_model = llm_router
+    let planner_models = llm_router
         .as_ref()
-        .map(|router| router.select(crate::router::Tier::Primary))
-        .unwrap_or(model.as_str());
+        .map_or_else(|| vec![model.clone()], |router| router.all_models_ordered());
+    let planner_model = planner_models
+        .first()
+        .map_or(model.as_str(), String::as_str);
     let planner_context = super::task_planning::task_assessment_conversation_context(
         initial_turn_context.followup_mode,
         session_summary
@@ -1246,7 +1249,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .map(|summary| summary.summary.as_str()),
         &initial_turn_context.assessment_recent_messages,
     );
-    let (mut task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
+    let (task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
         agent
             .emit_decision_point(
                 &emitter,
@@ -1282,7 +1285,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         (
             super::task_planning::generate_task_plan(
                 llm_provider.clone(),
-                planner_model,
+                &planner_models,
                 user_text,
                 planner_context.as_deref(),
                 assessment_mode,
@@ -1315,35 +1318,21 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         })
         .collect::<Vec<_>>();
     let mut relationship_fallback = None;
-    let mut recovered_required_invocations = Vec::new();
     if task_assessment_attempted && task_plan.is_none() {
-        // The recovery compilers own independent typed products. Run them
-        // concurrently so a slow contract recovery cannot serially delay the
-        // dialogue edge (or vice versa); neither result can rewrite the other.
-        let contract_recovery = super::task_planning::generate_task_contract_recovery(
-            llm_provider.clone(),
-            planner_model,
-            user_text,
-            &available_tool_names,
-            assessment_mode,
-            planner_telemetry,
-        );
-        let relationship_recovery = async {
-            let planner_context = planner_context.as_deref()?;
-            super::task_planning::generate_task_relationship(
+        // Contract classification has one authoritative structured compiler.
+        // It already owns bounded model failover, so a second prompt with a
+        // subtly different schema would create disagreement rather than
+        // recovery. Dialogue relationship remains an independent typed lane.
+        if let Some(planner_context) = planner_context.as_deref() {
+            relationship_fallback = super::task_planning::generate_task_relationship(
                 llm_provider.clone(),
                 planner_model,
                 user_text,
                 planner_context,
                 planner_telemetry,
             )
-            .await
-        };
-        let (recovered_contract, recovered_relationship) =
-            tokio::join!(contract_recovery, relationship_recovery);
-        recovered_required_invocations = recovered_contract.required_invocations;
-        task_plan = recovered_contract.plan;
-        relationship_fallback = recovered_relationship;
+            .await;
+        }
     }
     if relationship_fallback.is_none()
         && task_assessment_attempted
@@ -1373,7 +1362,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         resume_checkpoint.is_some(),
         &initial_turn_context,
         task_plan.as_ref(),
-        &recovered_required_invocations,
         &available_tool_names,
         relationship_fallback.as_ref(),
         task_assessment_attempted,

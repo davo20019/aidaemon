@@ -602,7 +602,7 @@ impl Consolidator {
                     for next_event in events.iter().take(events.len().min(i + 10)).skip(i + 1) {
                         if next_event.event_type == EventType::ToolResult {
                             if let Ok(result_data) = next_event.parse_data::<ToolResultData>() {
-                                if result_data.success {
+                                if result_data.succeeded() {
                                     recovery_tool = Some(result_data.name);
                                     recovery_summary = Some(truncate(&result_data.result, 200));
                                     break;
@@ -1327,7 +1327,7 @@ fn next_successful_tool_after(task_events: &[&Event], start_idx: usize) -> Optio
             return None;
         }
         let data = event.parse_data::<ToolResultData>().ok()?;
-        data.success.then_some(data.name)
+        data.succeeded().then_some(data.name)
     })
 }
 

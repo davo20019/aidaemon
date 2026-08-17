@@ -2135,7 +2135,7 @@ mod stuck_fallback_tests {
                 tool_call_id: "call-parent".to_string(),
                 name: "terminal".to_string(),
                 result: result.to_string(),
-                success: true,
+                success: status == crate::traits::ToolOutcomeStatus::Succeeded,
                 duration_ms: 1,
                 error: None,
                 task_id: Some("task-parent".to_string()),

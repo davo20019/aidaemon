@@ -561,7 +561,7 @@ pub(super) async fn latest_task_tool_result_for_completion(
         // completion recovery and can mislead the synthesis path (e.g.,
         // a web_fetch 403 error being synthesized instead of successful
         // web_search results).
-        if !data.success {
+        if !data.completed_observation() {
             continue;
         }
         let tool_name = data.name.trim();

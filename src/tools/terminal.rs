@@ -1703,6 +1703,43 @@ pub(crate) async fn confined_terminal_execution_request(
     read_paths: &[String],
     write_paths: &[String],
 ) -> anyhow::Result<ExecutionRequest> {
+    confined_terminal_execution_request_inner(
+        backend,
+        command,
+        false,
+        working_dir,
+        read_paths,
+        write_paths,
+    )
+    .await
+}
+
+async fn confined_terminal_script_execution_request(
+    backend: &SharedExecutionBackend,
+    script: &str,
+    working_dir: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> anyhow::Result<ExecutionRequest> {
+    confined_terminal_execution_request_inner(
+        backend,
+        script,
+        true,
+        working_dir,
+        read_paths,
+        write_paths,
+    )
+    .await
+}
+
+async fn confined_terminal_execution_request_inner(
+    backend: &SharedExecutionBackend,
+    shell_source: &str,
+    script_via_stdin: bool,
+    working_dir: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> anyhow::Result<ExecutionRequest> {
     let cwd = match working_dir {
         Some(path) => {
             let resolved = backend.resolve_path(path).await?;
@@ -1711,7 +1748,13 @@ pub(crate) async fn confined_terminal_execution_request(
         None => None,
     };
     if cwd.is_none() && read_paths.is_empty() && write_paths.is_empty() {
-        return Ok(ExecutionRequest::shell(command));
+        if script_via_stdin {
+            let mut request =
+                ExecutionRequest::argv("/bin/sh", vec!["-eu".to_string(), "-s".to_string()]);
+            request.stdin = Some(shell_source.as_bytes().to_vec());
+            return Ok(request);
+        }
+        return Ok(ExecutionRequest::shell(shell_source));
     }
 
     let codex = backend
@@ -1747,7 +1790,7 @@ pub(crate) async fn confined_terminal_execution_request(
     // granting their entire home directory would expose unrelated data and
     // credentials. Resolve exact machine invocations and add only registered,
     // read-only runtime roots/caches.
-    let runtime_support = native_sandbox_runtime_support(backend, command).await?;
+    let runtime_support = native_sandbox_runtime_support(backend, shell_source).await?;
     for path in &runtime_support.read_paths {
         if !reads.contains(path) && !writes.contains(path) {
             reads.push(path.clone());
@@ -1785,10 +1828,21 @@ pub(crate) async fn confined_terminal_execution_request(
             .iter()
             .map(|(name, value)| format!("{name}={value}")),
     );
-    args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
+    if script_via_stdin {
+        args.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+    } else {
+        args.extend([
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            shell_source.to_string(),
+        ]);
+    }
     let mut request = ExecutionRequest::argv(codex.to_string(), args);
     request.cwd = cwd;
     request.env.extend(sandbox_environment);
+    if script_via_stdin {
+        request.stdin = Some(shell_source.as_bytes().to_vec());
+    }
     Ok(request)
 }
 
@@ -3797,6 +3851,7 @@ impl TerminalTool {
     async fn handle_run(&self, request: TerminalRunRequest<'_>) -> anyhow::Result<ToolCallOutcome> {
         let TerminalRunRequest {
             command,
+            script_via_stdin,
             working_dir,
             read_paths,
             write_paths,
@@ -3812,7 +3867,15 @@ impl TerminalTool {
             working_dir.is_some() || !read_paths.is_empty() || !write_paths.is_empty(),
             !write_paths.is_empty(),
         );
-        let dedupe_identity = format!("cwd={}\0{command}", working_dir.unwrap_or_default());
+        let execution_mode = if script_via_stdin {
+            "script"
+        } else {
+            "command"
+        };
+        let dedupe_identity = format!(
+            "mode={execution_mode}\0cwd={}\0{command}",
+            working_dir.unwrap_or_default()
+        );
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
@@ -3831,14 +3894,25 @@ impl TerminalTool {
             });
         }
 
-        let execution_request = confined_terminal_execution_request(
-            &self.backend,
-            command,
-            working_dir,
-            read_paths,
-            write_paths,
-        )
-        .await?;
+        let execution_request = if script_via_stdin {
+            confined_terminal_script_execution_request(
+                &self.backend,
+                command,
+                working_dir,
+                read_paths,
+                write_paths,
+            )
+            .await?
+        } else {
+            confined_terminal_execution_request(
+                &self.backend,
+                command,
+                working_dir,
+                read_paths,
+                write_paths,
+            )
+            .await?
+        };
         let mut spawned = self.backend.spawn(execution_request).await?;
         let process_handle = spawned.handle().clone();
         let pid = process_handle.display_id();
@@ -4191,11 +4265,8 @@ impl TerminalTool {
                                                         tool_call_id: tool_call_id.clone(),
                                                         name: "terminal".to_string(),
                                                         result: with_notice.clone(),
-                                                        success: matches!(
-                                                            outcome_status,
-                                                            ToolOutcomeStatus::Succeeded
-                                                                | ToolOutcomeStatus::CompletedWithNegativeResult
-                                                        ),
+                                                        success: outcome_status
+                                                            == ToolOutcomeStatus::Succeeded,
                                                         duration_ms: elapsed_secs.saturating_mul(1000),
                                                         error: (outcome_status == ToolOutcomeStatus::FailedPermanent)
                                                             .then(|| "background process ended without an exit status".to_string()),
@@ -5210,13 +5281,20 @@ impl TerminalTool {
             }
             _ => {
                 // "run" or default
-                let command = args
-                    .command
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
+                let (command, script_via_stdin) =
+                    match (args.command.as_deref(), args.script.as_deref()) {
+                        (Some(_), Some(_)) => anyhow::bail!(
+                            "command and script are mutually exclusive for action=\"run\""
+                        ),
+                        (Some(command), None) => (command, false),
+                        (None, Some(script)) => (script, true),
+                        (None, None) => {
+                            anyhow::bail!("command or script is required for action=\"run\"")
+                        }
+                    };
                 let command = command.trim();
                 if command.is_empty() {
-                    anyhow::bail!("command must not be empty for action=\"run\"");
+                    anyhow::bail!("command or script must not be empty for action=\"run\"");
                 }
 
                 let command_semantics =
@@ -5588,6 +5666,7 @@ impl TerminalTool {
 
                 self.handle_run(TerminalRunRequest {
                     command,
+                    script_via_stdin,
                     working_dir: args.working_dir.as_deref(),
                     read_paths: &args.read_paths,
                     write_paths: &args.write_paths,
@@ -5612,6 +5691,7 @@ impl TerminalTool {
 
 struct TerminalRunRequest<'a> {
     command: &'a str,
+    script_via_stdin: bool,
     working_dir: Option<&'a str>,
     read_paths: &'a [String],
     write_paths: &'a [String],
@@ -5640,6 +5720,7 @@ impl Drop for TerminalTool {
 #[derive(Deserialize)]
 struct TerminalArgs {
     command: Option<String>,
+    script: Option<String>,
     #[serde(alias = "cwd")]
     working_dir: Option<String>,
     #[serde(default)]
@@ -5769,10 +5850,12 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         "kill" => ToolCallSemantics::mutation(),
         "trust_all" => ToolCallSemantics::administrative(),
         _ => {
-            let command = args
-                .as_ref()
-                .and_then(|value| value.get("command"))
-                .and_then(Value::as_str);
+            let command = args.as_ref().and_then(|value| {
+                value
+                    .get("command")
+                    .or_else(|| value.get("script"))
+                    .and_then(Value::as_str)
+            });
             let confinement_active = args.as_ref().is_some_and(|value| {
                 value
                     .get("working_dir")
@@ -5871,9 +5954,34 @@ fn validate_terminal_argument_contract(
     let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
         return Ok(());
     };
-    let Some(command) = parsed.get("command").and_then(Value::as_str) else {
+    let action = parsed
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("run");
+    if action != "run" {
         return Ok(());
+    }
+    let command = parsed.get("command").and_then(Value::as_str);
+    let script = parsed.get("script").and_then(Value::as_str);
+    let shell_source = match (command, script) {
+        (Some(_), Some(_)) => {
+            return Err(ToolArgumentContractViolation::new(
+                "terminal action=run accepts exactly one of command or script",
+            ))
+        }
+        (Some(command), None) => command,
+        (None, Some(script)) => script,
+        (None, None) => {
+            return Err(ToolArgumentContractViolation::new(
+                "terminal action=run requires command or script",
+            ))
+        }
     };
+    if shell_source.trim().is_empty() {
+        return Err(ToolArgumentContractViolation::new(
+            "terminal action=run requires a non-empty command or script",
+        ));
+    }
     let has_write_paths = parsed
         .get("write_paths")
         .and_then(Value::as_array)
@@ -5893,7 +6001,7 @@ fn validate_terminal_argument_contract(
             .is_some_and(|paths| !paths.is_empty())
         || has_write_paths;
     let semantics = crate::tools::command_semantics::classify_confined_shell_command(
-        command,
+        shell_source,
         confinement_active,
         has_write_paths,
     );
@@ -5929,7 +6037,11 @@ impl Tool for TerminalTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command for action=run"
+                        "description": "One shell command for action=run. Use this when exact native shell exit semantics are required. Mutually exclusive with script."
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "A multi-step POSIX shell workflow for action=run, passed through stdin to /bin/sh -eu -s so a failed step stops later steps without nested command-string quoting. Mutually exclusive with command."
                     },
                     "working_dir": {
                         "type": "string",
@@ -5959,7 +6071,7 @@ impl Tool for TerminalTool {
                         "description": "Process ID for check/kill"
                     }
                 },
-                "required": ["action", "command"],
+                "required": ["action"],
                 "additionalProperties": false
             }
         })
@@ -6112,6 +6224,46 @@ mod tests {
             r#"{"action":"run","command":"python3 -c 'print(1)'"}"#
         )
         .is_err());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","script":"/usr/bin/false\nprintf SYNTHETIC_UNREACHED","working_dir":"/tmp"}"#
+        )
+        .is_ok());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"/usr/bin/true","script":"/usr/bin/true","working_dir":"/tmp"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn confined_script_uses_stdin_and_stops_after_negative_step() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none() {
+            return;
+        }
+        let script = "printf 'SYNTHETIC_BEFORE\\n'\n/usr/bin/false\nprintf 'SYNTHETIC_AFTER\\n'\n";
+        let request = confined_terminal_script_execution_request(
+            &backend,
+            script,
+            Some("/tmp"),
+            &["/tmp".to_string()],
+            &[],
+        )
+        .await
+        .expect("confined script request");
+        let serialized_args = match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
+            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+        };
+        assert!(!serialized_args.contains("SYNTHETIC_BEFORE"));
+        assert_eq!(request.stdin.as_deref(), Some(script.as_bytes()));
+
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(output.exit_code, 1, "{}", output.stderr_lossy());
+        assert_eq!(output.stdout_lossy().trim(), "SYNTHETIC_BEFORE");
+        assert!(!output.stdout_lossy().contains("SYNTHETIC_AFTER"));
     }
 
     #[test]

@@ -779,6 +779,10 @@ impl Agent {
         let durable_result = persistent_result
             .map(str::to_owned)
             .unwrap_or_else(|| normalized_msg.content.clone().unwrap_or_default());
+        let success = receipt.as_ref().map_or(success, |receipt| {
+            receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
+                && !receipt.contract_rejected
+        });
         emitter
             .emit(
                 EventType::ToolResult,
