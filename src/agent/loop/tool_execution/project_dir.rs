@@ -233,6 +233,15 @@ fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
         candidate = redirected.trim();
     }
     if candidate.is_empty()
+        // `shell_words` intentionally removes quote provenance. A quoted
+        // program/source argument may therefore contain path-like operators
+        // or string literals, but it is not itself a filesystem target. Exact
+        // paths containing whitespace remain representable in typed access
+        // manifests; this parser is only conservative advisory telemetry.
+        || candidate.chars().any(char::is_whitespace)
+        || previous.is_some_and(|value| {
+            matches!(value, "-c" | "-e" | "--eval" | "--execute" | "--command")
+        })
         || crate::tools::command_semantics::is_discard_sink_path(candidate)
         || candidate.starts_with('-')
         || candidate.contains("://")
@@ -866,6 +875,24 @@ mod tests {
             .iter()
             .chain(&resources.data_paths)
             .all(|target| !target.contains("&&") && !target.contains("cd /tmp")));
+    }
+
+    #[test]
+    fn terminal_resources_do_not_treat_quoted_program_source_as_paths() {
+        let resources = terminal_command_resource_targets(
+            "python3 -c 'target = Path(wheel_directory) / filename; archive.write(target)' /tmp/synthetic-wheel",
+            Some("/tmp"),
+        );
+
+        assert!(resources.execution_contexts.is_empty());
+        assert_eq!(
+            resources.data_paths,
+            vec!["/tmp/synthetic-wheel".to_string()]
+        );
+        assert!(resources
+            .data_paths
+            .iter()
+            .all(|target| !target.contains("Path(") && !target.contains("archive.write")));
     }
 
     #[test]

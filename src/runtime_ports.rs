@@ -111,6 +111,40 @@ pub(crate) trait ConversationRuntime: Send + Sync {
 }
 
 /// Owned inbound turn delivered by a chat transport.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InboundMessageTiming {
+    /// Timestamp assigned by the source platform, when available.
+    pub platform_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// First instant the daemon transport handler observed the message.
+    pub transport_received_at: chrono::DateTime<chrono::Utc>,
+    /// Instant the message entered a per-session queue, if it waited.
+    pub queue_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Instant the transport handed the turn to the agent runtime.
+    pub agent_dispatched_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl InboundMessageTiming {
+    pub(crate) fn new(
+        platform_message_at: Option<chrono::DateTime<chrono::Utc>>,
+        transport_received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            platform_message_at,
+            transport_received_at,
+            queue_entered_at: None,
+            agent_dispatched_at: transport_received_at,
+        }
+    }
+
+    pub(crate) fn mark_queued(&mut self, at: chrono::DateTime<chrono::Utc>) {
+        self.queue_entered_at = Some(at);
+    }
+
+    pub(crate) fn mark_dispatched_now(&mut self) {
+        self.agent_dispatched_at = chrono::Utc::now();
+    }
+}
+
 pub(crate) struct InboundMessageRequest {
     pub session_id: String,
     pub user_text: String,
@@ -119,6 +153,7 @@ pub(crate) struct InboundMessageRequest {
     pub user_role: UserRole,
     pub channel_ctx: ChannelContext,
     pub heartbeat: Option<Arc<AtomicU64>>,
+    pub ingress_timing: Option<InboundMessageTiming>,
 }
 
 #[derive(Debug, Clone)]

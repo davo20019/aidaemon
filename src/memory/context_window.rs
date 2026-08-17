@@ -1256,6 +1256,7 @@ pub fn spawn_progressive_extraction(
     fast_model: String,
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
+    source_task_id: String,
     user_text: String,
     assistant_response: String,
     channel_id: Option<String>,
@@ -1398,6 +1399,25 @@ pub fn spawn_progressive_extraction(
                 // Flight-recorder entry so every background memory write is
                 // auditable: which facts, from which excerpt, into which channel.
                 if !written.is_empty() {
+                    let selected_source_event_id = match event_store
+                        .project_selected_user_message_memory_span_for_task(&source_task_id)
+                        .await
+                    {
+                        Ok(Some(event_id)) => {
+                            if let Err(error) = state.repair_memory_projections().await {
+                                debug!(%error, %source_task_id, "Failed to bind selected message provenance to extracted memory");
+                            }
+                            Some(event_id)
+                        }
+                        Ok(None) => {
+                            debug!(%source_task_id, "Selected memory write had no policy-eligible canonical user event");
+                            None
+                        }
+                        Err(error) => {
+                            debug!(%error, %source_task_id, "Failed to project selected message provenance");
+                            None
+                        }
+                    };
                     let event = crate::events::Event::new(
                         "background:progressive_extraction",
                         crate::events::EventType::DecisionPoint,
@@ -1411,6 +1431,8 @@ pub fn spawn_progressive_extraction(
                             ),
                             "metadata": {
                                 "source": "progressive",
+                                "source_task_id": source_task_id,
+                                "source_event_id": selected_source_event_id,
                                 "channel_id": channel_id,
                                 "facts": written,
                                 "source_excerpt": source_excerpt,

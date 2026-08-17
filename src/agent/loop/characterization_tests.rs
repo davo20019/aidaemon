@@ -7,9 +7,10 @@ use crate::testing::{
 };
 use crate::traits::{
     ChatOptions, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ProviderResponse,
-    ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolChoiceMode, ToolEvidenceCapability, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
-    ToolSemanticScope, ToolTargetHintKind, ToolVerificationMode,
+    ResponseMode, TokenUsage, Tool, ToolArgumentContractViolation, ToolCall, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolChoiceMode, ToolEvidenceCapability,
+    ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolTargetHintKind,
+    ToolVerificationMode,
 };
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use async_trait::async_trait;
@@ -17,6 +18,62 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+struct RejectingArgumentTool {
+    io_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for RejectingArgumentTool {
+    fn name(&self) -> &str {
+        "synthetic_contract_tool"
+    }
+
+    fn description(&self) -> &str {
+        "Synthetic adapter with a deterministic argument contract"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": self.name(),
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": { "mode": { "type": "string" } },
+                "required": ["mode"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn validate_arguments(&self, _arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        Err(ToolArgumentContractViolation::new(
+            "synthetic mode is rejected before I/O",
+        ))
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.io_calls.fetch_add(1, Ordering::SeqCst);
+        Ok("unexpected I/O".to_string())
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            needs_approval: false,
+            idempotent: true,
+            ..ToolCapabilities::default()
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+}
 
 #[tokio::test]
 async fn typed_expected_negative_receipt_completes_without_validation_retry() {
@@ -132,6 +189,114 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
 }
 
 #[tokio::test]
+async fn explicitly_required_permanent_failure_is_observation_not_retry_signal() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 7,
+            "goal": "Observe one expected permanent adapter outcome",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "check",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "restricted",
+                "allowed_tool_names": ["synthetic_adapter"],
+                "forbidden_tool_scopes": [],
+                "tool_constraint_evidence": ["Use synthetic_adapter exactly once"],
+                "required_response_fields": ["phase", "outcome"],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "required_invocations": [{
+                    "tool_names": ["synthetic_adapter"],
+                    "exit_codes": [],
+                    "outcome_statuses": ["failed_permanent"],
+                    "requires_output": true,
+                    "contract_rejected": false
+                }],
+                "filesystem_access": {
+                    "execution_cwd": null,
+                    "read_paths": [],
+                    "write_paths": []
+                },
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false,
+                "request_relationship": "new_request",
+                "antecedent_user_message_id": null,
+                "semantic_scope": "host_local"
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_adapter", r#"{"mode":"observe"}"#),
+        MockProvider::text_response(
+            r#"{"goal":"Observe one adapter receipt","success_criteria":["Receipt recorded"],"first_action":{"tool":"synthetic_adapter","target":null,"description":"Observe once"},"requires_verification":true,"risky_actions":[],"version":1}"#,
+        ),
+        MockProvider::text_response("phase=synthetic; outcome=failed_permanent"),
+    ])
+    .with_task_assessments(vec![assessment]);
+    let tool = MockTool::new(
+        "synthetic_adapter",
+        "Synthetic failing observation",
+        "adapter unavailable by construction",
+    )
+    .with_role(ToolRole::Universal)
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
+        semantics: ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_evidence(vec![ToolEvidenceCapability {
+                scope: ToolSemanticScope::HostLocal,
+                purposes: vec![EvidencePurpose::Outcome],
+                authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+            }]),
+        ..ToolCallMetadata::default()
+    });
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(tool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "typed-permanent-negative",
+            "Use synthetic_adapter exactly once; failed_permanent is the expected observed outcome. Return phase and outcome.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "phase=synthetic; outcome=failed_permanent");
+    assert_eq!(
+        harness.provider.call_log.lock().await.len(),
+        3,
+        "the expected typed failure must not enter validation/retry recovery"
+    );
+}
+
+#[tokio::test]
 async fn typed_contract_rejection_requires_the_actual_tool_receipt() {
     let assessment = MockProvider::text_response(
         &json!({
@@ -221,6 +386,188 @@ async fn typed_contract_rejection_requires_the_actual_tool_receipt() {
     );
     let calls = harness.provider.call_log.lock().await;
     assert_eq!(calls.len(), 2, "zero-tool prose cannot satisfy the receipt");
+}
+
+#[tokio::test]
+async fn dispatcher_argument_rejection_is_canonical_non_success_receipt() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 7,
+            "goal": "Observe a pre-I/O adapter contract rejection",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "check",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "restricted",
+                "allowed_tool_names": ["synthetic_contract_tool"],
+                "forbidden_tool_scopes": [],
+                "tool_constraint_evidence": ["Use synthetic_contract_tool exactly once"],
+                "required_response_fields": ["phase", "outcome"],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "required_invocations": [{
+                    "tool_names": ["synthetic_contract_tool"],
+                    "exit_codes": [],
+                    "outcome_statuses": ["completed_with_negative_result"],
+                    "requires_output": true,
+                    "contract_rejected": true
+                }],
+                "filesystem_access": {
+                    "execution_cwd": null,
+                    "read_paths": [],
+                    "write_paths": []
+                },
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false,
+                "request_relationship": "new_request",
+                "antecedent_user_message_id": null,
+                "semantic_scope": "host_local"
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "synthetic_contract_tool",
+            r#"{"mode":"reject"}"#,
+        ),
+        MockProvider::text_response(
+            r#"{"goal":"Observe one rejection receipt","success_criteria":["Receipt recorded"],"first_action":{"tool":"synthetic_contract_tool","target":null,"description":"Observe rejection"},"requires_verification":true,"risky_actions":[],"version":1}"#,
+        ),
+        MockProvider::text_response("phase=synthetic; outcome=contract_rejected"),
+    ])
+    .with_task_assessments(vec![assessment]);
+    let io_calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(RejectingArgumentTool {
+            io_calls: io_calls.clone(),
+        })],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "typed-dispatch-rejection",
+            "Use synthetic_contract_tool exactly once; its contract rejection is the expected observation. Return phase and outcome.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let trace: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_type, data FROM events
+         WHERE session_id = 'typed-dispatch-rejection' ORDER BY id",
+    )
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reply, "phase=synthetic; outcome=contract_rejected",
+        "typed rejection trace: {trace:#?}"
+    );
+    assert_eq!(
+        io_calls.load(Ordering::SeqCst),
+        0,
+        "rejection must precede I/O"
+    );
+    let data: String = sqlx::query_scalar(
+        "SELECT data FROM events
+         WHERE session_id = 'typed-dispatch-rejection' AND event_type = 'tool_result'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    let result: crate::events::ToolResultData = serde_json::from_str(&data).unwrap();
+    let receipt = result.receipt.expect("canonical rejection receipt");
+    assert!(!result.success);
+    assert!(receipt.contract_rejected);
+    assert_eq!(
+        receipt.outcome_status,
+        ToolOutcomeStatus::CompletedWithNegativeResult
+    );
+}
+
+#[tokio::test]
+async fn inbound_transport_lifecycle_is_persisted_before_agent_work() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("timing-ok")])
+        .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let transport_received_at = chrono::Utc::now() - chrono::Duration::seconds(4);
+    let queue_entered_at = transport_received_at + chrono::Duration::seconds(1);
+    let agent_dispatched_at = queue_entered_at + chrono::Duration::seconds(2);
+    let timing = crate::runtime_ports::InboundMessageTiming {
+        platform_message_at: Some(transport_received_at - chrono::Duration::seconds(2)),
+        transport_received_at,
+        queue_entered_at: Some(queue_entered_at),
+        agent_dispatched_at,
+    };
+
+    let reply = harness
+        .agent
+        .handle_message_with_attachments_and_ingress(
+            "inbound-lifecycle",
+            "Return the timing acknowledgement.",
+            &[],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+            Some(timing),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "timing-ok");
+
+    let data: String = sqlx::query_scalar(
+        "SELECT data FROM events
+         WHERE session_id = 'inbound-lifecycle'
+           AND event_type = 'decision_point'
+           AND json_extract(data, '$.metadata.condition') = 'inbound_transport_lifecycle'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    let event: Value = serde_json::from_str(&data).unwrap();
+    let metadata = event.get("metadata").unwrap();
+    assert_eq!(metadata.get("platform_to_receiver_ms"), Some(&json!(2000)));
+    assert_eq!(metadata.get("receiver_to_queue_ms"), Some(&json!(1000)));
+    assert_eq!(metadata.get("queue_wait_ms"), Some(&json!(2000)));
+    assert_eq!(metadata.get("receiver_to_dispatch_ms"), Some(&json!(3000)));
+    assert!(metadata
+        .get("dispatch_to_task_start_ms")
+        .and_then(Value::as_i64)
+        .is_some_and(|millis| millis >= 0));
 }
 
 #[tokio::test]

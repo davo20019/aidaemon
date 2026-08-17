@@ -8,8 +8,9 @@ use serde_json::{json, Value};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, StateStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    semantics_for_exact_read_actions, StateStore, Tool, ToolArgumentContractViolation,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolOutcomeStatus,
 };
 use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy};
 
@@ -412,6 +413,38 @@ impl Tool for ManageMemoriesTool {
 
     fn schema(&self) -> Value {
         manage_memories_schema()
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        const ACTIONS_REQUIRING_GOAL_ID: &[&str] = &[
+            "add_schedule",
+            "cancel_scheduled",
+            "pause_scheduled",
+            "resume_scheduled",
+            "retry_scheduled",
+            "diagnose_scheduled",
+        ];
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str);
+        if !action.is_some_and(|action| ACTIONS_REQUIRING_GOAL_ID.contains(&action)) {
+            return Ok(());
+        }
+        let has_goal_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("goal_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_goal_id {
+            return Ok(());
+        }
+        Err(ToolArgumentContractViolation::new(format!(
+            "action `{}` requires `goal_id` for `manage_memories`",
+            action.unwrap_or("<missing>")
+        ))
+        .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -2259,6 +2292,21 @@ mod tests {
             bytes <= 1250,
             "manage_memories schema is {bytes} bytes, budget is 1250"
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_actions_declare_goal_identity_contract() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state);
+        assert!(tool
+            .validate_arguments(r#"{"action":"diagnose_scheduled"}"#)
+            .is_err());
+        assert!(tool
+            .validate_arguments(r#"{"action":"diagnose_scheduled","goal_id":"goal-synthetic"}"#)
+            .is_ok());
+        assert!(tool
+            .validate_arguments(r#"{"action":"list_scheduled"}"#)
+            .is_ok());
     }
 
     /// Search action appends the relational neighborhood when results contain a

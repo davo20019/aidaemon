@@ -435,6 +435,11 @@ impl SqliteStateStore {
         &self,
     ) -> anyhow::Result<(usize, usize, usize, usize, usize)> {
         const BATCH_SIZE: i64 = 500;
+        let selected_event_spans_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_spans WHERE source_event_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let mut fact_count = 0usize;
         loop {
             let ids: Vec<i64> = sqlx::query_scalar(
@@ -477,34 +482,10 @@ impl SqliteStateStore {
             }
         }
 
-        let mut event_count = 0usize;
-        loop {
-            let ids: Vec<i64> = sqlx::query_scalar(
-                "SELECT e.id FROM events e
-                 LEFT JOIN memory_spans s ON s.source_event_id = e.id
-                 WHERE e.event_type = 'user_message' AND s.id IS NULL
-                   AND json_valid(e.data)
-                   AND length(trim(COALESCE(json_extract(e.data, '$.content'), ''))) > 0
-                   AND (e.task_id IS NULL OR EXISTS (
-                       SELECT 1 FROM events policy
-                       WHERE policy.task_id = e.task_id
-                         AND policy.event_type = 'memory_policy_compiled'
-                         AND json_extract(policy.data, '$.access') = 'allowed'
-                   ))
-                 ORDER BY e.id LIMIT ?",
-            )
-            .bind(BATCH_SIZE)
-            .fetch_all(&self.pool)
-            .await?;
-            if ids.is_empty() {
-                break;
-            }
-            event_count += ids.len();
-            for id in ids {
-                project_event_span(&self.pool, id).await?;
-            }
-        }
-
+        // Raw user messages remain canonical events and exact-history rows.
+        // They enter the durable memory graph only when a selected fact/claim
+        // needs that exact event as provenance; an allowed memory policy is a
+        // capability boundary, not a decision to remember every control turn.
         let evidence_fact_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT f.id
              FROM facts f
@@ -519,6 +500,13 @@ impl SqliteStateStore {
         for id in evidence_fact_ids {
             self.project_fact_memory(id).await?;
         }
+        let selected_event_spans_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_spans WHERE source_event_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let event_count =
+            selected_event_spans_after.saturating_sub(selected_event_spans_before) as usize;
 
         let mut procedure_count = 0usize;
         let mut after_id = 0i64;
@@ -1557,7 +1545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_backfill_processes_more_than_one_batch_idempotently() {
+    async fn startup_backfill_does_not_promote_unselected_messages_to_memory() {
         let (_dir, store) = test_store().await;
         let mut tx = store.pool.begin().await.unwrap();
         for i in 0..1_001 {
@@ -1579,9 +1567,62 @@ mod tests {
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
-        assert_eq!(first_count, 1_001);
+        assert_eq!(first_count, 0);
         assert_eq!(second_count, 0);
-        assert_eq!(spans, 1_001);
+        assert_eq!(spans, 0);
+    }
+
+    #[tokio::test]
+    async fn selected_fact_projects_only_its_canonical_source_message() {
+        let (_dir, store) = test_store().await;
+        let selected_event_id: i64 = sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('telegram:synthetic-user-1', 'user_message', ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(serde_json::json!({"content": "My default editor is Neovim"}).to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let control_event_id: i64 = sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('telegram:synthetic-user-1', 'user_message', ?, '2026-01-01T00:01:00Z')",
+        )
+        .bind(serde_json::json!({"content": "Run the control-plane check now"}).to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let fact_id = insert_fact(&store, "private").await;
+        sqlx::query(
+            "UPDATE facts SET source_excerpt = 'My default editor is Neovim',
+                              first_seen_at = '2026-01-01T00:00:00Z'
+             WHERE id = ?",
+        )
+        .bind(fact_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        project_event_span(&store.pool, selected_event_id)
+            .await
+            .unwrap();
+        store.project_fact_memory(fact_id).await.unwrap();
+
+        let selected_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
+                .bind(selected_event_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let control_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
+                .bind(control_event_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(selected_count, 1);
+        assert_eq!(control_count, 0);
     }
 
     #[tokio::test]

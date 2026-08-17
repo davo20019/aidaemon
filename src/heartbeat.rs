@@ -266,6 +266,12 @@ pub(crate) fn task_blocks_later_schedule_fire(
     run: &crate::traits::GoalRun,
     task: &crate::traits::Task,
 ) -> bool {
+    // Backpressure belongs to one active occurrence. Historical task rows are
+    // audit records after their parent run reaches a terminal state and can no
+    // longer suppress later schedule occurrences.
+    if !matches!(run.status.as_str(), "pending" | "running" | "blocked") {
+        return false;
+    }
     // A blocked scheduled run has no active worker and terminates that
     // occurrence. Keeping it resumable is useful for explicit recovery, but it
     // must not suppress every later occurrence of a recurring schedule. Manual
@@ -2923,6 +2929,16 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn terminal_run_tasks_never_apply_schedule_backpressure() {
+        let mut run = crate::traits::GoalRun::new("goal-1", "default", "scheduled");
+        run.status = "completed".to_string();
+        let mut task = synthetic_task("child", "blocked");
+        task.blocker = Some("Historical unresolved child".to_string());
+
+        assert!(!task_blocks_later_schedule_fire(&run, &task));
     }
 
     #[test]

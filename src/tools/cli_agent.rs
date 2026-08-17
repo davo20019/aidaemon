@@ -31,9 +31,10 @@ use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRou
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolCallAccessManifest,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolExecutionContext,
-    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolArgumentContractViolation,
+    ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
+    ToolVerificationMode,
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
@@ -4128,6 +4129,31 @@ impl Tool for CliAgentTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
+            return Ok(());
+        };
+        let is_read_write = parsed.get("action").and_then(Value::as_str) == Some("run")
+            && parsed.get("workspace_mode").and_then(Value::as_str) == Some("read_write");
+        let has_write_paths = parsed
+            .get("write_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+            });
+        if is_read_write && !has_write_paths {
+            return Err(ToolArgumentContractViolation::new(
+                "read-write CLI delegation requires an explicit non-empty write_paths access manifest",
+            )
+            .with_recovery_hint(
+                "Retry with readable context separate from exact mutation paths.",
+            ));
+        }
+        Ok(())
     }
 
     fn capabilities(&self) -> ToolCapabilities {

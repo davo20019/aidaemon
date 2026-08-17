@@ -391,11 +391,17 @@ impl Agent {
         user_role: UserRole,
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
+        ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
         internal_continuation: bool,
         continuation_parent_task_id: Option<&str>,
         continuation_parent_tool_call_id: Option<&str>,
         continuation_parent_result_id: Option<&str>,
     ) -> anyhow::Result<String> {
+        // One monotonic lifecycle clock covers bootstrap/planning, execution,
+        // verification, and response delivery. Phase-local clocks remain for
+        // diagnostics, but TaskEnd must never report only the post-bootstrap
+        // suffix of a request.
+        let task_start = Instant::now();
         touch_heartbeat(&heartbeat);
         info!(session_id, "handle_message_impl: starting bootstrap phase");
         let services = super::services::AgentServices::new(self);
@@ -409,6 +415,7 @@ impl Agent {
                 status_tx: status_tx.clone(),
                 user_role,
                 channel_ctx: &channel_ctx,
+                ingress_timing: ingress_timing.as_ref(),
                 internal_continuation,
                 parent_task_id: continuation_parent_task_id,
             },
@@ -489,7 +496,6 @@ impl Agent {
         // it would leak the span onto whatever task the worker thread polls next.
         let turn_span = tracing::info_span!("turn", task_id = %task_id, session_id = %session_id);
         tracing::Instrument::instrument(async move {
-        let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
         const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
         let mut approach_pivots_used: usize = 0;

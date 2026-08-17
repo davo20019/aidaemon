@@ -143,7 +143,7 @@ impl AgentIngress for Agent {
     ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
         let (text, captured) = crate::events::capture_generated_responses(
             &request.session_id,
-            self.handle_message_with_attachments(
+            self.handle_message_with_attachments_and_ingress(
                 &request.session_id,
                 &request.user_text,
                 &request.attachments,
@@ -151,6 +151,7 @@ impl AgentIngress for Agent {
                 request.user_role,
                 request.channel_ctx,
                 request.heartbeat,
+                request.ingress_timing,
             ),
         )
         .await;

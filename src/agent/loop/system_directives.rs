@@ -163,11 +163,6 @@ pub(in crate::agent) enum SystemDirective {
         tool_name: String,
         reason: String,
     },
-    ArgumentContractBlocked {
-        tool_name: String,
-        reason: String,
-        coaching: String,
-    },
     HardToolLimitReached,
     /// A specific tool hit its per-tool call limit but other tools remain
     /// available. The model should switch to a different tool.
@@ -627,14 +622,6 @@ impl SystemDirective {
             Self::ScopeLockBlocked { tool_name, reason } => format!(
                 "[SYSTEM] The previous `{}` tool call was blocked by deterministic scope locks ({}). Use paths/tool args aligned with the current request scope.",
                 tool_name, reason
-            ),
-            Self::ArgumentContractBlocked {
-                tool_name,
-                reason,
-                coaching,
-            } => format!(
-                "[SYSTEM] The previous `{}` tool call was blocked ({}). {}",
-                tool_name, reason, coaching
             ),
             Self::HardToolLimitReached => "[SYSTEM] Tool limit reached. No more tool calls available.\n\n\
                  You MUST now respond with a concise summary:\n\

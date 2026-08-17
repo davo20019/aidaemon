@@ -4184,6 +4184,9 @@ impl TelegramChannel {
     }
 
     async fn handle_message(self: &Arc<Self>, msg: teloxide::types::Message, bot: Bot) {
+        let transport_received_at = chrono::Utc::now();
+        let ingress_timing =
+            crate::runtime_ports::InboundMessageTiming::new(Some(msg.date), transport_received_at);
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
         // Authorization check with first-user auto-claim (DM only).
@@ -4570,7 +4573,8 @@ impl TelegramChannel {
                         user_role,
                         channel_ctx.clone(),
                         inbound_attachments.clone(),
-                    ),
+                    )
+                    .with_ingress_timing(ingress_timing.clone()),
                     Some(&dedup_key),
                 )
                 .await
@@ -4772,6 +4776,7 @@ impl TelegramChannel {
             let mut current_typing_cancel = typing_cancel;
             let mut current_status_task = status_task;
             let mut current_heartbeat = heartbeat;
+            let mut current_ingress_timing = Some(ingress_timing);
             // live_owner/live_sink are carried through all queue-drain iterations so
             // that Task 6 can finalize the surface after the agent reply is ready.
             let live_owner = live_owner;
@@ -4783,6 +4788,9 @@ impl TelegramChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
+                if let Some(timing) = current_ingress_timing.as_mut() {
+                    timing.mark_dispatched_now();
+                }
                 let result = tokio::select! {
                     r = agent.handle_inbound_message(InboundMessageRequest {
                         session_id: session_id.clone(),
@@ -4792,6 +4800,7 @@ impl TelegramChannel {
                         user_role: current_user_role,
                         channel_ctx: current_channel_ctx.clone(),
                         heartbeat: Some(current_heartbeat.clone()),
+                        ingress_timing: current_ingress_timing.clone(),
                     }) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
@@ -4997,6 +5006,7 @@ impl TelegramChannel {
                     current_user_role = queued.user_role;
                     current_channel_ctx = queued.channel_ctx;
                     current_attachments = queued.attachments;
+                    current_ingress_timing = queued.ingress_timing;
                     let desc: String = current_text.chars().take(80).collect();
                     let (new_task_id, new_cancel_token) =
                         registry.register(&session_id, &desc).await;

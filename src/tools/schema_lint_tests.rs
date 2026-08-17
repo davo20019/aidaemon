@@ -29,27 +29,138 @@ fn tool_source_files() -> Vec<PathBuf> {
     files
 }
 
-/// Returns the full source region covering schema-related definitions:
-/// the inline `fn schema` body plus any private helper such as
-/// `fn <tool>_schema() -> Value` that the method may delegate to.
-fn schema_source_region(source: &str) -> Option<&str> {
-    // If the schema fn delegates to a private helper (Pillar-C pattern), find
-    // the helper's definition start so we capture the JSON content.
-    // Convention: helper is `fn <name>_schema() -> Value {` appearing before
-    // `impl Tool for`.
-    let start = if let Some(pos) = source.find("_schema() -> Value {") {
-        // Walk back to the `fn ` keyword
-        let prefix = &source[..pos];
-        prefix.rfind("fn ").unwrap_or(0)
-    } else {
-        // No helper — fall through to schema_segment
-        let (_, after) = source.split_once("fn schema(&self) -> Value {")?;
-        return after.split_once("async fn call(").map(|(seg, _)| seg);
-    };
+/// Return exactly one Rust function, ending at its balanced closing brace.
+/// Strings and comments are skipped so braces in schema descriptions do not
+/// alter the boundary. This keeps the schema budget independent of whatever
+/// adapter hooks happen to follow `schema()` in a `Tool` implementation.
+fn rust_function_region(source: &str, start: usize) -> Option<&str> {
+    #[derive(Clone, Copy)]
+    enum ScanState {
+        Code,
+        String,
+        Char,
+        LineComment,
+        BlockComment(usize),
+        RawString(usize),
+    }
 
-    let region = &source[start..];
-    let (segment, _) = region.split_once("async fn call(")?;
-    Some(segment)
+    let bytes = source.as_bytes();
+    let mut index = source[start..].find('{')? + start;
+    let mut depth = 0usize;
+    let mut state = ScanState::Code;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            ScanState::Code => {
+                if byte == b'/' && next == Some(b'/') {
+                    state = ScanState::LineComment;
+                    index += 1;
+                } else if byte == b'/' && next == Some(b'*') {
+                    state = ScanState::BlockComment(1);
+                    index += 1;
+                } else if byte == b'r' {
+                    let mut cursor = index + 1;
+                    while bytes.get(cursor) == Some(&b'#') {
+                        cursor += 1;
+                    }
+                    if bytes.get(cursor) == Some(&b'"') {
+                        state = ScanState::RawString(cursor - index - 1);
+                        index = cursor;
+                    }
+                } else if byte == b'"' {
+                    state = ScanState::String;
+                    escaped = false;
+                } else if byte == b'\'' {
+                    state = ScanState::Char;
+                    escaped = false;
+                } else if byte == b'{' {
+                    depth += 1;
+                } else if byte == b'}' {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return source.get(start..=index);
+                    }
+                }
+            }
+            ScanState::String => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    state = ScanState::Code;
+                }
+            }
+            ScanState::Char => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'\'' {
+                    state = ScanState::Code;
+                }
+            }
+            ScanState::LineComment => {
+                if byte == b'\n' {
+                    state = ScanState::Code;
+                }
+            }
+            ScanState::BlockComment(comment_depth) => {
+                if byte == b'/' && next == Some(b'*') {
+                    state = ScanState::BlockComment(comment_depth + 1);
+                    index += 1;
+                } else if byte == b'*' && next == Some(b'/') {
+                    state = if comment_depth == 1 {
+                        ScanState::Code
+                    } else {
+                        ScanState::BlockComment(comment_depth - 1)
+                    };
+                    index += 1;
+                }
+            }
+            ScanState::RawString(hashes) => {
+                if byte == b'"'
+                    && (0..hashes).all(|offset| bytes.get(index + 1 + offset) == Some(&b'#'))
+                {
+                    state = ScanState::Code;
+                    index += hashes;
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Returns only the schema-producing function: the private schema helper when
+/// present, otherwise the inline `Tool::schema` implementation.
+fn schema_source_region(source: &str) -> Option<&str> {
+    let start = if let Some(pos) = source.find("_schema() -> Value {") {
+        source[..pos].rfind("fn ")?
+    } else {
+        source.find("fn schema(&self) -> Value {")?
+    };
+    rust_function_region(source, start)
+}
+
+#[test]
+fn schema_region_is_not_extended_by_following_adapter_hooks() {
+    let source = r###"
+        fn synthetic_schema() -> Value {
+            json!({"description": "literal } and {", "raw": r#"}"#})
+        }
+
+        fn validate_arguments(&self) {
+            // This hook is deliberately much larger than the schema.
+            if true { nested(); }
+        }
+    "###;
+    let region = schema_source_region(source).expect("schema function");
+    assert!(region.contains("literal } and {"));
+    assert!(!region.contains("validate_arguments"));
 }
 
 #[test]

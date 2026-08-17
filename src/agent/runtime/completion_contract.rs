@@ -771,6 +771,40 @@ pub(super) fn install_semantic_completion_contract(
     };
 }
 
+/// Add independently recovered invocation proof without changing any
+/// authority decision. This is intentionally additive and non-authorizing:
+/// tool/mutation/filesystem policy remains owned by the complete semantic
+/// contract (or its fail-closed fallback).
+pub(super) fn append_required_invocation_obligations(
+    contract: &mut CompletionContract,
+    required_invocations: &[crate::traits::RequestReceiptPredicate],
+) {
+    if contract.forbids_tool_use || required_invocations.is_empty() {
+        return;
+    }
+    for receipt in required_invocations {
+        let duplicate = contract
+            .evidence_requirements
+            .iter()
+            .any(|requirement| requirement.receipt.as_ref() == Some(receipt));
+        if !duplicate {
+            contract
+                .evidence_requirements
+                .push(RequestEvidenceRequirement {
+                    summary: "Complete the exact requested machine invocation".to_string(),
+                    acceptable_scopes: Vec::new(),
+                    purpose: crate::traits::EvidencePurpose::Outcome,
+                    minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                    temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                    required_content_markers: Vec::new(),
+                    receipt: Some(receipt.clone()),
+                    target: None,
+                });
+        }
+    }
+    contract.requires_observation = true;
+}
+
 /// Remove language-derived obligations when semantic assessment was skipped or
 /// failed. Exact URLs and structurally resolved paths remain target hints for
 /// one generic observation obligation.
@@ -4283,5 +4317,32 @@ mod tests {
         assert_eq!(progress.mutation_attempt_count, 1);
         assert_eq!(progress.indeterminate_mutation_count, 1);
         assert_eq!(progress.mutation_count, 0);
+    }
+
+    #[test]
+    fn recovered_invocation_adds_proof_without_adding_authority() {
+        let mut contract = CompletionContract {
+            allowed_tool_names: vec!["already_allowed".to_string()],
+            forbids_mutation: true,
+            ..CompletionContract::default()
+        };
+        let receipt = crate::traits::RequestReceiptPredicate {
+            tool_names: vec!["synthetic_observer".to_string()],
+            outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
+            requires_output: true,
+            ..crate::traits::RequestReceiptPredicate::default()
+        };
+
+        append_required_invocation_obligations(&mut contract, std::slice::from_ref(&receipt));
+
+        assert_eq!(contract.allowed_tool_names, ["already_allowed"]);
+        assert!(contract.forbids_mutation);
+        assert!(contract.requires_observation);
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert_eq!(contract.evidence_requirements[0].receipt, Some(receipt));
+        assert_eq!(
+            contract.evidence_requirements[0].purpose,
+            crate::traits::EvidencePurpose::Outcome
+        );
     }
 }

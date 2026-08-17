@@ -1448,82 +1448,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             continue;
         }
 
-        if let Some(contract_violation) =
-            deterministic_tool_contract_violation(&tc.name, &effective_arguments)
-        {
-            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-            let result_text = ToolResultNotice::DeterministicArgumentContractBlocked {
-                tool_name: tc.name.clone(),
-                reason: contract_violation.reason.clone(),
-            }
-            .render();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text.clone()),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.2,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
-            pending_system_messages.push(SystemDirective::ArgumentContractBlocked {
-                tool_name: tc.name.clone(),
-                reason: contract_violation.reason.to_string(),
-                coaching: contract_violation.coaching.to_string(),
-            });
-            learning_ctx.record_replay_note(
-                ReplayNoteCategory::ValidationFailure,
-                "tool_contract_violation",
-                format!(
-                    "Blocked {} because its arguments violated a deterministic contract: {}.",
-                    tc.name, contract_violation.reason
-                ),
-                true,
-            );
-            learning_ctx.record_replay_note(
-                ReplayNoteCategory::RetryReason,
-                "retry_step",
-                format!(
-                    "Retried locally after deterministic contract failure on {}.",
-                    tc.name
-                ),
-                true,
-            );
-            agent
-                .emit_warning_decision_point(
-                    emitter,
-                    task_id,
-                    iteration,
-                    DecisionType::ExecutionFailureClassification,
-                    format!("Classified deterministic contract failure for {}", tc.name),
-                    json!({
-                        "condition": "tool_contract_violation",
-                        "tool": tc.name,
-                        "execution_failure_kind": ExecutionFailureKind::ToolContractFailure,
-                        "failure_class": "semantic",
-                        "key_error_line": contract_violation.reason,
-                        "loop_repetition_reason": "retry_step",
-                    }),
-                )
-                .await;
-            execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
-            execution_state.mark_persisted_now();
-            iteration_had_tool_failures = true;
-            continue;
-        }
         match super::budget_blocking::maybe_block_tool_by_budget(
             agent,
             tc,
@@ -2257,6 +2181,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // process result or contract rejection can complete an observation
         // without being relabeled as a successful mutation.
         let outcome_satisfied = domain_outcome_satisfied || expected_observation_satisfied;
+        // Adapter status and request status are distinct axes. A permanent
+        // adapter failure is still the observed result when the current typed
+        // receipt explicitly requires that outcome; recovery/learning must not
+        // retry an already-satisfied negative observation.
+        let request_failed = is_error && !outcome_satisfied;
 
         if result_metadata.semantics.mutates_state()
             && !result_metadata.contract_rejected
@@ -2325,19 +2254,23 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             learning_ctx
                 .tool_calls
                 .push(format!("{} [REJECTED]", tool_summary));
-        } else if is_error {
+        } else if request_failed {
             learning_ctx
                 .tool_calls
                 .push(format!("{} [FAILED]", tool_summary));
+        } else if is_error {
+            learning_ctx
+                .tool_calls
+                .push(format!("{} [EXPECTED NEGATIVE]", tool_summary));
         } else {
             learning_ctx.tool_calls.push(tool_summary.clone());
         }
         execution_state.complete_current_step(classify_step_execution_outcome(
-            is_error,
+            request_failed,
             background_detached,
         ));
         execution_state.mark_persisted_now();
-        match execution_failure_kind {
+        match request_failed.then_some(execution_failure_kind).flatten() {
             Some(ExecutionFailureKind::ToolContractFailure)
             | Some(ExecutionFailureKind::ToolInvocationFailure) => {
                 validation_state.note_retry(LoopRepetitionReason::RetryStep);
@@ -2677,10 +2610,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             agent,
             tc,
             &mut result_text,
-            is_error,
+            request_failed,
             outcome_satisfied,
-            failure_class,
-            execution_failure_kind,
+            request_failed.then_some(failure_class).flatten(),
+            request_failed.then_some(execution_failure_kind).flatten(),
             &learning_env,
             &mut learning_state,
         )
@@ -2990,9 +2923,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .append_tool_message_with_receipt_event_policy(
                 emitter,
                 &tool_msg,
-                !is_error,
+                !is_error && !result_metadata.contract_rejected,
                 tool_duration_ms,
-                if is_error {
+                if is_error || result_metadata.contract_rejected {
                     Some(result_text.clone())
                 } else {
                     None

@@ -1,6 +1,29 @@
 use super::*;
 use crate::types::WorkspaceGrant;
 
+fn argument_contract_rejection_outcome(
+    violation: crate::traits::ToolArgumentContractViolation,
+) -> crate::traits::ToolCallOutcome {
+    let output = match violation.recovery_hint {
+        Some(hint) => format!(
+            "Invocation rejected before I/O: {}\nRecovery: {hint}",
+            violation.reason
+        ),
+        None => format!("Invocation rejected before I/O: {}", violation.reason),
+    };
+    crate::traits::ToolCallOutcome::contract_rejection(output)
+}
+
+fn validate_tool_arguments(
+    tool: &dyn crate::traits::Tool,
+    arguments: &str,
+) -> Option<crate::traits::ToolCallOutcome> {
+    match tool.validate_arguments(arguments) {
+        Ok(()) => None,
+        Err(violation) => Some(argument_contract_rejection_outcome(violation)),
+    }
+}
+
 fn sanitize_workspace_tool_text(text: &str, grant: &WorkspaceGrant) -> String {
     let relative = text.replace(&grant.project_root, ".");
     crate::tools::sanitize::redact_secrets(&relative)
@@ -50,6 +73,9 @@ async fn call_scoped_builtin_file_tool(
         "edit_file" => Box::new(crate::tools::EditFileTool),
         _ => anyhow::bail!("The workspace grant does not allow this tool."),
     };
+    if let Some(rejection) = validate_tool_arguments(tool.as_ref(), arguments) {
+        return Ok(rejection);
+    }
     let mut outcome = tool
         .call_with_execution_context(arguments, status_tx, exec_ctx)
         .await?;
@@ -790,6 +816,9 @@ impl Agent {
 
         for tool in &self.tools {
             if tool.name() == name {
+                if let Some(rejection) = validate_tool_arguments(tool.as_ref(), &enriched_args) {
+                    return Ok(rejection);
+                }
                 if !under_mandate
                     && name != "terminal"
                     && matches!(
@@ -855,6 +884,9 @@ impl Agent {
         // for builtins (MCP tools are non-delegable under the v1 policy).
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
+                if let Some(rejection) = validate_tool_arguments(tool.as_ref(), &enriched_args) {
+                    return Ok(rejection);
+                }
                 let mandate_preapproved = if under_mandate {
                     self.validate_mandate_dispatch(name, arguments, ctx, true)
                         .await?;

@@ -2,7 +2,7 @@ use crate::router::Router;
 use crate::traits::{ModelProvider, ProviderResponse};
 use crate::utils::truncate_str;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -188,8 +188,83 @@ struct TaskContractRecoveryResponse {
     contract: PlannedContractSignals,
 }
 
+/// Independently compiled products recovered after the broad assessment is
+/// unavailable. A malformed authority/evidence envelope must not erase a
+/// valid machine-invocation obligation, but the salvaged obligation is
+/// deliberately non-authorizing: it can require proof of a call, never grant
+/// tool, mutation, or filesystem access.
+#[derive(Debug, Default)]
+pub(crate) struct TaskContractRecoveryOutcome {
+    pub plan: Option<TaskPlan>,
+    pub required_invocations: Vec<crate::traits::RequestReceiptPredicate>,
+}
+
 const TASK_RELATIONSHIP_SCHEMA_VERSION: u16 = 1;
 const TASK_CONTRACT_RECOVERY_SCHEMA_VERSION: u16 = 1;
+
+fn valid_required_invocation(
+    receipt: &crate::traits::RequestReceiptPredicate,
+    available_tool_names: &[String],
+) -> bool {
+    receipt.tool_names.len() == 1
+        && receipt.tool_names.iter().all(|name| {
+            !name.is_empty()
+                && name.len() <= 80
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+                // Capability grounding is structural. The recovery compiler
+                // may choose only an exact identifier registered for this turn;
+                // no request wording or phrase matcher participates.
+                && available_tool_names.contains(name)
+        })
+        && receipt.exit_codes.len() <= 16
+        && receipt.outcome_statuses.len() <= 6
+}
+
+fn recover_required_invocations(
+    envelope: &Value,
+    available_tool_names: &[String],
+) -> Vec<crate::traits::RequestReceiptPredicate> {
+    if envelope.get("schema_version").and_then(Value::as_u64)
+        != Some(TASK_CONTRACT_RECOVERY_SCHEMA_VERSION.into())
+        || !confidence_is_sufficient(
+            envelope
+                .get("contract")
+                .and_then(|contract| contract.get("confidence"))
+                .and_then(Value::as_str),
+        )
+    {
+        return Vec::new();
+    }
+    let Some(items) = envelope
+        .get("contract")
+        .and_then(|contract| contract.get("required_invocations"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    if items.len() > 8 {
+        return Vec::new();
+    }
+
+    let mut recovered = Vec::new();
+    for item in items {
+        let Ok(receipt) =
+            serde_json::from_value::<crate::traits::RequestReceiptPredicate>(item.clone())
+        else {
+            continue;
+        };
+        if valid_required_invocation(&receipt, available_tool_names)
+            && !recovered.contains(&receipt)
+        {
+            recovered.push(receipt);
+        }
+    }
+    recovered
+}
 
 fn confidence_is_sufficient(value: Option<&str>) -> bool {
     matches!(
@@ -1267,9 +1342,10 @@ pub(crate) async fn generate_task_contract_recovery(
     provider: Arc<dyn ModelProvider>,
     model: &str,
     user_text: &str,
+    available_tool_names: &[String],
     mode: TaskAssessmentMode,
     telemetry: Option<PlannerTelemetryCtx<'_>>,
-) -> Option<TaskPlan> {
+) -> TaskContractRecoveryOutcome {
     let system = "You are a semantic task-contract compiler. Return only valid JSON. Classify obligations and authority from the current request; do not plan an approach, select dialogue history, or infer from isolated keywords.";
     let prompt = format!(
         "Current user request:\n{user_text}\n\n\
@@ -1331,7 +1407,7 @@ pub(crate) async fn generate_task_contract_recovery(
             )
             .await;
             warn!(%error, "Task contract recovery call failed");
-            return None;
+            return TaskContractRecoveryOutcome::default();
         }
         Err(_) => {
             record_auxiliary_model_failure(
@@ -1346,7 +1422,7 @@ pub(crate) async fn generate_task_contract_recovery(
                 timeout_secs = TASK_CONTRACT_RECOVERY_TIMEOUT.as_secs(),
                 "Task contract recovery call timed out"
             );
-            return None;
+            return TaskContractRecoveryOutcome::default();
         }
     };
     record_auxiliary_model_call(
@@ -1357,10 +1433,31 @@ pub(crate) async fn generate_task_contract_recovery(
         call_start.elapsed().as_millis() as u64,
     )
     .await;
-    let json_str = crate::utils::extract_json_object(result.content.as_deref().unwrap_or(""))?;
-    let parsed: TaskContractRecoveryResponse = serde_json::from_str(&json_str)
-        .inspect_err(|error| warn!(%error, "Task contract recovery response unparseable"))
-        .ok()?;
+    let Some(json_str) = crate::utils::extract_json_object(result.content.as_deref().unwrap_or(""))
+    else {
+        return TaskContractRecoveryOutcome::default();
+    };
+    let Ok(envelope) = serde_json::from_str::<Value>(&json_str)
+        .inspect_err(|error| warn!(%error, "Task contract recovery response is not a JSON object"))
+    else {
+        return TaskContractRecoveryOutcome::default();
+    };
+    let required_invocations = recover_required_invocations(&envelope, available_tool_names);
+    let parsed = serde_json::from_value::<TaskContractRecoveryResponse>(envelope)
+        .inspect_err(|error| {
+            warn!(
+                %error,
+                salvaged_invocation_count = required_invocations.len(),
+                "Task contract recovery authority envelope unparseable"
+            )
+        })
+        .ok();
+    let Some(parsed) = parsed else {
+        return TaskContractRecoveryOutcome {
+            plan: None,
+            required_invocations,
+        };
+    };
     if parsed.schema_version != TASK_CONTRACT_RECOVERY_SCHEMA_VERSION
         || !planned_contract_is_confident(&parsed.contract, None)
         || !planned_contract_is_complete(&parsed.contract)
@@ -1369,16 +1466,22 @@ pub(crate) async fn generate_task_contract_recovery(
             schema_version = parsed.schema_version,
             "Task contract recovery returned an incomplete contract"
         );
-        return None;
+        return TaskContractRecoveryOutcome {
+            plan: None,
+            required_invocations,
+        };
     }
-    Some(TaskPlan {
-        goal: parsed.goal,
-        steps: Vec::new(),
-        success_criteria: Vec::new(),
-        contract: Some(parsed.contract),
-        task_shape: None,
-        mode,
-    })
+    TaskContractRecoveryOutcome {
+        plan: Some(TaskPlan {
+            goal: parsed.goal,
+            steps: Vec::new(),
+            success_criteria: Vec::new(),
+            contract: Some(parsed.contract),
+            task_shape: None,
+            mode,
+        }),
+        required_invocations,
+    }
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -2202,15 +2305,16 @@ mod tests {
             }"#,
         );
         let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
-        let plan = generate_task_contract_recovery(
+        let recovered = generate_task_contract_recovery(
             std::sync::Arc::new(provider),
             "synthetic-model",
             "Use check_environment exactly once and report its result.",
+            &["check_environment".to_string()],
             TaskAssessmentMode::AutonomousRouting,
             None,
         )
-        .await
-        .expect("recovered contract");
+        .await;
+        let plan = recovered.plan.expect("recovered contract");
 
         let signals = plan.contract.expect("contract");
         assert!(planned_contract_is_complete(&signals));
@@ -2220,6 +2324,68 @@ mod tests {
         );
         assert!(plan.steps.is_empty());
         assert!(plan.task_shape.is_none());
+    }
+
+    #[tokio::test]
+    async fn contract_recovery_salvages_obligation_from_malformed_authority_lane() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+              "schema_version": 1,
+              "goal": "Observe a management call",
+              "contract": {
+                "confidence": "high",
+                "task_kind": "check",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "restricted",
+                "allowed_tool_names": ["manage_mandates"],
+                "forbidden_tool_scopes": ["no other tool"],
+                "tool_constraint_evidence": ["Use manage_mandates exactly once"],
+                "required_response_fields": [],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "required_invocations": [{
+                  "tool_names": ["manage_mandates"],
+                  "exit_codes": [],
+                  "outcome_statuses": ["succeeded"],
+                  "requires_output": true,
+                  "contract_rejected": false
+                }],
+                "filesystem_access": {
+                  "execution_cwd": null,
+                  "read_paths": [],
+                  "write_paths": []
+                },
+                "project_reference": null
+              }
+            }"#,
+        );
+        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+        let recovered = generate_task_contract_recovery(
+            std::sync::Arc::new(provider),
+            "synthetic-model",
+            "Use manage_mandates exactly once and report the receipt.",
+            &["manage_mandates".to_string()],
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await;
+
+        assert!(
+            recovered.plan.is_none(),
+            "a malformed authority envelope must still fail closed"
+        );
+        assert_eq!(recovered.required_invocations.len(), 1);
+        assert_eq!(
+            recovered.required_invocations[0].tool_names,
+            ["manage_mandates"]
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 
 use crate::traits::{
     semantics_for_exact_read_actions, Goal, ScheduledGoalRunsStore, StateStore, Task, TaskActivity,
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolResultPresentation,
+    Tool, ToolArgumentContractViolation, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
 };
 use crate::types::StatusUpdate;
 
@@ -952,6 +952,27 @@ impl Tool for ScheduledGoalRunsTool {
         scheduled_goal_runs_schema()
     }
 
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let has_goal_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("goal_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_goal_id {
+            return Ok(());
+        }
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        Err(ToolArgumentContractViolation::new(format!(
+            "action `{action}` requires `goal_id` for `scheduled_goal_runs`"
+        ))
+        .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,
@@ -1606,6 +1627,13 @@ mod tests {
     async fn run_history_reports_open_tasks_as_schedule_blockers() {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        assert!(tool
+            .validate_arguments(r#"{"action":"run_history"}"#)
+            .is_err());
+        assert!(tool
+            .validate_arguments(r#"{"action":"run_history","goal_id":"goal-synthetic"}"#)
+            .is_ok());
 
         let goal = Goal::new_continuous(
             "Post daily optimized tweets",

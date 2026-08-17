@@ -14,6 +14,7 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub user_role: UserRole,
     pub channel_ctx: &'a ChannelContext,
+    pub ingress_timing: Option<&'a crate::runtime_ports::InboundMessageTiming>,
     /// True for runtime-generated background-result continuations. These turns
     /// carry evidence for the existing request, not fresh user intent.
     pub internal_continuation: bool,

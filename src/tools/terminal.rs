@@ -26,9 +26,9 @@ use crate::execution::{
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
-    StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode,
+    StateStore, Tool, ToolArgumentContractViolation, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolMutationEffects,
+    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -5965,6 +5965,36 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
     }
 }
 
+fn validate_terminal_argument_contract(
+    arguments: &str,
+) -> Result<(), ToolArgumentContractViolation> {
+    let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
+        return Ok(());
+    };
+    let Some(command) = parsed.get("command").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let has_write_paths = parsed
+        .get("write_paths")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+        });
+    if crate::tools::command_semantics::classify_shell_command(command).mutates_state()
+        && !has_write_paths
+    {
+        return Err(ToolArgumentContractViolation::new(
+            "mutating terminal runs require an explicit non-empty write_paths access manifest",
+        )
+        .with_recovery_hint(
+            "Retry with the execution working directory separate from the exact paths that may change.",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Tool for TerminalTool {
     fn name(&self) -> &str {
@@ -6018,6 +6048,10 @@ impl Tool for TerminalTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        validate_terminal_argument_contract(arguments)
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -6139,6 +6173,22 @@ mod tests {
             terminal_receipt_kind(r#"{"action":"trust_all"}"#),
             crate::traits::ToolReceiptKind::Generic
         );
+    }
+
+    #[test]
+    fn terminal_argument_contract_rejects_mutation_without_write_manifest() {
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp"}"#
+        )
+        .is_err());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp","write_paths":["/tmp/synthetic-target"]}"#
+        )
+        .is_ok());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"/usr/bin/false","working_dir":"/tmp"}"#
+        )
+        .is_ok());
     }
 
     #[test]

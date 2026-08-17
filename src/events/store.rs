@@ -856,14 +856,34 @@ impl EventStore {
         Ok(event_id)
     }
 
-    /// Project one canonical user-message event into the derived memory graph.
-    ///
-    /// Callers invoke this only after the task's semantic capability policy has
-    /// been compiled. Keeping projection out of [`append`](Self::append) closes
-    /// the former ordering gap where a no-memory request was persisted to the
-    /// memory graph before its constraint had been assessed.
-    pub async fn project_user_message_memory_span(&self, event_id: i64) -> anyhow::Result<()> {
-        crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await
+    /// Project the canonical user-message event for a task only after the
+    /// memory pipeline has persisted at least one durable fact from that turn.
+    /// Task identity is the selection boundary; prose similarity never chooses
+    /// which raw control turn enters the memory graph.
+    pub(crate) async fn project_selected_user_message_memory_span_for_task(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let event_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM events
+             WHERE task_id = ? AND event_type = 'user_message'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(event_id) = event_id else {
+            return Ok(None);
+        };
+        crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await?;
+        let projected = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ? AND deleted_at IS NULL",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await?
+            > 0;
+        Ok(projected.then_some(event_id))
     }
 
     /// Atomically append the canonical model-call event and its aggregate
@@ -2647,7 +2667,7 @@ mod tests {
             "canonical append must not imply memory persistence"
         );
         store
-            .project_user_message_memory_span(event_id)
+            .project_selected_user_message_memory_span_for_task("task-memory-boundary")
             .await
             .unwrap();
         let while_policy_pending: i64 =
@@ -2677,7 +2697,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .project_user_message_memory_span(event_id)
+            .project_selected_user_message_memory_span_for_task("task-memory-boundary")
             .await
             .unwrap();
 
@@ -2688,6 +2708,41 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(after_suppressed_projection, 0);
+
+        let allowed_event_id = store
+            .append(Event::new(
+                "session-memory-allowed",
+                EventType::UserMessage,
+                json!({
+                    "task_id": "task-memory-allowed",
+                    "turn_id": "turn-memory-allowed",
+                    "content": "My synthetic preference is dark mode"
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                "session-memory-allowed",
+                EventType::MemoryPolicyCompiled,
+                json!({
+                    "task_id": "task-memory-allowed",
+                    "turn_id": "turn-memory-allowed",
+                    "access": "allowed",
+                    "reason_code": "ordinary_allowed_memory",
+                    "retrieval_suppressed": false,
+                    "persistence_suppressed": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .project_selected_user_message_memory_span_for_task("task-memory-allowed")
+                .await
+                .unwrap(),
+            Some(allowed_event_id)
+        );
     }
 
     #[tokio::test]

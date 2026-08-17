@@ -431,10 +431,27 @@ impl WorkCoordinationStore for SqliteStateStore {
         };
         let goal_id: String = run.get("goal_id");
         let prior_status: String = run.get("prior_status");
+        let trigger_type: String = run.get("trigger_type");
         let goal_type: String = run.get("goal_type");
         let session_id: String = run.get("session_id");
         let has_schedule = run.get::<i64, _>("has_schedule") != 0;
         let recovery_for_run: Option<String> = run.get("recovery_for_run");
+        if trigger_type == "scheduled" && status == "completed" {
+            let incomplete_task_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE goal_run_id = ?
+                   AND (status NOT IN ('completed', 'skipped', 'superseded')
+                        OR length(trim(COALESCE(error, ''))) > 0
+                        OR length(trim(COALESCE(blocker, ''))) > 0)",
+            )
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                incomplete_task_count == 0,
+                "scheduled run cannot complete while {incomplete_task_count} task obligation(s) remain unresolved"
+            );
+        }
         let result = sqlx::query(
             "UPDATE goal_runs
              SET status = ?, outcome_summary = ?, completed_at = ?,
@@ -450,6 +467,21 @@ impl WorkCoordinationStore for SqliteStateStore {
         if result.rows_affected() == 0 {
             tx.rollback().await?;
             return Ok(false);
+        }
+        if trigger_type == "scheduled" && matches!(status, "failed" | "cancelled") {
+            sqlx::query(
+                "UPDATE tasks
+                 SET status = 'cancelled',
+                     error = COALESCE(NULLIF(error, ''),
+                                      'Parent scheduled occurrence reached a terminal state.'),
+                     completed_at = COALESCE(completed_at, ?)
+                 WHERE goal_run_id = ?
+                   AND status IN ('pending', 'claimed', 'running')",
+            )
+            .bind(&now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         let scheduled_objective = goal_type == "continuous" && has_schedule;
@@ -2104,6 +2136,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_run_terminalization_reconciles_child_obligations() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("synthetic recurrence", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let child = task(&goal.id, "unfinished scheduled child", None);
+        store.create_task(&child).await.unwrap();
+
+        let premature = store
+            .finish_goal_run(&run.id, "completed", Some("premature"))
+            .await;
+        assert!(premature.is_err());
+        assert_eq!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            run.id
+        );
+
+        assert!(store
+            .finish_goal_run(&run.id, "failed", Some("terminal failure"))
+            .await
+            .unwrap());
+        let reconciled = store.get_tasks_for_goal_run(&run.id).await.unwrap();
+        assert_eq!(reconciled[0].status, "cancelled");
+        assert!(reconciled[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Parent scheduled occurrence")));
+    }
+
+    #[tokio::test]
     async fn claims_are_dependency_aware_fenced_and_handed_off() {
         let (store, _database) = test_store().await;
         let goal = Goal::new_finite("coordinate a release", "session-a");
@@ -2802,6 +2872,10 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
+        recovery_task.status = "completed".to_string();
+        recovery_task.result = Some("synthetic recovery verified".to_string());
+        recovery_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        store.update_task(&recovery_task).await.unwrap();
         assert!(store
             .finish_goal_run(
                 &recovery_run.id,

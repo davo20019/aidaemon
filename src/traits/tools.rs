@@ -1046,6 +1046,12 @@ impl ToolCallOutcome {
             metadata: ToolCallMetadata {
                 outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
                 contract_rejected: true,
+                // No requested domain effect ran, but the adapter directly
+                // observed and completed its deterministic validation. This
+                // lets an explicit receipt predicate prove the negative result
+                // without relabeling it as a successful mutation.
+                semantics: ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent),
                 ..ToolCallMetadata::default()
             },
         }
@@ -1317,12 +1323,38 @@ pub enum DurableReplayDecision {
 }
 
 /// Tool trait — system tools, terminal, MCP-proxied tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArgumentContractViolation {
+    pub reason: String,
+    pub recovery_hint: Option<String>,
+}
+
+impl ToolArgumentContractViolation {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recovery_hint: None,
+        }
+    }
+
+    pub fn with_recovery_hint(mut self, hint: impl Into<String>) -> Self {
+        self.recovery_hint = Some(hint.into());
+        self
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     /// Returns the OpenAI-format function schema as a JSON Value.
     fn schema(&self) -> Value;
+    /// Adapter-owned, deterministic argument invariants evaluated by the
+    /// common dispatcher before any tool I/O. The default accepts all schema-
+    /// valid calls. Rejections become typed `contract_rejected` receipts.
+    fn validate_arguments(&self, _arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        Ok(())
+    }
     /// Execute the tool with the given JSON arguments string, returns result text.
     async fn call(&self, arguments: &str) -> anyhow::Result<String>;
 
@@ -1718,6 +1750,12 @@ mod tests {
             Some(ToolOutcomeStatus::CompletedWithNegativeResult)
         );
         assert!(rejected.metadata.contract_rejected);
+        assert!(rejected.metadata.semantics.observes_state());
+        assert!(!rejected.metadata.semantics.mutates_state());
+        assert_eq!(
+            rejected.metadata.semantics.verification_mode,
+            ToolVerificationMode::ResultContent
+        );
     }
 
     #[test]

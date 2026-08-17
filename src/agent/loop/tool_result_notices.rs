@@ -8,10 +8,6 @@ pub(in crate::agent) enum ToolResultNotice {
         tool_name: String,
         reason: String,
     },
-    DeterministicArgumentContractBlocked {
-        tool_name: String,
-        reason: String,
-    },
     ProjectInstructionsDiscovered {
         tool_name: String,
         sources: String,
@@ -166,11 +162,6 @@ impl ToolResultNotice {
             ),
             Self::ScopeLockBlockedResult { tool_name, reason } => format!(
                 "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",
-                tool_name, reason
-            ),
-            Self::DeterministicArgumentContractBlocked { tool_name, reason } => format!(
-                "[SYSTEM] Blocked `{}` by deterministic argument contract: {}. \
-Continue with tools that directly match the user request.",
                 tool_name, reason
             ),
             Self::ProjectInstructionsDiscovered { tool_name, sources } => format!(

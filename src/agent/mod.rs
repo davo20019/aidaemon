@@ -272,13 +272,14 @@ pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
 pub(in crate::agent) use history::{
-    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
-    mutation_contract_fulfilled,
+    append_required_invocation_obligations, inherit_unfinished_request_contract,
+    install_semantic_completion_contract, parse_planned_forbidden_action,
+    parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
+    SemanticCompletionRequirements,
 };
 pub(in crate::agent) use history::{
-    inherit_unfinished_request_contract, install_semantic_completion_contract,
-    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
-    retain_structural_completion_contract, SemanticCompletionRequirements,
+    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
+    mutation_contract_fulfilled,
 };
 #[path = "runtime/llm.rs"]
 mod llm;
@@ -1107,6 +1108,31 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
+        self.handle_message_with_attachments_and_ingress(
+            session_id,
+            user_text,
+            attachments,
+            status_tx,
+            user_role,
+            channel_ctx,
+            heartbeat,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_message_with_attachments_and_ingress(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        attachments: &[crate::traits::MessageAttachment],
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
+        heartbeat: Option<Arc<AtomicU64>>,
+        ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
+    ) -> anyhow::Result<String> {
         // Marks an agent task in flight for the entire turn (all recursion
         // depths route through here: interactive turns, goal-run task leads,
         // spawned specialists). The background memory pipeline defers its
@@ -1183,6 +1209,7 @@ impl Agent {
                 user_role,
                 channel_ctx,
                 heartbeat,
+                ingress_timing,
                 false,
                 None,
                 None,
@@ -1218,6 +1245,7 @@ impl Agent {
             request.user_role,
             request.channel_ctx.clone(),
             request.heartbeat.clone(),
+            None,
             true,
             request.parent_task_id.as_deref(),
             request.parent_tool_call_id.as_deref(),

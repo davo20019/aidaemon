@@ -3311,6 +3311,7 @@ pub(super) async fn run_completion_phase(
                 fast_model.clone(),
                 agent.state.clone(),
                 agent.event_store.clone(),
+                task_id.to_string(),
                 user_text.to_string(),
                 reply.clone(),
                 channel_ctx.channel_id.clone(),

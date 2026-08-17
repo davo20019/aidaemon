@@ -35,6 +35,9 @@ pub struct QueuedMessage {
     pub attachments: Vec<MessageAttachment>,
     #[allow(dead_code)]
     pub queued_at: DateTime<Utc>,
+    /// Optional transport timing follows the exact message through queue
+    /// coalescing and later agent dispatch.
+    pub ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
 }
 
 impl QueuedMessage {
@@ -50,7 +53,17 @@ impl QueuedMessage {
             channel_ctx,
             attachments,
             queued_at: Utc::now(),
+            ingress_timing: None,
         }
+    }
+
+    pub fn with_ingress_timing(
+        mut self,
+        mut timing: crate::runtime_ports::InboundMessageTiming,
+    ) -> Self {
+        timing.mark_queued(self.queued_at);
+        self.ingress_timing = Some(timing);
+        self
     }
 
     fn can_coalesce_with(&self, other: &Self) -> bool {

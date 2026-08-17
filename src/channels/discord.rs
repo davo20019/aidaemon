@@ -816,6 +816,7 @@ impl DiscordChannel {
                         user_role: current_user_role,
                         channel_ctx: current_channel_ctx.clone(),
                         heartbeat: Some(current_heartbeat.clone()),
+                        ingress_timing: None,
                     }) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 8), if stale_threshold_secs > 0 => {

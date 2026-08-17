@@ -97,6 +97,7 @@ async fn finalize_turn_assessment(
     structural_resume: bool,
     initial_turn_context: &TurnContext,
     plan: Option<&super::task_planning::TaskPlan>,
+    recovered_required_invocations: &[crate::traits::RequestReceiptPredicate],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
@@ -426,6 +427,10 @@ async fn finalize_turn_assessment(
     {
         crate::agent::retain_structural_completion_contract(&mut turn_context.completion_contract);
     }
+    crate::agent::append_required_invocation_obligations(
+        &mut turn_context.completion_contract,
+        recovered_required_invocations,
+    );
     turn_context.completion_contract.adopt_for_task(task_id);
 
     // Task ownership is bound only after the relationship and inherited
@@ -769,6 +774,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .insert(session_id.to_string(), user_msg_id.clone());
 
     // Emit TaskStart event
+    let task_started_at = Utc::now();
     let _ = emitter
         .emit(
             EventType::TaskStart,
@@ -782,6 +788,34 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             },
         )
         .await;
+    if let Some(timing) = ctx.ingress_timing {
+        let millis = |later: chrono::DateTime<Utc>, earlier: chrono::DateTime<Utc>| {
+            (later - earlier).num_milliseconds().max(0)
+        };
+        agent
+            .emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::GateTelemetry,
+                "Recorded inbound transport lifecycle".to_string(),
+                json!({
+                    "condition": "inbound_transport_lifecycle",
+                    "platform": channel_ctx.platform,
+                    "platform_message_at": timing.platform_message_at,
+                    "transport_received_at": timing.transport_received_at,
+                    "queue_entered_at": timing.queue_entered_at,
+                    "agent_dispatched_at": timing.agent_dispatched_at,
+                    "task_started_at": task_started_at,
+                    "platform_to_receiver_ms": timing.platform_message_at.map(|at| millis(timing.transport_received_at, at)),
+                    "receiver_to_queue_ms": timing.queue_entered_at.map(|at| millis(at, timing.transport_received_at)),
+                    "receiver_to_dispatch_ms": millis(timing.agent_dispatched_at, timing.transport_received_at),
+                    "queue_wait_ms": timing.queue_entered_at.map(|at| millis(timing.agent_dispatched_at, at)),
+                    "dispatch_to_task_start_ms": millis(task_started_at, timing.agent_dispatched_at),
+                }),
+            )
+            .await;
+    }
     // 1. Persist the user message
     //
     // The user message's own id is also the turn_id for this conversation
@@ -809,7 +843,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let mut user_msg = user_msg;
     user_msg.importance = score;
 
-    let user_message_event_id = agent
+    agent
         .append_user_message_with_event(
             &emitter,
             &user_msg,
@@ -1360,14 +1394,27 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         task_id: &task_id,
     });
     let mut relationship_fallback = None;
+    let mut recovered_required_invocations = Vec::new();
     if task_assessment_attempted && task_plan.is_none() {
         // The recovery compilers own independent typed products. Run them
         // concurrently so a slow contract recovery cannot serially delay the
         // dialogue edge (or vice versa); neither result can rewrite the other.
+        let available_tool_names = tool_defs
+            .iter()
+            .filter_map(|definition| {
+                definition
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| definition.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
         let contract_recovery = super::task_planning::generate_task_contract_recovery(
             llm_provider.clone(),
             planner_model,
             user_text,
+            &available_tool_names,
             assessment_mode,
             planner_telemetry,
         );
@@ -1384,7 +1431,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         };
         let (recovered_contract, recovered_relationship) =
             tokio::join!(contract_recovery, relationship_recovery);
-        task_plan = recovered_contract;
+        recovered_required_invocations = recovered_contract.required_invocations;
+        task_plan = recovered_contract.plan;
         relationship_fallback = recovered_relationship;
     }
     if relationship_fallback.is_none()
@@ -1415,6 +1463,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         resume_checkpoint.is_some(),
         &initial_turn_context,
         task_plan.as_ref(),
+        &recovered_required_invocations,
         relationship_fallback.as_ref(),
         task_assessment_attempted,
         assessment_decision_type,
@@ -1463,16 +1512,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             }),
         )
         .await;
-    if memory_pipeline_allowed {
-        if let Err(error) = agent
-            .event_store
-            .project_user_message_memory_span(user_message_event_id)
-            .await
-        {
-            tracing::debug!(%error, user_message_event_id, "Deferred allowed user-message span projection");
-        }
-    }
-
     // Identity/profile retrieval is optional memory access too; compile the
     // policy first, then fetch only the bounded categories used by the prompt.
     let owner_dm_fact_cache = if memory_pipeline_allowed
@@ -1789,6 +1828,7 @@ mod mandate_bootstrap_isolation_tests {
                 status_tx: None,
                 user_role: UserRole::Owner,
                 channel_ctx: &ChannelContext::internal(),
+                ingress_timing: None,
                 internal_continuation: false,
                 parent_task_id: None,
             },
