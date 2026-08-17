@@ -975,8 +975,21 @@ async fn test_high_risk_critique_pass_replans_before_external_execution() {
     .await
     .unwrap();
     assert_eq!(
-        tool_call_count, 0,
-        "critique rejection should block external execution before any tool call event is emitted"
+        tool_call_count, 1,
+        "the rejected proposal must retain one correlated call event"
+    );
+    let dispatched_result_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE session_id = ? AND event_type = 'tool_result' \
+         AND json_extract(data, '$.receipt.invocation_stage') = 'dispatched'",
+    )
+    .bind("critique_replan_external")
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        dispatched_result_count, 0,
+        "critique rejection must prevent adapter dispatch while preserving proposal telemetry"
     );
 }
 

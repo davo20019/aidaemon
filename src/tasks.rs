@@ -86,6 +86,9 @@ pub enum QueueOutcome {
 #[derive(Clone, Debug)]
 pub enum TaskStatus {
     Running,
+    /// Cancellation was requested, but the owning channel worker has not yet
+    /// durably terminalized the agent task or handed off the session FIFO.
+    Cancelling,
     Completed,
     Failed(String),
     Cancelled,
@@ -95,6 +98,7 @@ impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TaskStatus::Running => write!(f, "Running"),
+            TaskStatus::Cancelling => write!(f, "Cancelling"),
             TaskStatus::Completed => write!(f, "Completed"),
             TaskStatus::Failed(e) => write!(f, "Failed: {}", e),
             TaskStatus::Cancelled => write!(f, "Cancelled"),
@@ -133,6 +137,10 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    fn is_active(status: &TaskStatus) -> bool {
+        matches!(status, TaskStatus::Running | TaskStatus::Cancelling)
+    }
+
     pub fn new(max_completed: usize) -> Self {
         Self {
             tasks: RwLock::new(HashMap::new()),
@@ -186,6 +194,7 @@ impl TaskRegistry {
     }
 
     /// Mark a task as failed.
+    #[allow(dead_code)] // Retained for non-queued registry consumers.
     pub async fn fail(&self, task_id: u64, error: &str) {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
@@ -213,8 +222,7 @@ impl TaskRegistry {
                 if let Some(ref typing) = handle.typing_cancel {
                     typing.cancel();
                 }
-                handle.entry.status = TaskStatus::Cancelled;
-                handle.entry.finished_at = Some(Utc::now());
+                handle.entry.status = TaskStatus::Cancelling;
                 return true;
             }
         }
@@ -233,8 +241,7 @@ impl TaskRegistry {
                 if let Some(ref typing) = handle.typing_cancel {
                     typing.cancel();
                 }
-                handle.entry.status = TaskStatus::Cancelled;
-                handle.entry.finished_at = Some(Utc::now());
+                handle.entry.status = TaskStatus::Cancelling;
                 cancelled.push((*id, handle.entry.description.clone()));
             }
         }
@@ -261,7 +268,7 @@ impl TaskRegistry {
         let now = Utc::now();
         let mut reaped = Vec::new();
         for handle in tasks.values_mut() {
-            let stale = matches!(handle.entry.status, TaskStatus::Running)
+            let stale = Self::is_active(&handle.entry.status)
                 && (now - handle.entry.started_at).num_seconds() > MAX_RUNNING_TASK_AGE_SECS;
             if stale {
                 handle.cancel_token.cancel();
@@ -281,7 +288,7 @@ impl TaskRegistry {
     fn cleanup_locked(tasks: &mut HashMap<u64, TaskHandle>, max_completed: usize) {
         let mut finished: Vec<u64> = tasks
             .iter()
-            .filter(|(_, h)| !matches!(h.entry.status, TaskStatus::Running))
+            .filter(|(_, h)| !Self::is_active(&h.entry.status))
             .map(|(&id, _)| id)
             .collect();
 
@@ -312,9 +319,9 @@ impl TaskRegistry {
                 "Reaped stale running task(s) that were never finalized"
             );
         }
-        tasks.values().any(|h| {
-            h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
-        })
+        tasks
+            .values()
+            .any(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
     }
 
     /// Get the description of the currently running task for a session (if any).
@@ -322,9 +329,7 @@ impl TaskRegistry {
         let tasks = self.tasks.read().await;
         tasks
             .values()
-            .find(|h| {
-                h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
-            })
+            .find(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
             .map(|h| h.entry.description.clone())
     }
 
@@ -460,9 +465,9 @@ impl TaskRegistry {
                 "Reaped stale running task(s) before queue decision"
             );
         }
-        let running = tasks.values().any(|h| {
-            h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
-        });
+        let running = tasks
+            .values()
+            .any(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status));
         if !running {
             return QueueOutcome::NoRunningTask;
         }
@@ -506,10 +511,17 @@ impl TaskRegistry {
     ) -> Option<QueuedMessage> {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
-            handle.entry.status = match error {
-                Some(e) => TaskStatus::Failed(e.to_string()),
-                None => TaskStatus::Completed,
-            };
+            // `cancel()` records the authoritative terminal cause before the
+            // running future observes its cancellation token. Preserve that
+            // state while still using this transaction to hand off the FIFO.
+            if matches!(handle.entry.status, TaskStatus::Cancelling) {
+                handle.entry.status = TaskStatus::Cancelled;
+            } else if !matches!(handle.entry.status, TaskStatus::Cancelled) {
+                handle.entry.status = match error {
+                    Some(e) => TaskStatus::Failed(e.to_string()),
+                    None => TaskStatus::Completed,
+                };
+            }
             handle.entry.finished_at = Some(Utc::now());
         }
         Self::cleanup_locked(&mut tasks, self.max_completed);
@@ -526,6 +538,7 @@ impl TaskRegistry {
     }
 
     /// Clear all queued messages for a session.
+    #[allow(dead_code)] // Explicit queue discard is reserved for reset/wipe flows.
     pub async fn clear_queue(&self, session_id: &str) {
         let mut queues = self.queues.write().await;
         if let Some(queue) = queues.get_mut(session_id) {
@@ -859,6 +872,49 @@ mod tests {
         assert!(!registry.has_running_task(session).await);
         let entries = registry.list_for_session(session).await;
         assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_terminal_cause_and_hands_off_fifo() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        registry
+            .queue_message_if_running(session, queued("next"), Some("next-1"))
+            .await;
+
+        assert!(registry.cancel(task_id).await);
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("Task cancelled"))
+            .await
+            .expect("queued work must be handed off after cancellation");
+
+        assert_eq!(drained.text, "next");
+        assert_eq!(registry.queue_len(session).await, 0);
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_keeps_fifo_owner_active_until_handoff() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        assert!(registry.cancel(task_id).await);
+        assert!(matches!(
+            registry.list_for_session(session).await[0].status,
+            TaskStatus::Cancelling
+        ));
+
+        let outcome = registry
+            .queue_message_if_running(session, queued("arrived during cancellation"), Some("m-2"))
+            .await;
+        assert!(matches!(outcome, QueueOutcome::Queued(1)));
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("Task cancelled"))
+            .await
+            .expect("cancelling worker retains FIFO ownership");
+        assert_eq!(drained.text, "arrived during cancellation");
     }
 
     // Regression: a user re-typing the SAME text gets a new per-message

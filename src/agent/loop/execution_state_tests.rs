@@ -1430,3 +1430,13 @@ fn explicit_diagnostic_presentation_disables_natural_summary_gate() {
         .unrequested_internal_identifiers(&format!("Run {id}"), "show diagnostics")
         .is_empty());
 }
+
+#[test]
+fn nonrecoverable_failure_remains_open_until_a_later_satisfying_result() {
+    let mut state = test_execution_state();
+    state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+    assert!(state.has_unresolved_nonrecoverable_failure());
+
+    state.completed_operation_results = 1;
+    assert!(!state.has_unresolved_nonrecoverable_failure());
+}

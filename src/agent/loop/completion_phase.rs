@@ -643,12 +643,15 @@ pub(super) async fn run_completion_phase(
     // heuristics. Autonomous models choose their own strategy, but a first-pass
     // text denial is not evidence that an actionable request was resolved.
     let unresolved_recoverable_failure = execution_state.has_unresolved_recoverable_failure();
-    let execution_tool_recovery =
-        execution_requirement.requires_execution() || unresolved_recoverable_failure;
+    let unresolved_nonrecoverable_failure = execution_state.has_unresolved_nonrecoverable_failure();
+    let execution_tool_recovery = execution_requirement.requires_execution()
+        || unresolved_recoverable_failure
+        || unresolved_nonrecoverable_failure;
     let force_text_allowed = completion_contract_allows_force_text(
         &turn_context.completion_contract,
         &completion_progress,
-    ) && !unresolved_recoverable_failure;
+    ) && !unresolved_recoverable_failure
+        && !unresolved_nonrecoverable_failure;
     let mut force_text_response = *ctx.force_text_response && force_text_allowed;
     let mut force_text_fast_path_accepted = false;
     #[cfg(feature = "computer_use")]
@@ -1007,12 +1010,20 @@ pub(super) async fn run_completion_phase(
                     deferred_no_tool_streak,
                     "Blocked no-tool completion because current turn requires tools"
                 );
-                if unresolved_recoverable_failure && deferred_no_tool_streak >= 2 {
+                let recovery_exhausted = (unresolved_recoverable_failure
+                    && deferred_no_tool_streak >= 2)
+                    || (unresolved_nonrecoverable_failure && deferred_no_tool_streak >= 1);
+                if recovery_exhausted {
+                    let blocker = if unresolved_nonrecoverable_failure {
+                        "The proposed operation was rejected before a compatible execution path could be dispatched, and the bounded alternate-strategy pass produced no later satisfying receipt."
+                    } else {
+                        "A dispatched operation failed, and two autonomous recovery passes did not produce a later satisfying receipt."
+                    };
                     let request = build_agent_side_partial_failure(
                         turn_context,
                         learning_ctx,
                         Some(execution_state),
-                        "A dispatched operation failed, and two autonomous recovery passes did not produce a later satisfying receipt.",
+                        blocker,
                         "Start a new attempt with a different compatible execution strategy.",
                     );
                     terminal_cause = Some(TaskTerminalCause::HardFailure);
@@ -1029,6 +1040,7 @@ pub(super) async fn run_completion_phase(
                             json!({
                                 "condition": "operation_recovery_exhausted",
                                 "deferred_no_tool_streak": deferred_no_tool_streak,
+                                "nonrecoverable": unresolved_nonrecoverable_failure,
                                 "operation_results_observed": execution_state.operation_results_observed,
                                 "completed_operation_results": execution_state.completed_operation_results,
                             }),

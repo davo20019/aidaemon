@@ -15,8 +15,12 @@ fn test_is_resume_request_detects_continue_variants() {
 
 #[tokio::test]
 async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
-    let provider =
-        MockProvider::with_responses(vec![MockProvider::text_response("Resumed and done.")]);
+    let provider = MockProvider::with_responses(vec![
+        // A typed permanent failure cannot be closed by an unsupported text
+        // assertion. The first resumed turn selects another executable step.
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Resumed and done."),
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session_id = "resume_session";
     let orphan_task_id = "task-orphan-1";

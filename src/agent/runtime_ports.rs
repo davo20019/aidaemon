@@ -185,6 +185,22 @@ impl AgentIngress for Agent {
 
 #[async_trait]
 impl ChannelAgentRuntime for Agent {
+    async fn terminalize_supervised_task(
+        &self,
+        session_id: &str,
+        status: crate::events::TaskStatus,
+        error: String,
+    ) -> anyhow::Result<Option<String>> {
+        self.event_store
+            .terminalize_active_task(
+                session_id,
+                status,
+                Some(error),
+                Some("Channel supervisor terminated the running task".to_string()),
+            )
+            .await
+    }
+
     async fn cancel_active_goals_for_session(&self, session_id: &str) -> Vec<String> {
         Agent::cancel_active_goals_for_session(self, session_id).await
     }

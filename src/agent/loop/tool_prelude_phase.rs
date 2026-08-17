@@ -217,15 +217,6 @@ fn tool_call_is_side_effecting(
     }
 }
 
-fn tool_call_semantics(agent: &Agent, tc: &ToolCall) -> ToolCallSemantics {
-    agent
-        .tools
-        .iter()
-        .find(|tool| tool.name() == tc.name && tool.is_available())
-        .map(|tool| tool.call_semantics(&tc.arguments))
-        .unwrap_or_default()
-}
-
 fn first_side_effecting_tool_call<'a>(
     agent: &Agent,
     resp: &'a ProviderResponse,
@@ -611,20 +602,20 @@ async fn inject_prelude_retry_messages(
     result_text: String,
 ) -> anyhow::Result<()> {
     for tc in tool_calls {
-        let tool_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "tool".to_string(),
-            content: Some(result_text.clone()),
-            tool_call_id: Some(tc.id.clone()),
-            tool_name: Some(tc.name.clone()),
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.3,
-            ..Message::runtime_defaults()
-        };
         agent
-            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .persist_pre_dispatch_outcome(
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text.clone(),
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                agent.resolve_tool_call_semantics(tc),
+                None,
+            )
             .await?;
     }
 
@@ -641,26 +632,25 @@ async fn defer_prelude_for_new_project_instructions(
 ) -> anyhow::Result<()> {
     let sources = source_paths.join(", ");
     for tool_call in tool_calls {
-        let tool_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "tool".to_string(),
-            content: Some(
-                ToolResultNotice::ProjectInstructionsDiscovered {
-                    tool_name: tool_call.name.clone(),
-                    sources: sources.clone(),
-                }
-                .render(),
-            ),
-            tool_call_id: Some(tool_call.id.clone()),
-            tool_name: Some(tool_call.name.clone()),
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.2,
-            ..Message::runtime_defaults()
-        };
+        let result_text = ToolResultNotice::ProjectInstructionsDiscovered {
+            tool_name: tool_call.name.clone(),
+            sources: sources.clone(),
+        }
+        .render();
         agent
-            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .persist_pre_dispatch_outcome(
+                emitter,
+                session_id,
+                task_id,
+                tool_call,
+                &tool_call.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                agent.resolve_tool_call_semantics(tool_call),
+                None,
+            )
             .await?;
     }
     Ok(())
@@ -840,7 +830,7 @@ pub(super) async fn run_tool_prelude_phase(
     // Autonomous model's valid tool call. Deterministic tool/auth/role policy
     // remains enforced in the execution phase for every model.
     let negative_contract_match = resp.tool_calls.iter().find_map(|tc| {
-        let semantics = tool_call_semantics(agent, tc);
+        let semantics = agent.resolve_tool_call_semantics(tc);
         negative_contract_block_reason(
             &turn_context.completion_contract,
             tc,

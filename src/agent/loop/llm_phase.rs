@@ -192,6 +192,10 @@ async fn exhaust_mandate_run_token_lease_after_ambiguous_call(
 }
 
 const MANDATE_MAX_LLM_CALL_TIMEOUT: Duration = Duration::from_secs(840);
+/// A foreground turn must regain control soon enough to select another model,
+/// render verified partial progress, or let its supervisor reconcile the task.
+/// Provider HTTP timeouts may be longer, but they are not the lifecycle budget.
+const FOREGROUND_MAX_LLM_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MANDATE_INPUT_RESERVATION_MARGIN_NUMERATOR: i64 = 5;
 const MANDATE_INPUT_RESERVATION_MARGIN_DENOMINATOR: i64 = 4;
 const MANDATE_INPUT_RESERVATION_FIXED_TOKENS: i64 = 512;
@@ -920,7 +924,7 @@ pub(super) async fn run_llm_phase(
     let timeout_dur = if services.agent.mandate_execution.is_some() {
         effective_llm_timeout.min(MANDATE_MAX_LLM_CALL_TIMEOUT)
     } else {
-        effective_llm_timeout
+        effective_llm_timeout.min(FOREGROUND_MAX_LLM_CALL_TIMEOUT)
     };
 
     // Mandate runs use one durable immutable balance across the task lead and
@@ -2223,6 +2227,18 @@ mod tests {
         assert!(
             MANDATE_MAX_LLM_CALL_TIMEOUT.as_secs() + LEASE_GRACE_SECS
                 <= SQLITE_MANDATE_TOKEN_LEASE_MAX_SECS
+        );
+    }
+
+    #[test]
+    fn foreground_provider_timeout_is_a_bounded_recovery_interval() {
+        assert_eq!(
+            Duration::from_secs(300).min(FOREGROUND_MAX_LLM_CALL_TIMEOUT),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            Duration::from_secs(30).min(FOREGROUND_MAX_LLM_CALL_TIMEOUT),
+            Duration::from_secs(30)
         );
     }
 

@@ -815,6 +815,44 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_roles_are_grounded_without_dropping_exact_request_resources() {
+        let mut signals = base_signals();
+        signals.filesystem_access = Some(PlannedFilesystemAccess {
+            execution_cwd: Some("/tmp".to_string()),
+            read_paths: vec![
+                "/Users/synthetic/.cargo".to_string(),
+                "/Users/synthetic/.rustup".to_string(),
+            ],
+            write_paths: vec!["/tmp/synthetic-future-root".to_string()],
+        });
+        let resources = vec![
+            "/tmp".to_string(),
+            "/Users/synthetic/.cargo".to_string(),
+            "/Users/synthetic/.rustup".to_string(),
+            "/tmp/synthetic-future-root".to_string(),
+        ];
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            available_tool_names: &["terminal".to_string()],
+            structural_filesystem_resources: &resources,
+            structural_project_scopes: &resources,
+            project_alias_roots: &[],
+        });
+
+        let access = compiled.filesystem_access.expect("filesystem authority");
+        assert_eq!(access.execution_cwd.as_deref(), Some("/tmp"));
+        assert_eq!(access.read_targets.len(), 2);
+        assert_eq!(access.write_targets.len(), 1);
+        assert_eq!(access.write_targets[0].value, "/tmp/synthetic-future-root");
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "filesystem_authority"
+                && decision.accepted
+                && decision.reason_code == "accepted"
+        }));
+    }
+
+    #[test]
     fn research_policy_cannot_attach_to_host_local_process_evidence() {
         let mut signals = base_signals();
         signals.minimum_sources = Some(1);

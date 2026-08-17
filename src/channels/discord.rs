@@ -630,8 +630,7 @@ impl DiscordChannel {
                 .task_registry
                 .cancel_running_for_session(&session_id)
                 .await;
-            let queue_cleared = self.task_registry.queue_len(&session_id).await;
-            self.task_registry.clear_queue(&session_id).await;
+            let queued_work_preserved = self.task_registry.queue_len(&session_id).await;
             let cancelled_goals = self
                 .agent
                 .cancel_active_goals_for_session(&session_id)
@@ -669,8 +668,11 @@ impl DiscordChannel {
                     .map(|(_, d)| d.as_str())
                     .unwrap_or("unknown");
                 let mut response = format!("⏹️ Cancelled: {}", desc);
-                if queue_cleared > 0 {
-                    response.push_str(&format!(" (+{} queued messages cleared)", queue_cleared));
+                if queued_work_preserved > 0 {
+                    response.push_str(&format!(
+                        " ({} queued request(s) will continue in order)",
+                        queued_work_preserved
+                    ));
                 }
                 if !cancelled_goals.is_empty() {
                     response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
@@ -880,18 +882,32 @@ impl DiscordChannel {
                     Err(e) => {
                         let error_msg = e.to_string();
                         if error_msg == "Task cancelled" {
-                            registry.fail(current_task_id, &error_msg).await;
+                            task_error = Some(error_msg);
                             info!("Task #{} cancelled", current_task_id);
-                            return;
-                        }
-                        task_error = Some(error_msg.clone());
-                        if error_msg.starts_with("Task auto-cancelled due to inactivity") {
-                            info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
-                            let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
                         } else {
-                            warn!("Agent error: {}", e);
-                            let _ = channel_id.say(&http, format!("Error: {}", e)).await;
+                            task_error = Some(error_msg.clone());
+                            if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                                info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
+                                let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
+                            } else {
+                                warn!("Agent error: {}", e);
+                                let _ = channel_id.say(&http, format!("Error: {}", e)).await;
+                            }
                         }
+                    }
+                }
+
+                if let Some(error) = task_error.as_ref() {
+                    let status = if error == "Task cancelled" {
+                        crate::events::TaskStatus::Cancelled
+                    } else {
+                        crate::events::TaskStatus::Failed
+                    };
+                    if let Err(terminalize_error) = agent
+                        .terminalize_supervised_task(&session_id, status, error.clone())
+                        .await
+                    {
+                        warn!(%terminalize_error, "Failed to persist supervised task termination");
                     }
                 }
 

@@ -1334,6 +1334,53 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
+    /// Fold one event kind for an exact task. Terminal telemetry uses this
+    /// durable count so pre-dispatch guards, adapter calls, and supervisor
+    /// exits cannot disagree with in-memory loop counters.
+    pub async fn task_event_count(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        event_type: EventType,
+    ) -> anyhow::Result<u32> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = ?",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .bind(event_type.as_str())
+        .fetch_one(&self.pool)
+        .await?
+        .max(0) as u32)
+    }
+
+    /// End-to-end duration from the canonical TaskStart, including bootstrap,
+    /// semantic assessment, queue-dispatched work, and finalization.
+    pub async fn task_elapsed_secs(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let started_at = sqlx::query_scalar::<_, String>(
+            "SELECT started_at FROM task_lifecycle
+             WHERE session_id = ? AND task_id = ?",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(raw) = started_at else {
+            return Ok(None);
+        };
+        let started_at = DateTime::parse_from_rfc3339(&raw)?;
+        Ok(Some(
+            (Utc::now() - started_at.with_timezone(&Utc))
+                .num_seconds()
+                .max(0) as u64,
+        ))
+    }
+
     /// Query recent task_end events for a session.
     /// When failures_only is true, only failed task_end events are returned.
     pub async fn query_recent_task_ends(
@@ -1743,6 +1790,109 @@ impl EventStore {
         .await?;
 
         Ok(self.rows_to_events(rows)?.into_iter().next())
+    }
+
+    /// Close the session's currently running task from durable evidence.
+    ///
+    /// Channel supervisors own cancellation and wall-clock watchdogs, so they
+    /// can drop the in-process agent future before its ordinary exit path gets
+    /// a chance to emit `TaskEnd`. This is the shared terminal boundary for
+    /// those exits. The lifecycle projection makes the append idempotent when
+    /// a normal task end races this method, and all counters are folded from
+    /// persisted events rather than guessed by the supervisor.
+    pub async fn terminalize_active_task(
+        &self,
+        session_id: &str,
+        status: TaskStatus,
+        error: Option<String>,
+        summary: Option<String>,
+    ) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT lifecycle.task_id AS task_id,
+                   start.created_at AS started_at,
+                   start.turn_id AS turn_id,
+                   start.data AS start_data
+            FROM task_lifecycle AS lifecycle
+            JOIN events AS start ON start.id = lifecycle.start_event_id
+            WHERE lifecycle.session_id = ?
+              AND lifecycle.state = 'running'
+            ORDER BY start.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let task_id: String = row.get("task_id");
+        let started_at_raw: String = row.get("started_at");
+        let started_at = DateTime::parse_from_rfc3339(&started_at_raw)
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let start_data: serde_json::Value =
+            serde_json::from_str(&row.get::<String, _>("start_data"))?;
+        let turn_id = row.try_get::<Option<String>, _>("turn_id")?.or_else(|| {
+            start_data
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+
+        let tool_calls_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_call'",
+        )
+        .bind(session_id)
+        .bind(&task_id)
+        .fetch_one(&self.pool)
+        .await?
+        .max(0) as u32;
+        let iterations = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'llm_call'",
+        )
+        .bind(session_id)
+        .bind(&task_id)
+        .fetch_one(&self.pool)
+        .await?
+        .max(0) as u32;
+        let outcome = match status {
+            TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
+            TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
+            TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
+        };
+        let completion_proof = crate::events::TaskCompletionProofData {
+            schema_version: 1,
+            task_id: task_id.clone(),
+            request_turn_id: turn_id.clone(),
+            response_message_ids: self.task_response_message_ids(&task_id).await?,
+            receipt_refs: self.task_completion_proof_references(&task_id).await?,
+            closed_at: Utc::now().to_rfc3339(),
+        };
+        let event = Event::new(
+            session_id,
+            EventType::TaskEnd,
+            serde_json::to_value(TaskEndData {
+                task_id: task_id.clone(),
+                status,
+                outcome: Some(outcome),
+                duration_secs: (Utc::now() - started_at).num_seconds().max(0) as u64,
+                iterations,
+                tool_calls_count,
+                error,
+                summary,
+                efficiency: None,
+                turn_id,
+                completion_proof: Some(completion_proof),
+                harness_eval: None,
+            })?,
+        );
+        self.append(event).await?;
+        Ok(Some(task_id))
     }
 
     /// Latest cumulative policy-counter checkpoint for every daemon boot.
@@ -3706,6 +3856,89 @@ mod tests {
             .parse_data::<DecisionPointData>()
             .expect("parse decision point");
         assert_eq!(parsed.decision_type, DecisionType::IntentGate);
+    }
+
+    #[tokio::test]
+    async fn supervisor_terminalization_folds_durable_task_evidence_and_is_idempotent() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        append_event_at(
+            &store,
+            "s-supervisor",
+            EventType::TaskStart,
+            json!({
+                "task_id": "task-supervisor",
+                "description": "synthetic long task",
+                "turn_id": "turn-supervisor"
+            }),
+            now - Duration::minutes(2),
+        )
+        .await;
+        append_event_at(
+            &store,
+            "s-supervisor",
+            EventType::ToolCall,
+            json!({
+                "task_id": "task-supervisor",
+                "tool_call_id": "call-1",
+                "name": "synthetic_tool",
+                "arguments": {}
+            }),
+            now - Duration::minutes(1),
+        )
+        .await;
+
+        let closed = store
+            .terminalize_active_task(
+                "s-supervisor",
+                TaskStatus::Cancelled,
+                Some("cancelled by test supervisor".to_string()),
+                Some("Supervisor stopped the running task".to_string()),
+            )
+            .await
+            .expect("terminalize active task");
+        assert_eq!(closed.as_deref(), Some("task-supervisor"));
+        assert!(store
+            .terminalize_active_task(
+                "s-supervisor",
+                TaskStatus::Failed,
+                Some("duplicate".to_string()),
+                None,
+            )
+            .await
+            .expect("idempotent terminalization")
+            .is_none());
+
+        let events = store
+            .query_task_events_for_session("s-supervisor", "task-supervisor")
+            .await
+            .expect("query task events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::TaskEnd)
+                .count(),
+            1
+        );
+        let end = events
+            .iter()
+            .find(|event| event.event_type == EventType::TaskEnd)
+            .expect("task end")
+            .parse_data::<TaskEndData>()
+            .expect("parse task end");
+        assert_eq!(end.status, TaskStatus::Cancelled);
+        assert_eq!(end.tool_calls_count, 1);
+        assert!(
+            end.duration_secs >= 119,
+            "duration must include bootstrap time"
+        );
+        assert_eq!(end.turn_id.as_deref(), Some("turn-supervisor"));
+        assert_eq!(
+            end.completion_proof
+                .as_ref()
+                .and_then(|proof| proof.request_turn_id.as_deref()),
+            Some("turn-supervisor")
+        );
     }
 
     #[tokio::test]

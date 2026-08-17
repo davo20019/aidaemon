@@ -475,23 +475,55 @@ async fn defer_tool_calls_for_new_project_instructions(
             sources: sources.clone(),
         }
         .render();
-        let tool_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "tool".to_string(),
-            content: Some(result_text),
-            tool_call_id: Some(tool_call.id.clone()),
-            tool_name: Some(tool_call.name.clone()),
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.2,
-            ..Message::runtime_defaults()
-        };
-        agent
-            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
-            .await?;
+        persist_pre_dispatch_outcome(
+            agent,
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            &tool_call.arguments,
+            result_text,
+            crate::traits::ToolOutcomeStatus::Blocked,
+            crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            false,
+            ToolCallSemantics::default(),
+            None,
+        )
+        .await?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_pre_dispatch_outcome(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_call: &ToolCall,
+    effective_arguments: &str,
+    result_text: String,
+    outcome_status: crate::traits::ToolOutcomeStatus,
+    invocation_stage: crate::traits::ToolInvocationStage,
+    contract_rejected: bool,
+    semantics: ToolCallSemantics,
+    access_manifest: Option<ToolCallAccessManifest>,
+) -> anyhow::Result<()> {
+    agent
+        .persist_pre_dispatch_outcome(
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            effective_arguments,
+            result_text,
+            outcome_status,
+            invocation_stage,
+            contract_rejected,
+            semantics,
+            access_manifest,
+        )
+        .await
 }
 
 fn finish_tool_execution_phase<T>(
@@ -755,28 +787,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tool_name: tc.name.clone(),
             }
             .render();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.2,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await?;
+            execution_state.record_tool_call();
             continue;
         }
         total_tool_calls_attempted = total_tool_calls_attempted.saturating_add(1);
@@ -792,28 +818,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &tc.name,
                 active_untrusted_external_reference_skills,
             );
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.15,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await?;
+            execution_state.record_tool_call();
             iteration_had_tool_failures = true;
             continue;
         }
@@ -843,28 +863,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tool_name: tc.name.clone(),
             }
             .render();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.15,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await?;
+            execution_state.record_tool_call();
             iteration_had_tool_failures = true;
             continue;
         }
@@ -904,28 +918,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tc.name,
                 prohibited_scope.as_str()
             );
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.2,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    false,
-                    0,
-                    Some("blocked_by_current_request_constraint".to_string()),
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await?;
+            execution_state.record_tool_call();
             iteration_had_tool_failures = true;
             continue;
         }
@@ -964,28 +972,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     "[SYSTEM] Semantic scope blocked `{}`: active request scope is {}, but the tool scope is {}. Continue with tools that match the active request.",
                     tc.name, active_scope, tool_scope
                 );
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text.clone()),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.2,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await?;
+            execution_state.record_tool_call();
             agent
                 .emit_warning_decision_point(
                     emitter,
@@ -1294,28 +1296,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 reason: scope_reason.clone(),
             }
             .render();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text.clone()),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.2,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+            persist_pre_dispatch_outcome(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &effective_arguments,
+                result_text,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                call_semantics.clone(),
+                Some(access_manifest.clone()),
+            )
+            .await?;
+            execution_state.record_tool_call();
             validation_state.record_failure(ValidationFailure::ScopeViolation);
             validation_state.note_replan();
             learning_ctx.record_replay_note(
@@ -1498,30 +1494,36 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 };
                 if let Some(result_text) = synthetic {
                     execution_state.record_synthetic_step();
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.3,
-                        ..Message::runtime_defaults()
+                    let (outcome_status, invocation_stage, step_outcome) = match decision {
+                        ReadDecision::Replay { .. } => (
+                            crate::traits::ToolOutcomeStatus::Succeeded,
+                            crate::traits::ToolInvocationStage::Replayed,
+                            StepExecutionOutcome::Progress,
+                        ),
+                        ReadDecision::PartialOverlap { .. } => (
+                            crate::traits::ToolOutcomeStatus::Blocked,
+                            crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                            StepExecutionOutcome::NonrecoverableFailure,
+                        ),
+                        ReadDecision::Execute | ReadDecision::Unknown => unreachable!(),
                     };
-                    agent
-                        .append_tool_message_with_result_event(
-                            emitter,
-                            &tool_msg,
-                            true,
-                            0,
-                            None,
-                            Some(task_id),
-                        )
-                        .await?;
+                    persist_pre_dispatch_outcome(
+                        agent,
+                        emitter,
+                        session_id,
+                        task_id,
+                        tc,
+                        &effective_arguments,
+                        result_text,
+                        outcome_status,
+                        invocation_stage,
+                        false,
+                        call_semantics.clone(),
+                        Some(access_manifest.clone()),
+                    )
+                    .await?;
                     execution_state.record_tool_call();
-                    execution_state.complete_current_step(StepExecutionOutcome::Progress);
+                    execution_state.complete_current_step(step_outcome);
                     execution_state.mark_persisted_now();
                     continue;
                 }
@@ -1654,28 +1656,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         "[CORRECTION BLOCKED] Tool call blocked by sandbox policy: {}",
                         redacted_reason
                     );
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.2,
-                        ..Message::runtime_defaults()
-                    };
-                    agent
-                        .append_tool_message_with_result_event(
-                            emitter,
-                            &tool_msg,
-                            true,
-                            0,
-                            None,
-                            Some(task_id),
-                        )
-                        .await?;
+                    persist_pre_dispatch_outcome(
+                        agent,
+                        emitter,
+                        session_id,
+                        task_id,
+                        tc,
+                        &effective_arguments,
+                        result_text,
+                        crate::traits::ToolOutcomeStatus::Blocked,
+                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                        false,
+                        call_semantics.clone(),
+                        Some(access_manifest.clone()),
+                    )
+                    .await?;
+                    execution_state.record_tool_call();
                     execution_state
                         .complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
                     execution_state.mark_persisted_now();
@@ -1683,28 +1679,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
                 CorrectionGateDecision::GiveUpToolResult { report } => {
                     let result_text = format!("[CORRECTION GAVE UP] {}", report);
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.2,
-                        ..Message::runtime_defaults()
-                    };
-                    agent
-                        .append_tool_message_with_result_event(
-                            emitter,
-                            &tool_msg,
-                            true,
-                            0,
-                            None,
-                            Some(task_id),
-                        )
-                        .await?;
+                    persist_pre_dispatch_outcome(
+                        agent,
+                        emitter,
+                        session_id,
+                        task_id,
+                        tc,
+                        &effective_arguments,
+                        result_text,
+                        crate::traits::ToolOutcomeStatus::Blocked,
+                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                        false,
+                        call_semantics.clone(),
+                        Some(access_manifest.clone()),
+                    )
+                    .await?;
+                    execution_state.record_tool_call();
                     execution_state
                         .complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
                     execution_state.mark_persisted_now();
@@ -1790,28 +1780,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             warn!(task_id = %tid, %error, "Failed to log mandate gate denial");
                         }
                     }
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.3,
-                        ..Message::runtime_defaults()
-                    };
-                    agent
-                        .append_tool_message_with_result_event(
-                            emitter,
-                            &tool_msg,
-                            false,
-                            0,
-                            Some(reason.clone()),
-                            Some(task_id),
-                        )
-                        .await?;
+                    persist_pre_dispatch_outcome(
+                        agent,
+                        emitter,
+                        session_id,
+                        task_id,
+                        tc,
+                        &effective_arguments,
+                        result_text,
+                        crate::traits::ToolOutcomeStatus::Blocked,
+                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                        false,
+                        call_semantics.clone(),
+                        Some(access_manifest.clone()),
+                    )
+                    .await?;
+                    execution_state.record_tool_call();
                     agent
                         .emit_warning_decision_point(
                             emitter,

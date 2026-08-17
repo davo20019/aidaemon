@@ -193,26 +193,19 @@ pub(super) async fn maybe_block_tool_by_budget(
                 until_iteration,
             }
             .render();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: ctx.session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.1,
-                ..Message::runtime_defaults()
-            };
             agent
-                .append_tool_message_with_result_event(
+                .persist_pre_dispatch_outcome(
                     ctx.emitter,
-                    &tool_msg,
-                    true,
-                    0,
+                    ctx.session_id,
+                    ctx.task_id,
+                    tc,
+                    &tc.arguments,
+                    result_text,
+                    crate::traits::ToolOutcomeStatus::Blocked,
+                    crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                    false,
+                    agent.resolve_tool_call_semantics(tc),
                     None,
-                    Some(ctx.task_id),
                 )
                 .await?;
             return Ok(ToolBlockKind::Cooldown);
@@ -374,27 +367,19 @@ pub(super) async fn maybe_block_tool_by_budget(
             }),
         )
         .await;
-    let tool_msg = Message {
-        id: Uuid::new_v4().to_string(),
-        session_id: ctx.session_id.to_string(),
-        role: "tool".to_string(),
-        content: Some(result_text),
-        tool_call_id: Some(tc.id.clone()),
-        tool_name: Some(tc.name.clone()),
-        tool_calls_json: None,
-        created_at: Utc::now(),
-        importance: 0.1,
-        ..Message::runtime_defaults()
-    };
-
     agent
-        .append_tool_message_with_result_event(
+        .persist_pre_dispatch_outcome(
             ctx.emitter,
-            &tool_msg,
-            true,
-            0,
+            ctx.session_id,
+            ctx.task_id,
+            tc,
+            &tc.arguments,
+            result_text,
+            crate::traits::ToolOutcomeStatus::Blocked,
+            crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            false,
+            agent.resolve_tool_call_semantics(tc),
             None,
-            Some(ctx.task_id),
         )
         .await?;
 
@@ -483,14 +468,28 @@ pub(super) async fn maybe_handle_duplicate_send_file_noop(
         importance: 0.3,
         ..Message::runtime_defaults()
     };
+    let metadata = crate::traits::ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+        invocation_stage: crate::traits::ToolInvocationStage::Replayed,
+        semantics: agent.resolve_tool_call_semantics(tc),
+        ..crate::traits::ToolCallMetadata::default()
+    };
+    let receipt = crate::events::ToolReceiptV1::from_metadata(
+        &metadata,
+        crate::traits::ToolOutcomeStatus::Succeeded,
+        crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+        None,
+    );
     agent
-        .append_tool_message_with_result_event(
+        .append_tool_message_with_receipt_event_policy(
             ctx.emitter,
             &tool_msg,
             true,
             0,
             None,
             Some(ctx.task_id),
+            None,
+            Some(receipt),
         )
         .await?;
 

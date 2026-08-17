@@ -1095,6 +1095,22 @@ impl Agent {
         error: Option<String>,
         summary: Option<String>,
     ) {
+        let durable_tool_calls_count = self
+            .event_store
+            .task_event_count(
+                emitter.session_id(),
+                task_id,
+                crate::events::EventType::ToolCall,
+            )
+            .await
+            .unwrap_or(tool_calls_count as u32);
+        let durable_duration_secs = self
+            .event_store
+            .task_elapsed_secs(emitter.session_id(), task_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| task_start.elapsed().as_secs());
         let efficiency = self.task_efficiency_data(task_id).await;
         let harness_eval_snapshot = if self.harness_eval_config.enabled {
             let acc = self.harness_eval.write().await.take();
@@ -1102,7 +1118,7 @@ impl Agent {
                 accumulator.finalize(
                     outcome,
                     iteration as u32,
-                    tool_calls_count as u32,
+                    durable_tool_calls_count,
                     efficiency.as_ref(),
                 )
             })
@@ -1143,9 +1159,9 @@ impl Agent {
                     task_id: task_id.to_string(),
                     status,
                     outcome: Some(outcome),
-                    duration_secs: task_start.elapsed().as_secs(),
+                    duration_secs: durable_duration_secs,
                     iterations: iteration as u32,
-                    tool_calls_count: tool_calls_count as u32,
+                    tool_calls_count: durable_tool_calls_count,
                     error,
                     summary,
                     efficiency,

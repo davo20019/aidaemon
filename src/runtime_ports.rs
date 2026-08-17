@@ -210,6 +210,12 @@ pub(crate) trait AgentIngress: Send + Sync {
 /// Agent administration surface used by shared channel commands.
 #[async_trait]
 pub(crate) trait ChannelAgentRuntime: AgentIngress {
+    async fn terminalize_supervised_task(
+        &self,
+        session_id: &str,
+        status: crate::events::TaskStatus,
+        error: String,
+    ) -> anyhow::Result<Option<String>>;
     async fn cancel_active_goals_for_session(&self, session_id: &str) -> Vec<String>;
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
     async fn current_model(&self) -> String;

@@ -692,6 +692,18 @@ impl ExecutionState {
             && !self.background_handoff_active
     }
 
+    /// Whether a pre-dispatch or dispatched step reached a terminal failure
+    /// that cannot be repaired by retrying the same operation. One subsequent
+    /// model turn may select a genuinely different step; absent that, the
+    /// finalizer must close honestly instead of consuming every loop budget.
+    pub fn has_unresolved_nonrecoverable_failure(&self) -> bool {
+        matches!(
+            self.last_outcome,
+            Some(StepExecutionOutcome::NonrecoverableFailure)
+        ) && self.completed_operation_results == 0
+            && !self.background_handoff_active
+    }
+
     pub fn record_outcome(&mut self, entry: OutcomeEntry) {
         self.outcome_ledger.push(entry);
     }

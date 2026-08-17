@@ -608,10 +608,21 @@ async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical
         response,
         "The cached resume section contains beta and gamma."
     );
-    let physical_reads: i64 = sqlx::query_scalar(
+    let proposed_reads: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
          WHERE session_id = ? AND event_type = 'tool_call' \
          AND json_extract(data, '$.name') = 'read_file'",
+    )
+    .bind("semantic_read_cache")
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(proposed_reads, 3);
+    let physical_reads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE session_id = ? AND event_type = 'tool_result' \
+         AND json_extract(data, '$.name') = 'read_file' \
+         AND json_extract(data, '$.receipt.invocation_stage') = 'dispatched'",
     )
     .bind("semantic_read_cache")
     .fetch_one(&harness.state.pool())

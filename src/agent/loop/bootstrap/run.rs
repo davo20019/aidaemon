@@ -236,11 +236,17 @@ async fn finalize_turn_assessment(
     }
 
     if let Some(signals) = plan.and_then(|plan| plan.contract.as_ref()) {
-        // Authority comes from the typed contract producer. Text-level path
-        // extraction is presentation assistance, not a control-plane input;
-        // actual calls contribute their prepared access manifests lazily.
-        let structural_filesystem_resources = Vec::new();
-        let structural_project_scopes = Vec::new();
+        // The semantic producer assigns read/write/cwd roles, but it cannot
+        // invent filesystem authority. Ground every proposed path against an
+        // exact path-shaped resource identity authored in the current request.
+        // This parser recognizes filesystem grammar only; it does not infer
+        // intent from words or phrases.
+        let structural_filesystem_resources =
+            crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
+                user_text,
+                &agent.path_aliases.projects,
+            );
+        let structural_project_scopes = structural_filesystem_resources.clone();
         let compiled = super::contract_compiler::compile_task_contract(
             super::contract_compiler::ContractCompilerInput {
                 signals,

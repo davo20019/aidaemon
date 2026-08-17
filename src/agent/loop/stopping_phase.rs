@@ -378,8 +378,8 @@ pub(super) async fn run_stopping_phase(
         }
 
         validation_state.record_failure(ValidationFailure::BudgetExhausted);
-        let request = if made_progress {
-            build_reduce_scope_request_with_plan(
+        let mut request = if made_progress {
+            build_partial_done_blocked_request_with_plan(
                     turn_context,
                     learning_ctx,
                     Some(execution_state),
@@ -387,8 +387,8 @@ pub(super) async fn run_stopping_phase(
                         "I hit the current execution budget limit ({}) before I could safely continue.",
                         limit.as_str()
                     ),
-                    "Confirm the reduced scope or next concrete target I should spend the remaining effort on.",
-                    "I will continue only on that narrowed scope and then report what changed.",
+                    "No user input can replenish an exhausted internal execution budget.",
+                    "Start a fresh autonomous attempt from the persisted receipts and choose a different strategy.",
                 )
         } else if matches!(
             execution_state.last_outcome,
@@ -402,8 +402,8 @@ pub(super) async fn run_stopping_phase(
                         "The current execution path failed nonrecoverably before making progress, and I also hit the {} limit.",
                         limit.as_str()
                     ),
-                    "A different plan, target, or operator intervention before I attempt this again.",
-                    "I will abandon this path and wait for a revised instruction instead of retrying the same broken approach.",
+                    "No user input is required for this agent-side execution failure.",
+                    "Start a fresh autonomous attempt with a different compatible execution path.",
                 )
         } else if !has_executed_concrete_work {
             build_abandon_request(
@@ -413,8 +413,8 @@ pub(super) async fn run_stopping_phase(
                         "I hit the current execution budget limit ({}) while planning or retrying, before any concrete tool or verification step could complete.",
                         limit.as_str()
                     ),
-                    "A narrower target, a revised approach, or explicit permission to spend more execution budget on a new attempt.",
-                    "I will stop this execution path here instead of pretending partial work exists when no concrete step completed.",
+                    "No user input is required for this agent-side execution failure.",
+                    "Start a fresh autonomous attempt instead of continuing this exhausted path.",
                 )
         } else {
             build_partial_done_blocked_request_with_plan(
@@ -425,10 +425,12 @@ pub(super) async fn run_stopping_phase(
                         "I hit the current execution budget limit ({}) before I could safely continue.",
                         limit.as_str()
                     ),
-                    "A narrower scope or explicit approval to continue beyond the current execution envelope.",
-                    "I will either continue with the reduced scope or spend the additional budget on the next concrete step.",
+                    "No user input can replenish an exhausted internal execution budget.",
+                    "Start a fresh autonomous attempt from the persisted receipts and choose a different strategy.",
                 )
         };
+        request.user_action_required = false;
+        request.consequence_if_not_provided = None;
         learning_ctx.record_replay_note(
                 ReplayNoteCategory::ValidationFailure,
                 "execution_budget_exhausted",
@@ -497,12 +499,15 @@ pub(super) async fn run_stopping_phase(
             .emit_task_end(
                 emitter,
                 task_id,
-                TaskStatus::Completed,
+                TaskStatus::Failed,
                 TaskOutcome::Failed,
                 task_start,
                 iteration,
                 learning_ctx.tool_calls.len(),
-                None,
+                Some(format!(
+                    "Execution budget exhausted: {}",
+                    limit.as_str()
+                )),
                 Some(reply.chars().take(200).collect()),
             )
             .await;
@@ -1801,7 +1806,7 @@ pub(super) async fn run_stopping_phase(
             if let Some(tool_output) =
                 latest_non_system_tool_output_excerpt(agent, session_id, 2500).await
             {
-                let reply = last_resort_tool_output_reply(&tool_output);
+                let (reply, user_answer_completed) = last_resort_tool_output_reply(&tool_output);
                 agent
                     .emit_warning_decision_point(
                         emitter,
@@ -1842,16 +1847,20 @@ pub(super) async fn run_stopping_phase(
                     )
                     .await?;
 
-                let outcome = TaskOutcomeDerivation::from_completion_state(
-                    &validation_state,
-                    execution_state,
-                    completion_progress,
-                    &turn_context.completion_contract,
-                    response_has_user_value(&reply, total_successful_tool_calls),
-                    false,
-                    None,
-                )
-                .derive_outcome();
+                let outcome = if user_answer_completed {
+                    TaskOutcomeDerivation::from_completion_state(
+                        &validation_state,
+                        execution_state,
+                        completion_progress,
+                        &turn_context.completion_contract,
+                        response_has_user_value(&reply, total_successful_tool_calls),
+                        false,
+                        None,
+                    )
+                    .derive_outcome()
+                } else {
+                    TaskOutcome::Partial
+                };
                 agent
                     .emit_task_end(
                         emitter,
@@ -2150,22 +2159,24 @@ pub(super) async fn run_stopping_phase(
     })
 }
 
-/// Last-resort stall recovery surfaces the latest tool output — but only when
-/// it is short human prose. A raw data dump or a spilled-file page is never an
-/// answer (live repro 2026-07-03: "Done. Here is the output:" followed by 87
-/// line-numbered rows of clinical-trial JSON shipped to the user — family
-/// member #8 of the fallback-paste class, via this inline format! that the
-/// named-builder sweep missed). Page-shaped or structured output becomes an
-/// honest handoff instead.
-pub(super) fn last_resort_tool_output_reply(tool_output: &str) -> String {
+/// Last-resort stall recovery surfaces a short human-readable result. A raw
+/// payload is evidence, not a user-facing answer, so the fallback reports the
+/// missing finalization honestly without claiming the task's subject data was
+/// gathered or asking the user to stimulate another turn.
+pub(super) fn last_resort_tool_output_reply(tool_output: &str) -> (String, bool) {
     let presentable = crate::agent::response_analysis::is_short_prose_excerpt(tool_output)
         && !crate::agent::response_analysis::reply_is_pasted_file_page(tool_output);
     if presentable {
-        format!("Done. Here is the output:\n\n{}", tool_output.trim())
+        (
+            format!("Done. Here is the output:\n\n{}", tool_output.trim()),
+            true,
+        )
     } else {
-        "I gathered the data but couldn't finish composing the answer. Ask me again and I'll \
-         summarize what I found."
-            .to_string()
+        (
+            "A tool produced a typed result, but this attempt did not produce a verified user-facing answer."
+                .to_string(),
+            false,
+        )
     }
 }
 
@@ -2175,7 +2186,9 @@ mod last_resort_reply_tests {
 
     #[test]
     fn short_prose_output_ships_directly() {
-        let reply = last_resort_tool_output_reply("3 recruiting trials found near Fairfax.");
+        let (reply, completed) =
+            last_resort_tool_output_reply("3 recruiting trials found near Fairfax.");
+        assert!(completed);
         assert!(reply.contains("3 recruiting trials found near Fairfax."));
         assert!(reply.starts_with("Done."));
     }
@@ -2184,23 +2197,23 @@ mod last_resort_reply_tests {
     fn spilled_file_page_never_ships() {
         // Live repro shape: harness page header + line-numbered JSON.
         let page = "File: /var/folders/x/T/aidaemon/tool_results/http_request-bfd18bdf.txt (lines 785-871 of 970, 29130 bytes, modified 2026-07-03)\n785 |         },\n786 |         {\n787 |           \"city\": \"Melbourne\",\n788 |           \"contacts\": [\n789 |             {\n790 |               \"name\": \"Damien Kee, MD\",\n791 |             }";
-        let reply = last_resort_tool_output_reply(page);
+        let (reply, completed) = last_resort_tool_output_reply(page);
+        assert!(!completed);
         assert!(
             !reply.contains("785 |"),
             "page lines must not ship: {reply}"
         );
         assert!(!reply.contains("File: /var"), "page header must not ship");
-        assert!(
-            reply.contains("summarize"),
-            "honest handoff expected: {reply}"
-        );
+        assert!(reply.contains("did not produce a verified user-facing answer"));
+        assert!(!reply.contains("Ask me again"));
     }
 
     #[test]
     fn structured_json_dump_never_ships() {
         let dump = "{\"studies\": [{\"city\": \"Melbourne\", \"status\": \"RECRUITING\"}]}";
-        let reply = last_resort_tool_output_reply(dump);
+        let (reply, completed) = last_resort_tool_output_reply(dump);
+        assert!(!completed);
         assert!(!reply.contains("RECRUITING"));
-        assert!(reply.contains("summarize"));
+        assert!(reply.contains("did not produce a verified user-facing answer"));
     }
 }

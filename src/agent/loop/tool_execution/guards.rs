@@ -160,20 +160,33 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
                 .render()
             }
         };
-        let tool_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "tool".to_string(),
-            content: Some(redirect_msg),
-            tool_call_id: Some(tc.id.clone()),
-            tool_name: Some(tc.name.clone()),
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.3,
-            ..Message::runtime_defaults()
+        let replayed_cached_read =
+            is_read_only && !is_api_tool && tool_result_cache.contains_key(&call_hash);
+        let (outcome_status, invocation_stage) = if replayed_cached_read {
+            (
+                crate::traits::ToolOutcomeStatus::Succeeded,
+                crate::traits::ToolInvocationStage::Replayed,
+            )
+        } else {
+            (
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            )
         };
         agent
-            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .persist_pre_dispatch_outcome(
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                redirect_msg,
+                outcome_status,
+                invocation_stage,
+                false,
+                agent.resolve_tool_call_semantics(tc),
+                None,
+            )
             .await?;
         return Ok(Some(LoopPatternGuardOutcome::ContinueLoop));
     }

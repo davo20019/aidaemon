@@ -780,11 +780,9 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
-// Both candidates are hedged concurrently, so this is one aggregate bootstrap
-// deadline rather than two serialized waits. Twenty seconds preserves the
-// prior single-attempt service envelope while eliminating the failover
-// starvation seen when the second candidate inherited only the first one's
-// leftover time.
+// Candidates run concurrently, so this is one aggregate bootstrap deadline
+// rather than serialized waits. Selection still follows configured candidate
+// priority; response latency must never choose a different task contract.
 const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
@@ -1181,12 +1179,10 @@ pub(crate) async fn generate_task_plan(
         },
     }
 
-    // Semantic assessment is an optional, read-only producer. Hedge model
-    // candidates under one deadline so one slow provider cannot serialize the
-    // entire request bootstrap. The first valid typed envelope wins; dropping
-    // the remaining futures cancels their unused responses.
-    let assessment_start = Instant::now();
-    let mut completed_candidates = std::collections::BTreeSet::new();
+    // Semantic assessment is an optional, read-only producer. Run candidates
+    // concurrently so one slow provider cannot serialize bootstrap, but collect
+    // every bounded result and select by configured priority. A latency race is
+    // not an authoritative input to the task contract.
     let mut attempts = FuturesUnordered::new();
     for (candidate_index, model) in model_candidates.iter().enumerate() {
         let provider = provider.clone();
@@ -1222,6 +1218,7 @@ pub(crate) async fn generate_task_plan(
         });
     }
 
+    let mut valid_plans = Vec::new();
     while let Some(attempt) = attempts.next().await {
         let (candidate_index, model, latency_ms, result) = match attempt {
             AssessmentAttempt::Response {
@@ -1229,17 +1226,13 @@ pub(crate) async fn generate_task_plan(
                 model,
                 latency_ms,
                 response,
-            } => {
-                completed_candidates.insert(candidate_index);
-                (candidate_index, model, latency_ms, response)
-            }
+            } => (candidate_index, model, latency_ms, response),
             AssessmentAttempt::ProviderError {
                 candidate_index,
                 model,
                 latency_ms,
                 error,
             } => {
-                completed_candidates.insert(candidate_index);
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
@@ -1258,7 +1251,6 @@ pub(crate) async fn generate_task_plan(
                 model,
                 latency_ms,
             } => {
-                completed_candidates.insert(candidate_index);
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
@@ -1292,30 +1284,7 @@ pub(crate) async fn generate_task_plan(
                     },
                 )
                 .await;
-                info!(
-                    goal = %plan.goal,
-                    step_count = plan.steps.len(),
-                    assessment_mode = mode.as_str(),
-                    %model,
-                    fallback = candidate_index > 0,
-                    "Task assessment generated"
-                );
-                for (pending_index, pending_model) in model_candidates.iter().enumerate() {
-                    if completed_candidates.contains(&pending_index) {
-                        continue;
-                    }
-                    record_auxiliary_model_failure(
-                        telemetry,
-                        "task_assessment",
-                        pending_model,
-                        assessment_start.elapsed().as_millis() as u64,
-                        (pending_index + 1) as u32,
-                        pending_index > 0,
-                        "cancelled_after_hedge_winner",
-                    )
-                    .await;
-                }
-                return Some(plan);
+                valid_plans.push((candidate_index, model, plan));
             }
             Err(error) => {
                 record_auxiliary_model_call(
@@ -1335,7 +1304,21 @@ pub(crate) async fn generate_task_plan(
             }
         }
     }
-    None
+    valid_plans.sort_by_key(|(candidate_index, _, _)| *candidate_index);
+    valid_plans
+        .into_iter()
+        .next()
+        .map(|(candidate_index, model, plan)| {
+            info!(
+                goal = %plan.goal,
+                step_count = plan.steps.len(),
+                assessment_mode = mode.as_str(),
+                %model,
+                fallback = candidate_index > 0,
+                "Task assessment selected by configured model priority"
+            );
+            plan
+        })
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -1622,6 +1605,75 @@ pub(crate) fn summarize_tool_calls_for_replan(tool_calls: &[String], max_entries
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ModelPriorityTestProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelPriorityTestProvider {
+        async fn chat(
+            &self,
+            model: &str,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<ProviderResponse> {
+            if model == "configured-primary" {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let goal = if model == "configured-primary" {
+                "primary contract"
+            } else {
+                "faster fallback contract"
+            };
+            Ok(crate::testing::MockProvider::text_response(
+                &json!({
+                    "schema_version": 10,
+                    "goal": goal,
+                    "steps": [],
+                    "success_criteria": [],
+                    "contract": {
+                        "confidence": "high",
+                        "task_kind": "answer",
+                        "expects_mutation": false,
+                        "requires_observation": false,
+                        "required_effects": [],
+                        "mutation_scope": "allowed",
+                        "forbidden_actions": [],
+                        "tool_scope": "allowed",
+                        "allowed_tool_names": [],
+                        "forbidden_tool_scopes": [],
+                        "minimum_sources": 0,
+                        "requires_primary_sources": false,
+                        "requires_exact_history": false,
+                        "evidence_requirements": [],
+                        "required_invocations": [],
+                        "filesystem_access": {
+                            "execution_cwd": null,
+                            "read_paths": [],
+                            "write_paths": []
+                        },
+                        "project_reference": null
+                    },
+                    "task_shape": {
+                        "execution_mode": "inline",
+                        "confidence": "high",
+                        "independent_workstreams": 1,
+                        "requires_background_continuation": false,
+                        "continue_inline_after_background_start": false,
+                        "request_relationship": "new_request",
+                        "antecedent_user_message_id": null,
+                        "semantic_scope": "general"
+                    }
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn contract_decoder_quarantines_malformed_lanes_independently() {
@@ -2198,6 +2250,25 @@ mod tests {
                 .and_then(|shape| shape.execution_mode.as_deref()),
             Some("inline")
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_contract_selection_uses_configured_priority_not_response_latency() {
+        let models = vec![
+            "configured-primary".to_string(),
+            "configured-fallback".to_string(),
+        ];
+        let assessment = generate_task_plan(
+            Arc::new(ModelPriorityTestProvider),
+            &models,
+            "Give a synthetic answer.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(assessment.goal, "primary contract");
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ use super::project_scope::{
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
+use crate::traits::{ToolCallAccessManifest, ToolCallSemantics};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct TurnContext {
@@ -711,6 +712,7 @@ impl Agent {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn append_tool_message_with_result_event(
         &self,
         emitter: &crate::events::EventEmitter,
@@ -732,6 +734,7 @@ impl Agent {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn append_tool_message_with_result_event_policy(
         &self,
@@ -814,6 +817,88 @@ impl Agent {
         Ok(())
     }
 
+    pub(super) fn resolve_tool_call_semantics(&self, tool_call: &ToolCall) -> ToolCallSemantics {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == tool_call.name && tool.is_available())
+            .map(|tool| tool.call_semantics(&tool_call.arguments))
+            .unwrap_or_default()
+    }
+
+    /// Persist a deterministic refusal or synthetic pre-dispatch result through
+    /// the same attempt/receipt protocol as adapter I/O.
+    ///
+    /// Guard layers must not write bare `tool_result` events: event counts,
+    /// operation cardinality, task outcome, and recovery all derive from the
+    /// correlated call/result pair and its typed disposition.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn persist_pre_dispatch_outcome(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        task_id: &str,
+        tool_call: &ToolCall,
+        effective_arguments: &str,
+        result_text: String,
+        outcome_status: crate::traits::ToolOutcomeStatus,
+        invocation_stage: crate::traits::ToolInvocationStage,
+        contract_rejected: bool,
+        semantics: ToolCallSemantics,
+        access_manifest: Option<ToolCallAccessManifest>,
+    ) -> anyhow::Result<()> {
+        emitter
+            .emit(
+                crate::events::EventType::ToolCall,
+                crate::events::ToolCallData::from_tool_call(
+                    tool_call.id.clone(),
+                    tool_call.name.clone(),
+                    serde_json::from_str(effective_arguments)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    Some(task_id.to_string()),
+                ),
+            )
+            .await?;
+
+        let metadata = crate::traits::ToolCallMetadata {
+            access_manifest,
+            outcome_status: Some(outcome_status),
+            invocation_stage,
+            contract_rejected,
+            semantics,
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let receipt = crate::events::ToolReceiptV1::from_metadata(
+            &metadata,
+            outcome_status,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        let error = outcome_status.is_failure().then_some(result_text.clone());
+        let tool_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "tool".to_string(),
+            content: Some(result_text),
+            tool_call_id: Some(tool_call.id.clone()),
+            tool_name: Some(tool_call.name.clone()),
+            tool_calls_json: None,
+            created_at: chrono::Utc::now(),
+            importance: 0.2,
+            ..Message::runtime_defaults()
+        };
+        self.append_tool_message_with_receipt_event_policy(
+            emitter,
+            &tool_msg,
+            false,
+            0,
+            error,
+            Some(task_id),
+            None,
+            Some(receipt),
+        )
+        .await
+    }
+
     // Pillar B (Task 7): `load_initial_history` and `load_recent_history` were
     // removed. Historical conversation retention is now owned entirely by the
     // turn-anchored fetch (`EventStore::get_turns_from_anchor`) in
@@ -841,6 +926,67 @@ mod tests {
             importance: 0.5,
             ..Message::runtime_defaults()
         }
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_outcome_always_persists_correlated_call_and_typed_receipt() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .expect("test harness");
+        let task_id = "task-pre-dispatch";
+        let emitter = crate::events::EventEmitter::new(
+            harness.agent.event_store.clone(),
+            "session-pre-dispatch",
+        )
+        .with_task_id(task_id);
+        let call = ToolCall {
+            id: "call-pre-dispatch".to_string(),
+            name: "terminal".to_string(),
+            arguments: r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#.to_string(),
+            extra_content: None,
+        };
+
+        harness
+            .agent
+            .persist_pre_dispatch_outcome(
+                &emitter,
+                "session-pre-dispatch",
+                task_id,
+                &call,
+                &call.arguments,
+                "synthetic scope refusal".to_string(),
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                ToolCallSemantics::default(),
+                None,
+            )
+            .await
+            .expect("persist pre-dispatch outcome");
+
+        let events = harness
+            .agent
+            .event_store
+            .query_task_events_for_session("session-pre-dispatch", task_id)
+            .await
+            .expect("query events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, EventType::ToolCall);
+        assert_eq!(events[1].event_type, EventType::ToolResult);
+        let result = events[1]
+            .parse_data::<ToolResultData>()
+            .expect("typed result");
+        assert_eq!(result.tool_call_id, "call-pre-dispatch");
+        assert!(!result.success);
+        let receipt = result.receipt.expect("canonical receipt");
+        assert_eq!(
+            receipt.outcome_status,
+            crate::traits::ToolOutcomeStatus::Blocked
+        );
+        assert_eq!(
+            receipt.invocation_stage,
+            crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+        );
     }
 
     #[test]
