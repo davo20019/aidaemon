@@ -698,11 +698,12 @@ impl ScheduledGoalRunsTool {
 
         for (run, tasks) in runs.iter().zip(tasks_by_run.iter()) {
             out.push_str(&format!(
-                "\n- **{}** trigger={} status={} started={} duration={} tasks={}",
+                "\n- **{}** trigger={} status={} started={} completed={} duration={} tasks={}",
                 run.id,
                 run.trigger_type,
                 run.status,
                 run.started_at,
+                run.completed_at.as_deref().unwrap_or("not_completed"),
                 Self::format_duration(Some(&run.started_at), run.completed_at.as_deref()),
                 tasks.len()
             ));
@@ -1686,7 +1687,6 @@ mod tests {
             completed_at: None,
         };
         state.create_task(&open_task).await.unwrap();
-
         let result = tool
             .call(
                 &json!({
@@ -1701,6 +1701,37 @@ mod tests {
         assert!(result.contains(&format!("next_run={}", schedule.next_run_at)));
         assert!(result.contains("Open task(s) blocking coalesced schedule fires"));
         assert!(result.contains("Analyze fetched engagement metrics"));
+    }
+
+    #[tokio::test]
+    async fn run_history_projects_terminal_completion_timestamp() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous("Inspect a synthetic ledger", "session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let run = state
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        state
+            .finish_goal_run(&run.id, "completed", Some("Synthetic check complete"))
+            .await
+            .unwrap();
+        let completed_at = state
+            .get_goal_runs(&goal.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run.id)
+            .and_then(|candidate| candidate.completed_at)
+            .expect("terminal run timestamp");
+
+        let result = tool
+            .call(&json!({"action": "run_history", "goal_id": goal.id}).to_string())
+            .await
+            .unwrap();
+
+        assert!(result.contains(&format!("completed={completed_at}")));
     }
 
     #[tokio::test]

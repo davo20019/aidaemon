@@ -272,9 +272,10 @@ pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
 pub(in crate::agent) use history::{
-    append_required_invocation_obligations, inherit_unfinished_request_contract,
-    install_semantic_completion_contract, parse_planned_forbidden_action,
-    parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
+    append_evidence_obligations, append_required_invocation_obligations, apply_semantic_authority,
+    inherit_unfinished_request_contract, install_semantic_completion_contract,
+    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
+    retain_structural_completion_contract, SemanticAuthorityRequirements,
     SemanticCompletionRequirements,
 };
 pub(in crate::agent) use history::{

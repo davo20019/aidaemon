@@ -442,13 +442,7 @@ async fn dispatcher_argument_rejection_is_canonical_non_success_receipt() {
         .to_string(),
     );
     let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response(
-            "synthetic_contract_tool",
-            r#"{"mode":"reject"}"#,
-        ),
-        MockProvider::text_response(
-            r#"{"goal":"Observe one rejection receipt","success_criteria":["Receipt recorded"],"first_action":{"tool":"synthetic_contract_tool","target":null,"description":"Observe rejection"},"requires_verification":true,"risky_actions":[],"version":1}"#,
-        ),
+        MockProvider::tool_call_response("synthetic_contract_tool", r#"{"mode":"reject"}"#),
         MockProvider::text_response("phase=synthetic; outcome=contract_rejected"),
     ])
     .with_task_assessments(vec![assessment]);
@@ -707,7 +701,7 @@ async fn explicit_no_tool_current_fact_returns_direct_limitation_with_zero_offer
 }
 
 #[tokio::test]
-async fn grounded_output_contract_retries_checklist_style_claim_and_returns_actual_fields() {
+async fn legacy_output_markers_do_not_control_finalization() {
     let assessment = MockProvider::text_response(
         &json!({
             "schema_version": 7,
@@ -745,12 +739,9 @@ async fn grounded_output_contract_retries_checklist_style_claim_and_returns_actu
         })
         .to_string(),
     );
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("The requested fields have been reported."),
-        MockProvider::text_response(
-            "owner: unavailable from supplied context\ncredential_status: unavailable from supplied context",
-        ),
-    ])
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "The requested fields have been reported.",
+    )])
     .with_task_assessments(vec![assessment]);
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -767,9 +758,8 @@ async fn grounded_output_contract_retries_checklist_style_claim_and_returns_actu
         .await
         .unwrap();
 
-    assert!(reply.contains("owner:"));
-    assert!(reply.contains("credential_status:"));
-    assert_eq!(harness.provider.call_count().await, 2);
+    assert_eq!(reply, "The requested fields have been reported.");
+    assert_eq!(harness.provider.call_count().await, 1);
 }
 
 #[tokio::test]
@@ -2502,12 +2492,12 @@ async fn planner_refined_observation_contract_requires_execution_until_observed(
 }
 
 #[tokio::test]
-async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation() {
+async fn typed_read_only_policy_is_not_revalidated_with_prose_matching() {
     let url = "https://example.com/status";
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("update_remote", &json!({"url": url}).to_string()),
         MockProvider::tool_call_response("check_remote", &json!({"url": url}).to_string()),
-        MockProvider::text_response("Remote status updated."),
+        MockProvider::text_response("No remote mutation was performed."),
     ])
     .with_task_assessments(vec![MockProvider::text_response(
         r#"{
@@ -2574,11 +2564,11 @@ async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation()
         .await
         .unwrap();
 
-    assert_eq!(reply, "Remote status updated.");
+    assert_eq!(reply, "No remote mutation was performed.");
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        1,
-        "an invented restriction without a verbatim span must not suppress mutation"
+        0,
+        "typed policy must not depend on a matching verbatim prose span"
     );
 }
 

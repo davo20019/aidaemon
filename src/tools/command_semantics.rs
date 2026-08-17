@@ -172,9 +172,10 @@ fn classify_shell_command_with_depth(command: &str, depth: usize) -> ToolCallSem
 }
 
 /// Resolve static uncertainty from the capability boundary actually enforced
-/// for one terminal call. An unknown command is observational only when a
-/// native confinement profile is active and exposes no writable task target;
-/// a declared write capability remains a conservative unknown mutation.
+/// for one terminal call. An opaque program is observational only when a
+/// native confinement profile is active and exposes neither writable task
+/// targets nor network access. The runtime sandbox, rather than inspection of
+/// embedded source text, enforces that claim.
 pub(crate) fn classify_confined_shell_command(
     command: &str,
     confinement_active: bool,
@@ -193,11 +194,6 @@ pub(crate) fn classify_confined_shell_command(
 
 fn observation() -> ToolCallSemantics {
     ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
-}
-
-fn observation_and_mutation() -> ToolCallSemantics {
-    ToolCallSemantics::observation_and_mutation()
-        .with_verification_mode(ToolVerificationMode::ResultContent)
 }
 
 fn observation_and_derived_mutation() -> ToolCallSemantics {
@@ -822,7 +818,10 @@ fn classify_simple_shell_command(command: &str, depth: usize) -> ToolCallSemanti
         "python" | "python3" if args.windows(2).any(|pair| pair == ["-m", "pytest"]) => {
             observation_and_derived_mutation()
         }
-        "python" | "python3" => observation_and_mutation(),
+        // Interpreter source is opaque executable input. Do not guess its
+        // effects from code strings. The confined capability boundary resolves
+        // this unknown to observation or mutation for the actual invocation.
+        "python" | "python3" => ToolCallSemantics::default(),
         "yarn" | "pnpm" | "bun" => match subcommand {
             Some("test" | "lint" | "check" | "typecheck" | "audit") => {
                 observation_and_derived_mutation()
@@ -955,16 +954,17 @@ mod tests {
 
     #[test]
     fn test_classify_with_cd_prefix() {
-        // Without cd prefix — observation
+        // Embedded interpreter source remains opaque until the enforced
+        // capability boundary resolves it for a concrete invocation.
         let sem = classify_shell_command("python3 -c 'print(1)'");
-        assert!(sem.observes_state());
-
-        // With cd prefix — should still be classified correctly
-        let sem = classify_shell_command("cd /home/user/project && python3 -c 'print(1)'");
-        assert!(
-            sem.observes_state(),
-            "cd-prefixed python3 should be observation"
+        assert_eq!(sem.effect, crate::traits::ToolCallEffect::Unknown);
+        let sem = classify_confined_shell_command(
+            "cd /home/user/project && python3 -c 'print(1)'",
+            true,
+            false,
         );
+        assert!(sem.observes_state());
+        assert!(!sem.mutates_state());
 
         let sem = classify_shell_command("cd /tmp && ls -la");
         assert!(sem.observes_state(), "cd-prefixed ls should be observation");
@@ -1070,7 +1070,6 @@ mod tests {
         for command in [
             "node build.js",
             "node build.js --version",
-            "python mutate.py --help",
             "npm install",
             "wrangler deploy",
             "npx wrangler deploy",
@@ -1092,6 +1091,11 @@ mod tests {
                 "{command} should remain mutating"
             );
         }
+        assert_eq!(
+            classify_shell_command("python mutate.py --help").effect,
+            crate::traits::ToolCallEffect::Unknown,
+            "opaque interpreter source must not receive effects from argv wording"
+        );
     }
 
     #[test]

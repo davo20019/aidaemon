@@ -670,17 +670,6 @@ pub(super) async fn run_completion_phase(
         // already policy-gated at its build site.
         let model_authored_reply = reply.clone();
 
-        let missing_response_fields = turn_context
-            .completion_contract
-            .required_response_fields
-            .iter()
-            .filter(|field| {
-                !reply
-                    .to_lowercase()
-                    .contains(&field.trim().to_lowercase())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
         let context_floor_result = emitter.session_context_boundary().await;
         let context_floor_event_id = context_floor_result.as_ref().ok().copied().flatten();
         let outstanding_requirement_indices = turn_context
@@ -716,8 +705,7 @@ pub(super) async fn run_completion_phase(
                     "completion_task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
                     "context_floor_event_id": context_floor_event_id,
                     "context_floor_available": context_floor_result.is_ok(),
-                    "required_response_fields": turn_context.completion_contract.required_response_fields,
-                    "missing_response_fields": missing_response_fields,
+                    "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
                     "primary_target_hint": turn_context.completion_contract.primary_target_hint(),
                     "evidence_requirements_total": turn_context.completion_contract.evidence_requirements.len(),
                     "evidence_requirements_satisfied": completion_progress.satisfied_evidence_requirements(),
@@ -736,44 +724,6 @@ pub(super) async fn run_completion_phase(
                 }),
             )
             .await;
-        if !missing_response_fields.is_empty() {
-            if completion_progress.response_contract_retry_count == 0 {
-                completion_progress.response_contract_retry_count = 1;
-                pending_system_messages.push(SystemDirective::OutputContractIncomplete {
-                    missing_fields: missing_response_fields.clone(),
-                });
-                agent
-                    .emit_warning_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::PostExecutionValidation,
-                        "Draft omitted grounded response-contract fields".to_string(),
-                        json!({
-                            "condition": "response_contract_incomplete",
-                            "contract_scope_task_id": turn_context.completion_contract.scope_task_id,
-                            "contract_adopted_from_task_ids": turn_context.completion_contract.adopted_from_task_ids,
-                            "missing_fields": missing_response_fields,
-                            "retry": 1,
-                        }),
-                    )
-                    .await;
-                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-            }
-
-            validation_state.record_failure(ValidationFailure::SuccessCriteriaUnmatched);
-            let unavailable = missing_response_fields
-                .iter()
-                .map(|field| format!("{}: unavailable in the generated answer", field.trim()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            reply = if reply.trim().is_empty() {
-                unavailable
-            } else {
-                format!("{unavailable}\n\n{reply}")
-            };
-        }
-
         // A mandate task lead's prose is never the authoritative decision.
         // Give a missing typed commit one bounded correction turn, then fail
         // closed so background finalization can safely schedule a retry.

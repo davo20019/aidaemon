@@ -1,3 +1,4 @@
+mod contract_compiler;
 mod run;
 mod shortcuts;
 pub(crate) mod task_planning;

@@ -351,7 +351,10 @@ impl EvidenceAuthority {
     }
 }
 
-/// Time coverage of an observation surface.
+/// Time coverage of the subject records an observation surface can return.
+/// Receipt timestamps independently prove when the observation itself ran; a
+/// current query may therefore support historical subject data when the tool
+/// exposes both current and historical records.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceTemporalScope {

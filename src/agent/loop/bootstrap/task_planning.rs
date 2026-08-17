@@ -79,8 +79,8 @@ pub(crate) struct PlannedContractSignals {
     /// Operation-specific constraints such as `deploy` or `send`.
     #[serde(default)]
     pub forbidden_actions: Vec<String>,
-    /// Exact, verbatim spans from the current user request that support a
-    /// negative mutation constraint.
+    /// Legacy schema field. Contract compilation never matches user prose;
+    /// retained only so older planner responses remain deserializable.
     #[serde(default)]
     pub constraint_evidence: Vec<String>,
     /// `allowed` or `forbidden`. This is independent of mutation scope: a
@@ -95,12 +95,11 @@ pub(crate) struct PlannedContractSignals {
     /// tools remain allowed. This is a typed deny-set, not a tool-name list.
     #[serde(default)]
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
-    /// Exact current-user spans grounding either `tool_scope=forbidden` or
-    /// every entry in `forbidden_tool_scopes`.
+    /// Legacy schema field. Contract compilation never matches user prose;
+    /// retained only so older planner responses remain deserializable.
     #[serde(default)]
     pub tool_constraint_evidence: Vec<String>,
-    /// Exact user-authored labels that a substantive final response must
-    /// contain (for example requested report fields or fixed verdict labels).
+    /// Retired compatibility field. Final prose is never lifecycle proof.
     #[serde(default)]
     pub required_response_fields: Vec<String>,
     /// Typed evidence requirements consumed directly by completion checks.
@@ -181,11 +180,73 @@ struct TaskRelationshipResponse {
     semantic_scope: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskContractRecoveryResponse {
-    schema_version: u16,
-    goal: String,
-    contract: PlannedContractSignals,
+fn decode_optional_field<T: serde::de::DeserializeOwned>(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Option<T> {
+    object
+        .get(name)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn decode_array_items<T: serde::de::DeserializeOwned>(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Vec<T> {
+    object
+        .get(name)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect()
+}
+
+/// Decode contract fields independently so malformed authority, response, or
+/// routing data cannot erase valid lifecycle obligations. This function only
+/// consumes typed JSON fields; it never reads or classifies request prose.
+fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSignals> {
+    let object = value.as_object()?;
+    let filesystem_access = object
+        .get("filesystem_access")
+        .and_then(Value::as_object)
+        .map(|filesystem| PlannedFilesystemAccess {
+            execution_cwd: decode_optional_field(filesystem, "execution_cwd"),
+            read_paths: decode_array_items(filesystem, "read_paths"),
+            write_paths: decode_array_items(filesystem, "write_paths"),
+        });
+    let evidence_requirements = object
+        .contains_key("evidence_requirements")
+        .then(|| decode_array_items(object, "evidence_requirements"));
+    let required_invocations = object
+        .contains_key("required_invocations")
+        .then(|| decode_array_items(object, "required_invocations"));
+
+    Some(PlannedContractSignals {
+        confidence: decode_optional_field(object, "confidence"),
+        expects_mutation: decode_optional_field(object, "expects_mutation"),
+        requires_observation: decode_optional_field(object, "requires_observation"),
+        required_effects: object
+            .contains_key("required_effects")
+            .then(|| decode_array_items(object, "required_effects")),
+        task_kind: decode_optional_field(object, "task_kind"),
+        mutation_scope: decode_optional_field(object, "mutation_scope"),
+        forbidden_actions: decode_array_items(object, "forbidden_actions"),
+        constraint_evidence: Vec::new(),
+        tool_scope: decode_optional_field(object, "tool_scope"),
+        allowed_tool_names: decode_array_items(object, "allowed_tool_names"),
+        forbidden_tool_scopes: decode_array_items(object, "forbidden_tool_scopes"),
+        tool_constraint_evidence: Vec::new(),
+        required_response_fields: decode_array_items(object, "required_response_fields"),
+        minimum_sources: decode_optional_field(object, "minimum_sources"),
+        requires_primary_sources: decode_optional_field(object, "requires_primary_sources"),
+        requires_exact_history: decode_optional_field(object, "requires_exact_history"),
+        evidence_requirements,
+        required_invocations,
+        filesystem_access,
+        project_reference: decode_optional_field(object, "project_reference"),
+    })
 }
 
 /// Independently compiled products recovered after the broad assessment is
@@ -322,6 +383,7 @@ pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) ->
 
 /// Hard completion decisions require a complete semantic contract. This is a
 /// schema/invariant check, not a text classifier.
+#[cfg(test)]
 pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> bool {
     let Some(expects_mutation) = signals.expects_mutation else {
         return false;
@@ -377,9 +439,7 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     if matches!(scope.as_str(), "read_only" | "read-only") && expects_mutation {
         return false;
     }
-    if scope == "allowed"
-        && (!signals.forbidden_actions.is_empty() || !signals.constraint_evidence.is_empty())
-    {
+    if scope == "allowed" && !signals.forbidden_actions.is_empty() {
         return false;
     }
     if scope == "scoped" && signals.forbidden_actions.is_empty() {
@@ -398,19 +458,9 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
     if !matches!(tool_scope.as_str(), "allowed" | "forbidden" | "restricted")
-        || tool_scope == "allowed"
-            && signals.forbidden_tool_scopes.is_empty()
-            && (!signals.tool_constraint_evidence.is_empty()
-                || !signals.allowed_tool_names.is_empty())
-        || tool_scope == "allowed"
-            && !signals.forbidden_tool_scopes.is_empty()
-            && signals.tool_constraint_evidence.is_empty()
-        || tool_scope == "forbidden"
-            && (signals.tool_constraint_evidence.is_empty()
-                || !signals.allowed_tool_names.is_empty())
-        || tool_scope == "restricted"
-            && (signals.tool_constraint_evidence.is_empty()
-                || signals.allowed_tool_names.is_empty())
+        || tool_scope == "allowed" && !signals.allowed_tool_names.is_empty()
+        || tool_scope == "forbidden" && !signals.allowed_tool_names.is_empty()
+        || tool_scope == "restricted" && signals.allowed_tool_names.is_empty()
         || signals.allowed_tool_names.len() > 8
         || signals.allowed_tool_names.iter().any(|name| {
             name.is_empty()
@@ -420,14 +470,6 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                         || byte.is_ascii_digit()
                         || matches!(byte, b'_' | b'-')
                 })
-        })
-    {
-        return false;
-    }
-    if signals.required_response_fields.len() > 20
-        || signals.required_response_fields.iter().any(|field| {
-            let len = field.trim().chars().count();
-            len == 0 || len > 80
         })
     {
         return false;
@@ -595,86 +637,6 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     true
 }
 
-pub(crate) fn planned_mutation_constraints_are_grounded(
-    signals: &PlannedContractSignals,
-    current_user_text: &str,
-) -> bool {
-    let scope = signals
-        .mutation_scope
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(scope.as_str(), "read_only" | "read-only" | "scoped") {
-        return false;
-    }
-    if scope == "scoped" && signals.forbidden_actions.is_empty() {
-        return false;
-    }
-    if matches!(scope.as_str(), "read_only" | "read-only") {
-        if !signals.forbidden_actions.is_empty() || signals.expects_mutation != Some(false) {
-            return false;
-        }
-        if signals.task_kind.as_deref().is_some_and(|kind| {
-            matches!(
-                kind.trim().to_ascii_lowercase().as_str(),
-                "change" | "deliver" | "schedule" | "monitor"
-            )
-        }) {
-            return false;
-        }
-    }
-
-    let current_lower = current_user_text.to_lowercase();
-    !signals.constraint_evidence.is_empty()
-        && signals.constraint_evidence.iter().all(|evidence| {
-            let evidence = evidence.trim();
-            !evidence.is_empty()
-                && evidence.chars().count() <= 500
-                && current_lower.contains(&evidence.to_lowercase())
-        })
-}
-
-pub(crate) fn planned_tool_constraints_are_grounded(
-    signals: &PlannedContractSignals,
-    current_user_text: &str,
-) -> bool {
-    let tool_scope = signals
-        .tool_scope
-        .as_deref()
-        .map(|scope| scope.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let has_name_allowlist = tool_scope == "restricted" && !signals.allowed_tool_names.is_empty();
-    if tool_scope != "forbidden" && !has_name_allowlist && signals.forbidden_tool_scopes.is_empty()
-    {
-        return false;
-    }
-    let current_lower = current_user_text.to_lowercase();
-    signals
-        .allowed_tool_names
-        .iter()
-        .all(|name| current_lower.contains(name))
-        && !signals.tool_constraint_evidence.is_empty()
-        && signals.tool_constraint_evidence.iter().all(|evidence| {
-            let evidence = evidence.trim();
-            !evidence.is_empty()
-                && evidence.chars().count() <= 500
-                && current_lower.contains(&evidence.to_lowercase())
-        })
-}
-
-pub(crate) fn planned_response_fields_are_grounded(
-    signals: &PlannedContractSignals,
-    current_user_text: &str,
-) -> bool {
-    let current_lower = current_user_text.to_lowercase();
-    signals.required_response_fields.iter().all(|field| {
-        let field = field.trim();
-        !field.is_empty()
-            && field.chars().count() <= 80
-            && current_lower.contains(&field.to_lowercase())
-    })
-}
-
 /// How much task scaffolding the active model needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskAssessmentMode {
@@ -718,6 +680,29 @@ const TASK_CONTRACT_SCHEMA_VERSION: u16 = 9;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
+}
+
+fn decode_task_plan_response(envelope: &Value) -> Option<TaskPlanResponse> {
+    let object = envelope.as_object()?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .unwrap_or_default();
+    Some(TaskPlanResponse {
+        schema_version,
+        goal: object
+            .get("goal")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        steps: decode_array_items(object, "steps"),
+        success_criteria: decode_array_items(object, "success_criteria"),
+        contract: object
+            .get("contract")
+            .and_then(decode_planned_contract_candidate),
+        task_shape: decode_optional_field(object, "task_shape"),
+    })
 }
 
 fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
@@ -799,45 +784,28 @@ impl MemoryPipelinePolicy {
 /// availability remains governed by the completion contract in the main loop.
 pub(crate) fn compile_memory_pipeline_policy(
     current_contract: &crate::agent::CompletionContract,
-    plan: Option<&TaskPlan>,
-    current_user_text: &str,
+    semantic_contract_applied: bool,
 ) -> MemoryPipelinePolicy {
     if current_contract
         .forbidden_tool_scopes
         .contains(&crate::traits::ToolSemanticScope::UserMemory)
     {
-        return MemoryPipelinePolicy::SuppressedByCurrentContract;
+        return if semantic_contract_applied {
+            MemoryPipelinePolicy::SuppressedByAssessment
+        } else {
+            MemoryPipelinePolicy::SuppressedByCurrentContract
+        };
     }
-
-    let Some(plan) = plan else {
-        return MemoryPipelinePolicy::SuppressedAssessmentUnavailable;
-    };
-    let Some(signals) = plan.contract.as_ref() else {
-        return MemoryPipelinePolicy::SuppressedAssessmentUnavailable;
-    };
-    let has_tool_constraint = signals
-        .tool_scope
-        .as_deref()
-        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"))
-        || !signals.allowed_tool_names.is_empty()
-        || !signals.forbidden_tool_scopes.is_empty();
-    let accepted = planned_contract_is_confident(signals, plan.task_shape.as_ref())
-        && planned_contract_is_complete(signals)
-        && (!has_tool_constraint
-            || planned_tool_constraints_are_grounded(signals, current_user_text));
-    if !accepted {
+    if !semantic_contract_applied {
         return MemoryPipelinePolicy::SuppressedAssessmentUnavailable;
     }
-    if signals
-        .forbidden_tool_scopes
-        .contains(&crate::traits::ToolSemanticScope::UserMemory)
-        || !signals.allowed_tool_names.is_empty()
-            && !signals.allowed_tool_names.iter().any(|name| {
-                matches!(
-                    name.as_str(),
-                    "manage_memories" | "manage_people" | "remember_fact" | "share_memory"
-                )
-            })
+    if !current_contract.allowed_tool_names.is_empty()
+        && !current_contract.allowed_tool_names.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "manage_memories" | "manage_people" | "remember_fact" | "share_memory"
+            )
+        })
     {
         MemoryPipelinePolicy::SuppressedByAssessment
     } else {
@@ -1053,12 +1021,9 @@ pub(crate) async fn generate_task_plan(
              \"required_effects\": [\"local_source_write\", \"remote_deploy\"],\n\
              \"mutation_scope\": \"allowed|read_only|scoped\",\n\
              \"forbidden_actions\": [\"deploy\"],\n\
-             \"constraint_evidence\": [\"exact verbatim span from the current user request\"],\n\
              \"tool_scope\": \"allowed|forbidden|restricted\",\n\
              \"allowed_tool_names\": [\"check_environment\"],\n\
              \"forbidden_tool_scopes\": [\"user_memory\"],\n\
-             \"tool_constraint_evidence\": [\"exact verbatim span prohibiting all tools or a capability domain\"],\n\
-             \"required_response_fields\": [\"exact user-authored output label\"],\n\
              \"minimum_sources\": 0,\n\
              \"requires_primary_sources\": false,\n\
              \"requires_exact_history\": false,\n\
@@ -1151,13 +1116,10 @@ pub(crate) async fn generate_task_plan(
          - When the CURRENT request prohibits only a capability domain, keep tool_scope=allowed \
            and add its typed scope to forbidden_tool_scopes. For example, a no-memory constraint \
            denies user_memory without denying conversation_history or local_workspace. Never infer \
-           a deny-set from the topic or an older turn. tool_constraint_evidence must quote exact \
-           current-user spans for either kind of prohibition. Otherwise use tool_scope=allowed, \
-           forbidden_tool_scopes=[], allowed_tool_names=[], and tool_constraint_evidence=[].\n\
-         - required_response_fields contains exact, short labels from the CURRENT user request \
-           that must appear in the final answer (requested report keys, columns, verdict labels, \
-           or fixed line prefixes). Do not paraphrase, invent, or copy labels from prior tasks; \
-           use [] when the user did not specify an output contract.\n\
+           a deny-set from the topic or an older turn. Otherwise use tool_scope=allowed, \
+           forbidden_tool_scopes=[], and allowed_tool_names=[].\n\
+         - required_response_fields is a retired compatibility field and must be []. Final prose \
+           is never lifecycle proof and is not matched by labels or markers.\n\
          - required_effects names the successful effects completion must prove. Valid \
            values are local_source_write, repository_write, remote_mutation, \
            remote_deploy, external_delivery, process_state, configuration, and \
@@ -1178,9 +1140,9 @@ pub(crate) async fn generate_task_plan(
            when the task is otherwise conversational or rejection/nonzero is the expected result.\n\
          - acceptable_scopes lists alternative authoritative domains for that ONE need. When two \
            domains establish different facts, create two requirements rather than treating them as alternatives.\n\
-         - required_content_markers is a legacy compatibility field and must be []. Subject words and \
-           response prose are not lifecycle proof. Put exact user-authored output labels in \
-           required_response_fields and machine invocation facts in receipt.\n\
+         - required_content_markers and required_response_fields are retired compatibility fields \
+           and must be []. Subject words and response prose are not lifecycle proof. Put machine \
+           invocation facts in receipt.\n\
          - receipt contains only machine-checkable invocation facts explicitly required by the CURRENT \
            request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
            outcome_statuses are alternative acceptable results; requires_output means authoritative result \
@@ -1214,11 +1176,8 @@ pub(crate) async fn generate_task_plan(
            secrets\", \"do not post filler\", and \"do not post if identity verification fails\" \
            must not produce forbidden_actions=[\"post\"].\n\
          - mutation_scope=allowed when there is no negative mutation constraint; then \
-           forbidden_actions and constraint_evidence must be empty.\n\
-         - For read_only or scoped, constraint_evidence must contain the exact verbatim \
-           words in the CURRENT user request that impose the restriction. Never derive \
-           a restriction from recent conversation context, this prompt's examples, or an \
-           inferred phrase that the user did not write.\n\
+           forbidden_actions must be empty. Contract fields are semantic typed values; \
+           never create phrase lists or prose markers for later matching.\n\
          {plan_instructions}",
         user_text = truncate_str(user_text, 4000),
     );
@@ -1283,12 +1242,16 @@ pub(crate) async fn generate_task_plan(
         }
     };
 
-    let parsed: TaskPlanResponse = match serde_json::from_str(&json_str) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "Task assessment response unparseable");
+    let envelope: Value = match serde_json::from_str(&json_str) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(%error, "Task assessment response unparseable");
             return None;
         }
+    };
+    let Some(parsed) = decode_task_plan_response(&envelope) else {
+        warn!("Task assessment response is not a JSON object");
+        return None;
     };
 
     let received_schema_version = parsed.schema_version;
@@ -1355,9 +1318,8 @@ pub(crate) async fn generate_task_contract_recovery(
          \"task_kind\":\"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\
          \"expects_mutation\":false,\"requires_observation\":false,\"required_effects\":[],\
          \"mutation_scope\":\"allowed|read_only|scoped\",\"forbidden_actions\":[],\
-         \"constraint_evidence\":[],\"tool_scope\":\"allowed|forbidden|restricted\",\
+         \"tool_scope\":\"allowed|forbidden|restricted\",\
          \"allowed_tool_names\":[],\"forbidden_tool_scopes\":[],\
-         \"tool_constraint_evidence\":[],\"required_response_fields\":[],\
          \"minimum_sources\":0,\"requires_primary_sources\":false,\
          \"requires_exact_history\":false,\"evidence_requirements\":[],\
          \"required_invocations\":[],\
@@ -1376,9 +1338,9 @@ pub(crate) async fn generate_task_contract_recovery(
          - A request to perform or observe a named machine invocation creates one required_invocations entry. This lane proves invocation occurrence/result and is separate from subject-matter evidence.\n\
          - Current-run tests, current state, files, history, or remote facts require observation and at least one evidence requirement or required invocation. Static explanation and ordinary conversation do not.\n\
          - For an explicitly expected negative process result, encode its exact acceptable exit/outcome in the invocation receipt; do not reinterpret it as task failure.\n\
-         - tool_scope=restricted only when the current request itself limits tools to exact identifiers. tool_scope=forbidden and forbidden_tool_scopes require exact verbatim grounding in tool_constraint_evidence.\n\
-         - read_only/scoped mutation constraints require exact verbatim grounding in constraint_evidence. allowed has no negative evidence.\n\
-         - Copy user-authored response labels into required_response_fields. Do not invent prose markers for evidence.\n\
+         - tool_scope=restricted only when the current request itself limits tools to exact registered identifiers. Tool policies are typed restrictions, never prose-match rules.\n\
+         - read_only/scoped mutation constraints are typed restrictions. Do not emit source phrases, keywords, or prose markers.\n\
+         - required_response_fields is retired and must be []. Do not invent prose markers.\n\
          - Filesystem fields contain only exact current-request paths and their actual read/write roles. A working directory is not implicitly writable.\n\
          - Mutation task kinds are change/deliver/schedule/monitor. They require nonempty required_effects. All other task kinds have expects_mutation=false and required_effects=[].\
          - Keep source authority and temporal scope faithful to the requested fact. Use canonical for exact daemon history/state ledgers.\n\
@@ -1443,28 +1405,30 @@ pub(crate) async fn generate_task_contract_recovery(
         return TaskContractRecoveryOutcome::default();
     };
     let required_invocations = recover_required_invocations(&envelope, available_tool_names);
-    let parsed = serde_json::from_value::<TaskContractRecoveryResponse>(envelope)
-        .inspect_err(|error| {
-            warn!(
-                %error,
-                salvaged_invocation_count = required_invocations.len(),
-                "Task contract recovery authority envelope unparseable"
-            )
-        })
-        .ok();
-    let Some(parsed) = parsed else {
+    let schema_version = envelope
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .unwrap_or_default();
+    let contract = envelope
+        .get("contract")
+        .and_then(decode_planned_contract_candidate);
+    let Some(contract) = contract else {
+        warn!(
+            salvaged_invocation_count = required_invocations.len(),
+            "Task contract recovery contains no typed contract object"
+        );
         return TaskContractRecoveryOutcome {
             plan: None,
             required_invocations,
         };
     };
-    if parsed.schema_version != TASK_CONTRACT_RECOVERY_SCHEMA_VERSION
-        || !planned_contract_is_confident(&parsed.contract, None)
-        || !planned_contract_is_complete(&parsed.contract)
+    if schema_version != TASK_CONTRACT_RECOVERY_SCHEMA_VERSION
+        || !planned_contract_is_confident(&contract, None)
     {
         warn!(
-            schema_version = parsed.schema_version,
-            "Task contract recovery returned an incomplete contract"
+            schema_version,
+            "Task contract recovery returned an untrusted contract candidate"
         );
         return TaskContractRecoveryOutcome {
             plan: None,
@@ -1473,10 +1437,14 @@ pub(crate) async fn generate_task_contract_recovery(
     }
     TaskContractRecoveryOutcome {
         plan: Some(TaskPlan {
-            goal: parsed.goal,
+            goal: envelope
+                .get("goal")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             steps: Vec::new(),
             success_criteria: Vec::new(),
-            contract: Some(parsed.contract),
+            contract: Some(contract),
             task_shape: None,
             mode,
         }),
@@ -1756,6 +1724,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contract_decoder_quarantines_malformed_lanes_independently() {
+        let decoded = decode_planned_contract_candidate(&json!({
+            "confidence": "high",
+            "task_kind": "conversational",
+            "expects_mutation": false,
+            "requires_observation": false,
+            "required_effects": [],
+            "mutation_scope": "allowed",
+            "forbidden_actions": [],
+            "tool_scope": "allowed",
+            "allowed_tool_names": [],
+            "forbidden_tool_scopes": ["not_a_capability", "user_memory"],
+            "required_response_fields": [],
+            "minimum_sources": 0,
+            "requires_primary_sources": false,
+            "requires_exact_history": false,
+            "evidence_requirements": [{"malformed": true}],
+            "required_invocations": [{
+                "tool_names": ["manage_mandates"],
+                "exit_codes": [],
+                "outcome_statuses": ["succeeded"],
+                "requires_output": true,
+                "contract_rejected": false
+            }],
+            "filesystem_access": {"execution_cwd": null, "read_paths": [], "write_paths": []},
+            "project_reference": null
+        }))
+        .expect("typed contract object");
+
+        assert_eq!(
+            decoded.forbidden_tool_scopes,
+            [crate::traits::ToolSemanticScope::UserMemory]
+        );
+        assert!(decoded.evidence_requirements.unwrap().is_empty());
+        assert_eq!(decoded.required_invocations.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_plan_decoder_requires_an_explicit_supported_protocol_version() {
+        let decoded = decode_task_plan_response(&json!({
+            "goal": "Synthetic protocol check",
+            "contract": {}
+        }))
+        .expect("JSON object");
+
+        assert!(migrate_task_plan_response(decoded).is_none());
+    }
+
+    #[test]
     fn conversational_turn_gets_semantic_assessment() {
         use crate::agent::CompletionTaskKind;
         assert!(!should_skip_planning(
@@ -1972,10 +1989,6 @@ mod tests {
             !planned_contract_is_complete(&restricted),
             "a restricted check needs a typed receipt requirement"
         );
-        assert!(planned_tool_constraints_are_grounded(
-            &restricted,
-            "Use only check_environment once. Do not use other tools."
-        ));
 
         let mut typed_outcome = restricted.clone();
         typed_outcome.evidence_requirements =
@@ -2048,14 +2061,6 @@ mod tests {
         no_tools.tool_scope = Some("forbidden".to_string());
         no_tools.tool_constraint_evidence = vec!["without using tools".to_string()];
         assert!(planned_contract_is_complete(&no_tools));
-        assert!(planned_tool_constraints_are_grounded(
-            &no_tools,
-            "Answer this without using tools"
-        ));
-        assert!(!planned_tool_constraints_are_grounded(
-            &no_tools,
-            "Answer this from live sources"
-        ));
 
         let mut no_tools_or_memory = no_tools.clone();
         no_tools_or_memory.forbidden_tool_scopes =
@@ -2065,35 +2070,15 @@ mod tests {
             "do not use memory on this turn or the related next turn".to_string(),
         ];
         assert!(planned_contract_is_complete(&no_tools_or_memory));
-        assert!(planned_tool_constraints_are_grounded(
-            &no_tools_or_memory,
-            "Answer without using tools; do not use memory on this turn or the related next turn"
-        ));
 
         let mut no_memory = complete.clone();
         no_memory.forbidden_tool_scopes = vec![crate::traits::ToolSemanticScope::UserMemory];
         no_memory.tool_constraint_evidence = vec!["do not use memory".to_string()];
         assert!(planned_contract_is_complete(&no_memory));
-        assert!(planned_tool_constraints_are_grounded(
-            &no_memory,
-            "Inspect the project, but do not use memory"
-        ));
-        assert!(!planned_tool_constraints_are_grounded(
-            &no_memory,
-            "Inspect the project"
-        ));
 
         let mut report_contract = complete.clone();
         report_contract.required_response_fields =
             vec!["owner".to_string(), "credential_status".to_string()];
-        assert!(planned_response_fields_are_grounded(
-            &report_contract,
-            "Report owner and credential_status."
-        ));
-        assert!(!planned_response_fields_are_grounded(
-            &report_contract,
-            "Report readiness."
-        ));
 
         let mut partial = complete.clone();
         partial.required_effects = None;
@@ -2184,7 +2169,7 @@ mod tests {
     fn memory_policy_is_compiled_once_from_typed_task_capabilities() {
         let current_contract = crate::agent::CompletionContract::default();
         assert_eq!(
-            compile_memory_pipeline_policy(&current_contract, None, "inspect the project"),
+            compile_memory_pipeline_policy(&current_contract, false),
             MemoryPipelinePolicy::SuppressedAssessmentUnavailable,
             "automatic memory must fail closed when the semantic assessment is unavailable"
         );
@@ -2194,59 +2179,21 @@ mod tests {
             .forbidden_tool_scopes
             .push(crate::traits::ToolSemanticScope::UserMemory);
         assert_eq!(
-            compile_memory_pipeline_policy(&inherited_denial, None, "inspect the project"),
+            compile_memory_pipeline_policy(&inherited_denial, false),
             MemoryPipelinePolicy::SuppressedByCurrentContract
         );
 
-        let denied_signals = PlannedContractSignals {
-            confidence: Some("high".to_string()),
-            expects_mutation: Some(false),
-            requires_observation: Some(false),
-            required_effects: Some(Vec::new()),
-            task_kind: Some("answer".to_string()),
-            mutation_scope: Some("allowed".to_string()),
-            forbidden_actions: Vec::new(),
-            constraint_evidence: Vec::new(),
-            tool_scope: Some("allowed".to_string()),
-            allowed_tool_names: Vec::new(),
-            forbidden_tool_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
-            tool_constraint_evidence: vec!["do not use memory".to_string()],
-            required_response_fields: Vec::new(),
-            minimum_sources: Some(0),
-            requires_primary_sources: Some(false),
-            requires_exact_history: Some(false),
-            evidence_requirements: Some(Vec::new()),
-            required_invocations: Some(Vec::new()),
-            filesystem_access: Some(PlannedFilesystemAccess::default()),
-            project_reference: None,
-        };
-        let denied_plan = TaskPlan {
-            goal: "Inspect without memory".to_string(),
-            steps: Vec::new(),
-            success_criteria: Vec::new(),
-            contract: Some(denied_signals),
-            task_shape: None,
-            mode: TaskAssessmentMode::AutonomousRouting,
-        };
+        let mut current_denial = current_contract.clone();
+        current_denial
+            .forbidden_tool_scopes
+            .push(crate::traits::ToolSemanticScope::UserMemory);
         assert_eq!(
-            compile_memory_pipeline_policy(
-                &current_contract,
-                Some(&denied_plan),
-                "inspect the project, but do not use memory",
-            ),
+            compile_memory_pipeline_policy(&current_denial, true),
             MemoryPipelinePolicy::SuppressedByAssessment
         );
 
-        let mut allowed_plan = denied_plan;
-        let allowed_signals = allowed_plan.contract.as_mut().unwrap();
-        allowed_signals.forbidden_tool_scopes.clear();
-        allowed_signals.tool_constraint_evidence.clear();
         assert_eq!(
-            compile_memory_pipeline_policy(
-                &current_contract,
-                Some(&allowed_plan),
-                "inspect the project",
-            ),
+            compile_memory_pipeline_policy(&current_contract, true),
             MemoryPipelinePolicy::Allowed
         );
     }
@@ -2377,10 +2324,12 @@ mod tests {
         )
         .await;
 
-        assert!(
-            recovered.plan.is_none(),
-            "a malformed authority envelope must still fail closed"
-        );
+        let plan = recovered
+            .plan
+            .expect("valid lifecycle lanes survive a malformed authority item");
+        let contract = plan.contract.expect("typed contract");
+        assert!(contract.forbidden_tool_scopes.is_empty());
+        assert_eq!(contract.allowed_tool_names, ["manage_mandates"]);
         assert_eq!(recovered.required_invocations.len(), 1);
         assert_eq!(
             recovered.required_invocations[0].tool_names,
@@ -2415,58 +2364,11 @@ mod tests {
         let contract = parsed.contract.unwrap();
         assert_eq!(contract.mutation_scope.as_deref(), Some("scoped"));
         assert_eq!(contract.forbidden_actions, ["deploy", "publish"]);
-        assert!(planned_mutation_constraints_are_grounded(
-            &contract,
-            "Build and verify locally without publishing"
-        ));
-        assert!(!planned_mutation_constraints_are_grounded(
-            &contract,
-            "Build and verify the project"
-        ));
         let shape = parsed.task_shape.unwrap();
         assert_eq!(shape.execution_mode.as_deref(), Some("inline"));
         assert_eq!(shape.confidence.as_deref(), Some("high"));
         assert_eq!(shape.independent_workstreams, Some(1));
         assert_eq!(shape.continue_inline_after_background_start, Some(true));
-    }
-
-    #[test]
-    fn scoped_evidence_cannot_ground_a_global_read_only_contract() {
-        let signals = PlannedContractSignals {
-            confidence: Some("high".to_string()),
-            expects_mutation: Some(true),
-            requires_observation: Some(true),
-            required_effects: Some(vec!["local_source_write".to_string()]),
-            task_kind: Some("change".to_string()),
-            mutation_scope: Some("read_only".to_string()),
-            forbidden_actions: vec!["deploy".to_string()],
-            constraint_evidence: vec!["do not deploy".to_string()],
-            tool_scope: Some("allowed".to_string()),
-            allowed_tool_names: Vec::new(),
-            forbidden_tool_scopes: Vec::new(),
-            tool_constraint_evidence: Vec::new(),
-            required_response_fields: Vec::new(),
-            minimum_sources: Some(0),
-            requires_primary_sources: Some(false),
-            requires_exact_history: Some(false),
-            evidence_requirements: Some(vec![crate::traits::RequestEvidenceRequirement {
-                summary: "Inspect the current local state".to_string(),
-                acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
-                purpose: crate::traits::EvidencePurpose::CurrentState,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-                required_content_markers: Vec::new(),
-                receipt: None,
-                target: None,
-            }]),
-            required_invocations: Some(Vec::new()),
-            filesystem_access: Some(PlannedFilesystemAccess::default()),
-            project_reference: None,
-        };
-        assert!(!planned_mutation_constraints_are_grounded(
-            &signals,
-            "Build the project locally, but do not deploy"
-        ));
     }
 
     #[test]
@@ -2479,6 +2381,7 @@ mod tests {
     async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
+                "schema_version": 9,
                 "goal": "Update one file",
                 "steps": [{"description": "Micromanaged step", "tool_hint": "edit_file"}],
                 "success_criteria": ["Micromanaged criterion"],
@@ -2593,6 +2496,7 @@ mod tests {
     async fn guided_assessment_retains_concrete_plan() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
+                "schema_version": 9,
                 "goal": "Update one file",
                 "steps": [
                     {"description": "Inspect the file", "tool_hint": "read_file"},

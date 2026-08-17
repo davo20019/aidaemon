@@ -296,16 +296,6 @@ impl TerminalCommandPathTargets {
     }
 }
 
-fn shell_token_is_environment_assignment(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.chars().enumerate().all(|(index, ch)| {
-            ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
-        })
-}
-
 fn shell_executable_name(token: &str) -> &str {
     std::path::Path::new(token)
         .file_name()
@@ -316,69 +306,27 @@ fn shell_executable_name(token: &str) -> &str {
 fn collect_terminal_command_resource_targets(
     command: &str,
     base_directory: Option<&str>,
-    depth: usize,
     targets: &mut TerminalCommandPathTargets,
 ) {
-    if depth > 4 {
-        return;
-    }
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
-        let Ok(tokens) = shell_words::split(&segment) else {
-            continue;
-        };
-        let mut executable_index = 0;
-        while tokens.get(executable_index).is_some_and(|token| {
-            shell_token_is_environment_assignment(token)
-                || matches!(token.as_str(), "command" | "builtin" | "env")
-        }) {
-            executable_index += 1;
-        }
-        let Some(executable) = tokens.get(executable_index) else {
-            continue;
-        };
-        let executable_name = shell_executable_name(executable);
+    for invocation in crate::tools::command_risk::structural_shell_invocations(command) {
+        let executable_name = shell_executable_name(&invocation.program);
 
-        // These arguments are shell programs, not path tokens. Recurse into
-        // the grammar so a quoted trap body cannot become one fabricated
-        // compound pathname while its real nested resources remain visible.
-        if executable_name == "trap" {
-            if let Some(script) = tokens.get(executable_index + 1) {
-                collect_terminal_command_resource_targets(
-                    script,
-                    base_directory,
-                    depth + 1,
-                    targets,
-                );
-            }
-            continue;
-        }
-        if matches!(executable_name, "sh" | "bash" | "zsh") {
-            if let Some(command_index) = tokens
-                .iter()
-                .skip(executable_index + 1)
-                .position(|token| token == "-c")
-                .map(|index| executable_index + index + 2)
-            {
-                if let Some(script) = tokens.get(command_index) {
-                    collect_terminal_command_resource_targets(
-                        script,
-                        base_directory,
-                        depth + 1,
-                        targets,
-                    );
-                }
-            }
+        // The shared shell parser already traversed shell programs and trap
+        // bodies. Their source operands are syntax, not filesystem targets.
+        if executable_name == "trap"
+            || matches!(executable_name, "sh" | "bash" | "dash" | "ksh" | "zsh")
+        {
             continue;
         }
 
-        for index in executable_index + 1..tokens.len() {
-            let token = &tokens[index];
+        for (index, token) in invocation.arguments.iter().enumerate() {
             let Some(candidate) = shell_path_candidate(
                 token,
                 index
                     .checked_sub(1)
-                    .and_then(|previous| tokens.get(previous))
-                    .map(String::as_str),
+                    .map_or(Some(executable_name), |previous| {
+                        invocation.arguments.get(previous).map(String::as_str)
+                    }),
             ) else {
                 continue;
             };
@@ -391,7 +339,7 @@ fn collect_terminal_command_resource_targets(
                 } else {
                     candidate
                 };
-            if executable_name == "cd" && index == executable_index + 1 {
+            if executable_name == "cd" && index == 0 {
                 targets.push_execution_context(target);
             } else {
                 targets.push_data_path(target);
@@ -405,7 +353,7 @@ pub(super) fn terminal_command_resource_targets(
     base_directory: Option<&str>,
 ) -> TerminalCommandPathTargets {
     let mut targets = TerminalCommandPathTargets::default();
-    collect_terminal_command_resource_targets(command, base_directory, 0, &mut targets);
+    collect_terminal_command_resource_targets(command, base_directory, &mut targets);
     targets
 }
 

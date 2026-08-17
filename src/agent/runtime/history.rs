@@ -12,13 +12,14 @@
 //! same names through `history::`.
 
 pub(super) use super::completion_contract::{
-    append_required_invocation_obligations, authored_artifact_still_needs_delivery_recovery,
-    completion_contract_allows_force_text, inherit_unfinished_request_contract,
-    install_semantic_completion_contract, mutation_contract_fulfilled,
-    parse_planned_forbidden_action, parse_planned_mutation_effects, parse_planned_task_kind,
-    retain_structural_completion_contract, CompletionContract, CompletionProgress,
-    CompletionTaskKind, ExecutionRequirement, ForbiddenMutationAction,
-    SemanticCompletionRequirements, VerificationTarget, VerificationTargetKind,
+    append_evidence_obligations, append_required_invocation_obligations, apply_semantic_authority,
+    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
+    inherit_unfinished_request_contract, install_semantic_completion_contract,
+    mutation_contract_fulfilled, parse_planned_forbidden_action, parse_planned_mutation_effects,
+    parse_planned_task_kind, retain_structural_completion_contract, CompletionContract,
+    CompletionProgress, CompletionTaskKind, ExecutionRequirement, ForbiddenMutationAction,
+    SemanticAuthorityRequirements, SemanticCompletionRequirements, VerificationTarget,
+    VerificationTargetKind,
 };
 pub(super) use super::followup::{assistant_message_looks_like_clarifying_question, FollowupMode};
 pub(super) use super::turn_context::TurnContext;

@@ -1037,18 +1037,14 @@ fn extract_segment_binary(segment: &str) -> &str {
 /// command. Exact executable basenames are used for workload classification;
 /// this is not natural-language keyword matching.
 fn parsed_command_invocations(command: &str) -> Vec<(String, Vec<String>)> {
-    crate::tools::command_risk::split_by_operators(command)
+    crate::tools::command_risk::structural_shell_invocations(command)
         .into_iter()
-        .filter_map(|(segment, _)| {
-            let tokens = shell_words::split(&segment).ok()?;
-            let program_index = tokens.iter().position(|token| {
-                !token.contains('=') && !matches!(token.as_str(), "command" | "builtin")
-            })?;
-            let program = std::path::Path::new(&tokens[program_index])
+        .filter_map(|invocation| {
+            let program = std::path::Path::new(&invocation.program)
                 .file_name()
                 .and_then(|name| name.to_str())?
                 .to_ascii_lowercase();
-            Some((program, tokens[program_index + 1..].to_vec()))
+            Some((program, invocation.arguments))
         })
         .collect()
 }
@@ -1197,78 +1193,6 @@ fn is_system_events_ui_scripting(command: &str) -> bool {
     ]
     .iter()
     .any(|verb| lower.contains(verb))
-}
-
-/// Detect `python3 -c "..."` commands that perform file **write** I/O.
-/// Read-only operations (ast.parse, open().read(), json.load) are allowed
-/// since there's no dedicated tool equivalent for validation/syntax checks.
-/// Only file writes should use write_file/edit_file tools instead.
-fn is_python_c_with_file_write_io(command: &str) -> bool {
-    // Split by shell operators to check each segment
-    let lower = command.to_ascii_lowercase();
-
-    // Quick pre-check: must contain python and -c
-    if !lower.contains("python") || !lower.contains("-c") {
-        return false;
-    }
-
-    // Parse the command properly to extract the -c argument
-    let parts = match shell_words::split(command) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    // Find python/python3 followed by -c
-    let mut i = 0;
-    while i < parts.len() {
-        let base = std::path::Path::new(&parts[i])
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&parts[i]);
-
-        if matches!(base, "python" | "python3") {
-            // Look for -c flag in subsequent args
-            for j in (i + 1)..parts.len() {
-                if parts[j] == "-c" {
-                    // The code string is the next argument (or concatenated)
-                    let code = if j + 1 < parts.len() {
-                        parts[j + 1].to_ascii_lowercase()
-                    } else {
-                        String::new()
-                    };
-
-                    // Only block file WRITE operations — read-only is fine.
-                    let file_write_patterns = [
-                        ".write(",
-                        ".writelines(",
-                        "write_text(",
-                        // json.dump( writes to file; json.dumps( returns string (safe)
-                        "json.dump(",
-                    ];
-                    if file_write_patterns.iter().any(|p| code.contains(p)) {
-                        return true;
-                    }
-
-                    // Check for open() with explicit write/append mode
-                    if code.contains("open(") {
-                        let write_modes = [
-                            "'w'", "\"w\"", "'a'", "\"a\"", "'x'", "\"x\"", "'wb'", "\"wb\"",
-                            "'ab'", "\"ab\"", "'xb'", "\"xb\"", "'w+'", "\"w+\"", "'a+'", "\"a+\"",
-                            "'r+'", "\"r+\"",
-                        ];
-                        if write_modes.iter().any(|m| code.contains(m)) {
-                            return true;
-                        }
-                    }
-
-                    break;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    false
 }
 
 fn detect_unscoped_recursive_grep_segment(segment: &str) -> Option<(String, String)> {
@@ -1901,17 +1825,9 @@ impl NativeSandboxRuntimeSupport {
 
 fn parsed_command_programs(command: &str) -> Vec<String> {
     let mut programs = Vec::new();
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
-        let Ok(tokens) = shell_words::split(&segment) else {
-            continue;
-        };
-        let Some(index) = tokens.iter().position(|token| {
-            !token.contains('=') && !matches!(token.as_str(), "command" | "builtin" | "env")
-        }) else {
-            continue;
-        };
-        if !programs.contains(&tokens[index]) {
-            programs.push(tokens[index].clone());
+    for invocation in crate::tools::command_risk::structural_shell_invocations(command) {
+        if !programs.contains(&invocation.program) {
+            programs.push(invocation.program);
         }
     }
     programs
@@ -5379,22 +5295,6 @@ impl TerminalTool {
                     }
                 }
 
-                // Soft-block python3 -c with file WRITE I/O: redirects to write_file/edit_file
-                // which are safer, faster, and don't require approval.
-                // Read-only operations (ast.parse, open().read(), json.load) are allowed
-                // since there's no dedicated tool for validation/syntax checks.
-                if is_python_c_with_file_write_io(command) {
-                    return Ok(ToolCallOutcome::blocked(
-                        "Blocked: `python3 -c` with file write I/O is not allowed through terminal.\n\n\
-                         Use dedicated tools instead:\n\
-                         - `write_file` to create or overwrite files\n\
-                         - `edit_file` to modify specific parts of a file\n\n\
-                         These tools are faster, do not require approval, and handle \
-                         encoding/quoting correctly."
-                            .to_string(),
-                    ));
-                }
-
                 // Hard-redirect AppleScript GUI automation to computer_use: the
                 // terminal path has none of its safety layer (approvals, blocked
                 // apps, action confirmation, lock detection) and System Events
@@ -5982,8 +5882,23 @@ fn validate_terminal_argument_contract(
                 .iter()
                 .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
         });
-    if crate::tools::command_semantics::classify_shell_command(command).mutates_state()
-        && !has_write_paths
+    let confinement_active = parsed
+        .get("working_dir")
+        .or_else(|| parsed.get("cwd"))
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.trim().is_empty())
+        || parsed
+            .get("read_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+        || has_write_paths;
+    let semantics = crate::tools::command_semantics::classify_confined_shell_command(
+        command,
+        confinement_active,
+        has_write_paths,
+    );
+    if !has_write_paths
+        && (semantics.mutates_state() || semantics.effect == crate::traits::ToolCallEffect::Unknown)
     {
         return Err(ToolArgumentContractViolation::new(
             "mutating terminal runs require an explicit non-empty write_paths access manifest",
@@ -6189,6 +6104,53 @@ mod tests {
             r#"{"action":"run","command":"/usr/bin/false","working_dir":"/tmp"}"#
         )
         .is_ok());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"/opt/homebrew/bin/python3 -c 'print(\"SYNTHETIC_OK\")'","working_dir":"/tmp","read_paths":[],"write_paths":[]}"#
+        )
+        .is_ok());
+        assert!(validate_terminal_argument_contract(
+            r#"{"action":"run","command":"python3 -c 'print(1)'"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn nested_shell_programs_share_runtime_dependency_discovery() {
+        let programs = parsed_command_programs(
+            "/bin/sh -lc '/opt/homebrew/bin/python3 -c '\"'\"'print(1)'\"'\"''",
+        );
+        assert!(programs.contains(&"/bin/sh".to_string()));
+        assert!(programs.contains(&"/opt/homebrew/bin/python3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn nested_managed_runtime_executes_through_combined_shell_flags() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none() {
+            return;
+        }
+        let Some(python) = backend.resolve_executable("python3").await.unwrap() else {
+            return;
+        };
+        let command = format!(
+            r#"/bin/sh -lc '{} -c "print(\"SYNTHETIC_NESTED_PYTHON_OK\")"'"#,
+            python
+        );
+        let request = confined_terminal_execution_request(
+            &backend,
+            &command,
+            Some("/tmp"),
+            &["/tmp".to_string()],
+            &[],
+        )
+        .await
+        .expect("confined request");
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(output.exit_code, 0, "{}", output.stderr_lossy());
+        assert_eq!(output.stdout_lossy().trim(), "SYNTHETIC_NESTED_PYTHON_OK");
     }
 
     #[test]

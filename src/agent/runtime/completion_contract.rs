@@ -107,7 +107,8 @@ pub(super) struct CompletionContract {
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
-    /// Grounded output labels that checklist/progress surfaces cannot satisfy.
+    /// Retained for persisted-schema compatibility. Final prose is not proof;
+    /// runtime completion deliberately ignores these legacy labels.
     pub required_response_fields: Vec<String>,
     /// Operation-specific negative obligations. These do not turn an otherwise
     /// mutating task into a report-only task; they block only the named action.
@@ -628,17 +629,59 @@ pub(super) struct SemanticCompletionRequirements<'a> {
     pub requires_observation: bool,
     pub task_kind: CompletionTaskKind,
     pub required_mutation_effects: ToolMutationEffects,
-    pub mutation_scope: &'a str,
-    pub forbidden_actions: &'a [ForbiddenMutationAction],
     pub minimum_sources: usize,
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
     pub evidence_requirements: &'a [RequestEvidenceRequirement],
     pub required_invocations: &'a [crate::traits::RequestReceiptPredicate],
+}
+
+/// Restrictive capability and response-shape policy compiled independently
+/// from completion obligations. Applying this lane can only preserve or reduce
+/// authority; it never creates a mutation/evidence obligation.
+pub(super) struct SemanticAuthorityRequirements<'a> {
+    pub mutation_scope: &'a str,
+    pub forbidden_actions: &'a [ForbiddenMutationAction],
     pub forbids_tool_use: bool,
     pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
-    pub required_response_fields: &'a [String],
+}
+
+pub(super) fn apply_semantic_authority(
+    contract: &mut CompletionContract,
+    authority: SemanticAuthorityRequirements<'_>,
+) {
+    match authority.mutation_scope {
+        "read_only" | "read-only" => {
+            contract.forbids_mutation = true;
+            contract.expects_mutation = false;
+            contract.required_mutation_effects = ToolMutationEffects::NONE;
+            contract.requires_reverification_after_mutation = false;
+            contract.forbidden_mutation_actions.clear();
+        }
+        "scoped" => {
+            for action in authority.forbidden_actions {
+                if !contract.forbidden_mutation_actions.contains(action) {
+                    contract.forbidden_mutation_actions.push(*action);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if authority.forbids_tool_use {
+        contract.forbids_tool_use = true;
+        contract.allowed_tool_names.clear();
+        contract.requires_observation = false;
+        contract.explicit_verification_requested = false;
+    } else if !authority.allowed_tool_names.is_empty() {
+        contract.allowed_tool_names = authority.allowed_tool_names.to_vec();
+    }
+    for scope in authority.forbidden_tool_scopes {
+        if !contract.forbidden_tool_scopes.contains(scope) {
+            contract.forbidden_tool_scopes.push(*scope);
+        }
+    }
 }
 
 fn structural_evidence_requirement(
@@ -727,9 +770,7 @@ pub(super) fn install_semantic_completion_contract(
             target: None,
         },
     ));
-    let scope = requirements.mutation_scope.trim().to_ascii_lowercase();
-    let forbids_mutation = matches!(scope.as_str(), "read_only" | "read-only");
-    let expects_mutation = requirements.expects_mutation && !forbids_mutation;
+    let expects_mutation = requirements.expects_mutation;
 
     *contract = CompletionContract {
         scope_task_id,
@@ -741,26 +782,20 @@ pub(super) fn install_semantic_completion_contract(
         } else {
             ToolMutationEffects::NONE
         },
-        forbids_mutation,
-        forbids_tool_use: requirements.forbids_tool_use,
-        allowed_tool_names: requirements.allowed_tool_names.to_vec(),
-        forbidden_tool_scopes: requirements.forbidden_tool_scopes.to_vec(),
-        required_response_fields: requirements.required_response_fields.to_vec(),
-        forbidden_mutation_actions: if scope == "scoped" {
-            requirements.forbidden_actions.to_vec()
-        } else {
-            Vec::new()
-        },
-        requires_observation: !requirements.forbids_tool_use
-            && (requirements.requires_observation
-                || !requirements.evidence_requirements.is_empty()
-                || !requirements.required_invocations.is_empty()),
+        forbids_mutation: false,
+        forbids_tool_use: false,
+        allowed_tool_names: Vec::new(),
+        forbidden_tool_scopes: Vec::new(),
+        required_response_fields: Vec::new(),
+        forbidden_mutation_actions: Vec::new(),
+        requires_observation: requirements.requires_observation
+            || !requirements.evidence_requirements.is_empty()
+            || !requirements.required_invocations.is_empty(),
         requires_reverification_after_mutation: expects_mutation
             && requirements.requires_observation,
         // This now records a semantic observation obligation, not an English
         // verification-phrase match.
-        explicit_verification_requested: !requirements.forbids_tool_use
-            && requirements.requires_observation,
+        explicit_verification_requested: requirements.requires_observation,
         minimum_sources: requirements.minimum_sources,
         requires_primary_sources: requirements.requires_primary_sources,
         requires_exact_history: requirements.requires_exact_history,
@@ -805,6 +840,38 @@ pub(super) fn append_required_invocation_obligations(
     contract.requires_observation = true;
 }
 
+/// Add independently compiled subject-evidence obligations without replacing
+/// lifecycle state or authority. This is the non-receipt sibling of
+/// `append_required_invocation_obligations`; both lanes remain useful even when
+/// another semantic lane is malformed.
+pub(super) fn append_evidence_obligations(
+    contract: &mut CompletionContract,
+    requirements: &[RequestEvidenceRequirement],
+) {
+    if contract.forbids_tool_use || requirements.is_empty() {
+        return;
+    }
+    for mut requirement in requirements.iter().cloned() {
+        requirement.required_content_markers.clear();
+        requirement
+            .acceptable_scopes
+            .sort_by_key(|scope| scope.as_str());
+        requirement.acceptable_scopes.dedup();
+        let duplicate = contract.evidence_requirements.iter().any(|existing| {
+            existing.acceptable_scopes == requirement.acceptable_scopes
+                && existing.purpose == requirement.purpose
+                && existing.minimum_authority == requirement.minimum_authority
+                && existing.temporal_scope == requirement.temporal_scope
+                && existing.receipt == requirement.receipt
+                && existing.target == requirement.target
+        });
+        if !duplicate {
+            contract.evidence_requirements.push(requirement);
+        }
+    }
+    contract.requires_observation |= !requirements.is_empty();
+}
+
 /// Remove language-derived obligations when semantic assessment was skipped or
 /// failed. Exact URLs and structurally resolved paths remain target hints for
 /// one generic observation obligation.
@@ -816,14 +883,24 @@ pub(super) fn append_required_invocation_obligations(
 /// The successful observation must still match at least one exact target, but
 /// the fallback creates only one evidence need regardless of how many
 /// identities were extracted.
-pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
+pub(super) fn retain_structural_completion_contract(
+    contract: &mut CompletionContract,
+    typed_obligation_pending: bool,
+) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let scope_task_id = contract.scope_task_id.take();
     let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
-    let requires_observation = !verification_targets.is_empty();
-    let evidence_requirements = structural_evidence_requirement(&verification_targets)
-        .into_iter()
-        .collect();
+    let requires_observation = typed_obligation_pending || !verification_targets.is_empty();
+    // Structural resources are matching hints for a typed obligation when one
+    // already exists. Creating a second generic proof node from the same path
+    // would make one requested invocation require two unrelated observations.
+    let evidence_requirements = if typed_obligation_pending {
+        Vec::new()
+    } else {
+        structural_evidence_requirement(&verification_targets)
+            .into_iter()
+            .collect()
+    };
     *contract = CompletionContract {
         scope_task_id,
         adopted_from_task_ids,
@@ -850,7 +927,7 @@ pub(super) fn infer_structural_completion_contract(
         verification_targets: extract_verification_targets(text, alias_roots),
         ..CompletionContract::default()
     };
-    retain_structural_completion_contract(&mut contract);
+    retain_structural_completion_contract(&mut contract, false);
     contract
 }
 
@@ -1220,9 +1297,6 @@ pub(super) struct CompletionProgress {
     /// Count of bounded retries issued because a mandate task lead attempted
     /// to finish without an exact durable decision for its current run.
     pub mandate_decision_retry_count: usize,
-    /// Bounded retry for a model-authored final response that omitted grounded
-    /// user-requested output labels.
-    pub response_contract_retry_count: usize,
     /// True when the coreference grounding gate already fired this turn
     /// (a pronoun-referent follow-up that was anchored to the prior exchange).
     /// When set, the denial gate must NOT also fire — coreference gate takes
@@ -2626,7 +2700,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn semantic_contract_replaces_lexical_obligations_but_keeps_exact_targets() {
+    fn semantic_contract_replaces_advisory_obligations_but_keeps_exact_targets() {
         let target = VerificationTarget {
             kind: VerificationTargetKind::Url,
             value: "https://example.test/status".to_string(),
@@ -2662,17 +2736,11 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Check,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
                 minimum_sources: 0,
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: &[],
                 required_invocations: &[],
-                forbids_tool_use: false,
-                allowed_tool_names: &[],
-                forbidden_tool_scopes: &[],
-                required_response_fields: &[],
             },
         );
 
@@ -2705,17 +2773,21 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Answer,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
                 minimum_sources: 0,
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: std::slice::from_ref(&requirement),
                 required_invocations: &[],
+            },
+        );
+        apply_semantic_authority(
+            &mut contract,
+            SemanticAuthorityRequirements {
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
                 forbids_tool_use: true,
                 allowed_tool_names: &[],
                 forbidden_tool_scopes: &[],
-                required_response_fields: &[],
             },
         );
 
@@ -2747,17 +2819,21 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Check,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
                 minimum_sources: 0,
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: std::slice::from_ref(&requirement),
                 required_invocations: &[],
+            },
+        );
+        apply_semantic_authority(
+            &mut contract,
+            SemanticAuthorityRequirements {
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
                 forbids_tool_use: false,
                 allowed_tool_names: &["check_environment".to_string()],
                 forbidden_tool_scopes: &[],
-                required_response_fields: &[],
             },
         );
         assert_eq!(contract.allowed_tool_names, ["check_environment"]);
@@ -2797,17 +2873,11 @@ mod tests {
                 requires_observation: true,
                 task_kind: CompletionTaskKind::Answer,
                 required_mutation_effects: ToolMutationEffects::NONE,
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
                 minimum_sources: 0,
                 requires_primary_sources: false,
                 requires_exact_history: false,
                 evidence_requirements: &requirements,
                 required_invocations: &[],
-                forbids_tool_use: false,
-                allowed_tool_names: &[],
-                forbidden_tool_scopes: &[],
-                required_response_fields: &[],
             },
         );
 
@@ -2858,7 +2928,7 @@ mod tests {
             ..CompletionContract::default()
         };
 
-        retain_structural_completion_contract(&mut contract);
+        retain_structural_completion_contract(&mut contract, false);
 
         assert_eq!(contract.task_kind, CompletionTaskKind::Check);
         assert!(contract.requires_observation);
@@ -2889,7 +2959,7 @@ mod tests {
             ],
             ..CompletionContract::default()
         };
-        retain_structural_completion_contract(&mut contract);
+        retain_structural_completion_contract(&mut contract, false);
         let progress = CompletionProgress::new(&contract, "synthetic-task");
 
         assert!(contract.requires_observation);
@@ -2898,6 +2968,29 @@ mod tests {
         assert!(progress.verification_obligation_id.is_none());
         assert_eq!(progress.evidence_obligation_ids.len(), 1);
         assert!(progress.mutation_obligation_ids.is_empty());
+    }
+
+    #[test]
+    fn typed_invocation_reuses_structural_targets_without_duplicate_proof_node() {
+        let mut contract = CompletionContract {
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value: "/tmp".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+        let invocation = crate::traits::RequestReceiptPredicate {
+            tool_names: vec!["run_command".to_string()],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult],
+            ..crate::traits::RequestReceiptPredicate::default()
+        };
+
+        retain_structural_completion_contract(&mut contract, true);
+        append_required_invocation_obligations(&mut contract, &[invocation]);
+
+        assert_eq!(contract.verification_targets.len(), 1);
+        assert_eq!(contract.evidence_requirements.len(), 1);
+        assert!(contract.evidence_requirements[0].receipt.is_some());
     }
 
     #[test]

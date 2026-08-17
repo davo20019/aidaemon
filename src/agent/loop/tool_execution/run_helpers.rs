@@ -995,10 +995,133 @@ fn requirement_target_matches(
         .any(|haystack| verification_target_matches_haystack(&contract_target, haystack))
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(in crate::agent) struct ReceiptPredicateEvaluation {
+    pub has_predicate: bool,
+    pub tool_compatible: bool,
+    pub exit_compatible: bool,
+    pub outcome_compatible: bool,
+    pub rejection_compatible: bool,
+    pub output_compatible: bool,
+}
+
+impl ReceiptPredicateEvaluation {
+    fn matched(&self) -> bool {
+        self.tool_compatible
+            && self.exit_compatible
+            && self.outcome_compatible
+            && self.rejection_compatible
+            && self.output_compatible
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(in crate::agent) struct EvidenceRequirementEvaluation {
+    pub requirement_index: usize,
+    pub matched: bool,
+    pub exact_invocation: bool,
+    pub read_selection_compatible: bool,
+    pub capability_compatible: bool,
+    pub receipt: ReceiptPredicateEvaluation,
+    pub target_compatible: bool,
+}
+
+fn evaluate_receipt_predicate(
+    requirement: &RequestEvidenceRequirement,
+    requested_tool_name: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> ReceiptPredicateEvaluation {
+    let Some(receipt) = requirement.receipt.as_ref() else {
+        return ReceiptPredicateEvaluation {
+            has_predicate: false,
+            tool_compatible: true,
+            exit_compatible: true,
+            outcome_compatible: true,
+            rejection_compatible: true,
+            output_compatible: true,
+        };
+    };
+    let tool_compatible = receipt.tool_names.is_empty()
+        || receipt.tool_names.iter().any(|name| {
+            name == requested_tool_name || metadata.effective_tool_name.as_deref() == Some(name)
+        });
+    let exit_compatible = receipt.exit_codes.is_empty()
+        || metadata.receipt_kind != crate::traits::ToolReceiptKind::Process
+        || metadata
+            .exit_code
+            .is_some_and(|actual| receipt.exit_codes.contains(&actual));
+    let outcome_compatible = receipt.outcome_statuses.is_empty()
+        || metadata
+            .outcome_status
+            .is_some_and(|actual| receipt.outcome_statuses.contains(&actual));
+    let rejection_compatible = receipt
+        .contract_rejected
+        .is_none_or(|expected| metadata.contract_rejected == expected);
+    let has_output = metadata
+        .result_provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.authoritative_chars > 0)
+        || !result_text.trim().is_empty();
+    ReceiptPredicateEvaluation {
+        has_predicate: true,
+        tool_compatible,
+        exit_compatible,
+        outcome_compatible,
+        rejection_compatible,
+        output_compatible: !receipt.requires_output || has_output,
+    }
+}
+
+/// Evaluate every lifecycle obligation against one typed receipt. The result
+/// is both the authoritative match input and causal telemetry: consumers no
+/// longer have to infer why a receipt failed from a generic validation loop.
+pub(in crate::agent) fn evaluate_evidence_requirements(
+    contract: &CompletionContract,
+    requested_tool_name: &str,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> Vec<EvidenceRequirementEvaluation> {
+    let read_selection_compatible = metadata
+        .read_file
+        .as_ref()
+        .is_none_or(|read| read_receipt_covers_requested_selection(raw_arguments, read));
+    contract
+        .evidence_requirements
+        .iter()
+        .enumerate()
+        .map(|(requirement_index, requirement)| {
+            let exact_invocation =
+                crate::agent::inquiry::requirement_is_exact_invocation(requirement);
+            let capability_compatible = exact_invocation
+                || semantics.evidence.iter().any(|capability| {
+                    crate::agent::inquiry::capability_supports_requirement(capability, requirement)
+                });
+            let receipt =
+                evaluate_receipt_predicate(requirement, requested_tool_name, result_text, metadata);
+            let target_compatible =
+                requirement_target_matches(requirement, semantics, raw_arguments, metadata);
+            EvidenceRequirementEvaluation {
+                requirement_index,
+                matched: read_selection_compatible
+                    && capability_compatible
+                    && receipt.matched()
+                    && target_compatible,
+                exact_invocation,
+                read_selection_compatible,
+                capability_compatible,
+                receipt,
+                target_compatible,
+            }
+        })
+        .collect()
+}
+
 /// Return the exact machine-checkable evidence obligations supported by one
-/// successful observation receipt. Free-form subject words never decide task
-/// completion; only typed capabilities, receipt fields, and structural target
-/// identity participate here.
+/// observation receipt. Free-form subject words never decide task completion;
+/// only typed capabilities, receipt fields, and structural target identity do.
 pub(in crate::agent) fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
     requested_tool_name: &str,
@@ -1007,32 +1130,17 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
     result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
 ) -> Vec<usize> {
-    let read_receipt_is_compatible = metadata
-        .read_file
-        .as_ref()
-        .is_none_or(|read| read_receipt_covers_requested_selection(raw_arguments, read));
-    contract
-        .evidence_requirements
-        .iter()
-        .enumerate()
-        .filter_map(|(index, requirement)| {
-            let capability_matches =
-                crate::agent::inquiry::requirement_is_exact_invocation(requirement)
-                    || semantics.evidence.iter().any(|capability| {
-                        crate::agent::inquiry::capability_supports_requirement(
-                            capability,
-                            requirement,
-                        )
-                    });
-            let receipt_matches =
-                receipt_predicate_matches(requirement, requested_tool_name, result_text, metadata);
-            (read_receipt_is_compatible
-                && capability_matches
-                && receipt_matches
-                && requirement_target_matches(requirement, semantics, raw_arguments, metadata))
-            .then_some(index)
-        })
-        .collect()
+    evaluate_evidence_requirements(
+        contract,
+        requested_tool_name,
+        semantics,
+        raw_arguments,
+        result_text,
+        metadata,
+    )
+    .into_iter()
+    .filter_map(|evaluation| evaluation.matched.then_some(evaluation.requirement_index))
+    .collect()
 }
 
 /// Associate a nonterminal invocation with the obligations it may eventually
@@ -1073,44 +1181,6 @@ pub(in crate::agent) fn pending_evidence_requirement_indices(
             .then_some(index)
         })
         .collect()
-}
-
-fn receipt_predicate_matches(
-    requirement: &RequestEvidenceRequirement,
-    requested_tool_name: &str,
-    result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
-) -> bool {
-    let Some(receipt) = requirement.receipt.as_ref() else {
-        return true;
-    };
-    let tool_matches = receipt.tool_names.is_empty()
-        || receipt.tool_names.iter().any(|name| {
-            name == requested_tool_name || metadata.effective_tool_name.as_deref() == Some(name)
-        });
-    // Exit codes are meaningful only for process receipts. An assessor adding
-    // a process-only field to a management/API receipt must not make an
-    // otherwise valid named invocation impossible to prove.
-    let exit_matches = receipt.exit_codes.is_empty()
-        || metadata.receipt_kind != crate::traits::ToolReceiptKind::Process
-        || metadata
-            .exit_code
-            .is_some_and(|actual| receipt.exit_codes.contains(&actual));
-    let outcome_matches = receipt.outcome_statuses.is_empty()
-        || metadata
-            .outcome_status
-            .is_some_and(|actual| receipt.outcome_statuses.contains(&actual));
-    let rejection_matches = receipt
-        .contract_rejected
-        .is_none_or(|expected| metadata.contract_rejected == expected);
-    let has_output = metadata
-        .result_provenance
-        .as_ref()
-        .is_some_and(|provenance| provenance.authoritative_chars > 0)
-        || !result_text.trim().is_empty();
-    let output_matches = !receipt.requires_output || has_output;
-
-    tool_matches && exit_matches && outcome_matches && rejection_matches && output_matches
 }
 
 pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
@@ -1344,6 +1414,20 @@ mod tests {
             &metadata,
         )
         .is_empty());
+        let evaluations = evaluate_evidence_requirements(
+            &mismatched,
+            "run_command",
+            &metadata.semantics,
+            raw_arguments,
+            "untrusted process text says exit=0",
+            &metadata,
+        );
+        assert_eq!(evaluations.len(), 1);
+        assert!(!evaluations[0].matched);
+        assert!(!evaluations[0].receipt.exit_compatible);
+        assert!(evaluations[0].receipt.tool_compatible);
+        assert!(evaluations[0].capability_compatible);
+        assert!(evaluations[0].target_compatible);
     }
 
     #[test]

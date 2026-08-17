@@ -168,12 +168,15 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
             )],
             Some("list" | "search") | None => vec![capability(
                 UserMemory,
-                &[CurrentState, Content, Attribution],
+                &[CurrentState, HistoricalRecord, Content, Attribution],
                 // This operation reads the canonical persisted memory ledger.
                 // The stored claim may itself be user-supplied, but whether it
                 // exists (or does not exist) is an authoritative store fact.
+                // A current lookup can return claims about either current or
+                // historical subjects; the receipt separately timestamps the
+                // lookup itself.
                 Canonical,
-                Current,
+                Both,
             )],
             _ => Vec::new(),
         },
@@ -592,6 +595,23 @@ mod tests {
             EvidenceTemporalScope::Current,
         );
         assert!(requirement_has_builtin_evidence_route(&coherent));
+    }
+
+    #[test]
+    fn current_memory_lookup_can_support_historical_subject_content() {
+        let historical_fact = requirement(
+            ToolSemanticScope::UserMemory,
+            EvidencePurpose::HistoricalRecord,
+            EvidenceAuthority::Advisory,
+            EvidenceTemporalScope::Historical,
+        );
+        let memory = evidence_capabilities_for_tool_call(
+            "manage_memories",
+            r#"{"action":"search","query":"synthetic family facts"}"#,
+        );
+        assert!(memory
+            .iter()
+            .any(|capability| { capability_supports_requirement(capability, &historical_fact) }));
     }
 
     #[test]

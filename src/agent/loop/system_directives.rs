@@ -103,11 +103,6 @@ pub(in crate::agent) enum SystemDirective {
     ToolUseForbiddenByRequest {
         outstanding_needs: Vec<String>,
     },
-    /// The draft omitted labels from the grounded user-authored output
-    /// contract. Progress/checklist state cannot satisfy these fields.
-    OutputContractIncomplete {
-        missing_fields: Vec<String>,
-    },
     DeferredToolCallRequired,
     DeferredProvideConcreteResults,
     StructuredToolResultSynthesis {
@@ -318,10 +313,6 @@ impl SystemDirective {
                 truncated_tail
             ),
             Self::ToolModeDisabledPlainText => "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. Do NOT emit tool calls.".to_string(),
-            Self::OutputContractIncomplete { missing_fields } => format!(
-                "[SYSTEM] Your draft did not satisfy the current request's output contract. The substantive final answer must include each exact requested label and either its supported value or an explicit unavailable/blocker marker. Missing labels: {}. A checklist or claim that fields were reported is not an answer.",
-                missing_fields.join(", ")
-            ),
             Self::ApproachPivotRequired {
                 attempt,
                 failure_record,

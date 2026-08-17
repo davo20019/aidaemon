@@ -2442,8 +2442,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &result_text,
                 &result_metadata,
             );
-        let mut matched_requirements = if semantics.observes_state() {
-            matching_evidence_requirement_indices(
+        let requirement_evaluations = if semantics.observes_state() {
+            evaluate_evidence_requirements(
                 &turn_context.completion_contract,
                 &tc.name,
                 semantics,
@@ -2454,6 +2454,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             Vec::new()
         };
+        let mut matched_requirements = requirement_evaluations
+            .iter()
+            .filter_map(|evaluation| {
+                evaluation
+                    .matched
+                    .then_some(evaluation.requirement_index)
+            })
+            .collect::<Vec<_>>();
         if semantics.observes_state() {
             for index in accumulate_evidence_requirement_marker_matches(
                 &turn_context.completion_contract,
@@ -2549,6 +2557,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             "tool_call_id": tc.id,
                             "matched_requirement_indices": matched_requirements,
                             "matched_requirement_summaries": matched_requirement_summaries,
+                            "requirement_evaluations": requirement_evaluations,
                             "evidence_capabilities": semantics.evidence,
                             "requirements_satisfied": completion_progress.satisfied_evidence_requirements(),
                             "requirements_total": turn_context.completion_contract.evidence_requirements.len(),

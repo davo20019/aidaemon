@@ -98,18 +98,13 @@ async fn finalize_turn_assessment(
     initial_turn_context: &TurnContext,
     plan: Option<&super::task_planning::TaskPlan>,
     recovered_required_invocations: &[crate::traits::RequestReceiptPredicate],
+    available_tool_names: &[String],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
     model: &str,
     planner_trust_tier: &str,
-) -> TurnContext {
-    use super::task_planning::{
-        planned_contract_is_complete, planned_contract_is_confident,
-        planned_mutation_constraints_are_grounded, planned_response_fields_are_grounded,
-        planned_tool_constraints_are_grounded,
-    };
-
+) -> (TurnContext, bool) {
     let confident_shape = plan
         .and_then(|plan| plan.task_shape.as_ref())
         .or(relationship_fallback)
@@ -226,6 +221,12 @@ async fn finalize_turn_assessment(
     turn_context.visible_antecedent_user_message_id = committed_antecedent_user_message_id;
     let before_contract = turn_context.completion_contract.clone();
     let mut semantic_contract_applied = false;
+    let mut contract_lane_decisions = Vec::new();
+    let mut compiled_evidence_requirements = Vec::new();
+    let mut compiled_required_invocations = Vec::new();
+    let mut compiled_authority = None;
+    let mut compiled_filesystem_access = None;
+    let mut compiled_project_scope = None;
 
     if let Some(shape) = confident_shape {
         turn_context.continue_inline_after_background_start = shape
@@ -234,141 +235,48 @@ async fn finalize_turn_assessment(
     }
 
     if let Some(signals) = plan.and_then(|plan| plan.contract.as_ref()) {
-        let scope = signals
-            .mutation_scope
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        let declares_negative_scope =
-            matches!(scope.as_str(), "read_only" | "read-only" | "scoped");
-        let tool_scope = signals
-            .tool_scope
-            .as_deref()
-            .map(|scope| scope.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        let forbids_tool_use = tool_scope == "forbidden";
-        let has_tool_constraints = forbids_tool_use
-            || tool_scope == "restricted"
-            || !signals.forbidden_tool_scopes.is_empty();
-        let confident =
-            planned_contract_is_confident(signals, plan.and_then(|p| p.task_shape.as_ref()));
-        let complete = planned_contract_is_complete(signals);
-        let grounded = planned_mutation_constraints_are_grounded(signals, user_text);
-        let tool_constraint_grounded = planned_tool_constraints_are_grounded(signals, user_text);
-        let response_fields_grounded = planned_response_fields_are_grounded(signals, user_text);
-        let filesystem_access = signals.filesystem_access.as_ref().and_then(|access| {
-            let grounded =
-                crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
-                    user_text,
-                    &agent.path_aliases.projects,
-                );
-            let resolve = |raw: &str| {
-                crate::tools::fs_utils::resolve_structural_filesystem_reference(
-                    raw,
-                    &agent.path_aliases.projects,
-                )
-                .map(|path| path.to_string_lossy().to_string())
-                .filter(|path| grounded.iter().any(|item| item == path))
-            };
-            let execution_cwd = access.execution_cwd.as_deref().and_then(resolve);
-            if access.execution_cwd.is_some() && execution_cwd.is_none() {
-                return None;
-            }
-            let read_paths = access
-                .read_paths
-                .iter()
-                .map(|path| resolve(path))
-                .collect::<Option<Vec<_>>>()?;
-            let write_paths = access
-                .write_paths
-                .iter()
-                .map(|path| resolve(path))
-                .collect::<Option<Vec<_>>>()?;
-            Some(crate::traits::ToolCallAccessManifest {
-                execution_cwd,
-                read_targets: read_paths
-                    .into_iter()
-                    .filter_map(|path| {
-                        crate::traits::ToolTargetHint::new(
-                            crate::traits::ToolTargetHintKind::Path,
-                            path,
-                        )
-                    })
-                    .collect(),
-                write_targets: write_paths
-                    .into_iter()
-                    .filter_map(|path| {
-                        crate::traits::ToolTargetHint::new(
-                            crate::traits::ToolTargetHintKind::Path,
-                            path,
-                        )
-                    })
-                    .collect(),
-            })
-        });
-        let filesystem_access_grounded = signals.filesystem_access.as_ref().is_some_and(|access| {
-            filesystem_access.is_some()
-                || access.execution_cwd.is_none()
-                    && access.read_paths.is_empty()
-                    && access.write_paths.is_empty()
-        });
+        let structural_filesystem_resources =
+            crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
+                user_text,
+                &agent.path_aliases.projects,
+            );
+        let mut structural_project_scopes = Vec::new();
+        crate::agent::project_scope::extract_project_scopes_from_text(
+            user_text,
+            &mut structural_project_scopes,
+            8,
+            &agent.path_aliases.projects,
+        );
+        let compiled = super::contract_compiler::compile_task_contract(
+            super::contract_compiler::ContractCompilerInput {
+                signals,
+                task_shape: plan.and_then(|plan| plan.task_shape.as_ref()),
+                available_tool_names,
+                structural_filesystem_resources: &structural_filesystem_resources,
+                structural_project_scopes: &structural_project_scopes,
+                project_alias_roots: &agent.path_aliases.projects,
+            },
+        );
+        contract_lane_decisions = compiled.decisions.clone();
+        compiled_evidence_requirements = compiled.evidence_requirements.clone();
+        compiled_required_invocations = compiled.required_invocations.clone();
+        compiled_authority = Some(compiled.authority.clone());
+        compiled_filesystem_access = compiled.filesystem_access.clone();
+        compiled_project_scope = compiled.project_scope.clone();
 
-        if confident
-            && complete
-            && (!declares_negative_scope || grounded)
-            && (!has_tool_constraints || tool_constraint_grounded)
-            && response_fields_grounded
-            && filesystem_access_grounded
-        {
-            let planned_kind = signals
-                .task_kind
-                .as_deref()
-                .and_then(crate::agent::parse_planned_task_kind)
-                .expect("complete semantic contract has a valid task kind");
-            let forbidden_actions = signals
-                .forbidden_actions
-                .iter()
-                .filter_map(|action| crate::agent::parse_planned_forbidden_action(action))
-                .collect::<Vec<_>>();
-            let required_effects = if signals.expects_mutation == Some(true) {
-                crate::agent::parse_planned_mutation_effects(
-                    signals
-                        .required_effects
-                        .as_deref()
-                        .expect("complete semantic contract has effects"),
-                )
-                .expect("complete semantic contract has valid effects")
-            } else {
-                crate::traits::ToolMutationEffects::NONE
-            };
+        if let Some(core) = compiled.core.as_ref() {
             crate::agent::install_semantic_completion_contract(
                 &mut turn_context.completion_contract,
                 crate::agent::SemanticCompletionRequirements {
-                    expects_mutation: signals
-                        .expects_mutation
-                        .expect("complete semantic contract"),
-                    requires_observation: signals
-                        .requires_observation
-                        .expect("complete semantic contract"),
-                    task_kind: planned_kind,
-                    required_mutation_effects: required_effects,
-                    mutation_scope: signals.mutation_scope.as_deref().unwrap_or("allowed"),
-                    forbidden_actions: &forbidden_actions,
-                    minimum_sources: signals.minimum_sources.unwrap_or_default() as usize,
-                    requires_primary_sources: signals.requires_primary_sources.unwrap_or(false),
-                    requires_exact_history: signals.requires_exact_history.unwrap_or(false),
-                    evidence_requirements: signals
-                        .evidence_requirements
-                        .as_deref()
-                        .unwrap_or_default(),
-                    required_invocations: signals
-                        .required_invocations
-                        .as_deref()
-                        .unwrap_or_default(),
-                    forbids_tool_use,
-                    allowed_tool_names: &signals.allowed_tool_names,
-                    forbidden_tool_scopes: &signals.forbidden_tool_scopes,
-                    required_response_fields: &signals.required_response_fields,
+                    expects_mutation: core.expects_mutation,
+                    requires_observation: core.requires_observation,
+                    task_kind: core.task_kind,
+                    required_mutation_effects: core.required_mutation_effects,
+                    minimum_sources: core.minimum_sources,
+                    requires_primary_sources: core.requires_primary_sources,
+                    requires_exact_history: core.requires_exact_history,
+                    evidence_requirements: &compiled.evidence_requirements,
+                    required_invocations: &compiled.required_invocations,
                 },
             );
             if turn_context.inherited_completion_contract {
@@ -385,51 +293,54 @@ async fn finalize_turn_assessment(
                     )
                 };
             }
-            if let Some(reference) = signals
-                .project_reference
-                .as_deref()
-                .map(str::trim)
-                .filter(|reference| !reference.is_empty())
-                .filter(|reference| {
-                    user_text
-                        .to_ascii_lowercase()
-                        .contains(&reference.to_ascii_lowercase())
-                })
-            {
-                if let Some(scope) = crate::tools::fs_utils::resolve_project_scope_reference(
-                    reference,
-                    &agent.path_aliases.projects,
-                ) {
-                    turn_context.primary_project_scope = Some(scope.to_string_lossy().to_string());
-                }
-            }
-            turn_context.filesystem_access = filesystem_access.filter(|access| {
-                access.execution_cwd.is_some()
-                    || !access.read_targets.is_empty()
-                    || !access.write_targets.is_empty()
-            });
             semantic_contract_applied = true;
-        } else {
-            warn!(
-                session_id,
-                confident,
-                complete,
-                grounded,
-                mutation_scope = %scope,
-                "Ignored incomplete or untrusted semantic contract"
-            );
         }
     }
 
+    let mut effective_required_invocations = compiled_required_invocations.clone();
+    for receipt in recovered_required_invocations {
+        if !effective_required_invocations.contains(receipt) {
+            effective_required_invocations.push(receipt.clone());
+        }
+    }
+    let typed_obligation_pending =
+        !compiled_evidence_requirements.is_empty() || !effective_required_invocations.is_empty();
     if agent.mandate_execution.is_none()
         && !semantic_contract_applied
         && !turn_context.inherited_completion_contract
     {
-        crate::agent::retain_structural_completion_contract(&mut turn_context.completion_contract);
+        crate::agent::retain_structural_completion_contract(
+            &mut turn_context.completion_contract,
+            typed_obligation_pending,
+        );
     }
+    if let Some(authority) = compiled_authority.as_ref() {
+        crate::agent::apply_semantic_authority(
+            &mut turn_context.completion_contract,
+            crate::agent::SemanticAuthorityRequirements {
+                mutation_scope: authority.mutation_scope,
+                forbidden_actions: &authority.forbidden_actions,
+                forbids_tool_use: authority.forbids_tool_use,
+                allowed_tool_names: &authority.allowed_tool_names,
+                forbidden_tool_scopes: &authority.forbidden_tool_scopes,
+            },
+        );
+    }
+    if let Some(project_scope) = compiled_project_scope {
+        turn_context.primary_project_scope = Some(project_scope);
+    }
+    turn_context.filesystem_access = compiled_filesystem_access.filter(|access| {
+        access.execution_cwd.is_some()
+            || !access.read_targets.is_empty()
+            || !access.write_targets.is_empty()
+    });
+    crate::agent::append_evidence_obligations(
+        &mut turn_context.completion_contract,
+        &compiled_evidence_requirements,
+    );
     crate::agent::append_required_invocation_obligations(
         &mut turn_context.completion_contract,
-        recovered_required_invocations,
+        &effective_required_invocations,
     );
     turn_context.completion_contract.adopt_for_task(task_id);
 
@@ -478,17 +389,16 @@ async fn finalize_turn_assessment(
                     );
                     metadata["assessment_mode"] = json!(plan.mode.as_str());
                     metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                    metadata["semantic_contract_applied"] = json!(semantic_contract_applied);
+                    metadata["contract_lane_decisions"] = json!(contract_lane_decisions);
                     metadata["completion_contract"] = json!({
                         "task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_ascii_lowercase(),
                         "expects_mutation": turn_context.completion_contract.expects_mutation,
                         "requires_observation": turn_context.completion_contract.requires_observation,
                         "evidence_requirements": turn_context.completion_contract.evidence_requirements,
-                        "required_invocations": plan.contract.as_ref()
-                            .and_then(|contract| contract.required_invocations.as_ref())
-                            .cloned()
-                            .unwrap_or_default(),
+                        "required_invocations": effective_required_invocations,
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
-                        "required_response_fields": turn_context.completion_contract.required_response_fields,
+                        "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
                     });
                     metadata
                 },
@@ -513,7 +423,7 @@ async fn finalize_turn_assessment(
             .await;
     }
 
-    turn_context
+    (turn_context, semantic_contract_applied)
 }
 
 /// Build mandate worker bootstrap state without consulting any owner-turn
@@ -1393,23 +1303,23 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         session_id,
         task_id: &task_id,
     });
+    let available_tool_names = tool_defs
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .or_else(|| definition.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
     let mut relationship_fallback = None;
     let mut recovered_required_invocations = Vec::new();
     if task_assessment_attempted && task_plan.is_none() {
         // The recovery compilers own independent typed products. Run them
         // concurrently so a slow contract recovery cannot serially delay the
         // dialogue edge (or vice versa); neither result can rewrite the other.
-        let available_tool_names = tool_defs
-            .iter()
-            .filter_map(|definition| {
-                definition
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .or_else(|| definition.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect::<Vec<_>>();
         let contract_recovery = super::task_planning::generate_task_contract_recovery(
             llm_provider.clone(),
             planner_model,
@@ -1453,7 +1363,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .await;
         }
     }
-    let turn_context = finalize_turn_assessment(
+    let (turn_context, semantic_contract_applied) = finalize_turn_assessment(
         agent,
         &emitter,
         session_id,
@@ -1464,6 +1374,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         &initial_turn_context,
         task_plan.as_ref(),
         &recovered_required_invocations,
+        &available_tool_names,
         relationship_fallback.as_ref(),
         task_assessment_attempted,
         assessment_decision_type,
@@ -1473,8 +1384,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     .await;
     let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
         &turn_context.completion_contract,
-        task_plan.as_ref(),
-        user_text,
+        semantic_contract_applied,
     );
     let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
     learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;
