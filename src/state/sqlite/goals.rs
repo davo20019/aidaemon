@@ -513,11 +513,10 @@ impl crate::traits::TaskStore for SqliteStateStore {
                 } else {
                     "manual"
                 };
-                // The first task created after a terminal run is the root of
-                // the new implicit run. Persist that relationship instead of
-                // creating an anonymous run that recovery/accounting cannot
-                // rebind structurally.
-                self.start_goal_run(&task.goal_id, trigger_type, None, Some(&task.id))
+                // An ordinary task is not a run root merely because it was
+                // created first. Callers that create an orchestration wrapper
+                // persist that typed relationship through `start_goal_run`.
+                self.start_goal_run(&task.goal_id, trigger_type, None, None)
                     .await?
             }
         };
@@ -571,22 +570,6 @@ impl crate::traits::TaskStore for SqliteStateStore {
                 .await?;
         }
 
-        let normalized = task.description.trim_start().to_ascii_lowercase();
-        if normalized.starts_with("execute scheduled goal:")
-            || normalized.starts_with("scheduled check:")
-            || normalized.starts_with("manual scheduled run:")
-            || normalized.starts_with("mandate review:")
-        {
-            sqlx::query(
-                "UPDATE goal_runs SET root_task_id = COALESCE(root_task_id, ?),
-                                      updated_at = datetime('now')
-                 WHERE id = ?",
-            )
-            .bind(&task.id)
-            .bind(&goal_run.id)
-            .execute(&mut *tx)
-            .await?;
-        }
         tx.commit().await?;
         Ok(())
     }

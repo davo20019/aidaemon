@@ -112,8 +112,6 @@ pub(in crate::agent) enum SystemDirective {
     /// An operational tool completed and exposed control-plane bookkeeping in
     /// its internal result. The model still chooses the owner-facing wording.
     NaturalToolOutcomePresentation,
-    SuccessfulToolEvidenceMustBeUsed,
-    EvidenceGroundingRequired,
     RecoveryModeModelSwitch,
     NoEvidenceRespondKnownUnknown,
     CliAgentPresentResults,
@@ -153,7 +151,6 @@ pub(in crate::agent) enum SystemDirective {
     HardPolicyToolBudgetReached {
         policy_tool_budget: usize,
     },
-    PersonalMemoryRecheckLimitReached,
     ScopeLockBlocked {
         tool_name: String,
         reason: String,
@@ -216,9 +213,8 @@ pub(in crate::agent) enum SystemDirective {
     /// Only constructed under the `computer_use` feature.
     #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
     GuiCoordinateClickUnverified,
-    /// The model produced a very short response after significant work (many
-    /// tool calls) for a multi-part request. Nudge it to provide a comprehensive
-    /// response addressing all parts of the user's request.
+    /// The model leaked tool-call protocol text into the candidate response.
+    /// Ask for a clean user-facing response without changing lifecycle state.
     ResponseQualityNudge {
         user_text_hint: String,
     },
@@ -226,26 +222,6 @@ pub(in crate::agent) enum SystemDirective {
     /// itself with search tools. Injected once per turn to force a retry.
     LocateFileInsteadOfAsking {
         user_text_hint: String,
-    },
-    /// The candidate final reply enumerates name-like list entries that
-    /// appear in no tool output (and not in the user's message) this turn —
-    /// the signature of fabricated list content (e.g. invented roster
-    /// members). Injected once per turn to force a grounded rewrite.
-    UngroundedListEntities {
-        entities: Vec<String>,
-    },
-    /// The candidate reply denies or asserts a specific personal fact about an
-    /// entity the user named, but no memory lookup for that entity grounded this
-    /// turn. Force a search before the denial/assertion is allowed through.
-    UnsearchedEntityDenial {
-        entities: Vec<String>,
-    },
-    /// The candidate final reply is an enumeration answer built from web
-    /// research, but fewer than two source pages were successfully read
-    /// (0 = snippets only). Injected once per turn: fetch a second
-    /// independent source, or explicitly caveat the single-sourcing.
-    SingleSourceEnumeration {
-        sources_read: usize,
     },
     /// The user explicitly requested a concrete number of directly cited
     /// sources; successful page reads and reply citations are both required.
@@ -260,22 +236,6 @@ pub(in crate::agent) enum SystemDirective {
     /// wrong — reorient instead of repeating or concluding absence.
     EmptyResultStreakVaryTerms {
         streak: usize,
-    },
-    /// Injected when plan detection heuristics identify a multi-step task
-    /// that benefits from structured execution with verification.
-    /// User challenged the immediately previous answer ("Are you sure?").
-    /// Anchor the model to that exchange only.
-    ReaffirmationChallengeAnchor {
-        prior_user_request: Option<String>,
-        prior_assistant_reply: String,
-    },
-    /// A follow-up question carries its person referent only via a pronoun
-    /// ("...what can you infer about her?"). Anchor the pronoun to the prior
-    /// exchange's subject and force a memory lookup so it is not bound to a
-    /// salient pinned-profile person (e.g. the pinned partner).
-    CoreferenceGroundingRequired {
-        prior_user_request: Option<String>,
-        prior_assistant_reply: String,
     },
 }
 
@@ -492,8 +452,6 @@ impl SystemDirective {
                 tool_name, excerpt
             ),
             Self::NaturalToolOutcomePresentation => "[SYSTEM] Communicate the operational outcome naturally at the user's level, choosing your own concise wording. Do not enumerate internal goal, schedule, run, task, queue, or receipt identifiers; raw queue states; tool names; or bookkeeping unless the user explicitly requested diagnostic details. State what happened and the useful next expectation. Do not copy the tool result or follow a canned template.".to_string(),
-            Self::SuccessfulToolEvidenceMustBeUsed => "[SYSTEM] You already have successful live tool results in this turn. Do NOT claim you cannot browse, access current data, or only provide guidance. Use the actual tool results already in context and answer with concrete findings now.".to_string(),
-            Self::EvidenceGroundingRequired => "[SYSTEM] The user is challenging whether a previously mentioned result, error, or detail was real. Do NOT defend prior assistant prose from memory. Only claim filenames, paths, status codes, errors, IDs, values, counts, test names, lines, field names, or other specifics if they appear in actual tool evidence already in context. Quote the exact line when helpful. If the evidence is partial, ambiguous, or unavailable, say that plainly and ask to re-check rather than inferring missing details.".to_string(),
             Self::RecoveryModeModelSwitch => "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results.".to_string(),
             Self::NoEvidenceRespondKnownUnknown => "[SYSTEM] You have searched across multiple tools and keep finding no evidence. Stop searching and respond with what is known/unknown.".to_string(),
             Self::CliAgentPresentResults => "[SYSTEM] The CLI agent completed successfully and returned substantive results. Present those results to the user directly now. Do NOT claim you cannot complete the request.".to_string(),
@@ -609,7 +567,6 @@ impl SystemDirective {
                  Focus only on concrete results and outcomes.",
                 policy_tool_budget
             ),
-            Self::PersonalMemoryRecheckLimitReached => "[SYSTEM] You already performed the allowed targeted memory re-check(s). Stop calling tools and answer directly with what you know.".to_string(),
             Self::ScopeLockBlocked { tool_name, reason } => format!(
                 "[SYSTEM] The previous `{}` tool call was blocked by deterministic scope locks ({}). Use paths/tool args aligned with the current request scope.",
                 tool_name, reason
@@ -698,28 +655,6 @@ impl SystemDirective {
                  mdfind) when the term may only appear inside the file.",
                 streak
             ),
-            Self::SingleSourceEnumeration { sources_read } => {
-                let basis = if *sources_read == 0 {
-                    "search snippets only — no source page was successfully read"
-                } else {
-                    "a single source page"
-                };
-                format!(
-                    "[SYSTEM] CORROBORATION CHECK: your enumerated answer rests on {}. \
-                     Before finalizing, do ONE of the following: (a) fetch one more \
-                     independent source page with web_fetch — pick a different domain \
-                     from your search results — and confirm the entries; or (b) state \
-                     explicitly in your reply that the answer is based on {} and may be \
-                     incomplete, naming the source(s) you used. Do not present an \
-                     uncorroborated enumeration as definitive.",
-                    basis,
-                    if *sources_read == 0 {
-                        "search snippets only"
-                    } else {
-                        "a single source"
-                    },
-                )
-            }
             Self::SourceEvidenceRequired {
                 required,
                 sources_read,
@@ -730,25 +665,6 @@ impl SystemDirective {
                 kind = if *primary { "primary " } else { "" },
             ),
             Self::ExactHistoryLookupRequired => "[SYSTEM] EXACT-HISTORY CHECK: the user asked for exact earlier conversation content, but your draft said it was unavailable without querying canonical retained history. Use `search_history` now before concluding it cannot be recovered. If the lookup returns no authorized match, say that explicitly and do not guess the wording.".to_string(),
-            Self::UngroundedListEntities { entities } => format!(
-                "[SYSTEM] GROUNDING CHECK FAILED: your draft reply lists entries that do not \
-                 appear in ANY tool output from this task: {}. Inventing list entries is a \
-                 critical error. Rewrite your answer using ONLY items literally present in \
-                 the tool results you received. If the data you gathered does not contain \
-                 the complete list, fetch a source page with web_fetch first, or state \
-                 exactly which part you could not verify instead of filling the gaps.",
-                entities.join(", ")
-            ),
-            Self::UnsearchedEntityDenial { entities } => format!(
-                "[SYSTEM] GROUNDING CHECK: your draft answers a question about {} but you did \
-                 not search memory for it this turn. Call manage_memories (and manage_people if \
-                 available) for {} BEFORE answering. If you genuinely find nothing after \
-                 searching, say so plainly — do not assert or deny a relationship you did not \
-                 look up, and never assume a partner is a child's biological parent; phrase any \
-                 such inference tentatively.",
-                entities.join(", "),
-                entities.join(", ")
-            ),
             Self::LocateFileInsteadOfAsking { user_text_hint } => format!(
                 "[SYSTEM] The user referenced a file by name. Do NOT ask the user to upload it or \
                  provide a path — you have tools to locate it yourself. \
@@ -758,51 +674,6 @@ impl SystemDirective {
                  User request: \"{}\"",
                 user_text_hint
             ),
-            Self::ReaffirmationChallengeAnchor {
-                prior_user_request,
-                prior_assistant_reply,
-            } => {
-                let mut lines = vec![
-                    "[SYSTEM] REAFFIRMATION CHALLENGE: The user is challenging your immediately previous answer, not an earlier topic.".to_string(),
-                    "Reply ONLY about the exchange below. Do NOT mention unrelated earlier topics, tools, goals, or session activity.".to_string(),
-                ];
-                if let Some(request) = prior_user_request {
-                    lines.push(format!(
-                        "Prior user request: \"{}\"",
-                        crate::utils::truncate_str(request, 240)
-                    ));
-                }
-                lines.push(format!(
-                    "Your prior answer: \"{}\"",
-                    crate::utils::truncate_str(prior_assistant_reply, 400)
-                ));
-                lines.push(
-                    "Either reaffirm that answer with brief justification, or correct it if you were wrong. Keep the reply focused on this exchange only.".to_string(),
-                );
-                lines.join("\n")
-            }
-            Self::CoreferenceGroundingRequired {
-                prior_user_request,
-                prior_assistant_reply,
-            } => {
-                let mut lines = vec![
-                    "[SYSTEM] PRONOUN REFERENT: The user's pronoun (\"her\"/\"him\"/\"she\"/\"he\") refers to the subject of the exchange below — NOT to anyone in your pinned core profile (e.g. the pinned partner or children). Do NOT assume it means the partner.".to_string(),
-                ];
-                if let Some(request) = prior_user_request {
-                    lines.push(format!(
-                        "Immediately prior user message: \"{}\"",
-                        crate::utils::truncate_str(request, 240)
-                    ));
-                }
-                lines.push(format!(
-                    "Your prior answer: \"{}\"",
-                    crate::utils::truncate_str(prior_assistant_reply, 400)
-                ));
-                lines.push(
-                    "Before answering, call manage_memories to look up that specific person. If you find nothing, say so plainly instead of substituting a different person.".to_string(),
-                );
-                lines.join("\n")
-            }
         }
     }
 }
@@ -843,26 +714,11 @@ mod tests {
     }
 
     #[test]
-    fn successful_tool_evidence_render_mentions_live_results() {
-        let rendered = SystemDirective::SuccessfulToolEvidenceMustBeUsed.render();
-        assert!(rendered.contains("successful live tool results"));
-        assert!(rendered.contains("answer with concrete findings now"));
-    }
-
-    #[test]
     fn gui_coordinate_unverified_render_demands_visual_confirmation() {
         let rendered = SystemDirective::GuiCoordinateClickUnverified.render();
         assert!(rendered.contains("COORDINATE click"));
         assert!(rendered.contains("get_app_state"));
         assert!(rendered.contains("Do NOT claim success"));
-    }
-
-    #[test]
-    fn evidence_grounding_render_requires_exact_evidence() {
-        let rendered = SystemDirective::EvidenceGroundingRequired.render();
-        assert!(rendered.contains("result, error, or detail"));
-        assert!(rendered.contains("actual tool evidence"));
-        assert!(rendered.contains("rather than inferring"));
     }
 
     #[test]
@@ -991,36 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn reaffirmation_challenge_anchor_render_focuses_prior_exchange() {
-        let rendered = SystemDirective::ReaffirmationChallengeAnchor {
-            prior_user_request: Some("How many R's in strawberry?".to_string()),
-            prior_assistant_reply: "There are 3 R's in strawberry.".to_string(),
-        }
-        .render();
-
-        assert!(rendered.contains("REAFFIRMATION CHALLENGE"));
-        assert!(rendered.contains("How many R's in strawberry?"));
-        assert!(rendered.contains("There are 3 R's in strawberry."));
-        assert!(rendered.contains("Do NOT mention unrelated earlier topics"));
-    }
-
-    #[test]
-    fn coreference_grounding_render_anchors_pronoun_and_forces_lookup() {
-        let rendered = SystemDirective::CoreferenceGroundingRequired {
-            prior_user_request: Some("Where is my mom from?".to_string()),
-            prior_assistant_reply: "I don't have info about Carol Mendez.".to_string(),
-        }
-        .render();
-
-        assert!(rendered.contains("PRONOUN REFERENT"));
-        assert!(rendered.contains("Where is my mom from?"));
-        assert!(rendered.contains("Carol Mendez"));
-        // Must steer away from the pinned partner and toward a lookup.
-        assert!(rendered.contains("NOT"));
-        assert!(rendered.contains("manage_memories"));
-    }
-
-    #[test]
     fn truncation_recovery_directive_covers_both_branches() {
         let text = SystemDirective::TruncationRecoveryUseWriteFile.render();
         // existing-file branch → deliver via send_file, don't regenerate
@@ -1133,38 +959,5 @@ mod tests {
         assert!(rendered.contains("Do not enumerate internal"));
         assert!(rendered.contains("unless the user explicitly requested diagnostic details"));
         assert!(rendered.contains("Do not copy the tool result"));
-    }
-}
-
-#[cfg(test)]
-mod unsearched_entity_tests {
-    use super::*;
-
-    #[test]
-    fn renders_unsearched_entity_denial() {
-        let d = SystemDirective::UnsearchedEntityDenial {
-            entities: vec!["Caro".into()],
-        };
-        let msg = d.render();
-        assert!(msg.contains("Caro"));
-        assert!(msg.to_lowercase().contains("search"));
-        assert!(msg.contains("biological"), "honesty clause must be present");
-    }
-}
-
-#[cfg(test)]
-mod corroboration_tests {
-    use super::*;
-
-    #[test]
-    fn single_source_enumeration_directive_demands_second_source_or_caveat() {
-        let zero = SystemDirective::SingleSourceEnumeration { sources_read: 0 }.render();
-        assert!(zero.contains("CORROBORATION CHECK"));
-        assert!(zero.contains("search snippets only"));
-        assert!(zero.contains("web_fetch"));
-
-        let one = SystemDirective::SingleSourceEnumeration { sources_read: 1 }.render();
-        assert!(one.contains("a single source"));
-        assert!(one.contains("different domain"));
     }
 }

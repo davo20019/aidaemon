@@ -867,6 +867,40 @@ pub enum ToolOutcomeStatus {
     Backgrounded,
 }
 
+/// Where an invocation reached in the common execution pipeline.
+///
+/// This is deliberately orthogonal to [`ToolOutcomeStatus`]. A deterministic
+/// argument rejection can be a completed validation observation, but it did
+/// not dispatch the requested domain operation and therefore cannot inherit
+/// that operation's effects, targets, or evidence capabilities.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInvocationStage {
+    /// Legacy receipt or adapter that did not report a stage.
+    #[default]
+    Unknown,
+    /// The common policy/retry boundary refused dispatch.
+    RejectedBeforeDispatch,
+    /// The adapter rejected its typed argument contract before domain I/O.
+    RejectedBeforeIo,
+    /// The adapter was invoked for the prepared operation.
+    Dispatched,
+    /// The result was reconstructed from a durable prior receipt.
+    Replayed,
+}
+
+impl ToolInvocationStage {
+    pub const fn reached_dispatch(self) -> bool {
+        matches!(self, Self::Dispatched | Self::Replayed)
+    }
+
+    /// True only for a newly executed adapter call. A durable replay carries
+    /// evidence forward but does not consume another operation attempt.
+    pub const fn performed_io(self) -> bool {
+        matches!(self, Self::Dispatched)
+    }
+}
+
 /// Shape of the machine receipt produced by a tool invocation.
 ///
 /// Completion predicates are compiled against this protocol type instead of
@@ -938,6 +972,10 @@ pub struct ToolCallMetadata {
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_status: Option<ToolOutcomeStatus>,
+    /// Authoritative pipeline stage for this result. Completion and effect
+    /// projection must never infer dispatch from intended call semantics.
+    #[serde(default)]
+    pub invocation_stage: ToolInvocationStage,
     /// The adapter deterministically rejected the invocation contract before
     /// performing domain I/O. This is an authoritative negative outcome, not
     /// evidence that the requested read/write itself occurred.
@@ -1047,7 +1085,11 @@ impl ToolCallOutcome {
         Self {
             output: output.into(),
             metadata: ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                // A rejected invocation observed no domain condition. Keep it
+                // distinct from an executed observation whose answer is
+                // legitimately negative (for example process exit 1).
+                outcome_status: Some(ToolOutcomeStatus::Blocked),
+                invocation_stage: ToolInvocationStage::RejectedBeforeIo,
                 contract_rejected: true,
                 // No requested domain effect ran, but the adapter directly
                 // observed and completed its deterministic validation. This
@@ -1352,6 +1394,34 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// Returns the OpenAI-format function schema as a JSON Value.
     fn schema(&self) -> Value;
+    /// Canonicalize provider argument projections before any semantics,
+    /// authority, retry, or access decision is made. The default is identity;
+    /// adapters with representational aliases or optional-empty projection
+    /// quirks can normalize them without teaching the orchestration layer
+    /// adapter-specific rules.
+    fn canonicalize_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<String, ToolArgumentContractViolation> {
+        Ok(arguments.to_string())
+    }
+
+    /// Produce the single typed invocation object consumed by the execution
+    /// control plane. Validation deliberately precedes semantics and access
+    /// derivation so a rejected proposal can never acquire intended effects.
+    fn prepare_invocation(
+        &self,
+        arguments: &str,
+    ) -> Result<PreparedToolInvocation, ToolArgumentContractViolation> {
+        let canonical_arguments = self.canonicalize_arguments(arguments)?;
+        self.validate_arguments(&canonical_arguments)?;
+        Ok(PreparedToolInvocation {
+            semantics: self.call_semantics(&canonical_arguments),
+            access_manifest: self.call_access_manifest(&canonical_arguments),
+            receipt_kind: self.receipt_kind(&canonical_arguments),
+            canonical_arguments,
+        })
+    }
     /// Adapter-owned, deterministic argument invariants evaluated by the
     /// common dispatcher before any tool I/O. The default accepts all schema-
     /// valid calls. Rejections become typed `contract_rejected` receipts.
@@ -1475,6 +1545,17 @@ pub trait Tool: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
+}
+
+/// Validated, canonical tool input. This is the boundary object shared by
+/// policy, retry, dispatch, and receipt projection; raw model JSON is not an
+/// execution fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedToolInvocation {
+    pub canonical_arguments: String,
+    pub semantics: ToolCallSemantics,
+    pub access_manifest: ToolCallAccessManifest,
+    pub receipt_kind: ToolReceiptKind,
 }
 
 #[cfg(test)]
@@ -1750,7 +1831,7 @@ mod tests {
         let rejected = ToolCallOutcome::contract_rejection("invalid requested arguments");
         assert_eq!(
             rejected.metadata.outcome_status,
-            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+            Some(ToolOutcomeStatus::Blocked)
         );
         assert!(rejected.metadata.contract_rejected);
         assert!(rejected.metadata.semantics.observes_state());

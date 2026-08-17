@@ -1666,7 +1666,7 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
 }
 
 #[tokio::test]
-async fn test_deferred_text_only_turn_switches_to_plain_text_recovery_mode() {
+async fn test_plain_text_draft_is_not_retried_from_wording() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll draft something engaging for you."),
         MockProvider::text_response(
@@ -1688,34 +1688,18 @@ async fn test_deferred_text_only_turn_switches_to_plain_text_recovery_mode() {
         .await
         .unwrap();
 
-    assert_eq!(
-        response,
-        "Building a lot lately. What's something you're curious about behind the scenes?"
-    );
+    assert_eq!(response, "I'll draft something engaging for you.");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        2,
-        "expected one direct-answer recovery retry"
-    );
+    assert_eq!(call_log.len(), 1);
     assert!(
         !call_log[0].tools.is_empty(),
         "initial drafting turn should still expose tools before recovery decides they are unnecessary"
     );
-    assert!(
-        !call_log[1].tools.is_empty(),
-        "plain-text recovery retains tool defs for prompt-prefix stability; \
-         calling is disabled via tool_choice=none instead"
-    );
-    assert_eq!(
-        call_log[1].options.tool_choice,
-        crate::traits::ToolChoiceMode::None
-    );
 }
 
 #[tokio::test]
-async fn test_route_failsafe_does_not_turn_plain_text_draft_into_tool_required_loop() {
+async fn test_route_failsafe_does_not_create_obligation_from_draft_wording() {
     let session_id = "route_failsafe_plain_text_draft";
     crate::agent::set_route_failsafe_for_session_for_test(session_id, true);
 
@@ -1742,20 +1726,11 @@ async fn test_route_failsafe_does_not_turn_plain_text_draft_into_tool_required_l
 
     crate::agent::set_route_failsafe_for_session_for_test(session_id, false);
 
-    assert_eq!(
-        response,
-        "Been heads-down building. What should I share a behind-the-scenes update about next?"
-    );
+    assert_eq!(response, "Let me draft a strong tweet for you.");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(call_log.len(), 2);
-    // "post a tweet ... make it engaging" is now classified as DraftThenDeliver
-    // (expects_mutation=true), so the second call keeps tools available for
-    // the mutation path rather than stripping them.
-    assert!(
-        !call_log[1].tools.is_empty(),
-        "DraftThenDeliver mutation turn should keep tools on retry"
-    );
+    assert_eq!(call_log.len(), 1);
+    assert!(!call_log[0].tools.is_empty());
 }
 
 #[tokio::test]
@@ -2058,10 +2033,10 @@ async fn test_required_tool_choice_ignored_persists_across_reload() {
     );
 }
 
-/// Stall detection: agent keeps calling an unknown tool which errors each
-/// iteration. After MAX_STALL_ITERATIONS (3), agent should gracefully stop.
+/// An unavailable tool cannot complete a task. Repeated proposals are bounded,
+/// and a later text candidate cannot erase the unresolved typed failure.
 #[tokio::test]
-async fn test_stall_detection_unknown_tool() {
+async fn test_unknown_tool_repetition_is_bounded_and_never_fabricates_success() {
     let provider = MockProvider::with_responses(vec![
         {
             let mut resp = MockProvider::tool_call_response("nonexistent_tool", "{}");
@@ -2098,16 +2073,13 @@ async fn test_stall_detection_unknown_tool() {
         .await
         .unwrap();
 
-    // Agent should have gracefully stopped due to stall (3 iterations with 0 success)
-    // The response will be the graceful stall message, not "This should not be reached"
     assert!(
         !response.contains("This should not be reached"),
-        "Agent should have stopped before the 4th LLM call"
+        "unresolved failure must not accept a later unsupported success"
     );
-    // Stall fires at iteration 4 check (after 3 failed iters), so we expect 3 LLM calls
     assert!(
-        harness.provider.call_count().await <= 4,
-        "Agent should stop after stall detection, got {} calls",
+        harness.provider.call_count().await <= 10,
+        "unknown-tool recovery must remain bounded, got {} calls",
         harness.provider.call_count().await
     );
 }
@@ -2708,18 +2680,15 @@ impl crate::traits::Tool for FlakyProbeTool {
     }
 }
 
-/// Persistence: a stalled task with a failing approach pivots (failure
-/// record + fresh stall runway) and keeps trying instead of ending at the
-/// first stall. The probe fails 4 times — beyond the repetition-guard
-/// block — and succeeds only because the pivot cleared the pattern window.
+/// A retryable typed failure receives bounded autonomous recovery. The same
+/// stable operation cannot gain unlimited runway by repeating indefinitely.
 #[tokio::test]
-async fn test_stalled_failing_approach_pivots_and_recovers() {
-    // The mock model stubbornly retries the same call — the worst case the
-    // pivot machinery has to rescue. 30 scripted identical calls >> any
-    // path to success; the task must end via recovery, not script luck.
-    let responses: Vec<_> = (0..30)
-        .map(|_| MockProvider::tool_call_response("flaky_probe", "{}"))
-        .collect();
+async fn test_recoverable_failure_gets_bounded_retry_and_recovers() {
+    let responses = vec![
+        MockProvider::tool_call_response("flaky_probe", "{}"),
+        MockProvider::tool_call_response("flaky_probe", "{}"),
+        MockProvider::text_response("The probe recovered from its transient failure."),
+    ];
     let provider = MockProvider::with_responses(responses);
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2727,24 +2696,11 @@ async fn test_stalled_failing_approach_pivots_and_recovers() {
     let tool = Arc::new(FlakyProbeTool {
         calls: calls.clone(),
         successes: successes.clone(),
-        fail_first: 4,
+        fail_first: 1,
     });
-    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
-    // Isolate pivot persistence from the independent execution-envelope
-    // backstop: this deliberately stubborn mock spends many model turns
-    // ignoring cooldown guidance before it accepts the pivot.
-    harness
-        .agent
-        .set_test_execution_budget_override(Some(crate::agent::ExecutionBudget {
-            max_steps: 100,
-            max_tokens: 0,
-            max_llm_calls: 100,
-            max_tool_calls: 100,
-            max_validation_rounds: 100,
-            max_wall_clock_ms: 600_000,
-        }));
     let response = harness
         .agent
         .handle_message(
@@ -2758,26 +2714,15 @@ async fn test_stalled_failing_approach_pivots_and_recovers() {
         .await
         .unwrap();
 
-    assert!(
-        successes.load(Ordering::SeqCst) >= 1,
-        "the task must persist past the failing approach to a successful call; \
-         calls={} response={response:?}",
-        calls.load(Ordering::SeqCst)
-    );
-    let pivots = crate::agent::heuristic_telemetry::global()
-        .stats_for("approach_pivot", "mock-model")
-        .enforced;
-    assert!(
-        pivots >= 1,
-        "expected at least one approach pivot to be recorded; response={response:?}"
-    );
+    assert_eq!(response, "The probe recovered from its transient failure.");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(successes.load(Ordering::SeqCst), 1);
 }
 
-/// A batch of 2+ distinct read-only tool calls in one assistant message
-/// executes concurrently (prefetch), not back-to-back: the two 150ms call
-/// windows must overlap.
+/// Model-proposed tool cardinality and order are preserved. The runtime no
+/// longer speculatively prefetches a batch outside the canonical dispatcher.
 #[tokio::test]
-async fn test_read_only_tool_batch_executes_concurrently() {
+async fn test_read_only_tool_batch_executes_once_in_canonical_order() {
     let mut batch = MockProvider::tool_call_response("slow_read", r#"{"q":"alpha"}"#);
     batch.tool_calls.push(crate::traits::ToolCall {
         id: "call_slow_beta".to_string(),
@@ -2810,11 +2755,11 @@ async fn test_read_only_tool_batch_executes_concurrently() {
 
     let windows = windows.lock().unwrap();
     assert_eq!(windows.len(), 2, "both batch calls must execute");
-    let latest_start = windows.iter().map(|w| w.0).max().unwrap();
-    let earliest_end = windows.iter().map(|w| w.1).min().unwrap();
+    let mut ordered = windows.clone();
+    ordered.sort_by_key(|window| window.0);
     assert!(
-        latest_start < earliest_end,
-        "read-only batch must execute concurrently; windows: {windows:?}"
+        ordered[0].1 <= ordered[1].0,
+        "canonical dispatch should not overlap speculative calls: {ordered:?}"
     );
 }
 

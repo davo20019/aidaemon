@@ -1,6 +1,7 @@
 use crate::router::Router;
 use crate::traits::{ModelProvider, ProviderResponse};
 use crate::utils::truncate_str;
+use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -600,7 +601,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 9;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 10;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -632,7 +633,7 @@ fn decode_task_plan_response(envelope: &Value) -> Option<TaskPlanResponse> {
 fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
     match parsed.schema_version {
         TASK_CONTRACT_SCHEMA_VERSION => Some(parsed),
-        7 | 8 => {
+        7..=9 => {
             if let Some(contract) = parsed.contract.as_mut() {
                 let invocations = contract.required_invocations.get_or_insert_with(Vec::new);
                 for requirement in contract
@@ -779,8 +780,12 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
+// Both candidates are hedged concurrently, so this is one aggregate bootstrap
+// deadline rather than two serialized waits. Twenty seconds preserves the
+// prior single-attempt service envelope while eliminating the failover
+// starvation seen when the second candidate inherited only the first one's
+// leftover time.
 const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const TASK_ASSESSMENT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 #[derive(Clone, Copy)]
@@ -951,20 +956,11 @@ pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
     model_candidates: &[String],
     user_text: &str,
-    conversation_context: Option<&str>,
     mode: TaskAssessmentMode,
     telemetry: Option<PlannerTelemetryCtx<'_>>,
 ) -> Option<TaskPlan> {
     let system = "You are a task assessment router. Read the request semantically in its \
                   original language and return ONLY valid JSON, with no markdown fences.";
-
-    // Include conversation context from the sliding window so the planner
-    // has the same narrative as the main LLM. Without this, short follow-ups
-    // like "and for ibuprofen?" lose the original intent from earlier turns.
-    let context_block = conversation_context
-        .filter(|ctx| !ctx.is_empty())
-        .map(|ctx| format!("Recent conversation context:\n{}\n\n", ctx))
-        .unwrap_or_default();
 
     let plan_instructions = if mode.includes_step_plan() {
         "- Return 2-7 concrete steps and concrete success criteria.\n\
@@ -979,11 +975,11 @@ pub(crate) async fn generate_task_plan(
     };
 
     let user_prompt = format!(
-        "{context_block}Assess this user request.\n\n\
+        "Assess this user request.\n\n\
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 9,\n\
+           \"schema_version\": 10,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -1014,7 +1010,8 @@ pub(crate) async fn generate_task_plan(
                    \"exit_codes\": [0],\n\
                    \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
                    \"requires_output\": false,\n\
-                   \"contract_rejected\": false\n\
+                   \"contract_rejected\": false,\n\
+                   \"max_invocations\": null\n\
                  }}\n\
                }}\n\
              ],\n\
@@ -1024,7 +1021,8 @@ pub(crate) async fn generate_task_plan(
                  \"exit_codes\": [0],\n\
                  \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
                  \"requires_output\": false,\n\
-                 \"contract_rejected\": false\n\
+                 \"contract_rejected\": false,\n\
+                 \"max_invocations\": null\n\
                }}\n\
              ],\n\
              \"filesystem_access\": {{\n\
@@ -1039,10 +1037,7 @@ pub(crate) async fn generate_task_plan(
              \"confidence\": \"low|medium|high\",\n\
              \"independent_workstreams\": 1,\n\
              \"requires_background_continuation\": false,\n\
-             \"continue_inline_after_background_start\": false,\n\
-             \"request_relationship\": \"new_request|continuation|clarification_answer|courtesy\",\n\
-             \"antecedent_user_message_id\": null,\n\
-             \"semantic_scope\": \"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"\n\
+             \"continue_inline_after_background_start\": false\n\
            }}\n\
          }}\n\n\
          Classification rules:\n\
@@ -1062,14 +1057,6 @@ pub(crate) async fn generate_task_plan(
            process leaves another requested action that can run immediately in this same \
            turn without waiting for that process to finish. Otherwise set it false and let \
            the durable completion notification resume dependent work.\n\
-         - request_relationship is semantic: use continuation only when this turn advances, \
-           retries, or asks about one prior request shown in Recent conversation context; then \
-           copy that prior USER row's exact message_id into antecedent_user_message_id. A \
-           continuation without that exact ID is invalid. Use null for new_request, courtesy, \
-           and clarification_answer. Otherwise use new_request.\n\
-         - semantic_scope names the primary typed resource domain, or none. It is independent of \
-           request_relationship and must reflect the current request rather than keyword overlap. \
-           Multi-domain evidence belongs in evidence_requirements, not in this singular routing hint.\n\
          - expects_mutation=true only when completion changes files or external state. \
            Text generated in the reply is not a mutation.\n\
          - requires_observation=true whenever completion depends on retrieving evidence: live files, \
@@ -1121,6 +1108,8 @@ pub(crate) async fn generate_task_plan(
            request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
            outcome_statuses are alternative acceptable results; requires_output means authoritative result \
            content must be nonempty; contract_rejected is the required pre-I/O validation disposition. \
+           max_invocations is the positive maximum number of tool-call proposals for that operation; set it \
+           only when the current request explicitly limits call count or forbids retries, otherwise null. \
            Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
            nonempty receipt and required_content_markers=[]. Never translate receipt facts into prose markers.\n\
          - filesystem_access is the task's least-privilege local access manifest. Put exact local paths \
@@ -1172,30 +1161,90 @@ pub(crate) async fn generate_task_plan(
         single_attempt_fail_closed: true,
         ..crate::traits::ChatOptions::default()
     };
+    enum AssessmentAttempt {
+        Response {
+            candidate_index: usize,
+            model: String,
+            latency_ms: u64,
+            response: ProviderResponse,
+        },
+        ProviderError {
+            candidate_index: usize,
+            model: String,
+            latency_ms: u64,
+            error: String,
+        },
+        Timeout {
+            candidate_index: usize,
+            model: String,
+            latency_ms: u64,
+        },
+    }
+
+    // Semantic assessment is an optional, read-only producer. Hedge model
+    // candidates under one deadline so one slow provider cannot serialize the
+    // entire request bootstrap. The first valid typed envelope wins; dropping
+    // the remaining futures cancels their unused responses.
     let assessment_start = Instant::now();
+    let mut completed_candidates = std::collections::BTreeSet::new();
+    let mut attempts = FuturesUnordered::new();
     for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let Some(remaining) = TASK_ASSESSMENT_TOTAL_TIMEOUT.checked_sub(assessment_start.elapsed())
-        else {
-            break;
-        };
-        let attempt_timeout = TASK_ASSESSMENT_ATTEMPT_TIMEOUT.min(remaining);
-        if attempt_timeout.is_zero() {
-            break;
-        }
-        let call_start = Instant::now();
-        let result = match tokio::time::timeout(
-            attempt_timeout,
-            provider.chat_with_options(model, &messages, &[], &options),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        let provider = provider.clone();
+        let model = model.clone();
+        let messages = messages.clone();
+        let options = options.clone();
+        attempts.push(async move {
+            let call_start = Instant::now();
+            match tokio::time::timeout(
+                TASK_ASSESSMENT_TOTAL_TIMEOUT,
+                provider.chat_with_options(&model, &messages, &[], &options),
+            )
+            .await
+            {
+                Ok(Ok(response)) => AssessmentAttempt::Response {
+                    candidate_index,
+                    model,
+                    latency_ms: call_start.elapsed().as_millis() as u64,
+                    response,
+                },
+                Ok(Err(error)) => AssessmentAttempt::ProviderError {
+                    candidate_index,
+                    model,
+                    latency_ms: call_start.elapsed().as_millis() as u64,
+                    error: error.to_string(),
+                },
+                Err(_) => AssessmentAttempt::Timeout {
+                    candidate_index,
+                    model,
+                    latency_ms: call_start.elapsed().as_millis() as u64,
+                },
+            }
+        });
+    }
+
+    while let Some(attempt) = attempts.next().await {
+        let (candidate_index, model, latency_ms, result) = match attempt {
+            AssessmentAttempt::Response {
+                candidate_index,
+                model,
+                latency_ms,
+                response,
+            } => {
+                completed_candidates.insert(candidate_index);
+                (candidate_index, model, latency_ms, response)
+            }
+            AssessmentAttempt::ProviderError {
+                candidate_index,
+                model,
+                latency_ms,
+                error,
+            } => {
+                completed_candidates.insert(candidate_index);
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
+                    &model,
+                    latency_ms,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     format!("provider_error: {error}"),
@@ -1204,12 +1253,17 @@ pub(crate) async fn generate_task_plan(
                 warn!(%error, %model, "Task assessment attempt failed");
                 continue;
             }
-            Err(_) => {
+            AssessmentAttempt::Timeout {
+                candidate_index,
+                model,
+                latency_ms,
+            } => {
+                completed_candidates.insert(candidate_index);
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
+                    &model,
+                    latency_ms,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     "timeout",
@@ -1217,7 +1271,7 @@ pub(crate) async fn generate_task_plan(
                 .await;
                 warn!(
                     %model,
-                    timeout_ms = attempt_timeout.as_millis(),
+                    timeout_ms = TASK_ASSESSMENT_TOTAL_TIMEOUT.as_millis(),
                     "Task assessment attempt timed out"
                 );
                 continue;
@@ -1228,9 +1282,9 @@ pub(crate) async fn generate_task_plan(
                 record_auxiliary_model_call(
                     telemetry,
                     "task_assessment",
-                    model,
+                    &model,
                     &result,
-                    call_start.elapsed().as_millis() as u64,
+                    latency_ms,
                     AuxiliaryAttemptTelemetry {
                         attempt: (candidate_index + 1) as u32,
                         fell_back: candidate_index > 0,
@@ -1246,15 +1300,30 @@ pub(crate) async fn generate_task_plan(
                     fallback = candidate_index > 0,
                     "Task assessment generated"
                 );
+                for (pending_index, pending_model) in model_candidates.iter().enumerate() {
+                    if completed_candidates.contains(&pending_index) {
+                        continue;
+                    }
+                    record_auxiliary_model_failure(
+                        telemetry,
+                        "task_assessment",
+                        pending_model,
+                        assessment_start.elapsed().as_millis() as u64,
+                        (pending_index + 1) as u32,
+                        pending_index > 0,
+                        "cancelled_after_hedge_winner",
+                    )
+                    .await;
+                }
                 return Some(plan);
             }
             Err(error) => {
                 record_auxiliary_model_call(
                     telemetry,
                     "task_assessment",
-                    model,
+                    &model,
                     &result,
-                    call_start.elapsed().as_millis() as u64,
+                    latency_ms,
                     AuxiliaryAttemptTelemetry {
                         attempt: (candidate_index + 1) as u32,
                         fell_back: candidate_index > 0,
@@ -2086,7 +2155,7 @@ mod tests {
     async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 9,
+                "schema_version": 10,
                 "goal": "Update one file",
                 "steps": [{"description": "Micromanaged step", "tool_hint": "edit_file"}],
                 "success_criteria": ["Micromanaged criterion"],
@@ -2113,7 +2182,6 @@ mod tests {
             Arc::new(provider),
             &models,
             "Update the file and verify it.",
-            None,
             TaskAssessmentMode::AutonomousRouting,
             None,
         )
@@ -2137,7 +2205,7 @@ mod tests {
         let invalid = crate::testing::MockProvider::text_response("");
         let valid = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 9,
+                "schema_version": 10,
                 "goal": "Observe one synthetic process result",
                 "steps": [],
                 "success_criteria": [],
@@ -2161,7 +2229,8 @@ mod tests {
                         "exit_codes": [1],
                         "outcome_statuses": ["completed_with_negative_result"],
                         "requires_output": false,
-                        "contract_rejected": false
+                        "contract_rejected": false,
+                        "max_invocations": 1
                     }],
                     "filesystem_access": {
                         "execution_cwd": "/tmp",
@@ -2194,7 +2263,6 @@ mod tests {
             provider.clone(),
             &models,
             "Observe the requested synthetic process result.",
-            None,
             TaskAssessmentMode::AutonomousRouting,
             None,
         )
@@ -2209,6 +2277,15 @@ mod tests {
                 .expect("typed invocation")[0]
                 .outcome_statuses,
             [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
+        );
+        assert_eq!(
+            assessment
+                .contract
+                .as_ref()
+                .and_then(|contract| contract.required_invocations.as_ref())
+                .expect("typed invocation")[0]
+                .max_invocations,
+            Some(1)
         );
         let calls = provider.call_log.lock().await;
         assert_eq!(calls.len(), 2);
@@ -2235,7 +2312,8 @@ mod tests {
                 "semantic_scope": "conversation_history"
             }"#,
         );
-        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+        let provider =
+            crate::testing::MockProvider::new().with_relationship_assessments(vec![response]);
 
         let shape = generate_task_relationship(
             Arc::new(provider),
@@ -2274,7 +2352,8 @@ mod tests {
                 "semantic_scope": "conversation_history"
             }"#,
         );
-        let provider = crate::testing::MockProvider::new().with_task_assessments(vec![response]);
+        let provider =
+            crate::testing::MockProvider::new().with_relationship_assessments(vec![response]);
 
         let shape = generate_task_relationship(
             Arc::new(provider),
@@ -2324,7 +2403,6 @@ mod tests {
             Arc::new(provider),
             &models,
             "Update the file.",
-            None,
             TaskAssessmentMode::GuidedPlan,
             None,
         )

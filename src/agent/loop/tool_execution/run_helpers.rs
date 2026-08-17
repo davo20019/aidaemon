@@ -570,39 +570,6 @@ pub(super) fn build_background_detach_ack(
     }
 }
 
-pub(super) fn run_command_policy_block_requires_terminal(result_text: &str) -> bool {
-    let lower = result_text.to_ascii_lowercase();
-    lower.contains("safe command list")
-        || lower.contains("use 'terminal' for this command")
-        || lower.contains("use `terminal`")
-        || lower.contains("shell operators")
-        || lower.contains("daemonization primitives are blocked in run_command")
-}
-
-pub(super) fn build_terminal_fallback_arguments_from_run_command(
-    raw_arguments: &str,
-) -> Option<String> {
-    let args = serde_json::from_str::<Value>(raw_arguments).ok()?;
-    let map = args.as_object()?;
-    let command = map.get("command").and_then(|v| v.as_str())?.trim();
-    if command.is_empty() {
-        return None;
-    }
-    let working_dir = map
-        .get("working_dir")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let mut terminal_args = json!({
-        "action": "run",
-        "command": command,
-    });
-    if let Some(working_dir) = working_dir {
-        terminal_args["working_dir"] = json!(working_dir);
-    }
-    Some(terminal_args.to_string())
-}
-
 pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
     lower.is_empty()
@@ -754,6 +721,13 @@ pub(in crate::agent) fn complete_tool_result_semantics(
     registered_call_semantics: &ToolCallSemantics,
     metadata: &mut crate::traits::ToolCallMetadata,
 ) {
+    if !metadata.invocation_stage.reached_dispatch() {
+        // Rejection receipts describe the validation/policy boundary only.
+        // Intended operation semantics are proposal data and cannot become
+        // observed evidence or effects when dispatch never occurred.
+        metadata.access_manifest = None;
+        return;
+    }
     metadata
         .semantics
         .merge_missing_from(registered_call_semantics.clone());
@@ -1038,7 +1012,10 @@ fn evaluate_receipt_predicate(
             tool_compatible: true,
             exit_compatible: true,
             outcome_compatible: true,
-            rejection_compatible: true,
+            // A generic subject requirement can never be closed by a
+            // validation/policy rejection. Only an explicit typed receipt
+            // predicate may request that disposition.
+            rejection_compatible: metadata.invocation_stage.reached_dispatch(),
             output_compatible: true,
         };
     };
@@ -1051,7 +1028,17 @@ fn evaluate_receipt_predicate(
         || metadata
             .exit_code
             .is_some_and(|actual| receipt.exit_codes.contains(&actual));
-    let outcome_compatible = receipt.outcome_statuses.is_empty()
+    // A pre-I/O contract rejection is its own typed terminal disposition. A
+    // schema-v7 producer represented that disposition as
+    // `completed_with_negative_result`; newer runtimes persist it as
+    // `blocked` so it can never masquerade as a dispatched operation. When a
+    // contract explicitly asks to observe the rejection, the rejection bit is
+    // therefore the cross-version outcome predicate. Generic requirements and
+    // predicates expecting `contract_rejected: false` still require the exact
+    // terminal status below.
+    let explicitly_expects_rejection = receipt.contract_rejected == Some(true);
+    let outcome_compatible = (metadata.contract_rejected && explicitly_expects_rejection)
+        || receipt.outcome_statuses.is_empty()
         || metadata
             .outcome_status
             .is_some_and(|actual| receipt.outcome_statuses.contains(&actual));
@@ -1183,6 +1170,70 @@ pub(in crate::agent) fn pending_evidence_requirement_indices(
         .collect()
 }
 
+/// Bind model retries to a user-owned operation rather than a transient tool
+/// call. Contract obligations take precedence, followed by a typed plan step;
+/// unplanned work falls back to the canonical prepared invocation.
+pub(in crate::agent) fn stable_operation_identity(
+    execution_id: &str,
+    contract: &CompletionContract,
+    requested_tool_name: &str,
+    semantics: &ToolCallSemantics,
+    canonical_arguments: &str,
+    access_manifest: &crate::traits::ToolCallAccessManifest,
+    planned_step_id: Option<&str>,
+) -> (String, Option<usize>) {
+    let metadata = crate::traits::ToolCallMetadata {
+        semantics: semantics.clone(),
+        access_manifest: Some(access_manifest.clone()),
+        ..crate::traits::ToolCallMetadata::default()
+    };
+    let requirement_indices = pending_evidence_requirement_indices(
+        contract,
+        requested_tool_name,
+        semantics,
+        canonical_arguments,
+        &metadata,
+    );
+    if !requirement_indices.is_empty() {
+        let owner = contract.scope_task_id.as_deref().unwrap_or(execution_id);
+        let indices = requirement_indices
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let max_invocations = requirement_indices
+            .iter()
+            .filter_map(|index| {
+                contract.evidence_requirements[*index]
+                    .receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.max_invocations)
+            })
+            .min();
+        return (
+            format!("contract:{owner}:requirements:{indices}"),
+            max_invocations,
+        );
+    }
+    if let Some(step_id) = planned_step_id {
+        return (format!("plan:{execution_id}:{step_id}"), None);
+    }
+
+    let arguments = serde_json::from_str::<serde_json::Value>(canonical_arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(canonical_arguments.to_string()));
+    let invocation = serde_json::json!({
+        "tool": requested_tool_name,
+        "arguments": arguments,
+    });
+    (
+        format!(
+            "invocation:{execution_id}:{}",
+            crate::agent::prefix_fingerprint::hash_canonical(&invocation)
+        ),
+        None,
+    )
+}
+
 pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
     requirement: &RequestEvidenceRequirement,
     metadata: &crate::traits::ToolCallMetadata,
@@ -1309,6 +1360,7 @@ fn read_receipt_has_complete_content(read: &crate::traits::ReadFileResultMetadat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolVerificationMode;
 
     #[test]
     fn adapter_outcome_metadata_retains_registered_observation_semantics() {
@@ -1320,6 +1372,7 @@ mod tests {
         );
         let mut metadata = crate::traits::ToolCallMetadata {
             outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
             ..crate::traits::ToolCallMetadata::default()
         };
 
@@ -1338,7 +1391,8 @@ mod tests {
 
     #[test]
     fn structured_negative_process_outcome_is_evidence_without_stream_bytes() {
-        let semantics = crate::tools::command_semantics::classify_shell_command("/usr/bin/false");
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
         let metadata = crate::traits::ToolCallMetadata {
             outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
@@ -1372,17 +1426,20 @@ mod tests {
                     outcome_statuses: vec![ToolOutcomeStatus::CompletedWithNegativeResult],
                     requires_output: false,
                     contract_rejected: Some(false),
+                    max_invocations: None,
                 }),
                 target: None,
             }],
             ..CompletionContract::default()
         };
         let raw_arguments = r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#;
-        let registered = crate::tools::command_semantics::classify_shell_command("/usr/bin/false");
+        let registered = ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
         let mut metadata = crate::traits::ToolCallMetadata {
             receipt_kind: crate::traits::ToolReceiptKind::Process,
             outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
             ..crate::traits::ToolCallMetadata::default()
         };
         complete_tool_result_semantics("terminal", raw_arguments, &registered, &mut metadata);
@@ -1451,6 +1508,7 @@ mod tests {
                     outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
                     requires_output: true,
                     contract_rejected: Some(false),
+                    max_invocations: None,
                 }),
                 target: None,
             }],
@@ -1510,6 +1568,7 @@ mod tests {
                     outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
                     requires_output: true,
                     contract_rejected: Some(false),
+                    max_invocations: None,
                 }),
                 target: None,
             }],
@@ -1598,7 +1657,10 @@ mod tests {
                 &external,
                 "{}",
                 "synthetic state_key current state",
-                &crate::traits::ToolCallMetadata::default(),
+                &crate::traits::ToolCallMetadata {
+                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                    ..crate::traits::ToolCallMetadata::default()
+                },
             ),
             [0]
         );
@@ -1609,7 +1671,10 @@ mod tests {
                 &external,
                 "{}",
                 "synthetic response without the requested field",
-                &crate::traits::ToolCallMetadata::default(),
+                &crate::traits::ToolCallMetadata {
+                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                    ..crate::traits::ToolCallMetadata::default()
+                },
             ),
             [0],
             "typed scope, purpose, authority, and time decide evidence routing"
@@ -1628,7 +1693,10 @@ mod tests {
                 &trace,
                 "{}",
                 "synthetic attribution record",
-                &crate::traits::ToolCallMetadata::default(),
+                &crate::traits::ToolCallMetadata {
+                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                    ..crate::traits::ToolCallMetadata::default()
+                },
             ),
             [1]
         );
@@ -1665,7 +1733,10 @@ mod tests {
                 temporal_scope: EvidenceTemporalScope::Both,
             },
         ]);
-        let metadata = crate::traits::ToolCallMetadata::default();
+        let metadata = crate::traits::ToolCallMetadata {
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            ..crate::traits::ToolCallMetadata::default()
+        };
 
         assert_eq!(
             matching_evidence_requirement_indices(
@@ -1769,8 +1840,9 @@ mod tests {
             crate::agent::inquiry::evidence_capabilities_for_tool_call("read_file", arguments),
         );
         let metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
             contract_rejected: true,
+            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeIo,
             ..crate::traits::ToolCallMetadata::default()
         };
 
@@ -1785,6 +1857,53 @@ mod tests {
             ),
             [0]
         );
+    }
+
+    #[test]
+    fn rejected_invocation_cannot_close_a_generic_evidence_requirement() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            ToolSemanticScope,
+        };
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Observe current synthetic state".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::HostLocal],
+                purpose: EvidencePurpose::CurrentState,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: None,
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation().with_evidence(vec![
+            crate::traits::ToolEvidenceCapability::new(
+                ToolSemanticScope::HostLocal,
+                &[EvidencePurpose::CurrentState],
+                EvidenceAuthority::Direct,
+                EvidenceTemporalScope::Current,
+            ),
+        ]);
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+            contract_rejected: true,
+            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeIo,
+            semantics: semantics.clone(),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+
+        assert!(matching_evidence_requirement_indices(
+            &contract,
+            "synthetic_observer",
+            &semantics,
+            "{}",
+            "validation rejected",
+            &metadata,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2187,6 +2306,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     fn target_scope_violation_flags_out_of_scope_mutation_path() {
         let step_plan = StepExecutionPlan {
             step_id: "step-1".to_string(),
+            operation_key: "operation-1".to_string(),
             description: "Edit a scoped file".to_string(),
             plan_version: 1,
             primary_tool: Some("edit_file".to_string()),
@@ -2201,6 +2321,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             },
             expected_targets: Vec::new(),
             retry_policy: RetryPolicy {
+                max_invocations: 1,
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },
@@ -2226,6 +2347,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
 
         let step_plan = StepExecutionPlan {
             step_id: "step-1".to_string(),
+            operation_key: "operation-1".to_string(),
             description: "Modify only the selected project".to_string(),
             plan_version: 1,
             primary_tool: Some("cli_agent".to_string()),
@@ -2240,6 +2362,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             },
             expected_targets: Vec::new(),
             retry_policy: RetryPolicy {
+                max_invocations: 1,
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },
@@ -2328,6 +2451,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     fn target_scope_violation_skips_non_hard_fail_observation_steps() {
         let step_plan = StepExecutionPlan {
             step_id: "step-1".to_string(),
+            operation_key: "operation-1".to_string(),
             description: "Inspect a path".to_string(),
             plan_version: 1,
             primary_tool: Some("search_files".to_string()),
@@ -2342,6 +2466,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             },
             expected_targets: Vec::new(),
             retry_policy: RetryPolicy {
+                max_invocations: 1,
                 max_attempts: 1,
                 allow_tool_invocation_retry: true,
             },
@@ -2354,45 +2479,6 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     }
 
     #[test]
-    fn run_command_policy_block_requires_terminal_detects_policy_errors() {
-        assert!(run_command_policy_block_requires_terminal(
-            "Error: Command 'npm install' is not in the safe command list for run_command. Use 'terminal' for this command."
-        ));
-        assert!(!run_command_policy_block_requires_terminal(
-            "$ cargo test (exit: 0, 22ms)"
-        ));
-    }
-
-    #[test]
-    fn build_terminal_fallback_arguments_preserves_working_dir() {
-        // Routing cannot create a working directory as an incidental effect.
-        // A command that needs to create it must carry that mutation itself.
-        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/my folder"}"#;
-        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
-            .expect("fallback args expected");
-        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
-        assert_eq!(parsed["action"], "run");
-        assert_eq!(
-            parsed["command"],
-            "npm create vite@latest whatsapp-site -- --template react"
-        );
-        assert_eq!(parsed["working_dir"], "/tmp/my folder");
-    }
-
-    #[test]
-    fn build_terminal_fallback_arguments_keeps_cwd_out_of_shell_program() {
-        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/david's projects"}"#;
-        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
-            .expect("fallback args expected");
-        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
-        assert_eq!(parsed["working_dir"], "/tmp/david's projects");
-        assert!(!parsed["command"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("cd "));
-    }
-
-    #[test]
     fn target_scope_violation_allows_run_command_parent_dir_for_new_project_scaffolding() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("projects");
@@ -2400,6 +2486,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         let target = parent.join("new-site");
         let step_plan = StepExecutionPlan {
             step_id: "step-1".to_string(),
+            operation_key: "operation-1".to_string(),
             description: "Scaffold a project".to_string(),
             plan_version: 1,
             primary_tool: Some("run_command".to_string()),
@@ -2414,6 +2501,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             },
             expected_targets: Vec::new(),
             retry_policy: RetryPolicy {
+                max_invocations: 1,
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },

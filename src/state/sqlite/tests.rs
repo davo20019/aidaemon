@@ -3002,7 +3002,7 @@ async fn test_tasks_crud() {
 }
 
 #[tokio::test]
-async fn implicit_goal_run_binds_its_first_task_as_root() {
+async fn implicit_goal_run_does_not_infer_a_root_from_creation_order() {
     let (store, _file) = setup_test_store().await;
     let goal = crate::traits::Goal::new_continuous(
         "Synthetic recurring work",
@@ -3037,7 +3037,7 @@ async fn implicit_goal_run_binds_its_first_task_as_root() {
 
     let run = store.get_current_goal_run(&goal.id).await.unwrap().unwrap();
     assert_eq!(run.trigger_type, "manual");
-    assert_eq!(run.root_task_id.as_deref(), Some(task.id.as_str()));
+    assert_eq!(run.root_task_id, None);
     assert_eq!(
         store
             .get_tasks_for_goal_run(&run.id)

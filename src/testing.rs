@@ -47,6 +47,7 @@ pub struct MockChatCall {
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
     task_assessment_responses: Mutex<Vec<ProviderResponse>>,
+    relationship_assessment_responses: Mutex<Vec<ProviderResponse>>,
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
@@ -63,6 +64,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(Vec::new()),
             task_assessment_responses: Mutex::new(Vec::new()),
+            relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -75,6 +77,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             task_assessment_responses: Mutex::new(Vec::new()),
+            relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -90,6 +93,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             task_assessment_responses: Mutex::new(Vec::new()),
+            relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
@@ -109,7 +113,37 @@ impl MockProvider {
     /// typed contract they exercise instead of teaching the mock to classify
     /// English request phrases.
     pub fn with_task_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
+        let relationships = responses
+            .iter()
+            // A fresh session has no candidate antecedent, so production does
+            // not invoke the relationship lane for its first assessment.
+            .skip(1)
+            .filter_map(|response| {
+                let value: Value = serde_json::from_str(response.content.as_deref()?).ok()?;
+                let shape = value.get("task_shape")?;
+                Some(Self::text_response(
+                    &json!({
+                        "schema_version": 1,
+                        "confidence": shape.get("confidence").and_then(Value::as_str).unwrap_or("high"),
+                        "request_relationship": shape.get("request_relationship").and_then(Value::as_str).unwrap_or("new_request"),
+                        "antecedent_user_message_id": Value::Null,
+                        "semantic_scope": shape.get("semantic_scope").and_then(Value::as_str).unwrap_or("none")
+                    })
+                    .to_string(),
+                ))
+            })
+            .collect();
         self.task_assessment_responses = Mutex::new(responses);
+        self.relationship_assessment_responses = Mutex::new(relationships);
+        self
+    }
+
+    /// Supply dialogue-edge responses independently from task contracts.
+    /// Production uses separate authority lanes, so the mock must not let a
+    /// relationship call consume the next turn's contract.
+    #[allow(dead_code)]
+    pub fn with_relationship_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
+        self.relationship_assessment_responses = Mutex::new(responses);
         self
     }
 
@@ -282,6 +316,11 @@ impl ModelProvider for MockProvider {
         // Silently intercept assessment/re-planner calls: return empty response
         // (causes generate_task_plan() to return None) without recording in call_log.
         if self.skip_planning_calls {
+            let is_relationship_call = messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("task relationship router"))
+            });
             let is_planning_call = messages.iter().any(|m| {
                 m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
                     s.contains("task planner")
@@ -292,9 +331,16 @@ impl ModelProvider for MockProvider {
                 })
             });
             if is_planning_call {
-                let mut task_assessments = self.task_assessment_responses.lock().await;
-                if !task_assessments.is_empty() {
-                    return Ok(task_assessments.remove(0));
+                if is_relationship_call {
+                    let mut relationships = self.relationship_assessment_responses.lock().await;
+                    if !relationships.is_empty() {
+                        return Ok(relationships.remove(0));
+                    }
+                } else {
+                    let mut task_assessments = self.task_assessment_responses.lock().await;
+                    if !task_assessments.is_empty() {
+                        return Ok(task_assessments.remove(0));
+                    }
                 }
                 return Ok(ProviderResponse {
                     content: None,

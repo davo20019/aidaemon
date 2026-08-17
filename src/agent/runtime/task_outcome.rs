@@ -4,7 +4,6 @@ use super::completion_contract::{
     mutation_contract_fulfilled, CompletionContract, CompletionProgress,
 };
 use super::execution_state::ExecutionState;
-use super::goal_dispatch::is_low_signal_task_lead_reply;
 use super::validation_state::ValidationState;
 use crate::events::TaskOutcome;
 use serde_json::Value;
@@ -43,6 +42,20 @@ impl RequestedActionSummary {
 
         if completion.verification_pending {
             actions.insert("verification:pending".to_string(), false);
+        }
+
+        // When the optional semantic producer is unavailable, actual prepared
+        // invocations form the lazy execution graph. A model reply cannot turn
+        // validation/policy rejections or failed dispatches into success: at
+        // least one typed operation result must have completed. A corrected
+        // or alternate successful operation resolves exploratory failures.
+        let completed_expected_receipt_observation =
+            completion.observation_count > 0 && completion.all_evidence_requirements_satisfied();
+        if execution.tool_calls_used > 0
+            && execution.completed_operation_results == 0
+            && !completed_expected_receipt_observation
+        {
+            actions.insert("execution:no-completed-operation".to_string(), false);
         }
 
         // A failed exploratory observation is not itself an unresolved user
@@ -148,12 +161,12 @@ impl TaskOutcomeDerivation {
         if self.terminal_cause.is_some() {
             return TaskOutcome::Failed;
         }
+        // Deferral is typed execution state. It must not depend on whether the
+        // acknowledgement happens to resemble one of several prose templates.
+        if self.deferred_to_background {
+            return TaskOutcome::Partial;
+        }
         if !self.response_has_user_value {
-            // A long-running command moved to the background (with a "will notify
-            // you when done" ack) is a deferral, not a failure.
-            if self.deferred_to_background {
-                return TaskOutcome::Partial;
-            }
             return TaskOutcome::Failed;
         }
         if self.required_actions.unresolved > 0 || !self.completion_contract_fulfilled {
@@ -195,30 +208,14 @@ fn completion_contract_is_fulfilled(
 }
 
 /// Whether accepted, sanitized assistant content has user-visible value.
-pub fn response_has_user_value(reply: &str, total_successful_tool_calls: usize) -> bool {
+pub fn response_has_user_value(reply: &str, _total_successful_tool_calls: usize) -> bool {
     let trimmed = reply.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // This is a progress receipt, not task completion. Live failure: a hung
-    // Quick Look conversion was moved to the background, the friendly handoff
-    // was counted as user value, and the unfinished retry was persisted as
-    // Succeeded. Keeping it valueless lets `deferred_to_background` derive the
-    // honest Partial outcome until the background follow-up actually finishes.
-    if super::post_task::is_friendly_background_handoff(trimmed) {
-        return false;
-    }
-    if is_low_signal_task_lead_reply(trimmed) {
-        return false;
-    }
-    if trimmed.starts_with("The requested action completed successfully")
-        || trimmed.starts_with("The requested action finished with errors")
-    {
-        return false;
-    }
-    if total_successful_tool_calls > 0 && trimmed == "Done." {
-        return false;
-    }
+    // Provider protocol leakage is structural invalid output. All ordinary
+    // prose is presentation only; lifecycle truth comes from obligations,
+    // typed receipts, and background state rather than phrase classifiers.
     if response_looks_like_plain_text_tool_call(trimmed) {
         return false;
     }
@@ -503,11 +500,11 @@ mod tests {
         d.response_has_user_value = false;
         assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
 
-        // With a valid final reply and no unresolved work, a previously
-        // backgrounded task can complete successfully.
+        // Presentation text cannot turn an active background handoff into a
+        // terminal success.
         let mut d = base_derivation();
         d.deferred_to_background = true;
-        assert_eq!(d.derive_outcome(), TaskOutcome::Succeeded);
+        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
     }
 
     #[test]
@@ -516,14 +513,14 @@ mod tests {
         let mut d = base_derivation();
         d.deferred_to_background = true;
         d.response_has_user_value = response_has_user_value(handoff, 5);
-        assert!(!d.response_has_user_value);
+        assert!(d.response_has_user_value);
         assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
     }
 
     #[test]
     fn completed_background_followup_can_succeed() {
         let mut d = base_derivation();
-        d.deferred_to_background = true;
+        d.deferred_to_background = false;
         d.required_actions = RequestedActionSummary {
             required: 3,
             satisfied: 3,
@@ -590,6 +587,98 @@ mod tests {
         )
         .derive_outcome();
         assert_eq!(outcome, TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn rejected_only_execution_cannot_be_persisted_as_succeeded() {
+        let validation = ValidationState::default();
+        let mut execution = empty_execution_state();
+        execution.tool_calls_used = 1;
+
+        let summary = RequestedActionSummary::from_completion_state(
+            &validation,
+            &execution,
+            &CompletionProgress::default(),
+        );
+        assert_eq!(summary.unresolved, 1);
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &CompletionProgress::default(),
+            &CompletionContract::default(),
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+        assert_eq!(outcome, TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn explicitly_expected_rejection_receipt_can_complete_without_dispatch() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            RequestReceiptPredicate, ToolSemanticScope,
+        };
+
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Observe the typed invocation disposition".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::HostLocal],
+                purpose: EvidencePurpose::Outcome,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["synthetic_tool".to_string()],
+                    contract_rejected: Some(true),
+                    ..RequestReceiptPredicate::default()
+                }),
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut completion = CompletionProgress::new(&contract, "synthetic-task");
+        completion.mark_observation_receipt(&contract, &[0], false, "synthetic-receipt");
+        let mut execution = empty_execution_state();
+        execution.tool_calls_used = 1;
+
+        let summary = RequestedActionSummary::from_completion_state(
+            &ValidationState::default(),
+            &execution,
+            &completion,
+        );
+        assert_eq!(summary, RequestedActionSummary::default());
+        assert_eq!(
+            TaskOutcomeDerivation::from_completion_state(
+                &ValidationState::default(),
+                &execution,
+                &completion,
+                &contract,
+                true,
+                false,
+                None,
+            )
+            .derive_outcome(),
+            TaskOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn corrected_completed_operation_resolves_prior_proposal_failure() {
+        let validation = ValidationState::default();
+        let mut execution = empty_execution_state();
+        execution.tool_calls_used = 2;
+        execution.operation_results_observed = 1;
+        execution.completed_operation_results = 1;
+
+        let summary = RequestedActionSummary::from_completion_state(
+            &validation,
+            &execution,
+            &CompletionProgress::default(),
+        );
+        assert_eq!(summary, RequestedActionSummary::default());
     }
 
     #[test]
@@ -775,10 +864,10 @@ mod tests {
     }
 
     #[test]
-    fn response_has_user_value_rejects_low_signal_replies() {
-        assert!(!response_has_user_value("Done.", 3));
+    fn response_value_is_structural_not_phrase_classified() {
+        assert!(response_has_user_value("Done.", 3));
         assert!(!response_has_user_value("", 0));
-        assert!(!response_has_user_value(
+        assert!(response_has_user_value(
             "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the background now. I'll send the result as soon as it's ready.",
             4
         ));

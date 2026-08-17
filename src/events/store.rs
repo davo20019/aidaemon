@@ -129,6 +129,57 @@ pub struct EventStore {
     pool: SqlitePool,
 }
 
+enum TaskLifecycleTransition {
+    Start {
+        task_id: String,
+    },
+    End {
+        task_id: String,
+        status: TaskStatus,
+        outcome: crate::events::TaskOutcome,
+    },
+}
+
+fn task_lifecycle_transition(event: &Event) -> anyhow::Result<Option<TaskLifecycleTransition>> {
+    let lifecycle_task_id = |payload_task_id: String| {
+        (!payload_task_id.trim().is_empty())
+            .then_some(payload_task_id)
+            .or_else(|| {
+                event
+                    .task_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!("legacy-task:{value}"))
+            })
+            .or_else(|| {
+                event
+                    .turn_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!("legacy-turn:{value}"))
+            })
+    };
+    match event.event_type {
+        EventType::TaskStart => {
+            let data = event.parse_data::<super::TaskStartData>()?;
+            Ok(lifecycle_task_id(data.task_id)
+                .map(|task_id| TaskLifecycleTransition::Start { task_id }))
+        }
+        EventType::TaskEnd => {
+            let data = event.parse_data::<TaskEndData>()?;
+            let outcome = data.effective_outcome();
+            Ok(
+                lifecycle_task_id(data.task_id).map(|task_id| TaskLifecycleTransition::End {
+                    task_id,
+                    status: data.status,
+                    outcome,
+                }),
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskWindowStats {
     pub total: u64,
@@ -775,6 +826,7 @@ impl EventStore {
     /// Append a new event to the store. Returns the assigned event ID.
     pub async fn append(&self, event: Event) -> anyhow::Result<i64> {
         let generated_response = generated_response_from_event(&event);
+        let lifecycle_transition = task_lifecycle_transition(&event)?;
         let data_json = serde_json::to_string(&event.data)?;
         let event_type_str = event.event_type.as_str();
         let created_at_str = event.created_at.to_rfc3339();
@@ -807,6 +859,88 @@ impl EventStore {
         .await?;
 
         let event_id = result.last_insert_rowid();
+        if let Some(transition) = lifecycle_transition {
+            match transition {
+                TaskLifecycleTransition::Start { task_id } => {
+                    let projected = sqlx::query(
+                        "INSERT INTO task_lifecycle (
+                             session_id, task_id, state, version, start_event_id, started_at
+                         ) VALUES (?, ?, 'running', 1, ?, ?)
+                         ON CONFLICT(session_id, task_id) DO NOTHING",
+                    )
+                    .bind(&event.session_id)
+                    .bind(&task_id)
+                    .bind(event_id)
+                    .bind(&created_at_str)
+                    .execute(&mut *tx)
+                    .await?;
+                    if projected.rows_affected() == 0 {
+                        let existing_id = sqlx::query_scalar::<_, Option<i64>>(
+                            "SELECT COALESCE(start_event_id, terminal_event_id)
+                             FROM task_lifecycle WHERE session_id = ? AND task_id = ?",
+                        )
+                        .bind(&event.session_id)
+                        .bind(&task_id)
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .unwrap_or(event_id);
+                        tx.rollback().await?;
+                        return Ok(existing_id);
+                    }
+                }
+                TaskLifecycleTransition::End {
+                    task_id,
+                    status,
+                    outcome,
+                } => {
+                    let projected = sqlx::query(
+                        "UPDATE task_lifecycle
+                         SET state = 'terminal', status = ?, outcome = ?,
+                             version = version + 1, terminal_event_id = ?, ended_at = ?
+                         WHERE session_id = ? AND task_id = ?
+                           AND state = 'running' AND terminal_event_id IS NULL",
+                    )
+                    .bind(status.as_str())
+                    .bind(outcome.as_str())
+                    .bind(event_id)
+                    .bind(&created_at_str)
+                    .bind(&event.session_id)
+                    .bind(&task_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if projected.rows_affected() == 0 {
+                        let inserted = sqlx::query(
+                            "INSERT INTO task_lifecycle (
+                                 session_id, task_id, state, status, outcome, version,
+                                 terminal_event_id, ended_at
+                             ) VALUES (?, ?, 'terminal', ?, ?, 1, ?, ?)
+                             ON CONFLICT(session_id, task_id) DO NOTHING",
+                        )
+                        .bind(&event.session_id)
+                        .bind(&task_id)
+                        .bind(status.as_str())
+                        .bind(outcome.as_str())
+                        .bind(event_id)
+                        .bind(&created_at_str)
+                        .execute(&mut *tx)
+                        .await?;
+                        if inserted.rows_affected() == 0 {
+                            let existing_id = sqlx::query_scalar::<_, Option<i64>>(
+                                "SELECT terminal_event_id FROM task_lifecycle
+                                 WHERE session_id = ? AND task_id = ?",
+                            )
+                            .bind(&event.session_id)
+                            .bind(&task_id)
+                            .fetch_one(&mut *tx)
+                            .await?
+                            .unwrap_or(event_id);
+                            tx.rollback().await?;
+                            return Ok(existing_id);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(projection) = mandate_projection {
             let updated = sqlx::query(
                 "UPDATE mandate_mutation_attempts
@@ -1596,17 +1730,10 @@ impl EventStore {
             SELECT start.id, start.session_id, start.event_type, start.data,
                    start.created_at, start.consolidated_at, start.task_id,
                    start.tool_name, start.turn_id
-            FROM events AS start
-            WHERE start.session_id = ?
-              AND start.event_type = 'task_start'
-              AND start.task_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM events AS terminal
-                  WHERE terminal.session_id = start.session_id
-                    AND terminal.task_id = start.task_id
-                    AND terminal.event_type = 'task_end'
-              )
+            FROM task_lifecycle AS lifecycle
+            JOIN events AS start ON start.id = lifecycle.start_event_id
+            WHERE lifecycle.session_id = ?
+              AND lifecycle.state = 'running'
             ORDER BY start.id DESC
             LIMIT 1
             "#,
@@ -1664,29 +1791,21 @@ impl EventStore {
 
         let rows = sqlx::query(
             r#"
-            SELECT s.session_id AS session_id,
-                   s.task_id AS task_id,
-                   MIN(s.created_at) AS started_at
-            FROM events s
-            WHERE s.event_type = 'task_start'
-              AND s.task_id IS NOT NULL
+            SELECT lifecycle.session_id AS session_id,
+                   lifecycle.task_id AS task_id,
+                   s.created_at AS started_at
+            FROM task_lifecycle AS lifecycle
+            JOIN events AS s ON s.id = lifecycle.start_event_id
+            WHERE lifecycle.state = 'running'
               AND s.created_at < ?
               AND NOT EXISTS (
                 SELECT 1
-                FROM events e
-                WHERE e.session_id = s.session_id
-                  AND e.task_id = s.task_id
-                  AND e.event_type = 'task_end'
-              )
-              AND NOT EXISTS (
-                SELECT 1
                 FROM events a
-                WHERE a.session_id = s.session_id
-                  AND a.task_id = s.task_id
+                WHERE a.session_id = lifecycle.session_id
+                  AND a.task_id = lifecycle.task_id
                   AND a.created_at >= ?
               )
-            GROUP BY s.session_id, s.task_id
-            ORDER BY MIN(s.created_at) ASC
+            ORDER BY s.created_at ASC
             LIMIT ?
             "#,
         )
@@ -1706,11 +1825,18 @@ impl EventStore {
             // task that emitted an event after the candidate query.
             let is_terminal_or_active = sqlx::query(
                 r#"
-                SELECT 1
-                FROM events
-                WHERE session_id = ?
-                  AND task_id = ?
-                  AND (event_type = 'task_end' OR created_at >= ?)
+                SELECT 1 FROM task_lifecycle AS lifecycle
+                WHERE lifecycle.session_id = ?
+                  AND lifecycle.task_id = ?
+                  AND (
+                      lifecycle.state = 'terminal'
+                      OR EXISTS (
+                          SELECT 1 FROM events AS activity
+                          WHERE activity.session_id = lifecycle.session_id
+                            AND activity.task_id = lifecycle.task_id
+                            AND activity.created_at >= ?
+                      )
+                  )
                 LIMIT 1
                 "#,
             )
@@ -2956,7 +3082,8 @@ mod tests {
         let metadata = crate::traits::ToolCallMetadata {
             outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
-            semantics: crate::tools::command_semantics::classify_shell_command("/usr/bin/false"),
+            semantics: crate::traits::ToolCallSemantics::observation()
+                .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
             ..crate::traits::ToolCallMetadata::default()
         };
         let mut receipt = crate::events::ToolReceiptV1::from_metadata(
@@ -3857,6 +3984,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_lifecycle_allows_exactly_one_terminal_transition() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        append_task_start(&store, "s-terminal-race", "task-1", now).await;
+        append_task_end(
+            &store,
+            "s-terminal-race",
+            "task-1",
+            TaskStatus::Completed,
+            now + Duration::seconds(1),
+            None,
+            Some("completed"),
+        )
+        .await;
+        append_task_end(
+            &store,
+            "s-terminal-race",
+            "task-1",
+            TaskStatus::Failed,
+            now + Duration::seconds(2),
+            Some("late watchdog"),
+            None,
+        )
+        .await;
+
+        let terminal_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = 's-terminal-race'
+               AND task_id = 'task-1' AND event_type = 'task_end'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("terminal count");
+        assert_eq!(terminal_events, 1);
+        let lifecycle: (String, String, String, i64) = sqlx::query_as(
+            "SELECT state, status, outcome, version FROM task_lifecycle
+             WHERE session_id = 's-terminal-race' AND task_id = 'task-1'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("lifecycle row");
+        assert_eq!(
+            lifecycle,
+            (
+                "terminal".to_string(),
+                "completed".to_string(),
+                "succeeded".to_string(),
+                2,
+            )
+        );
+        assert!(store
+            .get_active_task("s-terminal-race")
+            .await
+            .expect("active lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn policy_metric_history_keeps_only_latest_cumulative_snapshot_per_boot() {
         let (store, _db_file) = setup_store().await;
         for (boot_id, samples) in [("boot-a", 1_u64), ("boot-b", 4), ("boot-a", 7)] {
@@ -4465,7 +4650,7 @@ mod turn_anchored_tests {
             .iter()
             .find(|t| t.turn_id.as_deref() == Some("turn-A"))
             .unwrap();
-        assert_eq!(a.terminal_status, Some(TaskStatus::Completed));
+        assert_eq!(a.terminal_status, Some(TaskStatus::Failed));
     }
 
     #[tokio::test]

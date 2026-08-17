@@ -189,25 +189,31 @@ async fn test_truncated_tool_output_renders_notice_but_keeps_ledger_clean() {
     assert!(content.contains("Error: disk full"));
 }
 
-/// A final reply that promises imminent action while the task made ZERO tool
-/// calls (live repro: "I'm searching the ClinicalTrials.gov API ... now..."
-/// then task end, nothing running) gets ONE retry directing the model to do
-/// the work or admit inability. The retry's real answer ships.
+/// An unresolved typed observation cannot complete without a dispatched
+/// receipt. Candidate wording is deliberately irrelevant to this test.
 #[tokio::test]
-async fn test_unbacked_action_promise_retries_once() {
-    let promissory =
-        "I'm searching the ClinicalTrials.gov API specifically for recruiting skin cancer trials in the Fairfax area now...";
-    let clean_answer = "I couldn't reach ClinicalTrials.gov from here — want me to try the web search tool instead?";
+async fn test_unresolved_observation_requires_receipt_before_completion() {
+    let first_candidate = "The host inspection is still being prepared.";
+    let clean_answer = "The host inspection completed from a current receipt.";
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(promissory),
+        MockProvider::text_response(first_candidate),
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(clean_answer),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
     let harness = setup_test_agent(provider).await.unwrap();
     let response = harness
         .agent
         .handle_message(
             "tg_promise_retry",
-            "Find recruiting skin cancer trials near Fairfax",
+            "Inspect the current host state.",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -217,17 +223,14 @@ async fn test_unbacked_action_promise_retries_once() {
         .unwrap();
 
     assert_eq!(response, clean_answer, "the retry's answer must ship");
-    assert_eq!(harness.provider.call_count().await, 2);
+    assert_eq!(harness.provider.call_count().await, 3);
 }
 
-/// CONTRACT CHANGE 2026-07-03 (3rd live incident): a present-progressive
-/// status claim as the FINAL answer is false regardless of prior tool work —
-/// completion means nothing is running. "I am currently refining the API
-/// query..." shipped as the last message of an ENDED task that had failed
-/// tool attempts; the old zero-tool scoping let it through. Such replies now
-/// bounce even after tool work; the retry's real answer ships.
+/// A dispatched typed failure remains unresolved until a later operation
+/// satisfies the request. Recovery must not depend on parsing either the tool
+/// output or the assistant's prose.
 #[tokio::test]
-async fn test_action_promise_after_tool_work_bounces() {
+async fn test_typed_failed_operation_requires_recovery_before_completion() {
     struct FailingProbeTool;
     #[async_trait::async_trait]
     impl crate::traits::Tool for FailingProbeTool {
@@ -245,7 +248,7 @@ async fn test_action_promise_after_tool_work_bounces() {
             })
         }
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            Ok("Error: HTTP 400 Bad Request".to_string())
+            anyhow::bail!("synthetic probe failure")
         }
     }
 
@@ -255,9 +258,10 @@ async fn test_action_promise_after_tool_work_bounces() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("failing_probe", "{}"),
         MockProvider::text_response(promissory_after_work),
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(real_answer),
     ]);
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
         provider,
         vec![std::sync::Arc::new(FailingProbeTool) as std::sync::Arc<dyn crate::traits::Tool>],
         None,
@@ -278,7 +282,7 @@ async fn test_action_promise_after_tool_work_bounces() {
         .unwrap();
 
     assert_eq!(response, real_answer, "the retry's real answer must ship");
-    assert!(harness.provider.call_count().await >= 3, "bounce expected");
+    assert!(harness.provider.call_count().await >= 4, "recovery expected");
 }
 
 /// When BOTH the final reply and its retry gut under sanitization and no
@@ -354,17 +358,13 @@ async fn test_inline_json_dump_reply_retries_once() {
     assert_eq!(response, clean_answer, "the retry's answer must ship");
 }
 
-/// A reply ENDING with a promise line gets bounced even when the promised
-/// verb is a knowledge verb — nothing follows a closing line (live repro:
-/// half-answered two-part question ending "I will answer both clearly.").
+/// Plain-text completion is model-authored content. Without a typed response
+/// schema or outstanding evidence obligation, wording alone must not cause a
+/// hidden retry.
 #[tokio::test]
-async fn test_closing_promise_line_bounces() {
+async fn test_plain_text_completion_is_not_reclassified_from_wording() {
     let half_answer = "Counting the letters: the word has 6 r's.\n\nI will answer both clearly.";
-    let full_answer = "The word has 6 r's, and since 9.8 < 9.11 the car wash is 9.8m away — walk.";
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(half_answer),
-        MockProvider::text_response(full_answer),
-    ]);
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(half_answer)]);
     let harness = setup_test_agent(provider).await.unwrap();
     let response = harness
         .agent
@@ -378,5 +378,6 @@ async fn test_closing_promise_line_bounces() {
         )
         .await
         .unwrap();
-    assert_eq!(response, full_answer, "the completed answer must ship");
+    assert_eq!(response, half_answer);
+    assert_eq!(harness.provider.call_count().await, 1);
 }

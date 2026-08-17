@@ -11,7 +11,6 @@ pub(in crate::agent) struct LoopCounters {
     successful_send_file_keys: HashSet<String>,
     deferred_no_tool_streak: usize,
     deferred_no_tool_model_switches: usize,
-    personal_memory_tool_calls: usize,
 }
 
 pub(in crate::agent) struct StoppingCountersState<'a> {
@@ -35,7 +34,6 @@ pub(in crate::agent) struct ToolExecutionCountersState<'a> {
     pub total_tool_calls_attempted: &'a mut usize,
     pub total_successful_tool_calls: &'a mut usize,
     pub tool_call_count: &'a mut HashMap<String, usize>,
-    pub personal_memory_tool_calls: &'a mut usize,
     pub successful_send_file_keys: &'a mut HashSet<String>,
     pub deferred_no_tool_streak: &'a mut usize,
     pub tool_result_cache: &'a mut HashMap<u64, String>,
@@ -70,7 +68,6 @@ impl LoopCounters {
             total_tool_calls_attempted: &mut self.total_tool_calls_attempted,
             total_successful_tool_calls: &mut self.total_successful_tool_calls,
             tool_call_count: &mut self.tool_call_count,
-            personal_memory_tool_calls: &mut self.personal_memory_tool_calls,
             successful_send_file_keys: &mut self.successful_send_file_keys,
             deferred_no_tool_streak: &mut self.deferred_no_tool_streak,
             tool_result_cache: &mut self.tool_result_cache,
@@ -120,14 +117,6 @@ impl LoopCounters {
 
     pub(in crate::agent) fn successful_send_file_key_count(&self) -> usize {
         self.successful_send_file_keys.len()
-    }
-
-    pub(in crate::agent) fn record_personal_memory_tool_call(&mut self) {
-        self.personal_memory_tool_calls = self.personal_memory_tool_calls.saturating_add(1);
-    }
-
-    pub(in crate::agent) fn personal_memory_tool_calls(&self) -> usize {
-        self.personal_memory_tool_calls
     }
 
     pub(in crate::agent) fn increment_deferred_no_tool_streak(&mut self) {
@@ -226,16 +215,6 @@ mod tests {
 
         assert!(counters.has_successful_send_file_key("telegram:file.txt"));
         assert_eq!(counters.successful_send_file_key_count(), 1);
-    }
-
-    #[test]
-    fn counts_personal_memory_tool_calls() {
-        let mut counters = LoopCounters::default();
-
-        counters.record_personal_memory_tool_call();
-        counters.record_personal_memory_tool_call();
-
-        assert_eq!(counters.personal_memory_tool_calls(), 2);
     }
 
     #[test]

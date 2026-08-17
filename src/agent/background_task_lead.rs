@@ -22,11 +22,10 @@ use super::parent_delivery;
 use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
-    extract_file_paths_from_text, goal_has_scheduled_provenance, is_goal_run_root_task_description,
-    is_group_session, parse_goal_leading_wait, parse_wait_task_seconds,
-    persist_scheduled_run_state, strip_leading_wait, truncate_goal_result_text,
-    user_facing_task_description, Agent, SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS,
-    SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+    extract_file_paths_from_text, goal_has_scheduled_provenance, is_group_session,
+    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
+    strip_leading_wait, truncate_goal_result_text, user_facing_task_description, Agent,
+    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
 
 /// Progress-heartbeat wait schedule: quick early updates, then exponential
@@ -1386,7 +1385,7 @@ pub fn spawn_background_task_lead(
                             // Skip the parent "Scheduled check: <goal>" task — its
                             // description is the full (often huge) goal text, which
                             // is internal noise, not a user-facing step.
-                            .filter(|t| !is_goal_run_root_task_description(&t.description))
+                            .filter(|t| Some(t.id.as_str()) != heartbeat_trigger_task_id.as_deref())
                             .take(2)
                             // Keep each step label short so the progress line stays a
                             // glanceable one-liner, never a wall of text.
@@ -2469,6 +2468,7 @@ pub fn spawn_background_task_lead(
                 if let Some(run_status) = run_status {
                     let summary = build_goal_task_results_summary(
                         &final_run_tasks,
+                        dispatch_trigger_task_id.as_deref(),
                         if run_status == "completed" {
                             "Run completed."
                         } else {
@@ -2505,6 +2505,7 @@ pub fn spawn_background_task_lead(
                     Some(RecurringRunTerminalOutcome::Completed) => {
                         let summary = build_goal_task_results_summary(
                             &final_run_tasks,
+                            dispatch_trigger_task_id.as_deref(),
                             "All required tasks completed.",
                         );
                         Some(("completed", truncate_goal_result_text(&summary, 3500)))
@@ -2710,6 +2711,12 @@ pub fn spawn_background_task_lead(
                     started_at: None,
                     completed_at: None,
                 };
+                // Recovery is an orchestration root, so persist that role
+                // explicitly before inserting the task. Task creation order
+                // is not allowed to infer lifecycle identity.
+                let _ = state
+                    .start_goal_run(&goal_id, "recovery", None, Some(&recovery_task_id))
+                    .await;
                 let recovery_created = state.create_task(&recovery_task).await;
                 let recovery_run_id = if recovery_created.is_ok() {
                     if is_scheduled_run {
@@ -2918,8 +2925,11 @@ pub fn spawn_background_task_lead(
                                 Ok(r) => r.as_str(),
                                 Err(_) => "All tasks completed.",
                             };
-                            let task_results_summary =
-                                build_goal_task_results_summary(&completed_tasks, fallback_summary);
+                            let task_results_summary = build_goal_task_results_summary(
+                                &completed_tasks,
+                                dispatch_trigger_task_id.as_deref(),
+                                fallback_summary,
+                            );
 
                             // Check for partial success metadata in the goal context
                             let partial_info = final_goal
@@ -3808,6 +3818,10 @@ mod tests {
             .unwrap();
 
         let recovery_task = make_task("recovery-root", "Recover the failed scheduled attempt");
+        state
+            .start_goal_run(&goal.id, "recovery", None, Some(&recovery_task.id))
+            .await
+            .unwrap();
         state.create_task(&recovery_task).await.unwrap();
         let recovery_run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
         assert_eq!(

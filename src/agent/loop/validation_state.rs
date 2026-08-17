@@ -69,7 +69,11 @@ impl ValidationState {
             self.active_plan_version = Some(plan_version);
         }
         self.active_success_criteria = success_criteria.to_vec();
-        self.refresh_success_criteria_matches("");
+        // Planner-authored criteria are advisory plan context. Whether their
+        // wording appears in a reply is not evidence that an outcome occurred.
+        // Keep the legacy projection empty; typed obligations and receipts own
+        // completion.
+        self.matched_success_criteria.clear();
     }
 
     pub fn record_action(
@@ -108,20 +112,6 @@ impl ValidationState {
 
     pub fn clear_loop_repetition_reason(&mut self) {
         self.loop_repetition_reason = None;
-    }
-
-    pub fn refresh_success_criteria_matches(&mut self, text: &str) {
-        let normalized_text = normalize_success_text(text);
-        self.matched_success_criteria = self
-            .active_success_criteria
-            .iter()
-            .filter(|criterion| !criterion.trim().is_empty())
-            .filter(|criterion| {
-                let normalized = normalize_success_text(criterion);
-                !normalized.is_empty() && normalized_text.contains(&normalized)
-            })
-            .cloned()
-            .collect();
     }
 }
 
@@ -591,13 +581,6 @@ pub fn derive_executor_step_result(
         approval_request: None,
         partial_result: None,
     }
-}
-
-fn normalize_success_text(text: &str) -> String {
-    text.to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn parse_context_object(existing_context: &str) -> Option<Value> {

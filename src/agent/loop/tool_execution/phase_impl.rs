@@ -1,7 +1,6 @@
 mod budget_blocking;
 mod execution_io;
 mod guards;
-mod parallel_prefetch;
 mod post_loop;
 mod project_dir;
 mod reflection;

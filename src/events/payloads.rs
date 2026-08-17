@@ -308,6 +308,8 @@ pub enum ToolOutcomeEvidenceSource {
 pub struct ToolReceiptV1 {
     pub schema_version: u16,
     pub outcome_status: ToolOutcomeStatus,
+    #[serde(default)]
+    pub invocation_stage: crate::traits::ToolInvocationStage,
     pub outcome_evidence: ToolOutcomeEvidenceSource,
     #[serde(default)]
     pub receipt_kind: crate::traits::ToolReceiptKind,
@@ -358,7 +360,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 6;
+    pub const SCHEMA_VERSION: u16 = 7;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -369,6 +371,7 @@ impl ToolReceiptV1 {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             outcome_status,
+            invocation_stage: metadata.invocation_stage,
             outcome_evidence,
             receipt_kind: metadata.receipt_kind,
             access_manifest: metadata.access_manifest.clone(),
@@ -397,6 +400,7 @@ impl ToolReceiptV1 {
             receipt_kind: self.receipt_kind,
             access_manifest: self.access_manifest.clone(),
             outcome_status: Some(self.outcome_status),
+            invocation_stage: crate::traits::ToolInvocationStage::Replayed,
             receipt_replayed: true,
             contract_rejected: self.contract_rejected,
             effective_tool_name: self.effective_tool_name.clone(),
@@ -443,8 +447,9 @@ impl ToolReceiptV1 {
         };
         let result_id = provenance.result_id.as_deref().unwrap_or("unavailable");
         format!(
-            "[Tool receipt v{}: outcome={}; result_id={}; source={}; model_view={}; durable_view={}; requested_range={}; returned_range={}]",
+            "[Tool receipt v{}: stage={:?}; outcome={}; result_id={}; source={}; model_view={}; durable_view={}; requested_range={}; returned_range={}]",
             self.schema_version,
+            self.invocation_stage,
             self.outcome_status.as_str(),
             result_id,
             provenance.source.as_str(),
@@ -983,6 +988,11 @@ pub struct BackgroundContinuationLinkedData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEndData {
     /// Task ID (matches TaskStart)
+    ///
+    /// Events written before task identity was embedded in the payload carry
+    /// it only in the event envelope. Keep those durable rows readable; code
+    /// that needs identity must prefer the envelope when this is empty.
+    #[serde(default)]
     pub task_id: String,
     /// How the task ended
     pub status: TaskStatus,
@@ -990,10 +1000,13 @@ pub struct TaskEndData {
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
     /// Total duration in seconds
+    #[serde(default)]
     pub duration_secs: u64,
     /// Number of thinking iterations
+    #[serde(default)]
     pub iterations: u32,
     /// Number of tool calls made
+    #[serde(default)]
     pub tool_calls_count: u32,
     /// Error message if failed
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1926,7 +1939,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
-        assert_eq!(roundtrip.schema_version, 6);
+        assert_eq!(roundtrip.schema_version, 7);
         assert!(roundtrip
             .context_header()
             .contains("durable_view=truncated"));

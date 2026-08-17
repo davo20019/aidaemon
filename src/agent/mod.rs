@@ -125,15 +125,10 @@ pub mod activity_gate;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
-use response_analysis::has_action_promise;
-#[cfg(test)]
 use response_analysis::looks_like_incomplete_retry_plan;
+use response_analysis::reply_is_pasted_file_page;
 #[cfg(test)]
 use response_analysis::sanitize_response_analysis;
-use response_analysis::{
-    claims_completed_side_effect, claims_delegation_started, is_substantive_text_response,
-    looks_like_deferred_action_response, looks_like_multi_part_request, reply_is_pasted_file_page,
-};
 #[cfg(test)]
 use response_analysis::{reply_defers_file_access, user_text_references_file};
 #[path = "intent/keywords.rs"]
@@ -143,6 +138,7 @@ mod intent_routing;
 #[path = "intent/llm_classifier.rs"]
 pub mod llm_classifier;
 #[path = "intent/relational_prefilter.rs"]
+#[cfg(test)]
 pub mod relational_prefilter;
 use intent_routing::contains_keyword_as_words;
 #[cfg(test)]
@@ -185,8 +181,7 @@ pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
     classify_step_execution_outcome, compile_step_execution_plan, select_initial_execution_budget,
-    ApprovalRequirement, ExecutionBudgetLimit, ExecutionPersistence, ExecutionState,
-    StepExecutionOutcome,
+    ApprovalRequirement, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
 };
 #[path = "loop/approach_pivot.rs"]
 mod approach_pivot;
@@ -227,8 +222,6 @@ mod tool_loop_state;
 #[cfg(feature = "computer_use")]
 mod computer_use;
 
-#[path = "loop/answer_grounding.rs"]
-mod answer_grounding;
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
 #[path = "loop/completion_checks.rs"]
@@ -639,16 +632,10 @@ impl AgentLimits {
 // Goal/task dispatch helpers. Implementation lives in `goal_dispatch.rs`.
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
-#[cfg(test)]
-pub(crate) use goal_dispatch::goal_completion_response_indicates_incomplete_work;
 pub use goal_dispatch::is_group_session;
-#[cfg(test)]
-pub(in crate::agent) use goal_dispatch::looks_like_incomplete_live_work_summary;
 pub(in crate::agent) use goal_dispatch::{
     active_scheduled_root_task_id, auto_dispatch_scheduled_run_extension_budget,
     clear_scheduled_run_state, effective_goal_daily_budget, goal_has_scheduled_provenance,
-    is_goal_run_root_task_description, is_low_signal_task_lead_reply,
-    looks_like_evidence_grounding_challenge, looks_like_false_capability_denial_after_tool_success,
     parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
     strip_leading_wait, task_has_scheduled_provenance, truncate_goal_result_text,
     user_facing_task_description,
@@ -1554,11 +1541,14 @@ mod final_reply_marker_tests {
     }
 
     #[test]
-    fn strips_internal_scheduler_annotations_from_progress_descriptions() {
+    fn scheduler_prose_has_no_lifecycle_meaning_in_progress_descriptions() {
         let cleaned = user_facing_task_description(
             "Scheduled check: Post evening tweet about aidaemon features [SYSTEM: already scheduled and firing now; do not reschedule.]",
         );
-        assert_eq!(cleaned, "Post evening tweet about aidaemon features");
+        assert_eq!(
+            cleaned,
+            "Scheduled check: Post evening tweet about aidaemon features"
+        );
     }
 }
 

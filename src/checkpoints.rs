@@ -31,6 +31,7 @@ use crate::config::CheckpointConfig;
 use crate::events::{Event, EventStore, EventType};
 use crate::execution::{BackendKind, SharedExecutionBackend};
 use crate::tools::fs_utils;
+use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
 
 static ACTIVE_MANAGER: Lazy<RwLock<Option<Arc<CheckpointManager>>>> =
     Lazy::new(|| RwLock::new(None));
@@ -101,12 +102,6 @@ struct SnapshotStats {
 struct SnapshotFile {
     relative: String,
     mode: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandPathHint {
-    raw: String,
-    directory_target: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +292,21 @@ impl CheckpointManager {
         tool: &str,
         arguments: &str,
     ) -> anyhow::Result<Option<String>> {
-        if !self.config.enabled || !tool_action_can_mutate(tool, arguments) {
+        let manifest = checkpoint_access_manifest(tool, arguments);
+        self.begin_for_access_manifest(tool, arguments, &manifest)
+            .await
+    }
+
+    /// Begin a checkpoint from the invocation's validated access contract.
+    /// Shell source is intentionally absent: only typed write targets can
+    /// authorize and scope a filesystem snapshot.
+    pub(crate) async fn begin_for_access_manifest(
+        &self,
+        tool: &str,
+        arguments: &str,
+        manifest: &ToolCallAccessManifest,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.config.enabled || manifest.write_targets.is_empty() {
             return Ok(None);
         }
 
@@ -313,7 +322,7 @@ impl CheckpointManager {
             format!("call:{}", Uuid::new_v4())
         };
 
-        let root = match self.resolve_root(tool, &args).await {
+        let root = match self.resolve_root(tool, manifest).await {
             Ok(root) => root,
             Err(error) => {
                 self.emit(
@@ -869,7 +878,11 @@ impl CheckpointManager {
         })
     }
 
-    async fn resolve_root(&self, tool: &str, args: &Value) -> anyhow::Result<PathBuf> {
+    async fn resolve_root(
+        &self,
+        tool: &str,
+        manifest: &ToolCallAccessManifest,
+    ) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(
             self.backend.kind() == BackendKind::Local,
             "filesystem checkpoints currently support only the local execution backend"
@@ -877,105 +890,31 @@ impl CheckpointManager {
 
         let workspace =
             canonicalize_existing_prefix(Path::new(self.backend.workspace_root().as_str()))?;
-        let explicit_path = if matches!(tool, "write_file" | "edit_file") {
-            ["path", "file_path", "file", "filename"]
-                .iter()
-                .find_map(|key| args.get(*key).and_then(Value::as_str))
-        } else {
-            args.get("working_dir")
-                .and_then(Value::as_str)
-                .or_else(|| args.get("_project_scope").and_then(Value::as_str))
-        };
-
-        let explicit_candidate = if let Some(path) = explicit_path {
-            canonicalize_existing_prefix(Path::new(
-                self.backend.resolve_path(path).await?.as_str(),
-            ))?
-        } else {
-            workspace.clone()
-        };
-
-        if matches!(tool, "terminal" | "run_command") {
-            if let Some(command) = args.get("command").and_then(Value::as_str) {
-                let mut roots = Vec::new();
-                for hint in command_path_hints(command) {
-                    let unresolved = if path_is_absolute_or_home_anchored(&hint.raw) {
-                        self.backend.resolve_path(&hint.raw).await
-                    } else {
-                        self.backend
-                            .resolve_path(
-                                explicit_candidate
-                                    .join(&hint.raw)
-                                    .to_string_lossy()
-                                    .as_ref(),
-                            )
-                            .await
-                    };
-                    let Ok(unresolved) = unresolved else {
-                        // Commands routinely read system paths such as /dev/null.
-                        // Those paths are not checkpoint targets and remain governed
-                        // by terminal policy rather than widening the snapshot.
-                        continue;
-                    };
-                    let candidate = canonicalize_existing_prefix(Path::new(unresolved.as_str()))?;
-                    if explicit_candidate != workspace
-                        && !candidate.starts_with(&explicit_candidate)
-                    {
-                        if candidate.starts_with(&workspace) {
-                            anyhow::bail!(
-                                "command path {} is outside checkpoint scope {}",
-                                candidate.display(),
-                                explicit_candidate.display()
-                            );
-                        }
-                        // Absolute read operands such as /dev/null are not
-                        // checkpoint targets. Tool policy still governs them.
-                        continue;
-                    }
-                    let boundary = if candidate.starts_with(&workspace) {
-                        workspace.as_path()
-                    } else if self.backend.allows_outside_workspace()
-                        && explicit_candidate != workspace
-                        && candidate.starts_with(&explicit_candidate)
-                    {
-                        explicit_candidate.as_path()
-                    } else if self.backend.allows_outside_workspace() {
-                        workspace.as_path()
-                    } else {
-                        continue;
-                    };
-                    if let Ok(root) = self.bounded_root_for_candidate(
-                        &candidate,
-                        boundary,
-                        !hint.directory_target,
-                    ) {
-                        if !roots.iter().any(|existing| existing == &root) {
-                            roots.push(root);
-                        }
-                    }
-                }
-                match roots.as_slice() {
-                    [root] => return Ok(root.clone()),
-                    [] => {}
-                    _ => {
-                        anyhow::bail!(
-                            "refusing a checkpoint for a command spanning multiple project roots: {}",
-                            roots
-                                .iter()
-                                .map(|root| root.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-                }
+        let mut roots = Vec::new();
+        for target in &manifest.write_targets {
+            let unresolved = self.backend.resolve_path(&target.value).await?;
+            let candidate = canonicalize_existing_prefix(Path::new(unresolved.as_str()))?;
+            let root = self.bounded_root_for_candidate(
+                &candidate,
+                &workspace,
+                matches!(tool, "write_file" | "edit_file"),
+            )?;
+            if !roots.contains(&root) {
+                roots.push(root);
             }
         }
-
-        self.bounded_root_for_candidate(
-            &explicit_candidate,
-            &workspace,
-            matches!(tool, "write_file" | "edit_file"),
-        )
+        match roots.as_slice() {
+            [root] => Ok(root.clone()),
+            [] => anyhow::bail!("checkpoint access contract has no write target"),
+            _ => anyhow::bail!(
+                "refusing a checkpoint for an invocation spanning multiple project roots: {}",
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
 
     fn bounded_root_for_candidate(
@@ -1584,39 +1523,36 @@ fn internal_string(args: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn tool_action_can_mutate(tool: &str, arguments: &str) -> bool {
+fn checkpoint_access_manifest(tool: &str, arguments: &str) -> ToolCallAccessManifest {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let execution_cwd = parsed
+        .as_ref()
+        .and_then(|args| {
+            args.get("working_dir")
+                .or_else(|| args.get("cwd"))
+                .or_else(|| args.get("_project_scope"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut write_targets = Vec::new();
     if matches!(tool, "write_file" | "edit_file") {
-        return true;
-    }
-    if matches!(tool, "terminal" | "run_command") {
-        let Ok(args) = serde_json::from_str::<Value>(arguments) else {
-            return true;
-        };
-        if tool == "terminal" {
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
-            if !action.is_empty() && action != "run" {
-                return false;
+        if let Some(path) = parsed.as_ref().and_then(|args| {
+            ["path", "file_path", "file", "filename"]
+                .iter()
+                .find_map(|key| args.get(*key).and_then(Value::as_str))
+        }) {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
+                write_targets.push(target);
             }
         }
-        return args
-            .get("command")
-            .and_then(Value::as_str)
-            .is_none_or(|command| {
-                crate::tools::command_semantics::classify_shell_command(command).mutates_state()
-            });
     }
-    if tool == "cli_agent" {
-        return serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_none_or(|action| action.is_empty() || action == "run");
+    ToolCallAccessManifest {
+        execution_cwd,
+        read_targets: Vec::new(),
+        write_targets,
     }
-    false
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
@@ -2294,110 +2230,22 @@ fn directory_size(path: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
-fn path_is_absolute_or_home_anchored(raw: &str) -> bool {
-    Path::new(raw).is_absolute()
-        || matches!(raw, "~" | "$HOME")
-        || raw.starts_with("~/")
-        || raw.starts_with("$HOME/")
-}
-
-/// Collect filesystem operands that can narrow a mutating shell command to a
-/// bounded project root. Directory-changing/creation commands may use a
-/// relative target; other commands contribute only explicit absolute or
-/// home-anchored paths. This is intentionally scope discovery, not a shell
-/// execution parser: terminal policy remains responsible for command safety.
-fn command_path_hints(command: &str) -> Vec<CommandPathHint> {
-    let mut hints = Vec::new();
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
-        let Ok(tokens) = shell_words::split(&segment) else {
-            continue;
-        };
-        let Some(command_token) = tokens.first() else {
-            continue;
-        };
-        let command_name = Path::new(command_token)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(command_token);
-        let directory_command = matches!(command_name, "cd" | "mkdir");
-        let mut skip_next = false;
-
-        for token in tokens.iter().skip(1) {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if token == "--" {
-                continue;
-            }
-            if directory_command && matches!(token.as_str(), "-m" | "--mode") {
-                skip_next = true;
-                continue;
-            }
-
-            let (raw, directory_target) = if let Some((flag, value)) = token.split_once('=') {
-                let directory_flag = matches!(
-                    flag,
-                    "--cwd" | "--dir" | "--directory" | "--prefix" | "--project" | "--root"
-                );
-                if !directory_flag && !path_is_absolute_or_home_anchored(value) {
-                    continue;
-                }
-                (value, directory_flag || directory_command)
-            } else {
-                if token.starts_with('-') {
-                    continue;
-                }
-                if !directory_command && !path_is_absolute_or_home_anchored(token) {
-                    continue;
-                }
-                (token.as_str(), directory_command)
-            };
-
-            if matches!(raw, "." | "..") || raw.contains("://") {
-                continue;
-            }
-            let candidate = CommandPathHint {
-                raw: raw.to_string(),
-                directory_target,
-            };
-            if !hints.iter().any(|existing| existing == &candidate) {
-                hints.push(candidate);
-            }
-        }
-    }
-    hints
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn read_only_terminal_commands_do_not_request_filesystem_checkpoints() {
-        for command in [
-            "find \"$HOME/projects\" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print | wc -l",
-            "node --version",
-            "npm --version",
-            "wrangler --version",
-            "wrangler whoami",
-            "node --version && npm --version && wrangler --version && wrangler whoami",
-        ] {
-            let arguments = json!({ "action": "run", "command": command }).to_string();
-            for tool in ["terminal", "run_command"] {
-                assert!(
-                    !tool_action_can_mutate(tool, &arguments),
-                    "{tool} read-only introspection must not request a checkpoint: {command}"
-                );
-            }
-        }
-
-        let mutating = json!({
-            "action": "run",
-            "command": "touch generated.txt"
-        })
-        .to_string();
-        assert!(tool_action_can_mutate("terminal", &mutating));
+    fn shell_source_has_no_checkpoint_authority() {
+        let observational = checkpoint_access_manifest(
+            "terminal",
+            &json!({ "action": "run", "command": "node --version" }).to_string(),
+        );
+        let mutation_claim = checkpoint_access_manifest(
+            "terminal",
+            &json!({ "action": "run", "command": "touch generated.txt" }).to_string(),
+        );
+        assert!(observational.write_targets.is_empty());
+        assert_eq!(observational, mutation_claim);
     }
 
     #[tokio::test]
@@ -2508,27 +2356,8 @@ mod tests {
         assert!(!target.exists());
     }
 
-    #[test]
-    fn command_path_hints_distinguish_directory_targets() {
-        let hints = command_path_hints(
-            "cd /workspace && mkdir -p prompting-studio && npm --prefix=/workspace/prompting-studio install",
-        );
-        assert!(hints.contains(&CommandPathHint {
-            raw: "/workspace".to_string(),
-            directory_target: true,
-        }));
-        assert!(hints.contains(&CommandPathHint {
-            raw: "prompting-studio".to_string(),
-            directory_target: true,
-        }));
-        assert!(hints.contains(&CommandPathHint {
-            raw: "/workspace/prompting-studio".to_string(),
-            directory_target: true,
-        }));
-    }
-
     #[tokio::test]
-    async fn terminal_checkpoint_narrows_container_scope_to_command_child() {
+    async fn terminal_checkpoint_uses_typed_write_target() {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -2558,21 +2387,25 @@ mod tests {
         let project = workspace_container.path().join("prompting-studio");
         let args = json!({
             "action": "run",
-            "command": format!(
-                "cd {} && mkdir -p {} && npm --prefix={} install",
-                workspace_container.path().display(),
-                project.display(),
-                project.display()
-            ),
+            "command": "opaque shell payload",
             "_project_scope": workspace_container.path(),
             "_session_id": "telegram:synthetic-user-1",
             "_task_id": "task-prompting-studio",
             "_turn_id": "turn-prompting-studio"
         })
         .to_string();
+        let manifest = ToolCallAccessManifest {
+            execution_cwd: Some(workspace_container.path().to_string_lossy().into_owned()),
+            read_targets: Vec::new(),
+            write_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                project.to_string_lossy(),
+            )
+            .unwrap()],
+        };
 
         let checkpoint = manager
-            .begin_for_tool("terminal", &args)
+            .begin_for_access_manifest("terminal", &args, &manifest)
             .await
             .unwrap()
             .expect("the command child should receive a bounded checkpoint");
@@ -2586,7 +2419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_checkpoint_rejects_multiple_command_project_roots() {
+    async fn terminal_checkpoint_rejects_multiple_typed_project_roots() {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -2617,15 +2450,26 @@ mod tests {
         let second = workspace_container.path().join("second-project");
         let args = json!({
             "action": "run",
-            "command": format!("mkdir -p {} {}", first.display(), second.display()),
+            "command": "opaque shell payload",
             "_project_scope": workspace_container.path(),
             "_session_id": "telegram:synthetic-user-1",
             "_task_id": "task-multi-root"
         })
         .to_string();
+        let manifest = ToolCallAccessManifest {
+            execution_cwd: Some(workspace_container.path().to_string_lossy().into_owned()),
+            read_targets: Vec::new(),
+            write_targets: [first, second]
+                .into_iter()
+                .map(|path| {
+                    ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path.to_string_lossy())
+                        .unwrap()
+                })
+                .collect(),
+        };
 
         let error = manager
-            .begin_for_tool("terminal", &args)
+            .begin_for_access_manifest("terminal", &args, &manifest)
             .await
             .expect_err("one checkpoint must not cover two project roots");
         assert!(error.to_string().contains("multiple project roots"));

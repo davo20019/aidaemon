@@ -1,7 +1,4 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use crate::agent::recall_guardrails::{
-    looks_like_personal_memory_recall_question, user_is_reaffirmation_challenge,
-};
 use crate::agent::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,9 +101,13 @@ async fn finalize_turn_assessment(
     model: &str,
     planner_trust_tier: &str,
 ) -> (TurnContext, bool) {
-    let confident_shape = plan
+    // Only the relationship producer may select an antecedent. The contract
+    // producer's task shape remains useful for execution mode/confidence, but
+    // its relationship fields have no dialogue-state authority.
+    let relationship_shape = relationship_fallback
+        .filter(|shape| super::task_planning::planned_task_relationship_is_complete(shape));
+    let execution_shape = plan
         .and_then(|plan| plan.task_shape.as_ref())
-        .or(relationship_fallback)
         .filter(|shape| {
             matches!(
                 shape
@@ -129,7 +130,7 @@ async fn finalize_turn_assessment(
             == Some(crate::agent::followup::FollowupMode::ClarificationAnswer);
         let (relationship, semantic_scope, reason_code) = if structural_resume {
             ("continuation", "none", "runtime_resume_edge")
-        } else if let Some(shape) = confident_shape {
+        } else if let Some(shape) = relationship_shape {
             let requested = shape
                 .request_relationship
                 .as_deref()
@@ -228,25 +229,18 @@ async fn finalize_turn_assessment(
     let mut compiled_filesystem_access = None;
     let mut compiled_project_scope = None;
 
-    if let Some(shape) = confident_shape {
+    if let Some(shape) = execution_shape {
         turn_context.continue_inline_after_background_start = shape
             .continue_inline_after_background_start
             .unwrap_or(false);
     }
 
     if let Some(signals) = plan.and_then(|plan| plan.contract.as_ref()) {
-        let structural_filesystem_resources =
-            crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
-                user_text,
-                &agent.path_aliases.projects,
-            );
-        let mut structural_project_scopes = Vec::new();
-        crate::agent::project_scope::extract_project_scopes_from_text(
-            user_text,
-            &mut structural_project_scopes,
-            8,
-            &agent.path_aliases.projects,
-        );
+        // Authority comes from the typed contract producer. Text-level path
+        // extraction is presentation assistance, not a control-plane input;
+        // actual calls contribute their prepared access manifests lazily.
+        let structural_filesystem_resources = Vec::new();
+        let structural_project_scopes = Vec::new();
         let compiled = super::contract_compiler::compile_task_contract(
             super::contract_compiler::ContractCompilerInput {
                 signals,
@@ -569,12 +563,9 @@ async fn build_isolated_mandate_bootstrap(
         resume_execution_snapshot: None,
         emitter,
         learning_ctx,
-        is_reaffirmation_challenge_turn: false,
-        restrict_to_personal_memory_tools: false,
         active_skill_names,
         active_untrusted_external_reference_skills: Vec::new(),
         restrict_untrusted_external_reference_tools: false,
-        personal_memory_tool_call_cap: 0,
         tools_allowed_for_user: true,
         available_capabilities,
         base_tool_defs,
@@ -831,35 +822,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         );
     }
 
-    let mut is_personal_memory_recall_turn = looks_like_personal_memory_recall_question(user_text);
-    let is_reaffirmation_challenge_turn = user_is_reaffirmation_challenge(user_text);
-    if is_reaffirmation_challenge_turn && !is_personal_memory_recall_turn {
-        if let Ok(history) = agent.state.get_history(session_id, 8).await {
-            // Challenge turns like "Are you sure?" inherit context from the
-            // immediately previous user request.
-            let mut skipped_current = false;
-            for msg in history.iter().rev() {
-                if msg.role != "user" {
-                    continue;
-                }
-                let Some(content) = msg.content.as_deref() else {
-                    continue;
-                };
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if !skipped_current && trimmed.eq_ignore_ascii_case(user_text.trim()) {
-                    skipped_current = true;
-                    continue;
-                }
-                if looks_like_personal_memory_recall_question(trimmed) {
-                    is_personal_memory_recall_turn = true;
-                }
-                break;
-            }
-        }
-    }
     // Bootstrap tool exposure happens before per-task model selection. Use the
     // runtime primary model's trust tier to decide whether policy filtering is
     // merely observed or may narrow the roster.
@@ -868,8 +830,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let llm_router = llm_runtime_snapshot.router();
     let autonomous_bootstrap = agent.trust_tier_for_model(&llm_runtime_snapshot.primary_model())
         == crate::agent::trust_tier::ModelTrustTier::Autonomous;
-    let restrict_to_personal_memory_tools = false;
-    let personal_memory_tool_call_cap = 4;
 
     // Tools are owner-only by default. A Guest can receive a tiny file-tool
     // subset only through an explicit, active, channel-bound workspace grant.
@@ -996,19 +956,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     Agent::sort_tool_definitions_by_name(&mut tool_defs);
 
     let mut policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
-    if is_personal_memory_recall_turn
-        && matches!(policy_bundle.policy.model_profile, ModelProfile::Cheap)
-        && policy_bundle
-            .policy
-            .escalate("critical_recall_turn_requires_primary")
-    {
-        info!(
-            session_id,
-            new_profile = ?policy_bundle.policy.model_profile,
-            "Escalated model profile for critical personal recall turn"
-        );
-    }
-
     if !tool_defs.is_empty() {
         let shadow_filtered = agent.filter_tool_definitions_for_policy(
             &tool_defs,
@@ -1249,63 +1196,77 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .map(|summary| summary.summary.as_str()),
         &initial_turn_context.assessment_recent_messages,
     );
-    let (task_plan, task_assessment_attempted) = if let Some(reason) = planner_skip_reason {
-        agent
-            .emit_decision_point(
-                &emitter,
-                &task_id,
-                0,
-                assessment_decision_type,
-                "Task assessment skipped".to_string(),
-                crate::agent::hand_holding_telemetry::planner_skip_metadata(
-                    reason,
-                    &model,
-                    planner_trust_tier,
-                ),
-            )
-            .await;
-        (None, false)
-    } else {
-        agent
-            .emit_decision_point(
-                &emitter,
-                &task_id,
-                0,
-                assessment_decision_type,
-                "Task assessment attempted".to_string(),
-                crate::agent::hand_holding_telemetry::planner_result_metadata(
-                    "attempted",
-                    planner_model,
-                    planner_trust_tier,
-                    crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
-                    None,
-                ),
-            )
-            .await;
-        (
-            super::task_planning::generate_task_plan(
-                llm_provider.clone(),
-                &planner_models,
-                user_text,
-                planner_context.as_deref(),
-                assessment_mode,
-                Some(super::task_planning::PlannerTelemetryCtx {
-                    emitter: &emitter,
-                    state: agent.state.as_ref(),
-                    session_id,
-                    task_id: &task_id,
-                }),
-            )
-            .await,
-            true,
-        )
-    };
     let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
         emitter: &emitter,
         state: agent.state.as_ref(),
         session_id,
         task_id: &task_id,
     });
+    let (task_plan, task_assessment_attempted, relationship_fallback) =
+        if let Some(reason) = planner_skip_reason {
+            agent
+                .emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    assessment_decision_type,
+                    "Task assessment skipped".to_string(),
+                    crate::agent::hand_holding_telemetry::planner_skip_metadata(
+                        reason,
+                        &model,
+                        planner_trust_tier,
+                    ),
+                )
+                .await;
+            (None, false, None)
+        } else {
+            agent
+                .emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    assessment_decision_type,
+                    "Task assessment attempted".to_string(),
+                    crate::agent::hand_holding_telemetry::planner_result_metadata(
+                        "attempted",
+                        planner_model,
+                        planner_trust_tier,
+                        crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
+                        None,
+                    ),
+                )
+                .await;
+            // Contract and dialogue relationship are independent read-only
+            // producers. Run them concurrently under their own deadlines so a
+            // slow contract model cannot delay the lightweight relationship lane.
+            // Contract authority and obligations belong to the current request
+            // only. Prior conversation is visible exclusively to the relationship
+            // producer; carryover must cross its typed antecedent/adoption edge.
+            let contract_future = super::task_planning::generate_task_plan(
+                llm_provider.clone(),
+                &planner_models,
+                user_text,
+                assessment_mode,
+                planner_telemetry,
+            );
+            let relationship_future = async {
+                match planner_context.as_deref() {
+                    Some(context) => {
+                        super::task_planning::generate_task_relationship(
+                            llm_provider.clone(),
+                            planner_model,
+                            user_text,
+                            context,
+                            planner_telemetry,
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            };
+            let (task_plan, relationship) = tokio::join!(contract_future, relationship_future);
+            (task_plan, true, relationship)
+        };
     let available_tool_names = tool_defs
         .iter()
         .filter_map(|definition| {
@@ -1317,41 +1278,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 .map(str::to_string)
         })
         .collect::<Vec<_>>();
-    let mut relationship_fallback = None;
-    if task_assessment_attempted && task_plan.is_none() {
-        // Contract classification has one authoritative structured compiler.
-        // It already owns bounded model failover, so a second prompt with a
-        // subtly different schema would create disagreement rather than
-        // recovery. Dialogue relationship remains an independent typed lane.
-        if let Some(planner_context) = planner_context.as_deref() {
-            relationship_fallback = super::task_planning::generate_task_relationship(
-                llm_provider.clone(),
-                planner_model,
-                user_text,
-                planner_context,
-                planner_telemetry,
-            )
-            .await;
-        }
-    }
-    if relationship_fallback.is_none()
-        && task_assessment_attempted
-        && task_plan
-            .as_ref()
-            .and_then(|plan| plan.task_shape.as_ref())
-            .is_none_or(|shape| !super::task_planning::planned_task_relationship_is_complete(shape))
-    {
-        if let Some(planner_context) = planner_context.as_deref() {
-            relationship_fallback = super::task_planning::generate_task_relationship(
-                llm_provider.clone(),
-                planner_model,
-                user_text,
-                planner_context,
-                planner_telemetry,
-            )
-            .await;
-        }
-    }
     let (turn_context, semantic_contract_applied) = finalize_turn_assessment(
         agent,
         &emitter,
@@ -1637,12 +1563,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
         emitter,
         learning_ctx,
-        is_reaffirmation_challenge_turn,
-        restrict_to_personal_memory_tools,
         active_skill_names,
         active_untrusted_external_reference_skills,
         restrict_untrusted_external_reference_tools,
-        personal_memory_tool_call_cap,
         tools_allowed_for_user,
         available_capabilities,
         base_tool_defs,
@@ -1749,7 +1672,7 @@ mod mandate_bootstrap_isolation_tests {
         assert!(data.project_instruction_tracker.is_none());
         assert!(data.llm_router.is_none());
         assert!(!data.route_failsafe_active);
-        assert!(data.turn_context.recent_messages.is_empty());
+        assert!(data.turn_context.assessment_recent_messages.is_empty());
         assert!(data.turn_context.primary_project_scope.is_none());
         assert_eq!(
             data.turn_context.goal_user_text,

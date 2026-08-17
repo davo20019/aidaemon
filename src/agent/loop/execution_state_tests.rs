@@ -8,7 +8,6 @@ use crate::agent::{CompletionContract, CompletionTaskKind, FollowupMode, TurnCon
 use crate::traits::{
     ToolCallMetadata, ToolCallSemantics, ToolResultPresentation, ToolTargetHintKind,
 };
-use serde_json::json;
 
 #[test]
 fn top_level_requests_use_model_directed_standard_budget() {
@@ -65,6 +64,8 @@ fn compile_step_plan_uses_scope_and_idempotency_for_mutations() {
         ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Path, "src/main.rs");
     let plan = compile_step_execution_plan(
         "exec-1",
+        "operation-1".to_string(),
+        None,
         3,
         2,
         "call-1",
@@ -105,6 +106,8 @@ fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
     );
     let plan = compile_step_execution_plan(
         "exec-1",
+        "operation-1".to_string(),
+        None,
         3,
         2,
         "call-1",
@@ -137,6 +140,8 @@ fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
 fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
     let plan = compile_step_execution_plan(
         "exec-1",
+        "operation-1".to_string(),
+        None,
         1,
         1,
         "call-1",
@@ -155,6 +160,103 @@ fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
     );
     assert_eq!(plan.approval_requirement, ApprovalRequirement::NotNeeded);
     assert!(plan.idempotency_key.is_none());
+}
+
+#[test]
+fn operation_retry_budget_separates_invocations_from_dispatched_attempts() {
+    let compile = |call_id: &str| {
+        compile_step_execution_plan(
+            "exec-1",
+            "contract:task-1:requirements:0".to_string(),
+            Some(2),
+            1,
+            1,
+            call_id,
+            "terminal",
+            r#"{"action":"run","command":"/usr/bin/true","working_dir":"/tmp"}"#,
+            &ToolCallSemantics::observation(),
+            &Default::default(),
+            ToolCapabilities {
+                read_only: false,
+                external_side_effect: true,
+                needs_approval: true,
+                idempotent: false,
+                high_impact_write: true,
+            },
+            &[],
+        )
+    };
+    let mut state = ExecutionState::new(
+        BudgetTier::Small,
+        default_execution_budget(BudgetTier::Small),
+        ExecutionPersistence::Ephemeral,
+    );
+
+    state.stage_step(compile("proposal-rejected-before-io"));
+    assert!(state.begin_staged_step());
+    // No dispatch was recorded, so a corrected proposal still owns the first
+    // and only operation attempt.
+    state.stage_step(compile("corrected-proposal"));
+    assert!(state.begin_staged_step());
+    state.record_current_operation_dispatch();
+
+    state.stage_step(compile("model-retry-with-new-id"));
+    assert!(!state.begin_staged_step());
+    assert_eq!(
+        state
+            .operation_attempts
+            .get("contract:task-1:requirements:0"),
+        Some(&1)
+    );
+    assert_eq!(
+        state
+            .operation_invocations
+            .get("contract:task-1:requirements:0"),
+        Some(&2)
+    );
+}
+
+#[test]
+fn explicit_single_invocation_limit_counts_pre_io_rejection() {
+    let plan = compile_step_execution_plan(
+        "exec-1",
+        "contract:task-1:requirements:0".to_string(),
+        Some(1),
+        1,
+        1,
+        "proposal-1",
+        "run_command",
+        r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#,
+        &ToolCallSemantics::observation(),
+        &Default::default(),
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        },
+        &[],
+    );
+    let mut state = ExecutionState::new(
+        BudgetTier::Small,
+        default_execution_budget(BudgetTier::Small),
+        ExecutionPersistence::Ephemeral,
+    );
+
+    state.stage_step(plan.clone());
+    assert!(state.begin_staged_step());
+    // The adapter rejects before I/O, so no execution attempt is charged.
+    assert!(state.operation_attempts.is_empty());
+
+    state.stage_step(plan);
+    assert!(!state.begin_staged_step());
+    assert_eq!(
+        state
+            .operation_invocations
+            .get("contract:task-1:requirements:0"),
+        Some(&1)
+    );
 }
 
 #[test]
@@ -298,10 +400,6 @@ fn auth_management_requests_use_standard_budget() {
 fn contextual_followups_start_with_standard_budget() {
     let turn_context = TurnContext {
         followup_mode: Some(FollowupMode::Followup),
-        recent_messages: vec![json!({
-            "role": "assistant",
-            "content": "Here are 20 matching studies with short summaries."
-        })],
         ..TurnContext::default()
     };
     let (tier, _route_kind, budget) = select_initial_execution_budget(
@@ -321,10 +419,6 @@ fn clarification_followups_promote_scoped_edits_to_standard_budget() {
     let turn_context = TurnContext {
         primary_project_scope: Some("/tmp/demo".to_string()),
         followup_mode: Some(FollowupMode::ClarificationAnswer),
-        recent_messages: vec![json!({
-            "role": "assistant",
-            "content": "Which file should I update?"
-        })],
         ..TurnContext::default()
     };
     let (tier, route_kind, budget) = select_initial_execution_budget(

@@ -5,7 +5,6 @@ pub mod browser;
 #[cfg(feature = "slack")]
 mod channel_history;
 mod cli_agent;
-pub(crate) mod command_semantics;
 #[cfg(feature = "computer_use")]
 #[allow(dead_code)]
 pub mod computer_use;

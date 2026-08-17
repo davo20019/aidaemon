@@ -265,7 +265,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         anyhow::ensure!(
             matches!(
                 trigger_type,
-                "finite" | "scheduled" | "manual" | "mandate" | "legacy"
+                "finite" | "scheduled" | "manual" | "mandate" | "recovery" | "legacy"
             ),
             "unsupported goal run trigger type"
         );
@@ -379,6 +379,21 @@ impl WorkCoordinationStore for SqliteStateStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(goal_run_from_row).collect())
+    }
+
+    async fn get_goal_run_for_task(&self, task_id: &str) -> anyhow::Result<Option<GoalRun>> {
+        let row = sqlx::query(
+            "SELECT gr.id, gr.project_id, gr.goal_id, gr.trigger_type, gr.schedule_id,
+                    gr.root_task_id, gr.status, gr.outcome_summary, gr.started_at,
+                    gr.completed_at, gr.created_at, gr.updated_at
+             FROM tasks AS t
+             JOIN goal_runs AS gr ON gr.id = t.goal_run_id
+             WHERE t.id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(goal_run_from_row))
     }
 
     async fn get_tasks_for_goal_run(&self, run_id: &str) -> anyhow::Result<Vec<Task>> {

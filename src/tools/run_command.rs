@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use crate::execution::active_execution_backend;
 use crate::traits::{
     Tool, ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolOutcomeStatus, ToolRole, ToolTargetHint, ToolTargetHintKind,
+    ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
 
-use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
@@ -117,15 +117,20 @@ const SAFE_PREFIXES: &[&str] = &[
 ];
 
 fn run_command_semantics(arguments: &str) -> ToolCallSemantics {
-    serde_json::from_str::<Value>(arguments)
+    let workspace_write = serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| {
             value
-                .get("command")
+                .get("access")
                 .and_then(Value::as_str)
-                .map(classify_shell_command)
+                .map(|access| access == "workspace_write")
         })
-        .unwrap_or_else(ToolCallSemantics::mutation)
+        .unwrap_or(false);
+    if workspace_write {
+        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_DERIVED_WRITE)
+    } else {
+        ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
+    }
 }
 
 fn run_command_access_manifest(arguments: &str) -> ToolCallAccessManifest {
@@ -179,6 +184,11 @@ impl Tool for RunCommandTool {
                         "type": "string",
                         "description": "Working directory (default: configured execution workspace root)"
                     },
+                    "access": {
+                        "type": "string",
+                        "enum": ["read_only", "workspace_write"],
+                        "description": "Capability enforced by the process sandbox. Use read_only for inspection and predicates; use workspace_write only when the command must create derived files in working_dir."
+                    },
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Timeout in seconds (default: 30, max: 300)"
@@ -189,7 +199,7 @@ impl Tool for RunCommandTool {
                         "description": "Output parsing format for structured results (default: plain)"
                     }
                 },
-                "required": ["command"],
+                "required": ["command", "access"],
                 "additionalProperties": false
             }
         })
@@ -286,7 +296,9 @@ impl RunCommandTool {
         // run from an accidental daemon launch directory (frequently `/` for a
         // service) produces a misleading generic exit 128 and invites the model
         // to guess at repository state.
-        if trimmed == "git" || trimmed.starts_with("git ") {
+        let is_git_command = trimmed == "git" || trimmed.starts_with("git ");
+        let mut adapter_read_paths = Vec::new();
+        if is_git_command {
             let preflight =
                 fs_utils::run_cmd_backend("git rev-parse --show-toplevel", Some(&dir), 5).await?;
             if preflight.exit_code != 0 {
@@ -295,29 +307,80 @@ impl RunCommandTool {
                     dir
                 );
             }
+            let metadata = fs_utils::run_cmd_backend(
+                "git rev-parse --path-format=absolute --git-dir --git-common-dir",
+                Some(&dir),
+                5,
+            )
+            .await?;
+            if metadata.exit_code != 0 {
+                anyhow::bail!(
+                    "Git metadata discovery failed for execution directory '{}'.",
+                    dir
+                );
+            }
+            for path in metadata.stdout.lines().map(str::trim) {
+                if path.starts_with('/') && !adapter_read_paths.iter().any(|seen| seen == path) {
+                    adapter_read_paths.push(path.to_string());
+                }
+            }
         }
+
+        // `/usr/bin/git` is an xcrun shim on macOS. Resolving the concrete
+        // developer-tool executable before confinement prevents the shim from
+        // attempting a cache write during a read-only observation. This is an
+        // adapter/environment normalization, not a write grant.
+        #[cfg(target_os = "macos")]
+        let executable_command = if is_git_command {
+            let resolved = fs_utils::run_cmd_backend("xcrun --find git", Some(&dir), 5).await?;
+            if resolved.exit_code != 0 {
+                anyhow::bail!("Could not resolve the macOS Git executable before confinement.");
+            }
+            let git_path = resolved.stdout.trim();
+            if !git_path.starts_with('/') || git_path.contains(['\n', '\r']) {
+                anyhow::bail!("macOS returned an invalid Git executable path.");
+            }
+            format!(
+                "{}{}",
+                quote_shell_word(git_path),
+                trimmed.strip_prefix("git").unwrap_or_default()
+            )
+        } else {
+            trimmed.to_string()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let executable_command = trimmed.to_string();
 
         let semantics = self.call_semantics(arguments);
         let started = Instant::now();
-        let execution = if semantics.mutates_state() {
-            let request = crate::tools::terminal::confined_terminal_execution_request(
-                &backend,
-                trimmed,
-                Some(dir.as_str()),
-                &[],
-                &[dir.to_string()],
-            )
+        let write_paths = semantics.mutates_state().then(|| vec![dir.to_string()]);
+        let mut request = crate::tools::terminal::confined_terminal_execution_request(
+            &backend,
+            &executable_command,
+            Some(dir.as_str()),
+            &adapter_read_paths,
+            write_paths.as_deref().unwrap_or(&[]),
+        )
+        .await?;
+        if !semantics.mutates_state() {
+            // Git inspection ordinarily refreshes its index opportunistically.
+            // Disable optional locks for every observation capability so the
+            // process remains compatible with the enforced read-only sandbox.
+            request
+                .env
+                .insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+            if is_git_command {
+                request
+                    .env
+                    .insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+                request
+                    .env
+                    .insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+            }
+        }
+        let execution = backend
+            .execute(request, Duration::from_secs(timeout))
             .await?;
-            backend
-                .execute(request, Duration::from_secs(timeout))
-                .await?
-        } else {
-            let mut request = crate::execution::ExecutionRequest::shell(trimmed);
-            request.cwd = Some(dir.clone());
-            backend
-                .execute(request, Duration::from_secs(timeout))
-                .await?
-        };
         if execution.timed_out {
             anyhow::bail!("Command timed out after {}s", timeout);
         }
@@ -328,6 +391,14 @@ impl RunCommandTool {
             duration_ms: started.elapsed().as_millis() as u64,
         };
         let output = format_output(&result, trimmed, parse_format)?;
+        let mut actual_access_manifest = self.call_access_manifest(arguments);
+        for path in adapter_read_paths {
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
+                if !actual_access_manifest.read_targets.contains(&target) {
+                    actual_access_manifest.read_targets.push(target);
+                }
+            }
+        }
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -341,10 +412,15 @@ impl RunCommandTool {
                     ToolOutcomeStatus::CompletedWithNegativeResult
                 }),
                 exit_code: Some(result.exit_code),
+                access_manifest: Some(actual_access_manifest),
                 ..ToolCallMetadata::default()
             },
         })
     }
+}
+
+fn quote_shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn is_safe_command(cmd: &str) -> bool {
@@ -576,11 +652,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_command_defaults_to_the_execution_workspace() {
-        let args = json!({"command": "git status --short --branch"}).to_string();
-        let result = RunCommandTool.call(&args).await.unwrap();
-        assert!(result.contains("exit: 0"));
-        assert!(result.contains("## "));
+    async fn git_command_uses_the_selected_execution_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let args = json!({
+            "command": "git status --short --branch",
+            "working_dir": dir.path().to_str().unwrap()
+        })
+        .to_string();
+        let outcome = RunCommandTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("exit: 0"), "{}", outcome.output,);
+        assert!(outcome.output.contains("## "));
     }
 
     #[tokio::test]

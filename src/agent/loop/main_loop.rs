@@ -429,12 +429,9 @@ impl Agent {
             resume_execution_snapshot,
             emitter,
             mut learning_ctx,
-            is_reaffirmation_challenge_turn,
-            restrict_to_personal_memory_tools,
             active_skill_names,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
-            personal_memory_tool_call_cap,
             tools_allowed_for_user,
             mut available_capabilities,
             mut base_tool_defs,
@@ -1038,90 +1035,9 @@ impl Agent {
                 },
             );
         }
-        let has_recent_tool_context = turn_context
-            .recent_messages
-            .iter()
-            .any(|row| row.get("role").and_then(|v| v.as_str()) == Some("tool"));
-        if looks_like_evidence_grounding_challenge(user_text)
-            && (turn_context.followup_mode != Some(FollowupMode::NewTask)
-                || has_recent_tool_context)
-            && self
-                .supervision_gate_enforced(
-                    "evidence_challenge_directive",
-                    &model,
-                    &emitter,
-                    &task_id,
-                    0,
-                )
-                .await
-        {
-            turn_state
-                .directives
-                .push_system_message(SystemDirective::EvidenceGroundingRequired);
-        }
-        // Only pin the model to the prior exchange for genuinely vague
-        // challenges ("Are you sure?") — compound/new-task messages that merely
-        // contain a challenge keyword must not be anchored away from their
-        // actual request.
-        if is_reaffirmation_challenge_turn
-            && crate::agent::recall_guardrails::is_vague_reaffirmation_challenge(user_text)
-            && self
-                .supervision_gate_enforced(
-                    "reaffirmation_anchor_directive",
-                    &model,
-                    &emitter,
-                    &task_id,
-                    0,
-                )
-                .await
-        {
-            if let Ok(history) = self.state.get_history(session_id, 12).await {
-                if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
-                    &history, user_text,
-                ) {
-                    turn_state.directives.push_system_message(
-                        SystemDirective::ReaffirmationChallengeAnchor {
-                            prior_user_request: anchor.prior_user_request,
-                            prior_assistant_reply: anchor.prior_assistant_reply,
-                        },
-                    );
-                }
-            }
-        }
-        // Coreference grounding: a follow-up that carries its person referent
-        // only via a pronoun ("...what can you infer about her?") is prone to
-        // binding the pronoun to the salient pinned-profile person instead of
-        // the actual subject of the prior exchange. Anchor it to that exchange
-        // and force a memory lookup before answering.
-        else if crate::agent::recall_guardrails::looks_like_pronoun_referent_followup(user_text)
-            && self
-                .supervision_gate_enforced(
-                    "coreference_grounding_directive",
-                    &model,
-                    &emitter,
-                    &task_id,
-                    0,
-                )
-                .await
-        {
-            if let Ok(history) = self.state.get_history(session_id, 12).await {
-                if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
-                    &history, user_text,
-                ) {
-                    turn_state.directives.push_system_message(
-                        SystemDirective::CoreferenceGroundingRequired {
-                            prior_user_request: anchor.prior_user_request,
-                            prior_assistant_reply: anchor.prior_assistant_reply,
-                        },
-                    );
-                    // Signal the denial gate: coreference fired first this turn.
-                    // The two gates are mutually exclusive — coreference takes
-                    // precedence so the denial gate must not also fire and
-                    // inject a second, contradictory directive.
-                    completion_progress.coreference_fired = true;
-                }
-            }
-        }
+        // Dialogue carryover is resolved once by the typed relationship lane.
+        // The selected antecedent controls context projection; response words
+        // such as challenges or pronouns do not install a second hidden edge.
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
         if let Some(known_project_dir) = turn_context.primary_project_scope.clone() {
             turn_state.evidence.set_known_project_dir(known_project_dir);
@@ -1391,14 +1307,15 @@ impl Agent {
                 }
             }
 
-            // An unfulfilled Change/Deliver contract must retain execution
-            // capability. Recovery branches may request force-text for generic
-            // stall control, so clamp that shared state at the loop boundary.
+            // An unfulfilled Change/Deliver contract or unresolved dispatched
+            // failure must retain execution capability. Recovery branches may
+            // request force-text for generic stall control, so clamp that
+            // shared state at the loop boundary.
             if turn_state.recovery.force_text_response()
-                && !completion_contract_allows_force_text(
+                && (!completion_contract_allows_force_text(
                     &turn_context.completion_contract,
                     &completion_progress,
-                )
+                ) || execution_state.has_unresolved_recoverable_failure())
             {
                 turn_state.recovery.set_force_text_response(false);
                 turn_state.recovery.reset_force_text_iterations();
@@ -1877,13 +1794,10 @@ impl Agent {
                     task_tokens_used: turn_state.budget.task_tokens_used(),
                     user_text,
                     model: &model,
-                    restrict_to_personal_memory_tools,
                     active_skill_names: &active_skill_names,
                     active_untrusted_external_reference_skills:
                         &active_untrusted_external_reference_skills,
                     restrict_untrusted_external_reference_tools,
-                    is_reaffirmation_challenge_turn,
-                    personal_memory_tool_call_cap,
                     base_tool_defs: &base_tool_defs,
                     available_capabilities: &available_capabilities,
                     policy_bundle: &policy_bundle,
@@ -1902,7 +1816,6 @@ impl Agent {
                     tool_cooldown_until_iteration: tool_execution_failures
                         .tool_cooldown_until_iteration,
                     tool_call_count: tool_execution_counters.tool_call_count,
-                    personal_memory_tool_calls: tool_execution_counters.personal_memory_tool_calls,
                     no_evidence_result_streak: tool_execution_evidence.no_evidence_result_streak,
                     no_evidence_tools_seen: tool_execution_evidence.no_evidence_tools_seen,
                     evidence_gain_count: tool_execution_evidence.evidence_gain_count,
@@ -2102,7 +2015,8 @@ mod stuck_fallback_tests {
         let mut metadata = crate::traits::ToolCallMetadata {
             outcome_status: Some(status),
             exit_code: Some(exit_code),
-            semantics: crate::tools::command_semantics::classify_shell_command("/usr/bin/false"),
+            semantics: crate::traits::ToolCallSemantics::observation()
+                .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
             ..crate::traits::ToolCallMetadata::default()
         };
         super::super::tool_execution_phase::complete_tool_result_semantics(
@@ -2168,6 +2082,7 @@ mod stuck_fallback_tests {
                     ],
                     requires_output: false,
                     contract_rejected: None,
+                    max_invocations: None,
                 }),
                 target: None,
             }],

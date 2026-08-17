@@ -1,8 +1,7 @@
 //! Goal/task dispatch helpers extracted from `agent/mod.rs` (Phase 5 decoupling).
 //!
-//! Pure relocation — no logic changes. Groups wait-prefix parsing, scheduled-run
-//! provenance/state persistence, low-signal reply detection, evidence-grounding
-//! challenge detection, and goal/task result summary builders.
+//! Groups wait-prefix parsing, scheduled-run provenance/state persistence, file
+//! delivery helpers, and goal/task result summary builders.
 
 use std::sync::Arc;
 
@@ -10,13 +9,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
-#[cfg(test)]
-use crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished;
 use crate::traits::{Goal, ScheduledRunState, StateStore, Task};
 
-#[cfg(test)]
-use super::response_analysis::{is_substantive_text_response, looks_like_deferred_action_response};
-use super::{contains_keyword_as_words, Agent};
+use super::Agent;
 
 /// Recurring runs may spend one additional envelope when their durable health
 /// snapshot shows concrete progress. This is intentionally small: autonomy
@@ -161,49 +156,8 @@ pub fn is_group_session(session_id: &str) -> bool {
     crate::session::is_group_session(session_id)
 }
 
-pub(in crate::agent) fn is_scheduled_task_description(text: &str) -> bool {
-    let trimmed = text.trim_start().to_ascii_lowercase();
-    trimmed.starts_with("execute scheduled goal:")
-        || trimmed.starts_with("scheduled check:")
-        || trimmed.starts_with("manual scheduled run:")
-}
-
-/// Root tasks are orchestration envelopes, not user-facing work results.
-///
-/// Keep scheduled provenance deliberately narrower than this helper: mandate
-/// reviews have their own trigger type and must never inherit schedule trust or
-/// schedule lifecycle behavior merely because they are also goal-run roots.
-pub(in crate::agent) fn is_goal_run_root_task_description(text: &str) -> bool {
-    is_scheduled_task_description(text)
-        || text
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("mandate review:")
-}
-
 pub(in crate::agent) fn user_facing_task_description(description: &str) -> String {
-    static SCHEDULED_TASK_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)^\s*(?:execute scheduled goal:|scheduled check:|manual scheduled run:)\s*")
-            .expect("scheduled task prefix regex should compile")
-    });
-    static SCHEDULED_SYSTEM_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)\s*\[system:[^\]]*\]\s*$")
-            .expect("scheduled task suffix regex should compile")
-    });
-
-    let mut cleaned = description.trim().to_string();
-    if is_scheduled_task_description(&cleaned) {
-        cleaned = SCHEDULED_SYSTEM_SUFFIX_RE
-            .replace(&cleaned, "")
-            .trim()
-            .to_string();
-        cleaned = SCHEDULED_TASK_PREFIX_RE
-            .replace(&cleaned, "")
-            .trim()
-            .to_string();
-    }
-
-    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&cleaned);
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(description.trim());
     let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         "current task".to_string()
@@ -217,8 +171,8 @@ pub(in crate::agent) async fn task_has_scheduled_provenance(
     task_id: Option<&str>,
 ) -> bool {
     if let Some(tid) = task_id {
-        if let Ok(Some(task)) = state.get_task(tid).await {
-            return is_scheduled_task_description(&task.description);
+        if let Ok(Some(run)) = state.get_goal_run_for_task(tid).await {
+            return run.trigger_type == "scheduled";
         }
     }
 
@@ -229,24 +183,14 @@ pub(in crate::agent) async fn active_scheduled_root_task_id(
     state: &Arc<dyn StateStore>,
     goal_id: &str,
 ) -> Option<String> {
-    let tasks = state.get_tasks_for_goal(goal_id).await.ok()?;
-    tasks
+    state
+        .get_goal_runs(goal_id)
+        .await
+        .ok()?
         .into_iter()
-        .filter(|task| is_scheduled_task_description(&task.description))
-        .filter(|task| {
-            !matches!(
-                task.status.as_str(),
-                "completed"
-                    | "failed"
-                    | "cancelled"
-                    | "skipped"
-                    | "blocked"
-                    | "interrupted"
-                    | "abandoned"
-            )
-        })
-        .max_by(|a, b| a.created_at.cmp(&b.created_at))
-        .map(|task| task.id)
+        .filter(|run| run.trigger_type == "scheduled")
+        .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
+        .find_map(|run| run.root_task_id)
 }
 
 pub(in crate::agent) async fn goal_has_scheduled_provenance(
@@ -264,11 +208,8 @@ pub(in crate::agent) async fn goal_has_scheduled_provenance(
         }
     }
 
-    if let Ok(tasks) = state.get_tasks_for_goal(goal_id).await {
-        if tasks
-            .iter()
-            .any(|task| is_scheduled_task_description(&task.description))
-        {
+    if let Ok(runs) = state.get_goal_runs(goal_id).await {
+        if runs.iter().any(|run| run.trigger_type == "scheduled") {
             return true;
         }
     }
@@ -362,216 +303,6 @@ pub(in crate::agent) async fn effective_goal_daily_budget(
     shared.or(goal.budget_daily)
 }
 
-/// Detect low-signal task-lead replies that should not be sent as the
-/// primary user-facing result when richer goal/task outputs are available.
-pub(in crate::agent) fn is_low_signal_task_lead_reply(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-
-    if trimmed == "Done." || trimmed.eq_ignore_ascii_case("goal completed successfully") {
-        return true;
-    }
-
-    if trimmed.starts_with("Done — ") && !trimmed.contains('\n') {
-        return true;
-    }
-
-    if trimmed.starts_with("Goal ")
-        && trimmed.contains(" completed:")
-        && !trimmed.contains('\n')
-        && trimmed.len() <= 220
-    {
-        return true;
-    }
-
-    false
-}
-
-#[cfg(test)]
-pub(in crate::agent) fn looks_like_incomplete_live_work_summary(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let has_attempt_structure = lower.contains("what i tried:")
-        || lower.contains("current status:")
-        || (contains_keyword_as_words(&lower, "i attempted to")
-            && contains_keyword_as_words(&lower, "current status"));
-
-    let has_blocked_outcome = contains_keyword_as_words(&lower, "no results retrieved yet")
-        || contains_keyword_as_words(&lower, "no results found yet")
-        || contains_keyword_as_words(&lower, "could not retrieve results")
-        || contains_keyword_as_words(&lower, "encountered api errors")
-        || contains_keyword_as_words(&lower, "bad request")
-        || contains_keyword_as_words(&lower, "request is malformed")
-        || contains_keyword_as_words(&lower, "request was malformed")
-        || contains_keyword_as_words(&lower, "api is rejecting");
-
-    has_attempt_structure && has_blocked_outcome
-}
-
-pub(in crate::agent) fn looks_like_false_capability_denial_after_tool_success(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    const DIRECT_DENIALS: &[&str] = &[
-        "can't browse",
-        "cannot browse",
-        "can't access",
-        "cannot access",
-        "don't have access",
-        "do not have access",
-        "can't perform a live search",
-        "cannot perform a live search",
-        "unable to perform a live search",
-        "can't search the web",
-        "cannot search the web",
-        "don't have real time access",
-        "do not have real time access",
-        "don't have real-time access",
-        "do not have real-time access",
-        "don't have that in my records",
-        "do not have that in my records",
-        "don't have that in my memory",
-        "do not have that in my memory",
-        "don't have that information in my records",
-        "do not have that information in my records",
-        "don't have any record of",
-        "do not have any record of",
-        "can't access real time information",
-        "cannot access real time information",
-        "can't access real-time information",
-        "cannot access real-time information",
-        "from my training data",
-        "based on my training data",
-        "from training data",
-        "based on training data",
-    ];
-
-    if DIRECT_DENIALS.iter().any(|phrase| lower.contains(phrase)) {
-        return true;
-    }
-
-    let guide_only = lower.contains("i can guide you on how to find")
-        || lower.contains("i can guide you on how to")
-        || lower.contains("here's how to find");
-    let live_data_context = lower.contains("live search")
-        || lower.contains("current databases")
-        || lower.contains("current database")
-        || lower.contains("real time information")
-        || lower.contains("real-time information");
-
-    guide_only && live_data_context
-}
-
-pub(in crate::agent) fn looks_like_evidence_grounding_challenge(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let direct_grounding_challenges = [
-        "made them up",
-        "make them up",
-        "made that up",
-        "make that up",
-        "made this up",
-        "make this up",
-        "fabricated",
-        "invented",
-        "hallucinated",
-    ];
-    if direct_grounding_challenges
-        .iter()
-        .any(|phrase| contains_keyword_as_words(&lower, phrase))
-    {
-        return true;
-    }
-
-    let blocker_terms = [
-        "disabled",
-        "blocked",
-        "stopped",
-        "stop",
-        "failed",
-        "failure",
-        "error",
-        "errors",
-        "text-only",
-        "plain text",
-        "tool mode",
-        "couldn't",
-        "could not",
-        "unable",
-    ];
-    if contains_keyword_as_words(&lower, "why")
-        && blocker_terms
-            .iter()
-            .any(|term| contains_keyword_as_words(&lower, term))
-    {
-        return true;
-    }
-
-    let grounding_focus = [
-        "real", "really", "actually", "exact", "exactly", "quote", "quoted",
-    ];
-    let evidence_terms = [
-        "error", "errors", "result", "results", "output", "message", "messages", "line", "lines",
-        "status", "statuses", "id", "ids", "value", "values", "count", "counts", "failure",
-        "failures", "file", "files", "test", "tests", "api",
-    ];
-    let challenge_phrases = [
-        "show the exact output",
-        "show the exact result",
-        "what did it actually say",
-        "what did that actually say",
-        "what did the tool actually say",
-        "did it actually say",
-        "did that actually say",
-        "did it really say",
-        "did that really say",
-        "did it really return",
-        "did that really return",
-        "did it actually return",
-        "did that actually return",
-        "did it actually fail",
-        "did that actually fail",
-        "was that real",
-        "were those real",
-        "is that real",
-        "are those real",
-    ];
-
-    challenge_phrases
-        .iter()
-        .any(|phrase| contains_keyword_as_words(&lower, phrase))
-        || (grounding_focus
-            .iter()
-            .any(|word| contains_keyword_as_words(&lower, word))
-            && evidence_terms
-                .iter()
-                .any(|term| contains_keyword_as_words(&lower, term)))
-}
-
-#[cfg(test)]
-pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    goal_completion_summary_indicates_not_finished(trimmed)
-        || is_low_signal_task_lead_reply(trimmed)
-        || looks_like_incomplete_live_work_summary(trimmed)
-        || (looks_like_deferred_action_response(trimmed)
-            && !is_substantive_text_response(trimmed, 200))
-}
-
 pub(in crate::agent) fn truncate_goal_result_text(text: &str, max_chars: usize) -> String {
     let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
     let trimmed = sanitized.trim();
@@ -643,7 +374,6 @@ pub(crate) fn build_goal_failure_summary(
         .or_else(|| {
             task_lead_response
                 .map(str::trim)
-                .filter(|reply| !is_low_signal_task_lead_reply(reply))
                 .filter(|reply| !reply.is_empty())
                 .map(ToOwned::to_owned)
         })
@@ -675,7 +405,11 @@ fn is_activity_summary_result(task: &Task) -> bool {
         .is_some_and(|r| r.starts_with("Activity summary:"))
 }
 
-pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) -> String {
+pub(crate) fn build_goal_task_results_summary(
+    tasks: &[Task],
+    root_task_id: Option<&str>,
+    fallback: &str,
+) -> String {
     const MAX_INCLUDED_TASK_RESULTS: usize = 3;
     const MAX_CHARS_PER_TASK_RESULT: usize = 800;
     const MAX_CHARS_PRIMARY_RESULT: usize = 2500;
@@ -684,11 +418,9 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         .iter()
         .filter(|t| t.completed_successfully())
         .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
-        // Skip the parent "Execute scheduled goal: <goal>" task: its description
-        // is the full goal text (plus internal [SYSTEM: …] markers) and its
-        // result is a generic "completed via sub-tasks" — pure noise next to the
-        // real sub-task deliverables.
-        .filter(|t| !is_goal_run_root_task_description(&t.description))
+        // Root identity is persisted on the run. Description text is payload,
+        // never a lifecycle discriminator.
+        .filter(|t| Some(t.id.as_str()) != root_task_id)
         .collect();
 
     if successful.is_empty() {
@@ -775,13 +507,6 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
 mod summary_tests {
     use super::*;
 
-    #[test]
-    fn mandate_roots_are_filtered_without_gaining_scheduled_provenance() {
-        let description = "Mandate review: steward the account";
-        assert!(is_goal_run_root_task_description(description));
-        assert!(!is_scheduled_task_description(description));
-    }
-
     fn completed_task(id: &str, order: i32, completed_at: &str, result: &str) -> Task {
         Task {
             id: id.to_string(),
@@ -823,7 +548,8 @@ mod summary_tests {
         );
         let deliverable = completed_task("modules", 2, "2026-06-12T13:10:00Z", &deliverable_text);
 
-        let summary = build_goal_task_results_summary(&[bookkeeping, deliverable], "fallback text");
+        let summary =
+            build_goal_task_results_summary(&[bookkeeping, deliverable], None, "fallback text");
 
         let deliverable_pos = summary
             .find("Current Drupal Modules")
@@ -852,7 +578,7 @@ mod summary_tests {
         task.description =
             "Create, deploy, and verify a post using these detailed instructions".to_string();
 
-        let summary = build_goal_task_results_summary(&[task], "fallback text");
+        let summary = build_goal_task_results_summary(&[task], None, "fallback text");
 
         assert_eq!(
             summary,

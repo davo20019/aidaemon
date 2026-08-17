@@ -3,7 +3,7 @@ use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
-use crate::traits::ProviderResponse;
+use crate::traits::{ProviderResponse, ToolCallSemantics, ToolMutationEffects};
 use serde::{Deserialize, Serialize};
 
 pub(super) enum ToolPreludeOutcome {
@@ -217,6 +217,15 @@ fn tool_call_is_side_effecting(
     }
 }
 
+fn tool_call_semantics(agent: &Agent, tc: &ToolCall) -> ToolCallSemantics {
+    agent
+        .tools
+        .iter()
+        .find(|tool| tool.name() == tc.name && tool.is_available())
+        .map(|tool| tool.call_semantics(&tc.arguments))
+        .unwrap_or_default()
+}
+
 fn first_side_effecting_tool_call<'a>(
     agent: &Agent,
     resp: &'a ProviderResponse,
@@ -239,7 +248,11 @@ fn user_visible_side_effect_guard_blocks_tool(tool_name: &str, is_side_effecting
     is_side_effecting && tool_name != "spawn_agent"
 }
 
-fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCall) -> bool {
+fn scoped_action_matches_tool_call(
+    action: ForbiddenMutationAction,
+    tc: &ToolCall,
+    semantics: &ToolCallSemantics,
+) -> bool {
     // Delegation tools are opaque nested execution boundaries. If the current
     // typed contract forbids an operation, prose inside a mission cannot prove
     // that a delegate will avoid it. Fail closed until the child handoff has a
@@ -248,68 +261,34 @@ fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCal
         return true;
     }
 
-    let normalized_name = tc.name.replace(['_', '-'], " ").to_ascii_lowercase();
-    let command = if matches!(tc.name.as_str(), "terminal" | "run_command") {
-        serde_json::from_str::<Value>(&tc.arguments)
-            .ok()
-            .and_then(|args| {
-                ["command", "cmd", "script"]
-                    .iter()
-                    .find_map(|key| args.get(*key).and_then(Value::as_str).map(str::to_string))
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let name_has = |keyword: &str| contains_keyword_as_words(&normalized_name, keyword);
-    let command_effects = if command.is_empty() {
-        crate::traits::ToolMutationEffects::NONE
-    } else {
-        crate::tools::command_semantics::classify_shell_command(&command).mutation_effects
-    };
+    let effects = semantics.mutation_effects;
+    if effects == ToolMutationEffects::UNSPECIFIED && semantics.mutates_state() {
+        return true;
+    }
     match action {
-        ForbiddenMutationAction::Create => {
-            matches!(tc.name.as_str(), "write_file")
-                || name_has("create")
-                || command_effects.intersects(
-                    crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE
-                        .union(crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE),
-                )
-        }
-        ForbiddenMutationAction::Delete => {
-            name_has("delete")
-                || name_has("remove")
-                || command_effects.intersects(crate::traits::ToolMutationEffects::DESTRUCTIVE)
-        }
-        ForbiddenMutationAction::Deploy => {
-            name_has("deploy")
-                || command_effects.intersects(crate::traits::ToolMutationEffects::REMOTE_DEPLOY)
-        }
-        ForbiddenMutationAction::Publish => {
-            name_has("publish")
-                || command_effects.intersects(
-                    crate::traits::ToolMutationEffects::REMOTE_DEPLOY
-                        .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
-                        .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
-                )
-        }
-        ForbiddenMutationAction::Post => {
-            name_has("post")
-                || command_effects.intersects(
-                    crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY
-                        .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
-                )
-        }
-        ForbiddenMutationAction::Send => {
-            name_has("send")
-                || command_effects.intersects(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
-        }
+        ForbiddenMutationAction::Create => effects.intersects(
+            ToolMutationEffects::LOCAL_SOURCE_WRITE
+                .union(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+                .union(ToolMutationEffects::LOCAL_DERIVED_WRITE),
+        ),
+        ForbiddenMutationAction::Delete => effects.intersects(ToolMutationEffects::DESTRUCTIVE),
+        ForbiddenMutationAction::Deploy => effects.intersects(ToolMutationEffects::REMOTE_DEPLOY),
+        ForbiddenMutationAction::Publish => effects.intersects(
+            ToolMutationEffects::REMOTE_DEPLOY
+                .union(ToolMutationEffects::EXTERNAL_DELIVERY)
+                .union(ToolMutationEffects::REMOTE_MUTATION),
+        ),
+        ForbiddenMutationAction::Post => effects.intersects(
+            ToolMutationEffects::EXTERNAL_DELIVERY.union(ToolMutationEffects::REMOTE_MUTATION),
+        ),
+        ForbiddenMutationAction::Send => effects.intersects(ToolMutationEffects::EXTERNAL_DELIVERY),
     }
 }
 
 fn negative_contract_block_reason(
     contract: &CompletionContract,
     tool_call: &ToolCall,
+    semantics: &ToolCallSemantics,
     is_side_effecting: bool,
 ) -> Option<String> {
     if !contract.allowed_tool_names.is_empty()
@@ -324,28 +303,6 @@ fn negative_contract_block_reason(
         return Some("all tool use".to_string());
     }
     if contract.forbids_mutation {
-        // Shell is open-ended. An otherwise-unclassified command is not
-        // mutation evidence; defer it to terminal's async semantic effect gate,
-        // which receives this same hard contract and blocks before process I/O
-        // unless the full command is proven observational.
-        let opaque_shell_observation_candidate =
-            matches!(tool_call.name.as_str(), "terminal" | "run_command")
-                && serde_json::from_str::<Value>(&tool_call.arguments)
-                    .ok()
-                    .and_then(|args| {
-                        ["command", "cmd", "script"]
-                            .iter()
-                            .find_map(|key| args.get(*key).and_then(Value::as_str))
-                            .map(crate::tools::command_semantics::classify_shell_command)
-                    })
-                    .is_some_and(|semantics| {
-                        semantics.mutates_state()
-                            && semantics.mutation_effects
-                                == crate::traits::ToolMutationEffects::UNSPECIFIED
-                    });
-        if opaque_shell_observation_candidate {
-            return None;
-        }
         // `cli_agent` consumes the dispatcher-owned mutation-forbidden bit and
         // may proceed only through a registered provider-native read-only
         // sandbox. It is therefore safe to reach the tool boundary; unsupported
@@ -364,11 +321,20 @@ fn negative_contract_block_reason(
     {
         return None;
     }
+    if is_side_effecting
+        && semantics.effect == crate::traits::ToolCallEffect::Unknown
+        && !contract.forbidden_mutation_actions.is_empty()
+    {
+        return contract
+            .forbidden_mutation_actions
+            .first()
+            .map(|action| action.as_str().to_string());
+    }
     contract
         .forbidden_mutation_actions
         .iter()
         .copied()
-        .find(|action| scoped_action_matches_tool_call(*action, tool_call))
+        .find(|action| scoped_action_matches_tool_call(*action, tool_call, semantics))
         .map(|action| action.as_str().to_string())
 }
 
@@ -416,41 +382,6 @@ fn extract_target_preview(arguments: &str) -> Option<String> {
     }
 
     None
-}
-
-/// Whether the plain-text redirect should spare this blocked tool. Pure-read
-/// tools never irreversibly mutate, so blocking them only forces the model to
-/// fabricate an answer instead of looking it up — always exempt. Terminal
-/// calls are exempt only when their typed command semantics are observation
-/// only; the user's wording never changes this authority decision.
-fn plain_text_redirect_exempts_lookup(tool_name: &str, arguments: &str) -> bool {
-    const PURE_READ_TOOLS: &[&str] = &[
-        "read_file",
-        "search_files",
-        "web_search",
-        "web_fetch",
-        "read_channel_history",
-    ];
-    if PURE_READ_TOOLS.contains(&tool_name) {
-        return true;
-    }
-    if !matches!(tool_name, "terminal" | "run_command") {
-        return false;
-    }
-    terminal_command_is_read_only(arguments)
-}
-
-/// True when a terminal call's command classifies as pure observation
-/// (observes state, mutates nothing). Malformed arguments fail closed.
-fn terminal_command_is_read_only(arguments: &str) -> bool {
-    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
-        return false;
-    };
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    let semantics = crate::tools::command_semantics::classify_shell_command(command);
-    semantics.observes_state() && !semantics.mutates_state()
 }
 
 fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
@@ -909,9 +840,11 @@ pub(super) async fn run_tool_prelude_phase(
     // Autonomous model's valid tool call. Deterministic tool/auth/role policy
     // remains enforced in the execution phase for every model.
     let negative_contract_match = resp.tool_calls.iter().find_map(|tc| {
+        let semantics = tool_call_semantics(agent, tc);
         negative_contract_block_reason(
             &turn_context.completion_contract,
             tc,
+            &semantics,
             tool_call_is_side_effecting(agent, tc, available_capabilities),
         )
         .map(|restriction| (tc, restriction))
@@ -1026,14 +959,6 @@ pub(super) async fn run_tool_prelude_phase(
             .iter()
             .filter(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
             .all(|tc| crate::agent::recall_guardrails::is_personal_memory_tool(&tc.name));
-        // Read-only lookups (file/web reads, and shell observation on a question
-        // turn) must never be redirected to plain text — doing so forces the
-        // model to fabricate an answer it should have looked up.
-        let all_side_effecting_are_lookup = resp
-            .tool_calls
-            .iter()
-            .filter(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
-            .all(|tc| plain_text_redirect_exempts_lookup(&tc.name, &tc.arguments));
         // Child sessions (spawned TaskLead/Executor) exist to execute actions —
         // never redirect them to plain-text mode. `sub-` is the legacy prefix
         // kept for in-flight tasks; new sessions use `specialist:`.
@@ -1048,7 +973,6 @@ pub(super) async fn run_tool_prelude_phase(
         if !is_child_session
             && !any_computer_use
             && !all_side_effecting_are_memory
-            && !all_side_effecting_are_lookup
             && text_only_redirect_applies(turn_context, execution_state.tool_calls_used)
             && agent
                 .supervision_gate_enforced(
@@ -1816,6 +1740,44 @@ mod tests {
         }
     }
 
+    fn negative_contract_block_reason(
+        contract: &CompletionContract,
+        tool_call: &ToolCall,
+        is_side_effecting: bool,
+    ) -> Option<String> {
+        let parsed = serde_json::from_str::<Value>(&tool_call.arguments).ok();
+        let semantics = match tool_call.name.as_str() {
+            "write_file" | "edit_file" => {
+                ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            }
+            "terminal" => {
+                let has_writes = parsed.as_ref().is_some_and(|value| {
+                    value
+                        .get("write_paths")
+                        .and_then(Value::as_array)
+                        .is_some_and(|paths| !paths.is_empty())
+                });
+                let confined = has_writes
+                    || parsed.as_ref().is_some_and(|value| {
+                        value
+                            .get("working_dir")
+                            .and_then(Value::as_str)
+                            .is_some_and(|path| !path.trim().is_empty())
+                    });
+                if has_writes {
+                    ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+                } else if confined {
+                    ToolCallSemantics::observation()
+                } else {
+                    ToolCallSemantics::default()
+                }
+            }
+            _ if is_side_effecting => ToolCallSemantics::mutation(),
+            _ => ToolCallSemantics::default(),
+        };
+        super::negative_contract_block_reason(contract, tool_call, &semantics, is_side_effecting)
+    }
+
     #[test]
     fn resource_handles_are_concrete_structural_targets() {
         assert!(arguments_have_concrete_target(
@@ -1836,8 +1798,14 @@ mod tests {
             "write_file",
             r#"{"path":"/tmp/site/package.json","content":"{\"scripts\":{\"deploy\":\"wrangler deploy\"}}"}"#,
         );
-        let build = tool_call("terminal", r#"{"action":"run","command":"npm run build"}"#);
-        let inspect = tool_call("terminal", r#"{"action":"run","command":"rg deploy ."}"#);
+        let build = tool_call(
+            "terminal",
+            r#"{"action":"run","command":"npm run build","working_dir":"/tmp/site","write_paths":["/tmp/site/dist"]}"#,
+        );
+        let inspect = tool_call(
+            "terminal",
+            r#"{"action":"run","command":"rg deploy .","working_dir":"/tmp/site"}"#,
+        );
         let deploy = tool_call(
             "terminal",
             r#"{"action":"run","command":"npx wrangler deploy"}"#,
@@ -1966,13 +1934,12 @@ mod tests {
 
     fn turn_with(
         goal_user_text: &str,
-        recent_messages: Vec<Value>,
+        _recent_messages: Vec<Value>,
         expects_mutation: bool,
         requires_observation: bool,
     ) -> TurnContext {
         TurnContext {
             goal_user_text: goal_user_text.to_string(),
-            recent_messages,
             completion_contract: CompletionContract {
                 expects_mutation,
                 requires_observation,
@@ -1994,35 +1961,6 @@ mod tests {
         );
         assert!(!super::text_only_redirect_applies(&turn, 0));
         assert!(!super::text_only_redirect_applies(&turn, 3));
-    }
-
-    #[test]
-    fn read_only_terminal_command_exempt_from_plain_text_redirect() {
-        // The command's semantics—not the surrounding prose—make this safe.
-        let arguments =
-            r#"{"action": "run", "command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#;
-        assert!(super::plain_text_redirect_exempts_lookup(
-            "terminal", arguments
-        ));
-        assert!(super::plain_text_redirect_exempts_lookup(
-            "run_command",
-            r#"{"command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#
-        ));
-    }
-
-    #[test]
-    fn mutating_terminal_command_still_redirected_on_text_only_turn() {
-        let arguments = r#"{"action": "run", "command": "rm -rf ~/tmp/scratch"}"#;
-        assert!(!super::plain_text_redirect_exempts_lookup(
-            "terminal", arguments
-        ));
-    }
-
-    #[test]
-    fn malformed_terminal_arguments_not_exempt() {
-        assert!(!super::plain_text_redirect_exempts_lookup(
-            "terminal", "not-json"
-        ));
     }
 
     #[test]
@@ -2091,33 +2029,6 @@ mod tests {
             ..TurnContext::default()
         };
         assert!(turn_prefers_plain_text_completion(&tc));
-    }
-
-    #[test]
-    fn lookup_exemption_uses_command_semantics_not_user_words() {
-        assert!(plain_text_redirect_exempts_lookup(
-            "terminal",
-            r#"{"action": "run", "command": "git status --short"}"#
-        ));
-    }
-
-    #[test]
-    fn lookup_exemption_does_not_spare_mutating_terminal_command() {
-        assert!(!plain_text_redirect_exempts_lookup(
-            "terminal",
-            r#"{"action": "run", "command": "npm run build"}"#
-        ));
-    }
-
-    #[test]
-    fn lookup_exemption_always_spares_pure_read_tools() {
-        // Pure reads never irreversibly mutate — exempt regardless of phrasing.
-        for tool in ["read_file", "search_files", "web_search", "web_fetch"] {
-            assert!(
-                plain_text_redirect_exempts_lookup(tool, "{}"),
-                "pure-read tool should always be spared: {tool}"
-            );
-        }
     }
 
     #[test]

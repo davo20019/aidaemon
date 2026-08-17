@@ -1,5 +1,4 @@
 use crate::agent::*;
-use crate::execution::BackendPath;
 use crate::traits::{ToolCallSemantics, ToolTargetHintKind};
 
 const PATH_ARGUMENT_KEYS: &[&str] = &[
@@ -93,31 +92,6 @@ fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn extract_terminal_cd_dirs(command: &str) -> Vec<String> {
-    let mut dirs = Vec::new();
-    for segment in command.split([';', '\n']) {
-        let trimmed = segment.trim();
-        let Some(rest) = trimmed.strip_prefix("cd ") else {
-            continue;
-        };
-
-        let token = if let Some(stripped) = rest.strip_prefix('"') {
-            stripped.split('"').next().unwrap_or("").trim()
-        } else if let Some(stripped) = rest.strip_prefix('\'') {
-            stripped.split('\'').next().unwrap_or("").trim()
-        } else {
-            rest.split_whitespace().next().unwrap_or("").trim()
-        };
-        if token.is_empty() || token == "-" {
-            continue;
-        }
-        if let Some(dir) = normalize_project_dir(token) {
-            push_unique_project_dir(&mut dirs, dir);
-        }
-    }
-    dirs
-}
-
 fn resolve_injected_working_dir(project_dir: &str) -> String {
     if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
         return project_dir.to_string();
@@ -204,11 +178,6 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
         if let Some(working_dir) = parsed.get("working_dir") {
             collect_project_dirs_from_value(working_dir, Some("working_dir"), &mut dirs);
         }
-        if let Some(command) = parsed.get("command").and_then(|v| v.as_str()) {
-            for dir in extract_terminal_cd_dirs(command) {
-                push_unique_project_dir(&mut dirs, dir);
-            }
-        }
         return dirs;
     }
     if tool_name == "project_inspect" {
@@ -223,145 +192,6 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
 
     collect_project_dirs_from_value(&parsed, None, &mut dirs);
     dirs
-}
-
-fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
-    let mut candidate = token
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '(' | ')' | ',' | ';'));
-    if let Some((_, redirected)) = candidate.rsplit_once('>') {
-        candidate = redirected.trim();
-    }
-    if candidate.is_empty()
-        // `shell_words` intentionally removes quote provenance. A quoted
-        // program/source argument may therefore contain path-like operators
-        // or string literals, but it is not itself a filesystem target. Exact
-        // paths containing whitespace remain representable in typed access
-        // manifests; this parser is only conservative advisory telemetry.
-        || candidate.chars().any(char::is_whitespace)
-        || previous.is_some_and(|value| {
-            matches!(value, "-c" | "-e" | "--eval" | "--execute" | "--command")
-        })
-        || crate::tools::command_semantics::is_discard_sink_path(candidate)
-        || candidate.starts_with('-')
-        || candidate.contains("://")
-        || candidate.contains(['$', '`', '*', '?', '[', ']', '{', '}'])
-        || matches!(candidate, "&&" | "||" | "|" | ">" | ">>")
-    {
-        return None;
-    }
-
-    let previous_declares_path = previous.is_some_and(|value| {
-        matches!(
-            value,
-            "cd" | "-C" | "--directory" | "--manifest-path" | "--path" | "--file" | "-f"
-        )
-    });
-    let looks_like_path = previous_declares_path
-        || candidate.starts_with('/')
-        || candidate.starts_with("~/")
-        || candidate.starts_with("./")
-        || candidate.starts_with("../")
-        || candidate.contains('/');
-    looks_like_path.then(|| candidate.to_string())
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct TerminalCommandPathTargets {
-    pub execution_contexts: Vec<String>,
-    pub data_paths: Vec<String>,
-}
-
-impl TerminalCommandPathTargets {
-    fn push_execution_context(&mut self, path: String) {
-        if !self.execution_contexts.contains(&path) {
-            self.execution_contexts.push(path);
-        }
-    }
-
-    fn push_data_path(&mut self, path: String) {
-        if !self.data_paths.contains(&path) {
-            self.data_paths.push(path);
-        }
-    }
-
-    fn all_paths(self) -> Vec<String> {
-        let mut paths = self.execution_contexts;
-        for path in self.data_paths {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-        paths
-    }
-}
-
-fn shell_executable_name(token: &str) -> &str {
-    std::path::Path::new(token)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(token)
-}
-
-fn collect_terminal_command_resource_targets(
-    command: &str,
-    base_directory: Option<&str>,
-    targets: &mut TerminalCommandPathTargets,
-) {
-    for invocation in crate::tools::command_risk::structural_shell_invocations(command) {
-        let executable_name = shell_executable_name(&invocation.program);
-
-        // The shared shell parser already traversed shell programs and trap
-        // bodies. Their source operands are syntax, not filesystem targets.
-        if executable_name == "trap"
-            || matches!(executable_name, "sh" | "bash" | "dash" | "ksh" | "zsh")
-        {
-            continue;
-        }
-
-        for (index, token) in invocation.arguments.iter().enumerate() {
-            let Some(candidate) = shell_path_candidate(
-                token,
-                index
-                    .checked_sub(1)
-                    .map_or(Some(executable_name), |previous| {
-                        invocation.arguments.get(previous).map(String::as_str)
-                    }),
-            ) else {
-                continue;
-            };
-            let target =
-                if candidate.starts_with('/') || candidate == "~" || candidate.starts_with("~/") {
-                    candidate
-                } else if let Some(base_directory) = base_directory {
-                    let candidate = candidate.strip_prefix("./").unwrap_or(&candidate);
-                    BackendPath::new(base_directory).join(candidate).to_string()
-                } else {
-                    candidate
-                };
-            if executable_name == "cd" && index == 0 {
-                targets.push_execution_context(target);
-            } else {
-                targets.push_data_path(target);
-            }
-        }
-    }
-}
-
-pub(super) fn terminal_command_resource_targets(
-    command: &str,
-    base_directory: Option<&str>,
-) -> TerminalCommandPathTargets {
-    let mut targets = TerminalCommandPathTargets::default();
-    collect_terminal_command_resource_targets(command, base_directory, &mut targets);
-    targets
-}
-
-pub(super) fn terminal_command_path_targets(
-    command: &str,
-    base_directory: Option<&str>,
-) -> Vec<String> {
-    terminal_command_resource_targets(command, base_directory).all_paths()
 }
 
 /// Return filesystem locations whose first access should trigger nested
@@ -400,19 +230,6 @@ pub(in crate::agent) fn project_instruction_targets_for_tool_call(
     for directory in extract_project_dirs_from_tool_args(tool_name, args_json) {
         if !targets.iter().any(|existing| existing == &directory) {
             targets.push(directory);
-        }
-    }
-
-    if matches!(tool_name, "terminal" | "run_command") {
-        if let Ok(args) = serde_json::from_str::<Value>(args_json) {
-            if let Some(command) = args.get("command").and_then(Value::as_str) {
-                let base = targets.first().map(String::as_str);
-                for target in terminal_command_path_targets(command, base) {
-                    if !targets.iter().any(|existing| existing == &target) {
-                        targets.push(target);
-                    }
-                }
-            }
         }
     }
 
@@ -459,8 +276,12 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
         }) {
             return None;
         }
-        let command = obj.get("command").and_then(|v| v.as_str())?.trim();
-        if command.is_empty() || !extract_terminal_cd_dirs(command).is_empty() {
+        let has_program = ["command", "script"].iter().any(|key| {
+            obj.get(*key)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        if !has_program {
             return None;
         }
         let injected_dir = resolve_injected_working_dir(project_dir);
@@ -734,10 +555,10 @@ mod tests {
     }
 
     #[test]
-    fn extracts_terminal_cd_dirs_for_scope_locking() {
+    fn terminal_command_text_does_not_declare_project_scope() {
         let args = r#"{"command":"cd ~/projects/demo && npm run build"}"#;
         let dirs = extract_project_dirs_from_tool_args("terminal", args);
-        assert!(dirs.iter().any(|d| d.contains("projects/demo")));
+        assert!(dirs.is_empty());
     }
 
     #[test]
@@ -761,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_targets_extract_terminal_cwd_and_nested_command_paths() {
+    fn jit_targets_use_typed_terminal_cwd_not_command_text() {
         let args =
             r#"{"command":"sed -i '' crates/widget/src/lib.rs && cargo test","cwd":"/tmp/repo"}"#;
         let targets = project_instruction_targets_for_tool_call(
@@ -771,76 +592,7 @@ mod tests {
         );
 
         assert!(targets.iter().any(|target| target == "/tmp/repo"));
-        assert!(targets
-            .iter()
-            .any(|target| target.ends_with("/tmp/repo/crates/widget/src/lib.rs")));
-    }
-
-    #[test]
-    fn terminal_targets_exclude_discard_sink_redirections() {
-        let targets = terminal_command_path_targets(
-            "cargo init disposable --vcs none >/dev/null 2>&1 && ./disposable/run",
-            Some("/tmp"),
-        );
-
-        assert!(!targets.iter().any(|target| target == "/dev/null"));
-        assert!(!targets.iter().any(|target| target == "/tmp/disposable/run"));
-    }
-
-    #[test]
-    fn terminal_resources_separate_execution_context_and_executable_identity() {
-        let resources = terminal_command_resource_targets(
-            "/bin/sh -c 'sleep 1; printf SYNTHETIC_OK'",
-            Some("/tmp"),
-        );
-        assert!(resources.execution_contexts.is_empty());
-        assert!(resources.data_paths.is_empty());
-
-        let resources = terminal_command_resource_targets(
-            "cd /tmp && cargo new synthetic-package && stat /tmp/synthetic-package",
-            Some("/tmp"),
-        );
-        assert_eq!(resources.execution_contexts, vec!["/tmp".to_string()]);
-        assert_eq!(
-            resources.data_paths,
-            vec!["/tmp/synthetic-package".to_string()]
-        );
-    }
-
-    #[test]
-    fn terminal_resources_parse_nested_shell_programs_without_compound_pseudo_paths() {
-        let resources = terminal_command_resource_targets(
-            "trap 'cd /tmp && rm -rf -- /tmp/synthetic-package' EXIT; /bin/sh -c 'cd /tmp && stat /tmp/synthetic-package'",
-            Some("/tmp"),
-        );
-        assert_eq!(resources.execution_contexts, vec!["/tmp".to_string()]);
-        assert_eq!(
-            resources.data_paths,
-            vec!["/tmp/synthetic-package".to_string()]
-        );
-        assert!(resources
-            .execution_contexts
-            .iter()
-            .chain(&resources.data_paths)
-            .all(|target| !target.contains("&&") && !target.contains("cd /tmp")));
-    }
-
-    #[test]
-    fn terminal_resources_do_not_treat_quoted_program_source_as_paths() {
-        let resources = terminal_command_resource_targets(
-            "python3 -c 'target = Path(wheel_directory) / filename; archive.write(target)' /tmp/synthetic-wheel",
-            Some("/tmp"),
-        );
-
-        assert!(resources.execution_contexts.is_empty());
-        assert_eq!(
-            resources.data_paths,
-            vec!["/tmp/synthetic-wheel".to_string()]
-        );
-        assert!(resources
-            .data_paths
-            .iter()
-            .all(|target| !target.contains("Path(") && !target.contains("archive.write")));
+        assert_eq!(targets, vec!["/tmp/repo".to_string()]);
     }
 
     #[test]
@@ -887,11 +639,20 @@ mod tests {
     }
 
     #[test]
-    fn does_not_override_terminal_command_with_explicit_cd() {
+    fn shell_cd_does_not_override_typed_working_directory_injection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inferred = tmp.path().join("inferred");
+        std::fs::create_dir_all(&inferred).expect("create inferred project");
         let args = r#"{"command":"cd /tmp/explicit && npm run build"}"#;
-        let updated =
-            maybe_inject_project_dir_into_tool_args("terminal", args, Some("/tmp/inferred"));
-        assert!(updated.is_none());
+        let (updated, injected) = maybe_inject_project_dir_into_tool_args(
+            "terminal",
+            args,
+            Some(inferred.to_string_lossy().as_ref()),
+        )
+        .expect("typed cwd injection");
+        let parsed: Value = serde_json::from_str(&updated).expect("valid arguments");
+        assert_eq!(parsed["working_dir"], injected);
+        assert_eq!(parsed["command"], "cd /tmp/explicit && npm run build");
     }
 
     #[test]

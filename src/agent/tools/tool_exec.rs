@@ -14,14 +14,42 @@ fn argument_contract_rejection_outcome(
     crate::traits::ToolCallOutcome::contract_rejection(output)
 }
 
-fn validate_tool_arguments(
+fn prepare_tool_arguments(
     tool: &dyn crate::traits::Tool,
     arguments: &str,
-) -> Option<crate::traits::ToolCallOutcome> {
-    match tool.validate_arguments(arguments) {
-        Ok(()) => None,
-        Err(violation) => Some(argument_contract_rejection_outcome(violation)),
+) -> Result<crate::traits::PreparedToolInvocation, Box<crate::traits::ToolCallOutcome>> {
+    match tool.prepare_invocation(arguments) {
+        Ok(prepared) => Ok(prepared),
+        Err(violation) => Err(Box::new(argument_contract_rejection_outcome(violation))),
     }
+}
+
+fn finalize_dispatched_outcome(
+    prepared: &crate::traits::PreparedToolInvocation,
+    mut outcome: crate::traits::ToolCallOutcome,
+) -> crate::traits::ToolCallOutcome {
+    if outcome.metadata.invocation_stage == crate::traits::ToolInvocationStage::Unknown {
+        outcome.metadata.invocation_stage = if outcome.metadata.contract_rejected {
+            crate::traits::ToolInvocationStage::RejectedBeforeIo
+        } else {
+            crate::traits::ToolInvocationStage::Dispatched
+        };
+    }
+    // A pre-I/O rejection owns validation semantics only. It must never
+    // inherit the proposed operation's effects, evidence, or targets.
+    if outcome.metadata.invocation_stage.reached_dispatch() {
+        outcome
+            .metadata
+            .semantics
+            .merge_missing_from(prepared.semantics.clone());
+        if outcome.metadata.access_manifest.is_none() {
+            outcome.metadata.access_manifest = Some(prepared.access_manifest.clone());
+        }
+        outcome.metadata.receipt_kind = prepared.receipt_kind;
+    } else {
+        outcome.metadata.access_manifest = None;
+    }
+    outcome
 }
 
 fn sanitize_workspace_tool_text(text: &str, grant: &WorkspaceGrant) -> String {
@@ -73,14 +101,14 @@ async fn call_scoped_builtin_file_tool(
         "edit_file" => Box::new(crate::tools::EditFileTool),
         _ => anyhow::bail!("The workspace grant does not allow this tool."),
     };
-    if let Some(rejection) = validate_tool_arguments(tool.as_ref(), arguments) {
-        return Ok(rejection);
-    }
+    let prepared = match prepare_tool_arguments(tool.as_ref(), arguments) {
+        Ok(prepared) => prepared,
+        Err(rejection) => return Ok(*rejection),
+    };
     let mut outcome = tool
-        .call_with_execution_context(arguments, status_tx, exec_ctx)
+        .call_with_execution_context(&prepared.canonical_arguments, status_tx, exec_ctx)
         .await?;
-    let fallback = tool.call_semantics(arguments);
-    outcome.metadata.semantics.merge_missing_from(fallback);
+    outcome = finalize_dispatched_outcome(&prepared, outcome);
     Ok(outcome)
 }
 
@@ -816,9 +844,11 @@ impl Agent {
 
         for tool in &self.tools {
             if tool.name() == name {
-                if let Some(rejection) = validate_tool_arguments(tool.as_ref(), &enriched_args) {
-                    return Ok(rejection);
-                }
+                let prepared = match prepare_tool_arguments(tool.as_ref(), &enriched_args) {
+                    Ok(prepared) => prepared,
+                    Err(rejection) => return Ok(*rejection),
+                };
+                let prepared_args = &prepared.canonical_arguments;
                 if !under_mandate
                     && name != "terminal"
                     && matches!(
@@ -828,7 +858,13 @@ impl Agent {
                     && !(name == "cli_agent" && ctx.mutation_forbidden)
                 {
                     if let Some(manager) = crate::checkpoints::active_manager() {
-                        manager.begin_for_tool(name, &enriched_args).await?;
+                        manager
+                            .begin_for_access_manifest(
+                                name,
+                                prepared_args,
+                                &prepared.access_manifest,
+                            )
+                            .await?;
                     }
                 }
                 let mandate_preapproved = if under_mandate {
@@ -845,13 +881,9 @@ impl Agent {
                     mutation_forbidden: ctx.mutation_forbidden,
                 };
                 let result = tool
-                    .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
+                    .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
                     .await
-                    .map(|mut outcome| {
-                        let fallback = tool.call_semantics(&enriched_args);
-                        outcome.metadata.semantics.merge_missing_from(fallback);
-                        outcome
-                    });
+                    .map(|outcome| finalize_dispatched_outcome(&prepared, outcome));
                 if result.as_ref().is_ok_and(|outcome| {
                     outcome.metadata.background_started || outcome.metadata.detached
                 }) {
@@ -884,9 +916,10 @@ impl Agent {
         // for builtins (MCP tools are non-delegable under the v1 policy).
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
-                if let Some(rejection) = validate_tool_arguments(tool.as_ref(), &enriched_args) {
-                    return Ok(rejection);
-                }
+                let prepared = match prepare_tool_arguments(tool.as_ref(), &enriched_args) {
+                    Ok(prepared) => prepared,
+                    Err(rejection) => return Ok(*rejection),
+                };
                 let mandate_preapproved = if under_mandate {
                     self.validate_mandate_dispatch(name, arguments, ctx, true)
                         .await?;
@@ -901,13 +934,13 @@ impl Agent {
                     mutation_forbidden: ctx.mutation_forbidden,
                 };
                 return tool
-                    .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
+                    .call_with_execution_context(
+                        &prepared.canonical_arguments,
+                        ctx.status_tx.clone(),
+                        exec_ctx,
+                    )
                     .await
-                    .map(|mut outcome| {
-                        let fallback = tool.call_semantics(&enriched_args);
-                        outcome.metadata.semantics.merge_missing_from(fallback);
-                        outcome
-                    });
+                    .map(|outcome| finalize_dispatched_outcome(&prepared, outcome));
             }
         }
 

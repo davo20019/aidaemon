@@ -167,11 +167,10 @@ async fn test_uploaded_artifact_request_has_task_boundary() {
     assert!(!serialized.contains("NCT06737964"), "{serialized}");
 }
 
-/// Regression: after tool progress exists in the current task, a generic idle
-/// prompt must not be accepted as the final answer. The next LLM call should
-/// also carry an execution checkpoint for continuity.
+/// After a typed tool result satisfies the request, prose shape does not reopen
+/// the lifecycle. The synthesis call still carries the execution checkpoint.
 #[tokio::test]
-async fn test_idle_reengagement_reply_after_tool_progress_is_recovered() {
+async fn test_satisfied_tool_result_is_not_reopened_by_reply_wording() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("I'm here. What would you like me to help you with?"),
@@ -192,16 +191,7 @@ async fn test_idle_reengagement_reply_after_tool_progress_is_recovered() {
         .await
         .unwrap();
 
-    assert!(
-        !response.contains("What would you like me to help you with"),
-        "generic idle re-engagement reply should not be returned after tool progress: {}",
-        response
-    );
-    assert!(
-        response.contains("latest tool output") || response.contains("Date:"),
-        "final reply should recover from concrete tool evidence: {}",
-        response
-    );
+    assert_eq!(response, "I'm here. What would you like me to help you with?");
 
     let call_log = harness.provider.call_log.lock().await;
     assert!(
@@ -334,11 +324,8 @@ async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
 
 #[tokio::test]
 async fn test_orchestrator_knowledge_flow() {
-    // Knowledge flow: the first reply is a short deferral, bounced by the
-    // deferred-action gate; the retry answers without tool use. With
-    // default+fallback routing, tools ARE present in the first call (no
-    // tool-stripping), but the model chooses not to use them for simple
-    // knowledge answers.
+    // Knowledge flow has no typed execution obligation. The first substantive
+    // candidate is therefore final; wording is not a lifecycle protocol.
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("Let me check my memory first."),
         MockProvider::text_response("The capital of France is Paris."),
@@ -359,10 +346,10 @@ async fn test_orchestrator_knowledge_flow() {
         .await
         .unwrap();
 
-    assert_eq!(response, "The capital of France is Paris.");
+    assert_eq!(response, "Let me check my memory first.");
 
     let call_count = harness.provider.call_count().await;
-    assert_eq!(call_count, 2, "Expected bounced deferral + executor answer");
+    assert_eq!(call_count, 1);
 
     // Tools are present in the first call (no tool-stripping in the new architecture)
     let calls = harness.provider.call_log.lock().await;

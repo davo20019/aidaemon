@@ -36,7 +36,15 @@ async fn test_orchestration_simple_falls_through_to_full_loop() {
         MockProvider::tool_call_response("system_info", "{}"),
         // 3rd call: full agent loop — final response
         MockProvider::text_response("Your system is running macOS."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -115,7 +123,15 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -134,6 +150,8 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     assert_eq!(response, "Diagnostics complete. All systems normal.");
 }
 
+// Historical behavior for the retired lexical personal-recall scope gate.
+#[cfg(any())]
 #[tokio::test]
 async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
     let provider = MockProvider::with_responses(vec![
@@ -205,6 +223,8 @@ async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
     );
 }
 
+// Relationship adoption is now tested through typed antecedent state instead.
+#[cfg(any())]
 #[tokio::test]
 async fn test_personal_recall_challenge_inherits_previous_turn_context() {
     // Each turn makes a model call through the normal agent loop.
@@ -259,10 +279,28 @@ async fn test_personal_recall_challenge_inherits_previous_turn_context() {
 }
 
 #[tokio::test]
-async fn test_general_reaffirmation_challenge_injects_prior_answer_anchor() {
+async fn test_structural_continuation_projects_exact_prior_exchange() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("There are 3 R's in strawberry."),
         MockProvider::text_response("Yes — strawberry has 3 R's."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        ),
+        MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "continuation",
+            "conversation_history",
+        ),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -299,21 +337,14 @@ async fn test_general_reaffirmation_challenge_injects_prior_answer_anchor() {
 
     let call_log = harness.provider.call_log.lock().await;
     let challenge_call = call_log.last().expect("challenge turn LLM call");
-    let has_anchor = challenge_call.messages.iter().any(|message| {
-        message
-            .get("content")
-            .and_then(|content| content.as_str())
-            .is_some_and(|text| {
-                text.contains("REAFFIRMATION CHALLENGE")
-                    && text.contains("How many R's in strawberry?")
-                    && text.contains("There are 3 R's in strawberry.")
-            })
-    });
+    let serialized = serde_json::to_string(&challenge_call.messages).unwrap();
     assert!(
-        has_anchor,
-        "Challenge turn should inject reaffirmation anchor for the immediately previous exchange: {:?}",
-        challenge_call.messages
+        serialized.contains("How many R's in strawberry?")
+            && serialized.contains("There are 3 R's in strawberry."),
+        "typed continuation should project the exact prior exchange: {:?}",
+        challenge_call.messages,
     );
+    assert!(!serialized.contains("REAFFIRMATION CHALLENGE"));
 }
 
 #[tokio::test]
@@ -369,15 +400,9 @@ async fn test_compound_message_with_challenge_keyword_skips_reaffirmation_anchor
 
 #[tokio::test]
 async fn test_orchestration_targeted_cancel_text_does_not_auto_cancel_session_goal() {
-    let provider = MockProvider::with_responses(vec![
-        // Deterministic cancel detection classifies this as a targeted cancel,
-        // which falls through to the normal loop instead of auto-cancelling.
-        // The deferral below is bounced by the deferred-action gate.
-        MockProvider::text_response("I'll look into which goal you mean."),
-        // Deferred-action retry produces a real tool call
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response("Please share the goal ID to cancel that specific goal."),
-    ]);
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Please share the goal ID to cancel that specific goal.",
+    )]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let morning_goal = Goal::new_continuous(
@@ -413,11 +438,7 @@ async fn test_orchestration_targeted_cancel_text_does_not_auto_cancel_session_go
         response,
         "Please share the goal ID to cancel that specific goal."
     );
-    assert_eq!(
-        harness.provider.call_count().await,
-        3,
-        "Targeted cancel text should not trigger session-wide auto-cancel shortcut"
-    );
+    assert_eq!(harness.provider.call_count().await, 1);
 
     let morning_after = harness
         .state
@@ -450,7 +471,15 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         MockProvider::text_response(
             "I could not verify the deletion because no command was run.",
         ),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "change",
+        true,
+        false,
+        &["local_source_write"],
+        "new_request",
+        "local_workspace",
+    )]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -489,43 +518,24 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         "the typed mutation gate did not retain execution capability after the fabricated claim"
     );
 
-    let event_store = crate::events::EventStore::new(harness.state.pool())
+    let events = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "test_session",
+            &[crate::events::EventType::DecisionPoint],
+            200,
+        )
         .await
-        .expect("event store from harness pool");
-    let events = event_store
-        .query_recent_events("test_session", 200)
-        .await
-        .expect("recent events");
-    let saw_mutation_gate_warning = events.iter().any(|event| {
-        let Ok(data) = event.parse_data::<crate::events::DecisionPointData>() else {
-            return false;
-        };
-        data.decision_type == crate::events::DecisionType::PostExecutionValidation
-            && data
-                .metadata
-                .get("condition")
-                .and_then(serde_json::Value::as_str)
-                == Some("expects_mutation_gate_evaluated")
-            && data
-                .metadata
-                .get("assistant_claimed_mutation")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            && data
-                .metadata
-                .get("mutation_tool_calls_count")
-                .and_then(serde_json::Value::as_u64)
-                == Some(0)
-            && data
-                .metadata
-                .get("outcome")
-                .and_then(serde_json::Value::as_str)
-                == Some("blocked_claimed_mutation_without_tool")
-    });
-    assert!(
-        saw_mutation_gate_warning,
-        "mutation gate did not emit explicit warning telemetry for fabricated zero-tool mutation claim"
-    );
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event
+            .parse_data::<crate::events::DecisionPointData>()
+            .is_ok_and(|data| {
+                data.metadata.get("condition").and_then(serde_json::Value::as_str)
+                    == Some("tools_required_no_tool_response")
+            })
+    }));
 }
 
 #[tokio::test]
@@ -534,10 +544,19 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
         "I've initiated a deep analysis using a specialized review agent. I'll return shortly.";
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(fabrication),
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(
             "I could not start a specialist agent, so no delegated review is running.",
         ),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -558,14 +577,8 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
         "fabricated zero-tool delegation claim was accepted: {response}"
     );
     let calls = harness.provider.call_log.lock().await;
-    assert!(calls.len() >= 2);
-    assert!(calls.iter().skip(1).any(|call| {
-        call.messages.iter().any(|message| {
-            message["content"]
-                .as_str()
-                .is_some_and(|text| text.contains("MUST include at least one tool call"))
-        })
-    }));
+    assert_eq!(calls.len(), 3);
+    assert!(calls[1].options.tool_choice == crate::traits::ToolChoiceMode::Required);
 }
 
 /// The efficacy-analysis payoff: a supervision gate fire is persisted as a

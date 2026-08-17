@@ -25,7 +25,6 @@ use crate::llm_markers::INTENT_GATE_MARKER;
 pub(super) struct TurnContext {
     #[allow(dead_code)] // Retained as an inspectable trace of contract-inference input.
     pub goal_user_text: String,
-    pub recent_messages: Vec<Value>,
     /// Bounded prior messages exposed only to the relationship assessor. They
     /// carry stable message IDs so a continuation must select an exact
     /// antecedent. They never enter a fresh task's provider transcript.
@@ -511,11 +510,6 @@ impl Agent {
         }
         TurnContext {
             goal_user_text,
-            recent_messages: if followup_mode == FollowupMode::NewTask {
-                Vec::new()
-            } else {
-                extract_recent_parent_messages(&history, GOAL_CONTEXT_RECENT_MESSAGES_LIMIT)
-            },
             assessment_recent_messages: extract_recent_parent_messages(
                 history
                     .iter()
@@ -1042,10 +1036,7 @@ mod tests {
             .await;
 
         assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
-        assert!(
-            turn_context.recent_messages.is_empty(),
-            "a new task must not copy an unrelated response format into its volatile context"
-        );
+        assert!(turn_context.visible_antecedent_user_message_id.is_none());
     }
 
     #[tokio::test]

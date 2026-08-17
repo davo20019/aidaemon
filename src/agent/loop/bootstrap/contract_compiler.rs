@@ -240,6 +240,9 @@ fn valid_receipt(receipt: &RequestReceiptPredicate, available_tool_names: &[Stri
         })
         && receipt.exit_codes.len() <= 16
         && receipt.outcome_statuses.len() <= 6
+        && receipt
+            .max_invocations
+            .is_none_or(|limit| (1..=16).contains(&limit))
 }
 
 fn canonical_invocation_requirement(
@@ -735,6 +738,7 @@ mod tests {
             outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
             requires_output: true,
             contract_rejected: Some(false),
+            max_invocations: None,
         }]);
 
         let compiled = compile(&signals);

@@ -486,8 +486,8 @@ pub(super) fn inherit_request_constraints(
 /// Authoritative, finalized per-turn assessment of whether completing the
 /// request requires execution.
 ///
-/// Contract, route, and deterministic lexical signals are folded into one
-/// value. Downstream routing and recovery code must consume
+/// The finalized typed contract is folded into one value. Downstream routing
+/// and recovery code must consume
 /// [`Self::requires_execution`] instead of independently recalculating whether
 /// tools are needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1251,13 +1251,6 @@ pub(super) struct CompletionProgress {
     /// Count of times the locate-file retry nudge has been injected (model
     /// asked the user to upload a file it could find itself). Fires once.
     pub file_access_retry_count: usize,
-    /// Count of times the answer-grounding nudge has been injected (final
-    /// reply enumerated entities absent from all tool outputs). Fires once.
-    pub grounding_nudge_count: usize,
-    /// Count of times the single-source corroboration nudge has been
-    /// injected (enumeration answer from web research with <2 source pages
-    /// read). Fires once.
-    pub corroboration_nudge_count: usize,
     /// Count of retries issued to satisfy an explicit source-count and direct
     /// citation requirement from the user.
     pub source_evidence_nudge_count: usize,
@@ -1267,18 +1260,9 @@ pub(super) struct CompletionProgress {
     /// Count of bounded retries issued after a completion claim lacked the
     /// typed mutation receipt required by the request.
     pub mutation_claim_nudge_count: usize,
-    /// Count of times the search-before-deny gate has fired (reply denies/
-    /// asserts a personal fact about an entity that was not looked up in
-    /// memory this turn). Bounded to 1 to prevent infinite loops.
-    pub denial_gate_count: usize,
     /// Count of bounded retries issued because a mandate task lead attempted
     /// to finish without an exact durable decision for its current run.
     pub mandate_decision_retry_count: usize,
-    /// True when the coreference grounding gate already fired this turn
-    /// (a pronoun-referent follow-up that was anchored to the prior exchange).
-    /// When set, the denial gate must NOT also fire — coreference gate takes
-    /// precedence and the denial would be a false positive.
-    pub coreference_fired: bool,
     /// Per-turn proof graph. Legacy/default-constructed progress values keep
     /// using counters; runtime construction initializes this graph and makes
     /// typed receipt evidence authoritative for completion.

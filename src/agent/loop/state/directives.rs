@@ -169,7 +169,7 @@ mod tests {
         let mut state = PendingDirectives::default();
 
         state.push_system_message(SystemDirective::RouteFailsafeActive);
-        state.push_system_message(SystemDirective::EvidenceGroundingRequired);
+        state.push_system_message(SystemDirective::RecoveryModeModelSwitch);
 
         assert_eq!(state.system_message_count(), 2);
         let taken = state.take_system_messages();

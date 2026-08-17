@@ -223,6 +223,7 @@ pub(super) fn build_structured_tool_output_completion_reply(
 /// Detect when the LLM parrots our internal recovery format with trivial content.
 /// e.g., "Here is the latest tool output:\n\n(no output)" — the model saw a
 /// previous recovery message in the conversation history and repeated it verbatim.
+#[cfg(test)]
 pub(super) fn looks_like_recovery_message_with_trivial_content(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     let is_recovery_prefix = lower.starts_with("here is the latest tool output")
@@ -505,29 +506,6 @@ pub(super) fn should_recover_completion_from_tool_output(
         return false;
     }
     reply.trim().is_empty()
-        || is_low_signal_task_lead_reply(reply)
-        || looks_like_recovery_message_with_trivial_content(reply)
-}
-
-pub(super) fn looks_like_idle_reengagement_reply(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let generic_help_prompt = lower.contains("what would you like me to help you with")
-        || lower.contains("what can i help you with")
-        || lower.contains("how can i help")
-        || lower.contains("what would you like to continue with")
-        || lower.contains("what would you like to do next");
-
-    let reset_intro = lower.starts_with("i'm here")
-        || lower.starts_with("im here")
-        || lower.starts_with("i am here")
-        || lower.starts_with("ready when you are")
-        || lower.starts_with("ready to help");
-
-    generic_help_prompt || (reset_intro && lower.len() <= 180)
 }
 
 pub(super) async fn latest_task_tool_result_for_completion(
@@ -618,49 +596,15 @@ pub(super) async fn latest_task_tool_result_for_completion(
 }
 
 pub(super) fn should_enforce_no_tool_text_when_tools_required(
-    reply: &str,
+    _reply: &str,
     execution_recovery_required: bool,
-    execution_evidence_count: usize,
-    depth: usize,
+    completed_execution_results: usize,
+    _depth: usize,
 ) -> bool {
-    if depth != 0 || !execution_recovery_required || execution_evidence_count > 0 {
+    if !execution_recovery_required || completed_execution_results > 0 {
         return false;
     }
-    reply_reports_unresolved_execution(reply) || looks_like_deferred_action_response(reply)
-}
-
-/// Detect a model-authored terminal limitation for an execution obligation.
-/// This is a language feature rather than a success decision: it can trigger
-/// one evidence-seeking pass, but it can never prove success or unsupported
-/// capability by itself.
-fn reply_reports_unresolved_execution(reply: &str) -> bool {
-    let normalized = reply
-        .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'")
-        .trim()
-        .to_ascii_lowercase();
-    if normalized.is_empty() || claims_unqualified_success(&normalized) {
-        return false;
-    }
-    reply_admits_unfulfilled_request(&normalized)
-        || [
-            "i can't",
-            "i cannot",
-            "i couldn't",
-            "i could not",
-            "i'm unable",
-            "i am unable",
-            "not able to",
-            "not supported",
-            "unsupported",
-            "not available",
-            "unavailable",
-            "doesn't expose",
-            "does not expose",
-            "isn't exposed",
-            "is not exposed",
-        ]
-        .iter()
-        .any(|needle| normalized.contains(needle))
+    true
 }
 
 /// Whether the request carries a concrete mutation destination that the
@@ -693,8 +637,9 @@ pub(super) fn completion_verification_still_required(
     // user explicitly required another observation. Hard completion blocking
     // is reserved for concrete request evidence: an explicit verification
     // phrase or an observable target extracted from the request.
-    let has_concrete_verification_reason =
-        contract.explicit_verification_requested || !contract.verification_targets.is_empty();
+    let has_concrete_verification_reason = contract.explicit_verification_requested
+        || !contract.verification_targets.is_empty()
+        || !contract.evidence_requirements.is_empty();
 
     contract.requires_observation
         && completion_progress.verification_pending
@@ -767,6 +712,7 @@ fn claims_unqualified_success(reply_lower: &str) -> bool {
 /// [`mentions_failure_or_partial`]: generic words like "error" appear in
 /// legitimately pasted content, and this predicate weakens an
 /// anti-fabrication gate.
+#[cfg(test)]
 pub(super) fn reply_admits_unfulfilled_request(reply: &str) -> bool {
     let lower = reply.to_ascii_lowercase();
     if claims_unqualified_success(&lower) {
@@ -1007,7 +953,7 @@ mod tests {
         build_force_text_deferred_completion_reply, build_outcome_reconciliation_fallback_reply,
         build_structured_tool_output_completion_reply, build_tool_output_completion_reply,
         choose_completion_recovery_candidate, contract_has_concrete_mutation_target,
-        looks_like_idle_reengagement_reply, looks_like_recovery_message_with_trivial_content,
+        looks_like_recovery_message_with_trivial_content,
         reply_acknowledges_outcome_reconciliation, reply_admits_unfulfilled_request,
         should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output, summarize_structured_tool_output,
@@ -1394,8 +1340,8 @@ Top-level keys: data
         assert!(!looks_like_recovery_message_with_trivial_content(
             "I've completed the newsletter. The file has been written."
         ));
-        // Should also trigger recovery detection
-        assert!(should_recover_completion_from_tool_output(
+        // Prose shape does not trigger lifecycle recovery.
+        assert!(!should_recover_completion_from_tool_output(
             "Here is the latest tool output:\n\n(no output)",
             0,
             5,
@@ -1592,7 +1538,7 @@ Top-level keys: data
 
     #[test]
     fn recover_completion_when_reply_is_low_signal_after_tools() {
-        assert!(should_recover_completion_from_tool_output(
+        assert!(!should_recover_completion_from_tool_output(
             "Done — Run the command \"cat /nonexistent/file.txt\" and tell me what happens",
             0,
             2
@@ -1611,19 +1557,6 @@ Top-level keys: data
     #[test]
     fn do_not_recover_completion_without_tool_progress() {
         assert!(!should_recover_completion_from_tool_output("", 0, 0));
-    }
-
-    #[test]
-    fn idle_reengagement_reply_detected() {
-        assert!(looks_like_idle_reengagement_reply(
-            "I'm here. What would you like me to help you with?"
-        ));
-        assert!(looks_like_idle_reengagement_reply(
-            "Ready when you are. How can I help?"
-        ));
-        assert!(!looks_like_idle_reengagement_reply(
-            "I found the requested result and included it below."
-        ));
     }
 
     #[test]
@@ -1648,14 +1581,14 @@ Top-level keys: data
     }
 
     #[test]
-    fn execution_hint_does_not_override_a_self_contained_model_answer() {
-        assert!(!should_enforce_no_tool_text_when_tools_required(
+    fn typed_execution_requirement_is_not_overridden_by_answer_prose() {
+        assert!(should_enforce_no_tool_text_when_tools_required(
             "I prepared the requested draft and did not activate anything.",
             true,
             0,
             0
         ));
-        assert!(!should_enforce_no_tool_text_when_tools_required(
+        assert!(should_enforce_no_tool_text_when_tools_required(
             "Here is the recap based on our prior conversation.",
             true,
             0,
@@ -1681,15 +1614,15 @@ Top-level keys: data
     }
 
     #[test]
-    fn do_not_enforce_tools_contract_for_empty_reply() {
-        assert!(!should_enforce_no_tool_text_when_tools_required(
+    fn enforce_typed_execution_contract_for_empty_reply() {
+        assert!(should_enforce_no_tool_text_when_tools_required(
             "", true, 0, 0
         ));
     }
 
     #[test]
-    fn do_not_enforce_tools_contract_for_sub_agent_depth() {
-        assert!(!should_enforce_no_tool_text_when_tools_required(
+    fn enforce_tools_contract_for_sub_agent_depth() {
+        assert!(should_enforce_no_tool_text_when_tools_required(
             "Need to run tools.",
             true,
             0,

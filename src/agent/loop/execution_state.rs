@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -224,6 +224,10 @@ pub struct TargetScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetryPolicy {
+    /// Maximum model/tool-call proposals for the stable operation. Unlike
+    /// `max_attempts`, this includes pre-I/O validation outcomes.
+    #[serde(default)]
+    pub max_invocations: usize,
     pub max_attempts: usize,
     #[serde(default)]
     pub allow_tool_invocation_retry: bool,
@@ -239,6 +243,10 @@ pub enum ApprovalRequirement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepExecutionPlan {
     pub step_id: String,
+    /// Stable identity of the user-owned operation. Unlike `step_id`, this
+    /// survives model retries, new tool-call IDs, and loop iterations.
+    #[serde(default)]
+    pub operation_key: String,
     pub description: String,
     pub plan_version: u32,
     pub primary_tool: Option<String>,
@@ -298,6 +306,21 @@ pub struct ExecutionState {
     pub tool_calls_used: usize,
     pub validation_rounds_used: usize,
     pub steps_used: usize,
+    /// Attempts charged per stable operation. This is the authoritative retry
+    /// ledger; loop iterations and model-generated call IDs are not attempts.
+    #[serde(default)]
+    pub operation_attempts: BTreeMap<String, usize>,
+    /// Tool-call proposals charged per stable user-owned operation. This is
+    /// distinct from dispatched attempts so an explicit no-retry constraint
+    /// also applies after a pre-I/O rejection.
+    #[serde(default)]
+    pub operation_invocations: BTreeMap<String, usize>,
+    /// Prepared proposals that reached a real or durable-replay result.
+    #[serde(default)]
+    pub operation_results_observed: usize,
+    /// Operation results whose typed domain outcome satisfied the request.
+    #[serde(default)]
+    pub completed_operation_results: usize,
     /// Distinct outcome-bearing tool results that have earned additional
     /// execution runway. Persisting the keys prevents a resumed task from
     /// receiving fresh capacity for replaying evidence it already observed.
@@ -380,6 +403,10 @@ impl ExecutionState {
             tool_calls_used: 0,
             validation_rounds_used: 0,
             steps_used: 0,
+            operation_attempts: BTreeMap::new(),
+            operation_invocations: BTreeMap::new(),
+            operation_results_observed: 0,
+            completed_operation_results: 0,
             progress_credit_keys: BTreeSet::new(),
             progress_extensions_used: 0,
             observation_extensions_used: 0,
@@ -570,9 +597,72 @@ impl ExecutionState {
 
     /// Charge one attempt only when the staged step reaches actual or
     /// synthetic tool execution.
-    pub fn begin_staged_step(&mut self) {
+    pub fn begin_staged_step(&mut self) -> bool {
+        let Some(step) = self.current_step.as_ref() else {
+            return false;
+        };
+        let operation_key = if step.operation_key.is_empty() {
+            step.step_id.clone()
+        } else {
+            step.operation_key.clone()
+        };
+        let attempts = self
+            .operation_attempts
+            .get(&operation_key)
+            .copied()
+            .unwrap_or_default();
+        if attempts >= step.retry_policy.max_attempts.max(1) {
+            return false;
+        }
+        let invocations = self
+            .operation_invocations
+            .get(&operation_key)
+            .copied()
+            .unwrap_or_default();
+        if invocations >= step.retry_policy.max_invocations.max(1) {
+            return false;
+        }
+        *self.operation_invocations.entry(operation_key).or_default() =
+            invocations.saturating_add(1);
         self.steps_used = self.steps_used.saturating_add(1);
+        true
+    }
+
+    /// Commit an admitted operation attempt only after the adapter boundary
+    /// confirms that I/O was dispatched. Validation, policy, and replay paths
+    /// do not consume cardinality.
+    pub fn record_current_operation_dispatch(&mut self) {
+        let Some(step) = self.current_step.as_ref() else {
+            return;
+        };
+        let operation_key = if step.operation_key.is_empty() {
+            step.step_id.clone()
+        } else {
+            step.operation_key.clone()
+        };
+        let attempts = self.operation_attempts.entry(operation_key).or_default();
+        *attempts = attempts.saturating_add(1);
         self.attempt_count = self.attempt_count.saturating_add(1);
+    }
+
+    pub fn record_operation_result(
+        &mut self,
+        stage: crate::traits::ToolInvocationStage,
+        outcome_satisfied: bool,
+    ) {
+        if !stage.reached_dispatch() {
+            return;
+        }
+        self.operation_results_observed = self.operation_results_observed.saturating_add(1);
+        if outcome_satisfied {
+            self.completed_operation_results = self.completed_operation_results.saturating_add(1);
+        }
+    }
+
+    /// Charge loop capacity for a local replay/guard result that performs no
+    /// adapter I/O and therefore is not an operation attempt.
+    pub fn record_synthetic_step(&mut self) {
+        self.steps_used = self.steps_used.saturating_add(1);
     }
 
     pub fn record_tool_call(&mut self) {
@@ -587,6 +677,19 @@ impl ExecutionState {
         self.background_handoff_active =
             matches!(outcome, StepExecutionOutcome::BackgroundDetached);
         self.last_outcome = Some(outcome);
+    }
+
+    /// Whether the latest dispatched operation failed in a way that permits
+    /// an autonomous strategy pivot and no later operation has produced a
+    /// request-satisfying result. This is the lazy lifecycle fallback when the
+    /// semantic contract producer is unavailable; it never inspects assistant
+    /// or user prose.
+    pub fn has_unresolved_recoverable_failure(&self) -> bool {
+        matches!(
+            self.last_outcome,
+            Some(StepExecutionOutcome::RecoverableFailure)
+        ) && self.completed_operation_results == 0
+            && !self.background_handoff_active
     }
 
     pub fn record_outcome(&mut self, entry: OutcomeEntry) {
@@ -677,7 +780,7 @@ impl ExecutionState {
             .filter(|fail| {
                 !self.outcome_ledger.iter().any(|e| {
                     // Terminal's mutation classification is a per-command
-                    // heuristic (classify_shell_command): a failed
+                    // adapter receipt: a failed
                     // `python3 -c` parse lands in the mutation ledger while
                     // the successful `grep | head` retry classifies as an
                     // observation — same tool, same goal, different class —
@@ -1230,6 +1333,8 @@ pub fn select_initial_execution_budget(
 #[allow(clippy::too_many_arguments)]
 pub fn compile_step_execution_plan(
     execution_id: &str,
+    operation_key: String,
+    max_invocations: Option<usize>,
     plan_version: u32,
     iteration: usize,
     tool_call_id: &str,
@@ -1296,6 +1401,7 @@ pub fn compile_step_execution_plan(
 
     StepExecutionPlan {
         step_id: format!("step-{iteration}-{tool_call_id}"),
+        operation_key,
         description: format!("Run `{}` against {}", tool_name, target_label),
         plan_version: plan_version.max(1),
         primary_tool: Some(tool_name.to_string()),
@@ -1307,6 +1413,9 @@ pub fn compile_step_execution_plan(
         },
         expected_targets,
         retry_policy: RetryPolicy {
+            max_invocations: max_invocations
+                .unwrap_or(if capabilities.idempotent { 2 } else { 1 })
+                .max(1),
             max_attempts: if capabilities.idempotent { 2 } else { 1 },
             allow_tool_invocation_retry: capabilities.idempotent,
         },

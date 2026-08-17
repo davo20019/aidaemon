@@ -30,6 +30,7 @@
 /// Each entry is intentionally a multi-token phrase to minimize false
 /// positives from word stems and unrelated uses (e.g., "remembers", "saved
 /// me time").
+#[cfg(test)]
 pub(crate) const MEMORY_STORE_STRICT_PHRASES: &[&str] = &[
     "remember that",
     "remember my",
@@ -63,6 +64,7 @@ pub(crate) const MEMORY_STORE_STRICT_PHRASES: &[&str] = &[
 /// [`MEMORY_STORE_STRICT_PHRASES`] and tolerated by classifiers where the
 /// downside of a false positive is small (e.g., the recall guardrail just
 /// keeps the tool palette wider).
+#[cfg(test)]
 pub(crate) const MEMORY_STORE_LENIENT_VERBS: &[&str] = &["remember", "memorize", "store", "save"];
 
 /// Fact-storage context phrases. Even without an imperative verb, the presence

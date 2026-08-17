@@ -860,7 +860,7 @@ mod tests {
         assert!(outcome.metadata.contract_rejected);
         assert_eq!(
             outcome.metadata.outcome_status,
-            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+            Some(crate::traits::ToolOutcomeStatus::Blocked)
         );
         assert!(outcome.metadata.read_file.is_none());
     }

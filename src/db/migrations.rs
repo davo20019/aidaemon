@@ -74,6 +74,102 @@ pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Authoritative task lifecycle projection. Immutable events remain the
+    // audit log, while this versioned row is the single transition authority
+    // for start/terminal state and prevents duplicate terminal events under
+    // watchdog, cancellation, recovery, and normal-close races.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS task_lifecycle (
+            session_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('running', 'terminal')),
+            status TEXT,
+            outcome TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            start_event_id INTEGER,
+            terminal_event_id INTEGER,
+            started_at TEXT,
+            ended_at TEXT,
+            PRIMARY KEY(session_id, task_id),
+            FOREIGN KEY(start_event_id) REFERENCES events(id) ON DELETE SET NULL,
+            FOREIGN KEY(terminal_event_id) REFERENCES events(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_lifecycle_session_state
+         ON task_lifecycle(session_id, state)",
+    )
+    .execute(pool)
+    .await?;
+    // Backfill the first start and first terminal event for existing logs.
+    // New appends are projected atomically by EventStore::append.
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO task_lifecycle (
+            session_id, task_id, state, status, outcome, version,
+            start_event_id, terminal_event_id, started_at, ended_at
+        )
+        SELECT
+            s.session_id,
+            s.task_id,
+            CASE WHEN terminal.id IS NULL THEN 'running' ELSE 'terminal' END,
+            json_extract(terminal.data, '$.status'),
+            json_extract(terminal.data, '$.outcome'),
+            CASE WHEN terminal.id IS NULL THEN 1 ELSE 2 END,
+            s.id,
+            terminal.id,
+            s.created_at,
+            terminal.created_at
+        FROM events AS s
+        LEFT JOIN events AS terminal ON terminal.id = (
+            SELECT MIN(e.id)
+            FROM events AS e
+            WHERE e.session_id = s.session_id
+              AND e.task_id = s.task_id
+              AND e.event_type = 'task_end'
+        )
+        WHERE s.id = (
+            SELECT MIN(first_start.id)
+            FROM events AS first_start
+            WHERE first_start.session_id = s.session_id
+              AND first_start.task_id = s.task_id
+              AND first_start.event_type = 'task_start'
+        )
+          AND s.event_type = 'task_start'
+          AND s.task_id IS NOT NULL
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO task_lifecycle (
+            session_id, task_id, state, status, outcome, version,
+            terminal_event_id, ended_at
+        )
+        SELECT e.session_id, e.task_id, 'terminal',
+               json_extract(e.data, '$.status'),
+               json_extract(e.data, '$.outcome'),
+               1, e.id, e.created_at
+        FROM events AS e
+        WHERE e.event_type = 'task_end'
+          AND e.task_id IS NOT NULL
+          AND e.id = (
+              SELECT MIN(first_end.id)
+              FROM events AS first_end
+              WHERE first_end.session_id = e.session_id
+                AND first_end.task_id = e.task_id
+                AND first_end.event_type = 'task_end'
+          )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_consolidation
          ON events(consolidated_at) WHERE consolidated_at IS NULL",

@@ -66,6 +66,11 @@ pub struct RequestReceiptPredicate {
     /// Required pre-I/O invocation-contract disposition when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_rejected: Option<bool>,
+    /// Maximum tool-invocation proposals allowed for this user-owned
+    /// operation. This counts pre-I/O validation outcomes as invocations while
+    /// the execution-attempt ledger separately counts actual dispatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_invocations: Option<usize>,
 }
 
 impl RequestReceiptPredicate {
@@ -75,6 +80,7 @@ impl RequestReceiptPredicate {
             && self.outcome_statuses.is_empty()
             && !self.requires_output
             && self.contract_rejected.is_none()
+            && self.max_invocations.is_none()
     }
 }
 

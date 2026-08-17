@@ -26,6 +26,9 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     pub heartbeat: &'a Option<Arc<AtomicU64>>,
     pub emitter: &'a crate::events::EventEmitter,
     pub policy_bundle: &'a PolicyBundle,
+    /// Deterministic operation-ledger refusal. The call proposal is persisted,
+    /// but no adapter I/O may begin when this is present.
+    pub dispatch_block_reason: Option<&'a str>,
     /// Set by the correction gate when this specific tool call has already
     /// been classified as allowed for unattended execution.
     /// False on all normal (non-correction) paths.
@@ -208,12 +211,14 @@ pub(super) async fn execute_tool_call_io(
             tool_duration_ms: 0,
             result_metadata: crate::traits::ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
                 semantics,
                 ..crate::traits::ToolCallMetadata::default()
             },
         };
     }
 
+    let replay_invalidated = replay_invalidation_reason.is_some();
     if let Some(reason) = replay_invalidation_reason {
         agent
             .emit_decision_point(
@@ -242,6 +247,7 @@ pub(super) async fn execute_tool_call_io(
             .as_ref()
             .map(crate::events::ToolReceiptV1::to_metadata)
             .unwrap_or_default();
+        metadata.invocation_stage = crate::traits::ToolInvocationStage::Replayed;
         metadata.attachments = previous.attachments;
         agent
             .emit_decision_point(
@@ -294,10 +300,41 @@ pub(super) async fn execute_tool_call_io(
             tool_duration_ms: 0,
             result_metadata: crate::traits::ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
                 semantics,
                 ..crate::traits::ToolCallMetadata::default()
             },
         };
+    }
+
+    if !replay_invalidated {
+        if let Some(reason) = ctx.dispatch_block_reason {
+            agent
+                .emit_warning_decision_point(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
+                    DecisionType::ToolBudgetBlock,
+                    format!("Blocked an exhausted operation retry for {}", tc.name),
+                    serde_json::json!({
+                        "condition": "operation_retry_budget_exhausted",
+                        "tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "idempotency_key": ctx.idempotency_key,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            return ToolExecutionIoResult {
+                result_text: format!("Operation not dispatched: {reason}"),
+                tool_duration_ms: 0,
+                result_metadata: crate::traits::ToolCallMetadata {
+                    outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                    invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                    ..crate::traits::ToolCallMetadata::default()
+                },
+            };
+        }
     }
 
     let tool_exec_start = Instant::now();
@@ -371,8 +408,21 @@ pub(super) async fn execute_tool_call_io(
     let mut result_text = match result {
         Ok(outcome) => {
             result_metadata = outcome.metadata;
-            result_metadata.receipt_kind = registered_receipt_kind;
-            result_metadata.access_manifest = registered_access_manifest.clone();
+            if result_metadata.invocation_stage == crate::traits::ToolInvocationStage::Unknown {
+                result_metadata.invocation_stage = if result_metadata.contract_rejected {
+                    crate::traits::ToolInvocationStage::RejectedBeforeIo
+                } else {
+                    crate::traits::ToolInvocationStage::Dispatched
+                };
+            }
+            if result_metadata.invocation_stage.reached_dispatch() {
+                result_metadata.receipt_kind = registered_receipt_kind;
+                if result_metadata.access_manifest.is_none() {
+                    result_metadata.access_manifest = registered_access_manifest.clone();
+                }
+            } else {
+                result_metadata.access_manifest = None;
+            }
             // A successful typed observation boundary is authoritative even
             // when the observed subject describes failed jobs, blocked tasks,
             // or errors. Do not extend that rule to legacy mutation/admin
@@ -383,7 +433,8 @@ pub(super) async fn execute_tool_call_io(
                 .iter()
                 .find(|tool| tool.name() == tc.name && tool.is_available())
                 .map(|tool| tool.call_semantics(ctx.effective_arguments));
-            if result_metadata.outcome_status.is_none()
+            if result_metadata.invocation_stage.reached_dispatch()
+                && result_metadata.outcome_status.is_none()
                 && registered_semantics.as_ref().is_some_and(|semantics| {
                     semantics.observes_state() && !semantics.mutates_state()
                 })
@@ -417,6 +468,7 @@ pub(super) async fn execute_tool_call_io(
         Err(e) => {
             result_metadata.receipt_kind = registered_receipt_kind;
             result_metadata.access_manifest = registered_access_manifest;
+            result_metadata.invocation_stage = crate::traits::ToolInvocationStage::Dispatched;
             result_metadata.transport_error = Some(e.to_string());
             // A legacy tool returning `Err` has made an explicit typed Rust
             // failure. Classify it once at this adapter boundary instead of

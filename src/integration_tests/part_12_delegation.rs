@@ -416,17 +416,37 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
 }
 
 #[tokio::test]
-async fn operational_blocker_without_recovery_evidence_keeps_executor_running() {
+async fn operational_blocker_without_recovery_evidence_requires_recovery_receipt() {
+    let workspace = tempfile::tempdir().expect("synthetic recovery workspace");
+    let workspace_path = workspace.path().to_string_lossy().to_string();
+    let file_path = workspace.path().join("post.md");
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "report_blocker",
             r#"{"reason":"The build result contradicts a direct parser check","blocker_class":"recovery_exhausted","external_effect_state":"none","recovery_attempts":[{"action":"Parsed the current file","outcome":"The id is valid","evidence":"The parser returned integer 108"}],"outcome":"blocked"}"#,
         ),
+        MockProvider::tool_call_response(
+            "synthetic_patch",
+            &serde_json::json!({"path": file_path}).to_string(),
+        ),
         MockProvider::text_response(
             "Refreshed the workspace, reran the original build, and completed the task successfully.",
         ),
-    ]);
-    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "change",
+        true,
+        false,
+        &["local_source_write"],
+        "new_request",
+        "local_workspace",
+    )]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(StructuredPatchTool) as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
     let agent = Arc::new(harness.agent);
 
     let goal = Goal::new_finite("Build the current blog post", "delegation-recovery-gate");
@@ -464,7 +484,7 @@ async fn operational_blocker_without_recovery_evidence_keeps_executor_running() 
             Some(AgentRole::Executor),
             Some(goal.id.as_str()),
             Some(task.id.as_str()),
-            Some("/tmp/demo"),
+            Some(&workspace_path),
             None,
         )
         .await
@@ -473,8 +493,8 @@ async fn operational_blocker_without_recovery_evidence_keeps_executor_running() 
     assert!(response.contains("reran the original build"), "{response}");
     assert_eq!(
         harness.provider.call_count().await,
-        2,
-        "a rejected blocker must return control to the executor"
+        3,
+        "a rejected blocker must return control to the executor until a receipt exists"
     );
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(updated.status, "completed");

@@ -3,8 +3,7 @@ use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
     is_file_recheck_tool, maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
-    project_instruction_targets_for_tool_call, terminal_command_resource_targets,
-    tool_call_includes_project_path,
+    project_instruction_targets_for_tool_call, tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::run_helpers::*;
@@ -18,13 +17,10 @@ use crate::agent::execution_state::OutcomeEntry;
 use crate::agent::loop_state::{
     canonical_path_from_arguments, LineInterval, ReadDecision, ReadRequest,
 };
-use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::self_correction::AttemptDecision;
 use crate::agent::*;
 use crate::events::TaskOutcome;
-use crate::traits::{
-    MandateDecisionOutcome, ToolCallSemantics, ToolTargetHint, ToolTargetHintKind,
-};
+use crate::traits::{MandateDecisionOutcome, ToolCallAccessManifest, ToolCallSemantics};
 
 // ── Correction gate (P2.4) ───────────────────────────────────────────────────
 
@@ -521,13 +517,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let task_tokens_used = ctx.task_tokens_used;
     let _user_text = ctx.user_text;
     let model = ctx.model;
-    let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
     let active_skill_names = ctx.active_skill_names;
     let active_untrusted_external_reference_skills = ctx.active_untrusted_external_reference_skills;
     let restrict_untrusted_external_reference_tools =
         ctx.restrict_untrusted_external_reference_tools;
-    let is_reaffirmation_challenge_turn = ctx.is_reaffirmation_challenge_turn;
-    let personal_memory_tool_call_cap = ctx.personal_memory_tool_call_cap;
     let base_tool_defs = ctx.base_tool_defs;
     let available_capabilities = ctx.available_capabilities;
     let policy_bundle = ctx.policy_bundle;
@@ -552,7 +545,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let mut tool_transient_failure_count = std::mem::take(ctx.tool_transient_failure_count);
     let mut tool_cooldown_until_iteration = std::mem::take(ctx.tool_cooldown_until_iteration);
     let mut tool_call_count = std::mem::take(ctx.tool_call_count);
-    let mut personal_memory_tool_calls = *ctx.personal_memory_tool_calls;
     let mut no_evidence_result_streak = *ctx.no_evidence_result_streak;
     let mut no_evidence_tools_seen = std::mem::take(ctx.no_evidence_tools_seen);
     let mut evidence_gain_count = *ctx.evidence_gain_count;
@@ -598,7 +590,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             *ctx.tool_transient_failure_count = tool_transient_failure_count;
             *ctx.tool_cooldown_until_iteration = tool_cooldown_until_iteration;
             *ctx.tool_call_count = tool_call_count;
-            *ctx.personal_memory_tool_calls = personal_memory_tool_calls;
             *ctx.no_evidence_result_streak = no_evidence_result_streak;
             *ctx.no_evidence_tools_seen = no_evidence_tools_seen;
             *ctx.evidence_gain_count = evidence_gain_count;
@@ -693,57 +684,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         &mut pending_reflection_recoveries,
         iteration,
     );
-    // Concurrent prefetch for provably-safe read-only batches: overlaps the
-    // I/O latency of e.g. several web fetches. The sequential loop below
-    // keeps full ownership of guards/budgets and consumes a prefetched
-    // result only when its computed effective arguments match exactly.
-    // Prefetch is disabled in correction mode: the correction gate must run
-    // the full sandbox classifier on each call before I/O begins.
-    let mut prefetched_io = if project_instruction_tracker.is_none()
-        && !restrict_untrusted_external_reference_tools
-        && ctx.correction.is_none()
-        && !is_mandate_execution
-        && super::parallel_prefetch::batch_is_prefetch_eligible(
-            &resp.tool_calls,
-            available_capabilities,
-            &unknown_tools,
-            &tool_cooldown_until_iteration,
-            iteration,
-        ) {
-        info!(
-            session_id,
-            iteration,
-            batch_size = resp.tool_calls.len(),
-            "Prefetching read-only tool batch concurrently"
-        );
-        let prefetch_project_scope = (!turn_context.allow_multi_project_scope)
-            .then_some(turn_context.primary_project_scope.as_deref())
-            .flatten();
-        super::parallel_prefetch::prefetch_read_only_batch(
-            agent,
-            &resp.tool_calls,
-            &super::parallel_prefetch::PrefetchCtx {
-                model,
-                idempotency_key: execution_state
-                    .current_step
-                    .as_ref()
-                    .and_then(|step| step.idempotency_key.as_deref()),
-                project_scope: prefetch_project_scope,
-                session_id,
-                task_id,
-                iteration,
-                status_tx: &status_tx,
-                channel_ctx,
-                user_role,
-                heartbeat,
-                emitter,
-                policy_bundle,
-            },
-        )
-        .await
-    } else {
-        HashMap::new()
-    };
+    // Complete mediation invariant: no adapter I/O may begin until the exact
+    // prepared invocation has crossed project-instruction, authority, scope,
+    // retry, and obligation gates. The former speculative read-only prefetch
+    // ran before those turn-local gates. Parallelism can return only after a
+    // future batch-preparation phase produces authorized invocation objects.
     // Set when an executor successfully reports a blocker this iteration.
     // A declared blocker is a terminal outcome: the structured summary is the
     // deliverable for the task lead, so the loop ends after this batch instead
@@ -840,43 +785,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             None
         };
-        let is_personal_memory_tool_call = is_personal_memory_tool(&tc.name);
-
-        if restrict_to_personal_memory_tools && is_personal_memory_tool_call {
-            if personal_memory_tool_calls >= personal_memory_tool_call_cap {
-                force_text_response = true;
-                pending_system_messages.push(SystemDirective::PersonalMemoryRecheckLimitReached);
-                let result_text =
-                            "Targeted personal-memory re-check limit reached. No further tool calls are allowed for this question."
-                                .to_string();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.2,
-                    ..Message::runtime_defaults()
-                };
-                agent
-                    .append_tool_message_with_result_event(
-                        emitter,
-                        &tool_msg,
-                        true,
-                        0,
-                        None,
-                        Some(task_id),
-                    )
-                    .await?;
-                continue;
-            }
-
-            personal_memory_tool_calls = personal_memory_tool_calls.saturating_add(1);
-        }
-
         if restrict_untrusted_external_reference_tools
             && crate::agent::is_untrusted_external_reference_blocked_tool(&tc.name)
         {
@@ -1149,16 +1057,40 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .iter()
             .find(|tool| tool.name() == tc.name && tool.is_available());
         let (mut call_semantics, mut access_manifest) = if let Some(tool) = registered_tool {
-            (
-                tool.call_semantics(&effective_arguments),
-                tool.call_access_manifest(&effective_arguments),
-            )
+            match tool.prepare_invocation(&effective_arguments) {
+                Ok(prepared) => {
+                    effective_arguments = prepared.canonical_arguments;
+                    (prepared.semantics, prepared.access_manifest)
+                }
+                Err(_) => {
+                    // The dispatcher will persist the typed rejection. Until
+                    // then, retain validation-only semantics: proposed domain
+                    // effects and paths are not execution facts.
+                    if let Ok(canonical) = tool.canonicalize_arguments(&effective_arguments) {
+                        effective_arguments = canonical;
+                    }
+                    (
+                        ToolCallSemantics::observation().with_verification_mode(
+                            crate::traits::ToolVerificationMode::ResultContent,
+                        ),
+                        ToolCallAccessManifest::default(),
+                    )
+                }
+            }
         } else if let Some(registry) = agent.mcp_registry.as_ref() {
             if let Some(tool) = registry.find_tool(&tc.name).await {
-                (
-                    tool.call_semantics(&effective_arguments),
-                    tool.call_access_manifest(&effective_arguments),
-                )
+                match tool.prepare_invocation(&effective_arguments) {
+                    Ok(prepared) => {
+                        effective_arguments = prepared.canonical_arguments;
+                        (prepared.semantics, prepared.access_manifest)
+                    }
+                    Err(_) => (
+                        ToolCallSemantics::observation().with_verification_mode(
+                            crate::traits::ToolVerificationMode::ResultContent,
+                        ),
+                        ToolCallAccessManifest::default(),
+                    ),
+                }
             } else {
                 Default::default()
             }
@@ -1206,36 +1138,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             call_semantics
         };
-        if matches!(tc.name.as_str(), "terminal" | "run_command") {
-            if let Ok(arguments) = serde_json::from_str::<Value>(&effective_arguments) {
-                if let Some(command) = arguments.get("command").and_then(Value::as_str) {
-                    let base = access_manifest.execution_cwd.as_deref();
-                    let command_targets = terminal_command_resource_targets(command, base);
-                    for path in command_targets.execution_contexts {
-                        let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)
-                        else {
-                            continue;
-                        };
-                        if !access_manifest.read_targets.contains(&target) {
-                            access_manifest.read_targets.push(target);
-                        }
-                    }
-                    for path in command_targets.data_paths {
-                        let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path) else {
-                            continue;
-                        };
-                        let targets = if call_semantics.mutates_state() {
-                            &mut access_manifest.write_targets
-                        } else {
-                            &mut access_manifest.read_targets
-                        };
-                        if !targets.contains(&target) {
-                            targets.push(target);
-                        }
-                    }
-                }
-            }
-        }
         let tool_caps = available_capabilities
             .get(&tc.name)
             .copied()
@@ -1321,8 +1223,21 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
+        let (operation_key, max_invocations) = stable_operation_identity(
+            &execution_state.execution_id,
+            &turn_context.completion_contract,
+            &tc.name,
+            &call_semantics,
+            &effective_arguments,
+            &access_manifest,
+            execution_state
+                .current_linear_intent_step()
+                .map(|step| step.step_id.as_str()),
+        );
         let step_plan = compile_step_execution_plan(
             &execution_state.execution_id,
+            operation_key,
+            max_invocations,
             execution_state.current_plan_version.unwrap_or(1),
             iteration,
             &tc.id,
@@ -1485,6 +1400,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     // Model is stuck retrying blocked tools — force text.
                     force_text_response = true;
                     pending_system_messages.push(SystemDirective::HardToolLimitReached);
+                    if unknown_tools.contains(&tc.name) {
+                        // The runtime has already given the model one
+                        // tool-enabled opportunity to choose a registered
+                        // alternative. Repeating the same nonexistent adapter
+                        // is a terminal operation failure, not a reason to
+                        // reopen execution indefinitely.
+                        execution_state
+                            .complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+                        execution_state.mark_persisted_now();
+                    }
                 } else {
                     // First/second block — tell the model this tool is done
                     // but other tools are still available.
@@ -1572,7 +1497,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     ReadDecision::Execute | ReadDecision::Unknown => None,
                 };
                 if let Some(result_text) = synthetic {
-                    execution_state.begin_staged_step();
+                    execution_state.record_synthetic_step();
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -1602,25 +1527,42 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             }
         }
-        if let Some(guard_outcome) = super::guards::maybe_handle_loop_pattern_guards(
-            agent,
-            tc,
-            emitter,
-            task_id,
-            session_id,
-            iteration,
-            task_start,
-            task_tokens_used,
-            learning_ctx,
-            model,
-            &mut recent_tool_calls,
-            &mut recent_tool_names,
-            &mut consecutive_same_tool,
-            &mut consecutive_same_tool_arg_hashes,
-            &tool_result_cache,
-        )
-        .await?
-        {
+        let durable_reconciliation_pending = match step_plan.idempotency_key.as_deref() {
+            Some(key) => agent
+                .event_store
+                .get_tool_result_by_idempotency_key(session_id, key)
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            None => false,
+        };
+        // A stable operation with a durable receipt must reach the tool's
+        // typed replay/reconciliation hook. A generic repetition heuristic
+        // cannot decide whether the real-world postcondition still exists.
+        let guard_outcome = if durable_reconciliation_pending {
+            None
+        } else {
+            super::guards::maybe_handle_loop_pattern_guards(
+                agent,
+                tc,
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                task_start,
+                task_tokens_used,
+                learning_ctx,
+                model,
+                &mut recent_tool_calls,
+                &mut recent_tool_names,
+                &mut consecutive_same_tool,
+                &mut consecutive_same_tool_arg_hashes,
+                &tool_result_cache,
+            )
+            .await?
+        };
+        if let Some(guard_outcome) = guard_outcome {
             match guard_outcome {
                 LoopPatternGuardOutcome::ContinueLoop => {
                     continue;
@@ -1895,141 +1837,46 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             None
         };
 
-        let prefetched = match prefetched_io.remove(&tc.id) {
-            Some(entry) if entry.arguments == effective_arguments => Some(entry.io),
-            Some(_) => {
-                // The loop's argument pipeline (e.g. project-dir injection)
-                // diverged from the raw arguments the prefetch used —
-                // discard the spare read-only result and execute live.
-                warn!(
-                    session_id,
-                    tool = %tc.name,
-                    "Discarding prefetched result: effective arguments diverged"
-                );
-                None
-            }
-            None => None,
-        };
-        execution_state.begin_staged_step();
-        let io = match prefetched {
-            Some(io) => {
-                info!(
-                    session_id,
-                    tool = %tc.name,
-                    duration_ms = io.tool_duration_ms,
-                    "Using concurrently prefetched tool result"
-                );
-                io
-            }
-            None => {
-                super::execution_io::execute_tool_call_io(
-                    agent,
-                    tc,
-                    &ToolExecutionIoCtx {
-                        effective_arguments: &effective_arguments,
-                        model,
-                        idempotency_key: execution_state
-                            .current_step
-                            .as_ref()
-                            .and_then(|step| step.idempotency_key.as_deref()),
-                        injected_project_dir: injected_project_dir.as_deref(),
-                        project_scope: allowed_project_scope,
-                        session_id,
-                        task_id,
-                        iteration,
-                        status_tx: &status_tx,
-                        channel_ctx,
-                        user_role,
-                        heartbeat,
-                        emitter,
-                        policy_bundle,
-                        correction_preapproved: io_correction_preapproved,
-                        suppress_trusted_session: io_suppress_trusted_session,
-                        mandate_authority: mandate_authority_grant.as_ref(),
-                        mandate_execution: is_mandate_execution,
-                        mutation_forbidden: turn_context.completion_contract.forbids_mutation,
-                    },
-                )
-                .await
-            }
-        };
+        let operation_admitted = execution_state.begin_staged_step();
+        let io = super::execution_io::execute_tool_call_io(
+            agent,
+            tc,
+            &ToolExecutionIoCtx {
+                effective_arguments: &effective_arguments,
+                model,
+                idempotency_key: execution_state
+                    .current_step
+                    .as_ref()
+                    .and_then(|step| step.idempotency_key.as_deref()),
+                injected_project_dir: injected_project_dir.as_deref(),
+                project_scope: allowed_project_scope,
+                session_id,
+                task_id,
+                iteration,
+                status_tx: &status_tx,
+                channel_ctx,
+                user_role,
+                heartbeat,
+                emitter,
+                policy_bundle,
+                dispatch_block_reason: (!operation_admitted).then_some(
+                    "The stable operation has exhausted its producer-declared retry budget.",
+                ),
+                correction_preapproved: io_correction_preapproved,
+                suppress_trusted_session: io_suppress_trusted_session,
+                mandate_authority: mandate_authority_grant.as_ref(),
+                mandate_execution: is_mandate_execution,
+                mutation_forbidden: turn_context.completion_contract.forbids_mutation,
+            },
+        )
+        .await;
         execution_state.record_tool_call();
         execution_state.mark_persisted_now();
         let mut result_text = io.result_text;
-        let mut tool_duration_ms = io.tool_duration_ms;
+        let tool_duration_ms = io.tool_duration_ms;
         let mut result_metadata = io.result_metadata;
-        // run_command → terminal fallback is disabled in correction mode: the
-        // fallback would bypass the correction gate on the secondary terminal call.
-        if tc.name == "run_command"
-            && ctx.correction.is_none()
-            && run_command_policy_block_requires_terminal(&result_text)
-        {
-            if let Some(terminal_args) =
-                build_terminal_fallback_arguments_from_run_command(&effective_arguments)
-            {
-                let fallback_started = Instant::now();
-                let terminal_result = agent
-                    .execute_tool_with_watchdog_outcome(
-                        "terminal",
-                        &terminal_args,
-                        &tool_exec::ToolExecCtx {
-                            session_id,
-                            task_id: Some(task_id),
-                            status_tx: status_tx.clone(),
-                            channel_visibility: channel_ctx.visibility,
-                            channel_id: channel_ctx.channel_id.as_deref(),
-                            project_scope: allowed_project_scope,
-                            trusted: channel_ctx.trusted,
-                            user_role,
-                            workspace_grant: channel_ctx.active_workspace_grant(user_role),
-                            correction_preapproved: false,
-                            suppress_trusted_session: false,
-                            mandate_authority: None,
-                            // A transparent adapter keeps the originating
-                            // invocation identity. Background completion uses
-                            // this exact ID to bind the terminal receipt back
-                            // to the parent request.
-                            tool_call_id: Some(tc.id.as_str()),
-                            mutation_forbidden: turn_context.completion_contract.forbids_mutation,
-                        },
-                    )
-                    .await;
-                let fallback_duration =
-                    fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                tool_duration_ms = tool_duration_ms.saturating_add(fallback_duration);
-                let fallback_note = ToolResultNotice::RunCommandPolicyAutoRoutedToTerminal;
-                result_text = match terminal_result {
-                    Ok(outcome) => {
-                        result_metadata = outcome.metadata;
-                        result_metadata.effective_tool_name = Some("terminal".to_string());
-                        result_metadata.result_provenance = Some(
-                            crate::traits::ToolResultProvenance::from_authoritative_result(
-                                &outcome.output,
-                                &result_metadata,
-                                crate::traits::ToolResultContentSource::ToolOutput,
-                            ),
-                        );
-                        format!("{}\n\n{}", outcome.output, fallback_note.render())
-                    }
-                    Err(e) => {
-                        result_metadata.transport_error = Some(e.to_string());
-                        format!("Error: {}\n\n{}", e, fallback_note.render())
-                    }
-                };
-                if agent.context_window_config.enabled {
-                    let compressed = crate::memory::context_window::compress_tool_result(
-                        "terminal",
-                        &result_text,
-                        agent.context_window_config.tool_result_chars_for(model),
-                    );
-                    if compressed.chars().count() < result_text.chars().count() {
-                        if let Some(provenance) = result_metadata.result_provenance.as_mut() {
-                            provenance.mark_model_view_truncated(&compressed);
-                        }
-                    }
-                    result_text = compressed;
-                }
-            }
+        if result_metadata.invocation_stage.performed_io() {
+            execution_state.record_current_operation_dispatch();
         }
         // Tool adapters commonly return only authoritative outcome fields
         // (exit code, domain status, etc.). Preserve those fields, but always
@@ -2181,6 +2028,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // process result or contract rejection can complete an observation
         // without being relabeled as a successful mutation.
         let outcome_satisfied = domain_outcome_satisfied || expected_observation_satisfied;
+        // The semantic producer is optional. Its absence must not make an
+        // executed, read-only negative observation look unfinished: process
+        // exit 1, an empty lookup, or another typed negative domain result is
+        // still the completed result of the proposed observation. This does
+        // not apply to mutations and cannot be earned by a pre-I/O rejection.
+        let lazy_observation_completed = result_metadata.invocation_stage.reached_dispatch()
+            && result_metadata.semantics.observes_state()
+            && !result_metadata.semantics.mutates_state()
+            && tool_outcome_status
+                == crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult;
         // Adapter status and request status are distinct axes. A permanent
         // adapter failure is still the observed result when the current typed
         // receipt explicitly requires that outcome; recovery/learning must not
@@ -2350,6 +2207,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 planned_step_description: planned_step.as_ref().map(|s| s.description.clone()),
                 expected_step_count,
             });
+            execution_state.record_operation_result(
+                result_metadata.invocation_stage,
+                outcome_satisfied || lazy_observation_completed,
+            );
             // Advance linear intent step pointer on successful external mutation
             if domain_outcome_satisfied && planned_step.is_some() {
                 execution_state.advance_linear_intent_step_after_external_success();
@@ -2571,16 +2432,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let learning_env = ResultLearningEnv {
             attempted_required_file_recheck,
             send_file_key,
-            is_reaffirmation_challenge_turn,
-            session_id,
-            task_id,
-            emitter,
-            task_start,
             iteration,
-            restrict_to_personal_memory_tools,
             tool_arguments: &effective_arguments,
             tool_summary: &tool_summary,
             semantics: &result_metadata.semantics,
+            outcome_status: result_metadata.outcome_status,
         };
         let mut learning_state = ResultLearningState {
             learning_ctx,

@@ -32,101 +32,6 @@ fn completed_task(
 }
 
 #[test]
-fn low_signal_task_lead_reply_detects_synth_done() {
-    assert!(is_low_signal_task_lead_reply("Done."));
-    assert!(is_low_signal_task_lead_reply(
-        "Done — Check the disk usage of my projects directory..."
-    ));
-}
-
-#[test]
-fn low_signal_task_lead_reply_detects_brief_complete_goal_echo() {
-    assert!(is_low_signal_task_lead_reply(
-        "Goal goal_123 completed: Goal completed successfully"
-    ));
-}
-
-#[test]
-fn low_signal_task_lead_reply_allows_concrete_multiline_results() {
-    let concrete = "Goal goal_123 completed: Finished disk usage audit\n\nFinal task result:\n1.2G /Users/me/projects/aidaemon/target";
-    assert!(!is_low_signal_task_lead_reply(concrete));
-}
-
-#[test]
-fn goal_completion_response_detects_verification_pending_reply() {
-    let reply = "I completed part of the request, but I haven't verified the final outcome yet.\n\nI need a final read-only check before I can claim success.";
-    assert!(goal_completion_response_indicates_incomplete_work(reply));
-}
-
-#[test]
-fn goal_completion_response_detects_deferred_action_reply() {
-    assert!(goal_completion_response_indicates_incomplete_work(
-        "I'll start building the website."
-    ));
-}
-
-#[test]
-fn incomplete_live_work_summary_detects_attempt_only_reply() {
-    let reply = "I've attempted to search the live API, but encountered API errors.\n\nWhat I tried:\n- Multiple attempts with different geographic parameters\n\nCurrent status:\nNo results retrieved yet. The API is rejecting the parameters I attempted.";
-    assert!(looks_like_incomplete_live_work_summary(reply));
-    assert!(goal_completion_response_indicates_incomplete_work(reply));
-}
-
-#[test]
-fn incomplete_live_work_summary_allows_concrete_results() {
-    let reply = "I queried ClinicalTrials.gov and found an actively recruiting skin cancer study in Fairfax, Virginia.";
-    assert!(!looks_like_incomplete_live_work_summary(reply));
-}
-
-#[test]
-fn false_capability_denial_detects_live_search_fallback_text() {
-    let reply = "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.";
-    assert!(looks_like_false_capability_denial_after_tool_success(reply));
-}
-
-#[test]
-fn false_capability_denial_detects_memory_record_denial() {
-    let reply = "I don't have that in my records, but I can help you add it.";
-    assert!(looks_like_false_capability_denial_after_tool_success(reply));
-}
-
-#[test]
-fn evidence_grounding_challenge_detects_made_up_question() {
-    let reply = "Since the returned errors, does it mean you made them up?";
-    assert!(looks_like_evidence_grounding_challenge(reply));
-}
-
-#[test]
-fn evidence_grounding_challenge_detects_exact_output_request() {
-    let reply = "Show me the exact output from the tool.";
-    assert!(looks_like_evidence_grounding_challenge(reply));
-}
-
-#[test]
-fn evidence_grounding_challenge_detects_test_failure_verification() {
-    let reply = "Did that test actually fail?";
-    assert!(looks_like_evidence_grounding_challenge(reply));
-}
-
-#[test]
-fn evidence_grounding_challenge_detects_blocker_followup() {
-    let reply = "Disabled? Why?";
-    assert!(looks_like_evidence_grounding_challenge(reply));
-}
-
-#[test]
-fn evidence_grounding_challenge_ignores_generic_followup() {
-    let reply = "What does it mean?";
-    assert!(!looks_like_evidence_grounding_challenge(reply));
-}
-
-#[test]
-fn goal_completion_response_allows_concrete_finished_reply() {
-    let reply = "I audited the disk usage and found 1.2G in /Users/me/projects/aidaemon/target.";
-    assert!(!goal_completion_response_indicates_incomplete_work(reply));
-}
-
-#[test]
 fn goal_task_results_summary_includes_recent_tasks_and_omission_count() {
     let tasks = vec![
         completed_task("task_1", "Step 1", "Result one", "2026-02-17T09:00:00Z", 1),
@@ -141,7 +46,7 @@ fn goal_task_results_summary_includes_recent_tasks_and_omission_count() {
         completed_task("task_4", "Step 4", "Result four", "2026-02-17T09:03:00Z", 4),
     ];
 
-    let summary = build_goal_task_results_summary(&tasks, "fallback");
+    let summary = build_goal_task_results_summary(&tasks, None, "fallback");
     assert!(summary.contains("4/4 tasks completed."));
     assert!(summary.contains("Step 4"));
     assert!(summary.contains("Step 3"));
@@ -153,6 +58,6 @@ fn goal_task_results_summary_includes_recent_tasks_and_omission_count() {
 fn goal_task_results_summary_returns_fallback_when_no_results() {
     let mut task = completed_task("task_1", "Step 1", " ", "2026-02-17T09:00:00Z", 1);
     task.result = Some("   ".to_string());
-    let summary = build_goal_task_results_summary(&[task], "fallback summary");
+    let summary = build_goal_task_results_summary(&[task], None, "fallback summary");
     assert_eq!(summary, "fallback summary");
 }

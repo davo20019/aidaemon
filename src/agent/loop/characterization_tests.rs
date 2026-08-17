@@ -152,7 +152,8 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
     .with_metadata(ToolCallMetadata {
         outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
         exit_code: Some(1),
-        semantics: crate::tools::command_semantics::classify_shell_command("/usr/bin/false"),
+        semantics: ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
         ..ToolCallMetadata::default()
     });
     let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
@@ -185,6 +186,126 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
         calls.len(),
         3,
         "the receipt must close verification directly after the pre-execution gate"
+    );
+}
+
+#[tokio::test]
+async fn successful_memory_receipt_finalizes_without_a_validation_budget_loop() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 10,
+            "goal": "Read one synthetic family record",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "answer",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "forbidden",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "restricted",
+                "allowed_tool_names": ["manage_memories"],
+                "forbidden_tool_scopes": [],
+                "tool_constraint_evidence": [],
+                "required_response_fields": [],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [{
+                    "summary": "Read the current synthetic family record",
+                    "acceptable_scopes": ["user_memory"],
+                    "purpose": "content",
+                    "minimum_authority": "canonical",
+                    "temporal_scope": "both",
+                    "required_content_markers": [],
+                    "receipt": {
+                        "tool_names": ["manage_memories"],
+                        "exit_codes": [],
+                        "outcome_statuses": ["succeeded"],
+                        "requires_output": true,
+                        "contract_rejected": false,
+                        "max_invocations": 1
+                    },
+                    "target": null
+                }],
+                "required_invocations": [],
+                "filesystem_access": {
+                    "execution_cwd": null,
+                    "read_paths": [],
+                    "write_paths": []
+                },
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "manage_memories",
+            r#"{"action":"search","query":"synthetic family record"}"#,
+        ),
+        MockProvider::text_response(
+            r#"{"goal":"Read one synthetic family record","success_criteria":["Canonical receipt recorded"],"first_action":{"tool":"manage_memories","target":null,"description":"Read once"},"requires_verification":true,"risky_actions":[],"version":1}"#,
+        ),
+        MockProvider::text_response("The synthetic family record is available."),
+    ])
+    .with_task_assessments(vec![assessment]);
+    let semantics = ToolCallSemantics::observation()
+        .with_evidence(vec![ToolEvidenceCapability {
+            scope: ToolSemanticScope::UserMemory,
+            purposes: vec![EvidencePurpose::Content],
+            authority: EvidenceAuthority::Canonical,
+            temporal_scope: EvidenceTemporalScope::Both,
+        }])
+        .with_verification_mode(ToolVerificationMode::ResultContent);
+    let tool = MockTool::new(
+        "manage_memories",
+        "Read synthetic memory",
+        "Synthetic family record found.",
+    )
+    .with_role(ToolRole::Universal)
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(ToolOutcomeStatus::Succeeded),
+        semantics,
+        ..ToolCallMetadata::default()
+    });
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(tool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "typed-memory-receipt",
+            "Return the synthetic family record from authorized memory.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await;
+    assert_eq!(reply, "The synthetic family record is available.");
+    assert_eq!(
+        calls.len(),
+        3,
+        "a closed typed memory obligation must not trigger validation retries"
     );
 }
 
@@ -498,10 +619,7 @@ async fn dispatcher_argument_rejection_is_canonical_non_success_receipt() {
     let receipt = result.receipt.expect("canonical rejection receipt");
     assert!(!result.success);
     assert!(receipt.contract_rejected);
-    assert_eq!(
-        receipt.outcome_status,
-        ToolOutcomeStatus::CompletedWithNegativeResult
-    );
+    assert_eq!(receipt.outcome_status, ToolOutcomeStatus::Blocked);
 }
 
 #[tokio::test]
@@ -833,21 +951,13 @@ async fn capability_specific_deny_set_hides_memory_without_disabling_other_tools
 }
 
 #[tokio::test]
-async fn completed_negative_observation_is_reportable_without_verification_retry() {
+async fn completed_negative_observation_is_reportable_when_semantic_assessment_is_unavailable() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("synthetic_command_probe", "{}"),
         MockProvider::text_response(
             "The probe completed with exit code 127: the synthetic executable was not found.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let probe = MockTool::new(
         "synthetic_command_probe",
         "Observe whether a synthetic command is available",
@@ -888,7 +998,7 @@ async fn completed_negative_observation_is_reportable_without_verification_retry
     assert_eq!(
         harness.provider.call_count().await,
         2,
-        "a completed negative observation closes the evidence obligation"
+        "a dispatched typed negative observation must complete without a planner contract"
     );
 }
 
@@ -1836,34 +1946,37 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
         .await
         .unwrap();
 
-    assert_eq!(reply, "This model text should be ignored.");
+    assert!(
+        !reply.contains("This model text should be ignored"),
+        "an unfulfilled change cannot close from model text alone: {reply}"
+    );
+    assert!(reply.contains("couldn't complete"), "{reply}");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        2,
-        "background detach with inline work should continue through one normal model pass"
-    );
     assert!(
-        call_log.last().is_some_and(|call| !call.tools.is_empty()
+        call_log.iter().skip(1).any(|call| !call.tools.is_empty()
             && call.options.tool_choice != crate::traits::ToolChoiceMode::None),
         "an unfulfilled Change contract must retain tool definitions and execution capability"
     );
-    assert!(
-        call_log.last().is_some_and(|call| {
-            call.messages.iter().any(|message| {
-                message.get("role").and_then(|v| v.as_str()) == Some("system")
-                    && message
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|content| {
-                            content.contains("A background process was launched successfully")
-                                && content.contains("Continue with the remaining steps")
-                        })
+    let results = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "background_ack_characterization",
+            &[crate::events::EventType::ToolResult],
+            20,
+        )
+        .await
+        .unwrap();
+    assert!(results.iter().any(|event| {
+        event
+            .parse_data::<crate::events::ToolResultData>()
+            .is_ok_and(|result| {
+                result.receipt.is_some_and(|receipt| {
+                    receipt.outcome_status == crate::traits::ToolOutcomeStatus::Backgrounded
+                })
             })
-        }),
-        "background detach should carry a typed continuation directive into the next pass"
-    );
+    }));
 }
 
 #[tokio::test]
@@ -2244,7 +2357,7 @@ async fn replay_trace_yes_do_it_with_sanitized_response_analysis_falls_through_t
 }
 
 #[tokio::test]
-async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_call() {
+async fn prose_about_future_work_does_not_create_an_execution_obligation() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll search for all Rust files with async fn first."),
         MockProvider::text_response("Next I'll inspect each file and count async functions."),
@@ -2270,18 +2383,11 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
         .await
         .unwrap();
 
-    // The agent may either:
-    // 1. Run all 5 responses and return the final text (old behavior)
-    // 2. Stop earlier due to deferred-no-tool detection returning an intermediate text
-    // Both are acceptable — the key is no crash and a non-empty response.
-    assert!(
-        !reply.is_empty(),
-        "Agent should return a non-empty response"
-    );
-    // At minimum some deferral retries should fire before recovery.
-    assert!(
-        harness.provider.call_count().await >= 3,
-        "expected at least a few retries before deferred/no-tool recovery"
+    assert_eq!(reply, "I'll search for all Rust files with async fn first.");
+    assert_eq!(
+        harness.provider.call_count().await,
+        1,
+        "prose alone must not synthesize a lifecycle obligation or retry"
     );
 
     let call_log = harness.provider.call_log.lock().await.clone();
@@ -2291,13 +2397,12 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
             .any(|entry| matches!(entry.options.response_mode, ResponseMode::JsonSchema { .. })),
         "text-only schema pass should be disabled"
     );
-    // Generic complexity is advisory, so it cannot force a tool call by itself.
-    // Only a finalized mutation/observation contract or the narrow deterministic
-    // intent signal can support guided-model forced recovery.
+    // Only a finalized mutation/observation contract or a typed failed
+    // operation can support execution recovery.
 }
 
 #[tokio::test]
-async fn generic_deferred_no_tool_recovery_does_not_force_required() {
+async fn prose_deferral_does_not_create_execution_obligation_without_typed_contract() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "Need to inspect first.\n\
@@ -2327,11 +2432,15 @@ async fn generic_deferred_no_tool_recovery_does_not_force_required() {
         .await
         .unwrap();
 
-    assert_eq!(reply, "Final summary: system inspection completed.");
+    assert_eq!(reply, "I'll inspect the machine first.");
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "the structural protocol marker is sanitized once, but ordinary prose must not drive retries"
+    );
 
-    // No finalized concrete tool requirement exists for this generic request.
-    // Deferred-action recovery can still drive the model toward a tool, but it
-    // must not force provider-level Required mode.
+    // No finalized typed requirement or failed operation exists for this
+    // request, so presentation text cannot force provider-level Required mode.
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
         !call_log.is_empty(),

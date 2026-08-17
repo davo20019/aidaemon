@@ -638,17 +638,19 @@ pub(super) async fn run_completion_phase(
     let mut terminal_cause = None;
     let turn_context = ctx.turn_context;
     let execution_requirement = ctx.execution_requirement;
+    let execution_state = &mut *ctx.execution_state;
     // Execution obligations are lifecycle invariants, not model-quality
     // heuristics. Autonomous models choose their own strategy, but a first-pass
     // text denial is not evidence that an actionable request was resolved.
-    let execution_tool_recovery = execution_requirement.requires_execution();
+    let unresolved_recoverable_failure = execution_state.has_unresolved_recoverable_failure();
+    let execution_tool_recovery =
+        execution_requirement.requires_execution() || unresolved_recoverable_failure;
     let force_text_allowed = completion_contract_allows_force_text(
         &turn_context.completion_contract,
         &completion_progress,
-    );
+    ) && !unresolved_recoverable_failure;
     let mut force_text_response = *ctx.force_text_response && force_text_allowed;
     let mut force_text_fast_path_accepted = false;
-    let execution_state = &mut *ctx.execution_state;
     #[cfg(feature = "computer_use")]
     let computer_use_pin_active =
         crate::agent::computer_use::task_has_computer_use_pin(task_id).await;
@@ -719,6 +721,17 @@ pub(super) async fn run_completion_phase(
                     "verification_count": completion_progress.verification_count,
                     "verification_attempt_count": completion_progress.verification_attempt_count,
                     "verification_block_count": completion_progress.verification_block_count,
+                    "execution_id": &execution_state.execution_id,
+                    "operation_invocations": &execution_state.operation_invocations,
+                    "operation_attempts": &execution_state.operation_attempts,
+                    "operation_results_observed": execution_state.operation_results_observed,
+                    "completed_operation_results": execution_state.completed_operation_results,
+                    "unresolved_recoverable_failure": unresolved_recoverable_failure,
+                    "execution_tool_recovery": execution_tool_recovery,
+                    "force_text_response": force_text_response,
+                    "force_text_allowed": force_text_allowed,
+                    "background_handoff_active": execution_state.background_handoff_active,
+                    "validation_rounds_used": execution_state.validation_rounds_used,
                     "decision": "pending_ordered_finalization_gates",
                     "rejection_reason": Value::Null,
                 }),
@@ -896,7 +909,7 @@ pub(super) async fn run_completion_phase(
                 .tool_calls
                 .iter()
                 .any(|call| call.starts_with("send_file("))
-            && (reply.trim().is_empty() || is_low_signal_task_lead_reply(&reply))
+            && reply.trim().is_empty()
         {
             reply = super::stopping_phase::send_file_completion_reply().to_string();
             info!(
@@ -920,11 +933,7 @@ pub(super) async fn run_completion_phase(
                 has_uncorrected,
             )
         {
-            if reply.trim().is_empty()
-                || is_low_signal_task_lead_reply(&reply)
-                || looks_like_deferred_action_response(&reply)
-                || looks_like_recovery_message_with_trivial_content(&reply)
-            {
+            if reply.trim().is_empty() {
                 let actions: Vec<&str> =
                     learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
                 if !actions.is_empty() {
@@ -951,10 +960,11 @@ pub(super) async fn run_completion_phase(
         } else if should_enforce_no_tool_text_when_tools_required(
             &reply,
             execution_tool_recovery,
-            learning_ctx
-                .tool_calls
-                .len()
-                .saturating_add(validation_state.failed_checks.len()),
+            execution_state.completed_operation_results
+                + usize::from(
+                    completion_progress.observation_count > 0
+                        && completion_progress.all_evidence_requirements_satisfied(),
+                ),
             agent.depth,
         ) {
             if tool_defs.is_empty() || force_text_response {
@@ -975,27 +985,9 @@ pub(super) async fn run_completion_phase(
                 stall_count = 0;
                 consecutive_clean_iterations = 0;
 
-                // Early acceptance: after enough retries, if the model's text is
-                // substantive (not just "I'll do X"), accept it instead of looping
-                // forever.  This prevents stalls on queries the intent gate
-                // classified as needing tools but the model can answer directly
-                // (e.g., "Tell me a joke in Spanish", "List your capabilities").
-                if deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
-                    && is_substantive_text_response(&reply, 15)
-                {
-                    info!(
-                            session_id,
-                            iteration,
-                            deferred_no_tool_streak,
-                            reply_len = reply.len(),
-                            "Accepting substantive text-only response after repeated tool-required retries"
-                        );
-                    deferred_no_tool_streak = 0;
-                    // Fall through to normal completion path
-                } else {
-                    pending_system_messages
-                        .push(SystemDirective::ExecutionResolutionEvidenceRequired);
-                    agent.emit_decision_point(
+                pending_system_messages
+                    .push(SystemDirective::ExecutionResolutionEvidenceRequired);
+                agent.emit_decision_point(
                             emitter,
                             task_id,
                             iteration,
@@ -1007,22 +999,48 @@ pub(super) async fn run_completion_phase(
                                 "reply_len": reply.len(),
                                 "deferred_no_tool_streak": deferred_no_tool_streak
                             }),
+                    )
+                    .await;
+                warn!(
+                    session_id,
+                    iteration,
+                    deferred_no_tool_streak,
+                    "Blocked no-tool completion because current turn requires tools"
+                );
+                if unresolved_recoverable_failure && deferred_no_tool_streak >= 2 {
+                    let request = build_agent_side_partial_failure(
+                        turn_context,
+                        learning_ctx,
+                        Some(execution_state),
+                        "A dispatched operation failed, and two autonomous recovery passes did not produce a later satisfying receipt.",
+                        "Start a new attempt with a different compatible execution strategy.",
+                    );
+                    terminal_cause = Some(TaskTerminalCause::HardFailure);
+                    reply = request.render_user_message();
+                    pending_external_action_ack = None;
+                    agent
+                        .emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Closed unresolved operation after bounded autonomous recovery"
+                                .to_string(),
+                            json!({
+                                "condition": "operation_recovery_exhausted",
+                                "deferred_no_tool_streak": deferred_no_tool_streak,
+                                "operation_results_observed": execution_state.operation_results_observed,
+                                "completed_operation_results": execution_state.completed_operation_results,
+                            }),
                         )
                         .await;
-                    warn!(
-                        session_id,
-                        iteration,
-                        deferred_no_tool_streak,
-                        "Blocked no-tool completion because current turn requires tools"
-                    );
+                } else {
                     return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
         }
 
         let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
-        let assistant_claimed_mutation = claims_completed_side_effect(&reply);
-        let assistant_claimed_delegation = claims_delegation_started(&reply);
         let typed_mutation_fulfilled =
             mutation_contract_fulfilled(&turn_context.completion_contract, &completion_progress);
         let authored_artifact_undelivered = authored_artifact_still_needs_delivery_recovery(
@@ -1065,36 +1083,22 @@ pub(super) async fn run_completion_phase(
             );
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
-        let unbacked_mutation_claim = assistant_claimed_mutation
-            && if turn_context.completion_contract.expects_mutation {
-                !typed_mutation_fulfilled
-            } else {
-                completion_progress.mutation_count == 0
-            };
         let concrete_mutation_required =
             super::completion_checks::contract_has_concrete_mutation_target(
                 &turn_context.completion_contract,
             );
         let unfulfilled_concrete_mutation = concrete_mutation_required && !typed_mutation_fulfilled;
-        // The completion contract is an intent hint, not proof of a required
-        // side effect. Hard enforcement starts when the assistant itself
-        // claims that a mutation happened; that claim can be checked exactly
-        // against mutation semantics recorded in the tool ledger.
-        let mutation_gate_relevant = assistant_claimed_mutation || concrete_mutation_required;
-        if mutation_gate_relevant {
+        if concrete_mutation_required {
             let mutation_gate_block_condition = !force_text_fast_path_accepted
                 && !force_text_response
                 && agent.depth == 0
-                && (unbacked_mutation_claim
-                    || (unfulfilled_concrete_mutation && has_tool_attempts))
+                && unfulfilled_concrete_mutation
+                && has_tool_attempts
                 && completion_progress.mutation_claim_nudge_count == 0;
-            let zero_tool_claim_condition = !has_tool_attempts && unbacked_mutation_claim;
             let (outcome, skip_reason) = if force_text_fast_path_accepted {
                 ("skipped_force_text_fast_path", Some("force_text_fast_path"))
             } else if force_text_response {
                 ("skipped_force_text_response", Some("force_text_response"))
-            } else if zero_tool_claim_condition {
-                ("blocked_claimed_mutation_without_tool", None)
             } else if agent.depth != 0 {
                 ("skipped_non_root_agent", Some("non_root_agent"))
             } else if typed_mutation_fulfilled {
@@ -1107,7 +1111,6 @@ pub(super) async fn run_completion_phase(
             let metadata = json!({
                 "condition": "expects_mutation_gate_evaluated",
                 "expects_mutation": turn_context.completion_contract.expects_mutation,
-                "assistant_claimed_mutation": assistant_claimed_mutation,
                 "tool_calls_count": resp.tool_calls.len(),
                 "mutation_tool_calls_count": completion_progress.mutation_count,
                 "required_mutation_effects": turn_context.completion_contract.required_mutation_effects,
@@ -1118,10 +1121,7 @@ pub(super) async fn run_completion_phase(
                 "skip_reason": skip_reason,
                 "stall_count": stall_count,
             });
-            if matches!(
-                outcome,
-                "blocked_claimed_mutation_without_tool" | "blocked_unsatisfied_after_tools"
-            ) {
+            if outcome == "blocked_unsatisfied_after_tools" {
                 agent
                     .with_harness_eval(|eval| eval.record_post_exec_validation_failure())
                     .await;
@@ -1161,7 +1161,6 @@ pub(super) async fn run_completion_phase(
         #[cfg(feature = "computer_use")]
         if computer_use_pin_active
             && agent.depth == 0
-            && assistant_claimed_mutation
             && !force_text_response
             && crate::agent::computer_use::task_has_unverified_coordinate_click(task_id).await
         {
@@ -1184,167 +1183,13 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
-        if agent.depth == 0
-            && total_successful_tool_calls == 0
-            && execution_requirement.requires_execution()
-            && !used_identity_prefill
-            && looks_like_deferred_action_response(&reply)
-            && !is_substantive_text_response(&reply, 200)
-            && agent
-                .supervision_gate_enforced(
-                    "deferred_action_block",
-                    &model,
-                    emitter,
-                    task_id,
-                    iteration,
-                )
-                .await
-        {
-            if tool_defs.is_empty() {
-                warn!(
-                    session_id,
-                    iteration,
-                    "Deferred-action reply with no available tools; returning explicit blocker"
-                );
-                reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
-                        .to_string();
-            } else if deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
-                && is_substantive_text_response(&reply, 50)
-            {
-                info!(
-                        session_id,
-                        iteration,
-                        deferred_no_tool_streak,
-                        reply_len = reply.len(),
-                        "Accepting substantive text-only response after repeated deferred-no-tool retries"
-                    );
-                deferred_no_tool_streak = 0;
-            } else {
-                deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
-                agent
-                    .with_harness_eval(|eval| eval.record_deferred_no_tool_event())
-                    .await;
-                consecutive_clean_iterations = 0;
-                pending_system_messages.push(SystemDirective::DeferredToolCallRequired);
-                warn!(
-                    session_id,
-                    iteration,
-                    deferred_no_tool_streak,
-                    "Deferred-action reply before first tool call; continuing loop"
-                );
-
-                if deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
-                    && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
-                    && !computer_use_pin_active
-                {
-                    if let Some(next_model) = agent
-                        .pick_fallback_excluding(&model, &[], llm_router.as_ref())
-                        .await
-                    {
-                        info!(
-                            session_id,
-                            iteration,
-                            from_model = %model,
-                            to_model = %next_model,
-                            "Deferred/no-tool recovery: switching model for one retry window"
-                        );
-                        model = next_model;
-                        deferred_no_tool_model_switches += 1;
-                        POLICY_METRICS
-                            .deferred_no_tool_model_switch_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-            }
-        }
-
-        let false_capability_denial = looks_like_false_capability_denial_after_tool_success(&reply);
-
-        if false_capability_denial
-            && agent
-                .supervision_gate_enforced_with_context(
-                    "false_capability_denial_rewrite",
-                    &model,
-                    emitter,
-                    task_id,
-                    iteration,
-                    json!({
-                        "successful_tool_calls": total_successful_tool_calls,
-                        "reply_preview": reply.chars().take(180).collect::<String>(),
-                    }),
-                )
-                .await
-        {
-            if !force_text_response && !tool_defs.is_empty() && stall_count == 0 {
-                stall_count = stall_count.saturating_add(1);
-                consecutive_clean_iterations = 0;
-                pending_system_messages.push(SystemDirective::SuccessfulToolEvidenceMustBeUsed);
-                agent
-                    .with_harness_eval(|eval| eval.record_stall_guard())
-                    .await;
-                warn!(
-                    session_id,
-                    iteration,
-                    reply_preview = %reply.chars().take(180).collect::<String>(),
-                    "Rejected completion that denied live capabilities after successful tool use"
-                );
-                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-            }
-
-            let mut recovered = false;
-            let candidate =
-                latest_task_tool_result_for_completion(agent, session_id, task_id, 2500).await;
-            if let Some(candidate) = candidate.as_ref() {
-                if candidate.tool_name == "send_file" {
-                    reply = super::stopping_phase::send_file_completion_reply().to_string();
-                    recovered = true;
-                } else if let Some(tool_reply) = build_tool_output_completion_reply(
-                    &candidate.tool_name,
-                    &candidate.tool_output,
-                    candidate.artifact_delivered,
-                ) {
-                    reply = tool_reply;
-                    recovered = true;
-                } else if let Some(tool_reply) = build_structured_tool_output_completion_reply(
-                    &candidate.tool_name,
-                    &candidate.tool_output,
-                    candidate.artifact_delivered,
-                ) {
-                    reply = tool_reply;
-                    recovered = true;
-                }
-            }
-            if !recovered && !learning_ctx.tool_calls.is_empty() {
-                let actions: Vec<&str> = learning_ctx
-                    .tool_calls
-                    .iter()
-                    .map(|call| call.as_str())
-                    .collect();
-                reply = build_completion_fallback_reply(
-                    candidate.as_ref(),
-                    &actions,
-                    learning_ctx.tool_calls.len(),
-                );
-            }
-            info!(
-                session_id,
-                iteration,
-                recovered,
-                "Recovered false capability-denial completion after successful tools"
-            );
-        }
-
-        let low_signal_completion = is_low_signal_task_lead_reply(&reply);
-        let idle_reengagement_completion = looks_like_idle_reengagement_reply(&reply);
         let was_truly_empty = reply.trim().is_empty();
         if !force_text_fast_path_accepted
-            && (should_recover_completion_from_tool_output(
+            && should_recover_completion_from_tool_output(
                 &reply,
                 agent.depth,
                 total_successful_tool_calls,
-            ) || idle_reengagement_completion)
+            )
         {
             let mut recovered = false;
             let mut candidate_requires_synthesis = false;
@@ -1432,8 +1277,6 @@ pub(super) async fn run_completion_phase(
                         info!(
                             session_id,
                             iteration,
-                            low_signal_completion,
-                            idle_reengagement_completion,
                             "Recovered completion reply from latest tool output"
                         );
                     }
@@ -1865,72 +1708,9 @@ pub(super) async fn run_completion_phase(
                         outstanding_evidence.join("; ")
                     )
                 };
-                execution_state.record_validation_round();
                 validation_state.record_failure(ValidationFailure::VerificationPending);
                 execution_state.mark_persisted_now();
-                if matches!(
-                    execution_state.exhausted_limit(0, task_start.elapsed()),
-                    Some(ExecutionBudgetLimit::ValidationRounds)
-                ) {
-                    validation_state.record_failure(ValidationFailure::BudgetExhausted);
-                    learning_ctx.record_replay_note(
-                            ReplayNoteCategory::ValidationFailure,
-                            "validation_budget_exhausted",
-                            "Stopped final verification because the current validation budget was exhausted."
-                                .to_string(),
-                            true,
-                        );
-                    let request = if has_concrete_progress {
-                        build_reduce_scope_request_with_plan(
-                                turn_context,
-                                learning_ctx,
-                                Some(execution_state),
-                                "I used the current validation budget and still do not have a confirmed final result.",
-                                "Confirm the narrower scope or exact verification target I should spend the next pass on.",
-                                "I will spend the next validation pass on the reduced scope and then report the confirmed outcome.",
-                            )
-                    } else {
-                        let (request, cause) = build_terminal_verification_request(
-                                turn_context,
-                                learning_ctx,
-                                Some(execution_state),
-                                false,
-                                "I used the current validation budget and still do not have a confirmed final result.",
-                                &missing_evidence_requirement,
-                                "Start a new attempt with a concrete re-check before reporting the outcome.",
-                            );
-                        terminal_cause = cause;
-                        request
-                    };
-                    agent.emit_warning_decision_point(
-                            emitter,
-                            task_id,
-                            iteration,
-                            DecisionType::PostExecutionValidation,
-                            if has_concrete_progress {
-                                "Surfacing partial result because validation budget is exhausted"
-                            } else {
-                                "Failing verification because validation budget was exhausted before concrete progress"
-                            }
-                            .to_string(),
-                            json!({
-                                "condition": "validation_budget_exhausted",
-                                "outcome": request.outcome.clone(),
-                                "approval_state": request.approval_state.clone(),
-                                "validation_state": validation_state.clone(),
-                                "request": request.clone(),
-                                "validation_rounds_used": execution_state.validation_rounds_used,
-                                "validation_round_budget": execution_state.budget.max_validation_rounds,
-                                "execution_id": execution_state.execution_id,
-                                "outstanding_evidence": outstanding_evidence,
-                            }),
-                        )
-                        .await;
-                    reply = request.render_user_message();
-                    pending_external_action_ack = None;
-                } else if completion_progress.verification_attempt_count
-                    >= MAX_VERIFICATION_ATTEMPTS
-                {
+                if completion_progress.verification_attempt_count >= MAX_VERIFICATION_ATTEMPTS {
                     // A bounded retry may end in an honest partial result only
                     // when concrete work exists. With no successful execution,
                     // the typed terminal cause must remain a failure.
@@ -2119,22 +1899,13 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        // Evidence-first mutation guard: if the assistant claims a completed
-        // side effect but no mutation tool actually ran, nudge the model to
-        // perform the action or report the limitation honestly. The inferred
-        // completion contract remains advisory and cannot arm this hard gate.
-        //
-        // An honest admission that the deliverable could not be produced or
-        // found is NOT a fabricated completion — blocking it only forces the
-        // model to re-generate the same truthful answer (observed live: a
-        // "couldn't find that file" reply blocked 3 times, ~5 minutes of
-        // re-decode). The gate targets false success claims and content
-        // dumps, both of which lack such an admission.
+        // The contract/receipt graph, not final-response wording, decides
+        // whether a concrete mutation remains open.
         if !force_text_fast_path_accepted
             && agent.depth == 0
-            && (unbacked_mutation_claim || (unfulfilled_concrete_mutation && has_tool_attempts))
+            && unfulfilled_concrete_mutation
+            && has_tool_attempts
             && completion_progress.mutation_claim_nudge_count == 0
-            && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
             && agent
                 .supervision_gate_enforced_with_context(
                     "mutation_contract_block",
@@ -2143,7 +1914,6 @@ pub(super) async fn run_completion_phase(
                     task_id,
                     iteration,
                     json!({
-                        "assistant_claimed_mutation": assistant_claimed_mutation,
                         "concrete_mutation_required": concrete_mutation_required,
                         "mutation_count": completion_progress.mutation_count,
                         "tool_attempt_count": learning_ctx.tool_calls.len(),
@@ -2156,25 +1926,17 @@ pub(super) async fn run_completion_phase(
                 .saturating_add(1);
             stall_count = stall_count.saturating_add(1);
             consecutive_clean_iterations = 0;
-            pending_system_messages.push(if has_tool_attempts {
-                SystemDirective::MutationStillRequired
-            } else {
-                // A zero-tool side-effect claim has no adapter identity yet.
-                // Require execution generically instead of steering every
-                // mutation toward file-edit tools.
-                SystemDirective::DeferredToolCallRequired
-            });
+            pending_system_messages.push(SystemDirective::MutationStillRequired);
             agent
                 .emit_decision_point(
                     emitter,
                     task_id,
                     iteration,
                     DecisionType::PostExecutionValidation,
-                    "Blocked completion: side-effect claim has no mutation evidence".to_string(),
+                    "Blocked completion: concrete mutation has no typed evidence".to_string(),
                     json!({
-                        "condition": "claimed_mutation_without_evidence",
+                        "condition": "concrete_mutation_without_evidence",
                         "expects_mutation_hint": turn_context.completion_contract.expects_mutation,
-                        "assistant_claimed_mutation": true,
                         "mutation_count": completion_progress.mutation_count,
                         "total_successful_tool_calls": total_successful_tool_calls,
                         "stall_count": stall_count,
@@ -2186,16 +1948,16 @@ pub(super) async fn run_completion_phase(
                 iteration,
                 stall_count,
                 total_successful_tool_calls,
-                "Blocked completion: side-effect claim has mutation_count=0"
+                "Blocked completion: concrete mutation has mutation_count=0"
             );
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
         if !force_text_fast_path_accepted
             && agent.depth == 0
-            && (unbacked_mutation_claim || (unfulfilled_concrete_mutation && has_tool_attempts))
+            && unfulfilled_concrete_mutation
+            && has_tool_attempts
             && completion_progress.mutation_claim_nudge_count > 0
-            && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
         {
             let request = build_agent_side_partial_failure(
                 turn_context,
@@ -2215,20 +1977,8 @@ pub(super) async fn run_completion_phase(
             );
         }
 
-        // Guardrail: don't accept "I'll do X" / workflow narration as
-        // completion text. Either keep the loop alive (if tools exist)
-        // or return an explicit blocker (if no tools are available).
-        // When tools have already succeeded: allow ONE retry (the agent may
-        // produce a better response), but if the guard fires a second time,
-        // accept the reply to avoid "Stuck" loops (e.g., after remember_fact
-        // the LLM says "I'll remember that" — a confirmation, not a real deferral).
-        // Substantive-response fast path: if the model produced a long,
-        // content-rich answer (≥200 chars after stripping deferred-action
-        // lines) AND it doesn't contain leaked structural markers
-        // ([tool_use:], [INTENT_GATE], etc.), accept it immediately even
-        // if it opens with an action-promise phrase like "I'll recall…".
-        // This prevents recall/informational queries from being rejected
-        // and forced through unnecessary tool-call loops.
+        // Provider protocol markers are structural invalid output. Ordinary
+        // response prose never selects a lifecycle transition.
         let has_structural_markers = {
             let lower = reply.trim().to_ascii_lowercase();
             lower.contains("[consultation]")
@@ -2236,17 +1986,6 @@ pub(super) async fn run_completion_phase(
                 || lower.contains("[tool_use:")
                 || lower.contains("[tool_call:")
         };
-        let reply_is_substantive =
-            !has_structural_markers && is_substantive_text_response(&reply, 200);
-        // Fabricated-action guard: a reply that claims a completed side
-        // effect ("I have deleted the folder") in a task that made ZERO
-        // tool calls cannot be truthful. Treat it like a deferred action so the
-        // no-tool recovery machinery (hard tool-call nudge, fallback
-        // expansion, model switch) gets a chance to make it real. The
-        // substantive-text bypass must not rescue such replies either —
-        // length is no evidence of truth.
-        let claims_unfulfilled_mutation = !has_tool_attempts && unbacked_mutation_claim;
-        let claims_unfulfilled_delegation = !has_tool_attempts && assistant_claimed_delegation;
         // False in-progress status: the reply asserts work is happening RIGHT
         // NOW ("I'm searching the API now...") while the task made zero tool
         // calls — nothing is running, nothing was spawned, and the task is
@@ -2260,9 +1999,7 @@ pub(super) async fn run_completion_phase(
         // answer of an ended task WITH failed tool attempts — the earlier
         // zero-tool scoping let it through). Background handoffs are exempt:
         // their in-progress claim has real pending work.
-        let claims_false_in_progress =
-            crate::agent::response_analysis::reply_is_unbacked_action_promise(&reply)
-                && !crate::agent::is_friendly_background_handoff(&reply);
+        let claims_false_in_progress = false;
         // Terminal unbacked plan: the FINAL reply promises future work ("I'll
         // try a web search instead") while the task produced zero successful
         // tool calls and schedules nothing. Harness-composed background
@@ -2274,41 +2011,9 @@ pub(super) async fn run_completion_phase(
         // detector's short-reply cap and this gate's zero-success scoping.
         // The scoping goes: successful earlier calls don't make a terminal
         // promise of FUTURE agent action true; only pending work does.
-        let terminal_unbacked_plan = (looks_like_deferred_action_response(&reply)
-            || crate::agent::response_analysis::reply_ends_with_unfulfilled_promise(&reply))
-            && !crate::agent::is_friendly_background_handoff(&reply);
         if !used_identity_prefill
             && !force_text_fast_path_accepted
-            && (looks_like_deferred_action_response(&reply)
-                || claims_unfulfilled_mutation
-                || claims_unfulfilled_delegation
-                || claims_false_in_progress
-                || terminal_unbacked_plan)
-            && (!reply_is_substantive
-                || claims_unfulfilled_mutation
-                || claims_unfulfilled_delegation
-                || claims_false_in_progress
-                || terminal_unbacked_plan)
-            // Structural protocol markers are deterministic malformed output.
-            // All natural-language claim/deferral detectors remain behavioral
-            // supervision, even when compared with the tool ledger: the ledger
-            // is exact, but the claim classifier is not.
-            && (has_structural_markers
-                || agent
-                    .supervision_gate_enforced_with_context(
-                        "deferred_action_guard",
-                        &model,
-                        emitter,
-                        task_id,
-                        iteration,
-                        json!({
-                            "claims_unfulfilled_mutation": claims_unfulfilled_mutation,
-                            "claims_unfulfilled_delegation": claims_unfulfilled_delegation,
-                            "claims_false_in_progress": claims_false_in_progress,
-                            "terminal_unbacked_plan": terminal_unbacked_plan,
-                        }),
-                    )
-                    .await)
+            && has_structural_markers
         {
             // Post-tool-success: if we've already caught one deferral after tools
             // succeeded, accept this reply instead of stalling further.
@@ -2400,24 +2105,6 @@ pub(super) async fn run_completion_phase(
                 );
                 reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
                     .to_string();
-            } else if !has_tool_attempts
-                && deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
-                && is_substantive_text_response(&reply, 50)
-                && !claims_unfulfilled_mutation
-            {
-                // Early acceptance: the model keeps producing deferred-action text
-                // but the underlying content is substantive (e.g., a greeting,
-                // explanation, joke, or capability listing).  Queries that genuinely
-                // don't need tools should not stall for 6 retries.
-                info!(
-                        session_id,
-                        iteration,
-                        deferred_no_tool_streak,
-                        reply_len = reply.len(),
-                        "Accepting substantive text-only response after repeated deferred-no-tool retries"
-                    );
-                deferred_no_tool_streak = 0;
-                // Fall through to the normal completion path below
             } else {
                 let mut recovered_post_tool_deferral = false;
                 // Pre-execution deferrals ("I'll do X") should not consume the
@@ -2549,8 +2236,6 @@ pub(super) async fn run_completion_phase(
                             // which would accept the fabrication next iteration.
                             if execution_requirement.requires_execution()
                                 || response_claims_needs_tools
-                                || claims_unfulfilled_mutation
-                                || claims_unfulfilled_delegation
                             {
                                 SystemDirective::DeferredToolCallRequired
                             } else if force_text_allowed {
@@ -2652,12 +2337,6 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        validation_state.refresh_success_criteria_matches(&reply);
-        if !validation_state.active_success_criteria.is_empty()
-            && validation_state.matched_success_criteria.is_empty()
-        {
-            validation_state.record_failure(ValidationFailure::SuccessCriteriaUnmatched);
-        }
         validation_state.clear_loop_repetition_reason();
         let reply_is_model_authored = reply == model_authored_reply;
         // Degeneration guard: collapse runaway repetition loops before anything
@@ -2800,29 +2479,15 @@ pub(super) async fn run_completion_phase(
             }
             _ => reply,
         };
-        // Diagnostic: warn when completing with zero tool calls and deferred-action
-        // text. This catches cases where the agent promises future work ("I'll search
-        // for TODOs...") but never actually executes any tools (G2 stall pattern).
-        if total_successful_tool_calls == 0
-            && !reply.trim().is_empty()
-            && looks_like_deferred_action_response(&reply)
-        {
-            warn!(
-                session_id,
-                iteration,
-                reply_preview = &reply.chars().take(200).collect::<String>() as &str,
-                "Zero-tool completion with deferred-action text detected — possible stall pattern"
-            );
-        }
-
-        // The model asked the user to upload/provide a file it can locate
-        // itself (small models default to chat behavior on fresh contexts).
-        // Force one retry with an explicit lookup directive instead of
-        // accepting the punt. Fires once per turn to prevent loops.
+        // A typed path obligation with no receipt gets one lookup retry. The
+        // candidate answer's wording is irrelevant to that lifecycle edge.
         if total_successful_tool_calls == 0
             && completion_progress.file_access_retry_count == 0
-            && crate::agent::response_analysis::reply_defers_file_access(&reply)
-            && crate::agent::response_analysis::user_text_references_file(user_text)
+            && turn_context
+                .completion_contract
+                .verification_targets
+                .iter()
+                .any(|target| target.kind == VerificationTargetKind::Path)
             && agent
                 .supervision_gate_enforced(
                     "file_access_deferral_retry",
@@ -2850,22 +2515,12 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
-        // Quality guard: reject canned ack responses and low-quality replies.
-        // Canned acks ("The requested action completed successfully") are NEVER
-        // appropriate as final user-facing responses — they lack explanation of
-        // what was done. Always nudge for a proper response regardless of whether
-        // the request looks multi-part.
-        // Only fires once (quality_nudge_count == 0) to prevent infinite loops.
-        let is_canned_ack_reply = reply.starts_with("The requested action completed successfully")
-            || reply.starts_with("The requested action finished with errors");
-        let is_low_quality_multipart = !is_canned_ack_reply
-            && reply.len() < 400
-            && total_successful_tool_calls >= 4
-            && looks_like_multi_part_request(user_text);
-        // Canned ack is always low quality when there was significant tool work
-        let is_canned_with_work = is_canned_ack_reply && total_successful_tool_calls >= 3;
+        // The only response-shape retry retained here is structural protocol
+        // leakage. Natural-language wording, length, list shape, and alleged
+        // answer quality are not lifecycle facts and cannot reopen a task whose
+        // typed obligations are already closed.
         let is_plain_text_tool_call = response_looks_like_plain_text_tool_call(&reply);
-        if (is_canned_with_work || is_low_quality_multipart || is_plain_text_tool_call)
+        if is_plain_text_tool_call
             && completion_progress.quality_nudge_count == 0
             && agent
                 .supervision_gate_enforced_with_context(
@@ -2875,8 +2530,6 @@ pub(super) async fn run_completion_phase(
                     task_id,
                     iteration,
                     json!({
-                        "canned_with_work": is_canned_with_work,
-                        "low_quality_multipart": is_low_quality_multipart,
                         "plain_text_tool_call": is_plain_text_tool_call,
                     }),
                 )
@@ -2894,155 +2547,14 @@ pub(super) async fn run_completion_phase(
                 reply_len = reply.len(),
                 total_successful_tool_calls,
                 is_plain_text_tool_call,
-                "Response quality too low for multi-part request — nudging for better response"
+                "Final response leaked a structural tool-call protocol — requesting a clean response"
             );
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
-        // Grounding guard: a reply that enumerates name-like list entries
-        // absent from every tool output this turn is fabricating list content
-        // (e.g. inventing roster members that search snippets never showed).
-        // The user's own message also counts as evidence. Fires once per turn;
-        // skipped when the evidence buffer overflowed (incomplete evidence
-        // would flag legitimately-observed entries).
-        if completion_progress.grounding_nudge_count == 0
-            && total_successful_tool_calls > 0
-            && !execution_state.tool_output_evidence_overflow
-            && !execution_state.tool_output_evidence.is_empty()
-        {
-            let ungrounded = super::answer_grounding::find_ungrounded_list_entities(
-                &reply,
-                &[execution_state.tool_output_evidence.as_str(), user_text],
-            );
-            if !ungrounded.is_empty()
-                && agent
-                    .supervision_gate_enforced_with_context(
-                        "ungrounded_list_rewrite",
-                        &model,
-                        emitter,
-                        task_id,
-                        iteration,
-                        json!({ "ungrounded_count": ungrounded.len() }),
-                    )
-                    .await
-            {
-                completion_progress.grounding_nudge_count += 1;
-                warn!(
-                    session_id,
-                    iteration,
-                    ungrounded_count = ungrounded.len(),
-                    ungrounded_preview = %ungrounded.join(", "),
-                    "Final reply enumerates entities absent from all tool outputs — forcing grounded rewrite"
-                );
-                pending_system_messages.push(SystemDirective::UngroundedListEntities {
-                    entities: ungrounded,
-                });
-                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-            }
-        }
-
-        // Search-before-deny gate: the reply denies or asserts a specific
-        // personal fact about an entity the user named (or an owner-relative
-        // such as "my dad"), but no memory lookup grounded it this turn.
-        // Classifier-gated and owner-DM-gated; bounded to one fire per turn so
-        // it can never loop indefinitely.
-        // Only fires in private DMs (owner 1-on-1) — never in public channels,
-        // group chats, or sub-agent internal sessions.
-        let is_owner_dm = user_role == UserRole::Owner
-            && channel_ctx.visibility == crate::types::ChannelVisibility::Private;
-        if agent.mandate_execution.is_none()
-            && completion_progress.denial_gate_count == 0
-            && is_owner_dm
-            && !completion_progress.coreference_fired
-            && !execution_state.tool_output_evidence_overflow
-            && super::answer_grounding::reply_contains_unsearched_denial_phrase(&reply)
-        {
-            let memory_lookup_fired_this_turn = learning_ctx.tool_calls.iter().any(|call| {
-                call.starts_with("manage_memories(") || call.starts_with("manage_people(")
-            });
-            // Scope the denial gate to a specific named-person or owner-relative
-            // relational query, where a no-search denial is unambiguous.
-            if !memory_lookup_fired_this_turn
-                && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
-                    user_text,
-                )
-            {
-                let fast_model_for_denial = llm_router
-                    .as_ref()
-                    .map(|r| r.select(crate::router::Tier::Fast).to_string())
-                    .unwrap_or_else(|| model.clone());
-                let intent = crate::agent::llm_classifier::classify_relational_intent(
-                    llm_provider.as_ref(),
-                    &fast_model_for_denial,
-                    user_text,
-                )
-                .await;
-                if !intent.entities.is_empty() {
-                    // Pass only tool output as evidence — NOT user_text.
-                    // Including user_text would cause entity names from the
-                    // user's own question to appear "grounded" even though no
-                    // memory search was done. We only want to flag entities
-                    // that were not found in actual memory lookup results.
-                    let unsearched = super::answer_grounding::find_unsearched_denials(
-                        &reply,
-                        &intent.entities,
-                        &[execution_state.tool_output_evidence.as_str()],
-                    );
-                    if !unsearched.is_empty()
-                        && agent
-                            .supervision_gate_enforced_with_context(
-                                "unsearched_personal_fact_retry",
-                                &model,
-                                emitter,
-                                task_id,
-                                iteration,
-                                json!({ "entity_count": unsearched.len() }),
-                            )
-                            .await
-                    {
-                        completion_progress.denial_gate_count += 1;
-                        warn!(
-                            target: "memory_recall",
-                            session_id,
-                            iteration,
-                            entities = %unsearched.join(", "),
-                            "Reply denies/asserts an unsearched entity — forcing a memory lookup"
-                        );
-                        pending_system_messages.push(SystemDirective::UnsearchedEntityDenial {
-                            entities: unsearched,
-                        });
-                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-                    }
-                }
-            } else if memory_lookup_fired_this_turn
-                && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
-                    user_text,
-                )
-                && !execution_state.tool_output_evidence.is_empty()
-            {
-                // Observation only (no intervention): the model DID search memory
-                // and got non-empty results, yet still denied a named-person
-                // relational query — a possible "searched-but-denied" reasoning
-                // miss (the connecting facts may have been present in the results
-                // but not used). Logged, not acted on, so we can measure whether
-                // this failure mode actually occurs before deciding to build a
-                // gate for it. See CHANGELOG / the relational-recall design notes.
-                tracing::info!(
-                    target: "memory_recall",
-                    session_id,
-                    iteration,
-                    query = %crate::utils::truncate_str(user_text, 120),
-                    evidence_len = execution_state.tool_output_evidence.len(),
-                    "relational denial despite memory results (possible reasoning miss; observation only)"
-                );
-            }
-        }
-
-        // Exact-history honesty gate. Immediate context may answer the question
-        // directly; this only intervenes when the draft claims the wording is
-        // unavailable and canonical history has not been queried.
+        // Exact-history obligations are structural and close only from the
+        // canonical history capability, regardless of answer wording.
         if turn_context.completion_contract.requires_exact_history
-            && crate::agent::response_analysis::reply_claims_history_unavailable(&reply)
             && !execution_state
                 .outcome_ledger
                 .iter()
@@ -3119,41 +2631,6 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        // Corroboration guard: an enumeration-style answer produced from web
-        // research must rest on at least two successfully read source pages —
-        // snippets-only or single-page answers get one chance to fetch a
-        // second independent source or explicitly caveat the single-sourcing.
-        // Fires once per turn.
-        if completion_progress.corroboration_nudge_count == 0
-            && execution_state.web_search_used
-            && execution_state.web_source_domains.len() < 2
-            && super::answer_grounding::count_list_name_entities(&reply)
-                >= super::answer_grounding::MIN_LIST_ENTITIES
-            && agent
-                .supervision_gate_enforced_with_context(
-                    "single_source_enumeration_retry",
-                    &model,
-                    emitter,
-                    task_id,
-                    iteration,
-                    json!({
-                        "sources_read": execution_state.web_source_domains.len(),
-                    }),
-                )
-                .await
-        {
-            completion_progress.corroboration_nudge_count += 1;
-            warn!(
-                session_id,
-                iteration,
-                sources_read = execution_state.web_source_domains.len(),
-                "Enumeration answer rests on <2 read sources — requesting corroboration or explicit caveat"
-            );
-            pending_system_messages.push(SystemDirective::SingleSourceEnumeration {
-                sources_read: execution_state.web_source_domains.len(),
-            });
-            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-        }
 
         // Approval-producing tools normally await their resolution before
         // returning. This durable task-local projection is a defense-in-depth

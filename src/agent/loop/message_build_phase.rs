@@ -1993,14 +1993,16 @@ mod tests {
             ))
             .await
             .expect("seed final assistant");
-        store
-            .append(Event::new(
-                session,
-                EventType::TaskEnd,
-                json!({ "status": status, "turn_id": turn_id }),
-            ))
-            .await
-            .expect("seed task_end");
+        if status != "in_progress" {
+            store
+                .append(Event::new(
+                    session,
+                    EventType::TaskEnd,
+                    json!({ "status": status, "turn_id": turn_id }),
+                ))
+                .await
+                .expect("seed task_end");
+        }
     }
 
     /// A sibling `EventStore` over the harness's shared pool — the agent's own

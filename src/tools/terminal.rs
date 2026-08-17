@@ -3862,8 +3862,7 @@ impl TerminalTool {
             detach,
             status_tx,
         } = request;
-        let command_semantics = crate::tools::command_semantics::classify_confined_shell_command(
-            command,
+        let command_semantics = terminal_run_semantics_from_access(
             working_dir.is_some() || !read_paths.is_empty() || !write_paths.is_empty(),
             !write_paths.is_empty(),
         );
@@ -5281,38 +5280,39 @@ impl TerminalTool {
             }
             _ => {
                 // "run" or default
-                let (command, script_via_stdin) =
-                    match (args.command.as_deref(), args.script.as_deref()) {
-                        (Some(_), Some(_)) => anyhow::bail!(
-                            "command and script are mutually exclusive for action=\"run\""
-                        ),
-                        (Some(command), None) => (command, false),
-                        (None, Some(script)) => (script, true),
-                        (None, None) => {
-                            anyhow::bail!("command or script is required for action=\"run\"")
-                        }
-                    };
-                let command = command.trim();
-                if command.is_empty() {
-                    anyhow::bail!("command or script must not be empty for action=\"run\"");
-                }
+                let command = args
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let script = args
+                    .script
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let (command, script_via_stdin) = match (command, script) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "command and script are mutually exclusive for action=\"run\""
+                    ),
+                    (Some(command), None) => (command, false),
+                    (None, Some(script)) => (script, true),
+                    (None, None) => {
+                        anyhow::bail!("command or script is required for action=\"run\"")
+                    }
+                };
 
-                let command_semantics =
-                    crate::tools::command_semantics::classify_confined_shell_command(
-                        command,
-                        args.working_dir.is_some()
-                            || !args.read_paths.is_empty()
-                            || !args.write_paths.is_empty(),
-                        !args.write_paths.is_empty(),
-                    );
+                let command_semantics = terminal_run_semantics_from_access(
+                    args.working_dir.is_some()
+                        || !args.read_paths.is_empty()
+                        || !args.write_paths.is_empty(),
+                    !args.write_paths.is_empty(),
+                );
                 let mut precomputed_semantic_assessment = None;
                 if mutation_forbidden
                     && (command_semantics.mutates_state()
                         || command_semantics.effect == crate::traits::ToolCallEffect::Unknown)
                 {
-                    let opaque = command_semantics.effect == crate::traits::ToolCallEffect::Unknown
-                        || command_semantics.mutation_effects == ToolMutationEffects::UNSPECIFIED;
-                    if !opaque {
+                    if command_semantics.mutates_state() {
                         return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                     }
                     let Some(runtime) = self.command_risk_runtime.get() else {
@@ -5661,7 +5661,10 @@ impl TerminalTool {
                 // The checkpoint belongs after every command-safety and
                 // user-approval gate, but immediately before process spawn.
                 if let Some(manager) = crate::checkpoints::active_manager() {
-                    manager.begin_for_tool("terminal", arguments).await?;
+                    let access_manifest = terminal_access_manifest(arguments);
+                    manager
+                        .begin_for_access_manifest("terminal", arguments, &access_manifest)
+                        .await?;
                 }
 
                 self.handle_run(TerminalRunRequest {
@@ -5785,6 +5788,7 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
             }
         }),
         exit_code,
+        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
         timed_out: false,
         background_started: false,
         detached: false,
@@ -5806,6 +5810,7 @@ fn tracked_background_metadata(
     ToolCallMetadata {
         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
         exit_code,
+        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
         timed_out: true,
         background_started: true,
         detached,
@@ -5836,6 +5841,24 @@ fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
     }
 }
 
+/// Derive lifecycle semantics exclusively from the capability manifest that
+/// the process sandbox enforces. Shell source is program input, not a trusted
+/// declaration of effects: inspecting words in it cannot prove what an
+/// executable, script, trap, alias, or quoted expression will do.
+fn terminal_run_semantics_from_access(
+    confinement_active: bool,
+    has_write_targets: bool,
+) -> ToolCallSemantics {
+    if has_write_targets {
+        return ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE);
+    }
+    if confinement_active {
+        return ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
+    }
+    ToolCallSemantics::default()
+}
+
 fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
     let args = serde_json::from_str::<Value>(arguments).ok();
     let action = args
@@ -5850,12 +5873,6 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         "kill" => ToolCallSemantics::mutation(),
         "trust_all" => ToolCallSemantics::administrative(),
         _ => {
-            let command = args.as_ref().and_then(|value| {
-                value
-                    .get("command")
-                    .or_else(|| value.get("script"))
-                    .and_then(Value::as_str)
-            });
             let confinement_active = args.as_ref().is_some_and(|value| {
                 value
                     .get("working_dir")
@@ -5881,13 +5898,7 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
                             .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
                     })
             });
-            command.map_or_else(ToolCallSemantics::default, |command| {
-                crate::tools::command_semantics::classify_confined_shell_command(
-                    command,
-                    confinement_active,
-                    has_write_targets,
-                )
-            })
+            terminal_run_semantics_from_access(confinement_active, has_write_targets)
         }
     }
 }
@@ -5961,61 +5972,57 @@ fn validate_terminal_argument_contract(
     if action != "run" {
         return Ok(());
     }
-    let command = parsed.get("command").and_then(Value::as_str);
-    let script = parsed.get("script").and_then(Value::as_str);
-    let shell_source = match (command, script) {
+    let command = parsed
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let script = parsed
+        .get("script")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (command, script) {
         (Some(_), Some(_)) => {
             return Err(ToolArgumentContractViolation::new(
                 "terminal action=run accepts exactly one of command or script",
             ))
         }
-        (Some(command), None) => command,
-        (None, Some(script)) => script,
+        (Some(_), None) | (None, Some(_)) => {}
         (None, None) => {
             return Err(ToolArgumentContractViolation::new(
                 "terminal action=run requires command or script",
             ))
         }
-    };
-    if shell_source.trim().is_empty() {
-        return Err(ToolArgumentContractViolation::new(
-            "terminal action=run requires a non-empty command or script",
-        ));
-    }
-    let has_write_paths = parsed
-        .get("write_paths")
-        .and_then(Value::as_array)
-        .is_some_and(|paths| {
-            paths
-                .iter()
-                .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
-        });
-    let confinement_active = parsed
-        .get("working_dir")
-        .or_else(|| parsed.get("cwd"))
-        .and_then(Value::as_str)
-        .is_some_and(|path| !path.trim().is_empty())
-        || parsed
-            .get("read_paths")
-            .and_then(Value::as_array)
-            .is_some_and(|paths| !paths.is_empty())
-        || has_write_paths;
-    let semantics = crate::tools::command_semantics::classify_confined_shell_command(
-        shell_source,
-        confinement_active,
-        has_write_paths,
-    );
-    if !has_write_paths
-        && (semantics.mutates_state() || semantics.effect == crate::traits::ToolCallEffect::Unknown)
-    {
-        return Err(ToolArgumentContractViolation::new(
-            "mutating terminal runs require an explicit non-empty write_paths access manifest",
-        )
-        .with_recovery_hint(
-            "Retry with the execution working directory separate from the exact paths that may change.",
-        ));
     }
     Ok(())
+}
+
+fn canonicalize_terminal_arguments(
+    arguments: &str,
+) -> Result<String, ToolArgumentContractViolation> {
+    let mut parsed = serde_json::from_str::<Value>(arguments).map_err(|error| {
+        ToolArgumentContractViolation::new(format!("terminal arguments must be JSON: {error}"))
+    })?;
+    if let Some(object) = parsed.as_object_mut() {
+        // Provider schema projections may materialize an inactive optional
+        // string as "". Normalize the tagged union before any policy or
+        // semantic derivation; empty input is absence, not a second mode.
+        for field in ["command", "script"] {
+            let remove = object
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().is_empty());
+            if remove {
+                object.remove(field);
+            }
+        }
+    }
+    serde_json::to_string(&parsed).map_err(|error| {
+        ToolArgumentContractViolation::new(format!(
+            "terminal arguments could not be canonicalized: {error}"
+        ))
+    })
 }
 
 #[async_trait]
@@ -6075,6 +6082,13 @@ impl Tool for TerminalTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn canonicalize_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<String, ToolArgumentContractViolation> {
+        canonicalize_terminal_arguments(arguments)
     }
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
@@ -6203,11 +6217,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_argument_contract_rejects_mutation_without_write_manifest() {
+    fn terminal_argument_contract_does_not_infer_effects_from_shell_words() {
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp"}"#
         )
-        .is_err());
+        .is_ok());
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp","write_paths":["/tmp/synthetic-target"]}"#
         )
@@ -6223,7 +6237,7 @@ mod tests {
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","command":"python3 -c 'print(1)'"}"#
         )
-        .is_err());
+        .is_ok());
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","script":"/usr/bin/false\nprintf SYNTHETIC_UNREACHED","working_dir":"/tmp"}"#
         )
@@ -6232,6 +6246,24 @@ mod tests {
             r#"{"action":"run","command":"/usr/bin/true","script":"/usr/bin/true","working_dir":"/tmp"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_canonicalization_normalizes_empty_inactive_union_arms() {
+        for input in [
+            r#"{"action":"run","command":"/usr/bin/true","script":"","working_dir":"/tmp"}"#,
+            r#"{"action":"run","command":"","script":"/usr/bin/true","working_dir":"/tmp"}"#,
+        ] {
+            let canonical = canonicalize_terminal_arguments(input).expect("canonical arguments");
+            validate_terminal_argument_contract(&canonical).expect("valid tagged union");
+            let value: Value = serde_json::from_str(&canonical).expect("json");
+            let object = value.as_object().expect("object");
+            assert_eq!(
+                usize::from(object.contains_key("command"))
+                    + usize::from(object.contains_key("script")),
+                1
+            );
+        }
     }
 
     #[tokio::test]

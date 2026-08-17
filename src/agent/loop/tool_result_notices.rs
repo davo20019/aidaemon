@@ -12,7 +12,6 @@ pub(in crate::agent) enum ToolResultNotice {
         tool_name: String,
         sources: String,
     },
-    RunCommandPolicyAutoRoutedToTerminal,
     CliAgentInlineBoundary {
         task_hint: String,
     },
@@ -171,10 +170,6 @@ impl ToolResultNotice {
                  no filesystem or external change.",
                 tool_name, sources
             ),
-            Self::RunCommandPolicyAutoRoutedToTerminal => {
-                "[SYSTEM] run_command was blocked by policy; auto-routed to `terminal`."
-                    .to_string()
-            }
             Self::CliAgentInlineBoundary { task_hint } => format!(
                 "[SYSTEM] cli_agent completed. USER REQUEST SUMMARY (untrusted): {}. \
                  Unless the user explicitly asked for more work, stop calling tools and \

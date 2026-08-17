@@ -5,9 +5,7 @@ use super::project_dir::{
 use super::reflection::{record_tool_error, PendingReflectionRecovery, SemanticFailureInfo};
 use super::types::ToolExecutionOutcome;
 use crate::agent::loop_utils;
-use crate::agent::recall_guardrails::tool_result_indicates_no_evidence;
 use crate::agent::*;
-use crate::events::TaskOutcome;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -19,16 +17,11 @@ fn append_tool_result_notice(result_text: &mut String, notice: &ToolResultNotice
 pub(super) struct ResultLearningEnv<'a> {
     pub attempted_required_file_recheck: bool,
     pub send_file_key: Option<String>,
-    pub restrict_to_personal_memory_tools: bool,
-    pub is_reaffirmation_challenge_turn: bool,
-    pub session_id: &'a str,
-    pub task_id: &'a str,
-    pub emitter: &'a crate::events::EventEmitter,
-    pub task_start: Instant,
     pub iteration: usize,
     pub tool_arguments: &'a str,
     pub tool_summary: &'a str,
     pub semantics: &'a crate::traits::ToolCallSemantics,
+    pub outcome_status: Option<crate::traits::ToolOutcomeStatus>,
 }
 
 pub(super) struct ResultLearningState<'a> {
@@ -218,6 +211,20 @@ fn record_semantic_failure_signature(
         signature,
         count: repeated_count,
     }
+}
+
+fn is_typed_negative_lookup(
+    semantics: &crate::traits::ToolCallSemantics,
+    outcome_status: Option<crate::traits::ToolOutcomeStatus>,
+) -> bool {
+    matches!(
+        outcome_status,
+        Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+    ) && semantics.observes_state()
+        && semantics
+            .evidence
+            .iter()
+            .any(|capability| capability.scope != crate::traits::ToolSemanticScope::HostLocal)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -629,8 +636,11 @@ pub(super) async fn apply_result_learning(
         }
     }
 
-    let no_evidence_result =
-        tool_result_indicates_no_evidence(&strip_appended_diagnostics(result_text));
+    // Empty/negative lookup strategy is driven by the adapter's typed domain
+    // outcome and evidence scope. Tool prose must not decide whether an
+    // observation was empty, and a host-local expected-negative process result
+    // is evidence in its own right rather than a failed search term.
+    let no_evidence_result = is_typed_negative_lookup(env.semantics, env.outcome_status);
     if no_evidence_result {
         *state.no_evidence_result_streak = state.no_evidence_result_streak.saturating_add(1);
         state.no_evidence_tools_seen.insert(tc.name.clone());
@@ -654,55 +664,7 @@ pub(super) async fn apply_result_learning(
         }
     }
 
-    if env.restrict_to_personal_memory_tools
-        && (env.is_reaffirmation_challenge_turn
-            || state.no_evidence_tools_seen.len() >= 2
-            || *state.no_evidence_result_streak >= 3)
-        && no_evidence_result
-    {
-        let reaffirmation = if env.is_reaffirmation_challenge_turn {
-            "I checked again in your stored people/memory records, and I still do not have that information saved. If you want, share it and I will remember it.".to_string()
-        } else {
-            "I checked your stored people/memory records, and I do not have that information saved yet. If you share it, I can remember it for next time.".to_string()
-        };
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: env.session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(reaffirmation.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
-        agent
-            .append_assistant_message_with_event(env.emitter, &assistant_msg, "system", None, None)
-            .await?;
-        agent
-            .emit_task_end(
-                env.emitter,
-                env.task_id,
-                TaskStatus::Completed,
-                TaskOutcome::Succeeded,
-                env.task_start,
-                env.iteration,
-                state.learning_ctx.tool_calls.len(),
-                None,
-                Some(reaffirmation.chars().take(200).collect()),
-            )
-            .await;
-        return Ok(ResultLearningOutcome {
-            control_flow: Some(ToolExecutionOutcome::Return(Ok(reaffirmation))),
-            semantic_failure: None,
-        });
-    }
-
-    if !env.restrict_to_personal_memory_tools
-        && no_evidence_result
-        && state.no_evidence_tools_seen.len() >= 5
-    {
+    if no_evidence_result && state.no_evidence_tools_seen.len() >= 5 {
         *state.force_text_response = true;
         state
             .pending_system_messages
@@ -940,6 +902,43 @@ fn should_nudge_vary_terms(streak: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negative_lookup_strategy_uses_typed_outcome_and_scope() {
+        let memory_semantics = crate::traits::ToolCallSemantics::observation().with_evidence(vec![
+            crate::traits::ToolEvidenceCapability {
+                scope: crate::traits::ToolSemanticScope::UserMemory,
+                purposes: vec![crate::traits::EvidencePurpose::Content],
+                authority: crate::traits::EvidenceAuthority::Canonical,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Both,
+            },
+        ]);
+        assert!(is_typed_negative_lookup(
+            &memory_semantics,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+        ));
+        assert!(!is_typed_negative_lookup(
+            &memory_semantics,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded),
+        ));
+    }
+
+    #[test]
+    fn expected_negative_process_is_not_misclassified_as_an_empty_lookup() {
+        let process_semantics =
+            crate::traits::ToolCallSemantics::observation().with_evidence(vec![
+                crate::traits::ToolEvidenceCapability {
+                    scope: crate::traits::ToolSemanticScope::HostLocal,
+                    purposes: vec![crate::traits::EvidencePurpose::Outcome],
+                    authority: crate::traits::EvidenceAuthority::Direct,
+                    temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                },
+            ]);
+        assert!(!is_typed_negative_lookup(
+            &process_semantics,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+        ));
+    }
 
     #[test]
     fn vary_terms_nudge_fires_at_streak_multiples_of_three() {

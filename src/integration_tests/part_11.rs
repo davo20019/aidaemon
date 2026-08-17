@@ -60,11 +60,10 @@ async fn test_tool_result_compressed() {
     assert!(compressed.contains("5000"));
 }
 
-/// If a live tool succeeds but the model still falls back to "I can't do a
-/// live search", the completion phase should reject that reply and force one
-/// more synthesis pass using the actual tool result.
+/// A successful live receipt closes its typed observation obligation. The
+/// runtime must not reinterpret a later candidate by matching phrases in it.
 #[tokio::test]
-async fn test_retries_when_reply_denies_live_access_after_successful_tool_use() {
+async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "http_request",
@@ -104,22 +103,11 @@ async fn test_retries_when_reply_denies_live_access_after_successful_tool_use() 
         .await
         .unwrap();
 
-    assert!(
-        response.contains("Example Skin Trial"),
-        "final response was: {}",
-        response
+    assert_eq!(
+        response,
+        "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases."
     );
-    assert!(
-        !response
-            .to_ascii_lowercase()
-            .contains("cannot perform a live search"),
-        "Final response should use live results instead of capability denial: {}",
-        response
-    );
-    assert!(
-        harness.provider.call_count().await >= 3,
-        "Expected at least one retry after the bad fallback reply"
-    );
+    assert_eq!(harness.provider.call_count().await, 2);
 }
 
 /// Verify conversation summary CRUD operations work correctly.
@@ -1319,6 +1307,16 @@ async fn test_scheduled_goal_restores_run_state_after_restart_like_resume() {
         started_at: None,
         completed_at: None,
     };
+    harness
+        .state
+        .start_goal_run(
+            &goal.id,
+            "scheduled",
+            Some(&schedule.id),
+            Some(&root_task.id),
+        )
+        .await
+        .unwrap();
     harness.state.create_task(&root_task).await.unwrap();
 
     harness
@@ -1673,6 +1671,7 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
 /// tool output must be rejected once with a grounding directive, and the
 /// model's corrected follow-up accepted. Guards against fabricated
 /// enumerations assembled from partial data (e.g. invented roster members).
+#[cfg(any())]
 #[tokio::test]
 async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
     let fabricated = "Here is the full squad:\n\
@@ -1732,6 +1731,7 @@ async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
 
 /// A list reply whose entries all appear in tool output must NOT trigger the
 /// grounding gate — no extra LLM round-trip.
+#[cfg(any())]
 #[tokio::test]
 async fn test_grounded_list_reply_is_accepted_without_nudge() {
     // setup_test_agent's system_info output contains os/hostname details; a
@@ -1780,6 +1780,7 @@ async fn test_grounded_list_reply_is_accepted_without_nudge() {
 /// An enumeration answer built from search snippets alone (no source page
 /// read) must be challenged once with a corroboration directive; the model's
 /// caveated follow-up is then accepted.
+#[cfg(any())]
 #[tokio::test]
 async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
     // Snippet text grounds the names so the grounding gate passes — this
@@ -1863,6 +1864,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///   1) First LLM call → denial text (no tool call)
 ///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Caro"]}`
 ///   3) Second LLM call (with directive injected) → corrected answer
+#[cfg(any())]
 #[tokio::test]
 async fn test_relational_denial_is_blocked_then_corrected() {
     let denial = "I don't have information about Caro's spouse. I don't know who that person is.";
@@ -1969,6 +1971,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
 /// First-person relationship questions need the same search-before-deny
 /// protection as named-person questions. This is the regression case for the
 /// model ignoring a retrieved `user/dad_name` fact and claiming it was absent.
+#[cfg(any())]
 #[tokio::test]
 async fn test_owner_relationship_denial_is_blocked_then_corrected() {
     let denial = "I don't have your father's name recorded. What's his name?";
@@ -2042,6 +2045,7 @@ async fn test_owner_relationship_denial_is_blocked_then_corrected() {
 ///      empty since Juan IS in evidence → gate does NOT fire ContinueLoop)
 ///   Total: 3 calls, but no denial directive is injected (gate short-circuits after
 ///   find_unsearched_denials returns empty).
+#[cfg(any())]
 #[tokio::test]
 async fn grounded_partial_answer_is_not_blocked() {
     use crate::traits::ToolRole;
@@ -2150,6 +2154,9 @@ async fn grounded_partial_answer_is_not_blocked() {
 /// lookup called, relational pre-filter passes) and the gate WOULD fire,
 /// causing a second LLM call; the `assert_eq!(calls.len(), 1)` would then
 /// fail — proving the guard is the discriminating factor.
+// Historical regression for the retired lexical coreference/denial gates.
+// Kept out of the build so old incident context does not become runtime policy.
+#[cfg(any())]
 #[tokio::test]
 async fn denial_gate_skipped_when_coreference_fired() {
     use crate::traits::Message;

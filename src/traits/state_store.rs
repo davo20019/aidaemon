@@ -1579,6 +1579,15 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Typed lifecycle owner for a task. Callers must use this relationship,
+    /// never infer run provenance from the task description.
+    async fn get_goal_run_for_task(
+        &self,
+        _task_id: &str,
+    ) -> anyhow::Result<Option<super::GoalRun>> {
+        Ok(None)
+    }
+
     async fn get_tasks_for_goal_run(&self, _run_id: &str) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
     }

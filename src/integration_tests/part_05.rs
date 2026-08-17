@@ -473,7 +473,7 @@ Top-level keys: data
 }
 
 #[tokio::test]
-async fn test_post_tool_deferral_summarizes_structured_mutation_without_raw_json() {
+async fn test_successful_mutation_receipt_is_not_reopened_by_candidate_wording() {
     let responses = vec![
         MockProvider::tool_call_response("structured_external_action", "{}"),
         MockProvider::text_response("I'll handle that now."),
@@ -500,20 +500,25 @@ async fn test_post_tool_deferral_summarizes_structured_mutation_without_raw_json
         .await
         .unwrap();
 
-    assert!(response.contains("HTTP 201 Created"), "{response}");
-    assert!(
-        response.contains("Result ID: 2082623804740620701"),
-        "{response}"
-    );
-    assert!(
-        response.contains("Text: Synthetic engagement prompt"),
-        "{response}"
-    );
-    assert!(!response.contains("Here are the results"), "{response}");
-    assert!(!response.contains("JSON summary"), "{response}");
-    assert!(!response.contains("edit_history_tweet_ids"), "{response}");
-    assert!(!response.contains("\"data\""), "{response}");
-    assert!(!response.contains('{'), "{response}");
+    assert_eq!(response, "I'll handle that now.");
+    let tool_results = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "structured_external_action_deferral",
+            &[crate::events::EventType::ToolResult],
+            20,
+        )
+        .await
+        .unwrap();
+    assert!(tool_results.iter().any(|event| {
+        event
+            .parse_data::<crate::events::ToolResultData>()
+            .is_ok_and(|result| result.receipt.is_some_and(|receipt| {
+                receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
+                    && receipt.invocation_stage.reached_dispatch()
+            }))
+    }));
 }
 
 struct UrlProbeTool;
@@ -1236,10 +1241,7 @@ impl crate::traits::Tool for FailingExternalActionTool {
         crate::traits::ToolCallSemantics::mutation()
     }
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        // Real failing tools (terminal, http_request) return Ok with error
-        // text — the classifier marks it failed; a hard Err skips the
-        // result-metadata path entirely.
-        Ok("Error: HTTP 500: JSONDecodeError: Expecting value: line 1 column 2".to_string())
+        anyhow::bail!("synthetic external action failure")
     }
 }
 
@@ -1293,23 +1295,25 @@ async fn test_failed_mutation_gets_recovery_pass_before_report() {
         .await
         .unwrap();
 
-    // The recovery directive reached the model exactly once.
-    let calls = harness.provider.call_log.lock().await;
-
-    let directive_count = calls
+    // The runtime observed a typed failure and a later satisfying receipt;
+    // recovery never depends on a coaching phrase.
+    let results = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "tg_mutation_recovery",
+            &[crate::events::EventType::ToolResult],
+            20,
+        )
+        .await
+        .unwrap();
+    let statuses = results
         .iter()
-        .flat_map(|c| c.messages.iter())
-        .filter(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains("Try a DIFFERENT approach"))
-        })
-        .count();
-    assert!(
-        directive_count >= 1,
-        "recovery directive must be injected; got {directive_count}"
-    );
-    drop(calls);
+        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+        .filter_map(|result| result.receipt.map(|receipt| receipt.outcome_status))
+        .collect::<Vec<_>>();
+    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::FailedPermanent));
+    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::Succeeded));
 
     // The pivot's success ships — not a failure report.
     assert!(

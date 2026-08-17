@@ -109,6 +109,7 @@ impl LlmIntentClass {
 /// Coarse relational-recall classification used by neighborhood assembly and
 /// the search-before-deny gate. Separate from `LlmIntentClass` because both
 /// consumers need the *entities* the query names, which the coarse class lacks.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationalKind {
     /// A question about a relationship/connection between entities
@@ -120,6 +121,7 @@ pub enum RelationalKind {
     None,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalIntent {
     pub kind: RelationalKind,
@@ -127,6 +129,7 @@ pub struct RelationalIntent {
     pub entities: Vec<String>,
 }
 
+#[cfg(test)]
 impl RelationalIntent {
     fn none() -> Self {
         Self {
@@ -138,6 +141,7 @@ impl RelationalIntent {
 
 /// Parse the classifier's JSON reply. Fail-open: any malformed input yields
 /// `RelationalKind::None` with no entities (caller then does nothing).
+#[cfg(test)]
 pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
     // Extract the first {...} span so ```json fences / prose don't break parsing.
     let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else {
@@ -171,6 +175,7 @@ pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
 /// Build the messages array for a relational-intent classification call.
 /// Kept separate from `classify_relational_intent` so the prompt can be
 /// unit-tested without a provider.
+#[cfg(test)]
 fn build_relational_classifier_messages(user_text: &str) -> Vec<Value> {
     let system = "You classify a user message about their personal memory. \
 Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", \"entities\": [..]}. \
@@ -186,6 +191,7 @@ Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", 
 
 /// Classify a message for relational/recall intent and extract its entities.
 /// Fail-open: empty input, provider error, or timeout yields `RelationalKind::None`.
+#[cfg(test)]
 pub async fn classify_relational_intent(
     provider: &dyn ModelProvider,
     fast_model: &str,

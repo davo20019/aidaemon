@@ -2,11 +2,11 @@
 // Default+fallback routing tests — iteration 1 always has tools available
 // ---------------------------------------------------------------------------
 
-/// With non-uniform models, iteration 1 runs with tools available (no separate
-/// text-only pre-pass). A deferral first reply is bounced by the completion
-/// gates and the retry produces the user-visible answer.
+/// With no typed observation or response-schema obligation, a plain-text
+/// candidate is final regardless of wording. Tools remain available, but
+/// prose is not a lifecycle signal.
 #[tokio::test]
-async fn test_initial_routing_call_classifies_then_executor_answers_questions() {
+async fn test_initial_routing_does_not_reclassify_plain_text_from_wording() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll look that up and get back to you."),
         MockProvider::text_response(
@@ -45,12 +45,9 @@ async fn test_initial_routing_call_classifies_then_executor_answers_questions() 
         .await
         .unwrap();
 
-    assert_eq!(
-        response,
-        "Your website is deployed to Cloudflare Workers at your-site.workers.dev."
-    );
+    assert_eq!(response, "I'll look that up and get back to you.");
 
-    assert_eq!(harness.provider.call_count().await, 2);
+    assert_eq!(harness.provider.call_count().await, 1);
     let calls = harness.provider.call_log.lock().await;
     // With default+fallback routing, all LLM calls include tools
     assert!(
@@ -287,7 +284,15 @@ async fn test_initial_routing_call_continues_for_actions() {
         MockProvider::text_response("I'll check the system information for you."),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Your system is running macOS."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -323,11 +328,10 @@ async fn test_initial_routing_call_continues_for_actions() {
     );
 }
 
-/// Regression: if the execution model replies with deferred-action narration
-/// ("I'll do X", "starting workflow") but no tool calls, the agent must keep
-/// iterating instead of returning that narration as final output.
+/// An outstanding typed host observation keeps the loop active through any
+/// number of no-tool candidates until a compatible receipt arrives.
 #[tokio::test]
-async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
+async fn test_typed_observation_survives_multiple_no_tool_candidates() {
     let provider = MockProvider::with_responses(vec![
         // 1) First call (with tools): deferral text, bounced by the
         //    deferred-action gate
@@ -340,7 +344,15 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
         MockProvider::tool_call_response("system_info", "{}"),
         // 4) Final answer
         MockProvider::text_response("I checked the system information."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -497,26 +509,28 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
     }));
 }
 
-/// Regression: even after some successful tool calls, a deferred-action
-/// narration ("I'll send it over") must not be treated as final completion.
+/// Once the typed observation is satisfied, candidate wording does not reopen
+/// the lifecycle or synthesize a new obligation.
 #[tokio::test]
-async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
+async fn test_satisfied_observation_is_not_reopened_by_candidate_wording() {
     let provider = MockProvider::with_responses(vec![
-        // 1) First call: deferral text, bounced by the deferred-action gate
+        // 1) The typed observation keeps this candidate from completing.
         MockProvider::text_response("I'll find it for you."),
-        // 2) Deferred-action retry produces a real tool call
+        // 2) A compatible receipt satisfies the contract.
         MockProvider::tool_call_response("system_info", "{}"),
-        // 3) Execution loop (bad): deferred narration instead of results
+        // 3) This is accepted because receipt state, not prose, is authoritative.
         MockProvider::text_response(
             "I'll send it over once I locate the exact file. Give me a moment.",
         ),
-        // 4-6) Extra responses for mutation-contract nudges and deferred-action retries.
-        //       "send" triggers expects_mutation=true, causing up to 2 extra nudge
-        //       iterations before the text response is accepted.
-        MockProvider::text_response("I couldn't find a matching SOW PDF in the project files."),
-        MockProvider::text_response("I couldn't find a matching SOW PDF in the project files."),
-        MockProvider::text_response("I couldn't find a matching SOW PDF in the project files."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -526,7 +540,7 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
         .agent
         .handle_message(
             "test_session",
-            "Send me the SOW PDF from the Lodestar project",
+            "Inspect the current system state.",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -537,16 +551,9 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
 
     assert_eq!(
         response,
-        "I couldn't find a matching SOW PDF in the project files."
+        "I'll send it over once I locate the exact file. Give me a moment."
     );
-    // Call count varies due to deferred-action retries and mutation-contract
-    // nudges.
-    let call_count = harness.provider.call_count().await;
-    assert!(
-        (4..=7).contains(&call_count),
-        "Expected 4-7 LLM calls, got {}",
-        call_count
-    );
+    assert_eq!(harness.provider.call_count().await, 3);
 
     let calls = harness.provider.call_log.lock().await;
     // All calls should have tools available (no separate tool-free text-only pre-pass)

@@ -112,13 +112,6 @@ fn mandate_review_task_context(mandate: &Mandate) -> String {
     .to_string()
 }
 
-fn is_scheduled_task_description(text: &str) -> bool {
-    let trimmed = text.trim_start().to_ascii_lowercase();
-    trimmed.starts_with("execute scheduled goal:")
-        || trimmed.starts_with("scheduled check:")
-        || trimmed.starts_with("manual scheduled run:")
-}
-
 fn timestamp_is_at_or_after(value: &str, lower_bound: &str) -> bool {
     match (
         chrono::DateTime::parse_from_rfc3339(value),
@@ -1253,29 +1246,57 @@ impl HeartbeatCoordinator {
             };
 
             let schedules_for_goal = self.state.get_schedules_for_goal(goal_id).await.ok();
-            let is_scheduled_goal = if let Some(ref schedules) = schedules_for_goal {
-                !schedules.is_empty()
+            let goal_runs = self.state.get_goal_runs(goal_id).await.unwrap_or_default();
+            let is_scheduled_goal = schedules_for_goal
+                .as_ref()
+                .is_some_and(|schedules| !schedules.is_empty())
+                || goal_runs.iter().any(|run| run.trigger_type == "scheduled");
+            let active_scheduled_run = if is_scheduled_goal {
+                self.state
+                    .get_scheduled_run_state(goal_id)
+                    .await
+                    .ok()
+                    .flatten()
             } else {
-                tasks
-                    .iter()
-                    .any(|task| is_scheduled_task_description(&task.description))
+                None
             };
             // A goal run is the durable isolation boundary for one scheduled or
             // explicit manual firing.  In particular, `trigger_now` starts a new
             // goal run without advancing the cron schedule's `last_run_at`, so
             // using only the schedule timestamp here would let a mutation from
-            // the previous run suppress the newly requested run.
-            let current_goal_run = if is_scheduled_goal {
+            // the previous run suppress the newly requested run. Prefer the
+            // scheduled-run projection's root-task relationship: legacy runs
+            // may have been created before trigger provenance was typed, but
+            // the root task still identifies their exact owning run.
+            let projected_goal_run = if let Some(scheduled_run) = active_scheduled_run.as_ref() {
                 self.state
-                    .get_current_goal_run(goal_id)
+                    .get_goal_run_for_task(&scheduled_run.root_task_id)
                     .await
                     .ok()
                     .flatten()
-                    // Legacy/repair-created open runs can contain old child
-                    // rows without an execution root. They are not a valid
-                    // current scheduled cycle and must keep using the stale
-                    // child retirement fallback below.
-                    .filter(|run| run.root_task_id.is_some())
+                    .filter(|run| {
+                        run.goal_id == *goal_id
+                            && matches!(run.status.as_str(), "pending" | "running" | "blocked")
+                    })
+            } else {
+                None
+            };
+            let current_goal_run = if is_scheduled_goal {
+                match projected_goal_run {
+                    Some(run) => Some(run),
+                    None => self
+                        .state
+                        .get_current_goal_run(goal_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|run| run.trigger_type == "scheduled")
+                        // Legacy/repair-created open runs can contain old child
+                        // rows without an execution root. They are not a valid
+                        // current scheduled cycle and must keep using the stale
+                        // child retirement fallback below.
+                        .filter(|run| run.root_task_id.is_some()),
+                }
             } else {
                 None
             };
@@ -1293,29 +1314,6 @@ impl HeartbeatCoordinator {
             } else {
                 None
             };
-            // Retain the schedule timestamp only as a legacy eligibility
-            // fallback when a pending row predates durable goal-run tracking.
-            let current_cycle_since = current_goal_run
-                .as_ref()
-                .map(|run| run.started_at.clone())
-                .or_else(|| {
-                    schedules_for_goal.as_ref().and_then(|schedules| {
-                        schedules
-                            .iter()
-                            .filter_map(|s| s.last_run_at.as_deref())
-                            .max()
-                            .map(|s| s.to_string())
-                    })
-                });
-            let active_scheduled_run = if is_scheduled_goal {
-                self.state
-                    .get_scheduled_run_state(goal_id)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
             let mut eligible_tasks: Vec<&crate::traits::Task> = Vec::with_capacity(tasks.len());
             for task in tasks.iter().copied() {
                 let eligible = if mandate_controller {
@@ -1330,14 +1328,9 @@ impl HeartbeatCoordinator {
                 } else if let Some(run) = active_scheduled_run.as_ref() {
                     timestamp_is_at_or_after(&task.created_at, &run.created_at)
                 } else {
-                    // Before a task lead starts there is a brief window where
-                    // the newly-fired root is pending but no run state exists.
-                    // Only that root may be dispatched in this state; child
-                    // work necessarily belongs to a closed run.
-                    is_scheduled_task_description(&task.description)
-                        && current_cycle_since
-                            .as_deref()
-                            .is_none_or(|since| timestamp_is_at_or_after(&task.created_at, since))
+                    // No typed current-run identity means ownership is
+                    // indeterminate. Do not infer it from task prose.
+                    false
                 };
                 if eligible {
                     eligible_tasks.push(task);
@@ -1419,10 +1412,7 @@ impl HeartbeatCoordinator {
                 } else if let Some(run) = active_scheduled_run.as_ref() {
                     timestamp_is_at_or_after(&t.created_at, &run.created_at)
                 } else {
-                    is_scheduled_task_description(&t.description)
-                        && current_cycle_since
-                            .as_deref()
-                            .is_none_or(|since| timestamp_is_at_or_after(&t.created_at, since))
+                    false
                 };
                 if !belongs_to_current_run {
                     return false;
@@ -1747,6 +1737,10 @@ impl HeartbeatCoordinator {
                         .unwrap_or_default()
                         .into_iter()
                         .next();
+                    let latest_root_task_id = latest_run
+                        .as_ref()
+                        .and_then(|run| run.root_task_id.as_deref())
+                        .map(str::to_string);
                     let completed_tasks = match latest_run {
                         Some(run) => self
                             .state
@@ -1760,8 +1754,11 @@ impl HeartbeatCoordinator {
                             .unwrap_or_default(),
                     };
                     let fallback_summary: String = goal.description.chars().take(300).collect();
-                    let task_results_summary =
-                        build_goal_task_results_summary(&completed_tasks, &fallback_summary);
+                    let task_results_summary = build_goal_task_results_summary(
+                        &completed_tasks,
+                        latest_root_task_id.as_deref(),
+                        &fallback_summary,
+                    );
 
                     if !completed_tasks.is_empty()
                         && !crate::tools::manage_goal_tasks::tasks_satisfy_goal_completion(
@@ -3072,7 +3069,6 @@ mod tests {
             .contains("isolated built-in mandate protocol"));
         assert!(!tasks[0].description.contains(&mandate.objective));
         assert!(!tasks[0].description.contains("allowed tools"));
-        assert!(!is_scheduled_task_description(&tasks[0].description));
         let context: serde_json::Value =
             serde_json::from_str(tasks[0].context.as_deref().expect("minimal fence context"))
                 .unwrap();

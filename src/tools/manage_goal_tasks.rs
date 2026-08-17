@@ -32,15 +32,7 @@ impl ManageGoalTasksTool {
     }
 
     fn task_in_scope(&self, task: &Task) -> bool {
-        task.goal_id == self.goal_id && !Self::is_scheduled_root_task(task)
-    }
-
-    fn is_scheduled_root_task(task: &Task) -> bool {
-        let description = task.description.trim_start().to_ascii_lowercase();
-        description.starts_with("execute scheduled goal:")
-            || description.starts_with("scheduled check:")
-            || description.starts_with("manual scheduled run:")
-            || description.starts_with("mandate review:")
+        task.goal_id == self.goal_id
     }
 
     async fn scoped_tasks(&self) -> anyhow::Result<Vec<Task>> {
@@ -49,9 +41,21 @@ impl ManageGoalTasksTool {
         } else {
             self.state.get_tasks_for_goal(&self.goal_id).await?
         };
+        let root_task_ids = self
+            .state
+            .get_goal_runs(&self.goal_id)
+            .await?
+            .into_iter()
+            .filter(|run| {
+                self.goal_run_id
+                    .as_deref()
+                    .is_none_or(|run_id| run.id == run_id)
+            })
+            .filter_map(|run| run.root_task_id)
+            .collect::<std::collections::HashSet<_>>();
         Ok(tasks
             .into_iter()
-            .filter(|task| self.task_in_scope(task))
+            .filter(|task| self.task_in_scope(task) && !root_task_ids.contains(&task.id))
             .collect())
     }
 
