@@ -1230,6 +1230,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
         emitter: &emitter,
         state: agent.state.as_ref(),
+        event_store: agent.event_store.as_ref(),
         session_id,
         task_id: &task_id,
     });

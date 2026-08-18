@@ -4,7 +4,7 @@ use crate::utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Build bounded relationship-assessment context. This is not provider
@@ -782,19 +782,43 @@ const MAX_PLAN_STEPS: usize = 7;
 // Aggregate semantic-producer deadlines. Candidates are bounded failover
 // attempts under one logical producer envelope; valid results are selected by
 // configured priority, never by response wording or latency.
-const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-const TASK_RELATIONSHIP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+const TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+const TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+const TASK_RELATIONSHIP_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Divide the remaining assessment envelope across every candidate that is
-/// still eligible. Unlike the relationship lane, assessment has no arbitrary
-/// minimum: this keeps the helper scalable when a deployment configures more
-/// than three providers instead of silently dropping the tail of the lane.
-fn assessment_attempt_timeout(
-    remaining: std::time::Duration,
-    candidates_left: usize,
-) -> Option<std::time::Duration> {
-    (candidates_left > 0 && !remaining.is_zero())
-        .then(|| remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX))
+/// JSON-object mode is rejected by a number of OpenAI-compatible gateways
+/// unless the prompt contains a provider-specific lowercase marker.  The
+/// daemon's semantic producers should not depend on prompt spelling.  A
+/// permissive named schema requests the same object protocol while leaving
+/// the domain parser as the authoritative validator for optional fields.
+fn typed_object_response_mode(name: &str) -> crate::traits::ResponseMode {
+    crate::traits::ResponseMode::JsonSchema {
+        name: name.to_string(),
+        schema: json!({
+            "type": "object",
+            "additionalProperties": true
+        }),
+        strict: false,
+    }
+}
+
+/// Convert a model's observed p95 into a bounded producer deadline.  The
+/// default is deliberately large enough for a normal richer contract, while
+/// historical latency lets a slower configured model retain time without
+/// giving any single candidate an unbounded call.
+fn observed_assessment_budget(observed_latency_ms: Option<u64>) -> Duration {
+    let observed = observed_latency_ms
+        .map(Duration::from_millis)
+        .map(|latency| latency.saturating_mul(2))
+        .unwrap_or(TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT);
+    observed
+        .max(TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT)
+        .min(TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT)
+}
+
+fn bounded_attempt_timeout(remaining: Duration, requested: Duration) -> Option<Duration> {
+    (!remaining.is_zero() && !requested.is_zero()).then(|| remaining.min(requested))
 }
 
 /// Divide the remaining relationship envelope using the same fair allocator
@@ -805,13 +829,15 @@ fn relationship_attempt_timeout(
     remaining: std::time::Duration,
     candidates_left: usize,
 ) -> Option<std::time::Duration> {
-    assessment_attempt_timeout(remaining, candidates_left)
+    (candidates_left > 0 && !remaining.is_zero())
+        .then(|| remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX))
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerTelemetryCtx<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub state: &'a dyn crate::traits::TokenUsageStore,
+    pub event_store: &'a crate::events::EventStore,
     pub session_id: &'a str,
     pub task_id: &'a str,
 }
@@ -1177,7 +1203,7 @@ pub(crate) async fn generate_task_plan(
     ];
 
     let options = crate::traits::ChatOptions {
-        response_mode: crate::traits::ResponseMode::JsonObject,
+        response_mode: typed_object_response_mode("task_assessment"),
         tool_choice: crate::traits::ToolChoiceMode::None,
         // The contract is intentionally typed and bounded; a 2k output cap is
         // ample for this schema and avoids spending the entire attempt budget
@@ -1191,17 +1217,51 @@ pub(crate) async fn generate_task_plan(
         ..crate::traits::ChatOptions::default()
     };
     // Semantic assessment is one logical producer, not a quorum. Try
-    // configured candidates in priority order and give every remaining
-    // candidate a fair, bounded share of the aggregate envelope. A normal
-    // primary therefore finishes without speculative fallback calls, while a
-    // slow/erroring primary cannot starve the rest of the lane.
-    let assessment_deadline = Instant::now() + TASK_ASSESSMENT_TOTAL_TIMEOUT;
+    // configured candidates in priority order. Each candidate receives a
+    // bounded deadline derived from its observed p95 (with a conservative
+    // default for a cold model), rather than an equal slice that can starve a
+    // richer but otherwise ordinary response. The sum remains capped, so
+    // history can improve availability without creating an unbounded lane.
+    let attempt_budgets = {
+        let mut budgets = Vec::with_capacity(model_candidates.len());
+        for model in model_candidates {
+            let observed = match telemetry.as_ref() {
+                Some(telemetry) => telemetry
+                    .event_store
+                    .recent_model_latency_ms(model, "task_assessment")
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            budgets.push(observed_assessment_budget(observed));
+        }
+        let total = budgets
+            .iter()
+            .copied()
+            .fold(Duration::ZERO, |sum, budget| sum.saturating_add(budget));
+        if total > TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT && !budgets.is_empty() {
+            let scale = TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT.as_secs_f64() / total.as_secs_f64();
+            budgets = budgets
+                .into_iter()
+                .map(|budget| Duration::from_secs_f64((budget.as_secs_f64() * scale).max(1.0)))
+                .collect();
+        }
+        budgets
+    };
+    let assessment_deadline = Instant::now()
+        + attempt_budgets
+            .iter()
+            .copied()
+            .fold(Duration::ZERO, |sum, budget| sum.saturating_add(budget))
+            .min(TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT);
     for (candidate_index, model) in model_candidates.iter().enumerate() {
         let remaining = assessment_deadline.saturating_duration_since(Instant::now());
-        let Some(attempt_timeout) = assessment_attempt_timeout(
-            remaining,
-            model_candidates.len().saturating_sub(candidate_index),
-        ) else {
+        let Some(attempt_timeout) = attempt_budgets
+            .get(candidate_index)
+            .copied()
+            .and_then(|budget| bounded_attempt_timeout(remaining, budget))
+        else {
             break;
         };
         let call_start = Instant::now();
@@ -1357,7 +1417,7 @@ pub(crate) async fn generate_task_relationship_candidates(
             .min(u32::MAX as usize) as u32,
     );
     let options = crate::traits::ChatOptions {
-        response_mode: crate::traits::ResponseMode::JsonObject,
+        response_mode: typed_object_response_mode("task_relationship"),
         tool_choice: crate::traits::ToolChoiceMode::None,
         max_tokens_override: Some(1024),
         reasoning_effort_override: Some("low".to_string()),
@@ -2274,12 +2334,31 @@ mod tests {
     }
 
     #[test]
-    fn assessment_attempt_budget_covers_all_configured_candidates() {
-        let total = std::time::Duration::from_secs(45);
-        assert_eq!(assessment_attempt_timeout(total, 3), Some(total / 3));
-        assert_eq!(assessment_attempt_timeout(total, 4), Some(total / 4));
+    fn assessment_attempt_budget_uses_observed_latency_with_bounds() {
         assert_eq!(
-            assessment_attempt_timeout(std::time::Duration::ZERO, 1),
+            observed_assessment_budget(None),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            observed_assessment_budget(Some(13_000)),
+            std::time::Duration::from_secs(26)
+        );
+        assert_eq!(
+            observed_assessment_budget(Some(60_000)),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            bounded_attempt_timeout(
+                std::time::Duration::from_secs(7),
+                std::time::Duration::from_secs(20)
+            ),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(
+            bounded_attempt_timeout(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(20)
+            ),
             None
         );
     }
@@ -2464,7 +2543,8 @@ mod tests {
         assert!(calls.iter().all(|call| {
             matches!(
                 call.options.response_mode,
-                crate::traits::ResponseMode::JsonObject
+                crate::traits::ResponseMode::JsonSchema { ref name, strict, .. }
+                    if name == "task_assessment" && !strict
             ) && call.options.reasoning_effort_override.as_deref() == Some("low")
                 && call.options.tool_choice == crate::traits::ToolChoiceMode::None
                 && call.options.single_attempt_fail_closed

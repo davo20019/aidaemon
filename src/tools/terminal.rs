@@ -1769,7 +1769,8 @@ async fn confined_terminal_execution_request_inner(
     // read-only runtime roots/caches.
     let runtime_support = native_sandbox_runtime_support(backend, shell_source).await?;
     let mut runtime_support = runtime_support;
-    add_manifest_runtime_environment(backend, &writes, &mut runtime_support).await;
+    add_manifest_runtime_environment(backend, &writes, script_via_stdin, &mut runtime_support)
+        .await;
     for path in &runtime_support.read_paths {
         if !reads.contains(path) && !writes.contains(path) {
             reads.push(path.clone());
@@ -1896,6 +1897,7 @@ fn macos_manifest_sandbox_policy(
     traversal_cwd: Option<&str>,
     read_paths: &[String],
     write_paths: &[String],
+    script_via_stdin: bool,
 ) -> anyhow::Result<String> {
     let mut policy = include_str!("macos_terminal_sandbox.sbpl").to_string();
     if let Some(path) = traversal_cwd {
@@ -1957,6 +1959,33 @@ fn macos_manifest_sandbox_policy(
              (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
         ));
     }
+    if script_via_stdin {
+        // Darwin's /bin/sh (bash) materializes here-documents in the
+        // platform temporary directory and does not consistently honor the
+        // task's TMPDIR for that parser-internal file.  Permit only the
+        // shell's transient `sh-thd.*` names in that one OS-managed directory
+        // — never the directory as a whole — so a script can use normal shell
+        // syntax without reopening ambient temporary write authority.
+        let mut temp_dirs = vec![std::env::temp_dir()];
+        if let Ok(canonical) = std::fs::canonicalize(&temp_dirs[0]) {
+            if !temp_dirs.iter().any(|path| path == &canonical) {
+                temp_dirs.push(canonical);
+            }
+        }
+        let patterns = temp_dirs
+            .into_iter()
+            .map(|path| {
+                let escaped = regex::escape(path.to_string_lossy().trim_end_matches('/'));
+                format!("(regex #\"^{escaped}/[^/]*/sh-thd.*$\")")
+            })
+            .collect::<Vec<_>>();
+        if !patterns.is_empty() {
+            policy.push_str(&format!(
+                "\n(allow file-read* file-test-existence file-write*\n  {})\n",
+                patterns.join("\n  ")
+            ));
+        }
+    }
     Ok(policy)
 }
 
@@ -1970,7 +1999,8 @@ fn macos_manifest_sandbox_request(
     sandbox_environment: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<ExecutionRequest> {
     let traversal_cwd = cwd.as_ref().map(crate::execution::BackendPath::as_str);
-    let policy = macos_manifest_sandbox_policy(traversal_cwd, read_paths, write_paths)?;
+    let policy =
+        macos_manifest_sandbox_policy(traversal_cwd, read_paths, write_paths, script_via_stdin)?;
     let mut args = vec![
         "-p".to_string(),
         policy,
@@ -2005,6 +2035,10 @@ struct NativeSandboxRuntimeSupport {
     read_paths: Vec<String>,
     path_prefixes: Vec<String>,
     environment: HashMap<String, String>,
+    /// Python's macOS pip uses this explicit variable instead of
+    /// XDG_CACHE_HOME. It is a capability discovered from the resolved
+    /// executable, not a request/prose classifier.
+    python_cache: bool,
 }
 
 impl NativeSandboxRuntimeSupport {
@@ -2240,6 +2274,11 @@ async fn native_sandbox_runtime_support(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
+        if matches!(requested_name, "python" | "python3" | "pip" | "pip3")
+            || matches!(canonical_name, "python" | "python3" | "pip" | "pip3")
+        {
+            support.python_cache = true;
+        }
         if canonical_name == "rustup" && requested_name != "rustup" {
             let output = backend
                 .execute(
@@ -2316,6 +2355,7 @@ async fn native_sandbox_runtime_support(
 async fn add_manifest_runtime_environment(
     backend: &SharedExecutionBackend,
     write_paths: &[String],
+    script_via_stdin: bool,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
     let mut scratch_root = None;
@@ -2334,6 +2374,10 @@ async fn add_manifest_runtime_environment(
             break;
         }
     }
+    let future_scratch_root = scratch_root.is_none()
+        && script_via_stdin
+        && !support.path_prefixes.is_empty()
+        && !write_paths.is_empty();
     let scratch_root = scratch_root.or_else(|| {
         // A disposable package/build root is often intentionally absent at
         // planning time and created by the authorized script itself. Any
@@ -2341,13 +2385,21 @@ async fn add_manifest_runtime_environment(
         // future declared root; the decision is based on the execution
         // backend's capability graph, never on request wording or a list of
         // package-manager names.
-        (!support.path_prefixes.is_empty())
+        future_scratch_root
             .then(|| write_paths.first().cloned())
             .flatten()
     });
     let Some(scratch_root) = scratch_root else {
         return;
     };
+
+    if future_scratch_root {
+        let path = crate::execution::BackendPath::new(scratch_root.clone());
+        if let Err(error) = backend.create_dir_all(&path).await {
+            tracing::warn!(path = %scratch_root, %error, "Failed to prepare declared runtime scratch root");
+            return;
+        }
+    }
 
     for variable in ["TMPDIR", "TMP", "TEMP"] {
         support
@@ -2359,7 +2411,12 @@ async fn add_manifest_runtime_environment(
     // capability projection, not a package-specific command rewrite.
     support
         .environment
-        .insert("XDG_CACHE_HOME".to_string(), scratch_root);
+        .insert("XDG_CACHE_HOME".to_string(), scratch_root.clone());
+    if support.python_cache {
+        support
+            .environment
+            .insert("PIP_CACHE_DIR".to_string(), scratch_root);
+    }
 }
 
 fn native_sandbox_search_path(prefixes: &[String]) -> String {
@@ -6250,7 +6307,7 @@ impl Tool for TerminalTool {
                     "write_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Exact writable files/directories for a confined mutating run"
+                        "description": "Exact writable files/directories for a confined mutating run. For script workflows, include each writable directory root (including a future root) so the runtime can prepare its private shell/package scratch area before parsing the script."
                     },
                     "action": {
                         "type": "string",
@@ -6648,7 +6705,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_runtime_policy_does_not_widen_task_data_roots() {
-        let policy = macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[])
+        let policy = macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[], false)
             .expect("policy");
         assert!(!policy.contains("(subpath \"/private/etc\")"));
         assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
@@ -6746,6 +6803,52 @@ mod tests {
         assert_eq!(output.exit_code, 1, "{}", output.stderr_lossy());
         assert_eq!(output.stdout_lossy().trim(), "SYNTHETIC_BEFORE");
         assert!(!output.stdout_lossy().contains("SYNTHETIC_AFTER"));
+    }
+
+    #[tokio::test]
+    async fn confined_script_prepares_future_declared_scratch_before_heredoc() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend.resolve_executable("cat").await.unwrap().is_none()
+        {
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let cwd = parent.path().to_string_lossy().to_string();
+        let root = parent.path().join("synthetic-heredoc-root");
+        assert!(!root.exists());
+        let script =
+            "touch \"$TMPDIR/probe\"\ncat <<'EOF' > \"$PWD/synthetic-heredoc-root/value.txt\"\nSYNTHETIC_HEREDOC_OK\nEOF\n";
+        let request = confined_terminal_script_execution_request(
+            &backend,
+            script,
+            Some(&cwd),
+            &[cwd.clone()],
+            &[root.to_string_lossy().to_string()],
+        )
+        .await
+        .expect("confined script request");
+        assert!(
+            root.is_dir(),
+            "runtime scratch root must exist before shell parsing"
+        );
+        let canonical_root = backend
+            .canonicalize(&crate::execution::BackendPath::new(
+                root.to_string_lossy().to_string(),
+            ))
+            .await
+            .expect("canonical scratch root")
+            .to_string();
+        assert_eq!(request.env.get("TMPDIR"), Some(&canonical_root));
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(output.exit_code, 0, "{}", output.stderr_lossy());
+        assert_eq!(
+            std::fs::read_to_string(root.join("value.txt")).expect("heredoc output"),
+            "SYNTHETIC_HEREDOC_OK\n"
+        );
     }
 
     #[test]

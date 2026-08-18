@@ -2051,6 +2051,7 @@ impl Agent {
                                         super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
                                             emitter: &emitter,
                                             state: self.state.as_ref(),
+                                            event_store: self.event_store.as_ref(),
                                             session_id,
                                             task_id: &task_id,
                                         },

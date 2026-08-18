@@ -1918,6 +1918,15 @@ impl EventStore {
             TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
             TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
         };
+        let efficiency = self.task_efficiency_data(&task_id).await;
+        let harness_eval = Some(Self::supervisor_harness_snapshot(
+            &task_id,
+            turn_id.clone(),
+            iterations,
+            tool_calls_count,
+            efficiency.as_ref(),
+            outcome,
+        ));
         let completion_proof = crate::events::TaskCompletionProofData {
             schema_version: 1,
             task_id: task_id.clone(),
@@ -1938,10 +1947,10 @@ impl EventStore {
                 tool_calls_count,
                 error,
                 summary,
-                efficiency: None,
+                efficiency,
                 turn_id,
                 completion_proof: Some(completion_proof),
-                harness_eval: None,
+                harness_eval,
             })?,
         );
         self.append(event).await?;
@@ -2427,6 +2436,211 @@ impl EventStore {
         summary.p95_latency_ms = percentile(&latencies, 95.0);
         summary.max_latency_ms = max_latency;
         Ok(summary)
+    }
+
+    /// Return a bounded historical latency estimate for one auxiliary model
+    /// producer.  Assessment failover must budget for the provider that is
+    /// actually being called; dividing one envelope by candidate count
+    /// treats a fast and a slow model as interchangeable and starves ordinary
+    /// responses.  Only successful, purpose-labelled calls are eligible so a
+    /// timeout cannot teach the allocator to make the next deadline shorter.
+    pub async fn recent_model_latency_ms(
+        &self,
+        model: &str,
+        call_purpose: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE event_type = 'llm_call'
+            ORDER BY id DESC
+            LIMIT 512
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut latencies = rows
+            .into_iter()
+            .filter_map(|row| {
+                let data: String = row.get("data");
+                let call = serde_json::from_str::<LlmCallData>(&data).ok()?;
+                (call.model == model
+                    && call.call_purpose.as_deref() == Some(call_purpose)
+                    && !call.failed
+                    && call.latency_ms > 0)
+                    .then_some(call.latency_ms)
+            })
+            .collect::<Vec<_>>();
+        if latencies.is_empty() {
+            return Ok(None);
+        }
+        latencies.sort_unstable();
+        let rank = ((latencies.len() as f64) * 0.95).ceil() as usize;
+        Ok(latencies
+            .get(rank.saturating_sub(1).min(latencies.len() - 1))
+            .copied())
+    }
+
+    /// Build the same durable efficiency shape used by the in-process agent
+    /// when a supervisor has already dropped that agent future.  Keeping this
+    /// projection in the event store makes cancellation/crash terminalization
+    /// observable instead of silently omitting failed-call cost.
+    pub async fn task_efficiency_data(
+        &self,
+        task_id: &str,
+    ) -> Option<crate::events::TaskEfficiencyData> {
+        let summary = self.get_task_llm_stats(task_id).await.ok()?;
+        if summary.total_calls == 0 {
+            return None;
+        }
+        let drift = summary.est_input_drift();
+        let mut reasons = Vec::new();
+        if summary.failed_calls > 0 {
+            reasons.push(format!("{} failed call(s)", summary.failed_calls));
+        }
+        if summary.fell_back_count > 0 {
+            reasons.push(format!("{} fallback(s)", summary.fell_back_count));
+        }
+        if summary.total_attempts > summary.total_calls {
+            reasons.push(format!(
+                "{} retry attempt(s) over {} call(s)",
+                summary.total_attempts - summary.total_calls,
+                summary.total_calls
+            ));
+        }
+        if summary.total_calls >= 8 {
+            reasons.push(format!("{} LLM calls (heavy loop)", summary.total_calls));
+        }
+        if summary.est_samples > 0 && summary.actual_input_tokens_with_est > 0 {
+            let pct =
+                (drift.unsigned_abs() as f64 / summary.actual_input_tokens_with_est as f64) * 100.0;
+            if pct >= 30.0 {
+                reasons.push(format!("token estimate off by {pct:.0}%"));
+            }
+        }
+        Some(crate::events::TaskEfficiencyData {
+            llm_calls: summary.total_calls,
+            attempts: summary.total_attempts,
+            fell_back_count: summary.fell_back_count,
+            p95_latency_ms: summary.p95_latency_ms,
+            max_latency_ms: summary.max_latency_ms,
+            max_latency_iteration: summary.max_latency_iteration,
+            input_tokens: summary.total_input_tokens,
+            output_tokens: summary.total_output_tokens,
+            cached_input_tokens: (summary.cached_input_token_samples > 0)
+                .then_some(summary.total_cached_input_tokens),
+            cache_creation_input_tokens: (summary.cache_creation_input_token_samples > 0)
+                .then_some(summary.total_cache_creation_input_tokens),
+            fresh_input_tokens: (summary.cached_input_token_samples > 0).then_some(
+                summary
+                    .total_input_tokens
+                    .saturating_sub(summary.total_cached_input_tokens),
+            ),
+            est_input_drift: drift,
+            final_model: summary.final_model,
+            reasons,
+        })
+    }
+
+    fn supervisor_harness_snapshot(
+        task_id: &str,
+        turn_id: Option<String>,
+        iterations: u32,
+        tool_calls_count: u32,
+        efficiency: Option<&crate::events::TaskEfficiencyData>,
+        outcome: crate::events::TaskOutcome,
+    ) -> crate::events::HarnessEvalSnapshot {
+        let input_tokens = efficiency.map_or(0, |data| data.input_tokens);
+        let output_tokens = efficiency.map_or(0, |data| data.output_tokens);
+        let llm_calls = efficiency.map_or(0, |data| data.llm_calls as u32);
+        let fell_back_count = efficiency.map_or(0, |data| data.fell_back_count as u32);
+        let succeeded = outcome == crate::events::TaskOutcome::Succeeded;
+        crate::events::HarnessEvalSnapshot {
+            task_id: task_id.to_string(),
+            turn_id,
+            depth: 0,
+            parent_task_id: None,
+            goal_id: None,
+            durable_task_id: None,
+            completion_task_kind: "unknown".to_string(),
+            orchestration_route: "supervisor_terminalization".to_string(),
+            followup_mode: None,
+            routing: crate::events::RoutingEvalPayload {
+                orchestration_route: "supervisor_terminalization".to_string(),
+                tools_required_predicted: tool_calls_count > 0,
+                tools_actually_used: tool_calls_count > 0,
+                direct_return_attempted: false,
+                route_drift_failsafe: true,
+                skills_activated: Vec::new(),
+                policy_profile: None,
+                model_escalated: false,
+                response_fallthrough: true,
+                intent_gate_fires: 0,
+                evidence_gate_blocks: 0,
+                critique_replan_fires: 0,
+            },
+            progress: crate::events::ProgressEvalPayload {
+                iterations,
+                tool_calls_attempted: tool_calls_count,
+                tool_calls_succeeded: 0,
+                evidence_gain_total: 0,
+                no_progress_iterations: 0,
+                stall_guard_fires: 0,
+                repetition_guard_fires: 0,
+                plan_steps_completed: None,
+                plan_steps_total: None,
+                tool_defs_count: 0,
+                est_input_tokens: efficiency
+                    .map_or(0, |data| data.input_tokens.min(u32::MAX as u64) as u32),
+                context_drops: 0,
+                deferred_no_tool_events: 0,
+                budget_extensions: 0,
+            },
+            quality: crate::events::QualityEvalPayload {
+                outcome: outcome.as_str().to_string(),
+                stop_reason: "supervisor_terminalization".to_string(),
+                contract: crate::events::ContractFulfillmentPayload {
+                    expects_mutation: false,
+                    forbids_mutation: false,
+                    forbidden_mutation_attempts: 0,
+                    mutation_attempt_count: 0,
+                    indeterminate_mutation_count: 0,
+                    mutation_count: 0,
+                    requires_observation: false,
+                    observation_count: 0,
+                    verification_required: false,
+                    verification_count: 0,
+                    verification_blocks: 0,
+                    evidence_requirements_total: 0,
+                    evidence_requirements_satisfied: 0,
+                    fulfilled: succeeded,
+                },
+                post_exec_validation_failures: 0,
+                unrecovered_errors: u32::from(!succeeded),
+                approval_denied: false,
+                contract_fulfilled: succeeded,
+            },
+            cost: crate::events::CostEvalPayload {
+                total_input_tokens: input_tokens,
+                total_output_tokens: output_tokens,
+                weighted_tokens: input_tokens.saturating_add(output_tokens),
+                llm_calls,
+                fell_back_count,
+                sub_agent_weighted_tokens: 0,
+                sub_agent_spawn_count: 0,
+                sub_agent_failures: 0,
+                tokens_failed_waste: !succeeded && llm_calls > 0,
+            },
+            scores: crate::events::HarnessScoresPayload {
+                routing_accuracy: 0.0,
+                progress_yield: 0.0,
+                contract_fulfillment: if succeeded { 1.0 } else { 0.0 },
+                cost_efficiency: 0.0,
+                overall: 0.0,
+            },
+        }
     }
 
     /// Get the last completed task for a session

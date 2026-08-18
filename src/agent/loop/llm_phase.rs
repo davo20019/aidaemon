@@ -612,6 +612,115 @@ async fn finalize_verified_external_action_ack(
     Ok(reply)
 }
 
+/// Close from a durable typed receipt when the provider fails after tool I/O.
+/// A response model is useful for synthesis, but it is not authoritative for
+/// whether an already-dispatched operation has a terminal observation.  This
+/// boundary prevents provider outages from reopening a completed receipt into
+/// repeated 90-second calls or a silent running task.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_durable_receipt_after_provider_failure(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    task_id: &str,
+    session_id: &str,
+    iteration: usize,
+    task_start: Instant,
+    learning_ctx: &mut LearningContext,
+    model: &str,
+    provider_error: &str,
+) -> anyhow::Result<Option<String>> {
+    if agent
+        .event_store
+        .task_event_count(session_id, task_id, crate::events::EventType::TaskEnd)
+        .await
+        .unwrap_or_default()
+        > 0
+    {
+        return Ok(None);
+    }
+    let latest_result = agent
+        .event_store
+        .latest_task_tool_result(session_id, task_id)
+        .await?;
+    let result = match latest_result {
+        Some(result)
+            if result.failed()
+                && result
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.invocation_stage.reached_dispatch()) =>
+        {
+            Some(result)
+        }
+        Some(result) if result.completed_observation() => Some(result),
+        _ => {
+            agent
+                .event_store
+                .latest_completed_task_tool_result(session_id, task_id)
+                .await?
+        }
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let receipt_closed = result.receipt.as_ref().is_some_and(|receipt| {
+        !receipt.completion_obligation_ids.is_empty()
+            || (receipt.semantics.observes_state() && !receipt.semantics.mutates_state())
+    });
+    let reply = crate::agent::completion_checks::build_tool_output_completion_reply(
+        &result.name,
+        &result.result,
+        false,
+    )
+    .unwrap_or_else(|| {
+        format!(
+            "The {} operation produced a typed `{}` result. The response provider failed before it could add a summary; the durable result is preserved.",
+            result.name,
+            result.outcome_status().as_str()
+        )
+    });
+    let assistant_msg = Message {
+        id: Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        role: "assistant".to_string(),
+        content: Some(reply.clone()),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls_json: None,
+        created_at: Utc::now(),
+        importance: 0.5,
+        ..Message::runtime_defaults()
+    };
+    agent
+        .append_assistant_message_with_event(emitter, &assistant_msg, model, None, None)
+        .await?;
+    let (status, outcome, error) = if receipt_closed {
+        (TaskStatus::Completed, TaskOutcome::Succeeded, None)
+    } else {
+        (
+            TaskStatus::Failed,
+            TaskOutcome::Failed,
+            Some(provider_error.to_string()),
+        )
+    };
+    agent
+        .emit_task_end(
+            emitter,
+            task_id,
+            status,
+            outcome,
+            task_start,
+            iteration,
+            learning_ctx.tool_calls.len(),
+            error,
+            Some(reply.chars().take(200).collect()),
+        )
+        .await;
+    learning_ctx.completed_naturally = receipt_closed;
+    learning_ctx.task_outcome = Some(outcome);
+    Ok(Some(reply))
+}
+
 pub(super) async fn run_llm_phase(
     services: &super::services::AgentServices<'_>,
     ctx: &mut LlmPhaseCtx<'_>,
@@ -1235,6 +1344,24 @@ pub(super) async fn run_llm_phase(
                 .await;
                 return Ok(LlmPhaseOutcome::Return(result));
             }
+            if let Some(reply) = finalize_durable_receipt_after_provider_failure(
+                services.agent,
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                task_start,
+                learning_ctx,
+                model,
+                &error_message,
+            )
+            .await?
+            {
+                if let Some(last_error) = learning_ctx.errors.last_mut() {
+                    last_error.1 = true;
+                }
+                return Ok(LlmPhaseOutcome::Return(Ok(reply)));
+            }
             return Err(error);
         }
         Err(_elapsed) => {
@@ -1320,6 +1447,24 @@ pub(super) async fn run_llm_phase(
                 )
                 .await;
                 return Ok(LlmPhaseOutcome::Return(result));
+            }
+            if let Some(reply) = finalize_durable_receipt_after_provider_failure(
+                services.agent,
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                task_start,
+                learning_ctx,
+                model,
+                &format!("LLM call timed out after {}s", timeout_dur.as_secs()),
+            )
+            .await?
+            {
+                if let Some(last_error) = learning_ctx.errors.last_mut() {
+                    last_error.1 = true;
+                }
+                return Ok(LlmPhaseOutcome::Return(Ok(reply)));
             }
             *stall_count += 1;
             return Ok(LlmPhaseOutcome::ContinueLoop);
