@@ -1356,6 +1356,18 @@ pub(crate) async fn generate_task_relationship_candidates(
         crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
             .min(u32::MAX as usize) as u32,
     );
+    let options = crate::traits::ChatOptions {
+        response_mode: crate::traits::ResponseMode::JsonObject,
+        tool_choice: crate::traits::ToolChoiceMode::None,
+        max_tokens_override: Some(1024),
+        reasoning_effort_override: Some("low".to_string()),
+        // Relationship routing is optional, but it must not hide provider
+        // retries inside its aggregate deadline. The model supplies only a
+        // typed edge; one physical attempt per candidate keeps timeout and
+        // cost telemetry attributable to the right candidate.
+        single_attempt_fail_closed: true,
+        ..crate::traits::ChatOptions::default()
+    };
     let deadline = Instant::now() + TASK_RELATIONSHIP_TOTAL_TIMEOUT;
     for (candidate_index, model) in model_candidates.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1366,45 +1378,48 @@ pub(crate) async fn generate_task_relationship_candidates(
             break;
         };
         let call_start = Instant::now();
-        let response =
-            match tokio::time::timeout(attempt_timeout, provider.chat(model, &messages, &[])).await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    record_auxiliary_model_failure(
-                        telemetry,
-                        "task_relationship_fallback",
-                        model,
-                        call_start.elapsed().as_millis() as u64,
-                        (candidate_index + 1) as u32,
-                        candidate_index > 0,
-                        est_input_tokens,
-                        format!("provider_error: {error}"),
-                    )
-                    .await;
-                    warn!(%error, %model, "Task relationship fallback failed");
-                    continue;
-                }
-                Err(_) => {
-                    record_auxiliary_model_failure(
-                        telemetry,
-                        "task_relationship_fallback",
-                        model,
-                        call_start.elapsed().as_millis() as u64,
-                        (candidate_index + 1) as u32,
-                        candidate_index > 0,
-                        est_input_tokens,
-                        "timeout",
-                    )
-                    .await;
-                    warn!(
-                        %model,
-                        timeout_ms = attempt_timeout.as_millis(),
-                        "Task relationship fallback timed out"
-                    );
-                    continue;
-                }
-            };
+        let response = match tokio::time::timeout(
+            attempt_timeout,
+            provider.chat_with_options(model, &messages, &[], &options),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_relationship_fallback",
+                    model,
+                    call_start.elapsed().as_millis() as u64,
+                    (candidate_index + 1) as u32,
+                    candidate_index > 0,
+                    est_input_tokens,
+                    format!("provider_error: {error}"),
+                )
+                .await;
+                warn!(%error, %model, "Task relationship fallback failed");
+                continue;
+            }
+            Err(_) => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_relationship_fallback",
+                    model,
+                    call_start.elapsed().as_millis() as u64,
+                    (candidate_index + 1) as u32,
+                    candidate_index > 0,
+                    est_input_tokens,
+                    "timeout",
+                )
+                .await;
+                warn!(
+                    %model,
+                    timeout_ms = attempt_timeout.as_millis(),
+                    "Task relationship fallback timed out"
+                );
+                continue;
+            }
+        };
         let latency_ms = call_start.elapsed().as_millis() as u64;
         let Some(json) =
             crate::utils::extract_json_object(response.content.as_deref().unwrap_or(""))
