@@ -255,6 +255,14 @@ pub struct StepExecutionPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_targets: Vec<ToolTargetHint>,
     pub retry_policy: RetryPolicy,
+    /// Optional user-owned obligation cardinality. This is intentionally
+    /// separate from `operation_key`: alternative concrete strategies have
+    /// different operation identities but still share an explicit global
+    /// "invoke at most N times" constraint for the obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality_limit: Option<usize>,
     pub approval_requirement: ApprovalRequirement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
@@ -315,6 +323,25 @@ pub struct ExecutionState {
     /// also applies after a pre-I/O rejection.
     #[serde(default)]
     pub operation_invocations: BTreeMap<String, usize>,
+    /// Proposals charged to explicit request-level cardinality constraints.
+    /// This ledger is never used for ordinary retry/idempotency decisions.
+    #[serde(default)]
+    pub obligation_invocations: BTreeMap<String, usize>,
+    /// Actual adapter dispatches grouped by effective planned tool. This is
+    /// authoritative response/telemetry data and must not be reconstructed
+    /// from model prose or proposal counts.
+    #[serde(default)]
+    pub tool_dispatches: BTreeMap<String, usize>,
+    /// Monotonic revision of potentially changed domain state. Observation
+    /// operation identities bind to this revision so a check can run again
+    /// after a different mutation, while a mutation cannot refresh its own
+    /// retry key merely by having executed.
+    #[serde(default)]
+    pub effect_revision: u64,
+    #[serde(default)]
+    pub operation_effect_epochs: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mutation_operation_base: Option<String>,
     /// Prepared proposals that reached a real or durable-replay result.
     #[serde(default)]
     pub operation_results_observed: usize,
@@ -405,6 +432,11 @@ impl ExecutionState {
             steps_used: 0,
             operation_attempts: BTreeMap::new(),
             operation_invocations: BTreeMap::new(),
+            obligation_invocations: BTreeMap::new(),
+            tool_dispatches: BTreeMap::new(),
+            effect_revision: 0,
+            operation_effect_epochs: BTreeMap::new(),
+            last_mutation_operation_base: None,
             operation_results_observed: 0,
             completed_operation_results: 0,
             progress_credit_keys: BTreeSet::new(),
@@ -622,15 +654,34 @@ impl ExecutionState {
         if invocations >= step.retry_policy.max_invocations.max(1) {
             return false;
         }
+        if let (Some(cardinality_key), Some(limit)) =
+            (step.cardinality_key.as_ref(), step.cardinality_limit)
+        {
+            let used = self
+                .obligation_invocations
+                .get(cardinality_key)
+                .copied()
+                .unwrap_or_default();
+            if used >= limit.max(1) {
+                return false;
+            }
+        }
         *self.operation_invocations.entry(operation_key).or_default() =
             invocations.saturating_add(1);
+        if let Some(cardinality_key) = step.cardinality_key.as_ref() {
+            let used = self
+                .obligation_invocations
+                .entry(cardinality_key.clone())
+                .or_default();
+            *used = used.saturating_add(1);
+        }
         self.steps_used = self.steps_used.saturating_add(1);
         true
     }
 
-    /// Commit an admitted operation attempt only after the adapter boundary
-    /// confirms that I/O was dispatched. Validation, policy, and replay paths
-    /// do not consume cardinality.
+    /// Record actual adapter dispatch separately from admitted proposal and
+    /// request-cardinality ledgers. Validation, policy, and replay paths do not
+    /// increment dispatch counts or concrete-operation attempt counts.
     pub fn record_current_operation_dispatch(&mut self) {
         let Some(step) = self.current_step.as_ref() else {
             return;
@@ -642,7 +693,50 @@ impl ExecutionState {
         };
         let attempts = self.operation_attempts.entry(operation_key).or_default();
         *attempts = attempts.saturating_add(1);
+        if let Some(tool_name) = step.primary_tool.as_ref() {
+            let dispatches = self.tool_dispatches.entry(tool_name.clone()).or_default();
+            *dispatches = dispatches.saturating_add(1);
+        }
         self.attempt_count = self.attempt_count.saturating_add(1);
+    }
+
+    /// Bind a canonical concrete operation to the state revision it observes.
+    /// Repeating the operation without an intervening different mutation keeps
+    /// the same key. After another mutation, the same check becomes a new
+    /// operation because its preconditions may have changed.
+    pub fn bind_operation_to_effect_revision(&self, operation_base: &str) -> String {
+        let epoch = if self.last_mutation_operation_base.as_deref() == Some(operation_base) {
+            self.operation_effect_epochs
+                .get(operation_base)
+                .copied()
+                .unwrap_or(self.effect_revision)
+        } else {
+            self.effect_revision
+        };
+        format!("{operation_base}:effect_revision:{epoch}")
+    }
+
+    /// Record a potentially state-changing dispatched receipt. The current
+    /// operation keeps its original epoch, preventing self-refresh retries;
+    /// other operations will bind to the incremented revision.
+    pub fn record_current_mutation_transition(&mut self) {
+        let Some(operation_key) = self
+            .current_step
+            .as_ref()
+            .map(|step| step.operation_key.as_str())
+        else {
+            return;
+        };
+        let Some((operation_base, epoch)) = operation_key.rsplit_once(":effect_revision:") else {
+            return;
+        };
+        let Ok(epoch) = epoch.parse::<u64>() else {
+            return;
+        };
+        self.operation_effect_epochs
+            .insert(operation_base.to_string(), epoch);
+        self.effect_revision = self.effect_revision.saturating_add(1);
+        self.last_mutation_operation_base = Some(operation_base.to_string());
     }
 
     pub fn record_operation_result(
@@ -1207,14 +1301,30 @@ impl ExecutionState {
             return Some(ExecutionBudgetLimit::ValidationRounds);
         }
         if self.budget.max_wall_clock_ms > 0 {
-            // Subtract time lost to provider timeouts — those are external
-            // delays, not agent stalling, and shouldn't penalise the budget.
-            let effective_elapsed = execution_elapsed_ms.saturating_sub(self.provider_timeout_ms);
-            if effective_elapsed >= self.budget.max_wall_clock_ms {
+            // Wall clock is an owner-facing end-to-end deadline. Provider
+            // latency is still recorded separately for diagnosis, but it is
+            // never excluded from the time the owner actually waited.
+            if execution_elapsed_ms >= self.budget.max_wall_clock_ms {
                 return Some(ExecutionBudgetLimit::WallClock);
             }
         }
         None
+    }
+
+    /// Remaining owner-visible execution time for bounding the next external
+    /// provider call. Returning `None` means the execution envelope is not yet
+    /// active or has no wall-clock dimension.
+    pub fn remaining_wall_clock(&self, elapsed: Duration) -> Option<Duration> {
+        if !self.budget_envelope_active || self.budget.max_wall_clock_ms == 0 {
+            return None;
+        }
+        let execution_elapsed_ms = (elapsed.as_millis().min(u64::MAX as u128) as u64)
+            .saturating_sub(self.budget_started_elapsed_ms);
+        Some(Duration::from_millis(
+            self.budget
+                .max_wall_clock_ms
+                .saturating_sub(execution_elapsed_ms),
+        ))
     }
 
     /// Return the most constrained execution dimension once it reaches the
@@ -1231,8 +1341,7 @@ impl ExecutionState {
         let execution_tokens_used =
             task_tokens_used.saturating_sub(self.budget_started_task_tokens);
         let elapsed_ms = (elapsed.as_millis().min(u64::MAX as u128) as u64)
-            .saturating_sub(self.budget_started_elapsed_ms)
-            .saturating_sub(self.provider_timeout_ms);
+            .saturating_sub(self.budget_started_elapsed_ms);
         let dimensions = [
             (
                 ExecutionBudgetLimit::Steps,
@@ -1346,7 +1455,7 @@ pub fn select_initial_execution_budget(
 pub fn compile_step_execution_plan(
     execution_id: &str,
     operation_key: String,
-    max_invocations: Option<usize>,
+    cardinality: Option<(String, usize)>,
     plan_version: u32,
     iteration: usize,
     tool_call_id: &str,
@@ -1425,12 +1534,12 @@ pub fn compile_step_execution_plan(
         },
         expected_targets,
         retry_policy: RetryPolicy {
-            max_invocations: max_invocations
-                .unwrap_or(if capabilities.idempotent { 2 } else { 1 })
-                .max(1),
+            max_invocations: if capabilities.idempotent { 2 } else { 1 },
             max_attempts: if capabilities.idempotent { 2 } else { 1 },
             allow_tool_invocation_retry: capabilities.idempotent,
         },
+        cardinality_key: cardinality.as_ref().map(|(key, _)| key.clone()),
+        cardinality_limit: cardinality.map(|(_, limit)| limit.max(1)),
         approval_requirement,
         // Retries and crash recovery may receive a new model call id or loop
         // iteration. Bind idempotency to the durable execution plus the exact

@@ -110,7 +110,7 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
                     "receipt": {
                         "tool_names": ["run_command"],
                         "exit_codes": [1],
-                        "outcome_statuses": ["completed_with_negative_result"],
+                        "outcome_statuses": ["failed_permanent"],
                         "requires_output": false,
                         "contract_rejected": false
                     }

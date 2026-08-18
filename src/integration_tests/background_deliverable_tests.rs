@@ -175,6 +175,9 @@ async fn empty_stdout_background_command_delivers_result_file() {
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "read_paths": [script_path.to_string_lossy()],
+        "write_paths": [result_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })
@@ -258,6 +261,8 @@ async fn reaped_command_without_produced_file_sends_honest_failure() {
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "write_paths": [missing_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })
@@ -335,6 +340,9 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "read_paths": [script_path.to_string_lossy()],
+        "write_paths": [a_path.to_string_lossy(), b_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })
@@ -391,6 +399,9 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "read_paths": [script_path.to_string_lossy()],
+        "write_paths": [result_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })
@@ -458,6 +469,9 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "read_paths": [script_path.to_string_lossy()],
+        "write_paths": [result_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })
@@ -515,6 +529,9 @@ async fn reaped_script_declared_missing_output_reports_honest_failure() {
     let call = serde_json::json!({
         "action": "run",
         "command": command,
+        "working_dir": std::env::temp_dir().to_string_lossy(),
+        "read_paths": [script_path.to_string_lossy()],
+        "write_paths": [missing_path.to_string_lossy()],
         "_session_id": session_id,
         "_user_role": "Owner",
     })

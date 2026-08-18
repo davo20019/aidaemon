@@ -430,7 +430,7 @@ pub(super) fn target_scope_violation_for_tool_call(
 
 /// Verify a call's declared read/write capability request against the task's
 /// authority before I/O. Mixed operations must satisfy both sets; execution
-/// cwd is readable context and is never an implicit write grant.
+/// cwd selects process location and is never implicit data authority.
 pub(super) fn access_manifest_scope_violation(
     _tool_name: &str,
     call: &crate::traits::ToolCallAccessManifest,
@@ -451,18 +451,18 @@ pub(super) fn access_manifest_scope_violation(
         .filter_map(|scope| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope.clone()))
         .collect::<Vec<_>>();
     let (read_grants, write_grants) = if let Some(task) = task {
-        let mut reads = task.read_targets.clone();
-        if let Some(cwd) = task.execution_cwd.as_deref() {
-            if let Some(cwd) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd) {
-                if !reads.contains(&cwd) {
-                    reads.push(cwd);
-                }
-            }
-        }
-        (reads, task.write_targets.clone())
+        (task.read_targets.clone(), task.write_targets.clone())
     } else {
         (fallback.clone(), fallback)
     };
+    let invalid_cwd = task
+        .and_then(|task| task.execution_cwd.as_deref())
+        .zip(call.execution_cwd.as_deref())
+        .is_some_and(|(expected, actual)| {
+            let expected = crate::execution::normalize_active_path_lexically(expected).ok();
+            let actual = crate::execution::normalize_active_path_lexically(actual).ok();
+            expected.is_none() || actual.is_none() || expected != actual
+        });
 
     // Filesystem capabilities are monotone: a directory grant may authorize
     // descendants, while an exact-path grant never authorizes its parent or a
@@ -505,11 +505,12 @@ pub(super) fn access_manifest_scope_violation(
         .filter(|candidate| outside(candidate, &write_grants))
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
-    if invalid_reads.is_empty() && invalid_writes.is_empty() {
+    if !invalid_cwd && invalid_reads.is_empty() && invalid_writes.is_empty() {
         return None;
     }
     Some(format!(
-        "task filesystem capability violation (unauthorized reads: {}; unauthorized writes: {})",
+        "task filesystem capability violation (execution cwd mismatch: {}; unauthorized reads: {}; unauthorized writes: {})",
+        if invalid_cwd { "yes" } else { "no" },
         if invalid_reads.is_empty() {
             "none".to_string()
         } else {
@@ -1170,9 +1171,10 @@ pub(in crate::agent) fn pending_evidence_requirement_indices(
         .collect()
 }
 
-/// Bind model retries to a user-owned operation rather than a transient tool
-/// call. Contract obligations take precedence, followed by a typed plan step;
-/// unplanned work falls back to the canonical prepared invocation.
+/// Build the canonical prepared-invocation base for a user-owned operation,
+/// independent of transient tool-call and plan-step IDs. `ExecutionState`
+/// subsequently binds this base to its typed effect revision, while explicit
+/// request cardinality remains a separate ledger.
 pub(in crate::agent) fn stable_operation_identity(
     execution_id: &str,
     contract: &CompletionContract,
@@ -1180,8 +1182,8 @@ pub(in crate::agent) fn stable_operation_identity(
     semantics: &ToolCallSemantics,
     canonical_arguments: &str,
     access_manifest: &crate::traits::ToolCallAccessManifest,
-    planned_step_id: Option<&str>,
-) -> (String, Option<usize>) {
+    _planned_step_id: Option<&str>,
+) -> (String, Option<(String, usize)>) {
     let metadata = crate::traits::ToolCallMetadata {
         semantics: semantics.clone(),
         access_manifest: Some(access_manifest.clone()),
@@ -1194,14 +1196,14 @@ pub(in crate::agent) fn stable_operation_identity(
         canonical_arguments,
         &metadata,
     );
-    if !requirement_indices.is_empty() {
+    let cardinality = if !requirement_indices.is_empty() {
         let owner = contract.scope_task_id.as_deref().unwrap_or(execution_id);
         let indices = requirement_indices
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let max_invocations = requirement_indices
+        requirement_indices
             .iter()
             .filter_map(|index| {
                 contract.evidence_requirements[*index]
@@ -1209,15 +1211,16 @@ pub(in crate::agent) fn stable_operation_identity(
                     .as_ref()
                     .and_then(|receipt| receipt.max_invocations)
             })
-            .min();
-        return (
-            format!("contract:{owner}:requirements:{indices}"),
-            max_invocations,
-        );
-    }
-    if let Some(step_id) = planned_step_id {
-        return (format!("plan:{execution_id}:{step_id}"), None);
-    }
+            .min()
+            .map(|limit| {
+                (
+                    format!("contract:{owner}:requirements:{indices}"),
+                    limit.max(1),
+                )
+            })
+    } else {
+        None
+    };
 
     let arguments = serde_json::from_str::<serde_json::Value>(canonical_arguments)
         .unwrap_or_else(|_| serde_json::Value::String(canonical_arguments.to_string()));
@@ -1225,13 +1228,15 @@ pub(in crate::agent) fn stable_operation_identity(
         "tool": requested_tool_name,
         "arguments": arguments,
     });
-    (
-        format!(
-            "invocation:{execution_id}:{}",
-            crate::agent::prefix_fingerprint::hash_canonical(&invocation)
-        ),
-        None,
-    )
+    let operation_key = format!(
+        "invocation:{execution_id}:{}",
+        crate::agent::prefix_fingerprint::hash_canonical(&invocation)
+    );
+    // Plan step and tool-call IDs remain available as lineage on the compiled
+    // step, but neither participates in the operation base. The exact
+    // canonical invocation is stable across replanning and changes exactly
+    // when the concrete strategy changes.
+    (operation_key, cardinality)
 }
 
 pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
@@ -1244,6 +1249,18 @@ pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
                 || (metadata.contract_rejected && receipt.contract_rejected == Some(true))
         })
     })
+}
+
+/// A controller refusal for an already-closed operation is not a newer domain
+/// observation than the operation's dispatched receipt. Project it only when
+/// no real dispatch exists for this tool; otherwise the response model keeps
+/// the earlier process/domain receipt as the authoritative outcome.
+pub(in crate::agent) fn should_project_authoritative_receipt(
+    invocation_stage: crate::traits::ToolInvocationStage,
+    operation_admitted: bool,
+    dispatched_tool_calls: usize,
+) -> bool {
+    invocation_stage.reached_dispatch() || operation_admitted || dispatched_tool_calls == 0
 }
 
 /// Compatibility shim for persisted schema-v7 marker state. Content markers
@@ -2325,6 +2342,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },
+            cardinality_key: None,
+            cardinality_limit: None,
             approval_requirement: ApprovalRequirement::NotNeeded,
             idempotency_key: None,
         };
@@ -2366,6 +2385,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },
+            cardinality_key: None,
+            cardinality_limit: None,
             approval_requirement: ApprovalRequirement::Required {
                 reason: "cross-project mutation".to_string(),
             },
@@ -2386,10 +2407,10 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
         let task = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
-            read_targets: vec![hint(
-                ToolTargetHintKind::Path,
-                "/workspace/project/Cargo.toml",
-            )],
+            read_targets: vec![
+                hint(ToolTargetHintKind::ProjectScope, "/tmp"),
+                hint(ToolTargetHintKind::Path, "/workspace/project/Cargo.toml"),
+            ],
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
         };
         let valid = crate::traits::ToolCallAccessManifest {
@@ -2412,24 +2433,37 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     }
 
     #[test]
-    fn execution_cwd_is_readable_but_never_an_implicit_write_grant() {
+    fn execution_cwd_is_neither_an_implicit_read_nor_write_grant() {
         let task = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: Vec::new(),
-            write_targets: vec![
-                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/result.txt").expect("target"),
-            ],
+            write_targets: Vec::new(),
         };
         let call = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![
                 ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
             ],
-            write_targets: vec![
-                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
-            ],
+            write_targets: Vec::new(),
         };
         assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_some());
+    }
+
+    #[test]
+    fn explicit_task_execution_cwd_rejects_a_different_call_location() {
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp/expected".to_string()),
+            read_targets: Vec::new(),
+            write_targets: Vec::new(),
+        };
+        let call = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp/different".to_string()),
+            read_targets: Vec::new(),
+            write_targets: Vec::new(),
+        };
+        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[])
+            .expect("cwd mismatch");
+        assert!(violation.contains("execution cwd mismatch: yes"));
     }
 
     #[test]
@@ -2470,6 +2504,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 max_attempts: 1,
                 allow_tool_invocation_retry: true,
             },
+            cardinality_key: None,
+            cardinality_limit: None,
             approval_requirement: ApprovalRequirement::NotNeeded,
             idempotency_key: None,
         };
@@ -2505,6 +2541,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 max_attempts: 1,
                 allow_tool_invocation_retry: false,
             },
+            cardinality_key: None,
+            cardinality_limit: None,
             approval_requirement: ApprovalRequirement::NotNeeded,
             idempotency_key: None,
         };
@@ -2776,5 +2814,102 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             ),
             0
         );
+    }
+
+    #[test]
+    fn operation_identity_and_obligation_cardinality_are_independent() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            RequestReceiptPredicate, ToolOutcomeStatus,
+        };
+        let contract = CompletionContract {
+            scope_task_id: Some("task-1".to_string()),
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Observe one process result".to_string(),
+                acceptable_scopes: Vec::new(),
+                purpose: EvidencePurpose::Outcome,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: Some(RequestReceiptPredicate {
+                    tool_names: vec!["run_command".to_string()],
+                    exit_codes: vec![0, 1],
+                    outcome_statuses: vec![
+                        ToolOutcomeStatus::Succeeded,
+                        ToolOutcomeStatus::CompletedWithNegativeResult,
+                    ],
+                    requires_output: false,
+                    contract_rejected: Some(false),
+                    max_invocations: Some(1),
+                }),
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
+        let manifest = crate::traits::ToolCallAccessManifest::default();
+        let (false_key, false_cardinality) = stable_operation_identity(
+            "exec-1",
+            &contract,
+            "run_command",
+            &semantics,
+            r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#,
+            &manifest,
+            Some("step-1"),
+        );
+        let (true_key, true_cardinality) = stable_operation_identity(
+            "exec-1",
+            &contract,
+            "run_command",
+            &semantics,
+            r#"{"command":"/usr/bin/true","working_dir":"/tmp"}"#,
+            &manifest,
+            Some("step-1"),
+        );
+        let (false_replanned_key, _) = stable_operation_identity(
+            "exec-1",
+            &contract,
+            "run_command",
+            &semantics,
+            r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#,
+            &manifest,
+            Some("replacement-step"),
+        );
+
+        assert_ne!(false_key, true_key);
+        assert_eq!(false_key, false_replanned_key);
+        assert_eq!(false_cardinality, true_cardinality);
+        assert_eq!(
+            false_cardinality,
+            Some(("contract:task-1:requirements:0".to_string(), 1))
+        );
+    }
+
+    #[test]
+    fn closed_duplicate_cannot_supersede_an_existing_dispatched_receipt() {
+        use crate::traits::ToolInvocationStage;
+
+        assert!(should_project_authoritative_receipt(
+            ToolInvocationStage::Dispatched,
+            true,
+            1
+        ));
+        assert!(should_project_authoritative_receipt(
+            ToolInvocationStage::RejectedBeforeDispatch,
+            true,
+            0
+        ));
+        assert!(should_project_authoritative_receipt(
+            ToolInvocationStage::RejectedBeforeDispatch,
+            false,
+            0
+        ));
+        assert!(!should_project_authoritative_receipt(
+            ToolInvocationStage::RejectedBeforeDispatch,
+            false,
+            1
+        ));
     }
 }

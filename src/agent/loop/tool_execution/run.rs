@@ -1225,7 +1225,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
-        let (operation_key, max_invocations) = stable_operation_identity(
+        let (operation_base_key, cardinality) = stable_operation_identity(
             &execution_state.execution_id,
             &turn_context.completion_contract,
             &tc.name,
@@ -1236,10 +1236,12 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .current_linear_intent_step()
                 .map(|step| step.step_id.as_str()),
         );
+        let operation_key =
+            execution_state.bind_operation_to_effect_revision(&operation_base_key);
         let step_plan = compile_step_execution_plan(
             &execution_state.execution_id,
             operation_key,
-            max_invocations,
+            cardinality,
             execution_state.current_plan_version.unwrap_or(1),
             iteration,
             &tc.id,
@@ -1822,6 +1824,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         };
 
         let operation_admitted = execution_state.begin_staged_step();
+        let explicit_cardinality_closed = !operation_admitted
+            && step_plan.cardinality_key.is_some()
+            && step_plan.cardinality_limit.is_some_and(|limit| {
+                step_plan.cardinality_key.as_ref().is_some_and(|key| {
+                    execution_state
+                        .obligation_invocations
+                        .get(key)
+                        .copied()
+                        .unwrap_or_default()
+                        >= limit
+                })
+            });
         let io = super::execution_io::execute_tool_call_io(
             agent,
             tc,
@@ -2012,6 +2026,24 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // process result or contract rejection can complete an observation
         // without being relabeled as a successful mutation.
         let outcome_satisfied = domain_outcome_satisfied || expected_observation_satisfied;
+        let dispatched_tool_calls = execution_state
+            .tool_dispatches
+            .get(&tc.name)
+            .copied()
+            .unwrap_or_default();
+        if should_project_authoritative_receipt(
+            result_metadata.invocation_stage,
+            operation_admitted,
+            dispatched_tool_calls,
+        ) {
+            pending_system_messages.push(SystemDirective::AuthoritativeToolReceipt {
+                tool_name: tc.name.clone(),
+                invocation_stage: result_metadata.invocation_stage.as_str().to_string(),
+                outcome_status: tool_outcome_status.as_str().to_string(),
+                exit_code: result_metadata.exit_code,
+                dispatched_tool_calls,
+            });
+        }
         // The semantic producer is optional. Its absence must not make an
         // executed, read-only negative observation look unfinished: process
         // exit 1, an empty lookup, or another typed negative domain result is
@@ -2028,11 +2060,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // retry an already-satisfied negative observation.
         let request_failed = is_error && !outcome_satisfied;
 
-        if result_metadata.semantics.mutates_state()
+        if result_metadata.invocation_stage.performed_io()
+            && result_metadata.semantics.mutates_state()
             && !result_metadata.contract_rejected
             && !result_metadata.receipt_replayed
         {
             completion_progress.record_mutation_attempt(tool_outcome_status);
+            execution_state.record_current_mutation_transition();
         }
 
         // Record mutation before any observation carried by the same receipt.
@@ -2916,6 +2950,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             break;
         }
         if committed_non_action_decision.is_some() {
+            break;
+        }
+        if !operation_admitted {
+            // One canonical rejected receipt is enough to explain why this
+            // proposal could not run. Continuing with tools enabled merely
+            // manufactures more blocked receipts and lets validation loops
+            // overwrite the truth from the earlier dispatched receipt.
+            force_text_response = true;
+            pending_system_messages.push(SystemDirective::OperationDispatchClosed {
+                tool_name: tc.name.clone(),
+                explicit_cardinality: explicit_cardinality_closed,
+            });
             break;
         }
     }

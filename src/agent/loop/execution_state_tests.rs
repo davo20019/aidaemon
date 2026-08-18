@@ -99,6 +99,58 @@ fn compile_step_plan_uses_scope_and_idempotency_for_mutations() {
 }
 
 #[test]
+fn operation_identity_refreshes_only_after_a_different_mutation() {
+    let mut state = ExecutionState::new(
+        BudgetTier::Standard,
+        default_execution_budget(BudgetTier::Standard),
+        ExecutionPersistence::Durable,
+    );
+    let capabilities = ToolCapabilities {
+        read_only: false,
+        external_side_effect: false,
+        needs_approval: false,
+        idempotent: false,
+        high_impact_write: false,
+    };
+    let stage_mutation = |state: &mut ExecutionState, base: &str, tool: &str| {
+        let key = state.bind_operation_to_effect_revision(base);
+        let plan = compile_step_execution_plan(
+            "exec-1",
+            key,
+            None,
+            1,
+            1,
+            "call-1",
+            tool,
+            "{}",
+            &ToolCallSemantics::mutation(),
+            &Default::default(),
+            capabilities,
+            &[],
+        );
+        state.stage_step(plan);
+        assert!(state.begin_staged_step());
+        state.record_current_mutation_transition();
+    };
+
+    let first_a = state.bind_operation_to_effect_revision("invocation:a");
+    stage_mutation(&mut state, "invocation:a", "edit_file");
+    assert_eq!(
+        state.bind_operation_to_effect_revision("invocation:a"),
+        first_a,
+        "an operation must not refresh its own retry identity"
+    );
+    assert!(state
+        .bind_operation_to_effect_revision("invocation:check")
+        .ends_with(":effect_revision:1"));
+
+    stage_mutation(&mut state, "invocation:b", "write_file");
+    assert!(state
+        .bind_operation_to_effect_revision("invocation:a")
+        .ends_with(":effect_revision:2"));
+}
+
+#[test]
 fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
     let semantics = ToolCallSemantics::observation().with_target_hint(
         ToolTargetHintKind::Url,
@@ -167,8 +219,8 @@ fn operation_retry_budget_separates_invocations_from_dispatched_attempts() {
     let compile = |call_id: &str| {
         compile_step_execution_plan(
             "exec-1",
-            "contract:task-1:requirements:0".to_string(),
-            Some(2),
+            "invocation:exec-1:stable-operation".to_string(),
+            None,
             1,
             1,
             call_id,
@@ -180,7 +232,7 @@ fn operation_retry_budget_separates_invocations_from_dispatched_attempts() {
                 read_only: false,
                 external_side_effect: true,
                 needs_approval: true,
-                idempotent: false,
+                idempotent: true,
                 high_impact_write: true,
             },
             &[],
@@ -205,23 +257,24 @@ fn operation_retry_budget_separates_invocations_from_dispatched_attempts() {
     assert_eq!(
         state
             .operation_attempts
-            .get("contract:task-1:requirements:0"),
+            .get("invocation:exec-1:stable-operation"),
         Some(&1)
     );
     assert_eq!(
         state
             .operation_invocations
-            .get("contract:task-1:requirements:0"),
+            .get("invocation:exec-1:stable-operation"),
         Some(&2)
     );
+    assert_eq!(state.tool_dispatches.get("terminal"), Some(&1));
 }
 
 #[test]
 fn explicit_single_invocation_limit_counts_pre_io_rejection() {
     let plan = compile_step_execution_plan(
         "exec-1",
-        "contract:task-1:requirements:0".to_string(),
-        Some(1),
+        "invocation:exec-1:false".to_string(),
+        Some(("contract:task-1:requirements:0".to_string(), 1)),
         1,
         1,
         "proposal-1",
@@ -253,10 +306,55 @@ fn explicit_single_invocation_limit_counts_pre_io_rejection() {
     assert!(!state.begin_staged_step());
     assert_eq!(
         state
-            .operation_invocations
+            .obligation_invocations
             .get("contract:task-1:requirements:0"),
         Some(&1)
     );
+}
+
+#[test]
+fn explicit_cardinality_is_shared_across_distinct_concrete_strategies() {
+    let compile = |operation: &str, command: &str| {
+        compile_step_execution_plan(
+            "exec-1",
+            operation.to_string(),
+            Some(("contract:task-1:requirements:0".to_string(), 1)),
+            1,
+            1,
+            operation,
+            "run_command",
+            command,
+            &ToolCallSemantics::observation(),
+            &Default::default(),
+            ToolCapabilities {
+                read_only: true,
+                external_side_effect: false,
+                needs_approval: false,
+                idempotent: true,
+                high_impact_write: false,
+            },
+            &[],
+        )
+    };
+    let mut state = ExecutionState::new(
+        BudgetTier::Small,
+        default_execution_budget(BudgetTier::Small),
+        ExecutionPersistence::Ephemeral,
+    );
+
+    state.stage_step(compile(
+        "invocation:exec-1:first",
+        r#"{"command":"/usr/bin/false"}"#,
+    ));
+    assert!(state.begin_staged_step());
+    state.stage_step(compile(
+        "invocation:exec-1:alternative",
+        r#"{"command":"/usr/bin/true"}"#,
+    ));
+    assert!(!state.begin_staged_step());
+    assert!(!state
+        .operation_invocations
+        .contains_key("invocation:exec-1:alternative"));
 }
 
 #[test]
@@ -297,6 +395,37 @@ fn inactive_execution_budget_ignores_plain_text_token_usage() {
     );
 
     assert_eq!(state.exhausted_limit(10_000, Duration::from_secs(30)), None);
+}
+
+#[test]
+fn provider_delay_counts_toward_owner_visible_wall_clock() {
+    let mut state = ExecutionState::new(
+        BudgetTier::Small,
+        ExecutionBudget {
+            max_steps: 10,
+            max_tokens: 10_000,
+            max_llm_calls: 10,
+            max_tool_calls: 10,
+            max_validation_rounds: 10,
+            max_wall_clock_ms: 1_000,
+        },
+        ExecutionPersistence::Ephemeral,
+    );
+    state.activate_budget_envelope(0, Duration::from_millis(100));
+    state.provider_timeout_ms = 800;
+
+    assert_eq!(
+        state.remaining_wall_clock(Duration::from_millis(900)),
+        Some(Duration::from_millis(200))
+    );
+    assert_eq!(
+        state.exhausted_limit(0, Duration::from_millis(1_100)),
+        Some(ExecutionBudgetLimit::WallClock)
+    );
+    assert_eq!(
+        state.remaining_wall_clock(Duration::from_millis(1_100)),
+        Some(Duration::ZERO)
+    );
 }
 
 #[test]

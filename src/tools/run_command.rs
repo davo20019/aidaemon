@@ -127,7 +127,8 @@ fn run_command_semantics(arguments: &str) -> ToolCallSemantics {
         })
         .unwrap_or(false);
     if workspace_write {
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_DERIVED_WRITE)
+        ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::LOCAL_DERIVED_WRITE)
+            .with_verification_mode(ToolVerificationMode::ResultContent)
     } else {
         ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
     }
@@ -402,17 +403,14 @@ impl RunCommandTool {
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
-                outcome_status: Some(if result.exit_code == 0 {
-                    ToolOutcomeStatus::Succeeded
-                } else {
-                    // A process that ran to completion produced an authoritative
-                    // observation even when its predicate/test was false. The
-                    // caller decides whether that negative result answers the
-                    // request; it is not a transport or invocation failure.
-                    ToolOutcomeStatus::CompletedWithNegativeResult
-                }),
+                // A normally completed process produces an authoritative
+                // observation even when its predicate/test was false. A
+                // negative backend sentinel means there was no normal exit and
+                // therefore is an execution failure, not a negative result.
+                outcome_status: Some(ToolOutcomeStatus::from_process_exit_code(result.exit_code)),
                 exit_code: Some(result.exit_code),
                 access_manifest: Some(actual_access_manifest),
+                access_enforcement: crate::tools::terminal::confined_process_access_enforcement(),
                 ..ToolCallMetadata::default()
             },
         })
@@ -565,6 +563,17 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_process_keeps_result_observation_semantics() {
+        let semantics = run_command_semantics(r#"{"access":"workspace_write"}"#);
+        assert!(semantics.observes_state());
+        assert!(semantics.mutates_state());
+        assert_eq!(
+            semantics.verification_mode,
+            ToolVerificationMode::ResultContent
+        );
+    }
+
+    #[test]
     fn test_is_safe_command() {
         assert!(is_safe_command("cargo build"));
         assert!(is_safe_command("cargo test --release"));
@@ -648,6 +657,10 @@ mod tests {
             Some(ToolOutcomeStatus::CompletedWithNegativeResult)
         );
         assert_eq!(outcome.metadata.exit_code, Some(1));
+        assert_eq!(
+            outcome.metadata.access_enforcement,
+            crate::tools::terminal::confined_process_access_enforcement()
+        );
         assert!(outcome.output.contains("exit: 1"));
     }
 

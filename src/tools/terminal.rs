@@ -325,6 +325,7 @@ pub struct ApprovalRequest {
 /// 3. **Detached** (`detached=true`): survives task-end and notifier. Requires explicit kill.
 struct RunningProcess {
     command: String,
+    declared_write_paths: Vec<String>,
     semantics: ToolCallSemantics,
     dedupe_key: Option<String>,
     owner_task_id: Option<String>,
@@ -447,7 +448,6 @@ enum DeliverableAttribution {
     One(PathBuf),
     Ambiguous(Vec<PathBuf>),
     ExpectedMissing(Vec<PathBuf>),
-    Hints(Vec<String>),
     None,
 }
 
@@ -462,30 +462,18 @@ fn format_deliverable_paths(paths: &[PathBuf]) -> String {
 
 /// Completion-time deliverable attribution for a finished background command.
 ///
-/// Reads the session's incomplete checklist (best-effort) and runs the pure
-/// [`attribute_deliverable`](crate::tools::background_deliverable::attribute_deliverable)
-/// classifier over the command + any referenced script + filesystem mtimes.
+/// Uses exact write targets from the enforced process manifest. Shell source,
+/// referenced scripts, and checklist prose cannot create artifact authority.
 async fn attribute_background_deliverable(
-    session_id: &str,
-    command: &str,
+    declared_write_paths: &[String],
     command_start: std::time::SystemTime,
     command_end: std::time::SystemTime,
-    plan_store: Option<&Arc<crate::plans::PlanStore>>,
 ) -> DeliverableAttribution {
-    let checklist_text: Vec<String> = match plan_store {
-        Some(ps) => match ps.get_incomplete_for_session(session_id).await {
-            Ok(Some(plan)) => plan.steps.iter().map(|s| s.description.clone()).collect(),
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-    let ctx = crate::tools::background_deliverable::attribute_deliverable_backend(
+    let ctx = crate::tools::background_deliverable::attribute_declared_deliverables_backend(
         active_execution_backend(),
-        session_id,
-        command,
+        declared_write_paths,
         command_start,
         command_end,
-        &checklist_text,
     )
     .await;
     match crate::tools::background_deliverable::auto_send_decision(&ctx) {
@@ -498,8 +486,6 @@ async fn attribute_background_deliverable(
         crate::tools::background_deliverable::AutoSendDecision::None => {
             if !ctx.unconfirmed_candidates.is_empty() {
                 DeliverableAttribution::ExpectedMissing(ctx.unconfirmed_candidates)
-            } else if !ctx.pattern_hints.is_empty() {
-                DeliverableAttribution::Hints(ctx.pattern_hints)
             } else {
                 DeliverableAttribution::None
             }
@@ -1740,46 +1726,37 @@ async fn confined_terminal_execution_request_inner(
     read_paths: &[String],
     write_paths: &[String],
 ) -> anyhow::Result<ExecutionRequest> {
-    let cwd = match working_dir {
+    let resolved_cwd = match working_dir {
         Some(path) => {
             let resolved = backend.resolve_path(path).await?;
-            Some(backend.canonicalize(&resolved).await.unwrap_or(resolved))
+            backend.canonicalize(&resolved).await.unwrap_or(resolved)
         }
-        None => None,
+        None => {
+            let resolved = backend.workspace_root().clone();
+            backend.canonicalize(&resolved).await.unwrap_or(resolved)
+        }
     };
-    if cwd.is_none() && read_paths.is_empty() && write_paths.is_empty() {
-        if script_via_stdin {
-            let mut request =
-                ExecutionRequest::argv("/bin/sh", vec!["-eu".to_string(), "-s".to_string()]);
-            request.stdin = Some(shell_source.as_bytes().to_vec());
-            return Ok(request);
-        }
-        return Ok(ExecutionRequest::shell(shell_source));
-    }
-
-    let codex = backend
-        .resolve_executable("codex")
-        .await?
-        .ok_or_else(|| anyhow::anyhow!(
-            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
-        ))?;
+    let cwd = Some(resolved_cwd);
     let mut reads = Vec::new();
-    if let Some(cwd) = cwd.as_ref() {
-        reads.push(cwd.to_string());
-    }
     for path in read_paths {
-        let path = resolve_access_path(backend, path, cwd.as_ref())
-            .await?
-            .to_string();
+        let path = canonicalize_access_path(
+            backend,
+            resolve_access_path(backend, path, cwd.as_ref()).await?,
+        )
+        .await
+        .to_string();
         if !reads.contains(&path) {
             reads.push(path);
         }
     }
     let mut writes = Vec::new();
     for path in write_paths {
-        let path = resolve_access_path(backend, path, cwd.as_ref())
-            .await?
-            .to_string();
+        let path = canonicalize_access_path(
+            backend,
+            resolve_access_path(backend, path, cwd.as_ref()).await?,
+        )
+        .await
+        .to_string();
         if !writes.contains(&path) {
             writes.push(path);
         }
@@ -1797,11 +1774,6 @@ async fn confined_terminal_execution_request_inner(
         }
     }
 
-    let sandbox_cwd = cwd
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "/".to_string());
-    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes)?;
     let mut sandbox_environment = std::collections::BTreeMap::new();
     if !runtime_support.path_prefixes.is_empty() {
         sandbox_environment.insert(
@@ -1811,16 +1783,196 @@ async fn confined_terminal_execution_request_inner(
     }
     sandbox_environment.extend(runtime_support.environment);
 
+    #[cfg(target_os = "macos")]
+    {
+        macos_manifest_sandbox_request(
+            shell_source,
+            script_via_stdin,
+            cwd,
+            &reads,
+            &writes,
+            sandbox_environment,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let codex = backend
+        .resolve_executable("codex")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(
+            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
+        ))?;
+    #[cfg(not(target_os = "macos"))]
+    let sandbox_cwd = cwd
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "/".to_string());
+    #[cfg(not(target_os = "macos"))]
+    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes)?;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut args = vec![
+            "sandbox".to_string(),
+            "--sandbox-state-json".to_string(),
+            sandbox_state,
+            "--".to_string(),
+            // The sandbox adapter is a process boundary. Supplying these values
+            // only to the outer adapter does not guarantee that its child keeps
+            // them, so carry the registered runtime profile explicitly into the
+            // confined process as well. These are runtime dependencies, not task
+            // authority or ambient owner configuration.
+            "/usr/bin/env".to_string(),
+        ];
+        args.extend(
+            sandbox_environment
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+        if script_via_stdin {
+            args.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+        } else {
+            args.extend([
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                shell_source.to_string(),
+            ]);
+        }
+        let mut request = ExecutionRequest::argv(codex.to_string(), args);
+        request.cwd = cwd;
+        request.env.extend(sandbox_environment);
+        if script_via_stdin {
+            request.stdin = Some(shell_source.as_bytes().to_vec());
+        }
+        Ok(request)
+    }
+}
+
+/// Resolve symlinked existing prefixes while preserving a not-yet-created
+/// suffix. A policy for `/tmp/new-root` must protect the kernel path
+/// `/private/tmp/new-root`, including before the requested create occurs.
+async fn canonicalize_access_path(
+    backend: &SharedExecutionBackend,
+    path: crate::execution::BackendPath,
+) -> crate::execution::BackendPath {
+    if let Ok(canonical) = backend.canonicalize(&path).await {
+        return canonical;
+    }
+    let mut candidate = path.clone();
+    let mut suffix = Vec::new();
+    while let Some(name) = candidate.file_name().map(str::to_string) {
+        suffix.push(name);
+        let Some(parent) = candidate.parent() else {
+            return path;
+        };
+        candidate = parent;
+        if let Ok(mut canonical) = backend.canonicalize(&candidate).await {
+            for component in suffix.iter().rev() {
+                canonical = canonical.join(component);
+            }
+            return canonical;
+        }
+    }
+    path
+}
+
+#[cfg(target_os = "macos")]
+fn validated_seatbelt_path(path: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        path.starts_with('/')
+            && !path
+                .chars()
+                .any(|character| matches!(character, '\n' | '\r' | '\0')),
+        "sandbox manifest paths must be absolute and single-line"
+    );
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(escaped)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_manifest_sandbox_policy(
+    traversal_cwd: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> anyhow::Result<String> {
+    let mut policy = include_str!("macos_terminal_sandbox.sbpl").to_string();
+    if let Some(path) = traversal_cwd {
+        let path = validated_seatbelt_path(path)?;
+        // Execution cwd is location, not implicit authority to read that tree.
+        // Grant only the directory objects needed by getcwd/path traversal;
+        // child file contents still require an explicit read/write manifest.
+        policy.push_str(&format!(
+            "\n(allow file-read* file-test-existence\n  (literal \"{path}\") (path-ancestors \"{path}\"))\n"
+        ));
+    }
+    if !read_paths.is_empty() {
+        let paths = read_paths
+            .iter()
+            .map(|path| validated_seatbelt_path(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let data_clauses = paths
+            .iter()
+            .map(|path| format!("(literal \"{path}\") (subpath \"{path}\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        let ancestor_clauses = paths
+            .iter()
+            .map(|path| format!("(path-ancestors \"{path}\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        // `getcwd(3)` and normal path lookup walk and read containing
+        // directories. This exposes ancestor entry names, but never sibling
+        // file contents; exact/subpath data access remains bound to the
+        // declared target.
+        policy.push_str(&format!(
+            "\n(allow file-read* file-test-existence\n  {data_clauses})\n\
+             (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+        ));
+    }
+    if !write_paths.is_empty() {
+        let paths = write_paths
+            .iter()
+            .map(|path| validated_seatbelt_path(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let data_clauses = paths
+            .iter()
+            .map(|path| format!("(literal \"{path}\") (subpath \"{path}\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        let ancestor_clauses = paths
+            .iter()
+            .map(|path| format!("(path-ancestors \"{path}\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        // A write grant also permits reading the exact output tree so one
+        // process can create, validate, and clean it without widening scope.
+        // Ancestors receive read/traversal access only. Seatbelt requires
+        // directory lookup on the containing path to create a future child;
+        // granting write operations to every ancestor would unnecessarily
+        // permit mutation of the containing directory itself.
+        policy.push_str(&format!(
+            "\n(allow file-read* file-test-existence file-write*\n  {data_clauses})\n\
+             (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+        ));
+    }
+    Ok(policy)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_manifest_sandbox_request(
+    shell_source: &str,
+    script_via_stdin: bool,
+    cwd: Option<crate::execution::BackendPath>,
+    read_paths: &[String],
+    write_paths: &[String],
+    sandbox_environment: std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<ExecutionRequest> {
+    let traversal_cwd = cwd.as_ref().map(crate::execution::BackendPath::as_str);
+    let policy = macos_manifest_sandbox_policy(traversal_cwd, read_paths, write_paths)?;
     let mut args = vec![
-        "sandbox".to_string(),
-        "--sandbox-state-json".to_string(),
-        sandbox_state,
+        "-p".to_string(),
+        policy,
         "--".to_string(),
-        // The sandbox adapter is a process boundary. Supplying these values
-        // only to the outer adapter does not guarantee that its child keeps
-        // them, so carry the registered runtime profile explicitly into the
-        // confined process as well. These are runtime dependencies, not task
-        // authority or ambient owner configuration.
         "/usr/bin/env".to_string(),
     ];
     args.extend(
@@ -1837,7 +1989,7 @@ async fn confined_terminal_execution_request_inner(
             shell_source.to_string(),
         ]);
     }
-    let mut request = ExecutionRequest::argv(codex.to_string(), args);
+    let mut request = ExecutionRequest::argv("/usr/bin/sandbox-exec", args);
     request.cwd = cwd;
     request.env.extend(sandbox_environment);
     if script_via_stdin {
@@ -2186,6 +2338,7 @@ fn native_sandbox_search_path(prefixes: &[String]) -> String {
         .into_owned()
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn codex_sandbox_state_json(
     cwd: &str,
     read_paths: &[String],
@@ -3654,6 +3807,7 @@ impl TerminalTool {
             // moved into `terminate_running_process` below; the correction bridge
             // needs the untruncated command and the task scope.
             let proc_command = proc.command.clone();
+            let declared_write_paths = proc.declared_write_paths.clone();
             let owner_task_id = proc.owner_task_id.clone();
             // For the stall path, idle_secs = time since last progress. For the
             // max-runtime path, the meaningful number is total runtime.
@@ -3718,11 +3872,9 @@ impl TerminalTool {
                         .checked_sub(Duration::from_secs(runtime_secs))
                         .unwrap_or(command_end);
                     match attribute_background_deliverable(
-                        &session_id,
-                        &proc_command,
+                        &declared_write_paths,
                         command_start,
                         command_end,
-                        self.plan_store.get(),
                     )
                     .await
                     {
@@ -3755,9 +3907,7 @@ impl TerminalTool {
                                     .unwrap_or_else(|| path.to_string_lossy().to_string())
                             })
                         }
-                        DeliverableAttribution::Ambiguous(_)
-                        | DeliverableAttribution::Hints(_)
-                        | DeliverableAttribution::None => None,
+                        DeliverableAttribution::Ambiguous(_) | DeliverableAttribution::None => None,
                     }
                 };
 
@@ -3862,18 +4012,17 @@ impl TerminalTool {
             detach,
             status_tx,
         } = request;
-        let command_semantics = terminal_run_semantics_from_access(
-            working_dir.is_some() || !read_paths.is_empty() || !write_paths.is_empty(),
-            !write_paths.is_empty(),
-        );
+        let command_semantics = terminal_run_semantics_from_access(true, !write_paths.is_empty());
         let execution_mode = if script_via_stdin {
             "script"
         } else {
             "command"
         };
         let dedupe_identity = format!(
-            "mode={execution_mode}\0cwd={}\0{command}",
-            working_dir.unwrap_or_default()
+            "mode={execution_mode}\0cwd={}\0read={}\0write={}\0{command}",
+            working_dir.unwrap_or_default(),
+            serde_json::to_string(read_paths).unwrap_or_default(),
+            serde_json::to_string(write_paths).unwrap_or_default(),
         );
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
@@ -3995,6 +4144,8 @@ impl TerminalTool {
                     return Ok(ToolCallOutcome {
                         metadata: ToolCallMetadata {
                             outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+                            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                            access_enforcement: confined_process_access_enforcement(),
                             background_started: true,
                             detached: true,
                             timed_out: false,
@@ -4035,6 +4186,7 @@ impl TerminalTool {
 
                 let proc = RunningProcess {
                     command: command.to_string(),
+                    declared_write_paths: write_paths.to_vec(),
                     semantics: command_semantics.clone(),
                     dedupe_key: Some(dedupe_key.clone()),
                     owner_task_id: owner_task_id.clone(),
@@ -4080,6 +4232,7 @@ impl TerminalTool {
                 // Deliver-once ledger + delivery dirs + durable plan store for
                 // harness-side deliverable attribution and direct file delivery.
                 let delivered_deliverables_for_notify = self.delivered_deliverables.clone();
+                let declared_write_paths_for_notify = write_paths.to_vec();
                 let plan_store_for_notify = self.plan_store.get().cloned();
                 let inbox_dir_for_notify = self.inbox_dir.clone();
                 let outbox_dirs_for_notify = self.outbox_dirs.clone();
@@ -4215,11 +4368,7 @@ impl TerminalTool {
                                         ) {
                                             let outcome_status = exit_code.map_or(
                                                 ToolOutcomeStatus::FailedPermanent,
-                                                |code| if code == 0 {
-                                                    ToolOutcomeStatus::Succeeded
-                                                } else {
-                                                    ToolOutcomeStatus::CompletedWithNegativeResult
-                                                },
+                                                ToolOutcomeStatus::from_process_exit_code,
                                             );
                                             let mut metadata = foreground_terminal_metadata(exit_code);
                                             metadata.receipt_kind =
@@ -4302,11 +4451,9 @@ impl TerminalTool {
                                             .checked_sub(started_at_for_notify.elapsed())
                                             .unwrap_or(command_end);
                                         deliverable_attribution = attribute_background_deliverable(
-                                            &session_for_notify,
-                                            &command_for_notify,
+                                            &declared_write_paths_for_notify,
                                             command_start,
                                             command_end,
-                                            plan_store_for_notify.as_ref(),
                                         )
                                         .await;
 
@@ -4367,23 +4514,6 @@ impl TerminalTool {
                                                 let msg = format!(
                                                     "⚠️ The background command finished before the expected output file appeared: {}. There's nothing to send.",
                                                     format_deliverable_paths(paths)
-                                                );
-                                                deliver_background_text(
-                                                    hub_for_notify.as_ref(),
-                                                    state_for_notify.as_ref(),
-                                                    &session_for_notify,
-                                                    &goal_id_for_notify,
-                                                    &msg,
-                                                    pid,
-                                                )
-                                                .await;
-                                                break;
-                                            }
-                                            DeliverableAttribution::Hints(hints) => {
-                                                direct_deliverable_delivery = false;
-                                                let msg = format!(
-                                                    "⚠️ The background command finished, but the output filename was dynamic or pattern-based, so I couldn't choose a single file to send automatically. Hints: {}",
-                                                    hints.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
                                                 );
                                                 deliver_background_text(
                                                     hub_for_notify.as_ref(),
@@ -5301,12 +5431,8 @@ impl TerminalTool {
                     }
                 };
 
-                let command_semantics = terminal_run_semantics_from_access(
-                    args.working_dir.is_some()
-                        || !args.read_paths.is_empty()
-                        || !args.write_paths.is_empty(),
-                    !args.write_paths.is_empty(),
-                );
+                let command_semantics =
+                    terminal_run_semantics_from_access(true, !args.write_paths.is_empty());
                 let mut precomputed_semantic_assessment = None;
                 if mutation_forbidden
                     && (command_semantics.mutates_state()
@@ -5687,6 +5813,9 @@ impl TerminalTool {
         if outcome.metadata.exit_code.is_none() {
             outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
         }
+        if args.action == "run" && outcome.metadata.invocation_stage.reached_dispatch() {
+            outcome.metadata.access_enforcement = confined_process_access_enforcement();
+        }
 
         Ok(outcome)
     }
@@ -5780,15 +5909,10 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
 
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     ToolCallMetadata {
-        outcome_status: exit_code.map(|code| {
-            if code == 0 {
-                ToolOutcomeStatus::Succeeded
-            } else {
-                ToolOutcomeStatus::CompletedWithNegativeResult
-            }
-        }),
+        outcome_status: exit_code.map(ToolOutcomeStatus::from_process_exit_code),
         exit_code,
         invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        access_enforcement: confined_process_access_enforcement(),
         timed_out: false,
         background_started: false,
         detached: false,
@@ -5802,6 +5926,17 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     }
 }
 
+pub(crate) fn confined_process_access_enforcement() -> crate::traits::ToolAccessEnforcement {
+    #[cfg(target_os = "macos")]
+    {
+        crate::traits::ToolAccessEnforcement::KernelEnforced
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::traits::ToolAccessEnforcement::AdapterEnforced
+    }
+}
+
 fn tracked_background_metadata(
     detached: bool,
     completion_notifications_enabled: bool,
@@ -5811,6 +5946,7 @@ fn tracked_background_metadata(
         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
         exit_code,
         invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        access_enforcement: confined_process_access_enforcement(),
         timed_out: true,
         background_started: true,
         detached,
@@ -5850,7 +5986,15 @@ fn terminal_run_semantics_from_access(
     has_write_targets: bool,
 ) -> ToolCallSemantics {
     if has_write_targets {
-        return ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE);
+        // A process receipt always observes its own typed outcome (exit status
+        // and authoritative stdout/stderr), even when that same process was
+        // permitted to mutate a bounded output tree. Mutation effects and
+        // process-result evidence are independent facets; collapsing them into
+        // one enum made successful build/test scripts impossible to verify.
+        return ToolCallSemantics::observation_and_mutation_with(
+            ToolMutationEffects::LOCAL_SOURCE_WRITE,
+        )
+        .with_verification_mode(ToolVerificationMode::ResultContent);
     }
     if confinement_active {
         return ToolCallSemantics::observation()
@@ -5873,21 +6017,6 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         "kill" => ToolCallSemantics::mutation(),
         "trust_all" => ToolCallSemantics::administrative(),
         _ => {
-            let confinement_active = args.as_ref().is_some_and(|value| {
-                value
-                    .get("working_dir")
-                    .or_else(|| value.get("cwd"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| !path.trim().is_empty())
-                    || value
-                        .get("read_paths")
-                        .and_then(Value::as_array)
-                        .is_some_and(|paths| !paths.is_empty())
-                    || value
-                        .get("write_paths")
-                        .and_then(Value::as_array)
-                        .is_some_and(|paths| !paths.is_empty())
-            });
             let has_write_targets = args.as_ref().is_some_and(|value| {
                 value
                     .get("write_paths")
@@ -5898,7 +6027,11 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
                             .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
                     })
             });
-            terminal_run_semantics_from_access(confinement_active, has_write_targets)
+            // Every process call observes its own typed receipt, and every run
+            // crosses the native sandbox even when its task-data manifest is
+            // empty. An empty manifest means no task-data authority; it never
+            // means ambient host access.
+            terminal_run_semantics_from_access(true, has_write_targets)
         }
     }
 }
@@ -5923,11 +6056,10 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
             })
             .unwrap_or_else(|| path.to_string())
     };
-    let mut read_targets = execution_cwd
-        .as_deref()
-        .and_then(|cwd| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd))
-        .into_iter()
-        .collect::<Vec<_>>();
+    // Execution location and data authority are independent. Merely selecting
+    // a cwd must not expose every file below it; callers declare readable data
+    // explicitly through `read_paths`.
+    let mut read_targets = Vec::new();
     for path in parsed
         .as_ref()
         .and_then(|value| value.get("read_paths"))
@@ -6217,6 +6349,258 @@ mod tests {
     }
 
     #[test]
+    fn confined_write_process_is_both_observation_and_mutation() {
+        let semantics = terminal_run_semantics_from_access(true, true);
+        assert!(semantics.observes_state());
+        assert!(semantics.mutates_state());
+        assert_eq!(
+            semantics.verification_mode,
+            crate::traits::ToolVerificationMode::ResultContent
+        );
+        assert!(semantics
+            .mutation_effects
+            .intersects(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_manifest_denies_undeclared_system_file_read() {
+        let backend = active_execution_backend();
+        let request = confined_terminal_execution_request(
+            &backend,
+            "/usr/bin/head -n 1 /etc/hosts",
+            Some("/tmp"),
+            &["/tmp".to_string()],
+            &[],
+        )
+        .await
+        .expect("confined request");
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_ne!(output.exit_code, 0, "undeclared /etc/hosts read escaped");
+        assert!(
+            output.stdout_lossy().trim().is_empty(),
+            "undeclared file contents escaped: {}",
+            output.stdout_lossy()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn empty_manifest_is_fail_closed_not_ambient_access() {
+        let backend = active_execution_backend();
+        let request = confined_terminal_execution_request(
+            &backend,
+            "/usr/bin/head -n 1 /etc/hosts",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("confined request");
+        assert!(matches!(
+            request.command,
+            crate::execution::CommandSpec::Argv { .. }
+        ));
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_ne!(output.exit_code, 0, "empty manifest became ambient access");
+
+        let predicate_request =
+            confined_terminal_execution_request(&backend, "/usr/bin/false", None, &[], &[])
+                .await
+                .expect("pure predicate request");
+        let predicate_output = backend
+            .execute(predicate_request, Duration::from_secs(30))
+            .await
+            .expect("pure predicate execution");
+        assert_eq!(
+            predicate_output.exit_code,
+            1,
+            "empty task-data authority must still permit a pure process predicate: {}",
+            predicate_output.stderr_lossy()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn execution_cwd_does_not_implicitly_grant_child_file_reads() {
+        let backend = active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let private_child = root.path().join("private.txt");
+        std::fs::write(&private_child, "NOT_AUTHORIZED").expect("private fixture");
+
+        let request = confined_terminal_execution_request(
+            &backend,
+            "/bin/cat private.txt",
+            root.path().to_str(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("confined request");
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+
+        assert_ne!(output.exit_code, 0, "cwd widened task-data authority");
+        assert!(!output.stdout_lossy().contains("NOT_AUTHORIZED"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_read_grant_does_not_expose_a_sibling() {
+        let backend = active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let allowed = root.path().join("allowed.txt");
+        let sibling = root.path().join("sibling.txt");
+        std::fs::write(&allowed, "ALLOWED").expect("allowed fixture");
+        std::fs::write(&sibling, "SIBLING").expect("sibling fixture");
+        let allowed_path = allowed.to_string_lossy().to_string();
+        let allowed_request = confined_terminal_execution_request(
+            &backend,
+            &format!("/bin/cat '{}'", allowed.display()),
+            None,
+            std::slice::from_ref(&allowed_path),
+            &[],
+        )
+        .await
+        .expect("allowed request");
+        let allowed_output = backend
+            .execute(allowed_request, Duration::from_secs(30))
+            .await
+            .expect("allowed execution");
+        assert_eq!(
+            allowed_output.exit_code,
+            0,
+            "{}",
+            allowed_output.stderr_lossy()
+        );
+        assert_eq!(allowed_output.stdout_lossy(), "ALLOWED");
+
+        let sibling_request = confined_terminal_execution_request(
+            &backend,
+            &format!("/bin/cat '{}'", sibling.display()),
+            None,
+            &[allowed_path],
+            &[],
+        )
+        .await
+        .expect("sibling request");
+        let sibling_output = backend
+            .execute(sibling_request, Duration::from_secs(30))
+            .await
+            .expect("sibling execution");
+        assert_ne!(sibling_output.exit_code, 0, "sibling read escaped");
+        assert!(!sibling_output.stdout_lossy().contains("SIBLING"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_write_grant_cannot_mutate_a_sibling() {
+        let backend = active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let allowed = root.path().join("allowed");
+        let sibling = root.path().join("sibling.txt");
+        std::fs::write(&sibling, "UNCHANGED").expect("sibling fixture");
+        let allowed_path = allowed.to_string_lossy().to_string();
+
+        let request = confined_terminal_execution_request(
+            &backend,
+            &format!(
+                "/bin/mkdir '{}' && /usr/bin/touch '{}'",
+                allowed.display(),
+                sibling.display()
+            ),
+            None,
+            &[],
+            std::slice::from_ref(&allowed_path),
+        )
+        .await
+        .expect("confined request");
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_ne!(output.exit_code, 0, "sibling write escaped");
+        assert!(
+            allowed.is_dir(),
+            "authorized future root was not created: {}",
+            output.stderr_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sibling).expect("sibling contents"),
+            "UNCHANGED"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn manifest_grants_cannot_escape_through_an_internal_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let backend = active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let allowed = root.path().join("allowed");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&allowed).expect("allowed directory");
+        std::fs::write(&outside, "UNCHANGED").expect("outside fixture");
+        let link = allowed.join("escape");
+        symlink(&outside, &link).expect("escape symlink");
+        let allowed_path = allowed.to_string_lossy().to_string();
+
+        let read_request = confined_terminal_execution_request(
+            &backend,
+            &format!("/bin/cat '{}'", link.display()),
+            None,
+            std::slice::from_ref(&allowed_path),
+            &[],
+        )
+        .await
+        .expect("read request");
+        let read_output = backend
+            .execute(read_request, Duration::from_secs(30))
+            .await
+            .expect("read execution");
+        assert_ne!(read_output.exit_code, 0, "symlink read escaped");
+
+        let write_request = confined_terminal_execution_request(
+            &backend,
+            &format!("/usr/bin/printf MUTATED > '{}'", link.display()),
+            None,
+            &[],
+            std::slice::from_ref(&allowed_path),
+        )
+        .await
+        .expect("write request");
+        let write_output = backend
+            .execute(write_request, Duration::from_secs(30))
+            .await
+            .expect("write execution");
+        assert_ne!(write_output.exit_code, 0, "symlink write escaped");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside contents"),
+            "UNCHANGED"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_runtime_policy_does_not_widen_task_data_roots() {
+        let policy = macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[])
+            .expect("policy");
+        assert!(!policy.contains("(subpath \"/private/etc\")"));
+        assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
+        assert!(policy.contains("(subpath \"/private/tmp\")"));
+        assert!(policy.contains("(literal \"/private/etc/ssl/openssl.cnf\")"));
+    }
+
+    #[test]
     fn terminal_argument_contract_does_not_infer_effects_from_shell_words() {
         assert!(validate_terminal_argument_contract(
             r#"{"action":"run","command":"/usr/bin/touch /tmp/synthetic-target","working_dir":"/tmp"}"#
@@ -6246,6 +6630,16 @@ mod tests {
             r#"{"action":"run","command":"/usr/bin/true","script":"/usr/bin/true","working_dir":"/tmp"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_manifest_keeps_execution_location_separate_from_read_authority() {
+        let manifest = terminal_access_manifest(
+            r#"{"action":"run","command":"/usr/bin/false","working_dir":"/tmp","read_paths":[],"write_paths":[]}"#,
+        );
+        assert_eq!(manifest.execution_cwd.as_deref(), Some("/tmp"));
+        assert!(manifest.read_targets.is_empty());
+        assert!(manifest.write_targets.is_empty());
     }
 
     #[test]
@@ -6720,7 +7114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_contract_blocks_known_mutation_before_process_io() {
+    async fn undeclared_write_is_blocked_by_manifest_without_parsing_shell_words() {
         let temp_dir = tempfile::tempdir().unwrap();
         let target = temp_dir.path().join("must-not-exist.txt");
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -6755,12 +7149,22 @@ mod tests {
                 },
             )
             .await
-            .expect("contract block is a typed tool outcome");
+            .expect("sandbox denial is a typed tool outcome");
         assert_eq!(
             outcome.metadata.outcome_status,
-            Some(ToolOutcomeStatus::Blocked)
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+            "a dispatched process with a normal positive exit is a completed negative observation"
         );
-        assert!(!target.exists(), "blocked command must never spawn");
+        assert_eq!(
+            outcome.metadata.invocation_stage,
+            crate::traits::ToolInvocationStage::Dispatched
+        );
+        assert!(!outcome.metadata.contract_rejected);
+        assert_eq!(
+            outcome.metadata.access_enforcement,
+            confined_process_access_enforcement()
+        );
+        assert!(!target.exists(), "undeclared target must not be created");
     }
 
     #[test]
@@ -7651,9 +8055,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
+        let messages = state
+            .get_pending_notifications(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.session_id == "sess_seq")
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>();
         assert!(
             saw_progress_ping,
-            "expected at least one periodic background progress ping"
+            "expected at least one periodic background progress ping; messages={messages:?}"
         );
         assert!(
             saw_completion,
@@ -7720,9 +8132,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
+        let messages = state
+            .get_pending_notifications(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.session_id == "sess_quiet")
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>();
         assert!(
             !saw_progress_ping,
-            "no-output command should not emit periodic progress pings"
+            "no-output command should not emit periodic progress pings; messages={messages:?}"
         );
         assert!(
             saw_completion,
@@ -8398,7 +8818,12 @@ mod tests {
             .count();
         assert_eq!(
             result_count, 1,
-            "duplicate background completions should not deliver the same result twice"
+            "duplicate background completions should not deliver the same result twice; messages={:?}",
+            pending
+                .iter()
+                .filter(|entry| entry.session_id == "sess_dupe_result")
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -1,38 +1,24 @@
-// This module is infrastructure for terminal/notifier integration (upcoming task).
-// Items are not yet called from outside, so suppress dead-code lints.
-#![allow(dead_code)]
-//! Pure deliverable attribution module.
+//! Typed background artifact attribution.
 //!
-//! Determines which file(s) a background command produced, so the terminal
-//! notifier can deliver the right artifact to the user. All filesystem/process
-//! I/O is injected via closures (`read_script`, `stat_mtime`) for full
-//! unit-testability — this module does no real I/O of its own.
-use regex::Regex;
-use std::collections::{HashMap, HashSet};
+//! A background process may auto-deliver only an exact absolute file target
+//! from its enforced write manifest. Shell source, referenced source files,
+//! output-looking flags, and checklist prose are not authority and are never
+//! parsed to guess effects.
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::execution::SharedExecutionBackend;
 
-/// Context built at command completion describing which paths were produced.
 #[derive(Debug)]
 pub struct BackgroundDeliverableContext {
-    pub session_id: String,
-    pub command: String,
-    pub command_start: SystemTime,
-    pub command_end: SystemTime,
-    /// Explicit absolute paths classified as produced output (auto-send eligible).
+    /// Exact declared file targets modified during this process window.
     pub produced_candidates: Vec<PathBuf>,
-    /// Explicit output-like paths from script/checklist evidence that were not
-    /// confirmed by an mtime in the command window. These are not auto-send
-    /// eligible, but they let callers close out "expected file never appeared"
-    /// promises honestly.
+    /// Exact declared file targets that were missing or stale at completion.
     pub unconfirmed_candidates: Vec<PathBuf>,
-    /// Diagnostic-only dynamic/pattern hints (NOT auto-send eligible in v1).
-    pub pattern_hints: Vec<String>,
 }
 
-/// The result of deciding which (if any) single file to auto-send.
 #[derive(Debug)]
 pub enum AutoSendDecision {
     One(PathBuf),
@@ -40,718 +26,171 @@ pub enum AutoSendDecision {
     Ambiguous(Vec<PathBuf>),
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Bare temp-directory roots that are never themselves deliverables (their mtime
-/// bumps whenever any child is written).
-fn is_temp_root(path: &Path) -> bool {
-    matches!(
-        path.to_str(),
-        Some("/tmp") | Some("/private/tmp") | Some("/var/tmp") | Some("/private/var/tmp")
-    )
-}
-
-/// Patterns that signal dynamic filename construction — never a concrete path.
-fn is_dynamic_content(text: &str) -> bool {
-    let dynamic_patterns = [
-        "strftime",
-        "tempfile.gettempdir",
-        "os.path.join",
-        "$(",
-        "uuid4(",
-        "uuid1(",
-    ];
-    dynamic_patterns.iter().any(|p| text.contains(p))
-}
-
-/// Extract all absolute path tokens from a string (paths starting with `/`).
-fn extract_absolute_paths(text: &str) -> Vec<String> {
-    // Match tokens that look like absolute paths: start with / and contain
-    // at least one non-whitespace character, no shell quoting complexity.
-    let re = Regex::new(r#"(?:^|\s|['"])(/[^\s'"<>|;&]+)"#).unwrap();
-    re.captures_iter(text)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        .collect()
-}
-
-/// Paths that are I/O sinks, not files a command "produces": anything under
-/// /dev, /proc, or /sys. `2>/dev/null` matches the redirect regex like any
-/// other redirect, but a device node must never be attributed as the
-/// command's deliverable (observed live: One(/dev/null) suppressed the
-/// finished-ping and re-engagement, swallowing the user's answer).
 fn is_non_deliverable_sink(path: &Path) -> bool {
     path.starts_with("/dev") || path.starts_with("/proc") || path.starts_with("/sys")
 }
 
-/// Returns absolute paths that appear as output-flag targets in the command line.
-/// Handles: `> path`, `-o path`, `--output path`, `--output=path`.
-fn extract_output_flag_paths(command: &str) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-
-    // `> /path/to/file` — shell output redirection
-    let redir_re = Regex::new(r">\s*(/[^\s|;&>]+)").unwrap();
-    for cap in redir_re.captures_iter(command) {
-        if let Some(m) = cap.get(1) {
-            results.push(PathBuf::from(m.as_str()));
-        }
-    }
-
-    // `-o /path` or `--output /path` (value as next token)
-    let flag_re = Regex::new(r"(?:-o|--output)\s+(/[^\s|;&>]+)").unwrap();
-    for cap in flag_re.captures_iter(command) {
-        if let Some(m) = cap.get(1) {
-            results.push(PathBuf::from(m.as_str()));
-        }
-    }
-
-    // `--output=/path`
-    let flag_eq_re = Regex::new(r"--output=(/[^\s|;&>]+)").unwrap();
-    for cap in flag_eq_re.captures_iter(command) {
-        if let Some(m) = cap.get(1) {
-            results.push(PathBuf::from(m.as_str()));
-        }
-    }
-
-    results.retain(|p| !is_non_deliverable_sink(p));
-    results
-}
-
-/// Identify the "executed script" argument from a command — the path that is
-/// being *run* (as opposed to consumed/produced). These must be excluded from
-/// produced_candidates.
-///
-/// Heuristic: after stripping shell prefix tokens (`cd /dir &&`, env var
-/// assignments) look for the interpreter + script pattern:
-/// `python3 /tmp/x.py`, `bash /tmp/x.sh`, `node /tmp/x.js`, etc.
-/// Also handles bare script invocations like `/tmp/x.sh`.
-fn identify_executed_scripts(command: &str) -> Vec<PathBuf> {
-    let mut executed = Vec::new();
-
-    // Script extensions we recognise
-    let script_exts = ["py", "sh", "js", "ts", "rb", "pl", "php", "lua", "r"];
-
-    // Split on common shell operators and iterate clauses
-    let clauses: Vec<&str> = command.split_terminator(['&', ';', '|']).collect();
-
-    for clause in clauses {
-        let tokens: Vec<&str> = clause.split_whitespace().collect();
-        for (i, token) in tokens.iter().enumerate() {
-            // Skip env-var assignments like FOO=bar
-            if token.contains('=') && !token.starts_with('/') && !token.starts_with('-') {
-                continue;
-            }
-            // The "program" is the first non-env-var token; skip known interpreters
-            // and look at the next token as a potential script path.
-            let interpreters = [
-                "python", "python3", "python2", "bash", "sh", "node", "ruby", "perl", "php", "lua",
-                "Rscript", "npx", "uvx",
-            ];
-            if interpreters.contains(token) {
-                // The next absolute-path argument is the executed script
-                if let Some(next) = tokens.get(i + 1) {
-                    if next.starts_with('/') {
-                        let ext = Path::new(next)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        if script_exts.contains(&ext) {
-                            executed.push(PathBuf::from(next));
-                        }
-                    }
-                }
-                continue;
-            }
-            // Bare script invocation
-            if token.starts_with('/') {
-                let ext = Path::new(token)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if script_exts.contains(&ext) {
-                    executed.push(PathBuf::from(*token));
-                }
-            }
-        }
-    }
-
-    executed
-}
-
-/// Parse a script's text for write-mode `open(path, "w"|"a")` literals.
-/// Returns produced_candidates and pattern_hints separately.
-fn parse_script_for_writes(script_text: &str) -> (Vec<PathBuf>, Vec<String>) {
-    let mut produced = Vec::new();
-    let mut hints = Vec::new();
-
-    // Match open("literal_path", "w"|"a") — standard Python open() calls.
-    // We only handle string literals in the first position (not variable refs).
-    let open_literal_re = Regex::new(r#"open\(\s*["'](/[^"']+)["']\s*,\s*["'][wa]["']\)"#).unwrap();
-    for cap in open_literal_re.captures_iter(script_text) {
-        if let Some(m) = cap.get(1) {
-            let path_str = m.as_str();
-            if is_dynamic_content(path_str) {
-                hints.push(format!("dynamic open: {path_str}"));
-            } else {
-                produced.push(PathBuf::from(path_str));
-            }
-        }
-    }
-
-    // Detect dynamic patterns in the whole script body (even in f-strings).
-    // e.g. open(f"/tmp/{uuid.uuid4()}.txt","w")
-    let dynamic_open_re = Regex::new(r#"open\(f?["'][^"']*["']\s*,\s*["'][wa]["']\)"#).unwrap();
-    for cap in dynamic_open_re.captures_iter(script_text) {
-        let full = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-        if is_dynamic_content(full) && !hints.iter().any(|h: &String| h.contains(full)) {
-            hints.push(format!("dynamic open pattern: {full}"));
-        }
-    }
-
-    // Also detect dynamic constructs appearing anywhere in the script
-    if is_dynamic_content(script_text) && produced.is_empty() && hints.is_empty() {
-        // generic hint for the whole script
-        hints.push("dynamic filename construction detected".to_string());
-    }
-
-    (produced, hints)
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Build the deliverable context at command completion.
-pub fn attribute_deliverable(
-    session_id: &str,
-    command: &str,
+/// Attribute outputs from the process capability manifest. Only exact
+/// absolute write targets can be auto-delivered; directory grants and inferred
+/// paths are never promoted into artifacts.
+pub async fn attribute_declared_deliverables_backend(
+    backend: SharedExecutionBackend,
+    declared_write_paths: &[String],
     command_start: SystemTime,
     command_end: SystemTime,
-    checklist_text: &[String],
-    read_script: &dyn Fn(&Path) -> Option<String>,
-    stat_mtime: &dyn Fn(&Path) -> Option<SystemTime>,
 ) -> BackgroundDeliverableContext {
-    let mut produced_set: HashSet<PathBuf> = HashSet::new();
-    let mut unconfirmed_set: HashSet<PathBuf> = HashSet::new();
-    let mut pattern_hints: Vec<String> = Vec::new();
-
-    // mtime window: [command_start, command_end + 2s]
     let window_end = command_end + Duration::from_secs(2);
+    let mut produced_candidates = Vec::new();
+    let mut unconfirmed_candidates = Vec::new();
+    let mut seen = HashSet::new();
 
-    // --- Identify executed/consumed scripts (never eligible) ---
-    let executed_scripts: HashSet<PathBuf> =
-        identify_executed_scripts(command).into_iter().collect();
-
-    // --- Collect output-flag targets from the command line ---
-    let output_flag_paths = extract_output_flag_paths(command);
-    for p in &output_flag_paths {
-        if !executed_scripts.contains(p) {
-            produced_set.insert(p.clone());
-        }
-    }
-
-    // --- Collect all absolute paths mentioned in the command ---
-    let all_cmd_paths: Vec<PathBuf> = extract_absolute_paths(command)
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-
-    // --- Check mtime window (primary signal) ---
-    // Apply to all paths discovered from command + output flags
-    let mut all_candidate_paths: HashSet<PathBuf> = HashSet::new();
-    for p in &all_cmd_paths {
-        all_candidate_paths.insert(p.clone());
-    }
-    for p in &output_flag_paths {
-        all_candidate_paths.insert(p.clone());
-    }
-
-    for p in &all_candidate_paths {
-        if executed_scripts.contains(p) {
+    for raw in declared_write_paths {
+        let raw = raw.trim();
+        if !raw.starts_with('/') {
             continue;
         }
-        // Device/proc/sys nodes can carry fresh mtimes; they are sinks, not
-        // produced files — never candidates regardless of the mtime window.
-        if is_non_deliverable_sink(p) {
+        let candidate = PathBuf::from(raw);
+        if is_non_deliverable_sink(&candidate) || !seen.insert(candidate.clone()) {
             continue;
         }
-        if let Some(mtime) = stat_mtime(p) {
-            if mtime >= command_start && mtime <= window_end {
-                produced_set.insert(p.clone());
-            }
-        }
-    }
-
-    // --- Parse referenced script(s) ---
-    for p in &executed_scripts {
-        if let Some(script_text) = read_script(p) {
-            let (script_produced, mut script_hints) = parse_script_for_writes(&script_text);
-            pattern_hints.append(&mut script_hints);
-
-            for sp in script_produced {
-                if !executed_scripts.contains(&sp) {
-                    // Script text is weak evidence (the open() may be in a comment,
-                    // a dead `if False:` branch, or reference a pre-existing file
-                    // never written this run). Require mtime-in-window confirmation
-                    // before treating it as a produced candidate; otherwise keep it
-                    // as a diagnostic-only hint (NOT auto-send eligible).
-                    match stat_mtime(&sp) {
-                        Some(mtime) if mtime >= command_start && mtime <= window_end => {
-                            produced_set.insert(sp);
-                        }
-                        _ => {
-                            unconfirmed_set.insert(sp.clone());
-                            pattern_hints.push(format!(
-                                "unconfirmed write target (no mtime in window): {}",
-                                sp.display()
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Also check script-mentioned absolute paths for mtime signal
-            let script_paths = extract_absolute_paths(&script_text);
-            for sp_str in script_paths {
-                if is_dynamic_content(&sp_str) {
-                    continue;
-                }
-                let sp = PathBuf::from(&sp_str);
-                if executed_scripts.contains(&sp) {
-                    continue;
-                }
-                if let Some(mtime) = stat_mtime(&sp) {
-                    if mtime >= command_start && mtime <= window_end {
-                        produced_set.insert(sp);
-                    } else {
-                        unconfirmed_set.insert(sp);
-                    }
+        let Ok(path) = backend.resolve_path(raw).await else {
+            unconfirmed_candidates.push(candidate);
+            continue;
+        };
+        match backend.metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => {
+                let resolved = PathBuf::from(path.as_str());
+                if metadata
+                    .modified
+                    .is_some_and(|modified| modified >= command_start && modified <= window_end)
+                {
+                    produced_candidates.push(resolved);
                 } else {
-                    unconfirmed_set.insert(sp);
+                    unconfirmed_candidates.push(resolved);
                 }
             }
+            Ok(_) => {
+                // A directory capability authorizes a tree; it does not name
+                // one user-facing artifact and must not trigger a scan.
+            }
+            Err(_) => unconfirmed_candidates.push(PathBuf::from(path.as_str())),
         }
     }
 
-    // --- Process checklist_text hints ---
-    for line in checklist_text {
-        let paths = extract_absolute_paths(line);
-        for ps in paths {
-            let p = PathBuf::from(&ps);
-            if executed_scripts.contains(&p) {
-                continue;
-            }
-            if let Some(mtime) = stat_mtime(&p) {
-                if mtime >= command_start && mtime <= window_end {
-                    produced_set.insert(p);
-                }
-            }
-        }
-    }
-
-    // Build final list (deterministic order via sort)
-    let mut produced_candidates: Vec<PathBuf> = produced_set.into_iter().collect();
     produced_candidates.sort();
-    let mut unconfirmed_candidates: Vec<PathBuf> = unconfirmed_set.into_iter().collect();
     unconfirmed_candidates.sort();
-
-    // Refine the final produced set so it holds regardless of which signal
-    // admitted each path:
-    //  1. Reject any candidate containing a `..` traversal component.
-    //  2. Drop bare temp roots (`/tmp`, `/private/tmp`, ...) — a directory whose
-    //     mtime bumped because a child file was written is not the deliverable.
-    //  3. Drop any candidate that is a strict ancestor (prefix) of another
-    //     candidate — e.g. `/tmp` when `/tmp/probe_results.txt` is present.
-    //
-    // NOTE: This module only *attributes* candidate paths. The authoritative
-    // sensitive-path blocklist (`/etc`, `~/.ssh`, etc.) lives at the delivery
-    // boundary in `file_delivery::prepare_delivery` / `BLOCKED_PATTERNS`
-    // (consumed by the next task) — we deliberately do not duplicate it here so
-    // there is a single source of truth.
-    let all: Vec<PathBuf> = produced_candidates.clone();
-    produced_candidates.retain(|p| {
-        if p.components().any(|c| c == std::path::Component::ParentDir) {
-            return false;
-        }
-        if is_temp_root(p) {
-            return false;
-        }
-        // Strict ancestor of any other candidate → not the deliverable.
-        !all.iter().any(|other| other != p && other.starts_with(p))
-    });
-
-    let produced_confirmed: HashSet<PathBuf> = produced_candidates.iter().cloned().collect();
-    let all_unconfirmed: Vec<PathBuf> = unconfirmed_candidates.clone();
-    unconfirmed_candidates.retain(|p| {
-        if produced_confirmed.contains(p) {
-            return false;
-        }
-        if p.components().any(|c| c == std::path::Component::ParentDir) {
-            return false;
-        }
-        if is_temp_root(p) {
-            return false;
-        }
-        !all_unconfirmed
-            .iter()
-            .any(|other| other != p && other.starts_with(p))
-    });
-
     BackgroundDeliverableContext {
-        session_id: session_id.to_string(),
-        command: command.to_string(),
-        command_start,
-        command_end,
         produced_candidates,
         unconfirmed_candidates,
-        pattern_hints,
     }
 }
 
-/// Backend-aware adapter for [`attribute_deliverable`].
-///
-/// It preloads the finite set of command/script/checklist paths through the
-/// configured execution backend, then runs the same pure attribution policy.
-/// This keeps background result discovery on the same filesystem as the
-/// terminal process without making the policy itself transport-aware.
-pub async fn attribute_deliverable_backend(
-    backend: SharedExecutionBackend,
-    session_id: &str,
-    command: &str,
-    command_start: SystemTime,
-    command_end: SystemTime,
-    checklist_text: &[String],
-) -> BackgroundDeliverableContext {
-    let executed_scripts = identify_executed_scripts(command);
-    let mut candidate_paths: HashSet<PathBuf> = extract_absolute_paths(command)
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    candidate_paths.extend(extract_output_flag_paths(command));
-    for line in checklist_text {
-        candidate_paths.extend(extract_absolute_paths(line).into_iter().map(PathBuf::from));
-    }
-
-    let mut scripts = HashMap::new();
-    for script in &executed_scripts {
-        let Ok(backend_path) = backend.resolve_path(&script.to_string_lossy()).await else {
-            continue;
-        };
-        if let Ok(bytes) = backend.read(&backend_path).await {
-            if let Ok(text) = String::from_utf8(bytes) {
-                let (writes, _) = parse_script_for_writes(&text);
-                candidate_paths.extend(writes);
-                candidate_paths
-                    .extend(extract_absolute_paths(&text).into_iter().map(PathBuf::from));
-                scripts.insert(script.clone(), text);
-            }
-        }
-    }
-
-    let mut mtimes = HashMap::new();
-    for path in candidate_paths {
-        let Ok(backend_path) = backend.resolve_path(&path.to_string_lossy()).await else {
-            continue;
-        };
-        if let Ok(metadata) = backend.metadata(&backend_path).await {
-            if let Some(modified) = metadata.modified {
-                mtimes.insert(path, modified);
-            }
-        }
-    }
-
-    attribute_deliverable(
-        session_id,
-        command,
-        command_start,
-        command_end,
-        checklist_text,
-        &|path| scripts.get(path).cloned(),
-        &|path| mtimes.get(path).copied(),
-    )
-}
-
-/// Decide whether to auto-send and which file.
 pub fn auto_send_decision(ctx: &BackgroundDeliverableContext) -> AutoSendDecision {
-    // Deduplicate (already sorted; use a seen set just in case)
-    let mut seen: HashSet<&PathBuf> = HashSet::new();
-    let deduped: Vec<&PathBuf> = ctx
-        .produced_candidates
-        .iter()
-        .filter(|p| seen.insert(p))
-        .collect();
-
-    match deduped.len() {
-        0 => AutoSendDecision::None,
-        1 => AutoSendDecision::One(deduped[0].clone()),
-        _ => AutoSendDecision::Ambiguous(deduped.into_iter().cloned().collect()),
+    match ctx.produced_candidates.as_slice() {
+        [] => AutoSendDecision::None,
+        [path] => AutoSendDecision::One(path.clone()),
+        paths => AutoSendDecision::Ambiguous(paths.to_vec()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
 
-    fn t0() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
-    }
+    #[tokio::test]
+    async fn only_exact_declared_fresh_files_are_candidates() {
+        let backend = crate::execution::active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let declared = root.path().join("declared.txt");
+        let undeclared = root.path().join("undeclared.txt");
+        let start = SystemTime::now() - Duration::from_secs(2);
+        std::fs::write(&declared, "declared").expect("declared fixture");
+        std::fs::write(&undeclared, "undeclared").expect("undeclared fixture");
+        let end = SystemTime::now();
 
-    #[test]
-    fn stderr_redirect_to_dev_null_is_not_a_deliverable() {
-        // Live repro (2026-07-02, pid 51980): `du -sh ~/projects/* 2>/dev/null
-        // | sort -hr | head` — the redirect regex captured /dev/null as a
-        // produced-output file, attribution returned One(/dev/null), the
-        // finished-ping and re-engagement were suppressed to "deliver" it,
-        // delivery failed ("not a regular file"), and the user's answer was
-        // swallowed entirely.
-        let start = t0();
-        let end = start + Duration::from_secs(63);
-        let read = |_: &std::path::Path| -> Option<String> { None };
-        // Device nodes can carry fresh mtimes — the exclusion must not rely
-        // on the mtime gate.
-        let stat = |p: &std::path::Path| -> Option<SystemTime> {
-            if p == std::path::Path::new("/dev/null") {
-                Some(start + Duration::from_secs(30))
-            } else {
-                None
-            }
-        };
-        let ctx = attribute_deliverable(
-            "s1",
-            "cd '/Users/synthetic/projects' && du -sh ~/projects/* 2>/dev/null | sort -hr | head -n 5",
+        let context = attribute_declared_deliverables_backend(
+            backend,
+            &[declared.to_string_lossy().to_string()],
             start,
             end,
-            &[],
-            &read,
-            &stat,
-        );
-        assert!(
-            matches!(auto_send_decision(&ctx), AutoSendDecision::None),
-            "sink paths must never be deliverables; got candidates {:?}",
-            ctx.produced_candidates
-        );
+        )
+        .await;
+
+        assert_eq!(context.produced_candidates, [declared]);
+        assert!(context.unconfirmed_candidates.is_empty());
+        assert!(matches!(
+            auto_send_decision(&context),
+            AutoSendDecision::One(_)
+        ));
     }
 
-    #[test]
-    fn sink_paths_are_never_output_candidates() {
-        let start = t0();
-        let end = start + Duration::from_secs(10);
-        let read = |_: &std::path::Path| -> Option<String> { None };
-        let stat = |_: &std::path::Path| -> Option<SystemTime> { Some(start) };
-        for cmd in [
-            "some_tool --output /dev/stdout",
-            "cmd > /dev/null",
-            "cmd --output=/proc/self/fd/1",
-            "cmd -o /sys/kernel/foo",
-        ] {
-            let ctx = attribute_deliverable("s1", cmd, start, end, &[], &read, &stat);
-            assert!(
-                ctx.produced_candidates.is_empty(),
-                "{cmd:?} must yield no produced candidates, got {:?}",
-                ctx.produced_candidates
-            );
-        }
-        // Control: a real redirect target is still detected.
-        let ctx =
-            attribute_deliverable("s1", "cmd > /tmp/report.txt", start, end, &[], &read, &stat);
-        assert!(ctx
-            .produced_candidates
-            .contains(&PathBuf::from("/tmp/report.txt")));
+    #[tokio::test]
+    async fn directories_relative_paths_and_sinks_are_not_artifacts() {
+        let backend = crate::execution::active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let now = SystemTime::now();
+        let context = attribute_declared_deliverables_backend(
+            backend,
+            &[
+                root.path().to_string_lossy().to_string(),
+                "relative.txt".to_string(),
+                "/dev/null".to_string(),
+            ],
+            now - Duration::from_secs(1),
+            now,
+        )
+        .await;
+
+        assert!(context.produced_candidates.is_empty());
+        assert!(context.unconfirmed_candidates.is_empty());
+        assert!(matches!(
+            auto_send_decision(&context),
+            AutoSendDecision::None
+        ));
     }
 
-    #[test]
-    fn excludes_executed_script_includes_mtime_changed_output() {
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let script = "/tmp/probe.py";
-        let out = "/tmp/probe_results.txt";
-        let read = |p: &std::path::Path| -> Option<String> {
-            if p == std::path::Path::new(script) {
-                Some("output_path = \"/tmp/probe_results.txt\"\nopen(output_path, \"a\")\n".into())
-            } else {
-                None
-            }
-        };
-        // results file mtime is within the run window; script mtime is before it.
-        let stat = |p: &std::path::Path| -> Option<SystemTime> {
-            match p.to_str().unwrap() {
-                "/tmp/probe_results.txt" => Some(start + Duration::from_secs(20)),
-                "/tmp/probe.py" => Some(start - Duration::from_secs(10)),
-                _ => None,
-            }
-        };
-        let ctx = attribute_deliverable(
-            "s1",
-            "cd /tmp && python3 /tmp/probe.py",
+    #[tokio::test]
+    async fn exact_missing_target_is_reported_without_searching() {
+        let backend = crate::execution::active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let missing = root.path().join("missing.txt");
+        let now = SystemTime::now();
+        let context = attribute_declared_deliverables_backend(
+            backend,
+            &[missing.to_string_lossy().to_string()],
+            now - Duration::from_secs(1),
+            now,
+        )
+        .await;
+
+        assert!(context.produced_candidates.is_empty());
+        assert_eq!(context.unconfirmed_candidates, [missing]);
+    }
+
+    #[tokio::test]
+    async fn two_declared_fresh_files_are_ambiguous() {
+        let backend = crate::execution::active_execution_backend();
+        let root = tempfile::tempdir().expect("root");
+        let first = root.path().join("a.txt");
+        let second = root.path().join("b.txt");
+        let start = SystemTime::now() - Duration::from_secs(2);
+        std::fs::write(&first, "a").expect("first fixture");
+        std::fs::write(&second, "b").expect("second fixture");
+        let end = SystemTime::now();
+        let context = attribute_declared_deliverables_backend(
+            backend,
+            &[
+                second.to_string_lossy().to_string(),
+                first.to_string_lossy().to_string(),
+            ],
             start,
             end,
-            &[],
-            &read,
-            &stat,
-        );
-        assert!(
-            matches!(auto_send_decision(&ctx), AutoSendDecision::One(p) if p == std::path::Path::new(out)),
-            "expected One({out}) but got {:?}",
-            ctx.produced_candidates
-        );
-        assert!(
-            !ctx.produced_candidates
-                .iter()
-                .any(|p| p == std::path::Path::new(script)),
-            "executed script must be excluded as consumed"
-        );
-    }
+        )
+        .await;
 
-    #[test]
-    fn dynamic_filename_is_pattern_hint_not_candidate() {
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let read = |_: &std::path::Path| {
-            Some("import uuid\nopen(f\"/tmp/{uuid.uuid4()}.txt\",\"w\")".to_string())
-        };
-        let stat = |_: &std::path::Path| -> Option<SystemTime> { None };
-        let ctx = attribute_deliverable("s1", "python3 /tmp/dyn.py", start, end, &[], &read, &stat);
-        assert!(ctx.produced_candidates.is_empty());
-        assert!(!ctx.pattern_hints.is_empty());
-        assert!(matches!(auto_send_decision(&ctx), AutoSendDecision::None));
-    }
-
-    #[test]
-    fn two_outputs_are_ambiguous() {
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let read = |_: &std::path::Path| -> Option<String> { None };
-        let stat = |p: &std::path::Path| -> Option<SystemTime> {
-            match p.to_str().unwrap() {
-                "/tmp/a.txt" | "/tmp/b.txt" => Some(start + Duration::from_secs(5)),
-                _ => None,
-            }
-        };
-        let ctx = attribute_deliverable(
-            "s1",
-            "mytool -o /tmp/a.txt --output /tmp/b.txt",
-            start,
-            end,
-            &[],
-            &read,
-            &stat,
-        );
-        assert!(
-            matches!(auto_send_decision(&ctx), AutoSendDecision::Ambiguous(v) if v.len() == 2),
-            "expected Ambiguous(2) but got {:?}",
-            ctx.produced_candidates
-        );
-    }
-
-    #[test]
-    fn parent_dir_mtime_bump_does_not_create_phantom_candidate() {
-        // The OS bumps /tmp's mtime when a child file is written. The temp-root
-        // directory must NOT become a second produced candidate alongside the
-        // real output file.
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let script = "/tmp/probe.py";
-        let out = "/tmp/probe_results.txt";
-        let read = |p: &std::path::Path| -> Option<String> {
-            if p == std::path::Path::new(script) {
-                Some("output_path = \"/tmp/probe_results.txt\"\nopen(output_path, \"a\")\n".into())
-            } else {
-                None
-            }
-        };
-        // Both /tmp AND /tmp/probe_results.txt have in-window mtimes; the script
-        // file is before the window.
-        let stat = |p: &std::path::Path| -> Option<SystemTime> {
-            match p.to_str().unwrap() {
-                "/tmp" => Some(start + Duration::from_secs(20)),
-                "/tmp/probe_results.txt" => Some(start + Duration::from_secs(20)),
-                "/tmp/probe.py" => Some(start - Duration::from_secs(10)),
-                _ => None,
-            }
-        };
-        let ctx = attribute_deliverable(
-            "s1",
-            "cd /tmp && python3 /tmp/probe.py",
-            start,
-            end,
-            &[],
-            &read,
-            &stat,
-        );
-        assert!(
-            matches!(auto_send_decision(&ctx), AutoSendDecision::One(p) if p == std::path::Path::new(out)),
-            "expected One({out}), not Ambiguous; got {:?}",
-            ctx.produced_candidates
-        );
-    }
-
-    // --- Temporal-scope security: script-text write targets require an
-    //     mtime-in-window confirmation before becoming produced candidates. ---
-
-    #[test]
-    fn script_write_target_before_window_is_excluded() {
-        // (a) script writes /etc/passwd but its mtime predates the run window.
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let read = |_: &std::path::Path| Some("open(\"/etc/passwd\",\"w\")\n".to_string());
-        let stat = |p: &std::path::Path| -> Option<SystemTime> {
-            match p.to_str().unwrap() {
-                "/etc/passwd" => Some(start - Duration::from_secs(86_400)),
-                _ => None,
-            }
-        };
-        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
-        assert!(
-            !ctx.produced_candidates
-                .iter()
-                .any(|p| p == std::path::Path::new("/etc/passwd")),
-            "out-of-window script write target must be excluded; got {:?}",
-            ctx.produced_candidates
-        );
-    }
-
-    #[test]
-    fn script_write_target_without_mtime_is_excluded() {
-        // (b) literal open("/tmp/x.txt","w") but stat returns None.
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let read = |_: &std::path::Path| Some("open(\"/tmp/x.txt\",\"w\")\n".to_string());
-        let stat = |_: &std::path::Path| -> Option<SystemTime> { None };
-        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
-        assert!(
-            !ctx.produced_candidates
-                .iter()
-                .any(|p| p == std::path::Path::new("/tmp/x.txt")),
-            "script write target without mtime must be excluded; got {:?}",
-            ctx.produced_candidates
-        );
-    }
-
-    #[test]
-    fn script_write_target_in_dead_code_is_excluded() {
-        // (c) literal in a comment / `if False:` block, never touched (stat None).
-        let start = t0();
-        let end = start + Duration::from_secs(40);
-        let read = |_: &std::path::Path| {
-            Some(
-                "if False:\n    open(\"/tmp/never.txt\",\"w\")\n# open(\"/tmp/never.txt\",\"w\")\n"
-                    .to_string(),
-            )
-        };
-        let stat = |_: &std::path::Path| -> Option<SystemTime> { None };
-        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
-        assert!(
-            !ctx.produced_candidates
-                .iter()
-                .any(|p| p == std::path::Path::new("/tmp/never.txt")),
-            "never-executed script write target must be excluded; got {:?}",
-            ctx.produced_candidates
-        );
+        assert!(matches!(
+            auto_send_decision(&context),
+            AutoSendDecision::Ambiguous(paths) if paths == vec![first, second]
+        ));
     }
 }

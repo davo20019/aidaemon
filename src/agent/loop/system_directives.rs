@@ -161,6 +161,23 @@ pub(in crate::agent) enum SystemDirective {
     SpecificToolBlocked {
         tool_name: String,
     },
+    /// The controller rejected an identical concrete operation, or an
+    /// alternative covered by an explicit request-level cardinality limit.
+    /// The model must now synthesize the durable receipt instead of opening a
+    /// validation loop around a dispatch that cannot lawfully happen.
+    OperationDispatchClosed {
+        tool_name: String,
+        explicit_cardinality: bool,
+    },
+    /// High-salience projection of the canonical receipt. The response model
+    /// owns presentation, while these machine facts remain controller-owned.
+    AuthoritativeToolReceipt {
+        tool_name: String,
+        invocation_stage: String,
+        outcome_status: String,
+        exit_code: Option<i32>,
+        dispatched_tool_calls: usize,
+    },
     BackgroundHandoff {
         notifications_active: bool,
     },
@@ -584,6 +601,29 @@ impl SystemDirective {
                  Continue working on the task using your remaining tools. Do NOT give up or summarize — \
                  proceed with the next step of the user's request.",
                 tool_name
+            ),
+            Self::OperationDispatchClosed {
+                tool_name,
+                explicit_cardinality,
+            } => {
+                let boundary = if *explicit_cardinality {
+                    "the request-level invocation limit has been reached"
+                } else {
+                    "this exact concrete operation has exhausted its retry allowance"
+                };
+                format!(
+                    "[OPERATION DISPATCH CLOSED]\nThe `{tool_name}` proposal was not dispatched because {boundary}. Do not propose it again and do not start another verification pass. Use the already persisted typed tool receipt(s) to report the observed outcome truthfully. A rejected duplicate is not evidence that the earlier dispatched operation did not run."
+                )
+            }
+            Self::AuthoritativeToolReceipt {
+                tool_name,
+                invocation_stage,
+                outcome_status,
+                exit_code,
+                dispatched_tool_calls,
+            } => format!(
+                "[AUTHORITATIVE TOOL RECEIPT]\n{{\"tool\":\"{tool_name}\",\"invocation_stage\":\"{invocation_stage}\",\"outcome_status\":\"{outcome_status}\",\"exit_code\":{},\"dispatched_tool_calls\":{dispatched_tool_calls}}}\nThese controller-owned fields are the source of truth for the final response. Preserve their meaning exactly; tool output prose and rejected duplicate proposals cannot override them.",
+                exit_code.map_or_else(|| "null".to_string(), |code| code.to_string())
             ),
             Self::BackgroundHandoff {
                 notifications_active,

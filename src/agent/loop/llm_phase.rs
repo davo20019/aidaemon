@@ -535,9 +535,13 @@ pub(super) struct LlmPhaseCtx<'a> {
     /// the current iteration's text content is prepended with this prefix
     /// so the user sees the full answer.
     pub truncated_text_prefix: &'a mut Option<String>,
-    /// Accumulates milliseconds lost to LLM provider timeouts so the
-    /// wall-clock budget can exclude them (provider slowness ≠ agent stalling).
+    /// Accumulates milliseconds lost to LLM provider timeouts for diagnostic
+    /// attribution. Owner-visible wall-clock budgets still include this time.
     pub provider_timeout_ms: &'a mut u64,
+    /// Remaining time in the authoritative execution envelope. The physical
+    /// provider call is capped to this duration so one call cannot overshoot
+    /// the task-level deadline by a full per-call timeout.
+    pub remaining_execution_wall_clock: Option<Duration>,
     /// Counts consecutive iterations where the response was truncated with all
     /// tokens spent on thinking and no usable output.  Escalating recovery:
     /// 1 → reasoning_effort = "low", 2 → disable reasoning entirely,
@@ -925,7 +929,12 @@ pub(super) async fn run_llm_phase(
         effective_llm_timeout.min(MANDATE_MAX_LLM_CALL_TIMEOUT)
     } else {
         effective_llm_timeout.min(FOREGROUND_MAX_LLM_CALL_TIMEOUT)
-    };
+    }
+    .min(
+        ctx.remaining_execution_wall_clock
+            .unwrap_or(effective_llm_timeout)
+            .max(Duration::from_millis(1)),
+    );
 
     // Mandate runs use one durable immutable balance across the task lead and
     // every executor. The lease also prevents parallel model calls from each
@@ -1237,8 +1246,8 @@ pub(super) async fn run_llm_phase(
                 session_id,
             )
             .await;
-            // Record the timeout duration so the wall-clock budget
-            // can exclude time lost to provider slowness.
+            // Retain provider-attributed delay for telemetry. It remains part
+            // of the end-to-end wall clock seen by the owner.
             *provider_timeout_ms += timeout_dur.as_millis() as u64;
             warn!(
                 session_id,

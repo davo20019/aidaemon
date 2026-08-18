@@ -245,6 +245,35 @@ fn valid_receipt(receipt: &RequestReceiptPredicate, available_tool_names: &[Stri
             .is_none_or(|limit| (1..=16).contains(&limit))
 }
 
+/// Normalize dependent receipt fields against the runtime's typed process
+/// protocol. Exit code and outcome are not independent facts: a normal process
+/// exit of zero is `succeeded`, a positive exit is a completed negative
+/// observation, and the backend's negative no-status sentinel is an execution
+/// failure. Leaving a model-produced incompatible conjunction in the contract
+/// creates an obligation no real receipt can satisfy.
+fn normalize_receipt_predicate(mut receipt: RequestReceiptPredicate) -> RequestReceiptPredicate {
+    if receipt.contract_rejected == Some(true) {
+        // Rejection is an independent typed disposition that may occur at an
+        // adapter-validation or dispatcher-policy boundary. It causally rules
+        // out a process exit code, but it does not imply one universal domain
+        // outcome across receipt schema versions or adapter classes.
+        receipt.exit_codes.clear();
+        receipt.outcome_statuses.clear();
+    } else if !receipt.exit_codes.is_empty() {
+        receipt.outcome_statuses = receipt
+            .exit_codes
+            .iter()
+            .copied()
+            .map(crate::traits::ToolOutcomeStatus::from_process_exit_code)
+            .collect();
+        receipt
+            .outcome_statuses
+            .sort_by_key(|status| status.as_str());
+        receipt.outcome_statuses.dedup();
+    }
+    receipt
+}
+
 fn canonical_invocation_requirement(
     receipt: RequestReceiptPredicate,
 ) -> RequestEvidenceRequirement {
@@ -275,8 +304,9 @@ fn compile_obligations(
     let mut invocations = Vec::new();
 
     let mut add_invocation = |receipt: &RequestReceiptPredicate| {
-        if valid_receipt(receipt, available_tool_names) && !invocations.contains(receipt) {
-            invocations.push(receipt.clone());
+        let receipt = normalize_receipt_predicate(receipt.clone());
+        if valid_receipt(&receipt, available_tool_names) && !invocations.contains(&receipt) {
+            invocations.push(receipt);
         }
     };
     for receipt in invocation_candidates {
@@ -744,6 +774,43 @@ mod tests {
         let compiled = compile(&signals);
         assert_eq!(compiled.required_invocations.len(), 1);
         assert!(compiled.core.expect("valid core").requires_observation);
+    }
+
+    #[test]
+    fn process_exit_code_normalizes_an_impossible_model_outcome_conjunction() {
+        let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            exit_codes: vec![1],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::FailedPermanent],
+            contract_rejected: Some(false),
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        assert_eq!(compiled.required_invocations.len(), 1);
+        assert_eq!(
+            compiled.required_invocations[0].outcome_statuses,
+            [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
+        );
+        assert_eq!(compiled.required_invocations[0].exit_codes, [1]);
+    }
+
+    #[test]
+    fn rejected_before_dispatch_predicate_cannot_also_require_an_exit_code() {
+        let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            exit_codes: vec![1],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::FailedPermanent],
+            contract_rejected: Some(true),
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        assert!(compiled.required_invocations[0].exit_codes.is_empty());
+        assert!(compiled.required_invocations[0].outcome_statuses.is_empty());
     }
 
     #[test]

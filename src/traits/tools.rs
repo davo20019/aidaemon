@@ -890,6 +890,16 @@ pub enum ToolInvocationStage {
 }
 
 impl ToolInvocationStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::RejectedBeforeDispatch => "rejected_before_dispatch",
+            Self::RejectedBeforeIo => "rejected_before_io",
+            Self::Dispatched => "dispatched",
+            Self::Replayed => "replayed",
+        }
+    }
+
     pub const fn reached_dispatch(self) -> bool {
         matches!(self, Self::Dispatched | Self::Replayed)
     }
@@ -916,7 +926,38 @@ pub enum ToolReceiptKind {
     Http,
 }
 
+/// Strength of the boundary that enforced a tool's declared filesystem
+/// manifest. This reports enforcement, not merely manifest presence.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAccessEnforcement {
+    /// Legacy or uninstrumented adapter; no enforcement claim is made.
+    #[default]
+    Unknown,
+    /// The operation has no filesystem access contract.
+    NotApplicable,
+    /// A delegated sandbox adapter accepted the manifest.
+    AdapterEnforced,
+    /// The daemon installed a kernel-enforced policy from the exact manifest.
+    KernelEnforced,
+}
+
 impl ToolOutcomeStatus {
+    /// Normalize the execution backend's process status convention. Unix
+    /// commands that exit normally produce a nonnegative code; the backend
+    /// uses a negative sentinel when no normal exit status exists (for
+    /// example, a sandbox kill). Such termination is not a completed negative
+    /// predicate observation.
+    pub const fn from_process_exit_code(code: i32) -> Self {
+        if code == 0 {
+            Self::Succeeded
+        } else if code > 0 {
+            Self::CompletedWithNegativeResult
+        } else {
+            Self::FailedPermanent
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
@@ -967,6 +1008,10 @@ pub struct ToolCallMetadata {
     /// This is an audit receipt, not a reusable authority grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_manifest: Option<ToolCallAccessManifest>,
+    /// Whether the declared access manifest was installed at an execution
+    /// boundary. A populated manifest with `Unknown` is audit data only.
+    #[serde(default)]
+    pub access_enforcement: ToolAccessEnforcement,
     /// Authoritative domain outcome when the tool can provide one. Older tools
     /// may omit it; the loop then derives a conservative status from structured
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.
@@ -1816,6 +1861,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(meta.http_status, Some(201));
+    }
+
+    #[test]
+    fn process_status_distinguishes_normal_negative_exit_from_termination() {
+        assert_eq!(
+            ToolOutcomeStatus::from_process_exit_code(0),
+            ToolOutcomeStatus::Succeeded
+        );
+        assert_eq!(
+            ToolOutcomeStatus::from_process_exit_code(1),
+            ToolOutcomeStatus::CompletedWithNegativeResult
+        );
+        assert_eq!(
+            ToolOutcomeStatus::from_process_exit_code(-1),
+            ToolOutcomeStatus::FailedPermanent
+        );
     }
 
     #[test]

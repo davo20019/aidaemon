@@ -1,7 +1,6 @@
 use crate::router::Router;
 use crate::traits::{ModelProvider, ProviderResponse};
 use crate::utils::truncate_str;
-use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -780,11 +779,25 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
-// Candidates run concurrently, so this is one aggregate bootstrap deadline
-// rather than serialized waits. Selection still follows configured candidate
-// priority; response latency must never choose a different task contract.
+// Aggregate semantic-producer deadline. A validated higher-priority producer
+// stops the lane; failover candidates share whatever time remains and are
+// never launched speculatively.
 const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Reserve a deterministic share of the remaining aggregate deadline for
+/// every configured producer that has not yet been attempted. Priority
+/// determines selection order, while one slow producer cannot consume the
+/// failover lane's entire owner-visible budget.
+fn assessment_attempt_timeout(
+    remaining: std::time::Duration,
+    candidates_left: usize,
+) -> std::time::Duration {
+    if candidates_left <= 1 {
+        return remaining;
+    }
+    remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerTelemetryCtx<'a> {
@@ -1179,47 +1192,44 @@ pub(crate) async fn generate_task_plan(
         },
     }
 
-    // Semantic assessment is an optional, read-only producer. Run candidates
-    // concurrently so one slow provider cannot serialize bootstrap, but collect
-    // every bounded result and select by configured priority. A latency race is
-    // not an authoritative input to the task contract.
-    let mut attempts = FuturesUnordered::new();
+    // Semantic assessment is one logical producer, not a quorum. Try the
+    // configured candidates in priority order and stop at the first validated
+    // contract. Parallel hedging previously paid for every losing call and
+    // made a one-command request wait on models whose answer could never be
+    // selected. Failover remains bounded and fully telemetered.
+    let assessment_deadline = Instant::now() + TASK_ASSESSMENT_TOTAL_TIMEOUT;
     for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let provider = provider.clone();
-        let model = model.clone();
-        let messages = messages.clone();
-        let options = options.clone();
-        attempts.push(async move {
-            let call_start = Instant::now();
-            match tokio::time::timeout(
-                TASK_ASSESSMENT_TOTAL_TIMEOUT,
-                provider.chat_with_options(&model, &messages, &[], &options),
-            )
-            .await
-            {
-                Ok(Ok(response)) => AssessmentAttempt::Response {
-                    candidate_index,
-                    model,
-                    latency_ms: call_start.elapsed().as_millis() as u64,
-                    response,
-                },
-                Ok(Err(error)) => AssessmentAttempt::ProviderError {
-                    candidate_index,
-                    model,
-                    latency_ms: call_start.elapsed().as_millis() as u64,
-                    error: error.to_string(),
-                },
-                Err(_) => AssessmentAttempt::Timeout {
-                    candidate_index,
-                    model,
-                    latency_ms: call_start.elapsed().as_millis() as u64,
-                },
-            }
-        });
-    }
-
-    let mut valid_plans = Vec::new();
-    while let Some(attempt) = attempts.next().await {
+        let call_start = Instant::now();
+        let remaining = assessment_deadline.saturating_duration_since(call_start);
+        if remaining.is_zero() {
+            break;
+        }
+        let candidates_left = model_candidates.len().saturating_sub(candidate_index);
+        let attempt_timeout = assessment_attempt_timeout(remaining, candidates_left);
+        let attempt = match tokio::time::timeout(
+            attempt_timeout,
+            provider.chat_with_options(model, &messages, &[], &options),
+        )
+        .await
+        {
+            Ok(Ok(response)) => AssessmentAttempt::Response {
+                candidate_index,
+                model: model.clone(),
+                latency_ms: call_start.elapsed().as_millis() as u64,
+                response,
+            },
+            Ok(Err(error)) => AssessmentAttempt::ProviderError {
+                candidate_index,
+                model: model.clone(),
+                latency_ms: call_start.elapsed().as_millis() as u64,
+                error: error.to_string(),
+            },
+            Err(_) => AssessmentAttempt::Timeout {
+                candidate_index,
+                model: model.clone(),
+                latency_ms: call_start.elapsed().as_millis() as u64,
+            },
+        };
         let (candidate_index, model, latency_ms, result) = match attempt {
             AssessmentAttempt::Response {
                 candidate_index,
@@ -1284,7 +1294,15 @@ pub(crate) async fn generate_task_plan(
                     },
                 )
                 .await;
-                valid_plans.push((candidate_index, model, plan));
+                info!(
+                    goal = %plan.goal,
+                    step_count = plan.steps.len(),
+                    assessment_mode = mode.as_str(),
+                    %model,
+                    fallback = candidate_index > 0,
+                    "Task assessment selected by configured model priority"
+                );
+                return Some(plan);
             }
             Err(error) => {
                 record_auxiliary_model_call(
@@ -1304,21 +1322,7 @@ pub(crate) async fn generate_task_plan(
             }
         }
     }
-    valid_plans.sort_by_key(|(candidate_index, _, _)| *candidate_index);
-    valid_plans
-        .into_iter()
-        .next()
-        .map(|(candidate_index, model, plan)| {
-            info!(
-                goal = %plan.goal,
-                step_count = plan.steps.len(),
-                assessment_mode = mode.as_str(),
-                %model,
-                fallback = candidate_index > 0,
-                "Task assessment selected by configured model priority"
-            );
-            plan
-        })
+    None
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -1606,7 +1610,10 @@ pub(crate) fn summarize_tool_calls_for_replan(tool_calls: &[String], max_entries
 mod tests {
     use super::*;
 
-    struct ModelPriorityTestProvider;
+    #[derive(Default)]
+    struct ModelPriorityTestProvider {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
 
     #[async_trait::async_trait]
     impl ModelProvider for ModelPriorityTestProvider {
@@ -1616,6 +1623,10 @@ mod tests {
             _messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
         ) -> anyhow::Result<ProviderResponse> {
+            self.calls
+                .lock()
+                .expect("call ledger")
+                .push(model.to_string());
             if model == "configured-primary" {
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             } else {
@@ -2203,6 +2214,14 @@ mod tests {
         assert!(TaskAssessmentMode::GuidedPlan.includes_step_plan());
     }
 
+    #[test]
+    fn semantic_attempt_budget_reserves_time_for_every_remaining_failover() {
+        let total = std::time::Duration::from_secs(20);
+        assert_eq!(assessment_attempt_timeout(total, 1), total);
+        assert_eq!(assessment_attempt_timeout(total, 2), total / 2);
+        assert_eq!(assessment_attempt_timeout(total, 4), total / 4);
+    }
+
     #[tokio::test]
     async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
         let response = crate::testing::MockProvider::text_response(
@@ -2258,8 +2277,9 @@ mod tests {
             "configured-primary".to_string(),
             "configured-fallback".to_string(),
         ];
+        let provider = Arc::new(ModelPriorityTestProvider::default());
         let assessment = generate_task_plan(
-            Arc::new(ModelPriorityTestProvider),
+            provider.clone(),
             &models,
             "Give a synthetic answer.",
             TaskAssessmentMode::AutonomousRouting,
@@ -2269,6 +2289,10 @@ mod tests {
         .expect("assessment");
 
         assert_eq!(assessment.goal, "primary contract");
+        assert_eq!(
+            provider.calls.lock().expect("call ledger").as_slice(),
+            ["configured-primary"]
+        );
     }
 
     #[tokio::test]

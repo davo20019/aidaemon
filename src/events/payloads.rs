@@ -316,6 +316,8 @@ pub struct ToolReceiptV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_manifest: Option<crate::traits::ToolCallAccessManifest>,
     #[serde(default)]
+    pub access_enforcement: crate::traits::ToolAccessEnforcement,
+    #[serde(default)]
     pub contract_rejected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_tool_name: Option<String>,
@@ -375,6 +377,7 @@ impl ToolReceiptV1 {
             outcome_evidence,
             receipt_kind: metadata.receipt_kind,
             access_manifest: metadata.access_manifest.clone(),
+            access_enforcement: metadata.access_enforcement,
             contract_rejected: metadata.contract_rejected,
             effective_tool_name: metadata.effective_tool_name.clone(),
             idempotency_key,
@@ -399,6 +402,7 @@ impl ToolReceiptV1 {
         ToolCallMetadata {
             receipt_kind: self.receipt_kind,
             access_manifest: self.access_manifest.clone(),
+            access_enforcement: self.access_enforcement,
             outcome_status: Some(self.outcome_status),
             invocation_stage: crate::traits::ToolInvocationStage::Replayed,
             receipt_replayed: true,
@@ -1906,6 +1910,7 @@ mod tests {
             outcome_status: Some(ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
             http_status: Some(201),
+            access_enforcement: crate::traits::ToolAccessEnforcement::KernelEnforced,
             contract_rejected: true,
             effective_tool_name: Some("terminal".to_string()),
             result_provenance: Some(crate::traits::ToolResultProvenance {
@@ -1952,6 +1957,10 @@ mod tests {
         let replay = roundtrip.to_metadata();
         assert!(replay.receipt_replayed);
         assert_eq!(replay.outcome_status, Some(ToolOutcomeStatus::Succeeded));
+        assert_eq!(
+            replay.access_enforcement,
+            crate::traits::ToolAccessEnforcement::KernelEnforced
+        );
         assert!(replay.contract_rejected);
         assert_eq!(replay.effective_tool_name.as_deref(), Some("terminal"));
         assert!(replay

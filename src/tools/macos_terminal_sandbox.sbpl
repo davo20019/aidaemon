@@ -1,0 +1,165 @@
+;; Process/runtime policy for manifest-confined terminal calls on macOS.
+;;
+;; Derived from the Apache-2.0 OpenAI Codex Seatbelt base policy. Unlike the
+;; Codex `:minimal` profile, this deliberately does not grant data reads for
+;; all of /etc or writes to all temporary directories. Task data paths are
+;; appended per invocation by terminal.rs.
+
+(version 1)
+(deny default)
+
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+
+(allow file-write-data
+  (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))
+
+(allow sysctl-read
+  (sysctl-name "hw.activecpu")
+  (sysctl-name "hw.byteorder")
+  (sysctl-name "hw.cacheconfig")
+  (sysctl-name "hw.cachelinesize")
+  (sysctl-name "hw.cachelinesize_compat")
+  (sysctl-name "hw.cpufamily")
+  (sysctl-name "hw.cputype")
+  (sysctl-name "hw.logicalcpu")
+  (sysctl-name "hw.logicalcpu_max")
+  (sysctl-name "hw.machine")
+  (sysctl-name "hw.memsize")
+  (sysctl-name "hw.model")
+  (sysctl-name "hw.ncpu")
+  (sysctl-name "hw.nperflevels")
+  (sysctl-name-prefix "hw.optional.arm.")
+  (sysctl-name-prefix "hw.optional.armv8_")
+  (sysctl-name-prefix "hw.perflevel")
+  (sysctl-name "hw.packages")
+  (sysctl-name "hw.pagesize")
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.physicalcpu")
+  (sysctl-name "hw.physicalcpu_max")
+  (sysctl-name "kern.argmax")
+  (sysctl-name "kern.bootargs")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.maxfilesperproc")
+  (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.osproductversion")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osversion")
+  (sysctl-name "kern.version")
+  (sysctl-name-prefix "kern.proc.pgrp.")
+  (sysctl-name-prefix "kern.proc.pid.")
+  (sysctl-name-prefix "net.routetable."))
+
+(allow sysctl-read (sysctl-name "security.mac.lockdown_mode_state"))
+
+(allow sysctl-write (sysctl-name "kern.grade_cputype"))
+(allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
+(allow mach-lookup
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.analyticsd")
+  (global-name "com.apple.analyticsd.messagetracer")
+  (global-name "com.apple.appsleep")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.diagnosticd")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.logd.events")
+  (global-name "com.apple.secinitd")
+  (global-name "com.apple.system.DirectoryService.libinfo_v1")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent")
+  (local-name "com.apple.cfprefsd.agent"))
+
+(allow ipc-posix-sem)
+(allow ipc-sysv-sem)
+(allow ipc-posix-shm-read* (ipc-posix-name-prefix "apple.cfprefs."))
+(allow ipc-posix-shm-read-data
+  ipc-posix-shm-write-create
+  ipc-posix-shm-write-unlink
+  (ipc-posix-name-regex #"^/__KMP_REGISTERED_LIB_[0-9]+$"))
+(allow user-preference-read)
+
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write*
+  (require-all
+    (regex #"^/dev/ttys[0-9]+")
+    (extension "com.apple.sandbox.pty")))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+"))
+
+;; Runtime loader, standard executables, and immutable platform resources.
+(allow file-map-executable
+  (subpath "/Library/Apple/System/Library")
+  (subpath "/System/Library")
+  (subpath "/System/iOSSupport/System/Library")
+  (subpath "/usr/lib"))
+(allow file-read* file-test-existence
+  (subpath "/Library/Apple/System/Library")
+  (subpath "/Library/Preferences")
+  (subpath "/System/Library")
+  (subpath "/System/iOSSupport/System/Library")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/usr/bin")
+  (subpath "/usr/lib")
+  (subpath "/usr/libexec")
+  (subpath "/usr/sbin")
+  (subpath "/usr/share")
+  (subpath "/private/var/db/timezone"))
+
+;; Metadata-only traversal does not expose file contents. `/etc` and `/tmp`
+;; are symlinks on macOS, so both their lexical and canonical parents must be
+;; traversable before an exact manifest entry can be reached.
+(allow file-read-metadata file-test-existence
+  (literal "/")
+  (literal "/etc")
+  (literal "/tmp")
+  (literal "/var")
+  (literal "/private")
+  (literal "/private/etc")
+  (literal "/private/tmp")
+  (literal "/private/var")
+  (path-ancestors "/System/Volumes/Data/private"))
+
+;; Process startup performs a directory read at the filesystem root. This
+;; exposes only root entry names; it does not grant file contents or descend
+;; into any root entry.
+(allow file-read-data (literal "/"))
+
+;; Exact non-task operating-system data needed by normal process startup.
+(allow file-read* file-test-existence
+  (literal "/dev/autofs_nowait")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/private/etc/localtime")
+  (literal "/private/etc/master.passwd")
+  (literal "/private/etc/passwd")
+  (literal "/private/etc/protocols")
+  (literal "/private/etc/services")
+  ;; Curated platform/toolchain configuration. These are immutable runtime
+  ;; dependencies, not task data grants; importantly this does not grant the
+  ;; containing /private/etc tree (for example, hosts remains unreadable).
+  (literal "/private/etc/ssl/cert.pem")
+  (literal "/private/etc/ssl/openssl.cnf")
+  (subpath "/private/var/select"))
+(allow file-read* file-test-existence file-write-data
+  (literal "/dev/null")
+  (literal "/dev/zero"))
+(allow file-read-data file-test-existence file-write-data (subpath "/dev/fd"))
+(allow file-read-metadata (subpath "/dev"))
+
+(allow system-mac-syscall (mac-policy-name "vnguard"))
+(allow system-mac-syscall
+  (require-all (mac-policy-name "Sandbox") (mac-syscall-number 67)))
+(allow system-fsctl (fsctl-command FSIOC_CAS_BSDFLAGS))
+
+;; No generic network grant. Local syslog is an operating-system diagnostic
+;; endpoint rather than task network authority.
+(allow network-outbound (literal "/private/var/run/syslog"))

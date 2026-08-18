@@ -10,6 +10,7 @@ use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::ProviderResponse;
 
 const MAX_VERIFICATION_ATTEMPTS: usize = 2;
+const MAX_VERIFICATION_BLOCKS: usize = 1;
 
 pub(super) struct CompletionCtx<'a> {
     pub resp: &'a mut ProviderResponse,
@@ -726,7 +727,9 @@ pub(super) async fn run_completion_phase(
                     "verification_block_count": completion_progress.verification_block_count,
                     "execution_id": &execution_state.execution_id,
                     "operation_invocations": &execution_state.operation_invocations,
+                    "obligation_invocations": &execution_state.obligation_invocations,
                     "operation_attempts": &execution_state.operation_attempts,
+                    "tool_dispatches": &execution_state.tool_dispatches,
                     "operation_results_observed": execution_state.operation_results_observed,
                     "completed_operation_results": execution_state.completed_operation_results,
                     "unresolved_recoverable_failure": unresolved_recoverable_failure,
@@ -1722,7 +1725,9 @@ pub(super) async fn run_completion_phase(
                 };
                 validation_state.record_failure(ValidationFailure::VerificationPending);
                 execution_state.mark_persisted_now();
-                if completion_progress.verification_attempt_count >= MAX_VERIFICATION_ATTEMPTS {
+                if completion_progress.verification_attempt_count >= MAX_VERIFICATION_ATTEMPTS
+                    || completion_progress.verification_block_count >= MAX_VERIFICATION_BLOCKS
+                {
                     // A bounded retry may end in an honest partial result only
                     // when concrete work exists. With no successful execution,
                     // the typed terminal cause must remain a failure.
@@ -1875,11 +1880,12 @@ pub(super) async fn run_completion_phase(
                     completion_progress.verification_block_count = completion_progress
                         .verification_block_count
                         .saturating_add(1);
+                    execution_state.record_validation_round();
 
-                    // A blocked completion is not a verification attempt. Keep
-                    // directing the model toward compatible evidence until an
-                    // actual attempt budget or the validation-round budget is
-                    // exhausted.
+                    // A blocked completion is not a verification attempt, but
+                    // it still consumes the single bounded model re-entry. If
+                    // the next response again supplies no compatible receipt,
+                    // the controller closes honestly instead of looping.
                     consecutive_clean_iterations = 0;
                     if outstanding_requirements.is_empty() {
                         pending_system_messages.push(

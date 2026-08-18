@@ -83,13 +83,14 @@ pub use tools::{
     semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
     AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
     EvidenceTemporalScope, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolArgumentContractViolation,
-    ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext,
-    ToolInvocationStage, ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind,
-    ToolResultCompleteness, ToolResultContentSource, ToolResultPresentation, ToolResultProvenance,
-    ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolAccessEnforcement,
+    ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
+    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,
+    ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
+    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
+    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 
