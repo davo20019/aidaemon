@@ -317,6 +317,8 @@ pub struct ToolReceiptV1 {
     pub access_manifest: Option<crate::traits::ToolCallAccessManifest>,
     #[serde(default)]
     pub access_enforcement: crate::traits::ToolAccessEnforcement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_denial: Option<crate::traits::ToolAccessDenial>,
     #[serde(default)]
     pub contract_rejected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,6 +380,7 @@ impl ToolReceiptV1 {
             receipt_kind: metadata.receipt_kind,
             access_manifest: metadata.access_manifest.clone(),
             access_enforcement: metadata.access_enforcement,
+            access_denial: metadata.access_denial.clone(),
             contract_rejected: metadata.contract_rejected,
             effective_tool_name: metadata.effective_tool_name.clone(),
             idempotency_key,
@@ -403,6 +406,7 @@ impl ToolReceiptV1 {
             receipt_kind: self.receipt_kind,
             access_manifest: self.access_manifest.clone(),
             access_enforcement: self.access_enforcement,
+            access_denial: self.access_denial.clone(),
             outcome_status: Some(self.outcome_status),
             invocation_stage: crate::traits::ToolInvocationStage::Replayed,
             receipt_replayed: true,
@@ -1911,6 +1915,11 @@ mod tests {
             exit_code: Some(0),
             http_status: Some(201),
             access_enforcement: crate::traits::ToolAccessEnforcement::KernelEnforced,
+            access_denial: Some(crate::traits::ToolAccessDenial {
+                reason_code: "filesystem_access_denied".to_string(),
+                enforcement: crate::traits::ToolAccessEnforcement::KernelEnforced,
+                exit_code: Some(1),
+            }),
             contract_rejected: true,
             effective_tool_name: Some("terminal".to_string()),
             result_provenance: Some(crate::traits::ToolResultProvenance {
@@ -1960,6 +1969,13 @@ mod tests {
         assert_eq!(
             replay.access_enforcement,
             crate::traits::ToolAccessEnforcement::KernelEnforced
+        );
+        assert_eq!(
+            replay
+                .access_denial
+                .as_ref()
+                .map(|denial| denial.reason_code.as_str()),
+            Some("filesystem_access_denied")
         );
         assert!(replay.contract_rejected);
         assert_eq!(replay.effective_tool_name.as_deref(), Some("terminal"));

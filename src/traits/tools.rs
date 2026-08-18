@@ -942,6 +942,17 @@ pub enum ToolAccessEnforcement {
     KernelEnforced,
 }
 
+/// Typed diagnostic emitted when a dispatched process is rejected by the
+/// installed filesystem policy. This is audit telemetry only; the manifest
+/// remains the authority and this record never widens it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolAccessDenial {
+    pub reason_code: String,
+    pub enforcement: ToolAccessEnforcement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 impl ToolOutcomeStatus {
     /// Normalize the execution backend's process status convention. Unix
     /// commands that exit normally produce a nonnegative code; the backend
@@ -1012,6 +1023,10 @@ pub struct ToolCallMetadata {
     /// boundary. A populated manifest with `Unknown` is audit data only.
     #[serde(default)]
     pub access_enforcement: ToolAccessEnforcement,
+    /// Kernel/adapter denial details when a dispatched process was prevented
+    /// from opening a path. The declared manifest is retained separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_denial: Option<ToolAccessDenial>,
     /// Authoritative domain outcome when the tool can provide one. Older tools
     /// may omit it; the loop then derives a conservative status from structured
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.

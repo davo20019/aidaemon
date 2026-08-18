@@ -1355,6 +1355,59 @@ impl EventStore {
         .max(0) as u32)
     }
 
+    /// Return the newest typed tool result for an exact task. Recovery paths
+    /// use this durable boundary when a provider/finalizer fails after a tool
+    /// already produced a terminal receipt; they must not depend on the
+    /// in-memory response loop still being alive.
+    pub async fn latest_task_tool_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Option<ToolResultData>> {
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT data
+             FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        raw.map(|data| serde_json::from_str::<ToolResultData>(&data).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Return the newest *completed observation* for an exact task.
+    ///
+    /// A later rejected/blocked proposal is not allowed to erase an earlier
+    /// dispatched terminal receipt.  Recovery therefore walks the durable
+    /// result boundary in reverse and selects the newest typed observation,
+    /// rather than trusting the last row's legacy boolean or prose.  Malformed
+    /// legacy rows are skipped so one old event cannot make a task unrecoverable.
+    pub async fn latest_completed_task_tool_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Option<ToolResultData>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT data
+             FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
+             ORDER BY id DESC",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().find_map(|data| {
+            serde_json::from_str::<ToolResultData>(&data)
+                .ok()
+                .filter(ToolResultData::completed_observation)
+        }))
+    }
+
     /// End-to-end duration from the canonical TaskStart, including bootstrap,
     /// semantic assessment, queue-dispatched work, and finalization.
     pub async fn task_elapsed_secs(
@@ -2784,6 +2837,7 @@ fn is_synthetic_tool_result(tr: &ToolResultData) -> bool {
 }
 
 /// Builder for emitting events with a consistent session context
+#[derive(Clone)]
 pub struct EventEmitter {
     store: Arc<EventStore>,
     session_id: String,
@@ -2875,6 +2929,7 @@ impl EventEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{ToolOutcomeEvidenceSource, ToolReceiptV1};
     use chrono::Duration;
     use serde_json::json;
 
@@ -2884,6 +2939,99 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    #[tokio::test]
+    async fn latest_task_tool_result_reads_the_durable_terminal_boundary() {
+        let (store, _database) = setup_store().await;
+        let session_id = "session-latest-result";
+        let task_id = "task-latest-result";
+        for content in ["first result", "terminal result"] {
+            let metadata = crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                exit_code: Some(0),
+                ..crate::traits::ToolCallMetadata::default()
+            };
+            let receipt = ToolReceiptV1::from_metadata(
+                &metadata,
+                crate::traits::ToolOutcomeStatus::Succeeded,
+                ToolOutcomeEvidenceSource::StructuredMetadata,
+                None,
+            );
+            let result = ToolResultData {
+                message_id: None,
+                tool_call_id: format!("call-{content}"),
+                name: "terminal".to_string(),
+                result: content.to_string(),
+                success: true,
+                duration_ms: 1,
+                error: None,
+                task_id: Some(task_id.to_string()),
+                annotations: Vec::new(),
+                turn_id: None,
+                attachments: Vec::new(),
+                receipt: Some(receipt),
+            };
+            store
+                .append(Event::new(
+                    session_id,
+                    EventType::ToolResult,
+                    serde_json::to_value(result).expect("tool result JSON"),
+                ))
+                .await
+                .expect("append tool result");
+        }
+
+        // A later rejected proposal is not allowed to erase the durable
+        // dispatched observation used by lifecycle recovery.
+        let blocked_metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            contract_rejected: true,
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let blocked = ToolResultData {
+            message_id: None,
+            tool_call_id: "call-blocked-after-terminal".to_string(),
+            name: "terminal".to_string(),
+            result: "proposal rejected before dispatch".to_string(),
+            success: false,
+            duration_ms: 0,
+            error: Some("blocked".to_string()),
+            task_id: Some(task_id.to_string()),
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(ToolReceiptV1::from_metadata(
+                &blocked_metadata,
+                crate::traits::ToolOutcomeStatus::Blocked,
+                ToolOutcomeEvidenceSource::StructuredMetadata,
+                None,
+            )),
+        };
+        store
+            .append(Event::new(
+                session_id,
+                EventType::ToolResult,
+                serde_json::to_value(blocked).expect("blocked result JSON"),
+            ))
+            .await
+            .expect("append blocked result");
+
+        let latest = store
+            .latest_task_tool_result(session_id, task_id)
+            .await
+            .expect("query latest result")
+            .expect("latest result");
+        assert_eq!(latest.result, "proposal rejected before dispatch");
+        assert!(!latest.completed_observation());
+        let completed = store
+            .latest_completed_task_tool_result(session_id, task_id)
+            .await
+            .expect("query completed result")
+            .expect("completed result");
+        assert_eq!(completed.result, "terminal result");
+        assert!(completed.completed_observation());
     }
 
     #[tokio::test]

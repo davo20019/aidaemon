@@ -779,24 +779,33 @@ pub(crate) fn compile_memory_pipeline_policy(
 }
 
 const MAX_PLAN_STEPS: usize = 7;
-// Aggregate semantic-producer deadline. A validated higher-priority producer
-// stops the lane; failover candidates share whatever time remains and are
-// never launched speculatively.
-const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const TASK_RELATIONSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+// Aggregate semantic-producer deadlines. Candidates are bounded failover
+// attempts under one logical producer envelope; valid results are selected by
+// configured priority, never by response wording or latency.
+const TASK_ASSESSMENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const TASK_RELATIONSHIP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Reserve a deterministic share of the remaining aggregate deadline for
-/// every configured producer that has not yet been attempted. Priority
-/// determines selection order, while one slow producer cannot consume the
-/// failover lane's entire owner-visible budget.
+/// Divide the remaining assessment envelope across every candidate that is
+/// still eligible. Unlike the relationship lane, assessment has no arbitrary
+/// minimum: this keeps the helper scalable when a deployment configures more
+/// than three providers instead of silently dropping the tail of the lane.
 fn assessment_attempt_timeout(
     remaining: std::time::Duration,
     candidates_left: usize,
-) -> std::time::Duration {
-    if candidates_left <= 1 {
-        return remaining;
-    }
-    remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX)
+) -> Option<std::time::Duration> {
+    (candidates_left > 0 && !remaining.is_zero())
+        .then(|| remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX))
+}
+
+/// Divide the remaining relationship envelope using the same fair allocator
+/// as the contract lane. A relationship producer is not a special class of
+/// provider: every configured candidate receives a bounded share, and unused
+/// time is naturally returned to later candidates after a fast failure.
+fn relationship_attempt_timeout(
+    remaining: std::time::Duration,
+    candidates_left: usize,
+) -> Option<std::time::Duration> {
+    assessment_attempt_timeout(remaining, candidates_left)
 }
 
 #[derive(Clone, Copy)]
@@ -894,6 +903,7 @@ async fn record_auxiliary_model_call(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_auxiliary_model_failure(
     telemetry: Option<PlannerTelemetryCtx<'_>>,
     call_purpose: &str,
@@ -901,6 +911,7 @@ async fn record_auxiliary_model_failure(
     latency_ms: u64,
     attempt: u32,
     fell_back: bool,
+    est_input_tokens: Option<u32>,
     error: impl Into<String>,
 ) {
     let Some(telemetry) = telemetry else {
@@ -931,7 +942,11 @@ async fn record_auxiliary_model_failure(
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 fresh_input_tokens: None,
-                est_input_tokens: None,
+                // Failed calls cannot report provider usage, but the message
+                // build already gives us a bounded cost estimate. Persist it
+                // as estimate-only telemetry so timeout/error calls are not
+                // invisible in cost reconciliation.
+                est_input_tokens,
                 tool_calls_count: 0,
                 offered_tools: Vec::new(),
                 chosen_tools: Vec::new(),
@@ -1164,7 +1179,10 @@ pub(crate) async fn generate_task_plan(
     let options = crate::traits::ChatOptions {
         response_mode: crate::traits::ResponseMode::JsonObject,
         tool_choice: crate::traits::ToolChoiceMode::None,
-        max_tokens_override: Some(4096),
+        // The contract is intentionally typed and bounded; a 2k output cap is
+        // ample for this schema and avoids spending the entire attempt budget
+        // decoding a verbose planner response.
+        max_tokens_override: Some(2048),
         reasoning_effort_override: Some("low".to_string()),
         // Retries and model failover are owned here so the aggregate deadline
         // covers every physical attempt rather than hiding retries inside a
@@ -1172,120 +1190,75 @@ pub(crate) async fn generate_task_plan(
         single_attempt_fail_closed: true,
         ..crate::traits::ChatOptions::default()
     };
-    enum AssessmentAttempt {
-        Response {
-            candidate_index: usize,
-            model: String,
-            latency_ms: u64,
-            response: ProviderResponse,
-        },
-        ProviderError {
-            candidate_index: usize,
-            model: String,
-            latency_ms: u64,
-            error: String,
-        },
-        Timeout {
-            candidate_index: usize,
-            model: String,
-            latency_ms: u64,
-        },
-    }
-
-    // Semantic assessment is one logical producer, not a quorum. Try the
-    // configured candidates in priority order and stop at the first validated
-    // contract. Parallel hedging previously paid for every losing call and
-    // made a one-command request wait on models whose answer could never be
-    // selected. Failover remains bounded and fully telemetered.
+    // Semantic assessment is one logical producer, not a quorum. Try
+    // configured candidates in priority order and give every remaining
+    // candidate a fair, bounded share of the aggregate envelope. A normal
+    // primary therefore finishes without speculative fallback calls, while a
+    // slow/erroring primary cannot starve the rest of the lane.
     let assessment_deadline = Instant::now() + TASK_ASSESSMENT_TOTAL_TIMEOUT;
     for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let call_start = Instant::now();
-        let remaining = assessment_deadline.saturating_duration_since(call_start);
-        if remaining.is_zero() {
+        let remaining = assessment_deadline.saturating_duration_since(Instant::now());
+        let Some(attempt_timeout) = assessment_attempt_timeout(
+            remaining,
+            model_candidates.len().saturating_sub(candidate_index),
+        ) else {
             break;
-        }
-        let candidates_left = model_candidates.len().saturating_sub(candidate_index);
-        let attempt_timeout = assessment_attempt_timeout(remaining, candidates_left);
-        let attempt = match tokio::time::timeout(
+        };
+        let call_start = Instant::now();
+        let est_input_tokens = Some(
+            crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
+                .min(u32::MAX as usize) as u32,
+        );
+        let response = match tokio::time::timeout(
             attempt_timeout,
             provider.chat_with_options(model, &messages, &[], &options),
         )
         .await
         {
-            Ok(Ok(response)) => AssessmentAttempt::Response {
-                candidate_index,
-                model: model.clone(),
-                latency_ms: call_start.elapsed().as_millis() as u64,
-                response,
-            },
-            Ok(Err(error)) => AssessmentAttempt::ProviderError {
-                candidate_index,
-                model: model.clone(),
-                latency_ms: call_start.elapsed().as_millis() as u64,
-                error: error.to_string(),
-            },
-            Err(_) => AssessmentAttempt::Timeout {
-                candidate_index,
-                model: model.clone(),
-                latency_ms: call_start.elapsed().as_millis() as u64,
-            },
-        };
-        let (candidate_index, model, latency_ms, result) = match attempt {
-            AssessmentAttempt::Response {
-                candidate_index,
-                model,
-                latency_ms,
-                response,
-            } => (candidate_index, model, latency_ms, response),
-            AssessmentAttempt::ProviderError {
-                candidate_index,
-                model,
-                latency_ms,
-                error,
-            } => {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    &model,
-                    latency_ms,
+                    model,
+                    call_start.elapsed().as_millis() as u64,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
+                    est_input_tokens,
                     format!("provider_error: {error}"),
                 )
                 .await;
                 warn!(%error, %model, "Task assessment attempt failed");
                 continue;
             }
-            AssessmentAttempt::Timeout {
-                candidate_index,
-                model,
-                latency_ms,
-            } => {
+            Err(_) => {
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    &model,
-                    latency_ms,
+                    model,
+                    call_start.elapsed().as_millis() as u64,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
+                    est_input_tokens,
                     "timeout",
                 )
                 .await;
                 warn!(
                     %model,
-                    timeout_ms = TASK_ASSESSMENT_TOTAL_TIMEOUT.as_millis(),
+                    timeout_ms = attempt_timeout.as_millis(),
                     "Task assessment attempt timed out"
                 );
                 continue;
             }
         };
-        match decode_task_plan_result(&result, mode) {
+        let latency_ms = call_start.elapsed().as_millis() as u64;
+        match decode_task_plan_result(&response, mode) {
             Ok(plan) => {
                 record_auxiliary_model_call(
                     telemetry,
                     "task_assessment",
-                    &model,
-                    &result,
+                    model,
+                    &response,
                     latency_ms,
                     AuxiliaryAttemptTelemetry {
                         attempt: (candidate_index + 1) as u32,
@@ -1308,8 +1281,8 @@ pub(crate) async fn generate_task_plan(
                 record_auxiliary_model_call(
                     telemetry,
                     "task_assessment",
-                    &model,
-                    &result,
+                    model,
+                    &response,
                     latency_ms,
                     AuxiliaryAttemptTelemetry {
                         attempt: (candidate_index + 1) as u32,
@@ -1329,9 +1302,33 @@ pub(crate) async fn generate_task_plan(
 /// unavailable. This deliberately cannot produce completion obligations,
 /// authority, tool policy, or execution mode. The caller still validates an
 /// exact antecedent against persisted dialogue state before committing it.
+#[cfg(test)]
 pub(crate) async fn generate_task_relationship(
     provider: Arc<dyn ModelProvider>,
     model: &str,
+    user_text: &str,
+    conversation_context: &str,
+    telemetry: Option<PlannerTelemetryCtx<'_>>,
+) -> Option<PlannedTaskShape> {
+    let models = [model.to_string()];
+    generate_task_relationship_candidates(
+        provider,
+        &models,
+        user_text,
+        conversation_context,
+        telemetry,
+    )
+    .await
+}
+
+/// Resolve a dialogue relationship through the configured model lane. This
+/// producer returns only a typed edge; it never installs a task contract or
+/// imports prior authority. Candidates are attempted in configured priority
+/// order, with a bounded fair share so a slow primary cannot starve every
+/// relationship attempt and a fast fallback cannot win by latency alone.
+pub(crate) async fn generate_task_relationship_candidates(
+    provider: Arc<dyn ModelProvider>,
+    model_candidates: &[String],
     user_text: &str,
     conversation_context: &str,
     telemetry: Option<PlannerTelemetryCtx<'_>>,
@@ -1355,104 +1352,151 @@ pub(crate) async fn generate_task_relationship(
         json!({ "role": "system", "content": system }),
         json!({ "role": "user", "content": prompt }),
     ];
-    let call_start = Instant::now();
-    let response = match tokio::time::timeout(
-        TASK_RELATIONSHIP_TIMEOUT,
-        provider.chat(model, &messages, &[]),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            record_auxiliary_model_failure(
+    let est_input_tokens = Some(
+        crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
+            .min(u32::MAX as usize) as u32,
+    );
+    let deadline = Instant::now() + TASK_RELATIONSHIP_TOTAL_TIMEOUT;
+    for (candidate_index, model) in model_candidates.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(attempt_timeout) = relationship_attempt_timeout(
+            remaining,
+            model_candidates.len().saturating_sub(candidate_index),
+        ) else {
+            break;
+        };
+        let call_start = Instant::now();
+        let response =
+            match tokio::time::timeout(attempt_timeout, provider.chat(model, &messages, &[])).await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    record_auxiliary_model_failure(
+                        telemetry,
+                        "task_relationship_fallback",
+                        model,
+                        call_start.elapsed().as_millis() as u64,
+                        (candidate_index + 1) as u32,
+                        candidate_index > 0,
+                        est_input_tokens,
+                        format!("provider_error: {error}"),
+                    )
+                    .await;
+                    warn!(%error, %model, "Task relationship fallback failed");
+                    continue;
+                }
+                Err(_) => {
+                    record_auxiliary_model_failure(
+                        telemetry,
+                        "task_relationship_fallback",
+                        model,
+                        call_start.elapsed().as_millis() as u64,
+                        (candidate_index + 1) as u32,
+                        candidate_index > 0,
+                        est_input_tokens,
+                        "timeout",
+                    )
+                    .await;
+                    warn!(
+                        %model,
+                        timeout_ms = attempt_timeout.as_millis(),
+                        "Task relationship fallback timed out"
+                    );
+                    continue;
+                }
+            };
+        let latency_ms = call_start.elapsed().as_millis() as u64;
+        let Some(json) =
+            crate::utils::extract_json_object(response.content.as_deref().unwrap_or(""))
+        else {
+            record_auxiliary_model_call(
                 telemetry,
                 "task_relationship_fallback",
                 model,
-                call_start.elapsed().as_millis() as u64,
-                1,
-                false,
-                format!("provider_error: {error}"),
+                &response,
+                latency_ms,
+                AuxiliaryAttemptTelemetry {
+                    attempt: (candidate_index + 1) as u32,
+                    fell_back: candidate_index > 0,
+                    validation_error: Some("missing_json_object".to_string()),
+                },
             )
             .await;
-            warn!(%error, "Task relationship fallback failed");
-            return None;
-        }
-        Err(_) => {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_relationship_fallback",
-                model,
-                call_start.elapsed().as_millis() as u64,
-                1,
-                false,
-                "timeout",
+            continue;
+        };
+        let parsed: TaskRelationshipResponse = match serde_json::from_str(&json) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                record_auxiliary_model_call(
+                    telemetry,
+                    "task_relationship_fallback",
+                    model,
+                    &response,
+                    latency_ms,
+                    AuxiliaryAttemptTelemetry {
+                        attempt: (candidate_index + 1) as u32,
+                        fell_back: candidate_index > 0,
+                        validation_error: Some(error.to_string()),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let valid = parsed.schema_version == TASK_RELATIONSHIP_SCHEMA_VERSION
+            && matches!(parsed.confidence.as_str(), "low" | "medium" | "high")
+            && matches!(
+                parsed.request_relationship.as_str(),
+                "new_request" | "continuation" | "clarification_answer" | "courtesy"
             )
-            .await;
-            warn!(
-                timeout_secs = TASK_RELATIONSHIP_TIMEOUT.as_secs(),
-                "Task relationship fallback timed out"
+            && matches!(
+                parsed.semantic_scope.as_str(),
+                "none"
+                    | "goal_state"
+                    | "user_memory"
+                    | "conversation_history"
+                    | "external_remote"
+                    | "local_workspace"
+                    | "host_local"
             );
-            return None;
+        let antecedent = parsed
+            .antecedent_user_message_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        // The model owns semantic classification, not graph identity. An exact
+        // message ID is useful evidence when it is available, but omission is
+        // not a classification failure: the state resolver can bind a
+        // continuation only when exactly one persisted request node is possible.
+        let valid =
+            valid && (parsed.request_relationship == "continuation" || antecedent.is_none());
+        record_auxiliary_model_call(
+            telemetry,
+            "task_relationship_fallback",
+            model,
+            &response,
+            latency_ms,
+            AuxiliaryAttemptTelemetry {
+                attempt: (candidate_index + 1) as u32,
+                fell_back: candidate_index > 0,
+                validation_error: (!valid).then(|| "invalid_typed_relationship".to_string()),
+            },
+        )
+        .await;
+        if !valid {
+            continue;
         }
-    };
-    record_auxiliary_model_call(
-        telemetry,
-        "task_relationship_fallback",
-        model,
-        &response,
-        call_start.elapsed().as_millis() as u64,
-        AuxiliaryAttemptTelemetry {
-            attempt: 1,
-            fell_back: false,
-            validation_error: None,
-        },
-    )
-    .await;
-
-    let json = crate::utils::extract_json_object(response.content.as_deref().unwrap_or(""))?;
-    let parsed: TaskRelationshipResponse = serde_json::from_str(&json).ok()?;
-    if parsed.schema_version != TASK_RELATIONSHIP_SCHEMA_VERSION
-        || !matches!(parsed.confidence.as_str(), "low" | "medium" | "high")
-        || !matches!(
-            parsed.request_relationship.as_str(),
-            "new_request" | "continuation" | "clarification_answer" | "courtesy"
-        )
-        || !matches!(
-            parsed.semantic_scope.as_str(),
-            "none"
-                | "goal_state"
-                | "user_memory"
-                | "conversation_history"
-                | "external_remote"
-                | "local_workspace"
-                | "host_local"
-        )
-    {
-        return None;
+        return Some(PlannedTaskShape {
+            execution_mode: None,
+            confidence: Some(parsed.confidence),
+            independent_workstreams: None,
+            requires_background_continuation: None,
+            continue_inline_after_background_start: None,
+            request_relationship: Some(parsed.request_relationship),
+            antecedent_user_message_id: antecedent,
+            semantic_scope: Some(parsed.semantic_scope),
+        });
     }
-    let antecedent = parsed
-        .antecedent_user_message_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    // The model owns semantic classification, not graph identity. An exact
-    // message ID is useful evidence when it is available, but omission is not
-    // a classification failure: the deterministic dialogue-state resolver
-    // can bind a continuation only when exactly one persisted request node is
-    // possible. Non-continuations must never carry an adoption edge.
-    if parsed.request_relationship != "continuation" && antecedent.is_some() {
-        return None;
-    }
-
-    Some(PlannedTaskShape {
-        execution_mode: None,
-        confidence: Some(parsed.confidence),
-        independent_workstreams: None,
-        requires_background_continuation: None,
-        continue_inline_after_background_start: None,
-        request_relationship: Some(parsed.request_relationship),
-        antecedent_user_message_id: antecedent,
-        semantic_scope: Some(parsed.semantic_scope),
-    })
+    None
 }
 
 /// Determine whether a turn bypasses the optional task-start assessment.
@@ -2215,11 +2259,29 @@ mod tests {
     }
 
     #[test]
-    fn semantic_attempt_budget_reserves_time_for_every_remaining_failover() {
-        let total = std::time::Duration::from_secs(20);
-        assert_eq!(assessment_attempt_timeout(total, 1), total);
-        assert_eq!(assessment_attempt_timeout(total, 2), total / 2);
-        assert_eq!(assessment_attempt_timeout(total, 4), total / 4);
+    fn assessment_attempt_budget_covers_all_configured_candidates() {
+        let total = std::time::Duration::from_secs(45);
+        assert_eq!(assessment_attempt_timeout(total, 3), Some(total / 3));
+        assert_eq!(assessment_attempt_timeout(total, 4), Some(total / 4));
+        assert_eq!(
+            assessment_attempt_timeout(std::time::Duration::ZERO, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn relationship_attempt_budget_reserves_time_for_every_remaining_failover() {
+        let total = std::time::Duration::from_secs(45);
+        assert_eq!(relationship_attempt_timeout(total, 3), Some(total / 3));
+        assert_eq!(
+            relationship_attempt_timeout(std::time::Duration::from_secs(30), 2),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            relationship_attempt_timeout(std::time::Duration::from_secs(14), 1),
+            Some(std::time::Duration::from_secs(14)),
+            "the final configured candidate receives all remaining time"
+        );
     }
 
     #[tokio::test]
@@ -2289,10 +2351,8 @@ mod tests {
         .expect("assessment");
 
         assert_eq!(assessment.goal, "primary contract");
-        assert_eq!(
-            provider.calls.lock().expect("call ledger").as_slice(),
-            ["configured-primary"]
-        );
+        let calls = provider.calls.lock().expect("call ledger");
+        assert_eq!(calls.as_slice(), ["configured-primary"]);
     }
 
     #[tokio::test]

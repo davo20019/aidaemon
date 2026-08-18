@@ -171,6 +171,31 @@ async fn finalize_turn_assessment(
             )
         } else if typed_clarification {
             ("clarification_answer", "none", "typed_clarification_edge")
+        } else if initial_turn_context.followup_mode
+            == Some(crate::agent::followup::FollowupMode::Followup)
+        {
+            // The ingress dialogue reducer already persisted this turn as a
+            // follow-up when an unresolved request was present. If the state
+            // graph has exactly one candidate, that typed edge is sufficient
+            // to adopt it; requiring a second model call here made continuity
+            // depend on a fragile relationship timeout. Ambiguous topology
+            // remains fail-closed and cannot inherit arbitrary context.
+            let resolved_antecedent = dialogue_state.as_ref().and_then(|state| {
+                crate::agent::dialogue_state::unambiguous_request_antecedent(state)
+            });
+            if let Some(antecedent) = resolved_antecedent {
+                committed_antecedent_user_message_id = Some(antecedent.user_message_id.clone());
+                (
+                    "continuation",
+                    antecedent
+                        .semantic_scope
+                        .map(|scope| scope.as_str())
+                        .unwrap_or("none"),
+                    "typed_followup_topology_edge",
+                )
+            } else {
+                ("new_request", "none", "typed_followup_ambiguous_antecedent")
+            }
         } else {
             // A failed/unavailable language assessment cannot authorize an
             // adoption edge. Ordinary ingress therefore fails closed to a
@@ -1256,11 +1281,24 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 planner_telemetry,
             );
             let relationship_future = async {
+                // Ingress already reduced an unresolved request to a typed
+                // follow-up/clarification edge. Do not make that persisted
+                // topology depend on a second language call; the finalizer
+                // resolves the exact graph node (or fails closed on ambiguity).
+                if matches!(
+                    initial_turn_context.followup_mode,
+                    Some(
+                        crate::agent::followup::FollowupMode::Followup
+                            | crate::agent::followup::FollowupMode::ClarificationAnswer
+                    )
+                ) {
+                    return None;
+                }
                 match planner_context.as_deref() {
                     Some(context) => {
-                        super::task_planning::generate_task_relationship(
+                        super::task_planning::generate_task_relationship_candidates(
                             llm_provider.clone(),
-                            planner_model,
+                            &planner_models,
                             user_text,
                             context,
                             planner_telemetry,

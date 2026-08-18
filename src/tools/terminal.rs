@@ -1768,6 +1768,8 @@ async fn confined_terminal_execution_request_inner(
     // credentials. Resolve exact machine invocations and add only registered,
     // read-only runtime roots/caches.
     let runtime_support = native_sandbox_runtime_support(backend, shell_source).await?;
+    let mut runtime_support = runtime_support;
+    add_manifest_runtime_environment(backend, &writes, &mut runtime_support).await;
     for path in &runtime_support.read_paths {
         if !reads.contains(path) && !writes.contains(path) {
             reads.push(path.clone());
@@ -2305,6 +2307,59 @@ async fn native_sandbox_runtime_support(
     #[cfg(target_os = "macos")]
     add_macos_developer_runtime_support(backend, &mut support).await;
     Ok(support)
+}
+
+/// Give package/build processes a task-scoped scratch location without
+/// reopening the host's global `/tmp`. The location is selected only from an
+/// already-declared writable directory in the access manifest; read-only and
+/// exact-file calls receive no ambient temporary write authority.
+async fn add_manifest_runtime_environment(
+    backend: &SharedExecutionBackend,
+    write_paths: &[String],
+    support: &mut NativeSandboxRuntimeSupport,
+) {
+    let mut scratch_root = None;
+    for path in write_paths {
+        let candidate = crate::execution::BackendPath::new(path.clone());
+        // This helper is called after the manifest has been resolved. We only
+        // select an existing directory, avoiding any inference from command
+        // text or a file-name convention.
+        if backend
+            .metadata(&candidate)
+            .await
+            .ok()
+            .is_some_and(|metadata| metadata.is_dir())
+        {
+            scratch_root = Some(candidate.to_string());
+            break;
+        }
+    }
+    let scratch_root = scratch_root.or_else(|| {
+        // A disposable package/build root is often intentionally absent at
+        // planning time and created by the authorized script itself. Any
+        // resolved executable with a registered runtime prefix can use that
+        // future declared root; the decision is based on the execution
+        // backend's capability graph, never on request wording or a list of
+        // package-manager names.
+        (!support.path_prefixes.is_empty())
+            .then(|| write_paths.first().cloned())
+            .flatten()
+    });
+    let Some(scratch_root) = scratch_root else {
+        return;
+    };
+
+    for variable in ["TMPDIR", "TMP", "TEMP"] {
+        support
+            .environment
+            .insert(variable.to_string(), scratch_root.clone());
+    }
+    // XDG-aware build/package tools keep their cache inside the same declared
+    // lane instead of falling back to the owner's home directory. This is a
+    // capability projection, not a package-specific command rewrite.
+    support
+        .environment
+        .insert("XDG_CACHE_HOME".to_string(), scratch_root);
 }
 
 fn native_sandbox_search_path(prefixes: &[String]) -> String {
@@ -5908,11 +5963,12 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
 }
 
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
+    let enforcement = confined_process_access_enforcement();
     ToolCallMetadata {
         outcome_status: exit_code.map(ToolOutcomeStatus::from_process_exit_code),
         exit_code,
         invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-        access_enforcement: confined_process_access_enforcement(),
+        access_enforcement: enforcement,
         timed_out: false,
         background_started: false,
         detached: false,
@@ -6798,6 +6854,27 @@ mod tests {
         assert!(!serialized.contains("credentials.toml"));
         assert!(!serialized.contains(&format!("\"path\":\"{}\"", backend.home_hint())));
         let sandbox_path = request.env.get("PATH").cloned().unwrap_or_default();
+        let canonical_cwd = backend
+            .canonicalize(&crate::execution::BackendPath::new(cwd.clone()))
+            .await
+            .expect("canonical project root")
+            .to_string();
+        assert_eq!(
+            request.env.get("TMPDIR").map(String::as_str),
+            Some(canonical_cwd.as_str())
+        );
+        assert_eq!(
+            request.env.get("TMP").map(String::as_str),
+            Some(canonical_cwd.as_str())
+        );
+        assert_eq!(
+            request.env.get("TEMP").map(String::as_str),
+            Some(canonical_cwd.as_str())
+        );
+        assert_eq!(
+            request.env.get("XDG_CACHE_HOME").map(String::as_str),
+            Some(canonical_cwd.as_str())
+        );
         let git_config = backend.home_hint().join(".gitconfig").to_string();
         if backend
             .metadata(&crate::execution::BackendPath::new(git_config.clone()))

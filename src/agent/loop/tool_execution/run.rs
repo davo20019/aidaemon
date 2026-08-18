@@ -2650,7 +2650,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 completion_progress.successful_external_mutation_count,
                 completion_progress.failed_external_mutation_count,
                 &result_text,
-            ) {
+            ) || (outcome_satisfied
+                && !background_detached
+                && semantics.observes_state()
+                // A typed terminal observation is enough to preserve a
+                // receipt-backed response when the next model/finalizer call
+                // fails. This deliberately does not invent a completion
+                // obligation: it only makes an already-dispatched result
+                // deliverable.
+                && !completion_progress.evidence_obligation_ids.is_empty()
+                && observation_result_available)
+            {
                 pending_external_action_ack =
                     Some(build_external_action_completion_ack(&result_text));
             }

@@ -583,7 +583,12 @@ impl Agent {
         // guard) because the guard pattern is unsound across `.await` points —
         // it would leak the span onto whatever task the worker thread polls next.
         let turn_span = tracing::info_span!("turn", task_id = %task_id, session_id = %session_id);
-        tracing::Instrument::instrument(async move {
+        // Phase errors must still cross the same terminal lifecycle boundary.
+        // Keep separate identities for the outer recovery guard; the
+        // instrumented loop owns the working copies below.
+        let unhandled_error_emitter = emitter.clone();
+        let unhandled_error_task_id = task_id.clone();
+        let loop_result = tracing::Instrument::instrument(async move {
         let mut last_progress_summary = Instant::now();
         const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
         let mut approach_pivots_used: usize = 0;
@@ -2113,7 +2118,190 @@ impl Agent {
             );
         }
         }, turn_span)
-        .await
+        .await;
+
+        let Err(error) = loop_result else {
+            return loop_result;
+        };
+
+        // A provider/finalizer or phase error used to bubble out before
+        // TaskEnd, leaving the task running/undelivered and consuming no
+        // harness aggregate. The persisted event stream is authoritative, so
+        // synthesize a terminal record only when no earlier boundary did so.
+        let task_end_count = self
+            .event_store
+            .task_event_count(
+                session_id,
+                &unhandled_error_task_id,
+                crate::events::EventType::TaskEnd,
+            )
+            .await
+            .unwrap_or_default();
+        let response_message_count = self
+            .event_store
+            .task_response_message_ids(&unhandled_error_task_id)
+            .await
+            .map(|ids| ids.len() as u32)
+            .unwrap_or_default();
+        // A terminal event without its response is an incomplete delivery
+        // boundary, not a reason to abandon the task. Preserve the one-terminal
+        // transition and attach a deterministic receipt-backed response below;
+        // a terminal event that already has a response remains idempotent and
+        // is returned as the original error for the caller's normal handling.
+        let terminal_boundary_already_closed = task_end_count > 0;
+        if terminal_boundary_already_closed && response_message_count > 0 {
+            return Err(error);
+        }
+
+        let tool_call_count = self
+            .event_store
+            .task_event_count(
+                session_id,
+                &unhandled_error_task_id,
+                crate::events::EventType::ToolCall,
+            )
+            .await
+            .unwrap_or_default();
+        // Select the newest completed observation, not merely the newest
+        // result row: a later rejected proposal cannot erase an earlier
+        // dispatched receipt that is sufficient to answer the user.
+        let latest_result = self
+            .event_store
+            .latest_completed_task_tool_result(session_id, &unhandled_error_task_id)
+            .await
+            .ok()
+            .flatten();
+        let receipt_closed = latest_result.as_ref().is_some_and(|result| {
+            result.completed_observation()
+                && result.receipt.as_ref().is_some_and(|receipt| {
+                    // A proof-bound receipt is the strongest closeout. When
+                    // assessment was unavailable, an observation-only typed
+                    // receipt is still sufficient to deliver its own state;
+                    // mutation receipts remain partial until an explicit
+                    // obligation/effect proof is present.
+                    !receipt.completion_obligation_ids.is_empty()
+                        || (receipt.semantics.observes_state()
+                            && !receipt.semantics.mutates_state())
+                })
+        });
+        let receipt_reply = latest_result.as_ref().and_then(|result| {
+            crate::agent::completion_checks::build_tool_output_completion_reply(
+                &result.name,
+                &result.result,
+                false,
+            )
+        });
+        let (reply, outcome, status) = if let Some(result) = latest_result
+            .as_ref()
+            .filter(|result| result.completed_observation())
+        {
+            let reply = receipt_reply.unwrap_or_else(|| {
+                format!(
+                    "The {} operation completed with outcome `{}`. The response provider failed before it could add a summary; the typed result is preserved.",
+                    result.name,
+                    result.outcome_status().as_str()
+                )
+            });
+            (
+                reply,
+                if receipt_closed {
+                    TaskOutcome::Succeeded
+                } else {
+                    TaskOutcome::Partial
+                },
+                crate::events::TaskStatus::Completed,
+            )
+        } else if tool_call_count > 0 {
+            (
+                "A tool operation was attempted, but the response provider failed before a confirmed terminal result was available. The durable attempt is preserved for recovery.".to_string(),
+                TaskOutcome::Failed,
+                crate::events::TaskStatus::Failed,
+            )
+        } else {
+            (
+                "I couldn't complete this request because the response provider failed before a confirmed result was available.".to_string(),
+                TaskOutcome::Failed,
+                crate::events::TaskStatus::Failed,
+            )
+        };
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(reply.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.3,
+            ..Message::runtime_defaults()
+        };
+        if let Err(append_error) = self
+            .append_assistant_message_with_event(
+                &unhandled_error_emitter,
+                &assistant_msg,
+                "lifecycle_failure_fallback",
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(
+                task_id = %unhandled_error_task_id,
+                error = %append_error,
+                "Failed to attach lifecycle recovery response"
+            );
+            return Err(error.context("lifecycle recovery response could not be persisted"));
+        }
+        // `emit_task_end` owns semantic non-success accounting for completed
+        // status projections. Preserve the legacy explicit increment only for
+        // this new hard-failed recovery path, whose transport status is
+        // intentionally `Failed` and is excluded from that central branch.
+        // If an earlier phase already emitted TaskEnd, its accounting has
+        // already happened; this pass only repairs the missing response.
+        if !terminal_boundary_already_closed && status == crate::events::TaskStatus::Failed {
+            if let Some(efficiency) = self.task_efficiency_data(&unhandled_error_task_id).await {
+                crate::agent::record_failed_task_tokens(
+                    efficiency
+                        .input_tokens
+                        .saturating_add(efficiency.output_tokens),
+                );
+            }
+        }
+        if !terminal_boundary_already_closed {
+            self.emit_task_end(
+                &unhandled_error_emitter,
+                &unhandled_error_task_id,
+                status,
+                outcome,
+                task_start,
+                0,
+                tool_call_count as usize,
+                Some(error.to_string()),
+                Some(reply.clone()),
+            )
+            .await;
+        } else {
+            // Keep the repair visible without appending a second terminal
+            // transition (the lifecycle projection intentionally permits only
+            // one). The response event is now the authoritative missing
+            // delivery edge for the already-closed task.
+            self.emit_decision_point(
+                &unhandled_error_emitter,
+                &unhandled_error_task_id,
+                0,
+                crate::events::DecisionType::GateTelemetry,
+                "Attached lifecycle recovery response after terminal boundary".to_string(),
+                json!({
+                    "condition": "task_response_attached_after_terminal",
+                    "terminal_boundary_already_closed": true,
+                    "response_message_count_before": response_message_count,
+                    "receipt_backed": latest_result.is_some(),
+                }),
+            )
+            .await;
+        }
+        Ok(reply)
     }
 }
 

@@ -83,7 +83,7 @@ pub use tools::{
     semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
     AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
     EvidenceTemporalScope, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolAccessEnforcement,
+    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolAccessDenial, ToolAccessEnforcement,
     ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
     ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,

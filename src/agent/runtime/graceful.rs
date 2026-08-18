@@ -1112,6 +1112,20 @@ impl Agent {
             .flatten()
             .unwrap_or_else(|| task_start.elapsed().as_secs());
         let efficiency = self.task_efficiency_data(task_id).await;
+        // Task outcome is the authoritative failure signal.  Some bounded
+        // closeout paths intentionally return a user-facing fallback with a
+        // `Completed` transport status while the semantic outcome is
+        // `Failed`; recording only from the transport status silently drops
+        // their token cost from policy telemetry.  Existing `Failed` paths
+        // retain their legacy pre-boundary increment, so this branch covers
+        // only the previously uncounted status projection.
+        if !outcome.task_success() && status != TaskStatus::Failed {
+            let tokens = efficiency
+                .as_ref()
+                .map(|data| data.input_tokens.saturating_add(data.output_tokens))
+                .unwrap_or_default();
+            super::policy_metrics::record_failed_task_tokens(tokens);
+        }
         let harness_eval_snapshot = if self.harness_eval_config.enabled {
             let acc = self.harness_eval.write().await.take();
             acc.map(|accumulator| {
@@ -1207,7 +1221,7 @@ impl Agent {
     /// log it. When the turn looks inefficient (fallbacks, retries, heavy
     /// iteration loops, or large token-estimate drift), also emit a warning
     /// `DecisionPoint` so the agent's own `self_diagnose` surfaces it.
-    async fn task_efficiency_data(
+    pub(in crate::agent) async fn task_efficiency_data(
         &self,
         task_id: &str,
     ) -> Option<crate::events::TaskEfficiencyData> {

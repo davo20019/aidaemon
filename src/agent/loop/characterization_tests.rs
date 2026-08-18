@@ -1003,7 +1003,6 @@ async fn completed_negative_observation_is_reportable_when_semantic_assessment_i
 }
 
 #[tokio::test]
-#[ignore = "tokens_failed_tasks_total / no_progress_iterations_total not yet wired to agent loop"]
 async fn failed_task_and_no_progress_metrics_are_observable() {
     let before = policy_metrics_snapshot();
 
