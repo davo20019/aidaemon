@@ -330,7 +330,6 @@ pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) ->
 
 /// Hard completion decisions require a complete semantic contract. This is a
 /// schema/invariant check, not a text classifier.
-#[cfg(test)]
 pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> bool {
     let Some(expects_mutation) = signals.expects_mutation else {
         return false;
@@ -507,6 +506,16 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                         })
                         || receipt.exit_codes.len() > 16
                         || receipt.outcome_statuses.len() > 6
+                        || receipt
+                            .min_invocations
+                            .is_some_and(|limit| !(1..=16).contains(&limit))
+                        || receipt
+                            .max_invocations
+                            .is_some_and(|limit| !(1..=16).contains(&limit))
+                        || receipt
+                            .min_invocations
+                            .zip(receipt.max_invocations)
+                            .is_some_and(|(minimum, maximum)| minimum > maximum)
                 })
                 // Outcome observations are receipt facts. Requiring their
                 // labels to appear in returned content recreates a second,
@@ -535,6 +544,16 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                 })
                 || receipt.exit_codes.len() > 16
                 || receipt.outcome_statuses.len() > 6
+                || receipt
+                    .min_invocations
+                    .is_some_and(|limit| !(1..=16).contains(&limit))
+                || receipt
+                    .max_invocations
+                    .is_some_and(|limit| !(1..=16).contains(&limit))
+                || receipt
+                    .min_invocations
+                    .zip(receipt.max_invocations)
+                    .is_some_and(|(minimum, maximum)| minimum > maximum)
                 || tool_scope == "restricted"
                     && receipt
                         .tool_names
@@ -632,7 +651,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 11;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 12;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -664,7 +683,7 @@ fn decode_task_plan_response(envelope: &Value) -> Option<TaskPlanResponse> {
 fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
     match parsed.schema_version {
         TASK_CONTRACT_SCHEMA_VERSION => Some(parsed),
-        7..=10 => {
+        7..=11 => {
             if let Some(contract) = parsed.contract.as_mut() {
                 let invocations = contract.required_invocations.get_or_insert_with(Vec::new);
                 for requirement in contract
@@ -755,6 +774,13 @@ fn decode_task_plan_result(
             "unsupported_schema_version:{received_schema_version};supported:{TASK_CONTRACT_SCHEMA_VERSION}"
         )
     })?;
+    if parsed
+        .contract
+        .as_ref()
+        .is_some_and(|contract| !planned_contract_is_complete(contract))
+    {
+        return Err("incomplete_task_contract".to_string());
+    }
     if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return Err("empty_semantic_envelope".to_string());
     }
@@ -1115,7 +1141,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 11,\n\
+           \"schema_version\": 12,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -1147,6 +1173,7 @@ pub(crate) async fn generate_task_plan(
                    \"exit_codes\": [0],\n\
                    \"outcome_condition\": \"succeeded\",\n\
                    \"requires_output\": false,\n\
+                   \"min_invocations\": null,\n\
                    \"max_invocations\": null\n\
                  }}\n\
                }}\n\
@@ -1157,6 +1184,7 @@ pub(crate) async fn generate_task_plan(
                  \"exit_codes\": [0],\n\
                  \"outcome_condition\": \"succeeded\",\n\
                  \"requires_output\": false,\n\
+                 \"min_invocations\": null,\n\
                  \"max_invocations\": null\n\
                }}\n\
              ],\n\
@@ -1260,8 +1288,11 @@ pub(crate) async fn generate_task_plan(
            failure would satisfy the request without predetermining which execution boundary produces it. \
            Do not emit low-level outcome_statuses or contract_rejected fields; the deterministic reducer \
            evaluates this semantic condition against the typed receipt protocol. \
-           max_invocations is the positive maximum number of tool-call proposals for that operation; set it \
-           only when the current request explicitly limits call count or forbids retries, otherwise null. \
+           min_invocations is the positive minimum number of distinct matching terminal receipts required; \
+           max_invocations is the positive maximum number of tool-call proposals for that obligation. When \
+           the current request specifies an exact call count, set both to that count. Set only max_invocations \
+           when the request merely caps attempts or forbids retries, and leave both null when it specifies no \
+           cardinality. One receipt never proves a minimum greater than one. \
            Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
            nonempty receipt and required_content_markers=[]. Never translate receipt facts into prose markers.\n\
          - filesystem_access is the task's least-privilege local access manifest. Put exact local paths \
@@ -2456,6 +2487,51 @@ mod tests {
     }
 
     #[test]
+    fn live_decoder_rejects_an_observation_contract_without_provable_needs() {
+        let response = crate::testing::MockProvider::text_response(
+            &serde_json::to_string(&json!({
+                "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+                "goal": "Audit several independent runtime facts",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true,
+                    "required_effects": [],
+                    "mutation_scope": "read_only",
+                    "forbidden_actions": [],
+                    "tool_scope": "allowed",
+                    "allowed_tool_names": [],
+                    "forbidden_tool_scopes": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [],
+                    "filesystem_access": {},
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "continue_inline_after_background_start": false
+                }
+            }))
+            .expect("json"),
+        );
+
+        assert_eq!(
+            decode_task_plan_result(&response, TaskAssessmentMode::AutonomousRouting)
+                .expect_err("missing proof propositions must fail live decoding"),
+            "incomplete_task_contract"
+        );
+    }
+
+    #[test]
     fn memory_policy_is_compiled_once_from_typed_task_capabilities() {
         let current_contract = crate::agent::CompletionContract::default();
         assert_eq!(
@@ -2590,16 +2666,35 @@ mod tests {
     async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 11,
+                "schema_version": 12,
                 "goal": "Update one file",
                 "steps": [{"description": "Micromanaged step", "tool_hint": "edit_file"}],
                 "success_criteria": ["Micromanaged criterion"],
                 "contract": {
+                    "confidence": "high",
                     "task_kind": "change",
                     "expects_mutation": true,
                     "requires_observation": true,
+                    "required_effects": ["local_source_write"],
                     "mutation_scope": "allowed",
-                    "forbidden_actions": []
+                    "forbidden_actions": [],
+                    "tool_scope": "allowed",
+                    "allowed_tool_names": [],
+                    "forbidden_tool_scopes": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [{
+                        "summary": "Verify the current file content",
+                        "acceptable_scopes": ["local_workspace"],
+                        "purpose": "content",
+                        "minimum_authority": "direct",
+                        "temporal_scope": "current",
+                        "required_content_markers": []
+                    }],
+                    "required_invocations": [],
+                    "filesystem_access": {},
+                    "project_reference": null
                 },
                 "task_shape": {
                     "execution_mode": "inline",
@@ -2830,7 +2925,7 @@ mod tests {
     async fn guided_assessment_retains_concrete_plan() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 9,
+                "schema_version": 12,
                 "goal": "Update one file",
                 "steps": [
                     {"description": "Inspect the file", "tool_hint": "read_file"},
@@ -2838,11 +2933,30 @@ mod tests {
                 ],
                 "success_criteria": ["The requested value is present"],
                 "contract": {
+                    "confidence": "high",
                     "task_kind": "change",
                     "expects_mutation": true,
                     "requires_observation": true,
+                    "required_effects": ["local_source_write"],
                     "mutation_scope": "allowed",
-                    "forbidden_actions": []
+                    "forbidden_actions": [],
+                    "tool_scope": "allowed",
+                    "allowed_tool_names": [],
+                    "forbidden_tool_scopes": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [{
+                        "summary": "Verify the current file content",
+                        "acceptable_scopes": ["local_workspace"],
+                        "purpose": "content",
+                        "minimum_authority": "direct",
+                        "temporal_scope": "current",
+                        "required_content_markers": []
+                    }],
+                    "required_invocations": [],
+                    "filesystem_access": {},
+                    "project_reference": null
                 },
                 "task_shape": {
                     "execution_mode": "inline",

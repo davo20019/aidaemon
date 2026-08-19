@@ -340,8 +340,15 @@ fn valid_receipt(
         && receipt.exit_codes.len() <= 16
         && receipt.outcome_statuses.len() <= 6
         && receipt
+            .min_invocations
+            .is_none_or(|limit| (1..=16).contains(&limit))
+        && receipt
             .max_invocations
             .is_none_or(|limit| (1..=16).contains(&limit))
+        && receipt
+            .min_invocations
+            .zip(receipt.max_invocations)
+            .is_none_or(|(minimum, maximum)| minimum <= maximum)
 }
 
 /// Normalize dependent receipt fields against the runtime's typed process
@@ -1069,6 +1076,7 @@ mod tests {
             outcome_condition: None,
             requires_output: true,
             contract_rejected: Some(false),
+            min_invocations: None,
             max_invocations: None,
         }]);
 

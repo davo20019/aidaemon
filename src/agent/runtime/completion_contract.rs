@@ -1286,6 +1286,10 @@ pub(super) struct CompletionProgress {
     /// One proof-graph obligation per `CompletionContract::evidence_requirements`
     /// entry, preserving index alignment for receipt matching.
     pub(in crate::agent) evidence_obligation_ids: Vec<String>,
+    /// Distinct task-local receipts accumulated for each evidence obligation.
+    /// The graph edge is installed only after the predicate's typed minimum
+    /// cardinality is reached.
+    pub(in crate::agent) evidence_receipt_ids: Vec<Vec<String>>,
 }
 
 impl CompletionProgress {
@@ -1341,6 +1345,7 @@ impl CompletionProgress {
         }
 
         if contract.requires_observation && !contract.evidence_requirements.is_empty() {
+            self.evidence_receipt_ids = vec![Vec::new(); contract.evidence_requirements.len()];
             for (index, _) in contract.evidence_requirements.iter().enumerate() {
                 let id = self.scoped_node_id(&format!("obligation:evidence:{index}"));
                 self.proof_graph.add_node(
@@ -1573,8 +1578,27 @@ impl CompletionProgress {
         }
 
         if !contract.evidence_requirements.is_empty() {
+            for index in matched_requirement_indices {
+                let Some(receipts) = self.evidence_receipt_ids.get_mut(*index) else {
+                    continue;
+                };
+                if !receipts.iter().any(|receipt| receipt == tool_call_id) {
+                    receipts.push(tool_call_id.to_string());
+                }
+            }
             let obligation_ids = matched_requirement_indices
                 .iter()
+                .filter(|index| {
+                    let minimum = contract
+                        .evidence_requirements
+                        .get(**index)
+                        .and_then(|requirement| requirement.receipt.as_ref())
+                        .and_then(|predicate| predicate.min_invocations)
+                        .unwrap_or(1);
+                    self.evidence_receipt_ids
+                        .get(**index)
+                        .is_some_and(|receipts| receipts.len() >= minimum)
+                })
                 .filter_map(|index| self.evidence_obligation_ids.get(*index))
                 .filter(|id| self.proof_graph.state(id) != Some(ExecutionNodeState::Satisfied))
                 .cloned()
@@ -3820,6 +3844,43 @@ mod tests {
             ["task:test-task/support:evidence:read-current-state"]
         );
         assert_eq!(progress.satisfying_receipt_ids(), ["read-current-state"]);
+    }
+
+    #[test]
+    fn evidence_graph_waits_for_minimum_distinct_receipt_cardinality() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Observe three machine results".to_string(),
+                acceptable_scopes: Vec::new(),
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                required_content_markers: Vec::new(),
+                receipt: Some(crate::traits::RequestReceiptPredicate {
+                    tool_names: vec!["terminal".to_string()],
+                    min_invocations: Some(3),
+                    max_invocations: Some(3),
+                    ..Default::default()
+                }),
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut progress = CompletionProgress::new(&contract, "test-task");
+
+        progress.mark_observation_receipt(&contract, &[0], false, "first");
+        progress.mark_observation_receipt(&contract, &[0], false, "second");
+        assert_eq!(progress.satisfied_evidence_requirements(), 0);
+        assert!(progress.verification_pending);
+
+        // Replaying the same receipt is idempotent and does not advance count.
+        progress.mark_observation_receipt(&contract, &[0], false, "second");
+        assert_eq!(progress.satisfied_evidence_requirements(), 0);
+
+        progress.mark_observation_receipt(&contract, &[0], false, "third");
+        assert_eq!(progress.satisfied_evidence_requirements(), 1);
+        assert!(!progress.verification_pending);
     }
 
     #[test]

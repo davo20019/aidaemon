@@ -1512,22 +1512,28 @@ pub fn compile_step_execution_plan(
     capabilities: ToolCapabilities,
     allowed_project_scopes: &[String],
 ) -> StepExecutionPlan {
-    let expected_targets = if semantics.mutates_state()
-        && (access_manifest.execution_cwd.is_some()
-            || !access_manifest.read_targets.is_empty()
-            || !access_manifest.write_targets.is_empty())
-    {
-        access_manifest.write_targets.clone()
-    } else if !semantics.mutates_state() && !access_manifest.read_targets.is_empty() {
-        access_manifest.read_targets.clone()
+    let has_access_manifest = access_manifest.execution_cwd.is_some()
+        || !access_manifest.read_targets.is_empty()
+        || !access_manifest.write_targets.is_empty()
+        || !access_manifest.adapter_read_targets.is_empty();
+    let expected_targets = if has_access_manifest {
+        // A capability manifest is authoritative even when its data-target set
+        // is empty. In particular, execution_cwd selects process location; it
+        // does not become a read or write target and must not be reconstructed
+        // later by generic argument extraction.
+        if semantics.mutates_state() {
+            access_manifest.write_targets.clone()
+        } else {
+            access_manifest.read_targets.clone()
+        }
     } else if semantics.target_hints.is_empty() {
         extract_target_hints_from_arguments(effective_arguments)
     } else {
         semantics.target_hints.clone()
     };
 
-    let scope_applies_to_expected_targets = expected_targets.is_empty()
-        || expected_targets.iter().all(|target| {
+    let scope_applies_to_expected_targets = !expected_targets.is_empty()
+        && expected_targets.iter().all(|target| {
             matches!(
                 target.kind,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope

@@ -482,15 +482,6 @@ pub(super) fn access_manifest_scope_violation(
     } else {
         (fallback.clone(), fallback)
     };
-    let invalid_cwd = task
-        .and_then(|task| task.execution_cwd.as_deref())
-        .zip(call.execution_cwd.as_deref())
-        .is_some_and(|(expected, actual)| {
-            let expected = crate::execution::normalize_active_path_lexically(expected).ok();
-            let actual = crate::execution::normalize_active_path_lexically(actual).ok();
-            expected.is_none() || actual.is_none() || expected != actual
-        });
-
     // Filesystem capabilities are monotone: a directory grant may authorize
     // descendants, while an exact-path grant never authorizes its parent or a
     // sibling. Project discovery has a separate near-ancestor convenience
@@ -534,12 +525,11 @@ pub(super) fn access_manifest_scope_violation(
         .filter(|candidate| outside(candidate, &write_grants))
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
-    if !invalid_cwd && invalid_reads.is_empty() && invalid_writes.is_empty() {
+    if invalid_reads.is_empty() && invalid_writes.is_empty() {
         return None;
     }
     Some(format!(
-        "task filesystem capability violation (execution cwd mismatch: {}; unauthorized reads: {}; unauthorized writes: {})",
-        if invalid_cwd { "yes" } else { "no" },
+        "task filesystem capability violation (unauthorized reads: {}; unauthorized writes: {})",
         if invalid_reads.is_empty() {
             "none".to_string()
         } else {
@@ -1508,6 +1498,7 @@ mod tests {
                     outcome_condition: None,
                     requires_output: false,
                     contract_rejected: Some(false),
+                    min_invocations: None,
                     max_invocations: None,
                 }),
                 target: None,
@@ -1591,6 +1582,7 @@ mod tests {
                     outcome_condition: None,
                     requires_output: true,
                     contract_rejected: Some(false),
+                    min_invocations: None,
                     max_invocations: None,
                 }),
                 target: None,
@@ -1652,6 +1644,7 @@ mod tests {
                     outcome_condition: None,
                     requires_output: true,
                     contract_rejected: Some(false),
+                    min_invocations: None,
                     max_invocations: None,
                 }),
                 target: None,
@@ -2576,7 +2569,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     }
 
     #[test]
-    fn explicit_task_execution_cwd_rejects_a_different_call_location() {
+    fn execution_cwd_is_strategy_and_does_not_restrict_data_capabilities() {
         let task = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp/expected".to_string()),
             read_targets: Vec::new(),
@@ -2589,9 +2582,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[])
-            .expect("cwd mismatch");
-        assert!(violation.contains("execution cwd mismatch: yes"));
+        assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_none());
     }
 
     #[test]
@@ -2971,6 +2962,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                     outcome_condition: None,
                     requires_output: false,
                     contract_rejected: Some(false),
+                    min_invocations: None,
                     max_invocations: Some(1),
                 }),
                 target: None,

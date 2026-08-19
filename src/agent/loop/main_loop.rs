@@ -2404,6 +2404,7 @@ mod stuck_fallback_tests {
                     outcome_condition: None,
                     requires_output: false,
                     contract_rejected: None,
+                    min_invocations: None,
                     max_invocations: None,
                 }),
                 target: None,

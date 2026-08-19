@@ -252,6 +252,38 @@ fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
 }
 
 #[test]
+fn cwd_only_manifest_does_not_become_a_data_target() {
+    let manifest = crate::traits::ToolCallAccessManifest {
+        execution_cwd: Some("/".to_string()),
+        ..Default::default()
+    };
+    let plan = compile_step_execution_plan(
+        "exec-1",
+        "operation-1".to_string(),
+        None,
+        1,
+        1,
+        "call-1",
+        "terminal",
+        r#"{"action":"run","command":"/usr/bin/false","working_dir":"/"}"#,
+        &ToolCallSemantics::observation(),
+        &manifest,
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: true,
+            high_impact_write: true,
+        },
+        &[String::from("/bin"), String::from("/usr/bin")],
+    );
+
+    assert!(plan.expected_targets.is_empty());
+    assert!(plan.target_scope.allowed_targets.is_empty());
+    assert!(!plan.target_scope.hard_fail_outside_scope);
+}
+
+#[test]
 fn operation_retry_budget_separates_invocations_from_dispatched_attempts() {
     let compile = |call_id: &str| {
         compile_step_execution_plan(

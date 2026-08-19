@@ -173,6 +173,11 @@ pub struct RequestReceiptPredicate {
     /// Required pre-I/O invocation-contract disposition when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_rejected: Option<bool>,
+    /// Minimum number of distinct matching terminal receipts needed to prove
+    /// this invocation obligation. Response prose and repeated copies of one
+    /// receipt cannot substitute for the requested number of operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_invocations: Option<usize>,
     /// Maximum tool-invocation proposals allowed for this user-owned
     /// operation. This counts pre-I/O validation outcomes as invocations while
     /// the execution-attempt ledger separately counts actual dispatches.
@@ -188,6 +193,7 @@ impl RequestReceiptPredicate {
             && self.outcome_condition.is_none()
             && !self.requires_output
             && self.contract_rejected.is_none()
+            && self.min_invocations.is_none()
             && self.max_invocations.is_none()
     }
 

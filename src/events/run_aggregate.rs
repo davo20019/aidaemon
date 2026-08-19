@@ -267,7 +267,11 @@ impl RunAggregate {
             self.insert_obligation(RunObligation {
                 id: format!("task:{}/obligation:verification", self.task_id),
                 class: RunObligationClass::Observe,
-                state: RunObligationState::Pending,
+                // The semantic contract lost or omitted the proposition that
+                // evidence must prove. Any-observation fallback would allow a
+                // single unrelated read to close an arbitrary multi-fact
+                // request. Fail closed at the persisted lifecycle boundary.
+                state: RunObligationState::Unverifiable,
                 receipt: None,
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
@@ -391,6 +395,9 @@ impl RunAggregate {
             .cloned()
             .collect::<BTreeSet<_>>();
         for obligation in self.obligations.values_mut() {
+            if obligation.state == RunObligationState::Unverifiable {
+                continue;
+            }
             let explicitly_proven = explicit_ids.contains(&obligation.id);
             let predicate_proven = obligation
                 .receipt
@@ -408,11 +415,27 @@ impl RunAggregate {
                 && result.completed_observation()
                 && receipt.invocation_stage.reached_dispatch()
                 && receipt.semantics.observes_state();
-            if explicitly_proven || predicate_proven || effect_proven || generic_observation {
-                obligation.state = RunObligationState::Satisfied;
-                obligation.satisfied_at_revision = Some(self.effect_revision);
+            // Receipt-bound obligations are replayed from their predicate,
+            // never trusted from an upstream completion-ID annotation. This
+            // keeps the reducer authoritative if an intermediate matcher is
+            // stale or overly broad.
+            let proven = if obligation.receipt.is_some() {
+                predicate_proven
+            } else {
+                explicitly_proven || effect_proven || generic_observation
+            };
+            if proven {
                 if !obligation.satisfying_receipt_ids.contains(&result_id) {
                     obligation.satisfying_receipt_ids.push(result_id.clone());
+                }
+                let minimum = obligation
+                    .receipt
+                    .as_ref()
+                    .and_then(|predicate| predicate.min_invocations)
+                    .unwrap_or(1);
+                if obligation.satisfying_receipt_ids.len() >= minimum {
+                    obligation.state = RunObligationState::Satisfied;
+                    obligation.satisfied_at_revision = Some(self.effect_revision);
                 }
             }
         }
@@ -906,6 +929,77 @@ mod tests {
             RunAggregate::replay("task-1", &events).terminal_decision(),
             RunTerminalDecision::Succeeded
         );
+    }
+
+    #[test]
+    fn one_receipt_cannot_satisfy_a_three_receipt_obligation() {
+        let mut required = requirement("terminal", 0);
+        let predicate = required.receipt.as_mut().expect("receipt predicate");
+        predicate.min_invocations = Some(3);
+        predicate.max_invocations = Some(3);
+        let mut events = vec![
+            contract(vec![required]),
+            call("first", "terminal"),
+            result(
+                "first",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+
+        let one = RunAggregate::replay("task-1", &events);
+        assert_eq!(one.satisfied_count(), 0);
+        assert_eq!(one.terminal_decision(), RunTerminalDecision::Pending);
+
+        for id in ["second", "third"] {
+            events.push(call(id, "terminal"));
+            events.push(result(
+                id,
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ));
+        }
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let three = RunAggregate::replay("task-1", &events);
+        assert_eq!(three.satisfied_count(), 1);
+        assert_eq!(three.terminal_decision(), RunTerminalDecision::Succeeded);
+    }
+
+    #[test]
+    fn observation_without_a_compiled_proposition_is_unverifiable() {
+        let mut compiled = contract(Vec::new());
+        compiled.data["contract"]["requires_observation"] = json!(true);
+        let mut events = vec![
+            compiled,
+            call("unrelated-read", "manage_mandates"),
+            result(
+                "unrelated-read",
+                "manage_mandates",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.satisfied_count(), 0);
+        assert!(aggregate.obligations.values().any(|obligation| {
+            obligation.class == RunObligationClass::Observe
+                && obligation.state == RunObligationState::Unverifiable
+        }));
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
     }
 
     #[test]

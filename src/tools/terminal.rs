@@ -1922,6 +1922,14 @@ fn validated_seatbelt_path(path: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn seatbelt_ancestor_clause(path: &str) -> Option<String> {
+    // Seatbelt rejects `(path-ancestors "/")` while the root literal itself
+    // is valid. Root has no ancestors, so omitting the empty relationship is
+    // both the accurate capability model and valid policy syntax.
+    (path != "/").then(|| format!("(path-ancestors \"{path}\")"))
+}
+
+#[cfg(target_os = "macos")]
 fn macos_manifest_sandbox_policy(
     traversal_cwd: Option<&str>,
     read_paths: &[String],
@@ -1935,8 +1943,12 @@ fn macos_manifest_sandbox_policy(
         // Execution cwd is location, not implicit authority to read that tree.
         // Grant only the directory objects needed by getcwd/path traversal;
         // child file contents still require an explicit read/write manifest.
+        let clauses = std::iter::once(format!("(literal \"{path}\")"))
+            .chain(seatbelt_ancestor_clause(&path))
+            .collect::<Vec<_>>()
+            .join(" ");
         policy.push_str(&format!(
-            "\n(allow file-read* file-test-existence\n  (literal \"{path}\") (path-ancestors \"{path}\"))\n"
+            "\n(allow file-read* file-test-existence\n  {clauses})\n"
         ));
     }
     if !read_paths.is_empty() {
@@ -1951,7 +1963,7 @@ fn macos_manifest_sandbox_policy(
             .join("\n  ");
         let ancestor_clauses = paths
             .iter()
-            .map(|path| format!("(path-ancestors \"{path}\")"))
+            .filter_map(|path| seatbelt_ancestor_clause(path))
             .collect::<Vec<_>>()
             .join("\n  ");
         // `getcwd(3)` and normal path lookup walk and read containing
@@ -1959,9 +1971,13 @@ fn macos_manifest_sandbox_policy(
         // file contents; exact/subpath data access remains bound to the
         // declared target.
         policy.push_str(&format!(
-            "\n(allow file-read* file-test-existence\n  {data_clauses})\n\
-             (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+            "\n(allow file-read* file-test-existence\n  {data_clauses})\n"
         ));
+        if !ancestor_clauses.is_empty() {
+            policy.push_str(&format!(
+                "(allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+            ));
+        }
     }
     if !write_paths.is_empty() {
         let paths = write_paths
@@ -1975,7 +1991,7 @@ fn macos_manifest_sandbox_policy(
             .join("\n  ");
         let ancestor_clauses = paths
             .iter()
-            .map(|path| format!("(path-ancestors \"{path}\")"))
+            .filter_map(|path| seatbelt_ancestor_clause(path))
             .collect::<Vec<_>>()
             .join("\n  ");
         // A write grant also permits reading the exact output tree so one
@@ -1985,9 +2001,13 @@ fn macos_manifest_sandbox_policy(
         // granting write operations to every ancestor would unnecessarily
         // permit mutation of the containing directory itself.
         policy.push_str(&format!(
-            "\n(allow file-read* file-test-existence file-write*\n  {data_clauses})\n\
-             (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+            "\n(allow file-read* file-test-existence file-write*\n  {data_clauses})\n"
         ));
+        if !ancestor_clauses.is_empty() {
+            policy.push_str(&format!(
+                "(allow file-read* file-test-existence\n  {ancestor_clauses})\n"
+            ));
+        }
     }
     if !executable_paths.is_empty() {
         let paths = executable_paths
@@ -7047,6 +7067,36 @@ mod tests {
         assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
         assert!(policy.contains("(subpath \"/private/tmp\")"));
         assert!(policy.contains("(literal \"/private/etc/ssl/openssl.cnf\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_cwd_policy_omits_empty_ancestor_relationship() {
+        let policy = macos_manifest_sandbox_policy(Some("/"), &[], &[], &[], false)
+            .expect("root cwd policy");
+        assert!(policy.contains("(literal \"/\")"));
+        assert!(!policy.contains("(path-ancestors \"/\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_root_cwd_preserves_compound_negative_process_result() {
+        let backend = active_execution_backend();
+        let request = confined_terminal_execution_request(
+            &backend,
+            "/bin/sh -c 'printf SYNTHETIC_BEFORE; /usr/bin/false'",
+            Some("/"),
+            &[],
+            &[],
+        )
+        .await
+        .expect("confined root request");
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(output.exit_code, 1, "{}", output.stderr_lossy());
+        assert_eq!(output.stdout_lossy(), "SYNTHETIC_BEFORE");
     }
 
     #[test]
