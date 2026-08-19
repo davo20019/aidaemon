@@ -640,38 +640,26 @@ async fn finalize_durable_receipt_after_provider_failure(
     {
         return Ok(None);
     }
-    let latest_result = agent
+    let aggregate = agent
         .event_store
-        .latest_task_tool_result(session_id, task_id)
+        .task_run_aggregate(session_id, task_id)
         .await?;
-    let result = match latest_result {
-        Some(result)
-            if result.failed()
-                && result
-                    .receipt
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.invocation_stage.reached_dispatch()) =>
-        {
-            Some(result)
-        }
-        Some(result) if result.completed_observation() => Some(result),
-        _ => {
-            agent
-                .event_store
-                .latest_completed_task_tool_result(session_id, task_id)
-                .await?
-        }
+    let result = if let Some(operation_id) = aggregate.primary_causal_operation_id.as_deref() {
+        agent
+            .event_store
+            .task_tool_result_by_call_id(session_id, task_id, operation_id)
+            .await?
+    } else {
+        agent
+            .event_store
+            .latest_task_tool_result(session_id, task_id)
+            .await?
     };
     let Some(result) = result else {
         return Ok(None);
     };
-    let closure = agent
-        .event_store
-        .task_receipt_closure(session_id, task_id)
-        .await
-        .unwrap_or_default();
-    let receipt_closed = if closure.contract_present {
-        closure.fulfilled() && result.completed_observation()
+    let receipt_closed = if aggregate.contract_present {
+        aggregate.terminal_decision() == crate::events::RunTerminalDecision::Succeeded
     } else {
         result.receipt.as_ref().is_some_and(|receipt| {
             !receipt.completion_obligation_ids.is_empty()
@@ -706,8 +694,16 @@ async fn finalize_durable_receipt_after_provider_failure(
     agent
         .append_assistant_message_with_event(emitter, &assistant_msg, model, None, None)
         .await?;
+    let aggregate_failed =
+        aggregate.terminal_decision() == crate::events::RunTerminalDecision::Failed;
     let (status, outcome, error) = if receipt_closed {
         (TaskStatus::Completed, TaskOutcome::Succeeded, None)
+    } else if aggregate_failed {
+        (
+            TaskStatus::Completed,
+            TaskOutcome::Failed,
+            Some(provider_error.to_string()),
+        )
     } else {
         (
             TaskStatus::Completed,
@@ -728,7 +724,7 @@ async fn finalize_durable_receipt_after_provider_failure(
             Some(reply.chars().take(200).collect()),
         )
         .await;
-    learning_ctx.completed_naturally = receipt_closed;
+    learning_ctx.completed_naturally = receipt_closed || aggregate_failed;
     learning_ctx.task_outcome = Some(outcome);
     Ok(Some(reply))
 }
@@ -781,6 +777,38 @@ pub(super) async fn run_llm_phase(
     let est_input_tokens = ctx.est_input_tokens;
     let build_ms = ctx.build_ms;
     let timeout_after_external_action = Duration::from_secs(90);
+
+    // An exhausted typed obligation is already a terminal lifecycle fact.
+    // Do not spend another provider timeout asking an LLM to rediscover it or
+    // to authorize closure. The durable causal receipt supplies the closeout;
+    // successful runs still reach normal synthesis for a useful user answer.
+    if services
+        .agent
+        .event_store
+        .task_run_aggregate(session_id, task_id)
+        .await
+        .is_ok_and(|aggregate| {
+            aggregate.terminal_decision() == crate::events::RunTerminalDecision::Failed
+        })
+    {
+        if let Some(reply) = finalize_durable_receipt_after_provider_failure(
+            services.agent,
+            emitter,
+            task_id,
+            session_id,
+            iteration,
+            task_start,
+            learning_ctx,
+            model,
+            "typed obligation exhausted",
+            completion_contract,
+            completion_progress,
+        )
+        .await?
+        {
+            return Ok(LlmPhaseOutcome::Return(Ok(reply)));
+        }
+    }
 
     // Identity manipulation detection: if the user's message contains obvious
     // injection patterns, prepend a strong system reminder to the messages so

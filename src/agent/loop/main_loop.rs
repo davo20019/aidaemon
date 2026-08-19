@@ -2163,39 +2163,45 @@ impl Agent {
             )
             .await
             .unwrap_or_default();
-        // Select the newest completed observation, not merely the newest
-        // result row: a later rejected proposal cannot erase an earlier
-        // dispatched receipt that is sufficient to answer the user.
-        let latest_result = self
+        let run_aggregate = self
             .event_store
-            .latest_completed_task_tool_result(session_id, &unhandled_error_task_id)
+            .task_run_aggregate(session_id, &unhandled_error_task_id)
             .await
-            .ok()
-            .flatten();
-        let receipt_closure = self
-            .event_store
-            .task_receipt_closure(session_id, &unhandled_error_task_id)
-            .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| crate::events::RunAggregate::new(&unhandled_error_task_id));
+        // Select the result for the aggregate's causal operation rather than
+        // whichever unrelated receipt happened to be newest.
+        let latest_result =
+            if let Some(operation_id) = run_aggregate.primary_causal_operation_id.as_deref() {
+                self.event_store
+                    .task_tool_result_by_call_id(session_id, &unhandled_error_task_id, operation_id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                self.event_store
+                    .latest_task_tool_result(session_id, &unhandled_error_task_id)
+                    .await
+                    .ok()
+                    .flatten()
+            };
         let receipt_closed = latest_result.as_ref().is_some_and(|result| {
-            result.completed_observation()
-                && if receipt_closure.contract_present {
-                    receipt_closure.fulfilled()
-                } else {
-                    result.receipt.as_ref().is_some_and(|receipt| {
-                        // A proof-bound receipt is the strongest closeout. When
-                        // assessment was unavailable, an observation-only typed
-                        // receipt is still sufficient to deliver its own state;
-                        // mutation receipts remain partial until an explicit
-                        // obligation/effect proof is present.
-                        !receipt.completion_obligation_ids.is_empty()
-                            || (receipt.semantics.observes_state()
-                                && !receipt.semantics.mutates_state())
-                            || (result.succeeded()
-                                && receipt.semantics.mutates_state()
-                                && receipt.semantics.mutation_effects.has_specific_effects())
-                    })
-                }
+            if run_aggregate.contract_present {
+                run_aggregate.terminal_decision() == crate::events::RunTerminalDecision::Succeeded
+            } else {
+                result.receipt.as_ref().is_some_and(|receipt| {
+                    // A proof-bound receipt is the strongest closeout. When
+                    // assessment was unavailable, an observation-only typed
+                    // receipt is still sufficient to deliver its own state;
+                    // mutation receipts remain partial until an explicit
+                    // obligation/effect proof is present.
+                    !receipt.completion_obligation_ids.is_empty()
+                        || (receipt.semantics.observes_state()
+                            && !receipt.semantics.mutates_state())
+                        || (result.succeeded()
+                            && receipt.semantics.mutates_state()
+                            && receipt.semantics.mutation_effects.has_specific_effects())
+                })
+            }
         });
         let (reply, outcome, status) = if let Some(result) = latest_result
             .as_ref()

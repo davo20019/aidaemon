@@ -1753,16 +1753,34 @@ async fn confined_terminal_execution_request_inner(
             reads.push(path);
         }
     }
-    let mut writes = Vec::new();
-    for path in write_paths.iter().chain(write_roots.iter()) {
+    let mut resolved_write_paths = Vec::new();
+    for path in write_paths {
         let path = canonicalize_access_path(
             backend,
             resolve_access_path(backend, path, cwd.as_ref()).await?,
         )
         .await
         .to_string();
-        if !writes.contains(&path) {
-            writes.push(path);
+        if !resolved_write_paths.contains(&path) {
+            resolved_write_paths.push(path);
+        }
+    }
+    let mut resolved_write_roots = Vec::new();
+    for path in write_roots {
+        let path = canonicalize_access_path(
+            backend,
+            resolve_access_path(backend, path, cwd.as_ref()).await?,
+        )
+        .await
+        .to_string();
+        if !resolved_write_roots.contains(&path) {
+            resolved_write_roots.push(path);
+        }
+    }
+    let mut writes = resolved_write_paths.clone();
+    for path in &resolved_write_roots {
+        if !writes.contains(path) {
+            writes.push(path.clone());
         }
     }
 
@@ -1775,8 +1793,8 @@ async fn confined_terminal_execution_request_inner(
     let mut runtime_support = runtime_support;
     add_manifest_runtime_environment(
         backend,
-        &writes,
-        write_roots,
+        &resolved_write_paths,
+        &resolved_write_roots,
         script_via_stdin,
         &mut runtime_support,
     )
@@ -2457,38 +2475,65 @@ async fn add_manifest_runtime_environment(
     script_via_stdin: bool,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
-    let mut scratch_root = None;
-    // An existing directory is safe to use regardless of whether it was
-    // supplied as an exact path or an explicit root. The root list is kept
-    // separate so an absent exact file can never be mistaken for a directory
-    // merely because a shell script needs a temporary here-document file.
-    for path in write_roots.iter().chain(write_paths.iter()) {
-        let candidate = crate::execution::BackendPath::new(path.clone());
-        // This helper is called after the manifest has been resolved. We only
-        // select an existing directory, avoiding any inference from command
-        // text or a file-name convention.
-        if backend
-            .metadata(&candidate)
+    let mut declared_roots = write_roots.iter().collect::<Vec<_>>();
+    // The narrowest declared directory capability is the least-privilege
+    // scratch lane. A broad existing cwd such as /tmp must not steal TMPDIR
+    // from a more specific future output root merely because it already
+    // exists before execution.
+    declared_roots
+        .sort_by_key(|path| std::cmp::Reverse(std::path::Path::new(path).components().count()));
+    let preferred_root = declared_roots.first().map(|path| (*path).clone());
+    let preferred_is_directory = if let Some(path) = preferred_root.as_ref() {
+        backend
+            .metadata(&crate::execution::BackendPath::new(path.clone()))
             .await
             .ok()
             .is_some_and(|metadata| metadata.is_dir())
-        {
-            scratch_root = Some(candidate.to_string());
-            break;
+    } else {
+        false
+    };
+    let future_scratch_root =
+        preferred_root.is_some() && script_via_stdin && !preferred_is_directory;
+    let mut scratch_root = (preferred_is_directory || future_scratch_root)
+        .then(|| preferred_root.clone())
+        .flatten();
+    if scratch_root.is_none() {
+        for path in declared_roots.iter().skip(1) {
+            let candidate = crate::execution::BackendPath::new((*path).clone());
+            if backend
+                .metadata(&candidate)
+                .await
+                .ok()
+                .is_some_and(|metadata| metadata.is_dir())
+            {
+                scratch_root = Some(candidate.to_string());
+                break;
+            }
         }
     }
-    let future_scratch_root = scratch_root.is_none() && script_via_stdin && !write_roots.is_empty();
-    let scratch_root = scratch_root.or_else(|| {
-        // A disposable package/build root is often intentionally absent at
-        // planning time and created by the authorized script itself. Any
-        // resolved executable with a registered runtime prefix can use that
-        // future declared root; the decision is based on the execution
-        // backend's capability graph, never on request wording or a list of
-        // package-manager names.
-        future_scratch_root
-            .then(|| write_roots.first().cloned())
-            .flatten()
-    });
+    // Exact write paths may be used only when they are already directories;
+    // never create one as a scratch root because it could be a future file.
+    let scratch_root = if scratch_root.is_some() {
+        scratch_root
+    } else {
+        let mut existing_paths = write_paths.iter().collect::<Vec<_>>();
+        existing_paths
+            .sort_by_key(|path| std::cmp::Reverse(std::path::Path::new(path).components().count()));
+        let mut selected = None;
+        for path in existing_paths {
+            let candidate = crate::execution::BackendPath::new(path.clone());
+            if backend
+                .metadata(&candidate)
+                .await
+                .ok()
+                .is_some_and(|metadata| metadata.is_dir())
+            {
+                selected = Some(candidate.to_string());
+                break;
+            }
+        }
+        selected
+    };
     let Some(scratch_root) = scratch_root else {
         return;
     };
@@ -7135,7 +7180,7 @@ mod tests {
             Some(&cwd),
             &[cwd.clone()],
             &[],
-            &[root.to_string_lossy().to_string()],
+            &[cwd.clone(), root.to_string_lossy().to_string()],
         )
         .await
         .expect("confined script request");

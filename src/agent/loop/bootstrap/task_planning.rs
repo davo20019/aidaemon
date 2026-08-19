@@ -555,6 +555,9 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     if effects.is_empty() {
         return false;
     }
+    if effects.contains(crate::traits::ToolMutationEffects::DESTRUCTIVE) {
+        return false;
+    }
 
     // The current bitset represents one set of required outcomes, so it cannot
     // distinguish a generic remote mutation from a second, independent remote
@@ -1175,7 +1178,8 @@ pub(crate) async fn generate_task_plan(
          - required_effects names the successful effects completion must prove. Valid \
            values are local_source_write, local_workspace_write, local_derived_write, \
            repository_write, remote_mutation, remote_deploy, external_delivery, \
-           process_state, configuration, destructive, and unspecified. Use [] when \
+           process_state, configuration, and unspecified. Destructive is an \
+           operation/risk qualifier, not a completion effect. Use [] when \
            expects_mutation=false. A build cache or installed dependency is not a \
            local_source_write; use local_derived_write for reproducible build/package \
            output and local_workspace_write for other bounded workspace output. Use the \
@@ -1290,8 +1294,7 @@ pub(crate) async fn generate_task_plan(
     let aggregate_timeout = attempt_budgets
         .iter()
         .copied()
-        .max()
-        .unwrap_or(Duration::ZERO)
+        .fold(Duration::ZERO, Duration::saturating_add)
         .min(TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT);
     if aggregate_timeout.is_zero() {
         return None;
@@ -1300,64 +1303,46 @@ pub(crate) async fn generate_task_plan(
         crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
             .min(u32::MAX as usize) as u32,
     );
-    let attempts = model_candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(candidate_index, model)| {
-            let attempt_timeout = attempt_budgets.get(candidate_index).copied()?;
-            let provider = Arc::clone(&provider);
-            let messages = messages.clone();
-            let options = options.clone();
-            let model = model.clone();
-            Some(async move {
-                let call_start = Instant::now();
-                match tokio::time::timeout(
-                    attempt_timeout,
-                    provider.chat_with_options(&model, &messages, &[], &options),
-                )
-                .await
-                {
-                    Ok(Ok(response)) => TaskAssessmentAttempt::Response {
-                        candidate_index,
-                        model,
-                        response,
-                        latency_ms: call_start.elapsed().as_millis() as u64,
-                    },
-                    Ok(Err(error)) => TaskAssessmentAttempt::ProviderError {
-                        candidate_index,
-                        model,
-                        latency_ms: call_start.elapsed().as_millis() as u64,
-                        error: error.to_string(),
-                    },
-                    Err(_) => TaskAssessmentAttempt::Timeout {
-                        candidate_index,
-                        model,
-                        latency_ms: call_start.elapsed().as_millis() as u64,
-                    },
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let attempt_start = Instant::now();
-    let completed_attempts =
-        tokio::time::timeout(aggregate_timeout, futures::future::join_all(attempts))
-            .await
-            .unwrap_or_default();
-    let mut completed_indices = std::collections::HashSet::new();
-    let mut valid_plans = Vec::new();
-    for attempt in completed_attempts {
-        let candidate_index = match &attempt {
-            TaskAssessmentAttempt::Response {
-                candidate_index, ..
-            }
-            | TaskAssessmentAttempt::ProviderError {
-                candidate_index, ..
-            }
-            | TaskAssessmentAttempt::Timeout {
-                candidate_index, ..
-            } => *candidate_index,
+    // Candidates are alternatives, not a fan-out ensemble. Attempt them in
+    // configured priority order under one deadline and stop after the first
+    // valid typed product. This prevents a successful primary from still
+    // paying for every speculative fallback and makes each failed transition
+    // individually attributable in telemetry.
+    let deadline = Instant::now() + aggregate_timeout;
+    for (candidate_index, model) in model_candidates.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(configured_timeout) = attempt_budgets.get(candidate_index).copied() else {
+            continue;
         };
-        completed_indices.insert(candidate_index);
+        let attempt_timeout = configured_timeout.min(remaining);
+        let call_start = Instant::now();
+        let attempt = match tokio::time::timeout(
+            attempt_timeout,
+            provider.chat_with_options(model, &messages, &[], &options),
+        )
+        .await
+        {
+            Ok(Ok(response)) => TaskAssessmentAttempt::Response {
+                candidate_index,
+                model: model.clone(),
+                response,
+                latency_ms: call_start.elapsed().as_millis() as u64,
+            },
+            Ok(Err(error)) => TaskAssessmentAttempt::ProviderError {
+                candidate_index,
+                model: model.clone(),
+                latency_ms: call_start.elapsed().as_millis() as u64,
+                error: error.to_string(),
+            },
+            Err(_) => TaskAssessmentAttempt::Timeout {
+                candidate_index,
+                model: model.clone(),
+                latency_ms: call_start.elapsed().as_millis() as u64,
+            },
+        };
         match attempt {
             TaskAssessmentAttempt::Response {
                 candidate_index,
@@ -1379,7 +1364,15 @@ pub(crate) async fn generate_task_plan(
                         },
                     )
                     .await;
-                    valid_plans.push((candidate_index, model, plan));
+                    info!(
+                        goal = %plan.goal,
+                        step_count = plan.steps.len(),
+                        assessment_mode = mode.as_str(),
+                        %model,
+                        fallback = candidate_index > 0,
+                        "Task assessment selected by configured model priority"
+                    );
+                    return Some(plan);
                 }
                 Err(error) => {
                     record_auxiliary_model_call(
@@ -1437,42 +1430,7 @@ pub(crate) async fn generate_task_plan(
             }
         }
     }
-    // A hard aggregate timeout can cancel an attempt just before its inner
-    // deadline. Preserve that failed transition in telemetry instead of
-    // making the candidate disappear from the producer trace.
-    for candidate_index in 0..model_candidates.len() {
-        if completed_indices.contains(&candidate_index) {
-            continue;
-        }
-        if let Some(model) = model_candidates.get(candidate_index) {
-            record_auxiliary_model_failure(
-                telemetry,
-                "task_assessment",
-                model,
-                attempt_start.elapsed().as_millis() as u64,
-                (candidate_index + 1) as u32,
-                candidate_index > 0,
-                est_input_tokens,
-                "aggregate_timeout",
-            )
-            .await;
-            warn!(%model, "Task assessment aggregate deadline elapsed");
-        }
-    }
-    let selected = valid_plans.into_iter().min_by_key(|(index, _, _)| *index);
-    if let Some((candidate_index, model, plan)) = selected {
-        info!(
-            goal = %plan.goal,
-            step_count = plan.steps.len(),
-            assessment_mode = mode.as_str(),
-            %model,
-            fallback = candidate_index > 0,
-            "Task assessment selected by configured model priority"
-        );
-        Some(plan)
-    } else {
-        None
-    }
+    None
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -2545,7 +2503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_contract_selection_uses_configured_priority_not_response_latency() {
+    async fn semantic_contract_selection_stops_after_first_valid_priority_candidate() {
         let models = vec![
             "configured-primary".to_string(),
             "configured-fallback".to_string(),
@@ -2563,10 +2521,7 @@ mod tests {
 
         assert_eq!(assessment.goal, "primary contract");
         let calls = provider.calls.lock().expect("call ledger");
-        assert_eq!(
-            calls.as_slice(),
-            ["configured-primary", "configured-fallback"]
-        );
+        assert_eq!(calls.as_slice(), ["configured-primary"]);
     }
 
     #[tokio::test]

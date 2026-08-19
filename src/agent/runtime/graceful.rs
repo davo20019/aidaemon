@@ -1095,36 +1095,30 @@ impl Agent {
         error: Option<String>,
         summary: Option<String>,
     ) {
-        // The persisted receipt graph is the final authority for an
-        // invocation-bound task. Individual exit paths can only propose an
-        // outcome from in-memory state; reconcile it here so a provider
-        // timeout or finalizer fallback cannot record `succeeded` while a
-        // durable required invocation remains unsatisfied.
-        let receipt_closure = self
+        // One replayed task aggregate is the final authority. Individual exit
+        // paths propose a transport outcome, but cannot override durable
+        // obligations in either direction. This deliberately replaces the
+        // former asymmetric receipt merge that could downgrade success yet
+        // refused to promote a fully proven task after a finalizer failure.
+        let run_aggregate = self
             .event_store
-            .task_receipt_closure(emitter.session_id(), task_id)
+            .task_run_aggregate(emitter.session_id(), task_id)
             .await
-            .unwrap_or_default();
-        let effective_outcome = if receipt_closure.contract_present {
-            if !receipt_closure.fulfilled() && outcome == crate::events::TaskOutcome::Succeeded {
-                crate::events::TaskOutcome::Partial
-            } else if receipt_closure.fulfilled()
-                && outcome == crate::events::TaskOutcome::Partial
-                && summary
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-            {
-                // In-memory verification can lag a durable receipt when a
-                // provider/finalizer fails immediately after dispatch. The
-                // persisted proof graph is authoritative for obligation
-                // closure; promote only a present user-facing closeout, never
-                // a hard failure or an empty response.
+            .unwrap_or_else(|_| crate::events::RunAggregate::new(task_id));
+        let effective_outcome = match (status, run_aggregate.terminal_decision()) {
+            (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+            (_, crate::events::RunTerminalDecision::Succeeded) => {
                 crate::events::TaskOutcome::Succeeded
-            } else {
-                outcome
             }
-        } else {
-            outcome
+            (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
+            (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
+            (_, crate::events::RunTerminalDecision::Pending)
+                if outcome == crate::events::TaskOutcome::Succeeded =>
+            {
+                crate::events::TaskOutcome::Partial
+            }
+            (_, crate::events::RunTerminalDecision::Pending) => outcome,
+            (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
         };
         let durable_tool_calls_count = self
             .event_store
@@ -1195,21 +1189,16 @@ impl Agent {
                 "requested_outcome": outcome,
                 "effective_outcome": effective_outcome,
                 "status": status,
-                "receipt_contract_present": receipt_closure.contract_present,
-                "required_receipts": receipt_closure.required,
-                "satisfied_receipts": receipt_closure.satisfied,
-                "receipt_cardinality_violations": receipt_closure.cardinality_violations,
-                "persisted_receipt_count": receipt_closure.receipt_count,
-                "required_mutation_effects": receipt_closure
-                    .required_mutation_effects
-                    .telemetry_value(),
-                "observed_mutation_effects": receipt_closure
-                    .observed_mutation_effects
-                    .telemetry_value(),
-                "evidence_required": receipt_closure.evidence_required,
-                "evidence_satisfied": receipt_closure.evidence_satisfied,
-                "observation_required": receipt_closure.observation_required,
-                "observation_satisfied": receipt_closure.observation_satisfied,
+                "run_aggregate_schema_version": run_aggregate.schema_version,
+                "run_contract_present": run_aggregate.contract_present,
+                "run_terminal_decision": format!("{:?}", run_aggregate.terminal_decision()).to_lowercase(),
+                "obligations_required": run_aggregate.required_count(),
+                "obligations_satisfied": run_aggregate.satisfied_count(),
+                "effect_revision": run_aggregate.effect_revision,
+                "operation_count": run_aggregate.operations.len(),
+                "receipt_cardinality_violations": run_aggregate.cardinality_violations,
+                "primary_causal_operation_id": run_aggregate.primary_causal_operation_id,
+                "invariant_violations": run_aggregate.invariant_violations,
                 "tool_calls_count": durable_tool_calls_count,
             }),
         )

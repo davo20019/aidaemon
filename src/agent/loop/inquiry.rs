@@ -365,11 +365,16 @@ pub(in crate::agent) fn capability_supports_requirement(
 pub(in crate::agent) fn requirement_is_exact_invocation(
     requirement: &RequestEvidenceRequirement,
 ) -> bool {
-    requirement.acceptable_scopes.is_empty()
-        && requirement.purpose == EvidencePurpose::Outcome
+    // A receipt predicate identifies a performed operation by its typed
+    // adapter outcome. Scope remains useful for candidate routing and target
+    // constraints are checked separately, but neither can turn an immutable
+    // process receipt into a revision-bound subject observation. Keeping this
+    // classification aligned with `RunObligationClass::Perform` prevents the
+    // evidence ontology from vetoing an otherwise exact receipt merely because
+    // the contract also records where the operation ran.
+    requirement.purpose == EvidencePurpose::Outcome
         && requirement.minimum_authority == EvidenceAuthority::Direct
-        && requirement.temporal_scope == EvidenceTemporalScope::Current
-        && requirement.target.is_none()
+        && requirement.temporal_scope == EvidenceTemporalScope::Historical
         && requirement
             .receipt
             .as_ref()

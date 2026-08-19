@@ -1504,7 +1504,7 @@ mod tests {
                 acceptable_scopes: vec![ToolSemanticScope::HostLocal],
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
-                temporal_scope: EvidenceTemporalScope::Current,
+                temporal_scope: EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
                 receipt: Some(RequestReceiptPredicate {
                     tool_names: vec!["run_command".to_string()],
@@ -2961,7 +2961,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 acceptable_scopes: Vec::new(),
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
-                temporal_scope: EvidenceTemporalScope::Current,
+                temporal_scope: EvidenceTemporalScope::Historical,
                 required_content_markers: Vec::new(),
                 receipt: Some(RequestReceiptPredicate {
                     tool_names: vec!["run_command".to_string()],

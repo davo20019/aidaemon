@@ -126,6 +126,12 @@ fn compile_core(signals: &PlannedContractSignals) -> Result<CompiledCompletionCo
         if effects.is_empty() {
             return Err("missing_mutation_effect");
         }
+        // Destructive is an operation/risk qualifier, not a postcondition.
+        // Requiring it as an achieved effect creates an obligation no generic
+        // adapter can prove independently of the actual domain mutation.
+        if effects.contains(ToolMutationEffects::DESTRUCTIVE) {
+            return Err("risk_qualifier_is_not_completion_effect");
+        }
         if effects.contains(ToolMutationEffects::REMOTE_MUTATION)
             && effects.intersects(
                 ToolMutationEffects::REMOTE_DEPLOY.union(ToolMutationEffects::EXTERNAL_DELIVERY),
@@ -327,7 +333,9 @@ fn canonical_invocation_requirement(
         acceptable_scopes: Vec::new(),
         purpose: EvidencePurpose::Outcome,
         minimum_authority: EvidenceAuthority::Direct,
-        temporal_scope: EvidenceTemporalScope::Current,
+        // An invocation outcome remains true after later operations. Current
+        // scope is reserved for observations whose subject state can change.
+        temporal_scope: EvidenceTemporalScope::Historical,
         required_content_markers: Vec::new(),
         receipt: Some(receipt),
         target: None,
@@ -820,16 +828,19 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     compiled.decisions.extend(authority_decisions);
 
     if compiled.core.as_ref().is_some_and(|core| {
-        core.expects_mutation && compiled.authority.mutation_scope == "read_only"
+        core.expects_mutation
+            && (compiled.authority.mutation_scope == "read_only"
+                || compiled.authority.forbids_tool_use)
     }) {
+        let reason = if compiled.authority.forbids_tool_use {
+            "mutation_lifecycle_conflicts_with_tool_prohibition"
+        } else {
+            "mutation_lifecycle_conflicts_with_read_only_authority"
+        };
         compiled.core = None;
-        compiled.decisions.push(decision(
-            "composition",
-            false,
-            "mutation_lifecycle_conflicts_with_read_only_authority",
-            2,
-            1,
-        ));
+        compiled
+            .decisions
+            .push(decision("composition", false, reason, 2, 1));
     } else {
         compiled
             .decisions
@@ -1050,6 +1061,41 @@ mod tests {
         assert!(compiled.decisions.iter().any(|decision| {
             decision.lane == "composition"
                 && decision.reason_code == "mutation_lifecycle_conflicts_with_read_only_authority"
+        }));
+    }
+
+    #[test]
+    fn tool_prohibition_cannot_install_mutation_lifecycle() {
+        let mut signals = base_signals();
+        signals.task_kind = Some("change".to_string());
+        signals.expects_mutation = Some(true);
+        signals.required_effects = Some(vec!["local_source_write".to_string()]);
+        signals.tool_scope = Some("forbidden".to_string());
+
+        let compiled = compile(&signals);
+        assert!(compiled.core.is_none());
+        assert!(compiled.authority.forbids_tool_use);
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "composition"
+                && decision.reason_code == "mutation_lifecycle_conflicts_with_tool_prohibition"
+        }));
+    }
+
+    #[test]
+    fn destructive_risk_qualifier_is_not_accepted_as_completion_effect() {
+        let mut signals = base_signals();
+        signals.task_kind = Some("change".to_string());
+        signals.expects_mutation = Some(true);
+        signals.required_effects = Some(vec![
+            "local_source_write".to_string(),
+            "destructive".to_string(),
+        ]);
+
+        let compiled = compile(&signals);
+        assert!(compiled.core.is_none());
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "completion_core"
+                && decision.reason_code == "risk_qualifier_is_not_completion_effect"
         }));
     }
 

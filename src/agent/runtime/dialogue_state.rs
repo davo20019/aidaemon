@@ -172,21 +172,13 @@ fn classify_user_turn(
         return UserTurnKind::ClarificationAnswer;
     }
 
-    // Until semantic assessment runs, topology is the only safe fallback: an
-    // unresolved request is the antecedent, while a terminal/absent one is not.
-    if state.open_request.as_ref().is_some_and(|request| {
-        matches!(
-            request.status,
-            OpenRequestStatus::Open
-                | OpenRequestStatus::InProgress
-                | OpenRequestStatus::PartiallyAnswered
-                | OpenRequestStatus::Blocked
-        )
-    }) {
-        UserTurnKind::Followup
-    } else {
-        UserTurnKind::NewRequest
-    }
+    // A prior unresolved request is a candidate antecedent, not evidence that
+    // this message continues it. Ingress always opens a provisional request
+    // and retains the candidate as a typed node. Only an explicit pending
+    // interaction above or a validated semantic relationship may adopt it.
+    // This fail-fresh default prevents stale policy, scopes, and obligations
+    // from leaking into an unrelated request when assessment is unavailable.
+    UserTurnKind::NewRequest
 }
 
 fn classify_assistant_turn_text(text: &str) -> (AssistantTurnKind, bool) {
@@ -427,6 +419,10 @@ fn apply_semantic_user_turn_assessment(
             if let Some(request) = state.open_request.as_mut() {
                 if semantic_scope.is_some() {
                     request.semantic_scope = semantic_scope;
+                }
+                if state.active_task.is_some() {
+                    request.status = OpenRequestStatus::InProgress;
+                    request.resolved_at = None;
                 }
             }
         }
@@ -903,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_request_reference_stays_followup() {
+    fn unresolved_request_is_retained_as_candidate_not_assumed_followup() {
         let mut state = DialogueState::new("s1");
         state.open_request = Some(OpenRequest {
             user_message_id: "u1".to_string(),
@@ -926,11 +922,11 @@ mod tests {
         );
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
-            Some(UserTurnKind::Followup)
+            Some(UserTurnKind::NewRequest)
         );
         assert_eq!(
             state
-                .open_request
+                .antecedent_request
                 .as_ref()
                 .map(|request| request.user_message_id.as_str()),
             Some("u1")
@@ -1318,13 +1314,24 @@ mod tests {
     }
 
     #[test]
-    fn fresh_open_request_still_anchors_short_followup() {
+    fn semantic_edge_anchors_short_followup_to_retained_candidate() {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         let mut request = request_with(OpenRequestStatus::Open, now, None);
         request.text = "Find my tax documents".to_string();
         state.open_request = Some(request);
         apply_user_message(&mut state, "u2", "hmm the second folder maybe", &[], now);
+        assert_eq!(
+            state.last_user_turn.as_ref().map(|turn| turn.kind),
+            Some(UserTurnKind::NewRequest)
+        );
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "hmm the second folder maybe",
+            UserTurnKind::Followup,
+            None,
+            now,
+        );
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::Followup)
@@ -1339,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_request_anchors_elliptical_question_by_state() {
+    fn semantic_edge_anchors_elliptical_question_to_unresolved_request() {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         let mut request = request_with(OpenRequestStatus::PartiallyAnswered, now, None);
@@ -1347,6 +1354,13 @@ mod tests {
         state.open_request = Some(request);
 
         apply_user_message(&mut state, "u2", "Fixed?", &[], now);
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "Fixed?",
+            UserTurnKind::Followup,
+            None,
+            now,
+        );
 
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
@@ -1375,6 +1389,13 @@ mod tests {
             "u2",
             "Take another pass from the receipt we already have.",
             &[],
+            now,
+        );
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "Take another pass from the receipt we already have.",
+            UserTurnKind::Followup,
+            None,
             now,
         );
 
@@ -1516,6 +1537,18 @@ mod tests {
         {
             let mut followup_state = state.clone();
             apply_user_message(&mut followup_state, message_id, followup, &[], now);
+            assert_eq!(
+                followup_state.last_user_turn.as_ref().map(|turn| turn.kind),
+                Some(UserTurnKind::NewRequest),
+                "ingress must not infer a relationship from unresolved state"
+            );
+            apply_semantic_user_turn_assessment(
+                &mut followup_state,
+                followup,
+                UserTurnKind::Followup,
+                None,
+                now,
+            );
             assert_eq!(
                 followup_state.last_user_turn.as_ref().map(|turn| turn.kind),
                 Some(UserTurnKind::Followup),

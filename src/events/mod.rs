@@ -12,6 +12,7 @@ mod context;
 mod conversation_turn;
 mod model_call_telemetry;
 mod payloads;
+mod run_aggregate;
 mod store;
 pub mod terminal_state;
 
@@ -23,6 +24,7 @@ pub use model_call_telemetry::{
     record_background_model_call_telemetry, record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use payloads::*;
+pub(crate) use run_aggregate::{RunAggregate, RunTerminalDecision};
 #[cfg(test)]
 pub(crate) use store::GeneratedResponseRef;
 pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};

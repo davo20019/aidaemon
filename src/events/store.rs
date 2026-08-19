@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
 use super::{
     DecisionPointData, DecisionType, Event, EventType, InteractionRequestedData,
-    InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData,
+    InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, RunAggregate,
     TaskContractCompiledData, TaskEndData, TaskStatus, ToolCallData, ToolResultData,
 };
 use crate::traits::{Message, TokenUsage};
@@ -1493,6 +1493,21 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
+    /// Rebuild the authoritative lifecycle state for one task from its
+    /// immutable event history. The aggregate is deliberately a discardable
+    /// projection: every caller observes the same obligations and outcome,
+    /// including after a crash or provider failure.
+    pub(crate) async fn task_run_aggregate(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<RunAggregate> {
+        let events = self
+            .query_task_events_for_session(session_id, task_id)
+            .await?;
+        Ok(RunAggregate::replay(task_id, &events))
+    }
+
     /// Fold one event kind for an exact task. Terminal telemetry uses this
     /// durable count so pre-dispatch guards, adapter calls, and supervisor
     /// exits cannot disagree with in-memory loop counters.
@@ -1531,6 +1546,30 @@ impl EventStore {
         )
         .bind(session_id)
         .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        raw.map(|data| serde_json::from_str::<ToolResultData>(&data).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Return the typed result for an exact causal operation. This avoids
+    /// selecting an unrelated later observation merely because it is newest.
+    pub(crate) async fn task_tool_result_by_call_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        tool_call_id: &str,
+    ) -> anyhow::Result<Option<ToolResultData>> {
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT data
+             FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
+               AND json_extract(data, '$.tool_call_id') = ?
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .bind(tool_call_id)
         .fetch_optional(&self.pool)
         .await?;
         raw.map(|data| serde_json::from_str::<ToolResultData>(&data).map_err(Into::into))
@@ -2326,19 +2365,21 @@ impl EventStore {
         .fetch_one(&self.pool)
         .await?
         .max(0) as u32;
-        let receipt_closure = self
-            .task_receipt_closure(session_id, &task_id)
+        let aggregate = self
+            .task_run_aggregate(session_id, &task_id)
             .await
-            .unwrap_or_default();
-        let outcome = match status {
-            TaskStatus::Completed
-                if receipt_closure.contract_present && !receipt_closure.fulfilled() =>
-            {
+            .unwrap_or_else(|_| RunAggregate::new(&task_id));
+        let outcome = match (status, aggregate.terminal_decision()) {
+            (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+            (_, super::RunTerminalDecision::Succeeded) => crate::events::TaskOutcome::Succeeded,
+            (_, super::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
+            (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
+                crate::events::TaskOutcome::Succeeded
+            }
+            (TaskStatus::Completed | TaskStatus::Interrupted, _) => {
                 crate::events::TaskOutcome::Partial
             }
-            TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
-            TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
-            TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
+            (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
         };
         let efficiency = Some(
             self.task_efficiency_data(&task_id)

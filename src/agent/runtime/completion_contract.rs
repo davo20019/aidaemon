@@ -810,7 +810,7 @@ pub(super) fn append_required_invocation_obligations(
                     acceptable_scopes: Vec::new(),
                     purpose: crate::traits::EvidencePurpose::Outcome,
                     minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                    temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                    temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
                     required_content_markers: Vec::new(),
                     receipt: Some(receipt.clone()),
                     target: None,

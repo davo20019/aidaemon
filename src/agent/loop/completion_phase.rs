@@ -1773,23 +1773,29 @@ pub(super) async fn run_completion_phase(
                     // receipt is never reported as a missing verification
                     // receipt. The durable contract closure decides whether
                     // the result is a success or an honest partial outcome.
-                    let durable_completed_result = tokio::time::timeout(
+                    let aggregate = tokio::time::timeout(
                         Duration::from_secs(5),
-                        agent
-                            .event_store
-                            .latest_completed_task_tool_result(session_id, task_id),
+                        agent.event_store.task_run_aggregate(session_id, task_id),
                     )
                     .await
                     .ok()
                     .and_then(Result::ok)
-                    .flatten();
-                    // A task with no completed observation can still have a
-                    // durable typed negative/blocked receipt. Preserve that
-                    // fact for deterministic closeout, but never let it mask
-                    // an earlier dispatched observation (the completed result
-                    // remains authoritative whenever it exists).
-                    let durable_result = if durable_completed_result.is_some() {
-                        durable_completed_result
+                    .unwrap_or_else(|| crate::events::RunAggregate::new(task_id));
+                    let durable_result = if let Some(operation_id) =
+                        aggregate.primary_causal_operation_id.as_deref()
+                    {
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            agent.event_store.task_tool_result_by_call_id(
+                                session_id,
+                                task_id,
+                                operation_id,
+                            ),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
                     } else {
                         tokio::time::timeout(
                             Duration::from_secs(5),
@@ -1804,13 +1810,9 @@ pub(super) async fn run_completion_phase(
                         .as_ref()
                         .filter(|result| result.receipt.is_some())
                     {
-                        let closure = agent
-                            .event_store
-                            .task_receipt_closure(session_id, task_id)
-                            .await
-                            .unwrap_or_default();
-                        let fulfilled = if closure.contract_present {
-                            closure.fulfilled()
+                        let fulfilled = if aggregate.contract_present {
+                            aggregate.terminal_decision()
+                                == crate::events::RunTerminalDecision::Succeeded
                         } else {
                             result.completed_observation()
                                 && result.receipt.as_ref().is_some_and(|receipt| {
