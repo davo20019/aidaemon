@@ -26,6 +26,10 @@ pub use model_call_telemetry::{
 pub use payloads::*;
 pub(crate) use run_aggregate::{RunAggregate, RunTerminalDecision};
 #[cfg(test)]
+pub(crate) use run_aggregate::{
+    RunObligation, RunObligationClass, RunObligationState, RunOperation,
+};
+#[cfg(test)]
 pub(crate) use store::GeneratedResponseRef;
 pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]

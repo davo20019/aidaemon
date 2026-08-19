@@ -3814,6 +3814,7 @@ mod tests {
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             required_response_fields: Vec::new(),
+            response_contract: None,
             forbidden_actions: Vec::new(),
             requires_observation: true,
             requires_reverification_after_mutation: false,
@@ -5612,6 +5613,7 @@ mod tests {
             projected_source_turn_ids: Vec::new(),
             force_text: false,
             token_usage_present: true,
+            token_usage_evidence: crate::events::TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
         };

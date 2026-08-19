@@ -15,8 +15,9 @@ use crate::execution_graph::{
     ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
 };
 use crate::traits::{
-    RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction, RequestTaskKind,
-    RequestVerificationTarget, RequestVerificationTargetKind,
+    RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction,
+    RequestResponseContract, RequestTaskKind, RequestVerificationTarget,
+    RequestVerificationTargetKind,
 };
 use crate::traits::{ToolCallSemantics, ToolMutationEffects, ToolOutcomeStatus};
 
@@ -110,6 +111,9 @@ pub(super) struct CompletionContract {
     /// Retained for persisted-schema compatibility. Final prose is not proof;
     /// runtime completion deliberately ignores these legacy labels.
     pub required_response_fields: Vec<String>,
+    /// Exact successful response artifact produced for the current request.
+    /// It is presentation state and never execution evidence.
+    pub response_contract: Option<Box<RequestResponseContract>>,
     /// Operation-specific negative obligations. These do not turn an otherwise
     /// mutating task into a report-only task; they block only the named action.
     pub forbidden_mutation_actions: Vec<ForbiddenMutationAction>,
@@ -179,6 +183,7 @@ pub(super) fn persistable_completion_contract(
         allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
         required_response_fields: contract.required_response_fields.clone(),
+        response_contract: contract.response_contract.clone(),
         forbidden_actions: contract
             .forbidden_mutation_actions
             .iter()
@@ -250,6 +255,7 @@ pub(super) fn completion_contract_from_persisted(
         allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
         required_response_fields: contract.required_response_fields.clone(),
+        response_contract: contract.response_contract.clone(),
         forbidden_mutation_actions: contract
             .forbidden_actions
             .iter()
@@ -402,6 +408,9 @@ pub(super) fn inherit_unfinished_request_contract(
         if !current.required_response_fields.contains(field) {
             current.required_response_fields.push(field.clone());
         }
+    }
+    if current.response_contract.is_none() {
+        current.response_contract = unfinished.response_contract.clone();
     }
     if current.forbids_tool_use {
         current.allowed_tool_names.clear();
@@ -769,6 +778,7 @@ pub(super) fn install_semantic_completion_contract(
         allowed_tool_names: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
         required_response_fields: Vec::new(),
+        response_contract: None,
         forbidden_mutation_actions: Vec::new(),
         requires_observation: requirements.requires_observation,
         requires_reverification_after_mutation: expects_mutation
@@ -2645,6 +2655,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         allowed_tool_names: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
         required_response_fields: Vec::new(),
+        response_contract: None,
         forbidden_mutation_actions,
         requires_observation,
         requires_reverification_after_mutation,
@@ -2680,6 +2691,7 @@ mod tests {
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             required_response_fields: Vec::new(),
+            response_contract: None,
             forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
             requires_observation: true,
             requires_reverification_after_mutation: true,
@@ -3261,6 +3273,23 @@ mod tests {
         assert_eq!(inherited.minimum_sources, 3);
         assert!(inherited.requires_primary_sources);
         assert!(inherited.requires_exact_history);
+    }
+
+    #[test]
+    fn unfinished_request_retains_its_typed_response_artifact() {
+        let expected = RequestResponseContract::ExactText {
+            success_text: "phase=synthetic; outcome=complete".to_string(),
+            source_message_hash: "synthetic-hash".to_string(),
+        };
+        let current = CompletionContract::default();
+        let unfinished = CompletionContract {
+            response_contract: Some(Box::new(expected.clone())),
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_unfinished_request_contract(current, &unfinished);
+
+        assert_eq!(inherited.response_contract, Some(Box::new(expected)));
     }
 
     #[test]

@@ -31,6 +31,45 @@ pub enum RequestForbiddenAction {
     Send,
 }
 
+/// Typed presentation contract for the successful terminal response.
+///
+/// This never proves that execution succeeded. The run aggregate may project
+/// it only after every non-delivery obligation has authoritative evidence.
+/// `source_message_hash` binds the assessor-produced contract to the user turn
+/// it interpreted. Natural-language interpretation remains entirely in the
+/// semantic producer rather than being repeated as Rust keyword rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RequestResponseContract {
+    ExactText {
+        success_text: String,
+        source_message_hash: String,
+    },
+}
+
+impl RequestResponseContract {
+    pub fn success_text(&self) -> &str {
+        match self {
+            Self::ExactText { success_text, .. } => success_text,
+        }
+    }
+
+    pub fn source_message_hash(&self) -> &str {
+        match self {
+            Self::ExactText {
+                source_message_hash,
+                ..
+            } => source_message_hash,
+        }
+    }
+
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::ExactText { .. } => "exact_text",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestVerificationTargetKind {
@@ -152,6 +191,11 @@ pub struct RequestCompletionContract {
     /// Exact user-authored labels required in the substantive final answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_response_fields: Vec<String>,
+    /// Grounded response artifact to project after execution proof closes.
+    /// Unlike legacy response-field labels, this is an exact typed value with
+    /// user-message provenance and is never interpreted as execution proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_contract: Option<Box<RequestResponseContract>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_actions: Vec<RequestForbiddenAction>,
     pub requires_observation: bool,

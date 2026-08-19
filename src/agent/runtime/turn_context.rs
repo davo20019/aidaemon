@@ -650,7 +650,27 @@ impl Agent {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     ) -> anyhow::Result<()> {
-        let normalized_msg = normalize_message_resources(msg);
+        let mut normalized_msg = normalize_message_resources(msg);
+        if normalized_msg.tool_calls_json.is_none() {
+            if let Some(task_id) = emitter.task_id() {
+                if let Ok(aggregate) = self
+                    .event_store
+                    .task_run_aggregate(&normalized_msg.session_id, task_id)
+                    .await
+                {
+                    if let Some(projected) = aggregate.projected_success_response() {
+                        if normalized_msg.content.as_deref() != Some(projected) {
+                            tracing::info!(
+                                task_id,
+                                response_id = %normalized_msg.id,
+                                "Projected typed successful response artifact"
+                            );
+                            normalized_msg.content = Some(projected.to_string());
+                        }
+                    }
+                }
+            }
+        }
         let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
         let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
             serde_json::from_str::<Vec<ToolCall>>(raw)
@@ -1216,6 +1236,7 @@ mod tests {
                 allowed_tool_names: Vec::new(),
                 forbidden_tool_scopes: Vec::new(),
                 required_response_fields: Vec::new(),
+                response_contract: None,
                 forbidden_actions: Vec::new(),
                 requires_observation: true,
                 requires_reverification_after_mutation: true,
@@ -1292,6 +1313,7 @@ mod tests {
                 allowed_tool_names: Vec::new(),
                 forbidden_tool_scopes: Vec::new(),
                 required_response_fields: Vec::new(),
+                response_contract: None,
                 forbidden_actions: Vec::new(),
                 requires_observation: true,
                 requires_reverification_after_mutation: false,

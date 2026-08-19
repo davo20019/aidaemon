@@ -2416,6 +2416,33 @@ pub(super) async fn run_completion_phase(
         }
 
         validation_state.clear_loop_repetition_reason();
+        if let Ok(aggregate) = agent
+            .event_store
+            .task_run_aggregate(session_id, task_id)
+            .await
+        {
+            if let Some(projected) = aggregate.projected_success_response() {
+                if reply != projected {
+                    agent
+                        .emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Projected typed successful response artifact".to_string(),
+                            json!({
+                                "condition": "response_contract_projected",
+                                "run_aggregate_schema_version": aggregate.schema_version,
+                                "execution_obligations_satisfied": true,
+                                "candidate_chars": reply.chars().count(),
+                                "projected_chars": projected.chars().count(),
+                            }),
+                        )
+                        .await;
+                    reply = projected.to_string();
+                }
+            }
+        }
         let reply_is_model_authored = reply == model_authored_reply;
         // Degeneration guard: collapse runaway repetition loops before anything
         // else. Models (especially local ones) sometimes collapse into emitting

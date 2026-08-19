@@ -115,8 +115,10 @@ impl ConversationRuntime for Agent {
             self.handle_internal_continuation(&request),
         )
         .await;
-        let text = text?;
-        let generated = returned_generated_response(captured, &text)?.response;
+        let returned_text = text?;
+        let captured = returned_generated_response(captured, &returned_text)?;
+        let text = captured.content;
+        let generated = captured.response;
         Ok(crate::runtime_ports::AgentResponseEnvelope {
             response_id: generated.response_id,
             task_id: generated.task_id,
@@ -155,8 +157,10 @@ impl AgentIngress for Agent {
             ),
         )
         .await;
-        let text = text?;
-        let generated = returned_generated_response(captured, &text)?.response;
+        let returned_text = text?;
+        let captured = returned_generated_response(captured, &returned_text)?;
+        let text = captured.content;
+        let generated = captured.response;
         Ok(crate::runtime_ports::AgentResponseEnvelope {
             response_id: generated.response_id,
             task_id: generated.task_id,
@@ -258,7 +262,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_response_identity_survives_final_text_transformation() {
+    fn persisted_response_is_the_authoritative_delivery_envelope() {
         let captured = crate::events::CapturedGeneratedResponse {
             content: "pre-transform response".to_string(),
             response: crate::events::GeneratedResponseRef {
@@ -276,5 +280,6 @@ mod tests {
         .expect("causal identity");
         assert_eq!(selected.response.response_id, "response-synthetic");
         assert_eq!(selected.response.task_id, "task-synthetic");
+        assert_eq!(selected.content, "pre-transform response");
     }
 }

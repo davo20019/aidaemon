@@ -5,10 +5,11 @@ use super::task_planning::{
 use crate::agent::CompletionTaskKind;
 use crate::traits::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-    RequestReceiptPredicate, ToolCallAccessManifest, ToolMutationEffects, ToolSemanticScope,
-    ToolTargetHint, ToolTargetHintKind,
+    RequestReceiptPredicate, RequestResponseContract, ToolCallAccessManifest, ToolMutationEffects,
+    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// One independently compiled contract lane. Reason codes are stable telemetry
 /// values; they never contain or classify user prose.
@@ -64,6 +65,7 @@ pub(crate) struct CompiledTaskContract {
     pub evidence_policy: CompiledEvidencePolicy,
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     pub required_invocations: Vec<RequestReceiptPredicate>,
+    pub response_contract: Option<Box<RequestResponseContract>>,
     pub filesystem_access: Option<ToolCallAccessManifest>,
     pub project_scope: Option<String>,
     pub decisions: Vec<ContractLaneDecision>,
@@ -77,6 +79,9 @@ pub(crate) struct ContractCompilerInput<'a> {
     pub structural_filesystem_resources: &'a [String],
     pub structural_project_scopes: &'a [String],
     pub project_alias_roots: &'a [String],
+    /// Current user turn used only to bind an assessor-produced response
+    /// contract to its request identity. Rust never classifies its wording.
+    pub current_user_text: &'a str,
 }
 
 fn decision(
@@ -158,6 +163,74 @@ fn compile_core(signals: &PlannedContractSignals) -> Result<CompiledCompletionCo
         task_kind,
         required_mutation_effects,
     })
+}
+
+fn compile_response_contract(
+    signals: &PlannedContractSignals,
+    current_user_text: &str,
+) -> (Option<Box<RequestResponseContract>>, ContractLaneDecision) {
+    const MAX_EXACT_RESPONSE_BYTES: usize = 4096;
+    let Some(candidate) = signals.response_contract.as_ref() else {
+        return (
+            None,
+            decision("response_presentation", true, "not_requested", 0, 0),
+        );
+    };
+    if candidate.mode != "exact_text" {
+        return (
+            None,
+            decision(
+                "response_presentation",
+                false,
+                "unsupported_presentation_mode",
+                1,
+                0,
+            ),
+        );
+    }
+    let Some(success_text) = candidate
+        .success_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    else {
+        return (
+            None,
+            decision("response_presentation", false, "exact_text_missing", 1, 0),
+        );
+    };
+    if success_text.len() > MAX_EXACT_RESPONSE_BYTES {
+        return (
+            None,
+            decision("response_presentation", false, "exact_text_too_large", 1, 0),
+        );
+    }
+    if success_text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return (
+            None,
+            decision(
+                "response_presentation",
+                false,
+                "exact_text_contains_control",
+                1,
+                0,
+            ),
+        );
+    }
+    // The semantic producer decides whether the request asks for exact text.
+    // This deterministic boundary validates only the typed value's shape and
+    // binds it to the current request; it deliberately does not re-interpret
+    // natural language with keywords, phrase lists, or substring rules.
+    let source_message_hash = format!("{:x}", Sha256::digest(current_user_text.as_bytes()));
+    (
+        Some(Box::new(RequestResponseContract::ExactText {
+            success_text: success_text.to_string(),
+            source_message_hash,
+        })),
+        decision("response_presentation", true, "accepted", 1, 1),
+    )
 }
 
 fn compile_evidence_policy(
@@ -808,6 +881,11 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
             .push(decision("completion_core", false, reason, 1, 0)),
     }
 
+    let (response_contract, response_decision) =
+        compile_response_contract(input.signals, input.current_user_text);
+    compiled.response_contract = response_contract;
+    compiled.decisions.push(response_decision);
+
     let (evidence, invocations, obligation_decision) = compile_obligations(
         input.signals,
         input.available_tool_names,
@@ -913,6 +991,7 @@ mod tests {
             forbidden_tool_scopes: Vec::new(),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),
+            response_contract: None,
             minimum_sources: Some(0),
             requires_primary_sources: Some(false),
             requires_exact_history: Some(false),
@@ -942,6 +1021,7 @@ mod tests {
             structural_filesystem_resources: &[],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         })
     }
 
@@ -1100,6 +1180,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_success_response_is_accepted_as_a_typed_artifact() {
+        let mut signals = base_signals();
+        signals.response_contract = Some(super::super::task_planning::PlannedResponseContract {
+            mode: "exact_text".to_string(),
+            success_text: Some("synthetic".to_string()),
+        });
+
+        let compiled = compile(&signals);
+        assert_eq!(
+            compiled
+                .response_contract
+                .as_ref()
+                .map(|contract| contract.success_text()),
+            Some("synthetic")
+        );
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "response_presentation"
+                && decision.accepted
+                && decision.reason_code == "accepted"
+        }));
+    }
+
+    #[test]
+    fn malformed_response_artifact_is_rejected_without_affecting_execution() {
+        let mut signals = base_signals();
+        signals.response_contract = Some(super::super::task_planning::PlannedResponseContract {
+            mode: "unsupported_mode".to_string(),
+            success_text: Some("synthetic".to_string()),
+        });
+
+        let compiled = compile(&signals);
+        assert!(compiled.core.is_some());
+        assert!(compiled.response_contract.is_none());
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "response_presentation"
+                && !decision.accepted
+                && decision.reason_code == "unsupported_presentation_mode"
+        }));
+    }
+
+    #[test]
     fn receipt_bound_evidence_and_invocation_share_one_proof_identity() {
         let receipt = RequestReceiptPredicate {
             tool_names: vec!["terminal".to_string()],
@@ -1180,6 +1301,7 @@ mod tests {
             structural_filesystem_resources: &resources,
             structural_project_scopes: &resources,
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
 
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -1224,6 +1346,7 @@ mod tests {
             structural_filesystem_resources: &[file.clone(), directory.clone()],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
         assert_eq!(access.read_targets[0].kind, ToolTargetHintKind::Path);
@@ -1256,6 +1379,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string()],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
         assert_eq!(
@@ -1288,6 +1412,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string()],
             structural_project_scopes: &[root.to_string()],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
         assert_eq!(access.write_targets.len(), 1);
@@ -1328,6 +1453,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string(), child.clone()],
             structural_project_scopes: &[root.to_string()],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
         assert!(access
@@ -1364,6 +1490,7 @@ mod tests {
             structural_filesystem_resources: &resources,
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
         assert!(access

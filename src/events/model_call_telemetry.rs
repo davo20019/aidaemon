@@ -10,6 +10,19 @@ use crate::traits::{ProviderResponse, TokenUsage, TokenUsageStore};
 
 use super::{EventEmitter, EventStore, LlmCallData};
 
+fn token_usage_evidence(
+    provider_usage_present: bool,
+    estimated_input_tokens: Option<u32>,
+) -> super::TokenUsageEvidence {
+    if provider_usage_present {
+        super::TokenUsageEvidence::ProviderMeasured
+    } else if estimated_input_tokens.is_some() {
+        super::TokenUsageEvidence::EstimatedInputOnly
+    } else {
+        super::TokenUsageEvidence::Unavailable
+    }
+}
+
 /// Input for a single model-call telemetry recording operation.
 #[derive(Debug, Clone)]
 pub struct ModelCallTelemetryInput {
@@ -38,6 +51,8 @@ pub async fn record_model_call_telemetry(
         .clone()
         .or_else(|| input.llm_call.call_purpose.clone());
     input.llm_call.token_usage_present = input.token_usage.is_some();
+    input.llm_call.token_usage_evidence =
+        token_usage_evidence(input.token_usage.is_some(), input.llm_call.est_input_tokens);
 
     if let Err(error) = emitter
         .emit_model_call_with_token_usage(input.llm_call, input.token_usage.as_ref(), &call_id)
@@ -50,6 +65,28 @@ pub async fn record_model_call_telemetry(
             call_purpose = ?input.call_purpose,
             error = %error,
             "Model-call telemetry transaction failed; neither canonical event nor token projection committed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_usage_evidence;
+    use crate::events::TokenUsageEvidence;
+
+    #[test]
+    fn token_usage_provenance_never_presents_an_estimate_as_provider_measurement() {
+        assert_eq!(
+            token_usage_evidence(true, Some(12_345)),
+            TokenUsageEvidence::ProviderMeasured
+        );
+        assert_eq!(
+            token_usage_evidence(false, Some(12_345)),
+            TokenUsageEvidence::EstimatedInputOnly
+        );
+        assert_eq!(
+            token_usage_evidence(false, None),
+            TokenUsageEvidence::Unavailable
         );
     }
 }
@@ -143,6 +180,7 @@ pub async fn record_background_model_call_telemetry(
                 message_count: None,
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
+                token_usage_evidence: super::TokenUsageEvidence::Unavailable,
                 failed: false,
                 error: None,
             },

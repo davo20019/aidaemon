@@ -29,7 +29,7 @@ pub use dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AdoptedEvidenceBinding, AssistantTurnKind,
     AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
     QuestionKind, RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction,
-    RequestReceiptPredicate, RequestTaskKind, RequestVerificationTarget,
+    RequestReceiptPredicate, RequestResponseContract, RequestTaskKind, RequestVerificationTarget,
     RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{

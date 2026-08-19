@@ -9,10 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Event, EventType, TaskContractCompiledData, ToolCallData, ToolResultData};
+use super::{
+    AssistantResponseData, Event, EventType, TaskContractCompiledData, ToolCallData, ToolResultData,
+};
 use crate::traits::{
-    EvidenceTemporalScope, RequestReceiptPredicate, ToolMutationEffects, ToolOutcomeStatus,
-    ToolReceiptKind,
+    EvidenceTemporalScope, RequestReceiptPredicate, RequestResponseContract, ToolMutationEffects,
+    ToolOutcomeStatus, ToolReceiptKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,7 +26,8 @@ pub(crate) enum RunObligationClass {
     Achieve,
     /// A state assertion holds at one effect revision and may be invalidated.
     Observe,
-    /// A response/artifact reached its requested delivery boundary.
+    /// The canonical response artifact was durably prepared for the transport
+    /// outbox. Platform acknowledgement remains a separate delivery event.
     Deliver,
 }
 
@@ -89,6 +92,8 @@ pub(crate) struct RunAggregate {
     pub effect_revision: u64,
     #[serde(default)]
     pub obligations: BTreeMap<String, RunObligation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_contract: Option<Box<RequestResponseContract>>,
     #[serde(default)]
     pub operations: BTreeMap<String, RunOperation>,
     #[serde(default)]
@@ -100,7 +105,7 @@ pub(crate) struct RunAggregate {
 }
 
 impl RunAggregate {
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 
     pub(crate) fn new(task_id: impl Into<String>) -> Self {
         Self {
@@ -109,6 +114,7 @@ impl RunAggregate {
             contract_present: false,
             effect_revision: 0,
             obligations: BTreeMap::new(),
+            response_contract: None,
             operations: BTreeMap::new(),
             cardinality_violations: 0,
             primary_causal_operation_id: None,
@@ -154,6 +160,13 @@ impl RunAggregate {
                     self.record_invariant("tool_result_payload_invalid");
                 }
             }
+            EventType::AssistantResponse => {
+                if let Ok(response) = event.parse_data::<AssistantResponseData>() {
+                    self.record_assistant_response(response);
+                } else {
+                    self.record_invariant("assistant_response_payload_invalid");
+                }
+            }
             _ => {}
         }
     }
@@ -165,6 +178,7 @@ impl RunAggregate {
         }
         self.contract_present = true;
         self.obligations.clear();
+        self.response_contract = compiled.contract.response_contract.clone();
         self.cardinality_violations = 0;
 
         for (index, requirement) in compiled.contract.evidence_requirements.iter().enumerate() {
@@ -242,6 +256,18 @@ impl RunAggregate {
             self.insert_obligation(RunObligation {
                 id: format!("task:{}/obligation:verification", self.task_id),
                 class: RunObligationClass::Observe,
+                state: RunObligationState::Pending,
+                receipt: None,
+                required_effect: ToolMutationEffects::NONE,
+                satisfied_at_revision: None,
+                satisfying_receipt_ids: Vec::new(),
+            });
+        }
+
+        if self.response_contract.is_some() {
+            self.insert_obligation(RunObligation {
+                id: format!("task:{}/obligation:deliver:response", self.task_id),
+                class: RunObligationClass::Deliver,
                 state: RunObligationState::Pending,
                 receipt: None,
                 required_effect: ToolMutationEffects::NONE,
@@ -387,6 +413,50 @@ impl RunAggregate {
         }
     }
 
+    fn record_assistant_response(&mut self, response: AssistantResponseData) {
+        if response
+            .task_id
+            .as_deref()
+            .is_some_and(|task_id| task_id != self.task_id)
+        {
+            self.record_invariant("assistant_response_task_identity_mismatch");
+            return;
+        }
+        if response
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            return;
+        }
+        let Some(expected) = self
+            .response_contract
+            .as_ref()
+            .map(|contract| contract.success_text())
+        else {
+            return;
+        };
+        if response.content.as_deref() != Some(expected) || !self.work_is_fulfilled() {
+            return;
+        }
+        let proof_id = response
+            .message_id
+            .as_deref()
+            .map(|id| format!("response:{id}"))
+            .unwrap_or_else(|| "response:unidentified".to_string());
+        for obligation in self
+            .obligations
+            .values_mut()
+            .filter(|obligation| obligation.class == RunObligationClass::Deliver)
+        {
+            obligation.state = RunObligationState::Satisfied;
+            obligation.satisfied_at_revision = Some(self.effect_revision);
+            if !obligation.satisfying_receipt_ids.contains(&proof_id) {
+                obligation.satisfying_receipt_ids.push(proof_id.clone());
+            }
+        }
+    }
+
     fn reconcile_cardinality(&mut self) {
         self.cardinality_violations = 0;
         for obligation in self.obligations.values() {
@@ -441,6 +511,46 @@ impl RunAggregate {
                     RunObligationState::Satisfied | RunObligationState::Abandoned
                 )
             })
+    }
+
+    /// Whether all execution/evidence work is proved and only presentation may
+    /// remain. This is deliberately separate from terminal success: preparing
+    /// the requested response artifact closes the `Deliver` obligation later.
+    pub(crate) fn work_is_fulfilled(&self) -> bool {
+        if !self.contract_present || self.cardinality_violations > 0 {
+            return false;
+        }
+        let mut work_obligations = self
+            .obligations
+            .values()
+            .filter(|obligation| obligation.class != RunObligationClass::Deliver)
+            .peekable();
+        if work_obligations.peek().is_none() {
+            // A response-only conversational request has no execution work.
+            // Once any operation exists, however, absence of a corresponding
+            // work obligation is not proof: never project success from a 0/0
+            // contract merely because an untracked tool happened to return.
+            return self.operations.is_empty();
+        }
+        work_obligations.all(|obligation| {
+            matches!(
+                obligation.state,
+                RunObligationState::Satisfied | RunObligationState::Abandoned
+            )
+        })
+    }
+
+    /// Deterministic successful response projection. A semantic producer owns
+    /// the presentation choice; the reducer exposes the typed artifact only
+    /// after non-delivery proof has closed.
+    pub(crate) fn projected_success_response(&self) -> Option<&str> {
+        self.work_is_fulfilled()
+            .then(|| {
+                self.response_contract
+                    .as_ref()
+                    .map(|contract| contract.success_text())
+            })
+            .flatten()
     }
 
     pub(crate) fn terminal_decision(&self) -> RunTerminalDecision {
@@ -574,6 +684,13 @@ mod tests {
     }
 
     fn contract(requirements: Vec<RequestEvidenceRequirement>) -> Event {
+        contract_with_response(requirements, None)
+    }
+
+    fn contract_with_response(
+        requirements: Vec<RequestEvidenceRequirement>,
+        response_contract: Option<Box<RequestResponseContract>>,
+    ) -> Event {
         event(
             EventType::TaskContractCompiled,
             TaskContractCompiledData {
@@ -590,6 +707,7 @@ mod tests {
                     allowed_tool_names: Vec::new(),
                     forbidden_tool_scopes: Vec::new(),
                     required_response_fields: Vec::new(),
+                    response_contract,
                     forbidden_actions: Vec::new(),
                     requires_observation: !requirements.is_empty(),
                     requires_reverification_after_mutation: false,
@@ -692,6 +810,24 @@ mod tests {
         )
     }
 
+    fn assistant_response(id: &str, content: &str) -> Event {
+        event(
+            EventType::AssistantResponse,
+            AssistantResponseData {
+                message_id: Some(id.to_string()),
+                content: Some(content.to_string()),
+                tool_calls: None,
+                model: "synthetic-model".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                annotations: Vec::new(),
+                turn_id: None,
+                task_id: Some("task-1".to_string()),
+                referenced_receipts: Vec::new(),
+            },
+        )
+    }
+
     #[test]
     fn invocation_accomplishments_accumulate_across_later_mutations() {
         let mut events = vec![
@@ -764,6 +900,89 @@ mod tests {
             RunAggregate::replay("task-1", &events).terminal_decision(),
             RunTerminalDecision::Succeeded
         );
+    }
+
+    #[test]
+    fn successful_work_requires_the_typed_response_artifact_for_delivery() {
+        let response = RequestResponseContract::ExactText {
+            success_text: "phase=synthetic; outcome=complete".to_string(),
+            source_message_hash: "synthetic-hash".to_string(),
+        };
+        let mut events = vec![
+            contract_with_response(vec![requirement("terminal", 0)], Some(Box::new(response))),
+            call("check", "terminal"),
+            result(
+                "check",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let work_complete = RunAggregate::replay("task-1", &events);
+        assert!(work_complete.work_is_fulfilled());
+        assert_eq!(
+            work_complete.projected_success_response(),
+            Some("phase=synthetic; outcome=complete")
+        );
+        assert_eq!(
+            work_complete.terminal_decision(),
+            RunTerminalDecision::Pending
+        );
+
+        events.push(assistant_response("wrong", "generic summary"));
+        events.last_mut().unwrap().id = 4;
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).terminal_decision(),
+            RunTerminalDecision::Pending
+        );
+
+        events.push(assistant_response(
+            "exact",
+            "phase=synthetic; outcome=complete",
+        ));
+        events.last_mut().unwrap().id = 5;
+        let delivered = RunAggregate::replay("task-1", &events);
+        assert_eq!(delivered.satisfied_count(), 2);
+        assert_eq!(
+            delivered.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+    }
+
+    #[test]
+    fn uncontracted_operation_cannot_unlock_a_success_response() {
+        let response = RequestResponseContract::ExactText {
+            success_text: "phase=synthetic; outcome=complete".to_string(),
+            source_message_hash: "synthetic-hash".to_string(),
+        };
+        let mut events = vec![
+            contract_with_response(Vec::new(), Some(Box::new(response))),
+            call("untracked", "terminal"),
+            result(
+                "untracked",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(!aggregate.work_is_fulfilled());
+        assert!(aggregate.projected_success_response().is_none());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
     }
 
     #[test]

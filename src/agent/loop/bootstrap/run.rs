@@ -225,6 +225,7 @@ async fn finalize_turn_assessment(
     let mut contract_lane_decisions = Vec::new();
     let mut compiled_evidence_requirements = Vec::new();
     let mut compiled_required_invocations = Vec::new();
+    let mut compiled_response_contract = None;
     let mut compiled_authority = None;
     let mut compiled_evidence_policy = None;
     let mut compiled_filesystem_access = None;
@@ -257,11 +258,13 @@ async fn finalize_turn_assessment(
                 structural_filesystem_resources: &structural_filesystem_resources,
                 structural_project_scopes: &structural_project_scopes,
                 project_alias_roots: &agent.path_aliases.projects,
+                current_user_text: user_text,
             },
         );
         contract_lane_decisions = compiled.decisions.clone();
         compiled_evidence_requirements = compiled.evidence_requirements.clone();
         compiled_required_invocations = compiled.required_invocations.clone();
+        compiled_response_contract = compiled.response_contract.clone();
         compiled_authority = Some(compiled.authority.clone());
         compiled_evidence_policy = Some(compiled.evidence_policy.clone());
         compiled_filesystem_access = compiled.filesystem_access.clone();
@@ -346,6 +349,17 @@ async fn finalize_turn_assessment(
         &mut turn_context.completion_contract,
         &effective_required_invocations,
     );
+    // Presentation follows the request lifecycle, not session recency. A new
+    // external request clears it; a structural resume or a validated adoption
+    // of unfinished obligations retains the parent artifact unless the current
+    // semantic producer supplies a typed replacement for the current request.
+    if compiled_response_contract.is_some()
+        || !(internal_continuation
+            || structural_resume
+            || turn_context.inherited_outstanding_obligations)
+    {
+        turn_context.completion_contract.response_contract = compiled_response_contract;
+    }
     turn_context.completion_contract.adopt_for_task(task_id);
 
     // Persist the finalized contract on its own correctness-critical event.
@@ -443,6 +457,11 @@ async fn finalize_turn_assessment(
                         "required_invocations": effective_required_invocations,
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
                         "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
+                        "response_contract": turn_context.completion_contract.response_contract.as_ref().map(|contract| json!({
+                            "mode": contract.mode(),
+                            "source_message_hash": contract.source_message_hash(),
+                            "success_text_bytes": contract.success_text().len(),
+                        })),
                         "filesystem_access": turn_context.filesystem_access,
                         "primary_project_scope": turn_context.primary_project_scope,
                     });

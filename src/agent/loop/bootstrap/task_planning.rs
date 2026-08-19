@@ -102,6 +102,11 @@ pub(crate) struct PlannedContractSignals {
     /// Retired compatibility field. Final prose is never lifecycle proof.
     #[serde(default)]
     pub required_response_fields: Vec<String>,
+    /// Optional presentation artifact for a successful run. The semantic
+    /// producer interprets the request; the compiler validates only the typed
+    /// artifact's shape. It never participates in execution proof.
+    #[serde(default)]
+    pub response_contract: Option<PlannedResponseContract>,
     /// Typed evidence requirements consumed directly by completion checks.
     #[serde(default)]
     pub minimum_sources: Option<u8>,
@@ -144,6 +149,13 @@ pub(crate) struct PlannedFilesystemAccess {
     pub read_roots: Vec<String>,
     #[serde(default, alias = "write_scopes")]
     pub write_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PlannedResponseContract {
+    pub mode: String,
+    #[serde(default)]
+    pub success_text: Option<String>,
 }
 
 /// Semantic task shape used by the orchestration router. The route decision is
@@ -249,6 +261,7 @@ fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSig
         forbidden_tool_scopes: decode_array_items(object, "forbidden_tool_scopes"),
         tool_constraint_evidence: Vec::new(),
         required_response_fields: decode_array_items(object, "required_response_fields"),
+        response_contract: decode_optional_field(object, "response_contract"),
         minimum_sources: decode_optional_field(object, "minimum_sources"),
         requires_primary_sources: decode_optional_field(object, "requires_primary_sources"),
         requires_exact_history: decode_optional_field(object, "requires_exact_history"),
@@ -960,6 +973,7 @@ async fn record_auxiliary_model_call(
                 projected_source_turn_ids: Vec::new(),
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
+                token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
                 failed: attempt_telemetry.validation_error.is_some(),
                 error: attempt_telemetry.validation_error,
             },
@@ -1029,6 +1043,7 @@ async fn record_auxiliary_model_failure(
                 projected_source_turn_ids: Vec::new(),
                 force_text: false,
                 token_usage_present: false,
+                token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
                 failed: true,
                 error: Some(error.into()),
             },
@@ -1086,6 +1101,7 @@ pub(crate) async fn generate_task_plan(
              \"tool_scope\": \"allowed|forbidden|restricted\",\n\
              \"allowed_tool_names\": [\"check_environment\"],\n\
              \"forbidden_tool_scopes\": [\"user_memory\"],\n\
+             \"response_contract\": {{\"mode\": \"exact_text\", \"success_text\": \"literal user-authored response\"}},\n\
              \"minimum_sources\": 0,\n\
              \"requires_primary_sources\": false,\n\
              \"requires_exact_history\": false,\n\
@@ -1174,7 +1190,13 @@ pub(crate) async fn generate_task_plan(
            a deny-set from the topic or an older turn. Otherwise use tool_scope=allowed, \
            forbidden_tool_scopes=[], and allowed_tool_names=[].\n\
          - required_response_fields is a retired compatibility field and must be []. Final prose \
-           is never lifecycle proof and is not matched by labels or markers.\n\
+           is never execution proof and is not matched by labels or markers.\n\
+         - response_contract is null unless the CURRENT user explicitly supplies the complete \
+           literal response to return when every execution/evidence obligation succeeds. In that \
+           case use mode=exact_text and copy success_text byte-for-byte from the current request, \
+           preserving punctuation and newlines. Do not infer a template, field list, wording style, \
+           placeholder, or success claim. This controls presentation only after typed proof closes; \
+           a failed run still receives an honest failure response.\n\
          - required_effects names the successful effects completion must prove. Valid \
            values are local_source_write, local_workspace_write, local_derived_write, \
            repository_write, remote_mutation, remote_deploy, external_delivery, \
@@ -2087,7 +2109,11 @@ mod tests {
                 "confidence": "high",
                 "expects_mutation": true,
                 "requires_observation": true,
-                "task_kind": "change"
+                "task_kind": "change",
+                "response_contract": {
+                    "mode": "exact_text",
+                    "success_text": "phase=synthetic; outcome=complete"
+                }
             }
         }"#;
 
@@ -2096,6 +2122,13 @@ mod tests {
         assert_eq!(contract.expects_mutation, Some(true));
         assert_eq!(contract.requires_observation, Some(true));
         assert_eq!(contract.task_kind.as_deref(), Some("change"));
+        assert_eq!(
+            contract
+                .response_contract
+                .as_ref()
+                .and_then(|response| response.success_text.as_deref()),
+            Some("phase=synthetic; outcome=complete")
+        );
         assert!(contract.mutation_scope.is_none());
         assert!(contract.forbidden_actions.is_empty());
     }
@@ -2116,6 +2149,7 @@ mod tests {
             forbidden_tool_scopes: Vec::new(),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),
+            response_contract: None,
             minimum_sources: Some(0),
             requires_primary_sources: Some(false),
             requires_exact_history: Some(false),

@@ -683,12 +683,26 @@ pub struct LlmCallData {
     /// Whether provider token usage was available for this call.
     #[serde(default)]
     pub token_usage_present: bool,
+    /// Authoritative provenance for token accounting. Failed/time-limited
+    /// calls commonly lack provider usage; an input estimate remains visible
+    /// without being mixed into measured billing totals.
+    #[serde(default)]
+    pub token_usage_evidence: TokenUsageEvidence,
     /// Whether the provider call ultimately failed after recovery was exhausted.
     #[serde(default)]
     pub failed: bool,
     /// Final provider/recovery error for failed calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageEvidence {
+    ProviderMeasured,
+    EstimatedInputOnly,
+    #[default]
+    Unavailable,
 }
 
 // =============================================================================
@@ -1613,6 +1627,7 @@ mod tests {
             projected_source_turn_ids: vec!["turn-1".to_string()],
             force_text: true,
             token_usage_present: true,
+            token_usage_evidence: TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
         };

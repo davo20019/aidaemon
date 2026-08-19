@@ -659,7 +659,10 @@ async fn finalize_durable_receipt_after_provider_failure(
         return Ok(None);
     };
     let receipt_closed = if aggregate.contract_present {
-        aggregate.terminal_decision() == crate::events::RunTerminalDecision::Succeeded
+        // A response-presentation obligation is closed by the assistant event
+        // emitted below. Do not spend a provider call merely to narrate work
+        // that the aggregate has already proved.
+        aggregate.work_is_fulfilled()
     } else {
         result.receipt.as_ref().is_some_and(|receipt| {
             !receipt.completion_obligation_ids.is_empty()
@@ -677,8 +680,12 @@ async fn finalize_durable_receipt_after_provider_failure(
                     && receipt.semantics.mutation_effects.has_specific_effects())
         })
     };
-    let reply =
-        crate::agent::completion_checks::build_receipt_closeout_reply(&result, receipt_closed);
+    let reply = aggregate
+        .projected_success_response()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            crate::agent::completion_checks::build_receipt_closeout_reply(&result, receipt_closed)
+        });
     let assistant_msg = Message {
         id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
@@ -727,6 +734,10 @@ async fn finalize_durable_receipt_after_provider_failure(
     learning_ctx.completed_naturally = receipt_closed || aggregate_failed;
     learning_ctx.task_outcome = Some(outcome);
     Ok(Some(reply))
+}
+
+fn aggregate_should_close_before_provider(aggregate: &crate::events::RunAggregate) -> bool {
+    aggregate.projected_success_response().is_some() && !aggregate.operations.is_empty()
 }
 
 pub(super) async fn run_llm_phase(
@@ -782,15 +793,37 @@ pub(super) async fn run_llm_phase(
     // Do not spend another provider timeout asking an LLM to rediscover it or
     // to authorize closure. The durable causal receipt supplies the closeout;
     // successful runs still reach normal synthesis for a useful user answer.
-    if services
+    let aggregate_before_provider = services
         .agent
         .event_store
         .task_run_aggregate(session_id, task_id)
         .await
-        .is_ok_and(|aggregate| {
-            aggregate.terminal_decision() == crate::events::RunTerminalDecision::Failed
-        })
+        .ok();
+    if aggregate_before_provider
+        .as_ref()
+        .is_some_and(aggregate_should_close_before_provider)
     {
+        if let Some(reply) = finalize_durable_receipt_after_provider_failure(
+            services.agent,
+            emitter,
+            task_id,
+            session_id,
+            iteration,
+            task_start,
+            learning_ctx,
+            model,
+            "typed response artifact ready",
+            completion_contract,
+            completion_progress,
+        )
+        .await?
+        {
+            return Ok(LlmPhaseOutcome::Return(Ok(reply)));
+        }
+    }
+    if aggregate_before_provider.as_ref().is_some_and(|aggregate| {
+        aggregate.terminal_decision() == crate::events::RunTerminalDecision::Failed
+    }) {
         if let Some(reply) = finalize_durable_receipt_after_provider_failure(
             services.agent,
             emitter,
@@ -1269,6 +1302,7 @@ pub(super) async fn run_llm_phase(
         projected_source_turn_ids: ctx.projected_source_turn_ids.to_vec(),
         force_text: prefix_fp.force_text,
         token_usage_present: false,
+        token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
         failed: false,
         error: None,
     };
@@ -1627,6 +1661,7 @@ pub(super) async fn run_llm_phase(
                     // the model fell back to another one.
                     chosen_tools: resp.tool_calls.iter().map(|tc| tc.name.clone()).collect(),
                     token_usage_present: resp.usage.is_some(),
+                    token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
                     ..base_llm_call.clone()
                 },
                 token_usage: resp.usage.clone(),
@@ -2438,6 +2473,43 @@ mod tests {
             Duration::from_secs(30).min(FOREGROUND_MAX_LLM_CALL_TIMEOUT),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn typed_response_with_closed_work_skips_optional_narrator() {
+        let mut aggregate = crate::events::RunAggregate::new("task-synthetic");
+        aggregate.contract_present = true;
+        aggregate.response_contract = Some(Box::new(
+            crate::traits::RequestResponseContract::ExactText {
+                success_text: "phase=synthetic; outcome=complete".to_string(),
+                source_message_hash: "synthetic-hash".to_string(),
+            },
+        ));
+        aggregate.obligations.insert(
+            "obligation-1".to_string(),
+            crate::events::RunObligation {
+                id: "obligation-1".to_string(),
+                class: crate::events::RunObligationClass::Perform,
+                state: crate::events::RunObligationState::Satisfied,
+                receipt: None,
+                required_effect: crate::traits::ToolMutationEffects::NONE,
+                satisfied_at_revision: Some(0),
+                satisfying_receipt_ids: vec!["result-1".to_string()],
+            },
+        );
+        aggregate.operations.insert(
+            "operation-1".to_string(),
+            crate::events::RunOperation {
+                operation_id: "operation-1".to_string(),
+                tool_name: "terminal".to_string(),
+                idempotency_key: None,
+                outcome: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                dispatched: true,
+                result_id: Some("result-1".to_string()),
+            },
+        );
+
+        assert!(aggregate_should_close_before_provider(&aggregate));
     }
 
     #[test]
