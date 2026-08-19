@@ -110,6 +110,8 @@ pub struct ContractSnapshot {
 pub struct CostSnapshot {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Estimate-only input tokens attached to failed provider calls.
+    pub failed_est_input_tokens: u64,
     pub weighted_tokens: u64,
     pub llm_calls: u32,
     pub fell_back_count: u32,
@@ -141,6 +143,7 @@ pub struct HarnessEvalAccumulator {
     stop_reason: StopReason,
     raw_input_tokens: u64,
     raw_output_tokens: u64,
+    failed_est_input_tokens: u64,
     weighted_tokens: u64,
     llm_calls: u32,
     fell_back_count: u32,
@@ -174,6 +177,7 @@ impl HarnessEvalAccumulator {
             stop_reason: StopReason::Other,
             raw_input_tokens: 0,
             raw_output_tokens: 0,
+            failed_est_input_tokens: 0,
             weighted_tokens: 0,
             llm_calls: 0,
             fell_back_count: 0,
@@ -333,6 +337,7 @@ impl HarnessEvalAccumulator {
     pub fn record_llm_efficiency(&mut self, efficiency: &TaskEfficiencyData) {
         self.raw_input_tokens = efficiency.input_tokens;
         self.raw_output_tokens = efficiency.output_tokens;
+        self.failed_est_input_tokens = efficiency.failed_est_input_tokens.unwrap_or_default();
         self.llm_calls = efficiency.llm_calls as u32;
         self.fell_back_count = efficiency.fell_back_count as u32;
         self.weighted_tokens = weighted_tokens_from_raw(
@@ -419,6 +424,7 @@ impl HarnessEvalAccumulator {
         let cost = CostSnapshot {
             total_input_tokens: acc.raw_input_tokens,
             total_output_tokens: acc.raw_output_tokens,
+            failed_est_input_tokens: acc.failed_est_input_tokens,
             weighted_tokens: acc.weighted_tokens,
             llm_calls: acc.llm_calls,
             fell_back_count: acc.fell_back_count,
@@ -540,6 +546,7 @@ impl From<CostSnapshot> for crate::events::CostEvalPayload {
         Self {
             total_input_tokens: value.total_input_tokens,
             total_output_tokens: value.total_output_tokens,
+            failed_est_input_tokens: value.failed_est_input_tokens,
             weighted_tokens: value.weighted_tokens,
             llm_calls: value.llm_calls,
             fell_back_count: value.fell_back_count,
@@ -631,6 +638,7 @@ mod tests {
             cost: CostEvalPayload {
                 total_input_tokens: 100,
                 total_output_tokens: 50,
+                failed_est_input_tokens: 0,
                 weighted_tokens,
                 llm_calls: 1,
                 fell_back_count: 0,

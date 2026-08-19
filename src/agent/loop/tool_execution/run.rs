@@ -677,11 +677,34 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .clone()
             .or_else(|| workspace_project_root.clone());
     }
-    let task_authorized_project_scopes = if turn_context.authorized_project_scopes.is_empty() {
+    // The semantic contract and the ingress scope are two projections of the
+    // same current-request authority.  Keep both in the execution compiler:
+    // a model may correctly bind a disposable root in `filesystem_access`
+    // while the older turn-context extractor only saw the surrounding text.
+    // Losing that typed root here makes the later step-scope lock reject an
+    // otherwise authorized descendant (notably `write_file` before a terminal
+    // build).  Only directory capabilities are promoted; exact file grants
+    // remain exact in the access-manifest check below.
+    let mut task_authorized_project_scopes = if turn_context.authorized_project_scopes.is_empty() {
         workspace_project_root.iter().cloned().collect::<Vec<_>>()
     } else {
         turn_context.authorized_project_scopes.clone()
     };
+    if let Some(access) = turn_context.filesystem_access.as_ref() {
+        for target in access
+            .read_targets
+            .iter()
+            .chain(access.write_targets.iter())
+            .filter(|target| target.kind == crate::traits::ToolTargetHintKind::ProjectScope)
+        {
+            if !task_authorized_project_scopes
+                .iter()
+                .any(|scope| scope == &target.value)
+            {
+                task_authorized_project_scopes.push(target.value.clone());
+            }
+        }
+    }
 
     let mut successful_tool_calls = 0;
     let mut iteration_had_tool_failures = false;
@@ -1099,30 +1122,135 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         } else {
             Default::default()
         };
-        if call_semantics.mutates_state()
-            && matches!(tc.name.as_str(), "terminal" | "cli_agent")
-            && access_manifest.write_targets.is_empty()
+        if let Some(tool) = registered_tool {
+            let adapter_manifest = tool.adapter_owned_access_manifest(&effective_arguments);
+            for target in adapter_manifest.adapter_read_targets {
+                if !access_manifest.adapter_read_targets.contains(&target) {
+                    access_manifest.adapter_read_targets.push(target);
+                }
+            }
+            call_semantics = tool.project_contract_mutation_effects(
+                call_semantics,
+                turn_context
+                    .completion_contract
+                    .required_mutation_effects,
+            );
+        }
+        // The compiled obligation identifies a terminal invocation as the
+        // requested mutation even when the model omitted the optional path
+        // manifest. This is a typed contract edge, not a command-text guess:
+        // only a mutation task with an exact required terminal operation may
+        // receive the task's already-authorized directory capability.
+        let terminal_is_required_mutation = tc.name == "terminal"
+            && turn_context.completion_contract.expects_mutation
+            && turn_context
+                .completion_contract
+                .evidence_requirements
+                .iter()
+                .filter_map(|requirement| requirement.receipt.as_ref())
+                .any(|predicate| predicate.tool_names.iter().any(|name| name == &tc.name));
+        // Project-scope grants are directory capabilities, not just a set of
+        // exact child paths. When a terminal mutation already carries a
+        // writable call, project the authorized roots into its typed argument
+        // so the native sandbox can prepare the root and enforce descendants.
+        // This is capability propagation from the compiled task contract; it
+        // does not inspect shell text or infer a directory from a filename.
+        if tc.name == "terminal"
+            && (call_semantics.mutates_state() || terminal_is_required_mutation)
         {
-            let write_authorities = turn_context
+            let authorized_roots = turn_context
                 .filesystem_access
                 .as_ref()
                 .map(|access| {
                     access
                         .write_targets
                         .iter()
+                        .filter(|target| {
+                            target.kind == crate::traits::ToolTargetHintKind::ProjectScope
+                        })
                         .map(|target| target.value.clone())
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_else(|| task_authorized_project_scopes.clone());
+                .unwrap_or_default();
+            if !authorized_roots.is_empty() {
+                if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
+                    if let Some(object) = arguments.as_object_mut() {
+                        let roots = object
+                            .entry("write_roots")
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Some(values) = roots.as_array_mut() {
+                            for root in authorized_roots {
+                                if !values.iter().any(|value| value.as_str() == Some(&root)) {
+                                    values.push(Value::String(root));
+                                }
+                            }
+                        }
+                        effective_arguments = serde_json::to_string(&arguments)?;
+                        if let Some(tool) = registered_tool {
+                            if let Ok(prepared) = tool.prepare_invocation(&effective_arguments) {
+                                effective_arguments = prepared.canonical_arguments;
+                                call_semantics = prepared.semantics;
+                                access_manifest = prepared.access_manifest;
+                                let adapter_manifest =
+                                    tool.adapter_owned_access_manifest(&effective_arguments);
+                                access_manifest.adapter_read_targets =
+                                    adapter_manifest.adapter_read_targets;
+                                call_semantics = tool.project_contract_mutation_effects(
+                                    call_semantics,
+                                    turn_context
+                                        .completion_contract
+                                        .required_mutation_effects,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (call_semantics.mutates_state() || terminal_is_required_mutation)
+            && matches!(tc.name.as_str(), "terminal" | "cli_agent")
+            && access_manifest.write_targets.is_empty()
+        {
+            let write_authorities = fallback_write_authorities(
+                turn_context.filesystem_access.as_ref(),
+                turn_context.completion_contract.expects_mutation,
+                turn_context.completion_contract.forbids_mutation,
+                &task_authorized_project_scopes,
+            );
             let narrow_scopes = narrowest_authorized_path_scopes(&write_authorities);
             if narrow_scopes.len() == 1 {
                 if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
                     if let Some(object) = arguments.as_object_mut() {
-                        object.insert("write_paths".to_string(), json!(narrow_scopes));
+                        let has_directory_authority = if !write_authorities.is_empty() {
+                            turn_context.filesystem_access.as_ref().is_some_and(|access| {
+                                access.write_targets.iter().any(|target| {
+                                    target.kind == crate::traits::ToolTargetHintKind::ProjectScope
+                                })
+                            }) || (turn_context.filesystem_access.is_none()
+                                && turn_context.completion_contract.expects_mutation
+                                && !turn_context.completion_contract.forbids_mutation)
+                        } else {
+                            false
+                        };
+                        if tc.name == "terminal" && has_directory_authority {
+                            object.insert("write_roots".to_string(), json!(narrow_scopes));
+                        } else {
+                            object.insert("write_paths".to_string(), json!(narrow_scopes));
+                        }
                         effective_arguments = serde_json::to_string(&arguments)?;
                         if let Some(tool) = registered_tool {
                             call_semantics = tool.call_semantics(&effective_arguments);
                             access_manifest = tool.call_access_manifest(&effective_arguments);
+                            let adapter_manifest =
+                                tool.adapter_owned_access_manifest(&effective_arguments);
+                            access_manifest.adapter_read_targets =
+                                adapter_manifest.adapter_read_targets;
+                            call_semantics = tool.project_contract_mutation_effects(
+                                call_semantics,
+                                turn_context
+                                    .completion_contract
+                                    .required_mutation_effects,
+                            );
                         }
                     }
                 }
@@ -1285,9 +1413,21 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         );
         let step_scope_violation =
             target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
+        let blocked_dependency = if call_semantics.mutates_state() {
+            execution_state
+                .mutation_depends_on_blocked_target(&access_manifest)
+                .map(|target| {
+                    format!(
+                        "Blocked because a prerequisite mutation for `{target}` was rejected before dispatch."
+                    )
+                })
+        } else {
+            None
+        };
         if let Some(scope_reason) = internal_scope_violation
             .or(access_scope_violation)
             .or(step_scope_violation)
+            .or(blocked_dependency)
         {
             POLICY_METRICS
                 .cross_scope_blocked_total
@@ -1356,9 +1496,23 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 )
                 .await;
             execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+            if call_semantics.mutates_state() {
+                let mut dependency_targets = access_manifest.write_targets.clone();
+                dependency_targets.extend(step_plan.expected_targets.iter().cloned());
+                // The task manifest is authority, not an attempted mutation.
+                // Recording every authorized target here would make one
+                // rejected path poison unrelated later work in the same
+                // request. Only the prepared call/step targets that were
+                // actually rejected become dependency blockers.
+                execution_state.record_blocked_dependency_targets(&dependency_targets);
+            }
             execution_state.mark_persisted_now();
             iteration_had_tool_failures = true;
-            continue;
+            // A rejected prerequisite closes this proposal batch. Dispatching
+            // later calls from the same model response would let a dependent
+            // operation run against unproven state; the next turn can choose a
+            // genuinely independent recovery step.
+            break;
         }
 
         match super::budget_blocking::maybe_block_tool_by_budget(

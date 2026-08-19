@@ -1095,6 +1095,37 @@ impl Agent {
         error: Option<String>,
         summary: Option<String>,
     ) {
+        // The persisted receipt graph is the final authority for an
+        // invocation-bound task. Individual exit paths can only propose an
+        // outcome from in-memory state; reconcile it here so a provider
+        // timeout or finalizer fallback cannot record `succeeded` while a
+        // durable required invocation remains unsatisfied.
+        let receipt_closure = self
+            .event_store
+            .task_receipt_closure(emitter.session_id(), task_id)
+            .await
+            .unwrap_or_default();
+        let effective_outcome = if receipt_closure.contract_present {
+            if !receipt_closure.fulfilled() && outcome == crate::events::TaskOutcome::Succeeded {
+                crate::events::TaskOutcome::Partial
+            } else if receipt_closure.fulfilled()
+                && outcome == crate::events::TaskOutcome::Partial
+                && summary
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+            {
+                // In-memory verification can lag a durable receipt when a
+                // provider/finalizer fails immediately after dispatch. The
+                // persisted proof graph is authoritative for obligation
+                // closure; promote only a present user-facing closeout, never
+                // a hard failure or an empty response.
+                crate::events::TaskOutcome::Succeeded
+            } else {
+                outcome
+            }
+        } else {
+            outcome
+        };
         let durable_tool_calls_count = self
             .event_store
             .task_event_count(
@@ -1111,7 +1142,10 @@ impl Agent {
             .ok()
             .flatten()
             .unwrap_or_else(|| task_start.elapsed().as_secs());
-        let efficiency = self.task_efficiency_data(task_id).await;
+        // Every terminalization path carries a task-level cost aggregate,
+        // including cancellation/watchdog exits with zero provider calls.
+        // A missing row is a real zero, not an unknown lifecycle state.
+        let efficiency = Some(self.task_efficiency_data(task_id).await.unwrap_or_default());
         // Task outcome is the authoritative failure signal.  Some bounded
         // closeout paths intentionally return a user-facing fallback with a
         // `Completed` transport status while the semantic outcome is
@@ -1119,7 +1153,7 @@ impl Agent {
         // their token cost from policy telemetry.  Existing `Failed` paths
         // retain their legacy pre-boundary increment, so this branch covers
         // only the previously uncounted status projection.
-        if !outcome.task_success() && status != TaskStatus::Failed {
+        if !effective_outcome.task_success() && status != TaskStatus::Failed {
             let tokens = efficiency
                 .as_ref()
                 .map(|data| data.input_tokens.saturating_add(data.output_tokens))
@@ -1130,7 +1164,7 @@ impl Agent {
             let acc = self.harness_eval.write().await.take();
             acc.map(|accumulator| {
                 accumulator.finalize(
-                    outcome,
+                    effective_outcome,
                     iteration as u32,
                     durable_tool_calls_count,
                     efficiency.as_ref(),
@@ -1150,6 +1184,36 @@ impl Agent {
         if let Some(ref snapshot) = harness_eval_snapshot {
             super::policy_metrics::record_harness_eval_task(snapshot);
         }
+        self.emit_decision_point(
+            emitter,
+            task_id,
+            iteration,
+            crate::events::DecisionType::PostExecutionValidation,
+            "Task finalization reconciled against durable receipt state",
+            serde_json::json!({
+                "condition": "task_finalization_reconciled",
+                "requested_outcome": outcome,
+                "effective_outcome": effective_outcome,
+                "status": status,
+                "receipt_contract_present": receipt_closure.contract_present,
+                "required_receipts": receipt_closure.required,
+                "satisfied_receipts": receipt_closure.satisfied,
+                "receipt_cardinality_violations": receipt_closure.cardinality_violations,
+                "persisted_receipt_count": receipt_closure.receipt_count,
+                "required_mutation_effects": receipt_closure
+                    .required_mutation_effects
+                    .telemetry_value(),
+                "observed_mutation_effects": receipt_closure
+                    .observed_mutation_effects
+                    .telemetry_value(),
+                "evidence_required": receipt_closure.evidence_required,
+                "evidence_satisfied": receipt_closure.evidence_satisfied,
+                "observation_required": receipt_closure.observation_required,
+                "observation_satisfied": receipt_closure.observation_satisfied,
+                "tool_calls_count": durable_tool_calls_count,
+            }),
+        )
+        .await;
         let completion_proof = crate::events::TaskCompletionProofData {
             schema_version: 1,
             task_id: task_id.to_string(),
@@ -1172,7 +1236,7 @@ impl Agent {
                 TaskEndData {
                     task_id: task_id.to_string(),
                     status,
-                    outcome: Some(outcome),
+                    outcome: Some(effective_outcome),
                     duration_secs: durable_duration_secs,
                     iterations: iteration as u32,
                     tool_calls_count: durable_tool_calls_count,
@@ -1200,7 +1264,7 @@ impl Agent {
             emitter.session_id(),
             task_id,
             status,
-            outcome,
+            effective_outcome,
         )
         .await
         {
@@ -1240,6 +1304,8 @@ impl Agent {
             max_latency_iteration: summary.max_latency_iteration,
             input_tokens: summary.total_input_tokens,
             output_tokens: summary.total_output_tokens,
+            failed_est_input_tokens: (summary.failed_est_input_tokens > 0)
+                .then_some(summary.failed_est_input_tokens),
             cached_input_tokens: if summary.cached_input_token_samples > 0 {
                 Some(summary.total_cached_input_tokens)
             } else {

@@ -50,6 +50,66 @@ pub(super) fn build_tool_output_completion_reply(
     Some(format!("{}\n\n{}", prefix, trimmed))
 }
 
+/// Render a user-facing closeout from the durable typed receipt. This is used
+/// when the response provider is unavailable or finalization exhausts its
+/// bounded pass: persisted receipt truth must be visible, and a present but
+/// unsatisfied receipt must never be described as missing.
+pub(super) fn build_receipt_closeout_reply(
+    result: &crate::events::ToolResultData,
+    contract_fulfilled: bool,
+) -> String {
+    let status = result.outcome_status().as_str();
+    let exit = result
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.exit_code)
+        .map(|code| format!(", exit code {code}"))
+        .unwrap_or_default();
+    if contract_fulfilled {
+        if let Some(reply) = build_tool_output_completion_reply(&result.name, &result.result, false)
+        {
+            return reply;
+        }
+        return format!(
+            "The {} operation completed with typed outcome `{status}`{exit}.",
+            result.name
+        );
+    }
+    let stage = result
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.invocation_stage.as_str())
+        .unwrap_or("unknown");
+    let detail = result
+        .error
+        .as_deref()
+        .or_else(|| {
+            result
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.access_denial.as_ref())
+                .map(|denial| denial.reason_code.as_str())
+        })
+        .or_else(|| {
+            result
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.transport_error.as_deref())
+        })
+        .or_else(|| {
+            let output = result.result.trim();
+            (!output.is_empty()).then_some(output)
+        })
+        .map(|detail| crate::utils::truncate_str(detail.trim(), 240).to_string())
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!(" Detail: {detail}."))
+        .unwrap_or_default();
+    format!(
+        "The {} operation ended with durable typed outcome `{status}` at `{stage}`{exit}, but it did not satisfy all requested obligations.{detail} No successful completion is claimed.",
+        result.name,
+    )
+}
+
 pub(super) fn build_force_text_deferred_completion_reply(
     candidate: &CompletionRecoveryCandidate,
     _tool_call_count: usize,

@@ -250,6 +250,33 @@ pub(super) fn narrowest_authorized_path_scopes(scopes: &[String]) -> Vec<String>
     result
 }
 
+/// Return the typed write capabilities available for a mutation call when
+/// the semantic manifest did not include a separate write target list.
+///
+/// A project path used only for read/cwd confinement must never become a write
+/// grant by fallback. The promotion is allowed only for a contract that
+/// explicitly expects mutation and has not installed a hard read-only fence.
+pub(super) fn fallback_write_authorities(
+    task_access: Option<&crate::traits::ToolCallAccessManifest>,
+    expects_mutation: bool,
+    forbids_mutation: bool,
+    task_scopes: &[String],
+) -> Vec<String> {
+    if forbids_mutation || !expects_mutation {
+        return Vec::new();
+    }
+    task_access
+        .map(|access| {
+            access
+                .write_targets
+                .iter()
+                .map(|target| target.value.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|targets| !targets.is_empty())
+        .unwrap_or_else(|| task_scopes.to_vec())
+}
+
 pub(super) fn tool_is_currently_exposed(tool_defs: &[Value], tool_name: &str) -> bool {
     tool_defs.iter().any(|def| {
         def.get("function")
@@ -496,7 +523,9 @@ pub(super) fn access_manifest_scope_violation(
     let invalid_reads = call
         .read_targets
         .iter()
-        .filter(|candidate| outside(candidate, &read_grants))
+        .filter(|candidate| {
+            outside(candidate, &read_grants) && outside(candidate, &call.adapter_read_targets)
+        })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
     let invalid_writes = call
@@ -1004,7 +1033,7 @@ pub(in crate::agent) struct EvidenceRequirementEvaluation {
 fn evaluate_receipt_predicate(
     requirement: &RequestEvidenceRequirement,
     requested_tool_name: &str,
-    result_text: &str,
+    _result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
 ) -> ReceiptPredicateEvaluation {
     let Some(receipt) = requirement.receipt.as_ref() else {
@@ -1049,8 +1078,7 @@ fn evaluate_receipt_predicate(
     let has_output = metadata
         .result_provenance
         .as_ref()
-        .is_some_and(|provenance| provenance.authoritative_chars > 0)
-        || !result_text.trim().is_empty();
+        .is_some_and(|provenance| provenance.authoritative_chars > 0);
     ReceiptPredicateEvaluation {
         has_predicate: true,
         tool_compatible,
@@ -1404,6 +1432,47 @@ mod tests {
             "No memories matching 'synthetic pets'.",
             &metadata,
         ));
+    }
+
+    #[test]
+    fn read_only_project_scope_never_becomes_a_write_fallback() {
+        let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
+        let read_only = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/read-only-project",
+            )],
+            write_targets: Vec::new(),
+            ..Default::default()
+        };
+        assert!(fallback_write_authorities(
+            Some(&read_only),
+            false,
+            true,
+            &["/tmp/read-only-project".to_string()],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn mutation_contract_can_fallback_to_explicit_task_scope() {
+        let read_only_manifest = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/autonomy-project",
+            )
+            .expect("target")],
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_write_authorities(
+                Some(&read_only_manifest),
+                true,
+                false,
+                &["/tmp/autonomy-project".to_string()],
+            ),
+            vec!["/tmp/autonomy-project".to_string()]
+        );
     }
 
     #[test]
@@ -2412,6 +2481,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 hint(ToolTargetHintKind::Path, "/workspace/project/Cargo.toml"),
             ],
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
+            adapter_read_targets: Vec::new(),
         };
         let valid = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
@@ -2420,6 +2490,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 hint(ToolTargetHintKind::Path, "/workspace/project/Cargo.toml"),
             ],
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
+            adapter_read_targets: Vec::new(),
         };
         assert!(access_manifest_scope_violation("cli_agent", &valid, Some(&task), &[]).is_none());
 
@@ -2433,11 +2504,67 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
     }
 
     #[test]
+    fn adapter_runtime_reads_are_not_task_data_authority() {
+        let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/tmp")],
+            write_targets: Vec::new(),
+            adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
+        };
+        let call = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/usr/bin/env")],
+            write_targets: Vec::new(),
+            adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
+        };
+        assert!(
+            access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_none(),
+            "adapter-owned runtime reads must be independently grantable"
+        );
+
+        let undeclared = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
+            ..call
+        };
+        assert!(
+            access_manifest_scope_violation("terminal", &undeclared, Some(&task), &[]).is_some()
+        );
+    }
+
+    #[test]
+    fn directory_write_grant_allows_a_future_descendant_without_widening_reads() {
+        let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/input.txt")],
+            write_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/tmp/output-root")],
+            adapter_read_targets: Vec::new(),
+        };
+        let call = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/input.txt")],
+            write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/.keep")],
+            adapter_read_targets: Vec::new(),
+        };
+        assert!(access_manifest_scope_violation("write_file", &call, Some(&task), &[]).is_none());
+
+        let read_escape = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/secret")],
+            ..call
+        };
+        assert!(
+            access_manifest_scope_violation("write_file", &read_escape, Some(&task), &[]).is_some()
+        );
+    }
+
+    #[test]
     fn execution_cwd_is_neither_an_implicit_read_nor_write_grant() {
         let task = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
         };
         let call = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
@@ -2445,6 +2572,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                 ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
             ],
             write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
         };
         assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_some());
     }
@@ -2455,11 +2583,13 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             execution_cwd: Some("/tmp/expected".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
         };
         let call = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp/different".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
         };
         let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[])
             .expect("cwd mismatch");
@@ -2476,6 +2606,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: vec![
                 ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/output.txt").expect("write"),
             ],
+            adapter_read_targets: Vec::new(),
         };
 
         assert!(access_manifest_scope_violation("synthetic", &call, None, &[]).is_none());

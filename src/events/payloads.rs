@@ -8,8 +8,8 @@ use serde_json::Value as JsonValue;
 
 use super::{TaskOutcome, TaskStatus};
 use crate::traits::{
-    MessageAnnotation, MessageAttachment, ToolCallMetadata, ToolCallSemantics, ToolOutcomeStatus,
-    TruncationInfo,
+    MessageAnnotation, MessageAttachment, RequestCompletionContract, RequestReceiptPredicate,
+    ToolCallMetadata, ToolCallSemantics, ToolOutcomeStatus, TruncationInfo,
 };
 
 // =============================================================================
@@ -813,6 +813,23 @@ pub struct MemoryPolicyCompiledData {
     pub persistence_suppressed: bool,
 }
 
+/// Correctness-critical snapshot of the contract that owns a task's receipt
+/// obligations. This is separate from `DecisionPointData`: diagnostics may be
+/// sampled or disabled, while task outcome reconciliation must always have a
+/// durable typed contract to evaluate after provider/finalizer failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContractCompiledData {
+    pub schema_version: u16,
+    pub task_id: String,
+    pub contract: RequestCompletionContract,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_invocations: Vec<RequestReceiptPredicate>,
+}
+
+impl TaskContractCompiledData {
+    pub const SCHEMA_VERSION: u16 = 1;
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPipelineAccess {
@@ -1065,7 +1082,7 @@ impl TaskEndData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskEfficiencyData {
     pub llm_calls: u64,
     pub attempts: u64,
@@ -1075,6 +1092,10 @@ pub struct TaskEfficiencyData {
     pub max_latency_iteration: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Estimate-only input tokens for provider calls that failed before
+    /// authoritative usage was returned. This is a cost bound, not a bill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_est_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1215,6 +1236,9 @@ pub struct ContractFulfillmentPayload {
 pub struct CostEvalPayload {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Estimate-only input tokens for failed provider calls.
+    #[serde(default)]
+    pub failed_est_input_tokens: u64,
     pub weighted_tokens: u64,
     pub llm_calls: u32,
     pub fell_back_count: u32,
@@ -1739,6 +1763,7 @@ mod tests {
                 max_latency_iteration: 2,
                 input_tokens: 42_000,
                 output_tokens: 700,
+                failed_est_input_tokens: Some(2_000),
                 cached_input_tokens: Some(32_000),
                 cache_creation_input_tokens: Some(1_000),
                 fresh_input_tokens: Some(10_000),
@@ -1762,6 +1787,7 @@ mod tests {
         assert_eq!(efficiency.max_latency_iteration, 2);
         assert_eq!(efficiency.input_tokens, 42_000);
         assert_eq!(efficiency.output_tokens, 700);
+        assert_eq!(efficiency.failed_est_input_tokens, Some(2_000));
         assert_eq!(efficiency.cached_input_tokens, Some(32_000));
         assert_eq!(efficiency.cache_creation_input_tokens, Some(1_000));
         assert_eq!(efficiency.fresh_input_tokens, Some(10_000));

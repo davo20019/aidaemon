@@ -255,6 +255,7 @@ mod response_phase;
 #[path = "loop/services.rs"]
 mod services;
 pub(in crate::agent) use completion_contract::inherit_request_constraints;
+pub(in crate::agent) use completion_contract::persistable_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;

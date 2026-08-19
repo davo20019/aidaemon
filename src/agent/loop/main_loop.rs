@@ -2172,37 +2172,39 @@ impl Agent {
             .await
             .ok()
             .flatten();
+        let receipt_closure = self
+            .event_store
+            .task_receipt_closure(session_id, &unhandled_error_task_id)
+            .await
+            .unwrap_or_default();
         let receipt_closed = latest_result.as_ref().is_some_and(|result| {
             result.completed_observation()
-                && result.receipt.as_ref().is_some_and(|receipt| {
-                    // A proof-bound receipt is the strongest closeout. When
-                    // assessment was unavailable, an observation-only typed
-                    // receipt is still sufficient to deliver its own state;
-                    // mutation receipts remain partial until an explicit
-                    // obligation/effect proof is present.
-                    !receipt.completion_obligation_ids.is_empty()
-                        || (receipt.semantics.observes_state()
-                            && !receipt.semantics.mutates_state())
-                })
-        });
-        let receipt_reply = latest_result.as_ref().and_then(|result| {
-            crate::agent::completion_checks::build_tool_output_completion_reply(
-                &result.name,
-                &result.result,
-                false,
-            )
+                && if receipt_closure.contract_present {
+                    receipt_closure.fulfilled()
+                } else {
+                    result.receipt.as_ref().is_some_and(|receipt| {
+                        // A proof-bound receipt is the strongest closeout. When
+                        // assessment was unavailable, an observation-only typed
+                        // receipt is still sufficient to deliver its own state;
+                        // mutation receipts remain partial until an explicit
+                        // obligation/effect proof is present.
+                        !receipt.completion_obligation_ids.is_empty()
+                            || (receipt.semantics.observes_state()
+                                && !receipt.semantics.mutates_state())
+                            || (result.succeeded()
+                                && receipt.semantics.mutates_state()
+                                && receipt.semantics.mutation_effects.has_specific_effects())
+                    })
+                }
         });
         let (reply, outcome, status) = if let Some(result) = latest_result
             .as_ref()
             .filter(|result| result.completed_observation())
         {
-            let reply = receipt_reply.unwrap_or_else(|| {
-                format!(
-                    "The {} operation completed with outcome `{}`. The response provider failed before it could add a summary; the typed result is preserved.",
-                    result.name,
-                    result.outcome_status().as_str()
-                )
-            });
+            let reply = crate::agent::completion_checks::build_receipt_closeout_reply(
+                result,
+                receipt_closed,
+            );
             (
                 reply,
                 if receipt_closed {

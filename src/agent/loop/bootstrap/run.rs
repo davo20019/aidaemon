@@ -95,12 +95,13 @@ async fn finalize_turn_assessment(
     initial_turn_context: &TurnContext,
     plan: Option<&super::task_planning::TaskPlan>,
     available_tool_names: &[String],
+    available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
     model: &str,
     planner_trust_tier: &str,
-) -> (TurnContext, bool) {
+) -> anyhow::Result<(TurnContext, bool)> {
     // Only the relationship producer may select an antecedent. The contract
     // producer's task shape remains useful for execution mode/confidence, but
     // its relationship fields have no dialogue-state authority.
@@ -277,6 +278,7 @@ async fn finalize_turn_assessment(
                 signals,
                 task_shape: plan.and_then(|plan| plan.task_shape.as_ref()),
                 available_tool_names,
+                available_tool_receipt_kinds,
                 structural_filesystem_resources: &structural_filesystem_resources,
                 structural_project_scopes: &structural_project_scopes,
                 project_alias_roots: &agent.path_aliases.projects,
@@ -359,6 +361,7 @@ async fn finalize_turn_assessment(
         access.execution_cwd.is_some()
             || !access.read_targets.is_empty()
             || !access.write_targets.is_empty()
+            || !access.adapter_read_targets.is_empty()
     });
     crate::agent::append_evidence_obligations(
         &mut turn_context.completion_contract,
@@ -369,6 +372,42 @@ async fn finalize_turn_assessment(
         &effective_required_invocations,
     );
     turn_context.completion_contract.adopt_for_task(task_id);
+
+    // Persist the finalized contract on its own correctness-critical event.
+    // Decision points are an optional flight recorder and may be disabled for
+    // cost/volume reasons; task outcome reconciliation must still survive a
+    // provider failure, restart, or finalizer fallback with the exact same
+    // typed obligation set.
+    let persisted_contract =
+        crate::agent::persistable_completion_contract(&turn_context.completion_contract);
+    let required_invocations = turn_context
+        .completion_contract
+        .evidence_requirements
+        .iter()
+        .filter(|requirement| requirement.purpose == crate::traits::EvidencePurpose::Outcome)
+        .filter_map(|requirement| requirement.receipt.clone())
+        .fold(Vec::new(), |mut values, receipt| {
+            if !values.contains(&receipt) {
+                values.push(receipt);
+            }
+            values
+        });
+    emitter
+        .emit(
+            EventType::TaskContractCompiled,
+            crate::events::TaskContractCompiledData {
+                schema_version: crate::events::TaskContractCompiledData::SCHEMA_VERSION,
+                task_id: task_id.to_string(),
+                contract: persisted_contract,
+                required_invocations,
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not persist correctness-critical task contract for {task_id}: {error}"
+            )
+        })?;
 
     // Task ownership is bound only after the relationship and inherited
     // contract are frozen. This prevents a new or internal child TaskStart
@@ -420,11 +459,17 @@ async fn finalize_turn_assessment(
                     metadata["completion_contract"] = json!({
                         "task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_ascii_lowercase(),
                         "expects_mutation": turn_context.completion_contract.expects_mutation,
+                        "required_mutation_effects": turn_context
+                            .completion_contract
+                            .required_mutation_effects
+                            .telemetry_value(),
                         "requires_observation": turn_context.completion_contract.requires_observation,
                         "evidence_requirements": turn_context.completion_contract.evidence_requirements,
                         "required_invocations": effective_required_invocations,
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
                         "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
+                        "filesystem_access": turn_context.filesystem_access,
+                        "primary_project_scope": turn_context.primary_project_scope,
                     });
                     metadata
                 },
@@ -449,7 +494,7 @@ async fn finalize_turn_assessment(
             .await;
     }
 
-    (turn_context, semantic_contract_applied)
+    Ok((turn_context, semantic_contract_applied))
 }
 
 /// Build mandate worker bootstrap state without consulting any owner-turn
@@ -1323,6 +1368,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 .map(str::to_string)
         })
         .collect::<Vec<_>>();
+    let available_tool_receipt_kinds = agent
+        .tools
+        .iter()
+        .map(|tool| (tool.name().to_string(), tool.receipt_kind("{}")))
+        .collect::<Vec<_>>();
     let (turn_context, semantic_contract_applied) = finalize_turn_assessment(
         agent,
         &emitter,
@@ -1334,13 +1384,14 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         &initial_turn_context,
         task_plan.as_ref(),
         &available_tool_names,
+        &available_tool_receipt_kinds,
         relationship_fallback.as_ref(),
         task_assessment_attempted,
         assessment_decision_type,
         &model,
         planner_trust_tier,
     )
-    .await;
+    .await?;
     let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
         &turn_context.completion_contract,
         semantic_contract_applied,

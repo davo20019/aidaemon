@@ -366,6 +366,12 @@ pub struct ExecutionState {
     /// Structured outcome ledger — one entry per tool call attempt.
     #[serde(default)]
     pub outcome_ledger: Vec<OutcomeEntry>,
+    /// Typed targets whose prerequisite mutation was rejected before I/O.
+    /// Later mutation proposals that overlap one of these targets are blocked
+    /// before dispatch; a dependent operation cannot run on an unproven
+    /// prerequisite merely because a new model turn proposed it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_dependency_targets: Vec<ToolTargetHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_linear_intent_plan: Option<LinearIntentPlan>,
     /// Cumulative milliseconds lost to LLM provider timeouts.  These are NOT
@@ -444,6 +450,7 @@ impl ExecutionState {
             observation_extensions_used: 0,
             resource_pressure_emitted: false,
             outcome_ledger: Vec::new(),
+            blocked_dependency_targets: Vec::new(),
             active_linear_intent_plan: None,
             provider_timeout_ms: 0,
             tool_output_evidence: String::new(),
@@ -771,6 +778,45 @@ impl ExecutionState {
         self.background_handoff_active =
             matches!(outcome, StepExecutionOutcome::BackgroundDetached);
         self.last_outcome = Some(outcome);
+    }
+
+    pub fn record_blocked_dependency_targets(&mut self, targets: &[ToolTargetHint]) {
+        for target in targets {
+            if matches!(
+                target.kind,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+            ) && !self.blocked_dependency_targets.contains(target)
+            {
+                self.blocked_dependency_targets.push(target.clone());
+            }
+        }
+    }
+
+    /// Return the first prior prerequisite target whose declared capability
+    /// overlaps a proposed mutation target. Both containment directions are
+    /// checked: a blocked exact prerequisite can prevent a later directory
+    /// operation from assuming that prerequisite exists, while a blocked
+    /// directory prerequisite prevents a descendant mutation. Comparison is
+    /// structural path containment with an explicit separator boundary; no
+    /// command or user wording is inspected.
+    pub fn mutation_depends_on_blocked_target(
+        &self,
+        access_manifest: &crate::traits::ToolCallAccessManifest,
+    ) -> Option<String> {
+        access_manifest.write_targets.iter().find_map(|candidate| {
+            let candidate =
+                crate::execution::normalize_active_path_lexically(&candidate.value).ok()?;
+            let candidate = std::path::Path::new(candidate.as_str());
+            self.blocked_dependency_targets.iter().find_map(|blocked| {
+                let blocked_path =
+                    crate::execution::normalize_active_path_lexically(&blocked.value).ok()?;
+                let blocked_path = std::path::Path::new(blocked_path.as_str());
+                (candidate == blocked_path
+                    || candidate.starts_with(blocked_path)
+                    || blocked_path.starts_with(candidate))
+                .then(|| blocked.value.clone())
+            })
+        })
     }
 
     /// Whether the latest dispatched operation failed in a way that permits

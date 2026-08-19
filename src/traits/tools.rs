@@ -162,8 +162,61 @@ impl ToolMutationEffects {
     /// intentionally not allowed to satisfy a more specific required outcome.
     pub const UNSPECIFIED: Self = Self(1 << 10);
 
+    /// Stable bit representation retained for durable telemetry and audits.
+    /// Human-readable names are emitted alongside it; consumers must never
+    /// interpret a raw bitset as a count.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Rehydrate a durable effect set without interpreting the bits as a
+    /// count. Unknown future bits remain visible to `telemetry_value` and do
+    /// not silently become a known effect.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Return the protocol names represented by this effect set. These names
+    /// describe typed adapter effects, not natural-language task wording.
+    pub fn protocol_names(self) -> Vec<&'static str> {
+        [
+            (Self::LOCAL_SOURCE_WRITE, "local_source_write"),
+            (Self::LOCAL_WORKSPACE_WRITE, "local_workspace_write"),
+            (Self::LOCAL_DERIVED_WRITE, "local_derived_write"),
+            (Self::REPOSITORY_WRITE, "repository_write"),
+            (Self::REMOTE_MUTATION, "remote_mutation"),
+            (Self::REMOTE_DEPLOY, "remote_deploy"),
+            (Self::EXTERNAL_DELIVERY, "external_delivery"),
+            (Self::PROCESS_STATE, "process_state"),
+            (Self::CONFIGURATION, "configuration"),
+            (Self::DESTRUCTIVE, "destructive"),
+            (Self::UNSPECIFIED, "unspecified"),
+        ]
+        .into_iter()
+        .filter_map(|(effect, name)| self.intersects(effect).then_some(name))
+        .collect()
+    }
+
+    /// Machine-readable telemetry projection that keeps unknown future bits
+    /// visible instead of silently dropping them.
+    pub fn telemetry_value(self) -> serde_json::Value {
+        let known_bits = Self::UNSPECIFIED.bits() | ((1 << 10) - 1);
+        serde_json::json!({
+            "bits": self.bits(),
+            "names": self.protocol_names(),
+            "unknown_bits": self.bits() & !known_bits,
+        })
+    }
+
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// Keep only effects present in both sets.  This is used when an adapter
+    /// projects a task's typed obligation onto the subset it can actually
+    /// report; it never interprets the bitset as a count.
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 
     /// Parse a protocol enum value. These names are structured tool metadata,
@@ -507,6 +560,13 @@ pub struct ToolCallAccessManifest {
     pub read_targets: Vec<ToolTargetHint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_targets: Vec<ToolTargetHint>,
+    /// Immutable capabilities owned by the adapter itself (for example the
+    /// system executable roots a confined terminal needs to start a process).
+    /// These are deliberately separate from task data grants: callers may use
+    /// them for runtime loading, but they do not authorize arbitrary user
+    /// paths or writes and are never inferred from command prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapter_read_targets: Vec<ToolTargetHint>,
 }
 
 impl ToolCallSemantics {
@@ -1326,6 +1386,7 @@ fn default_access_manifest(
         execution_cwd,
         read_targets,
         write_targets,
+        adapter_read_targets: Vec::new(),
     }
 }
 
@@ -1580,6 +1641,26 @@ pub trait Tool: Send + Sync {
     fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
         let semantics = self.call_semantics(arguments);
         default_access_manifest(arguments, &semantics)
+    }
+
+    /// Capabilities supplied by the adapter rather than requested as task
+    /// data.  The common dispatcher uses this typed lane when attenuating the
+    /// call against the task manifest.  The default is empty so an adapter
+    /// cannot accidentally widen authority by inheriting a generic grant.
+    fn adapter_owned_access_manifest(&self, _arguments: &str) -> ToolCallAccessManifest {
+        ToolCallAccessManifest::default()
+    }
+
+    /// Project a typed task obligation onto the adapter's observable mutation
+    /// effect.  Opaque adapters keep their own conservative classification;
+    /// specialized adapters may refine it only from the already-compiled
+    /// effect contract, never from natural-language command text.
+    fn project_contract_mutation_effects(
+        &self,
+        semantics: ToolCallSemantics,
+        _required_effects: ToolMutationEffects,
+    ) -> ToolCallSemantics {
+        semantics
     }
 
     /// Reconcile a successful durable receipt with current state before replay.

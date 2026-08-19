@@ -1552,6 +1552,7 @@ fn checkpoint_access_manifest(tool: &str, arguments: &str) -> ToolCallAccessMani
         execution_cwd,
         read_targets: Vec::new(),
         write_targets,
+        adapter_read_targets: Vec::new(),
     }
 }
 
@@ -2402,6 +2403,7 @@ mod tests {
                 project.to_string_lossy(),
             )
             .unwrap()],
+            adapter_read_targets: Vec::new(),
         };
 
         let checkpoint = manager
@@ -2466,6 +2468,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect(),
+            adapter_read_targets: Vec::new(),
         };
 
         let error = manager

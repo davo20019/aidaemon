@@ -14,8 +14,8 @@ use tracing::{info, warn};
 use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
 use super::{
     DecisionPointData, DecisionType, Event, EventType, InteractionRequestedData,
-    InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, TaskEndData,
-    TaskStatus, ToolCallData, ToolResultData,
+    InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData,
+    TaskContractCompiledData, TaskEndData, TaskStatus, ToolCallData, ToolResultData,
 };
 use crate::traits::{Message, TokenUsage};
 
@@ -124,6 +124,46 @@ pub struct ContinuationToolEvidence {
     pub result: ToolResultData,
 }
 
+/// Durable reconciliation of one task's compiled invocation obligations.
+/// Receipt IDs are references to proof edges; this projection evaluates the
+/// referenced receipts against the actual persisted predicates before any
+/// recovery path is allowed to close the task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskReceiptClosure {
+    pub contract_present: bool,
+    pub required: usize,
+    pub satisfied: usize,
+    pub receipt_count: usize,
+    /// Number of invocation predicates whose proposal cardinality was
+    /// exceeded. A matching receipt is not enough when the request required
+    /// an exact-once or bounded operation.
+    pub cardinality_violations: usize,
+    /// Durable effect reconciliation for contracts that require a mutation
+    /// but do not bind it to one particular tool invocation.
+    pub required_mutation_effects: crate::traits::ToolMutationEffects,
+    pub observed_mutation_effects: crate::traits::ToolMutationEffects,
+    /// Observation/evidence obligations are kept separate from invocation
+    /// predicates because a successful tool transport is not itself proof of
+    /// the requested subject fact.
+    pub evidence_required: usize,
+    pub evidence_satisfied: usize,
+    pub observation_required: bool,
+    pub observation_satisfied: bool,
+}
+
+impl TaskReceiptClosure {
+    pub fn fulfilled(&self) -> bool {
+        self.contract_present
+            && self.required == self.satisfied
+            && self.cardinality_violations == 0
+            && self
+                .observed_mutation_effects
+                .satisfies(self.required_mutation_effects)
+            && self.evidence_required == self.evidence_satisfied
+            && (!self.observation_required || self.observation_satisfied)
+    }
+}
+
 /// The event store backed by SQLite.
 pub struct EventStore {
     pool: SqlitePool,
@@ -138,6 +178,117 @@ enum TaskLifecycleTransition {
         status: TaskStatus,
         outcome: crate::events::TaskOutcome,
     },
+}
+
+fn receipt_matches_predicate(
+    result: &ToolResultData,
+    predicate: &crate::traits::RequestReceiptPredicate,
+) -> bool {
+    let Some(receipt) = result.receipt.as_ref() else {
+        return false;
+    };
+    let tool_matches = predicate.tool_names.is_empty()
+        || predicate.tool_names.iter().any(|name| {
+            name == &result.name || receipt.effective_tool_name.as_deref() == Some(name)
+        });
+    if !tool_matches {
+        return false;
+    }
+    if let Some(expected_rejection) = predicate.contract_rejected {
+        if receipt.contract_rejected != expected_rejection {
+            return false;
+        }
+    } else if receipt.contract_rejected
+        && !predicate
+            .outcome_statuses
+            .contains(&crate::traits::ToolOutcomeStatus::Blocked)
+    {
+        return false;
+    }
+    if !predicate.exit_codes.is_empty()
+        && !receipt
+            .exit_code
+            .is_some_and(|code| predicate.exit_codes.contains(&code))
+    {
+        return false;
+    }
+    if !predicate.outcome_statuses.is_empty()
+        && !predicate.outcome_statuses.contains(&receipt.outcome_status)
+    {
+        // A normal process exit with a non-zero status is a completed
+        // observation, not an adapter failure. Older assessments only knew
+        // `failed_permanent` for this branch; preserve that typed contract
+        // across the receipt-vocabulary upgrade without accepting arbitrary
+        // API/transport failures as proof.
+        let legacy_process_negative = receipt.outcome_status
+            == crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+            && receipt.receipt_kind == crate::traits::ToolReceiptKind::Process
+            && receipt.exit_code.is_some_and(|code| code != 0)
+            && predicate
+                .outcome_statuses
+                .contains(&crate::traits::ToolOutcomeStatus::FailedPermanent);
+        if !legacy_process_negative {
+            return false;
+        }
+    }
+    if predicate.contract_rejected != Some(true)
+        && !receipt.invocation_stage.reached_dispatch()
+        && !predicate
+            .outcome_statuses
+            .contains(&crate::traits::ToolOutcomeStatus::Blocked)
+    {
+        return false;
+    }
+    if predicate.requires_output {
+        // Receipt predicates may rely only on durable authoritative
+        // provenance. The result body is a display projection and cannot
+        // repair a routed adapter that persisted an empty provenance record.
+        let has_output = receipt.result_provenance.authoritative_chars > 0;
+        if !has_output {
+            return false;
+        }
+    }
+    true
+}
+
+fn receipt_matches_tool(
+    result: &ToolResultData,
+    predicate: &crate::traits::RequestReceiptPredicate,
+) -> bool {
+    predicate.tool_names.is_empty()
+        || predicate.tool_names.iter().any(|name| {
+            name == &result.name
+                || result
+                    .receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.effective_tool_name.as_deref())
+                    == Some(name.as_str())
+        })
+}
+
+fn persisted_mutation_effects(
+    value: Option<&serde_json::Value>,
+) -> crate::traits::ToolMutationEffects {
+    let bits = value
+        .and_then(|value| {
+            value
+                .get("bits")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| value.as_u64())
+        })
+        .and_then(|bits| u32::try_from(bits).ok())
+        .unwrap_or_default();
+    crate::traits::ToolMutationEffects::from_bits(bits)
+}
+
+fn receipt_proves_obligation(result: &ToolResultData, task_id: &str, local_id: &str) -> bool {
+    let expected = format!("task:{task_id}/{local_id}");
+    result.receipt.as_ref().is_some_and(|receipt| {
+        receipt
+            .completion_obligation_ids
+            .iter()
+            .any(|id| id == &expected)
+    })
 }
 
 fn task_lifecycle_transition(event: &Event) -> anyhow::Result<Option<TaskLifecycleTransition>> {
@@ -295,6 +446,11 @@ fn mandate_projection_from_tool_result(
 pub struct LlmStats {
     pub total_calls: u64,
     pub failed_calls: u64,
+    /// Estimate-only input tokens for provider calls that failed before
+    /// authoritative usage was returned. This is never presented as an exact
+    /// provider bill; it makes the missing-cost boundary explicit.
+    #[serde(default)]
+    pub failed_est_input_tokens: u64,
     pub avg_latency_ms: u64,
     pub p50_latency_ms: u64,
     pub p95_latency_ms: u64,
@@ -310,6 +466,9 @@ pub struct LlmStats {
 pub struct TaskLlmSummary {
     pub total_calls: u64,
     pub failed_calls: u64,
+    /// Estimate-only input tokens attached to failed provider calls.
+    #[serde(default)]
+    pub failed_est_input_tokens: u64,
     /// Most recent terminal provider error, when any call failed.
     pub last_error: Option<String>,
     pub total_input_tokens: u64,
@@ -1408,6 +1567,260 @@ impl EventStore {
         }))
     }
 
+    /// Load every typed tool result for one task in event order. Recovery and
+    /// audit must evaluate the complete receipt set; selecting only the newest
+    /// row loses an earlier successful prerequisite when a later operation is
+    /// negative or blocked.
+    pub async fn task_tool_results(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Vec<ToolResultData>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT data
+             FROM events
+             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
+             ORDER BY id ASC",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|data| serde_json::from_str::<ToolResultData>(&data).ok())
+            .collect())
+    }
+
+    /// Reconcile receipt-bound invocation obligations from the persisted task
+    /// assessment and result events. This is deliberately independent of the
+    /// response model and of in-memory completion progress, so provider
+    /// failures cannot turn an unfulfilled mutation into success.
+    pub async fn task_receipt_closure(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<TaskReceiptClosure> {
+        let events = self
+            .query_task_events_for_session(session_id, task_id)
+            .await?;
+        let mut predicates = Vec::<crate::traits::RequestReceiptPredicate>::new();
+        let mut evidence_requirements = Vec::<crate::traits::RequestEvidenceRequirement>::new();
+        let mut required_mutation_effects = crate::traits::ToolMutationEffects::NONE;
+        let mut expects_mutation = false;
+        let mut requires_observation = false;
+        let mut contract_observed = false;
+        // The typed contract event is correctness-critical and wins over the
+        // optional decision-point flight recorder. Older tasks fall back to
+        // the latter for compatibility, but new outcome reconciliation never
+        // depends on diagnostics being enabled.
+        if let Some(compiled) = events
+            .iter()
+            .rev()
+            .filter(|event| event.event_type == EventType::TaskContractCompiled)
+            .filter_map(|event| event.parse_data::<TaskContractCompiledData>().ok())
+            .find(|compiled| compiled.task_id == task_id)
+        {
+            contract_observed = true;
+            predicates = compiled.required_invocations;
+            evidence_requirements = compiled.contract.evidence_requirements;
+            required_mutation_effects = compiled.contract.required_mutation_effects;
+            expects_mutation = compiled.contract.expects_mutation;
+            requires_observation = compiled.contract.requires_observation;
+        } else {
+            for event in events.iter().rev() {
+                if event.event_type != EventType::DecisionPoint {
+                    continue;
+                }
+                let Ok(decision) = event.parse_data::<DecisionPointData>() else {
+                    continue;
+                };
+                let Some(contract) = decision.metadata.get("completion_contract") else {
+                    continue;
+                };
+                contract_observed = true;
+                predicates = contract
+                    .get("required_invocations")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| {
+                                serde_json::from_value::<crate::traits::RequestReceiptPredicate>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                evidence_requirements = contract
+                    .get("evidence_requirements")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| {
+                                serde_json::from_value::<crate::traits::RequestEvidenceRequirement>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                required_mutation_effects =
+                    persisted_mutation_effects(contract.get("required_mutation_effects"));
+                expects_mutation = contract
+                    .get("expects_mutation")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                requires_observation = contract
+                    .get("requires_observation")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                break;
+            }
+        }
+
+        let results = events
+            .iter()
+            .filter(|event| event.event_type == EventType::ToolResult)
+            .filter_map(|event| event.parse_data::<ToolResultData>().ok())
+            .collect::<Vec<_>>();
+        if expects_mutation && required_mutation_effects.is_empty() {
+            // This is the durable equivalent of CompletionProgress's generic
+            // mutation obligation. It requires a completed typed mutation but
+            // does not pretend to know whether it was a source edit, cache
+            // write, deployment, or another more specific effect.
+            required_mutation_effects = crate::traits::ToolMutationEffects::UNSPECIFIED;
+        }
+        let contract_present = contract_observed
+            && (expects_mutation
+                || requires_observation
+                || !predicates.is_empty()
+                || !evidence_requirements.is_empty());
+        let mut closure = TaskReceiptClosure {
+            contract_present,
+            required: predicates.len(),
+            receipt_count: results
+                .iter()
+                .filter(|result| result.receipt.is_some())
+                .count(),
+            required_mutation_effects,
+            evidence_required: evidence_requirements.len(),
+            observation_required: requires_observation,
+            ..TaskReceiptClosure::default()
+        };
+
+        for predicate in &predicates {
+            let matching_results = results
+                .iter()
+                .filter(|result| receipt_matches_predicate(result, predicate))
+                .count();
+            if matching_results > 0 {
+                closure.satisfied = closure.satisfied.saturating_add(1);
+            }
+            if let Some(max_invocations) = predicate.max_invocations {
+                let invocation_count = results
+                    .iter()
+                    // Cardinality limits govern adapter dispatch attempts, not
+                    // proposals that were rejected by a policy/argument gate.
+                    // A blocked prerequisite may therefore be retried once
+                    // through a different prepared strategy without making a
+                    // later real dispatch look like a duplicate. Replayed
+                    // receipts remain counted because they represent the same
+                    // durable invocation, not a fresh proposal.
+                    .filter(|result| {
+                        receipt_matches_tool(result, predicate)
+                            && result
+                                .receipt
+                                .as_ref()
+                                .is_some_and(|receipt| receipt.invocation_stage.reached_dispatch())
+                    })
+                    .count();
+                closure.cardinality_violations = closure
+                    .cardinality_violations
+                    .saturating_add(invocation_count.saturating_sub(max_invocations));
+            }
+        }
+
+        for (index, requirement) in evidence_requirements.iter().enumerate() {
+            let satisfied = if let Some(predicate) = requirement.receipt.as_ref() {
+                results
+                    .iter()
+                    .any(|result| receipt_matches_predicate(result, predicate))
+            } else {
+                let local_id = format!("obligation:evidence:{index}");
+                results
+                    .iter()
+                    .any(|result| receipt_proves_obligation(result, task_id, &local_id))
+            };
+            if satisfied {
+                closure.evidence_satisfied = closure.evidence_satisfied.saturating_add(1);
+            }
+        }
+
+        for result in &results {
+            let Some(receipt) = result.receipt.as_ref() else {
+                continue;
+            };
+            // A receipt may carry a proof-graph edge even when an adapter's
+            // persisted semantics are legacy/empty. Rehydrate only the exact
+            // typed mutation effect named by that edge; never infer an effect
+            // from the result text or from the tool name.
+            for effect_name in closure.required_mutation_effects.protocol_names() {
+                if receipt_proves_obligation(
+                    result,
+                    task_id,
+                    &format!("obligation:mutation:{effect_name}"),
+                ) {
+                    if let Some(effect) =
+                        crate::traits::ToolMutationEffects::from_protocol_name(effect_name)
+                    {
+                        closure.observed_mutation_effects =
+                            closure.observed_mutation_effects.union(effect);
+                    }
+                }
+            }
+            if result.succeeded()
+                && receipt.invocation_stage.reached_dispatch()
+                && receipt.semantics.mutates_state()
+            {
+                let effects = if receipt.semantics.mutation_effects.is_empty() {
+                    crate::traits::ToolMutationEffects::UNSPECIFIED
+                } else {
+                    receipt.semantics.mutation_effects
+                };
+                closure.observed_mutation_effects =
+                    closure.observed_mutation_effects.union(effects);
+            }
+        }
+        closure.observation_satisfied = if !requires_observation {
+            true
+        } else if !evidence_requirements.is_empty() {
+            closure.evidence_required == closure.evidence_satisfied
+        } else {
+            results.iter().any(|result| {
+                result.completed_observation()
+                    && result.receipt.as_ref().is_some_and(|receipt| {
+                        receipt.invocation_stage.reached_dispatch()
+                            && receipt.semantics.observes_state()
+                    })
+            })
+        };
+
+        // Keep the generic observation fallback proof-aware when the evidence
+        // obligation has a durable graph ID but no subject predicate.
+        if requires_observation && evidence_requirements.is_empty() {
+            closure.observation_satisfied = closure.observation_satisfied
+                || results.iter().any(|result| {
+                    receipt_proves_obligation(result, task_id, "obligation:verification")
+                });
+        }
+        Ok(closure)
+    }
+
     /// End-to-end duration from the canonical TaskStart, including bootstrap,
     /// semantic assessment, queue-dispatched work, and finalization.
     pub async fn task_elapsed_secs(
@@ -1913,12 +2326,25 @@ impl EventStore {
         .fetch_one(&self.pool)
         .await?
         .max(0) as u32;
+        let receipt_closure = self
+            .task_receipt_closure(session_id, &task_id)
+            .await
+            .unwrap_or_default();
         let outcome = match status {
+            TaskStatus::Completed
+                if receipt_closure.contract_present && !receipt_closure.fulfilled() =>
+            {
+                crate::events::TaskOutcome::Partial
+            }
             TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
             TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
             TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
         };
-        let efficiency = self.task_efficiency_data(&task_id).await;
+        let efficiency = Some(
+            self.task_efficiency_data(&task_id)
+                .await
+                .unwrap_or_default(),
+        );
         let harness_eval = Some(Self::supervisor_harness_snapshot(
             &task_id,
             turn_id.clone(),
@@ -2067,6 +2493,36 @@ impl EventStore {
                 .unwrap_or(cutoff);
             let duration_secs = (Utc::now() - started_at).num_seconds().max(0) as u64;
             let stale_after_mins = (stale_after_secs / 60).max(1);
+            let tool_calls_count = self
+                .task_event_count(&session_id, &task_id, EventType::ToolCall)
+                .await
+                .unwrap_or_default();
+            let iterations = self
+                .task_event_count(&session_id, &task_id, EventType::LlmCall)
+                .await
+                .unwrap_or_default();
+            let efficiency = Some(
+                self.task_efficiency_data(&task_id)
+                    .await
+                    .unwrap_or_default(),
+            );
+            let outcome = crate::events::TaskOutcome::Failed;
+            let harness_eval = Some(Self::supervisor_harness_snapshot(
+                &task_id,
+                None,
+                iterations,
+                tool_calls_count,
+                efficiency.as_ref(),
+                outcome,
+            ));
+            let completion_proof = crate::events::TaskCompletionProofData {
+                schema_version: 1,
+                task_id: task_id.clone(),
+                request_turn_id: None,
+                response_message_ids: self.task_response_message_ids(&task_id).await?,
+                receipt_refs: self.task_completion_proof_references(&task_id).await?,
+                closed_at: Utc::now().to_rfc3339(),
+            };
 
             let event = Event::new(
                 session_id.clone(),
@@ -2074,21 +2530,21 @@ impl EventStore {
                 serde_json::to_value(TaskEndData {
                     task_id: task_id.clone(),
                     status: TaskStatus::Failed,
-                    outcome: Some(crate::events::TaskOutcome::Failed),
+                    outcome: Some(outcome),
                     duration_secs,
-                    iterations: 0,
-                    tool_calls_count: 0,
+                    iterations,
+                    tool_calls_count,
                     error: Some(format!(
                         "Auto-failed by watchdog after {} minute(s) without task_end",
                         stale_after_mins
                     )),
                     summary: Some("Recovered stale in-flight task".to_string()),
-                    efficiency: None,
+                    efficiency,
                     // Watchdog-synthesized TaskEnd has no in-process turn
                     // context; legacy/unscoped => None.
                     turn_id: None,
-                    completion_proof: None,
-                    harness_eval: None,
+                    completion_proof: Some(completion_proof),
+                    harness_eval,
                 })?,
             );
             self.append(event).await?;
@@ -2305,6 +2761,7 @@ impl EventStore {
         let mut output_sum: u128 = 0;
         let mut fell_back_count = 0u64;
         let mut failed_calls = 0u64;
+        let mut failed_est_input_tokens = 0u64;
 
         for row in rows {
             let data_str: String = row.get("data");
@@ -2321,6 +2778,8 @@ impl EventStore {
             }
             if call.failed {
                 failed_calls += 1;
+                failed_est_input_tokens = failed_est_input_tokens
+                    .saturating_add(call.est_input_tokens.map(u64::from).unwrap_or_default());
             }
         }
 
@@ -2343,6 +2802,7 @@ impl EventStore {
         Ok(LlmStats {
             total_calls,
             failed_calls,
+            failed_est_input_tokens,
             avg_latency_ms: (latency_sum / total_calls as u128) as u64,
             p50_latency_ms: percentile(&latencies, 50.0),
             p95_latency_ms: percentile(&latencies, 95.0),
@@ -2384,6 +2844,9 @@ impl EventStore {
             summary.total_calls += 1;
             if call.failed {
                 summary.failed_calls += 1;
+                summary.failed_est_input_tokens = summary
+                    .failed_est_input_tokens
+                    .saturating_add(call.est_input_tokens.map(u64::from).unwrap_or_default());
                 if call.error.is_some() {
                     summary.last_error = call.error.clone();
                 }
@@ -2529,6 +2992,8 @@ impl EventStore {
             max_latency_iteration: summary.max_latency_iteration,
             input_tokens: summary.total_input_tokens,
             output_tokens: summary.total_output_tokens,
+            failed_est_input_tokens: (summary.failed_est_input_tokens > 0)
+                .then_some(summary.failed_est_input_tokens),
             cached_input_tokens: (summary.cached_input_token_samples > 0)
                 .then_some(summary.total_cached_input_tokens),
             cache_creation_input_tokens: (summary.cache_creation_input_token_samples > 0)
@@ -2625,6 +3090,9 @@ impl EventStore {
             cost: crate::events::CostEvalPayload {
                 total_input_tokens: input_tokens,
                 total_output_tokens: output_tokens,
+                failed_est_input_tokens: efficiency
+                    .and_then(|data| data.failed_est_input_tokens)
+                    .unwrap_or_default(),
                 weighted_tokens: input_tokens.saturating_add(output_tokens),
                 llm_calls,
                 fell_back_count,
@@ -3153,6 +3621,237 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    #[test]
+    fn receipt_predicate_accepts_typed_negative_process_evidence() {
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            receipt_kind: crate::traits::ToolReceiptKind::Process,
+            exit_code: Some(1),
+            semantics: crate::traits::ToolCallSemantics::observation(),
+            result_provenance: Some(
+                crate::traits::ToolResultProvenance::from_authoritative_result(
+                    "[exit code: 1]",
+                    &crate::traits::ToolCallMetadata::default(),
+                    crate::traits::ToolResultContentSource::ToolOutput,
+                ),
+            ),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let result = ToolResultData {
+            message_id: None,
+            tool_call_id: "call-negative".to_string(),
+            name: "run_command".to_string(),
+            result: "[exit code: 1]".to_string(),
+            success: false,
+            duration_ms: 1,
+            error: None,
+            task_id: None,
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(ToolReceiptV1::from_metadata(
+                &metadata,
+                crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+                ToolOutcomeEvidenceSource::StructuredMetadata,
+                None,
+            )),
+        };
+        let predicate = crate::traits::RequestReceiptPredicate {
+            tool_names: vec!["run_command".to_string()],
+            exit_codes: vec![1],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult],
+            requires_output: true,
+            ..crate::traits::RequestReceiptPredicate::default()
+        };
+        assert!(receipt_matches_predicate(&result, &predicate));
+    }
+
+    #[tokio::test]
+    async fn receipt_closure_rejects_duplicate_bounded_invocations() {
+        let (store, _database) = setup_store().await;
+        let session_id = "session-cardinality";
+        let task_id = "task-cardinality";
+        let predicate = crate::traits::RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+            max_invocations: Some(1),
+            ..crate::traits::RequestReceiptPredicate::default()
+        };
+        let decision = DecisionPointData {
+            decision_type: DecisionType::ExecutionPlanningGate,
+            task_id: task_id.to_string(),
+            iteration: 0,
+            severity: crate::events::DiagnosticSeverity::Info,
+            code: None,
+            metadata: serde_json::json!({
+                "completion_contract": {
+                    "expects_mutation": false,
+                    "requires_observation": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [predicate]
+                }
+            }),
+            summary: "synthetic contract".to_string(),
+        };
+        store
+            .append(Event::new(
+                session_id,
+                EventType::DecisionPoint,
+                serde_json::to_value(decision).expect("decision JSON"),
+            ))
+            .await
+            .expect("append contract");
+
+        for call_id in ["call-one", "call-two"] {
+            let metadata = crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+                semantics: crate::traits::ToolCallSemantics::observation(),
+                ..crate::traits::ToolCallMetadata::default()
+            };
+            let result = ToolResultData {
+                message_id: None,
+                tool_call_id: call_id.to_string(),
+                name: "terminal".to_string(),
+                result: "ok".to_string(),
+                success: true,
+                duration_ms: 1,
+                error: None,
+                task_id: Some(task_id.to_string()),
+                annotations: Vec::new(),
+                turn_id: None,
+                attachments: Vec::new(),
+                receipt: Some(ToolReceiptV1::from_metadata(
+                    &metadata,
+                    crate::traits::ToolOutcomeStatus::Succeeded,
+                    ToolOutcomeEvidenceSource::StructuredMetadata,
+                    None,
+                )),
+            };
+            store
+                .append(Event::new(
+                    session_id,
+                    EventType::ToolResult,
+                    serde_json::to_value(result).expect("result JSON"),
+                ))
+                .await
+                .expect("append result");
+        }
+
+        let closure = store
+            .task_receipt_closure(session_id, task_id)
+            .await
+            .expect("closure");
+        assert_eq!(closure.required, 1);
+        assert_eq!(closure.satisfied, 1);
+        assert_eq!(closure.cardinality_violations, 1);
+        assert!(!closure.fulfilled());
+    }
+
+    #[tokio::test]
+    async fn receipt_closure_uses_typed_contract_event_without_diagnostics() {
+        let (store, _database) = setup_store().await;
+        let session_id = "session-typed-contract";
+        let task_id = "task-typed-contract";
+        let predicate = crate::traits::RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+            max_invocations: Some(1),
+            ..crate::traits::RequestReceiptPredicate::default()
+        };
+        let contract = crate::traits::RequestCompletionContract {
+            scope_task_id: Some(task_id.to_string()),
+            adopted_from_task_ids: Vec::new(),
+            task_kind: crate::traits::RequestTaskKind::Check,
+            expects_mutation: false,
+            required_mutation_effects: crate::traits::ToolMutationEffects::NONE,
+            forbids_mutation: false,
+            forbids_tool_use: false,
+            allowed_tool_names: Vec::new(),
+            forbidden_tool_scopes: Vec::new(),
+            required_response_fields: Vec::new(),
+            forbidden_actions: Vec::new(),
+            requires_observation: true,
+            requires_reverification_after_mutation: false,
+            explicit_verification_requested: true,
+            minimum_sources: 0,
+            requires_primary_sources: false,
+            requires_exact_history: false,
+            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
+                summary: "one terminal observation".to_string(),
+                acceptable_scopes: Vec::new(),
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
+                receipt: Some(predicate.clone()),
+                target: None,
+            }],
+            adopted_evidence_bindings: Vec::new(),
+            verification_targets: Vec::new(),
+        };
+        store
+            .append(Event::new(
+                session_id,
+                EventType::TaskContractCompiled,
+                serde_json::to_value(TaskContractCompiledData {
+                    schema_version: TaskContractCompiledData::SCHEMA_VERSION,
+                    task_id: task_id.to_string(),
+                    contract,
+                    required_invocations: vec![predicate],
+                })
+                .expect("typed contract JSON"),
+            ))
+            .await
+            .expect("append typed contract");
+
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            semantics: crate::traits::ToolCallSemantics::observation(),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let result = ToolResultData {
+            message_id: None,
+            tool_call_id: "call-typed-contract".to_string(),
+            name: "terminal".to_string(),
+            result: "typed observation".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(task_id.to_string()),
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(ToolReceiptV1::from_metadata(
+                &metadata,
+                crate::traits::ToolOutcomeStatus::Succeeded,
+                ToolOutcomeEvidenceSource::StructuredMetadata,
+                None,
+            )),
+        };
+        store
+            .append(Event::new(
+                session_id,
+                EventType::ToolResult,
+                serde_json::to_value(result).expect("result JSON"),
+            ))
+            .await
+            .expect("append result");
+
+        let closure = store
+            .task_receipt_closure(session_id, task_id)
+            .await
+            .expect("closure");
+        assert!(closure.contract_present);
+        assert_eq!(closure.required, 1);
+        assert_eq!(closure.satisfied, 1);
+        assert_eq!(closure.evidence_required, 1);
+        assert_eq!(closure.evidence_satisfied, 1);
+        assert!(closure.fulfilled());
     }
 
     #[tokio::test]
@@ -4378,6 +5077,9 @@ mod tests {
             .parse_data::<TaskEndData>()
             .expect("parse stale task_end");
         assert_eq!(stale_end.status, TaskStatus::Failed);
+        assert!(stale_end.efficiency.is_some());
+        assert!(stale_end.harness_eval.is_some());
+        assert!(stale_end.completion_proof.is_some());
         assert!(
             stale_end
                 .error
@@ -4980,6 +5682,7 @@ mod tests {
                 "final_model": "gpt-test",
                 "attempts": 2,
                 "latency_ms": 42,
+                "est_input_tokens": 777,
                 "failed": true,
                 "error": "LLM request was malformed (400)"
             }),
@@ -4993,6 +5696,7 @@ mod tests {
             .expect("failed-call stats");
         assert_eq!(summary.total_calls, 1);
         assert_eq!(summary.failed_calls, 1);
+        assert_eq!(summary.failed_est_input_tokens, 777);
         assert_eq!(summary.total_attempts, 2);
         assert_eq!(
             summary.last_error.as_deref(),

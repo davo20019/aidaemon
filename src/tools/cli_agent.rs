@@ -4301,6 +4301,7 @@ impl Tool for CliAgentTool {
             execution_cwd,
             read_targets,
             write_targets,
+            adapter_read_targets: Vec::new(),
         }
     }
 

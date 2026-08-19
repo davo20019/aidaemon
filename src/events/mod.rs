@@ -29,8 +29,8 @@ pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]
 pub use store::{
     ContinuationToolEvidence, EventEmitter, EventStore, LlmStats, PolicyGraduationReport,
-    SessionWriteDrift, TaskLlmSummary, TaskWindowStats, ToolStats, WriteConsistencyGateStatus,
-    WriteConsistencyReport, WriteConsistencyThresholds,
+    SessionWriteDrift, TaskLlmSummary, TaskReceiptClosure, TaskWindowStats, ToolStats,
+    WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
 };
 #[allow(unused_imports)]
 pub use terminal_state::TerminalState;
@@ -258,6 +258,10 @@ pub enum EventType {
     /// The authoritative task-local policy for automatic memory retrieval and
     /// persistence, compiled before either pipeline can run.
     MemoryPolicyCompiled,
+    /// The final typed completion contract installed for a task. Unlike a
+    /// diagnostic decision point this event is correctness-critical and is
+    /// emitted even when flight-recorder telemetry is disabled.
+    TaskContractCompiled,
     /// A runtime-generated continuation was linked to the background tool
     /// receipt and parent task that caused it.
     BackgroundContinuationLinked,

@@ -334,6 +334,7 @@ mod tests {
         let cost = CostSnapshot {
             total_input_tokens: 5000,
             total_output_tokens: 500,
+            failed_est_input_tokens: 0,
             weighted_tokens: 5500,
             llm_calls: 2,
             fell_back_count: 0,

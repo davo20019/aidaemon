@@ -599,6 +599,8 @@ pub(super) fn parse_planned_mutation_effects(values: &[String]) -> Option<ToolMu
     for value in values {
         let effect = match value.trim().to_ascii_lowercase().as_str() {
             "local_source_write" => ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            "local_workspace_write" => ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+            "local_derived_write" => ToolMutationEffects::LOCAL_DERIVED_WRITE,
             "repository_write" => ToolMutationEffects::REPOSITORY_WRITE,
             "remote_mutation" => ToolMutationEffects::REMOTE_MUTATION,
             "remote_deploy" => ToolMutationEffects::REMOTE_DEPLOY,
@@ -606,6 +608,7 @@ pub(super) fn parse_planned_mutation_effects(values: &[String]) -> Option<ToolMu
             "process_state" => ToolMutationEffects::PROCESS_STATE,
             "configuration" => ToolMutationEffects::CONFIGURATION,
             "destructive" => ToolMutationEffects::DESTRUCTIVE,
+            "unspecified" => ToolMutationEffects::UNSPECIFIED,
             _ => return None,
         };
         effects = effects.union(effect);

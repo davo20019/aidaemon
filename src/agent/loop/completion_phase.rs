@@ -1086,8 +1086,8 @@ pub(super) async fn run_completion_phase(
                     "Blocked completion: authored artifact was not delivered".to_string(),
                     json!({
                         "condition": "authored_artifact_undelivered",
-                        "required_mutation_effects": turn_context.completion_contract.required_mutation_effects,
-                        "observed_mutation_effects": completion_progress.observed_mutation_effects,
+                        "required_mutation_effects": turn_context.completion_contract.required_mutation_effects.telemetry_value(),
+                        "observed_mutation_effects": completion_progress.observed_mutation_effects.telemetry_value(),
                     }),
                 )
                 .await;
@@ -1128,8 +1128,8 @@ pub(super) async fn run_completion_phase(
                 "expects_mutation": turn_context.completion_contract.expects_mutation,
                 "tool_calls_count": resp.tool_calls.len(),
                 "mutation_tool_calls_count": completion_progress.mutation_count,
-                "required_mutation_effects": turn_context.completion_contract.required_mutation_effects,
-                "observed_mutation_effects": completion_progress.observed_mutation_effects,
+                "required_mutation_effects": turn_context.completion_contract.required_mutation_effects.telemetry_value(),
+                "observed_mutation_effects": completion_progress.observed_mutation_effects.telemetry_value(),
                 "total_successful_tool_calls": total_successful_tool_calls,
                 "has_tool_attempts": has_tool_attempts,
                 "outcome": outcome,
@@ -1767,17 +1767,75 @@ pub(super) async fn run_completion_phase(
                         verification_attempt_count = completion_progress.verification_attempt_count,
                         "Verification retries exhausted; suppressing unverified completion claim"
                     );
-                    let (request, cause) = build_terminal_verification_request(
-                        turn_context,
-                        learning_ctx,
-                        Some(execution_state),
-                        has_concrete_progress,
-                        "I completed part of the request, but I could not obtain the required final verification receipt.",
-                        &missing_evidence_requirement,
-                        "Start a new attempt and run a compatible verification check before reporting success.",
-                    );
-                    terminal_cause = cause;
-                    reply = request.render_user_message();
+                    // A persisted typed receipt is a real terminal fact even
+                    // when the in-memory verifier did not consume it. Use it
+                    // directly for closeout so a present negative/rejected
+                    // receipt is never reported as a missing verification
+                    // receipt. The durable contract closure decides whether
+                    // the result is a success or an honest partial outcome.
+                    let durable_completed_result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        agent
+                            .event_store
+                            .latest_completed_task_tool_result(session_id, task_id),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten();
+                    // A task with no completed observation can still have a
+                    // durable typed negative/blocked receipt. Preserve that
+                    // fact for deterministic closeout, but never let it mask
+                    // an earlier dispatched observation (the completed result
+                    // remains authoritative whenever it exists).
+                    let durable_result = if durable_completed_result.is_some() {
+                        durable_completed_result
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            agent.event_store.latest_task_tool_result(session_id, task_id),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
+                    };
+                    if let Some(result) = durable_result
+                        .as_ref()
+                        .filter(|result| result.receipt.is_some())
+                    {
+                        let closure = agent
+                            .event_store
+                            .task_receipt_closure(session_id, task_id)
+                            .await
+                            .unwrap_or_default();
+                        let fulfilled = if closure.contract_present {
+                            closure.fulfilled()
+                        } else {
+                            result.completed_observation()
+                                && result.receipt.as_ref().is_some_and(|receipt| {
+                                    !receipt.completion_obligation_ids.is_empty()
+                                        || (receipt.semantics.observes_state()
+                                            && !receipt.semantics.mutates_state())
+                                })
+                        };
+                        reply = super::completion_checks::build_receipt_closeout_reply(
+                            result, fulfilled,
+                        );
+                        terminal_cause = (!fulfilled).then_some(TaskTerminalCause::HardFailure);
+                    } else {
+                        let (request, cause) = build_terminal_verification_request(
+                            turn_context,
+                            learning_ctx,
+                            Some(execution_state),
+                            has_concrete_progress,
+                            "I completed part of the request, but I could not obtain the required final verification receipt.",
+                            &missing_evidence_requirement,
+                            "Start a new attempt and run a compatible verification check before reporting success.",
+                        );
+                        terminal_cause = cause;
+                        reply = request.render_user_message();
+                    }
                     pending_external_action_ack = None;
                 } else if tool_defs.is_empty()
                     || force_text_response

@@ -341,7 +341,7 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
     .with_task_assessments(vec![MockProvider::semantic_task_assessment(
         "change",
         true,
-        true,
+        false,
         &["local_source_write"],
         "new_request",
         "local_workspace",

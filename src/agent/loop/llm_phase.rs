@@ -628,6 +628,8 @@ async fn finalize_durable_receipt_after_provider_failure(
     learning_ctx: &mut LearningContext,
     model: &str,
     provider_error: &str,
+    completion_contract: &CompletionContract,
+    completion_progress: &CompletionProgress,
 ) -> anyhow::Result<Option<String>> {
     if agent
         .event_store
@@ -663,22 +665,32 @@ async fn finalize_durable_receipt_after_provider_failure(
     let Some(result) = result else {
         return Ok(None);
     };
-    let receipt_closed = result.receipt.as_ref().is_some_and(|receipt| {
-        !receipt.completion_obligation_ids.is_empty()
-            || (receipt.semantics.observes_state() && !receipt.semantics.mutates_state())
-    });
-    let reply = crate::agent::completion_checks::build_tool_output_completion_reply(
-        &result.name,
-        &result.result,
-        false,
-    )
-    .unwrap_or_else(|| {
-        format!(
-            "The {} operation produced a typed `{}` result. The response provider failed before it could add a summary; the durable result is preserved.",
-            result.name,
-            result.outcome_status().as_str()
-        )
-    });
+    let closure = agent
+        .event_store
+        .task_receipt_closure(session_id, task_id)
+        .await
+        .unwrap_or_default();
+    let receipt_closed = if closure.contract_present {
+        closure.fulfilled() && result.completed_observation()
+    } else {
+        result.receipt.as_ref().is_some_and(|receipt| {
+            !receipt.completion_obligation_ids.is_empty()
+                || (result.completed_observation()
+                    && receipt.semantics.observes_state()
+                    && !receipt.semantics.mutates_state())
+                || (result.completed_observation()
+                    && completion_contract.expects_mutation
+                    && crate::agent::mutation_contract_fulfilled(
+                        completion_contract,
+                        completion_progress,
+                    ))
+                || (result.succeeded()
+                    && receipt.semantics.mutates_state()
+                    && receipt.semantics.mutation_effects.has_specific_effects())
+        })
+    };
+    let reply =
+        crate::agent::completion_checks::build_receipt_closeout_reply(&result, receipt_closed);
     let assistant_msg = Message {
         id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
@@ -698,8 +710,8 @@ async fn finalize_durable_receipt_after_provider_failure(
         (TaskStatus::Completed, TaskOutcome::Succeeded, None)
     } else {
         (
-            TaskStatus::Failed,
-            TaskOutcome::Failed,
+            TaskStatus::Completed,
+            TaskOutcome::Partial,
             Some(provider_error.to_string()),
         )
     };
@@ -1354,6 +1366,8 @@ pub(super) async fn run_llm_phase(
                 learning_ctx,
                 model,
                 &error_message,
+                completion_contract,
+                completion_progress,
             )
             .await?
             {
@@ -1458,6 +1472,8 @@ pub(super) async fn run_llm_phase(
                 learning_ctx,
                 model,
                 &format!("LLM call timed out after {}s", timeout_dur.as_secs()),
+                completion_contract,
+                completion_progress,
             )
             .await?
             {

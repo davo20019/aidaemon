@@ -1696,6 +1696,7 @@ pub(crate) async fn confined_terminal_execution_request(
         working_dir,
         read_paths,
         write_paths,
+        &[],
     )
     .await
 }
@@ -1706,6 +1707,7 @@ async fn confined_terminal_script_execution_request(
     working_dir: Option<&str>,
     read_paths: &[String],
     write_paths: &[String],
+    write_roots: &[String],
 ) -> anyhow::Result<ExecutionRequest> {
     confined_terminal_execution_request_inner(
         backend,
@@ -1714,6 +1716,7 @@ async fn confined_terminal_script_execution_request(
         working_dir,
         read_paths,
         write_paths,
+        write_roots,
     )
     .await
 }
@@ -1725,6 +1728,7 @@ async fn confined_terminal_execution_request_inner(
     working_dir: Option<&str>,
     read_paths: &[String],
     write_paths: &[String],
+    write_roots: &[String],
 ) -> anyhow::Result<ExecutionRequest> {
     let resolved_cwd = match working_dir {
         Some(path) => {
@@ -1750,7 +1754,7 @@ async fn confined_terminal_execution_request_inner(
         }
     }
     let mut writes = Vec::new();
-    for path in write_paths {
+    for path in write_paths.iter().chain(write_roots.iter()) {
         let path = canonicalize_access_path(
             backend,
             resolve_access_path(backend, path, cwd.as_ref()).await?,
@@ -1769,8 +1773,14 @@ async fn confined_terminal_execution_request_inner(
     // read-only runtime roots/caches.
     let runtime_support = native_sandbox_runtime_support(backend, shell_source).await?;
     let mut runtime_support = runtime_support;
-    add_manifest_runtime_environment(backend, &writes, script_via_stdin, &mut runtime_support)
-        .await;
+    add_manifest_runtime_environment(
+        backend,
+        &writes,
+        write_roots,
+        script_via_stdin,
+        &mut runtime_support,
+    )
+    .await;
     for path in &runtime_support.read_paths {
         if !reads.contains(path) && !writes.contains(path) {
             reads.push(path.clone());
@@ -1794,6 +1804,7 @@ async fn confined_terminal_execution_request_inner(
             cwd,
             &reads,
             &writes,
+            &runtime_support.executable_paths,
             sandbox_environment,
         )
     }
@@ -1897,6 +1908,7 @@ fn macos_manifest_sandbox_policy(
     traversal_cwd: Option<&str>,
     read_paths: &[String],
     write_paths: &[String],
+    executable_paths: &[String],
     script_via_stdin: bool,
 ) -> anyhow::Result<String> {
     let mut policy = include_str!("macos_terminal_sandbox.sbpl").to_string();
@@ -1959,6 +1971,22 @@ fn macos_manifest_sandbox_policy(
              (allow file-read* file-test-existence\n  {ancestor_clauses})\n"
         ));
     }
+    if !executable_paths.is_empty() {
+        let paths = executable_paths
+            .iter()
+            .map(|path| validated_seatbelt_path(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let clauses = paths
+            .iter()
+            .map(|path| format!("(literal \"{path}\") (subpath \"{path}\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        // Runtime mapping is a separate capability from task-data reads. This
+        // lets Homebrew/Python/Rust toolchains load their immutable binaries
+        // and frameworks without making an arbitrary user read target
+        // executable or widening task mutation authority.
+        policy.push_str(&format!("\n(allow file-map-executable\n  {clauses})\n"));
+    }
     if script_via_stdin {
         // Darwin's /bin/sh (bash) materializes here-documents in the
         // platform temporary directory and does not consistently honor the
@@ -1972,11 +2000,58 @@ fn macos_manifest_sandbox_policy(
                 temp_dirs.push(canonical);
             }
         }
+        // `/tmp` and `/var/tmp` are symlink/alias spellings on Darwin, and
+        // shells launched by different service managers can inherit either
+        // spelling. Keep the aliases in the same narrowly scoped transient
+        // rule rather than granting a general temporary-tree write.
+        for path in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
+            let path = PathBuf::from(path);
+            if !temp_dirs.iter().any(|existing| existing == &path) {
+                temp_dirs.push(path);
+            }
+        }
+        // A canonical temp path may have a lexical `/private` counterpart (or
+        // vice versa) when the daemon and shell resolve symlinks differently.
+        // Add only that paired spelling; the transient filename remains the
+        // final constrained component.
+        let alias_dirs = temp_dirs
+            .iter()
+            .filter_map(|path| {
+                let value = path.to_string_lossy();
+                if let Some(rest) = value.strip_prefix("/private/") {
+                    Some(PathBuf::from(format!("/{rest}")))
+                } else if value.starts_with('/') {
+                    Some(PathBuf::from(format!("/private{value}")))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for path in alias_dirs {
+            if !temp_dirs.iter().any(|existing| existing == &path) {
+                temp_dirs.push(path);
+            }
+        }
         let patterns = temp_dirs
             .into_iter()
             .map(|path| {
                 let escaped = regex::escape(path.to_string_lossy().trim_end_matches('/'));
-                format!("(regex #\"^{escaped}/[^/]*/sh-thd.*$\")")
+                // Different /bin/sh builds place the parser temporary either
+                // directly in TMPDIR or below one of a few implementation
+                // directories. Enumerate a small structural depth while
+                // constraining the leaf to the shell's transient prefix;
+                // never grant the whole temporary tree.
+                (0..=3)
+                    .map(|depth| {
+                        let components = if depth == 0 {
+                            String::new()
+                        } else {
+                            "[^/]*/".repeat(depth)
+                        };
+                        format!("(regex #\"^{escaped}/{components}sh-thd.*$\")")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
             })
             .collect::<Vec<_>>();
         if !patterns.is_empty() {
@@ -1996,11 +2071,17 @@ fn macos_manifest_sandbox_request(
     cwd: Option<crate::execution::BackendPath>,
     read_paths: &[String],
     write_paths: &[String],
+    executable_paths: &[String],
     sandbox_environment: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<ExecutionRequest> {
     let traversal_cwd = cwd.as_ref().map(crate::execution::BackendPath::as_str);
-    let policy =
-        macos_manifest_sandbox_policy(traversal_cwd, read_paths, write_paths, script_via_stdin)?;
+    let policy = macos_manifest_sandbox_policy(
+        traversal_cwd,
+        read_paths,
+        write_paths,
+        executable_paths,
+        script_via_stdin,
+    )?;
     let mut args = vec![
         "-p".to_string(),
         policy,
@@ -2033,6 +2114,10 @@ fn macos_manifest_sandbox_request(
 #[derive(Debug, Default)]
 struct NativeSandboxRuntimeSupport {
     read_paths: Vec<String>,
+    /// Immutable runtime roots that may be mapped as executable by the native
+    /// loader. This is deliberately separate from task-data reads: a user
+    /// supplied read path must never become an executable mapping authority.
+    executable_paths: Vec<String>,
     path_prefixes: Vec<String>,
     environment: HashMap<String, String>,
     /// Python's macOS pip uses this explicit variable instead of
@@ -2053,6 +2138,13 @@ impl NativeSandboxRuntimeSupport {
         let path = path.into();
         if !path.trim().is_empty() && !self.path_prefixes.contains(&path) {
             self.path_prefixes.push(path);
+        }
+    }
+
+    fn add_executable(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !path.trim().is_empty() && !self.executable_paths.contains(&path) {
+            self.executable_paths.push(path);
         }
     }
 
@@ -2244,6 +2336,7 @@ async fn native_sandbox_runtime_support(
         if let Some(parent) = resolved.parent() {
             support.add_read(parent.to_string());
             support.add_path_prefix(parent.to_string());
+            support.add_executable(parent.to_string());
         }
         let canonical = backend
             .canonicalize(&resolved)
@@ -2252,14 +2345,17 @@ async fn native_sandbox_runtime_support(
         if let Some(parent) = canonical.parent() {
             support.add_read(parent.to_string());
             support.add_path_prefix(parent.to_string());
+            support.add_executable(parent.to_string());
         }
         if let Some(runtime_root) = managed_executable_runtime_root(&canonical) {
-            support.add_read(runtime_root);
+            support.add_read(runtime_root.clone());
+            support.add_executable(runtime_root);
         }
         if let Some(runtime_alias) = homebrew_stable_runtime_alias(&canonical) {
             let alias_path = crate::execution::BackendPath::new(runtime_alias.clone());
             if backend.metadata(&alias_path).await.is_ok() {
                 support.add_read(runtime_alias);
+                support.add_executable(alias_path.to_string());
                 if let Some(namespace) = homebrew_alias_namespace(&canonical) {
                     support.add_read(namespace);
                 }
@@ -2303,8 +2399,10 @@ async fn native_sandbox_runtime_support(
                         // from the sibling toolchain tree, not just `bin/`.
                         if let Some(toolchain_root) = bin_dir.parent() {
                             support.add_read(toolchain_root.to_string());
+                            support.add_executable(toolchain_root.to_string());
                         } else {
                             support.add_read(bin_dir.to_string());
+                            support.add_executable(bin_dir.to_string());
                         }
                     }
                 }
@@ -2355,11 +2453,16 @@ async fn native_sandbox_runtime_support(
 async fn add_manifest_runtime_environment(
     backend: &SharedExecutionBackend,
     write_paths: &[String],
+    write_roots: &[String],
     script_via_stdin: bool,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
     let mut scratch_root = None;
-    for path in write_paths {
+    // An existing directory is safe to use regardless of whether it was
+    // supplied as an exact path or an explicit root. The root list is kept
+    // separate so an absent exact file can never be mistaken for a directory
+    // merely because a shell script needs a temporary here-document file.
+    for path in write_roots.iter().chain(write_paths.iter()) {
         let candidate = crate::execution::BackendPath::new(path.clone());
         // This helper is called after the manifest has been resolved. We only
         // select an existing directory, avoiding any inference from command
@@ -2374,10 +2477,7 @@ async fn add_manifest_runtime_environment(
             break;
         }
     }
-    let future_scratch_root = scratch_root.is_none()
-        && script_via_stdin
-        && !support.path_prefixes.is_empty()
-        && !write_paths.is_empty();
+    let future_scratch_root = scratch_root.is_none() && script_via_stdin && !write_roots.is_empty();
     let scratch_root = scratch_root.or_else(|| {
         // A disposable package/build root is often intentionally absent at
         // planning time and created by the authorized script itself. Any
@@ -2386,7 +2486,7 @@ async fn add_manifest_runtime_environment(
         // backend's capability graph, never on request wording or a list of
         // package-manager names.
         future_scratch_root
-            .then(|| write_paths.first().cloned())
+            .then(|| write_roots.first().cloned())
             .flatten()
     });
     let Some(scratch_root) = scratch_root else {
@@ -2400,6 +2500,16 @@ async fn add_manifest_runtime_environment(
             return;
         }
     }
+    // The sandbox policy and the child environment must use the same
+    // canonical identity. Temporary roots on macOS can pass through `/var`
+    // and `/private/var` aliases; resolving once here prevents the shell from
+    // receiving an environment path that differs from the policy path.
+    let scratch_path = crate::execution::BackendPath::new(scratch_root);
+    let scratch_root = backend
+        .canonicalize(&scratch_path)
+        .await
+        .unwrap_or(scratch_path)
+        .to_string();
 
     for variable in ["TMPDIR", "TMP", "TEMP"] {
         support
@@ -4117,6 +4227,7 @@ impl TerminalTool {
             working_dir,
             read_paths,
             write_paths,
+            write_roots,
             notify_session_id,
             notify_goal_id,
             task_id,
@@ -4124,17 +4235,19 @@ impl TerminalTool {
             detach,
             status_tx,
         } = request;
-        let command_semantics = terminal_run_semantics_from_access(true, !write_paths.is_empty());
+        let has_write_targets = !write_paths.is_empty() || !write_roots.is_empty();
+        let command_semantics = terminal_run_semantics_from_access(true, has_write_targets);
         let execution_mode = if script_via_stdin {
             "script"
         } else {
             "command"
         };
         let dedupe_identity = format!(
-            "mode={execution_mode}\0cwd={}\0read={}\0write={}\0{command}",
+            "mode={execution_mode}\0cwd={}\0read={}\0write={}\0roots={}\0{command}",
             working_dir.unwrap_or_default(),
             serde_json::to_string(read_paths).unwrap_or_default(),
             serde_json::to_string(write_paths).unwrap_or_default(),
+            serde_json::to_string(write_roots).unwrap_or_default(),
         );
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
@@ -4161,15 +4274,18 @@ impl TerminalTool {
                 working_dir,
                 read_paths,
                 write_paths,
+                write_roots,
             )
             .await?
         } else {
-            confined_terminal_execution_request(
+            confined_terminal_execution_request_inner(
                 &self.backend,
                 command,
+                false,
                 working_dir,
                 read_paths,
                 write_paths,
+                write_roots,
             )
             .await?
         };
@@ -4225,6 +4341,7 @@ impl TerminalTool {
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
                 metadata.semantics = command_semantics.clone();
+                metadata.access_denial = sandbox_access_denial(stderr.as_ref(), exit_code);
                 Ok(ToolCallOutcome { metadata, output })
             }
             Err(_) => {
@@ -4488,6 +4605,8 @@ impl TerminalTool {
                                             metadata.effective_tool_name = Some("terminal".to_string());
                                             metadata.truncation = truncation.clone();
                                             metadata.semantics = command_semantics_for_notify.clone();
+                                            metadata.access_denial =
+                                                sandbox_access_denial(&stderr, exit_code);
                                             let provenance =
                                                 crate::traits::ToolResultProvenance::from_authoritative_result(
                                                     &with_notice,
@@ -5489,6 +5608,15 @@ impl TerminalTool {
         mutation_forbidden: bool,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
+        // Keep exact paths and directory capabilities separate until the
+        // sandbox request is built. The native adapter receives both as
+        // authorized paths, while the typed call manifest preserves whether
+        // a descendant grant was intentional.
+        let mut declared_read_paths = args.read_paths.clone();
+        declared_read_paths.extend(args.read_roots.iter().cloned());
+        let mut declared_write_paths = args.write_paths.clone();
+        declared_write_paths.extend(args.write_roots.iter().cloned());
+        let declared_write_roots = args.write_roots.clone();
 
         // Reap any finished background processes on each call.
         self.reap_finished().await;
@@ -5536,7 +5664,7 @@ impl TerminalTool {
                     (Some(_), Some(_)) => anyhow::bail!(
                         "command and script are mutually exclusive for action=\"run\""
                     ),
-                    (Some(command), None) => (command, false),
+                    (Some(command), None) => (command, command_requires_stdin_shell(command)),
                     (None, Some(script)) => (script, true),
                     (None, None) => {
                         anyhow::bail!("command or script is required for action=\"run\"")
@@ -5544,7 +5672,7 @@ impl TerminalTool {
                 };
 
                 let command_semantics =
-                    terminal_run_semantics_from_access(true, !args.write_paths.is_empty());
+                    terminal_run_semantics_from_access(true, !declared_write_paths.is_empty());
                 let mut precomputed_semantic_assessment = None;
                 if mutation_forbidden
                     && (command_semantics.mutates_state()
@@ -5905,12 +6033,31 @@ impl TerminalTool {
                         .await?;
                 }
 
+                // A typed root grant is allowed to name a future directory.
+                // Prepare only those explicit roots, after all approval and
+                // checkpoint gates, so the confined process can create
+                // descendants without relying on ambient /tmp access. Exact
+                // file grants never enter this path.
+                if !args.write_roots.is_empty() {
+                    let cwd = if let Some(path) = args.working_dir.as_deref() {
+                        Some(self.backend.resolve_path(path).await?)
+                    } else {
+                        None
+                    };
+                    for root in &args.write_roots {
+                        let resolved =
+                            resolve_access_path(&self.backend, root, cwd.as_ref()).await?;
+                        self.backend.create_dir_all(&resolved).await?;
+                    }
+                }
+
                 self.handle_run(TerminalRunRequest {
                     command,
                     script_via_stdin,
                     working_dir: args.working_dir.as_deref(),
-                    read_paths: &args.read_paths,
-                    write_paths: &args.write_paths,
+                    read_paths: &declared_read_paths,
+                    write_paths: &declared_write_paths,
+                    write_roots: &declared_write_roots,
                     notify_session_id: &notify_session_id,
                     notify_goal_id: args._goal_id.as_deref(),
                     task_id: args._task_id.as_deref(),
@@ -5939,6 +6086,7 @@ struct TerminalRunRequest<'a> {
     working_dir: Option<&'a str>,
     read_paths: &'a [String],
     write_paths: &'a [String],
+    write_roots: &'a [String],
     notify_session_id: &'a str,
     notify_goal_id: Option<&'a str>,
     task_id: Option<&'a str>,
@@ -5971,6 +6119,13 @@ struct TerminalArgs {
     read_paths: Vec<String>,
     #[serde(default)]
     write_paths: Vec<String>,
+    /// Typed directory capabilities. The dispatcher may project an
+    /// authorized task root here so future descendants can be created before
+    /// the process starts without widening an exact-file grant.
+    #[serde(default)]
+    read_roots: Vec<String>,
+    #[serde(default)]
+    write_roots: Vec<String>,
     #[serde(default = "default_action")]
     action: String,
     pid: Option<u32>,
@@ -6017,6 +6172,27 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
     } else {
         code_token.parse::<i32>().ok()
     }
+}
+
+/// Classify the small set of diagnostics emitted by the process boundary when
+/// the installed filesystem policy rejects an open. This is adapter/kernel
+/// telemetry, not request-language matching: the manifest and sandbox remain
+/// authoritative, while the diagnostic simply records why a dispatched
+/// process returned a negative status.
+fn sandbox_access_denial(
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> Option<crate::traits::ToolAccessDenial> {
+    let denied = exit_code.is_some_and(|code| code != 0)
+        && stderr.lines().any(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            line.contains("operation not permitted") || line.contains("permission denied")
+        });
+    denied.then(|| crate::traits::ToolAccessDenial {
+        reason_code: "sandbox_policy_denied".to_string(),
+        enforcement: confined_process_access_enforcement(),
+        exit_code,
+    })
 }
 
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
@@ -6105,7 +6281,7 @@ fn terminal_run_semantics_from_access(
         // process-result evidence are independent facets; collapsing them into
         // one enum made successful build/test scripts impossible to verify.
         return ToolCallSemantics::observation_and_mutation_with(
-            ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
         )
         .with_verification_mode(ToolVerificationMode::ResultContent);
     }
@@ -6131,14 +6307,16 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         "trust_all" => ToolCallSemantics::administrative(),
         _ => {
             let has_write_targets = args.as_ref().is_some_and(|value| {
-                value
-                    .get("write_paths")
-                    .and_then(Value::as_array)
-                    .is_some_and(|paths| {
-                        paths
-                            .iter()
-                            .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
-                    })
+                ["write_paths", "write_roots"].into_iter().any(|field| {
+                    value
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .is_some_and(|paths| {
+                            paths.iter().any(|path| {
+                                path.as_str().is_some_and(|path| !path.trim().is_empty())
+                            })
+                        })
+                })
             });
             // Every process call observes its own typed receipt, and every run
             // crosses the native sandbox even when its task-data manifest is
@@ -6187,7 +6365,21 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
             read_targets.push(path);
         }
     }
-    let write_targets = parsed
+    for path in parsed
+        .as_ref()
+        .and_then(|value| value.get("read_roots"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(resolve)
+        .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path))
+    {
+        if !read_targets.contains(&path) {
+            read_targets.push(path);
+        }
+    }
+    let mut write_targets: Vec<ToolTargetHint> = parsed
         .as_ref()
         .and_then(|value| value.get("write_paths"))
         .and_then(Value::as_array)
@@ -6197,11 +6389,32 @@ fn terminal_access_manifest(arguments: &str) -> crate::traits::ToolCallAccessMan
         .map(resolve)
         .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
         .collect();
+    write_targets.extend(
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("write_roots"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(resolve)
+            .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)),
+    );
     crate::traits::ToolCallAccessManifest {
         execution_cwd,
         read_targets,
         write_targets,
+        adapter_read_targets: Vec::new(),
     }
+}
+
+/// Shell here-documents are parsed by the shell before the command body runs.
+/// Routing command-form here-documents through the same stdin boundary keeps
+/// the sandbox transient parser allowance and scratch preparation consistent.
+/// The marker is shell syntax, not natural-language classification; a false
+/// positive only changes the equivalent transport form.
+fn command_requires_stdin_shell(command: &str) -> bool {
+    command.contains("<<")
 }
 
 fn validate_terminal_argument_contract(
@@ -6309,6 +6522,16 @@ impl Tool for TerminalTool {
                         "items": { "type": "string" },
                         "description": "Exact writable files/directories for a confined mutating run. For script workflows, include each writable directory root (including a future root) so the runtime can prepare its private shell/package scratch area before parsing the script."
                     },
+                    "read_roots": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Typed directory roots whose descendants the confined run may read"
+                    },
+                    "write_roots": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Typed directory roots whose descendants the confined run may create or change; future roots are prepared before launch"
+                    },
                     "action": {
                         "type": "string",
                         "enum": ["run", "check", "kill", "trust_all"],
@@ -6360,6 +6583,56 @@ impl Tool for TerminalTool {
 
     fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
         terminal_access_manifest(arguments)
+    }
+
+    fn adapter_owned_access_manifest(
+        &self,
+        _arguments: &str,
+    ) -> crate::traits::ToolCallAccessManifest {
+        // A confined process must load its shell and immutable system
+        // executables before it can exercise the task manifest.  These roots
+        // are adapter-owned runtime capabilities, not task data grants.  The
+        // native sandbox still installs the narrower executable/runtime paths
+        // it resolves for the actual command; this lane merely prevents a
+        // model from having to repeat host-loader paths in `read_paths`.
+        let adapter_read_targets = [
+            "/bin",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .into_iter()
+        .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path.to_string()))
+        .collect();
+        crate::traits::ToolCallAccessManifest {
+            adapter_read_targets,
+            ..Default::default()
+        }
+    }
+
+    fn project_contract_mutation_effects(
+        &self,
+        mut semantics: ToolCallSemantics,
+        required_effects: ToolMutationEffects,
+    ) -> ToolCallSemantics {
+        if semantics.mutates_state() && !required_effects.is_empty() {
+            // A terminal is an opaque bounded workspace adapter. It may be
+            // assigned the contract's derived/workspace lane when the typed
+            // obligation explicitly names this operation, but it can never
+            // masquerade as a path-aware source edit or a remote mutation.
+            let local_output = required_effects.intersect(
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+                    .union(ToolMutationEffects::LOCAL_DERIVED_WRITE),
+            );
+            semantics.mutation_effects = if local_output.is_empty() {
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+            } else {
+                local_output
+            };
+        }
+        semantics
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -6462,7 +6735,26 @@ mod tests {
     }
 
     #[test]
-    fn confined_write_process_is_both_observation_and_mutation() {
+    fn sandbox_denial_telemetry_is_adapter_diagnostic_not_exit_classifier() {
+        let denial = sandbox_access_denial(
+            "/bin/sh: cannot open /etc/hosts: Operation not permitted",
+            Some(1),
+        )
+        .expect("kernel denial diagnostic");
+        assert_eq!(denial.reason_code, "sandbox_policy_denied");
+        assert_eq!(denial.exit_code, Some(1));
+        assert!(sandbox_access_denial("ordinary command error", Some(1)).is_none());
+        assert!(sandbox_access_denial("Operation not permitted", Some(0)).is_none());
+    }
+
+    #[test]
+    fn command_form_heredoc_uses_the_script_sandbox_boundary() {
+        assert!(command_requires_stdin_shell("cat <<'EOF'\nvalue\nEOF"));
+        assert!(!command_requires_stdin_shell("printf '%s' value"));
+    }
+
+    #[test]
+    fn confined_write_process_is_bounded_workspace_observation_and_mutation() {
         let semantics = terminal_run_semantics_from_access(true, true);
         assert!(semantics.observes_state());
         assert!(semantics.mutates_state());
@@ -6472,7 +6764,7 @@ mod tests {
         );
         assert!(semantics
             .mutation_effects
-            .intersects(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE));
+            .intersects(crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
     }
 
     #[cfg(target_os = "macos")]
@@ -6705,8 +6997,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_runtime_policy_does_not_widen_task_data_roots() {
-        let policy = macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[], false)
-            .expect("policy");
+        let policy =
+            macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[], &[], false)
+                .expect("policy");
         assert!(!policy.contains("(subpath \"/private/etc\")"));
         assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
         assert!(policy.contains("(subpath \"/private/tmp\")"));
@@ -6756,6 +7049,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_manifest_preserves_typed_directory_roots() {
+        let manifest = terminal_access_manifest(
+            r#"{"action":"run","command":"/usr/bin/true","working_dir":"/tmp","read_roots":["/tmp/read-root"],"write_roots":["/tmp/write-root"]}"#,
+        );
+        assert_eq!(
+            manifest.read_targets[0].kind,
+            ToolTargetHintKind::ProjectScope
+        );
+        assert_eq!(
+            manifest.write_targets[0].kind,
+            ToolTargetHintKind::ProjectScope
+        );
+        assert_eq!(manifest.write_targets[0].value, "/tmp/write-root");
+    }
+
+    #[test]
     fn terminal_canonicalization_normalizes_empty_inactive_union_arms() {
         for input in [
             r#"{"action":"run","command":"/usr/bin/true","script":"","working_dir":"/tmp"}"#,
@@ -6785,6 +7094,7 @@ mod tests {
             script,
             Some("/tmp"),
             &["/tmp".to_string()],
+            &[],
             &[],
         )
         .await
@@ -6824,6 +7134,7 @@ mod tests {
             script,
             Some(&cwd),
             &[cwd.clone()],
+            &[],
             &[root.to_string_lossy().to_string()],
         )
         .await

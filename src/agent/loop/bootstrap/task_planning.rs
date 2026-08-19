@@ -136,6 +136,14 @@ pub(crate) struct PlannedFilesystemAccess {
     pub read_paths: Vec<String>,
     #[serde(default)]
     pub write_paths: Vec<String>,
+    /// Explicit directory capabilities. A path grant is exact; a root grant
+    /// authorizes descendants. Keeping the distinction in the assessment
+    /// protocol prevents the dispatcher from guessing directory intent from
+    /// filenames or command text.
+    #[serde(default, alias = "read_scopes")]
+    pub read_roots: Vec<String>,
+    #[serde(default, alias = "write_scopes")]
+    pub write_roots: Vec<String>,
 }
 
 /// Semantic task shape used by the orchestration router. The route decision is
@@ -215,6 +223,8 @@ fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSig
             execution_cwd: decode_optional_field(filesystem, "execution_cwd"),
             read_paths: decode_array_items(filesystem, "read_paths"),
             write_paths: decode_array_items(filesystem, "write_paths"),
+            read_roots: decode_array_items(filesystem, "read_roots"),
+            write_roots: decode_array_items(filesystem, "write_roots"),
         });
     let evidence_requirements = object
         .contains_key("evidence_requirements")
@@ -412,6 +422,8 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         || required_invocations.len() > 8
         || filesystem_access.read_paths.len() > 8
         || filesystem_access.write_paths.len() > 8
+        || filesystem_access.read_roots.len() > 8
+        || filesystem_access.write_roots.len() > 8
         || filesystem_access
             .execution_cwd
             .as_deref()
@@ -420,8 +432,12 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
             .read_paths
             .iter()
             .chain(&filesystem_access.write_paths)
+            .chain(&filesystem_access.read_roots)
+            .chain(&filesystem_access.write_roots)
             .any(|path| path.trim().is_empty() || path.chars().count() > 1000)
-        || !expects_mutation && !filesystem_access.write_paths.is_empty()
+        || !expects_mutation
+            && (!filesystem_access.write_paths.is_empty()
+                || !filesystem_access.write_roots.is_empty())
         // A check is an evidence-producing lifecycle kind. Treating it as a
         // zero-observation answer would let the model assert current-run or
         // current-state facts without any proof edge.
@@ -817,6 +833,7 @@ fn observed_assessment_budget(observed_latency_ms: Option<u64>) -> Duration {
         .min(TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT)
 }
 
+#[cfg(test)]
 fn bounded_attempt_timeout(remaining: Duration, requested: Duration) -> Option<Duration> {
     (!remaining.is_zero() && !requested.is_zero()).then(|| remaining.min(requested))
 }
@@ -846,6 +863,26 @@ struct AuxiliaryAttemptTelemetry {
     attempt: u32,
     fell_back: bool,
     validation_error: Option<String>,
+}
+
+enum TaskAssessmentAttempt {
+    Response {
+        candidate_index: usize,
+        model: String,
+        response: ProviderResponse,
+        latency_ms: u64,
+    },
+    ProviderError {
+        candidate_index: usize,
+        model: String,
+        latency_ms: u64,
+        error: String,
+    },
+    Timeout {
+        candidate_index: usize,
+        model: String,
+        latency_ms: u64,
+    },
 }
 
 async fn record_auxiliary_model_call(
@@ -1060,7 +1097,7 @@ pub(crate) async fn generate_task_plan(
                  \"receipt\": {{\n\
                    \"tool_names\": [\"exact required tool identifier\"],\n\
                    \"exit_codes\": [0],\n\
-                   \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
+                   \"outcome_statuses\": [],\n\
                    \"requires_output\": false,\n\
                    \"contract_rejected\": false,\n\
                    \"max_invocations\": null\n\
@@ -1071,7 +1108,7 @@ pub(crate) async fn generate_task_plan(
                {{\n\
                  \"tool_names\": [\"exact required tool identifier\"],\n\
                  \"exit_codes\": [0],\n\
-                 \"outcome_statuses\": [\"succeeded|completed_with_negative_result|failed_retryable|failed_permanent|blocked|backgrounded\"],\n\
+                 \"outcome_statuses\": [],\n\
                  \"requires_output\": false,\n\
                  \"contract_rejected\": false,\n\
                  \"max_invocations\": null\n\
@@ -1080,7 +1117,9 @@ pub(crate) async fn generate_task_plan(
              \"filesystem_access\": {{\n\
                \"execution_cwd\": null,\n\
                \"read_paths\": [],\n\
-               \"write_paths\": []\n\
+               \"write_paths\": [],\n\
+               \"read_roots\": [],\n\
+               \"write_roots\": []\n\
              }},\n\
              \"project_reference\": null\n\
            }},\n\
@@ -1134,10 +1173,13 @@ pub(crate) async fn generate_task_plan(
          - required_response_fields is a retired compatibility field and must be []. Final prose \
            is never lifecycle proof and is not matched by labels or markers.\n\
          - required_effects names the successful effects completion must prove. Valid \
-           values are local_source_write, repository_write, remote_mutation, \
-           remote_deploy, external_delivery, process_state, configuration, and \
-           destructive. Use [] when expects_mutation=false. A build cache or installed \
-           dependency is not a local_source_write. Use the narrowest applicable effect: \
+           values are local_source_write, local_workspace_write, local_derived_write, \
+           repository_write, remote_mutation, remote_deploy, external_delivery, \
+           process_state, configuration, destructive, and unspecified. Use [] when \
+           expects_mutation=false. A build cache or installed dependency is not a \
+           local_source_write; use local_derived_write for reproducible build/package \
+           output and local_workspace_write for other bounded workspace output. Use the \
+           narrowest applicable effect: \
            do not add remote_mutation merely because a remote_deploy or external_delivery \
            occurs. Every deliver task must include external_delivery.\n\
          - minimum_sources is the explicit number of distinct source pages required by the \
@@ -1160,15 +1202,20 @@ pub(crate) async fn generate_task_plan(
            request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
            outcome_statuses are alternative acceptable results; requires_output means authoritative result \
            content must be nonempty; contract_rejected is the required pre-I/O validation disposition. \
+           Each outcome_statuses item is one exact enum value: succeeded, completed_with_negative_result, \
+           failed_retryable, failed_permanent, blocked, or backgrounded; do not combine enum values in one \
+           string. \
            max_invocations is the positive maximum number of tool-call proposals for that operation; set it \
            only when the current request explicitly limits call count or forbids retries, otherwise null. \
            Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
            nonempty receipt and required_content_markers=[]. Never translate receipt facts into prose markers.\n\
          - filesystem_access is the task's least-privilege local access manifest. Put exact local paths \
            the request permits inspecting in read_paths, exact local paths it permits changing in \
-           write_paths, and an explicitly requested process working directory in execution_cwd. Paths \
-           may appear in both lists. Do not widen a file to its repository, make cwd writable implicitly, \
-           or include paths absent from the current request. For non-filesystem tasks use null/[]/[].\n\
+           write_paths, directory roots whose descendants are explicitly in scope in read_roots/write_roots, \
+           and an explicitly requested process working directory in execution_cwd. Paths may appear in both \
+           lists. A root is a typed directory capability; never use it for an exact file. Do not widen a file \
+           to its repository, make cwd writable implicitly, or include paths absent from the current request. \
+           For non-filesystem tasks use null/[]/[]/[].\n\
          - A current state observation proves only current state/content/outcome. It does not by itself \
            prove who performed an action, why it happened, what the agent previously decided, or whether \
            a historical claim came from autonomous execution. Attribution, causal explanation, and prior \
@@ -1216,12 +1263,14 @@ pub(crate) async fn generate_task_plan(
         single_attempt_fail_closed: true,
         ..crate::traits::ChatOptions::default()
     };
-    // Semantic assessment is one logical producer, not a quorum. Try
-    // configured candidates in priority order. Each candidate receives a
-    // bounded deadline derived from its observed p95 (with a conservative
-    // default for a cold model), rather than an equal slice that can starve a
-    // richer but otherwise ordinary response. The sum remains capped, so
-    // history can improve availability without creating an unbounded lane.
+    // Semantic assessment is one logical producer, not a quorum. Hedge the
+    // configured candidates concurrently under one bounded envelope, then
+    // choose the highest-priority valid result. Serial failover makes three
+    // ordinary provider latencies add together and can time out every
+    // candidate even when one would have completed inside the envelope. Each
+    // physical attempt still has its own observed-latency deadline and is
+    // recorded, so concurrency changes availability without hiding failures or
+    // allowing an unbounded provider fan-out.
     let attempt_budgets = {
         let mut budgets = Vec::with_capacity(model_candidates.len());
         for model in model_candidates {
@@ -1236,52 +1285,130 @@ pub(crate) async fn generate_task_plan(
             };
             budgets.push(observed_assessment_budget(observed));
         }
-        let total = budgets
-            .iter()
-            .copied()
-            .fold(Duration::ZERO, |sum, budget| sum.saturating_add(budget));
-        if total > TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT && !budgets.is_empty() {
-            let scale = TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT.as_secs_f64() / total.as_secs_f64();
-            budgets = budgets
-                .into_iter()
-                .map(|budget| Duration::from_secs_f64((budget.as_secs_f64() * scale).max(1.0)))
-                .collect();
-        }
         budgets
     };
-    let assessment_deadline = Instant::now()
-        + attempt_budgets
-            .iter()
-            .copied()
-            .fold(Duration::ZERO, |sum, budget| sum.saturating_add(budget))
-            .min(TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT);
-    for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let remaining = assessment_deadline.saturating_duration_since(Instant::now());
-        let Some(attempt_timeout) = attempt_budgets
-            .get(candidate_index)
-            .copied()
-            .and_then(|budget| bounded_attempt_timeout(remaining, budget))
-        else {
-            break;
+    let aggregate_timeout = attempt_budgets
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(Duration::ZERO)
+        .min(TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT);
+    if aggregate_timeout.is_zero() {
+        return None;
+    }
+    let est_input_tokens = Some(
+        crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
+            .min(u32::MAX as usize) as u32,
+    );
+    let attempts = model_candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, model)| {
+            let attempt_timeout = attempt_budgets.get(candidate_index).copied()?;
+            let provider = Arc::clone(&provider);
+            let messages = messages.clone();
+            let options = options.clone();
+            let model = model.clone();
+            Some(async move {
+                let call_start = Instant::now();
+                match tokio::time::timeout(
+                    attempt_timeout,
+                    provider.chat_with_options(&model, &messages, &[], &options),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => TaskAssessmentAttempt::Response {
+                        candidate_index,
+                        model,
+                        response,
+                        latency_ms: call_start.elapsed().as_millis() as u64,
+                    },
+                    Ok(Err(error)) => TaskAssessmentAttempt::ProviderError {
+                        candidate_index,
+                        model,
+                        latency_ms: call_start.elapsed().as_millis() as u64,
+                        error: error.to_string(),
+                    },
+                    Err(_) => TaskAssessmentAttempt::Timeout {
+                        candidate_index,
+                        model,
+                        latency_ms: call_start.elapsed().as_millis() as u64,
+                    },
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let attempt_start = Instant::now();
+    let completed_attempts =
+        tokio::time::timeout(aggregate_timeout, futures::future::join_all(attempts))
+            .await
+            .unwrap_or_default();
+    let mut completed_indices = std::collections::HashSet::new();
+    let mut valid_plans = Vec::new();
+    for attempt in completed_attempts {
+        let candidate_index = match &attempt {
+            TaskAssessmentAttempt::Response {
+                candidate_index, ..
+            }
+            | TaskAssessmentAttempt::ProviderError {
+                candidate_index, ..
+            }
+            | TaskAssessmentAttempt::Timeout {
+                candidate_index, ..
+            } => *candidate_index,
         };
-        let call_start = Instant::now();
-        let est_input_tokens = Some(
-            crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
-                .min(u32::MAX as usize) as u32,
-        );
-        let response = match tokio::time::timeout(
-            attempt_timeout,
-            provider.chat_with_options(model, &messages, &[], &options),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        completed_indices.insert(candidate_index);
+        match attempt {
+            TaskAssessmentAttempt::Response {
+                candidate_index,
+                model,
+                response,
+                latency_ms,
+            } => match decode_task_plan_result(&response, mode) {
+                Ok(plan) => {
+                    record_auxiliary_model_call(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        &response,
+                        latency_ms,
+                        AuxiliaryAttemptTelemetry {
+                            attempt: (candidate_index + 1) as u32,
+                            fell_back: candidate_index > 0,
+                            validation_error: None,
+                        },
+                    )
+                    .await;
+                    valid_plans.push((candidate_index, model, plan));
+                }
+                Err(error) => {
+                    record_auxiliary_model_call(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        &response,
+                        latency_ms,
+                        AuxiliaryAttemptTelemetry {
+                            attempt: (candidate_index + 1) as u32,
+                            fell_back: candidate_index > 0,
+                            validation_error: Some(error.clone()),
+                        },
+                    )
+                    .await;
+                    warn!(%model, %error, "Task assessment response rejected");
+                }
+            },
+            TaskAssessmentAttempt::ProviderError {
+                candidate_index,
+                model,
+                latency_ms,
+                error,
+            } => {
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
+                    &model,
+                    latency_ms,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
@@ -1289,73 +1416,63 @@ pub(crate) async fn generate_task_plan(
                 )
                 .await;
                 warn!(%error, %model, "Task assessment attempt failed");
-                continue;
             }
-            Err(_) => {
+            TaskAssessmentAttempt::Timeout {
+                candidate_index,
+                model,
+                latency_ms,
+            } => {
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_assessment",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
+                    &model,
+                    latency_ms,
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
                     "timeout",
                 )
                 .await;
-                warn!(
-                    %model,
-                    timeout_ms = attempt_timeout.as_millis(),
-                    "Task assessment attempt timed out"
-                );
-                continue;
-            }
-        };
-        let latency_ms = call_start.elapsed().as_millis() as u64;
-        match decode_task_plan_result(&response, mode) {
-            Ok(plan) => {
-                record_auxiliary_model_call(
-                    telemetry,
-                    "task_assessment",
-                    model,
-                    &response,
-                    latency_ms,
-                    AuxiliaryAttemptTelemetry {
-                        attempt: (candidate_index + 1) as u32,
-                        fell_back: candidate_index > 0,
-                        validation_error: None,
-                    },
-                )
-                .await;
-                info!(
-                    goal = %plan.goal,
-                    step_count = plan.steps.len(),
-                    assessment_mode = mode.as_str(),
-                    %model,
-                    fallback = candidate_index > 0,
-                    "Task assessment selected by configured model priority"
-                );
-                return Some(plan);
-            }
-            Err(error) => {
-                record_auxiliary_model_call(
-                    telemetry,
-                    "task_assessment",
-                    model,
-                    &response,
-                    latency_ms,
-                    AuxiliaryAttemptTelemetry {
-                        attempt: (candidate_index + 1) as u32,
-                        fell_back: candidate_index > 0,
-                        validation_error: Some(error.clone()),
-                    },
-                )
-                .await;
-                warn!(%model, %error, "Task assessment response rejected");
+                warn!(%model, "Task assessment attempt timed out");
             }
         }
     }
-    None
+    // A hard aggregate timeout can cancel an attempt just before its inner
+    // deadline. Preserve that failed transition in telemetry instead of
+    // making the candidate disappear from the producer trace.
+    for candidate_index in 0..model_candidates.len() {
+        if completed_indices.contains(&candidate_index) {
+            continue;
+        }
+        if let Some(model) = model_candidates.get(candidate_index) {
+            record_auxiliary_model_failure(
+                telemetry,
+                "task_assessment",
+                model,
+                attempt_start.elapsed().as_millis() as u64,
+                (candidate_index + 1) as u32,
+                candidate_index > 0,
+                est_input_tokens,
+                "aggregate_timeout",
+            )
+            .await;
+            warn!(%model, "Task assessment aggregate deadline elapsed");
+        }
+    }
+    let selected = valid_plans.into_iter().min_by_key(|(index, _, _)| *index);
+    if let Some((candidate_index, model, plan)) = selected {
+        info!(
+            goal = %plan.goal,
+            step_count = plan.steps.len(),
+            assessment_mode = mode.as_str(),
+            %model,
+            fallback = candidate_index > 0,
+            "Task assessment selected by configured model priority"
+        );
+        Some(plan)
+    } else {
+        None
+    }
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -2446,7 +2563,10 @@ mod tests {
 
         assert_eq!(assessment.goal, "primary contract");
         let calls = provider.calls.lock().expect("call ledger");
-        assert_eq!(calls.as_slice(), ["configured-primary"]);
+        assert_eq!(
+            calls.as_slice(),
+            ["configured-primary", "configured-fallback"]
+        );
     }
 
     #[tokio::test]

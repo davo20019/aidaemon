@@ -151,6 +151,43 @@ fn operation_identity_refreshes_only_after_a_different_mutation() {
 }
 
 #[test]
+fn blocked_dependency_requires_reconciliation_for_overlapping_capabilities() {
+    let mut state = ExecutionState::new(
+        BudgetTier::Standard,
+        default_execution_budget(BudgetTier::Standard),
+        ExecutionPersistence::Durable,
+    );
+    let blocked_child =
+        ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/synthetic-output/.keep")
+            .expect("blocked target");
+    state.record_blocked_dependency_targets(std::slice::from_ref(&blocked_child));
+
+    let mut mutating_scope = crate::traits::ToolCallAccessManifest {
+        execution_cwd: None,
+        read_targets: Vec::new(),
+        write_targets: vec![ToolTargetHint::new(
+            ToolTargetHintKind::ProjectScope,
+            "/tmp/synthetic-output",
+        )
+        .expect("directory capability")],
+        adapter_read_targets: Vec::new(),
+    };
+    assert_eq!(
+        state.mutation_depends_on_blocked_target(&mutating_scope),
+        Some("/tmp/synthetic-output/.keep".to_string())
+    );
+
+    mutating_scope.write_targets =
+        vec![
+            ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/other-output/file")
+                .expect("unrelated target"),
+        ];
+    assert!(state
+        .mutation_depends_on_blocked_target(&mutating_scope)
+        .is_none());
+}
+
+#[test]
 fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
     let semantics = ToolCallSemantics::observation().with_target_hint(
         ToolTargetHintKind::Url,

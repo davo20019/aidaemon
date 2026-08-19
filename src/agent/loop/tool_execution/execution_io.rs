@@ -402,8 +402,16 @@ pub(super) async fn execute_tool_call_io(
     let registered_receipt_kind = registered_tool
         .map(|tool| tool.receipt_kind(ctx.effective_arguments))
         .unwrap_or_default();
-    let registered_access_manifest =
-        registered_tool.map(|tool| tool.call_access_manifest(ctx.effective_arguments));
+    let registered_access_manifest = registered_tool.map(|tool| {
+        let mut manifest = tool.call_access_manifest(ctx.effective_arguments);
+        let adapter_manifest = tool.adapter_owned_access_manifest(ctx.effective_arguments);
+        for target in adapter_manifest.adapter_read_targets {
+            if !manifest.adapter_read_targets.contains(&target) {
+                manifest.adapter_read_targets.push(target);
+            }
+        }
+        manifest
+    });
     let mut result_is_err = result.is_err();
     let mut result_text = match result {
         Ok(outcome) => {
@@ -442,7 +450,25 @@ pub(super) async fn execute_tool_call_io(
                 result_metadata.outcome_status = Some(crate::traits::ToolOutcomeStatus::Succeeded);
             }
             let text = outcome.output;
-            if result_metadata.result_provenance.is_none() {
+            if result_metadata
+                .result_provenance
+                .as_ref()
+                .is_some_and(|provenance| {
+                    provenance.authoritative_chars == 0 && !text.trim().is_empty()
+                })
+            {
+                // The effective adapter result is authoritative at this
+                // boundary. Repair incomplete provenance from a routed or
+                // composite adapter instead of allowing a zero-length receipt
+                // to disagree with the bytes that were actually returned.
+                result_metadata.result_provenance = Some(
+                    crate::traits::ToolResultProvenance::from_authoritative_result(
+                        &text,
+                        &result_metadata,
+                        crate::traits::ToolResultContentSource::ToolOutput,
+                    ),
+                );
+            } else if result_metadata.result_provenance.is_none() {
                 result_metadata.result_provenance = Some(
                     crate::traits::ToolResultProvenance::from_authoritative_result(
                         &text,

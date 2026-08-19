@@ -157,6 +157,7 @@ fn run_command_access_manifest(arguments: &str) -> ToolCallAccessManifest {
         } else {
             Vec::new()
         },
+        adapter_read_targets: Vec::new(),
     }
 }
 
