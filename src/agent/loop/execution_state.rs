@@ -636,6 +636,7 @@ impl ExecutionState {
 
     /// Charge one attempt only when the staged step reaches actual or
     /// synthetic tool execution.
+    #[cfg(test)]
     pub fn begin_staged_step(&mut self) -> bool {
         let Some(step) = self.current_step.as_ref() else {
             return false;
@@ -684,6 +685,30 @@ impl ExecutionState {
         }
         self.steps_used = self.steps_used.saturating_add(1);
         true
+    }
+
+    /// Mirror a task-kernel admission into the legacy in-process counters.
+    /// These counters remain useful for diagnostics and budget rendering, but
+    /// their process-local history is not authoritative for correctness.
+    pub fn record_kernel_admitted_step(&mut self) {
+        let Some(step) = self.current_step.as_ref() else {
+            return;
+        };
+        let operation_key = if step.operation_key.is_empty() {
+            step.step_id.clone()
+        } else {
+            step.operation_key.clone()
+        };
+        let invocations = self.operation_invocations.entry(operation_key).or_default();
+        *invocations = invocations.saturating_add(1);
+        if let Some(cardinality_key) = step.cardinality_key.as_ref() {
+            let used = self
+                .obligation_invocations
+                .entry(cardinality_key.clone())
+                .or_default();
+            *used = used.saturating_add(1);
+        }
+        self.steps_used = self.steps_used.saturating_add(1);
     }
 
     /// Record actual adapter dispatch separately from admitted proposal and

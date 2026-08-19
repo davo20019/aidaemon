@@ -1,8 +1,7 @@
-use super::history::assistant_message_looks_like_clarifying_question;
 use super::*;
 use crate::events::{
-    AssistantResponseData, EventType, TaskEndData, TaskOutcome, TaskStartData, TaskStatus,
-    UserMessageData,
+    AssistantResponseData, EventType, InteractionRequestedData, InteractionResolvedData,
+    TaskEndData, TaskOutcome, TaskStartData, TaskStatus, UserMessageData,
 };
 use crate::traits::{
     extract_primary_message_content, message_content_is_structural_only, ActiveTaskRef,
@@ -185,10 +184,6 @@ fn classify_assistant_turn_text(text: &str) -> (AssistantTurnKind, bool) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return (AssistantTurnKind::SystemNotice, false);
-    }
-
-    if assistant_message_looks_like_clarifying_question(trimmed) {
-        return (AssistantTurnKind::ClarificationQuestion, true);
     }
 
     if message_content_is_structural_only(trimmed, &[]) {
@@ -454,7 +449,7 @@ fn apply_assistant_message(
     state: &mut DialogueState,
     message_id: &str,
     content: &str,
-    observed_at: chrono::DateTime<Utc>,
+    _observed_at: chrono::DateTime<Utc>,
 ) {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -474,23 +469,9 @@ fn apply_assistant_message(
     // otherwise prose containing words like "blocked", "partial", or
     // "failed" can silently rewrite durable state.
     match kind {
-        AssistantTurnKind::ClarificationQuestion => {
-            state.open_question = Some(OpenQuestion {
-                assistant_message_id: message_id.to_string(),
-                text: trimmed.to_string(),
-                // Ordinary model-authored questions are provisional
-                // clarification edges. Approval and mandate-input obligations
-                // are created only by their typed runtime paths.
-                kind: QuestionKind::Clarification,
-                related_user_message_id: state
-                    .open_request
-                    .as_ref()
-                    .map(|request| request.user_message_id.clone()),
-                mandate_id: None,
-                awaiting_user_reply: true,
-                asked_at: observed_at,
-            });
-        }
+        // Questions are lifecycle state only when a typed interaction broker
+        // creates them. Assistant prose alone cannot open an obligation.
+        AssistantTurnKind::ClarificationQuestion => {}
         AssistantTurnKind::PartialProgress => {
             state.open_question = None;
         }
@@ -504,6 +485,37 @@ fn apply_assistant_message(
     }
 
     state.touch();
+}
+
+fn apply_interaction_requested(
+    state: &mut DialogueState,
+    interaction: InteractionRequestedData,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    state.open_question = Some(OpenQuestion {
+        assistant_message_id: interaction.interaction_id,
+        text: interaction.action,
+        kind: QuestionKind::Approval,
+        related_user_message_id: state
+            .open_request
+            .as_ref()
+            .map(|request| request.user_message_id.clone()),
+        mandate_id: None,
+        awaiting_user_reply: true,
+        asked_at: observed_at,
+    });
+    state.last_closed_question = None;
+    state.touch();
+}
+
+fn apply_interaction_resolved(state: &mut DialogueState, interaction: InteractionResolvedData) {
+    if state.open_question.as_ref().is_some_and(|question| {
+        question.kind == QuestionKind::Approval
+            && question.assistant_message_id == interaction.interaction_id
+    }) {
+        state.last_closed_question = state.open_question.take();
+        state.touch();
+    }
 }
 
 fn apply_task_end(
@@ -645,6 +657,16 @@ async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> 
                             event.created_at,
                         );
                     }
+                }
+            }
+            EventType::InteractionRequested => {
+                if let Ok(data) = event.parse_data::<InteractionRequestedData>() {
+                    apply_interaction_requested(&mut state, data, event.created_at);
+                }
+            }
+            EventType::InteractionResolved => {
+                if let Ok(data) = event.parse_data::<InteractionResolvedData>() {
+                    apply_interaction_resolved(&mut state, data);
                 }
             }
             EventType::TaskEnd => {
@@ -1411,11 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn incident_2026_07_11_ack_binds_to_menu_not_stale_request() {
-        // Full replay of the incident chain: a request answered two hours ago
-        // sits in state, the assistant presents a clarifying menu, the user
-        // acks with option numbers. The persisted classifier must bind the
-        // answer to that menu rather than resurrecting the stale request.
+    fn typed_interaction_binds_reply_without_classifying_assistant_prose() {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         state.open_request = Some(request_with(
@@ -1423,7 +1441,20 @@ mod tests {
             now - chrono::Duration::hours(2),
             Some(now - chrono::Duration::hours(2)),
         ));
-        apply_assistant_message(&mut state, "a2", MENU, now - chrono::Duration::seconds(90));
+        apply_interaction_requested(
+            &mut state,
+            InteractionRequestedData {
+                schema_version: InteractionRequestedData::SCHEMA_VERSION,
+                interaction_id: "a2".to_string(),
+                interaction_kind: "approval".to_string(),
+                action: MENU.to_string(),
+                action_sha256: "synthetic".to_string(),
+                risk_level: "low".to_string(),
+                warnings: Vec::new(),
+                permission_mode: "once".to_string(),
+            },
+            now - chrono::Duration::seconds(90),
+        );
         apply_user_message(&mut state, "u2", "Yes do 1, 2", &[], now);
 
         assert_eq!(
@@ -1436,6 +1467,23 @@ mod tests {
                 .as_ref()
                 .map(|question| question.assistant_message_id.as_str()),
             Some("a2")
+        );
+    }
+
+    #[test]
+    fn assistant_question_punctuation_does_not_create_lifecycle_state() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("s1");
+        apply_assistant_message(
+            &mut state,
+            "a1",
+            "Which synthetic environment should be used?",
+            now,
+        );
+        assert!(state.open_question.is_none());
+        assert_eq!(
+            state.last_assistant_turn.as_ref().map(|turn| turn.kind),
+            Some(AssistantTurnKind::SubstantiveAnswer)
         );
     }
 

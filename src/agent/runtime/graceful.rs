@@ -1192,6 +1192,7 @@ impl Agent {
                 "run_aggregate_schema_version": run_aggregate.schema_version,
                 "run_contract_present": run_aggregate.contract_present,
                 "run_terminal_decision": format!("{:?}", run_aggregate.terminal_decision()).to_lowercase(),
+                "task_kernel_phase": format!("{:?}", run_aggregate.lifecycle_phase()).to_lowercase(),
                 "obligations_required": run_aggregate.required_count(),
                 "obligations_satisfied": run_aggregate.satisfied_count(),
                 "effect_revision": run_aggregate.effect_revision,

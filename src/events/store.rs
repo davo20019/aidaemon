@@ -1133,6 +1133,74 @@ impl EventStore {
         Ok(event_id)
     }
 
+    /// Atomically decide and persist one tool-call proposal against the task's
+    /// durable event history. A rejected proposal is still appended for audit
+    /// and correlation with its typed pre-dispatch result; the returned
+    /// admission is the only dispatch authority.
+    pub(crate) async fn admit_and_append_tool_call(
+        &self,
+        event: Event,
+        claim: &crate::events::TaskKernelOperationClaim,
+    ) -> anyhow::Result<(i64, crate::events::TaskKernelAdmission)> {
+        anyhow::ensure!(
+            event.event_type == EventType::ToolCall,
+            "expected tool_call event"
+        );
+        let task_id = event
+            .task_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("kernel tool claim requires task identity"))?;
+        let persisted_claim: ToolCallData = serde_json::from_value(event.data.clone())?;
+        anyhow::ensure!(
+            persisted_claim.tool_call_id == claim.operation_id
+                && persisted_claim.name == claim.tool_name
+                && persisted_claim.stable_operation_key.as_deref()
+                    == Some(claim.stable_operation_key.as_str())
+                && persisted_claim.obligation_ids == claim.obligation_ids
+                && persisted_claim.max_operation_attempts == Some(claim.max_attempts.max(1))
+                && persisted_claim.max_operation_invocations == Some(claim.max_invocations.max(1))
+                && persisted_claim.idempotency_key == claim.idempotency_key
+                && persisted_claim.operation_lineage == claim.operation_lineage,
+            "persisted tool claim does not match kernel admission input"
+        );
+
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
+            FROM events
+            WHERE session_id = ? AND task_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(&event.session_id)
+        .bind(task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let aggregate = RunAggregate::replay(task_id, &self.rows_to_events(rows)?);
+        let admission = aggregate.admit_operation(claim);
+
+        let data_json = serde_json::to_string(&event.data)?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name, turn_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&event.session_id)
+        .bind(event.event_type.as_str())
+        .bind(data_json)
+        .bind(event.created_at.to_rfc3339())
+        .bind(&event.task_id)
+        .bind(&event.tool_name)
+        .bind(&event.turn_id)
+        .execute(&mut *tx)
+        .await?;
+        let event_id = result.last_insert_rowid();
+        tx.commit().await?;
+        Ok((event_id, admission))
+    }
+
     /// Project the canonical user-message event for a task only after the
     /// memory pipeline has persisted at least one durable fact from that turn.
     /// Task identity is the selection boundary; prose similarity never chooses
@@ -3598,6 +3666,22 @@ impl EventEmitter {
         self.store.append(event).await
     }
 
+    pub(crate) async fn emit_admitted_tool_call(
+        &self,
+        mut data: ToolCallData,
+        claim: &crate::events::TaskKernelOperationClaim,
+    ) -> anyhow::Result<(i64, crate::events::TaskKernelAdmission)> {
+        if data.task_id.is_none() {
+            data.task_id = self.current_task_id.clone();
+        }
+        let event = Event::new(
+            &self.session_id,
+            EventType::ToolCall,
+            serde_json::to_value(data)?,
+        );
+        self.store.admit_and_append_tool_call(event, claim).await
+    }
+
     /// Emit an `llm_call` event and correlated token projection as one durable
     /// transaction. This is intentionally specialized so unrelated event
     /// writers cannot accidentally couple themselves to the projection table.
@@ -4315,6 +4399,11 @@ mod tests {
             idempotency_key: None,
             policy_rev: None,
             risk_score: None,
+            stable_operation_key: None,
+            obligation_ids: Vec::new(),
+            max_operation_attempts: None,
+            max_operation_invocations: None,
+            operation_lineage: None,
             turn_id: None,
         };
         store
@@ -4419,6 +4508,77 @@ mod tests {
         assert_eq!(
             proof[0].obligation_ids,
             ["task:task-child/obligation:background-result"]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_tool_claim_admission_and_append_share_one_transaction() {
+        let (store, _database) = setup_store().await;
+        let claim = crate::events::TaskKernelOperationClaim {
+            operation_id: "call-1".to_string(),
+            stable_operation_key: "stable-operation".to_string(),
+            tool_name: "terminal".to_string(),
+            obligation_ids: Vec::new(),
+            max_attempts: 1,
+            max_invocations: 1,
+            idempotency_key: None,
+            operation_lineage: None,
+        };
+        let call = ToolCallData::from_tool_call(
+            "call-1",
+            "terminal",
+            json!({"command": "synthetic"}),
+            Some("task-atomic".to_string()),
+        )
+        .with_kernel_claim("stable-operation", Vec::new(), 1, 1);
+        let first = store
+            .admit_and_append_tool_call(
+                Event::new(
+                    "session-atomic",
+                    EventType::ToolCall,
+                    serde_json::to_value(call).unwrap(),
+                ),
+                &claim,
+            )
+            .await
+            .expect("first atomic claim");
+        assert_eq!(first.1, crate::events::TaskKernelAdmission::Admitted);
+
+        let second_claim = crate::events::TaskKernelOperationClaim {
+            operation_id: "call-2".to_string(),
+            ..claim
+        };
+        let second_call = ToolCallData::from_tool_call(
+            "call-2",
+            "terminal",
+            json!({"command": "synthetic"}),
+            Some("task-atomic".to_string()),
+        )
+        .with_kernel_claim("stable-operation", Vec::new(), 1, 1);
+        let second = store
+            .admit_and_append_tool_call(
+                Event::new(
+                    "session-atomic",
+                    EventType::ToolCall,
+                    serde_json::to_value(second_call).unwrap(),
+                ),
+                &second_claim,
+            )
+            .await
+            .expect("second atomic claim");
+        assert!(matches!(
+            second.1,
+            crate::events::TaskKernelAdmission::Rejected {
+                code: "operation_invocations_exhausted",
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .task_event_count("session-atomic", "task-atomic", EventType::ToolCall)
+                .await
+                .unwrap(),
+            2
         );
     }
 

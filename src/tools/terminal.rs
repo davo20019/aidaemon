@@ -2284,6 +2284,71 @@ fn homebrew_alias_namespace(executable: &crate::execution::BackendPath) -> Optio
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+/// Ask a selected Python runtime for its own immutable import roots before it
+/// enters confinement. This is capability discovery from the resolved
+/// executable, not inference from shell prose: the adapter reports exactly
+/// which standard-library trees its child process will need.
+async fn add_python_runtime_support(
+    backend: &SharedExecutionBackend,
+    executable: &crate::execution::BackendPath,
+    support: &mut NativeSandboxRuntimeSupport,
+) {
+    let probe = r#"import json,sys; print(json.dumps({"base_prefix":sys.base_prefix,"prefix":sys.prefix,"path":sys.path}))"#;
+    let Ok(output) = backend
+        .execute(
+            ExecutionRequest::argv(
+                executable.to_string(),
+                vec!["-c".to_string(), probe.to_string()],
+            ),
+            Duration::from_secs(5),
+        )
+        .await
+    else {
+        return;
+    };
+    if output.exit_code != 0 {
+        return;
+    }
+    let Some(profile) = output
+        .stdout_lossy()
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+    else {
+        return;
+    };
+
+    for path in profile
+        .get("path")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|path| path.starts_with('/'))
+    {
+        let path = crate::execution::BackendPath::new(path.to_string());
+        if backend.metadata(&path).await.is_ok() {
+            support.add_read(path.to_string());
+            support.add_executable(path.to_string());
+        }
+    }
+    for prefix in ["base_prefix", "prefix"]
+        .into_iter()
+        .filter_map(|key| profile.get(key).and_then(Value::as_str))
+        .filter(|path| path.starts_with('/'))
+    {
+        let prefix = crate::execution::BackendPath::new(prefix.to_string());
+        for dependency in [prefix.join("lib"), prefix.join("pyvenv.cfg")] {
+            if backend.metadata(&dependency).await.is_ok() {
+                support.add_read(dependency.to_string());
+                if dependency.file_name() == Some("lib") {
+                    support.add_executable(dependency.to_string());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_developer_root_from_sdk_root(sdk_root: &str) -> Option<String> {
     ["/Platforms/", "/SDKs/"]
@@ -2412,6 +2477,7 @@ async fn native_sandbox_runtime_support(
             || matches!(canonical_name, "python" | "python3" | "pip" | "pip3")
         {
             support.python_cache = true;
+            add_python_runtime_support(backend, &canonical, &mut support).await;
         }
         if canonical_name == "rustup" && requested_name != "rustup" {
             let output = backend

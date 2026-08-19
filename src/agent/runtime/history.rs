@@ -22,5 +22,5 @@ pub(super) use super::completion_contract::{
     SemanticAuthorityRequirements, SemanticCompletionRequirements, SemanticEvidencePolicy,
     VerificationTarget, VerificationTargetKind,
 };
-pub(super) use super::followup::{assistant_message_looks_like_clarifying_question, FollowupMode};
+pub(super) use super::followup::FollowupMode;
 pub(super) use super::turn_context::TurnContext;

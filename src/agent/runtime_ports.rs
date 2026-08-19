@@ -181,10 +181,25 @@ impl AgentIngress for Agent {
             delivery.task_id.trim() != "" && delivery.response_id.trim() != "",
             "delivery event requires generated response and task identities"
         );
+        let task_id = delivery.task_id.clone();
+        let response_id = delivery.response_id.clone();
         crate::events::EventEmitter::new(self.event_store.clone(), session_id.to_string())
-            .with_task_id(delivery.task_id.clone())
+            .with_task_id(task_id.clone())
             .emit(crate::events::EventType::ResponseDelivery, delivery)
             .await?;
+        if let Ok(aggregate) = self
+            .event_store
+            .task_run_aggregate(session_id, &task_id)
+            .await
+        {
+            tracing::info!(
+                session_id,
+                task_id,
+                response_id,
+                task_kernel_phase = ?aggregate.lifecycle_phase(),
+                "Recorded durable response-delivery transition"
+            );
+        }
         Ok(())
     }
 }

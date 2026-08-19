@@ -8,6 +8,7 @@ pub(super) struct ToolExecutionIoResult {
     pub result_text: String,
     pub tool_duration_ms: u64,
     pub result_metadata: crate::traits::ToolCallMetadata,
+    pub kernel_admission: crate::events::TaskKernelAdmission,
 }
 
 pub(super) struct ToolExecutionIoCtx<'a> {
@@ -26,9 +27,13 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     pub heartbeat: &'a Option<Arc<AtomicU64>>,
     pub emitter: &'a crate::events::EventEmitter,
     pub policy_bundle: &'a PolicyBundle,
-    /// Deterministic operation-ledger refusal. The call proposal is persisted,
-    /// but no adapter I/O may begin when this is present.
-    pub dispatch_block_reason: Option<&'a str>,
+    /// Durable task-kernel claim admitted before dispatch. This binding is
+    /// persisted on ToolCall so replay never has to recover ownership from
+    /// command text, tool names, or transient plan-step IDs.
+    pub stable_operation_key: &'a str,
+    pub obligation_ids: &'a [String],
+    pub max_operation_attempts: usize,
+    pub max_operation_invocations: usize,
     /// Set by the correction gate when this specific tool call has already
     /// been classified as allowed for unattended execution.
     /// False on all normal (non-correction) paths.
@@ -56,6 +61,14 @@ fn should_replay_durable_result(
         && result.receipt.as_ref().is_some_and(|receipt| {
             receipt.outcome_status == crate::traits::ToolOutcomeStatus::FailedRetryable
         }))
+}
+
+fn durable_result_identity(result: &crate::events::ToolResultData) -> String {
+    result
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.result_provenance.result_id.clone())
+        .unwrap_or_else(|| format!("receipt:{}", result.tool_call_id))
 }
 
 pub(super) async fn execute_tool_call_io(
@@ -89,8 +102,8 @@ pub(super) async fn execute_tool_call_io(
         .iter()
         .find(|tool| tool.name() == tc.name && tool.is_available())
         .is_some_and(|tool| tool.capabilities().idempotent);
-    let mut replayed_result: Option<crate::events::ToolResultData> = None;
-    let mut replay_invalidation_reason: Option<String> = None;
+    let mut replayed_result: Option<Box<crate::events::ToolResultData>> = None;
+    let mut replay_invalidation: Option<(String, String, String)> = None;
     let mut idempotency_block_reason: Option<String> = None;
     if let Some(idempotency_key) = ctx.idempotency_key {
         match agent
@@ -119,10 +132,14 @@ pub(super) async fn execute_tool_call_io(
                     };
                     match replay_decision {
                         crate::traits::DurableReplayDecision::Replay => {
-                            replayed_result = Some(result);
+                            replayed_result = Some(Box::new(result));
                         }
                         crate::traits::DurableReplayDecision::Reexecute { reason } => {
-                            replay_invalidation_reason = Some(reason);
+                            replay_invalidation = Some((
+                                result.tool_call_id.clone(),
+                                durable_result_identity(&result),
+                                reason,
+                            ));
                         }
                         crate::traits::DurableReplayDecision::Block { reason } => {
                             idempotency_block_reason = Some(reason);
@@ -158,11 +175,44 @@ pub(super) async fn execute_tool_call_io(
         }
     }
 
+    let operation_lineage = replayed_result
+        .as_ref()
+        .map(
+            |result| crate::events::ToolOperationLineage::DurableReplay {
+                source_operation_id: result.tool_call_id.clone(),
+                source_result_id: durable_result_identity(result),
+            },
+        )
+        .or_else(|| {
+            replay_invalidation
+                .as_ref()
+                .map(|(source_operation_id, source_result_id, _)| {
+                    crate::events::ToolOperationLineage::ReconcileInvalidated {
+                        source_operation_id: source_operation_id.clone(),
+                        source_result_id: source_result_id.clone(),
+                    }
+                })
+        });
+
+    let persisted_idempotency_key = ctx
+        .idempotency_key
+        .map(str::to_string)
+        .or_else(|| Some(format!("{}:{}:{}", ctx.task_id, tc.name, tc.id)));
+
     // Emit ToolCall event
+    let kernel_claim = crate::events::TaskKernelOperationClaim {
+        operation_id: tc.id.clone(),
+        stable_operation_key: ctx.stable_operation_key.to_string(),
+        tool_name: tc.name.clone(),
+        obligation_ids: ctx.obligation_ids.to_vec(),
+        max_attempts: ctx.max_operation_attempts,
+        max_invocations: ctx.max_operation_invocations,
+        idempotency_key: persisted_idempotency_key.clone(),
+        operation_lineage: operation_lineage.clone(),
+    };
     let claim_result = ctx
         .emitter
-        .emit(
-            EventType::ToolCall,
+        .emit_admitted_tool_call(
             ToolCallData::from_tool_call(
                 tc.id.clone(),
                 tc.name.clone(),
@@ -170,18 +220,31 @@ pub(super) async fn execute_tool_call_io(
                 Some(ctx.task_id.to_string()),
             )
             .with_policy_metadata(
-                ctx.idempotency_key
-                    .map(str::to_string)
-                    .or_else(|| Some(format!("{}:{}:{}", ctx.task_id, tc.name, tc.id))),
+                persisted_idempotency_key,
                 Some(ctx.policy_bundle.policy.policy_rev),
                 Some(ctx.policy_bundle.risk_score),
-            ),
+            )
+            .with_kernel_claim(
+                ctx.stable_operation_key,
+                ctx.obligation_ids.to_vec(),
+                ctx.max_operation_attempts,
+                ctx.max_operation_invocations,
+            )
+            .with_operation_lineage(operation_lineage),
+            &kernel_claim,
         )
         .await;
+    let kernel_admission = match &claim_result {
+        Ok((_, admission)) => admission.clone(),
+        Err(error) => crate::events::TaskKernelAdmission::Rejected {
+            code: "kernel_claim_persist_failed",
+            detail: format!("Could not persist the durable operation claim: {error}"),
+        },
+    };
 
-    if let (Some(idempotency_key), Err(error)) = (ctx.idempotency_key, claim_result) {
+    if let Err(error) = claim_result {
         let reason = format!(
-            "Could not persist the durable execution claim for `{}` ({error}); refusing to run a mutation without replay protection.",
+            "Could not persist the durable execution claim for `{}` ({error}); refusing dispatch without replayable task state.",
             tc.name
         );
         agent
@@ -190,12 +253,12 @@ pub(super) async fn execute_tool_call_io(
                 ctx.task_id,
                 ctx.iteration,
                 DecisionType::IdempotencyIndeterminateBlock,
-                "Blocked mutation because its durable claim could not be persisted".to_string(),
+                "Blocked operation because its durable claim could not be persisted".to_string(),
                 serde_json::json!({
                     "condition": "idempotency_claim_persist_failed",
                     "tool": tc.name,
                     "tool_call_id": tc.id,
-                    "idempotency_key": idempotency_key,
+                    "idempotency_key": ctx.idempotency_key,
                     "error": error.to_string(),
                 }),
             )
@@ -215,11 +278,11 @@ pub(super) async fn execute_tool_call_io(
                 semantics,
                 ..crate::traits::ToolCallMetadata::default()
             },
+            kernel_admission,
         };
     }
 
-    let replay_invalidated = replay_invalidation_reason.is_some();
-    if let Some(reason) = replay_invalidation_reason {
+    if let Some((_, _, reason)) = replay_invalidation {
         agent
             .emit_decision_point(
                 ctx.emitter,
@@ -239,6 +302,36 @@ pub(super) async fn execute_tool_call_io(
                 }),
             )
             .await;
+    }
+
+    if let crate::events::TaskKernelAdmission::Rejected { code, detail } = &kernel_admission {
+        agent
+            .emit_warning_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::ToolBudgetBlock,
+                format!("Task kernel rejected operation {} before dispatch", tc.name),
+                serde_json::json!({
+                    "condition": "task_kernel_admission_rejected",
+                    "reason_code": code,
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "idempotency_key": ctx.idempotency_key,
+                    "reason": detail,
+                }),
+            )
+            .await;
+        return ToolExecutionIoResult {
+            result_text: format!("Operation not dispatched: {detail}"),
+            tool_duration_ms: 0,
+            result_metadata: crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                ..crate::traits::ToolCallMetadata::default()
+            },
+            kernel_admission,
+        };
     }
 
     if let Some(previous) = replayed_result {
@@ -269,6 +362,7 @@ pub(super) async fn execute_tool_call_io(
             result_text: previous.result,
             tool_duration_ms: 0,
             result_metadata: metadata,
+            kernel_admission,
         };
     }
 
@@ -304,37 +398,8 @@ pub(super) async fn execute_tool_call_io(
                 semantics,
                 ..crate::traits::ToolCallMetadata::default()
             },
+            kernel_admission,
         };
-    }
-
-    if !replay_invalidated {
-        if let Some(reason) = ctx.dispatch_block_reason {
-            agent
-                .emit_warning_decision_point(
-                    ctx.emitter,
-                    ctx.task_id,
-                    ctx.iteration,
-                    DecisionType::ToolBudgetBlock,
-                    format!("Blocked an exhausted operation retry for {}", tc.name),
-                    serde_json::json!({
-                        "condition": "operation_retry_budget_exhausted",
-                        "tool": tc.name,
-                        "tool_call_id": tc.id,
-                        "idempotency_key": ctx.idempotency_key,
-                        "reason": reason,
-                    }),
-                )
-                .await;
-            return ToolExecutionIoResult {
-                result_text: format!("Operation not dispatched: {reason}"),
-                tool_duration_ms: 0,
-                result_metadata: crate::traits::ToolCallMetadata {
-                    outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
-                    invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                    ..crate::traits::ToolCallMetadata::default()
-                },
-            };
-        }
     }
 
     let tool_exec_start = Instant::now();
@@ -717,6 +782,7 @@ pub(super) async fn execute_tool_call_io(
         result_text,
         tool_duration_ms,
         result_metadata,
+        kernel_admission,
     }
 }
 

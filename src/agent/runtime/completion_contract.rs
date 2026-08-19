@@ -1376,6 +1376,67 @@ impl CompletionProgress {
         format!("{}/{}", self.task_scope, local_id)
     }
 
+    /// Rebuild the legacy proof-graph view from the durable task kernel.
+    /// Callers may continue reading `CompletionProgress` during migration, but
+    /// they cannot preserve a contradictory in-memory completion decision.
+    pub(super) fn reconcile_with_run_aggregate(&mut self, aggregate: &crate::events::RunAggregate) {
+        if !self.proof_graph_initialized
+            || aggregate.task_id != self.task_scope.trim_start_matches("task:")
+        {
+            return;
+        }
+
+        let mut verification_pending = false;
+        for obligation in aggregate.obligations.values() {
+            let graph_state = match obligation.state {
+                crate::events::RunObligationState::Pending => ExecutionNodeState::Pending,
+                crate::events::RunObligationState::Satisfied => ExecutionNodeState::Satisfied,
+                crate::events::RunObligationState::Invalidated => ExecutionNodeState::Invalidated,
+                crate::events::RunObligationState::Abandoned => ExecutionNodeState::Superseded,
+                crate::events::RunObligationState::Unverifiable => ExecutionNodeState::Blocked,
+            };
+            if self.proof_graph.node_kind(&obligation.id).is_some() {
+                if obligation.state == crate::events::RunObligationState::Satisfied {
+                    for receipt in &obligation.satisfying_receipt_ids {
+                        if let Some(receipt_id) = self.record_receipt_node(receipt) {
+                            if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                                &obligation.id,
+                                &receipt_id,
+                                Some(receipt.clone()),
+                            ) {
+                                tracing::warn!(%error, obligation_id = %obligation.id, "Kernel proof projection was rejected");
+                            }
+                        }
+                    }
+                    // Effect obligations can be proved by typed effect metadata
+                    // without a dedicated receipt reference in legacy rows.
+                    if obligation.satisfying_receipt_ids.is_empty() {
+                        let _ = self.proof_graph.set_state(&obligation.id, graph_state);
+                    }
+                } else {
+                    let _ = self.proof_graph.set_state(&obligation.id, graph_state);
+                }
+            }
+            if obligation.class == crate::events::RunObligationClass::Observe
+                && !matches!(
+                    obligation.state,
+                    crate::events::RunObligationState::Satisfied
+                        | crate::events::RunObligationState::Abandoned
+                )
+            {
+                verification_pending = true;
+            }
+            if let Some(index) = self
+                .evidence_obligation_ids
+                .iter()
+                .position(|id| id == &obligation.id)
+            {
+                self.evidence_receipt_ids[index] = obligation.satisfying_receipt_ids.clone();
+            }
+        }
+        self.verification_pending = verification_pending;
+    }
+
     #[cfg(test)]
     fn next_evidence_id(&self, prefix: &str) -> String {
         format!(
@@ -4495,6 +4556,54 @@ mod tests {
         assert_eq!(
             contract.evidence_requirements[0].purpose,
             crate::traits::EvidencePurpose::Outcome
+        );
+    }
+
+    #[test]
+    fn durable_kernel_projection_overwrites_stale_compatibility_progress() {
+        let contract = CompletionContract {
+            scope_task_id: Some("synthetic-task".to_string()),
+            requires_observation: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "synthetic observation".to_string(),
+                acceptable_scopes: Vec::new(),
+                purpose: crate::traits::EvidencePurpose::Outcome,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                required_content_markers: Vec::new(),
+                receipt: Some(crate::traits::RequestReceiptPredicate::default()),
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut progress = CompletionProgress::new(&contract, "synthetic-task");
+        assert!(progress.verification_pending);
+
+        let obligation_id = "task:synthetic-task/obligation:evidence:0".to_string();
+        let mut aggregate = crate::events::RunAggregate::new("synthetic-task");
+        aggregate.contract_present = true;
+        aggregate.obligations.insert(
+            obligation_id.clone(),
+            crate::events::RunObligation {
+                id: obligation_id.clone(),
+                class: crate::events::RunObligationClass::Perform,
+                state: crate::events::RunObligationState::Satisfied,
+                receipt: Some(crate::traits::RequestReceiptPredicate::default()),
+                required_effect: ToolMutationEffects::NONE,
+                satisfied_at_revision: Some(0),
+                satisfying_receipt_ids: vec!["receipt-1".to_string()],
+            },
+        );
+
+        progress.reconcile_with_run_aggregate(&aggregate);
+        assert!(!progress.verification_pending);
+        assert_eq!(
+            progress.proof_graph.state(&obligation_id),
+            Some(ExecutionNodeState::Satisfied)
+        );
+        assert_eq!(
+            progress.evidence_receipt_ids,
+            vec![vec!["receipt-1".to_string()]]
         );
     }
 }

@@ -129,6 +129,7 @@ pub(super) fn find_previous_turns(
     (prev_assistant, prev_user)
 }
 
+#[cfg(test)]
 pub(super) fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
     // Question punctuation is the language feature here. Do not maintain a
     // phrase vocabulary whose omissions can silently lose the open-question

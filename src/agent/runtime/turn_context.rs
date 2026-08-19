@@ -907,17 +907,58 @@ impl Agent {
         semantics: ToolCallSemantics,
         access_manifest: Option<ToolCallAccessManifest>,
     ) -> anyhow::Result<()> {
+        self.persist_pre_dispatch_outcome_with_kernel_claim(
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            effective_arguments,
+            result_text,
+            outcome_status,
+            invocation_stage,
+            contract_rejected,
+            semantics,
+            access_manifest,
+            None,
+        )
+        .await
+    }
+
+    /// Persist a pre-dispatch outcome together with the durable operation and
+    /// obligation binding that was proposed. This makes denied attempts part
+    /// of the same replayable lifecycle as dispatched calls.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn persist_pre_dispatch_outcome_with_kernel_claim(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        task_id: &str,
+        tool_call: &ToolCall,
+        effective_arguments: &str,
+        result_text: String,
+        outcome_status: crate::traits::ToolOutcomeStatus,
+        invocation_stage: crate::traits::ToolInvocationStage,
+        contract_rejected: bool,
+        semantics: ToolCallSemantics,
+        access_manifest: Option<ToolCallAccessManifest>,
+        kernel_claim: Option<&crate::events::TaskKernelOperationClaim>,
+    ) -> anyhow::Result<()> {
+        let mut call_data = crate::events::ToolCallData::from_tool_call(
+            tool_call.id.clone(),
+            tool_call.name.clone(),
+            serde_json::from_str(effective_arguments).unwrap_or_else(|_| serde_json::json!({})),
+            Some(task_id.to_string()),
+        );
+        if let Some(claim) = kernel_claim {
+            call_data = call_data.with_kernel_claim(
+                &claim.stable_operation_key,
+                claim.obligation_ids.clone(),
+                claim.max_attempts,
+                claim.max_invocations,
+            );
+        }
         emitter
-            .emit(
-                crate::events::EventType::ToolCall,
-                crate::events::ToolCallData::from_tool_call(
-                    tool_call.id.clone(),
-                    tool_call.name.clone(),
-                    serde_json::from_str(effective_arguments)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    Some(task_id.to_string()),
-                ),
-            )
+            .emit(crate::events::EventType::ToolCall, call_data)
             .await?;
 
         let metadata = crate::traits::ToolCallMetadata {

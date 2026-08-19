@@ -574,7 +574,7 @@ async fn test_synthesized_done_persisted() {
 /// preceding answer remains available for natural-language follow-ups.
 #[tokio::test]
 async fn test_old_interaction_assistant_content_truncated() {
-    let long_response_1 = "B".repeat(500);
+    let long_response_1 = format!("{}TAIL-B", "B".repeat(3_000));
     let long_response_2 = "A".repeat(500);
     let provider = MockProvider::with_responses(vec![
         // Turn 1: long response
@@ -661,11 +661,18 @@ async fn test_old_interaction_assistant_content_truncated() {
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
         .collect();
 
-    // Turn 1's response (BBB...) should be truncated (archived).
+    // Turn 1's response should be structurally bounded while preserving its
+    // premise and conclusion. Wording and punctuation do not choose a
+    // compaction policy.
     let has_truncated_b = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.starts_with('B') && s.ends_with('…') && s.len() < 500)
+            .is_some_and(|s| {
+                s.starts_with('B')
+                    && s.ends_with("TAIL-B")
+                    && s.contains("\n…\n")
+                    && s.len() < long_response_1.len()
+            })
     });
     assert!(
         has_truncated_b,
@@ -682,14 +689,13 @@ async fn test_old_interaction_assistant_content_truncated() {
         "Turn 2's assistant response should be preserved in full as the referenced parent"
     );
 
-    // Truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
+    // Archived winning content remains bounded independently of its prose.
     for m in &assistant_msgs {
         if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if content.starts_with('B') && content.ends_with('…') {
-                // 200 chars + "…" (3 bytes) = ~203 bytes max
+            if content.starts_with('B') && content.ends_with("TAIL-B") {
                 assert!(
-                    content.len() <= 210,
-                    "Truncated content should be ~203 chars max, got {} chars: {}...",
+                    content.chars().count() <= 2_100,
+                    "Archived content should stay within its structural cap, got {} chars: {}...",
                     content.len(),
                     &content[..50.min(content.len())]
                 );

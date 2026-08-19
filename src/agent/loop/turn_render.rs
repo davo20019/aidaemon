@@ -167,15 +167,10 @@ fn retain_adjacent_tool_result(content: &str) -> String {
 
 /// Truncation for the winning assistant message of an archived turn.
 ///
-/// Clarifying questions/menus get a higher cap with head+tail preservation:
-/// the options at the END of the message are the actionable state the next
-/// user turn refers to ("Yes do 1, 2"), so head-truncation to the old
-/// assistant cap would delete exactly what that turn needs (2026-07-11
-/// incident). Everything else keeps the legacy head-truncation.
+/// Preserve both the premise and conclusion of every winning response. This
+/// is presentation compaction, not dialogue classification: response wording
+/// never decides whether a request remains open.
 fn truncate_winning_assistant(content: &str) -> String {
-    if !super::followup::assistant_message_looks_like_clarifying_question(content) {
-        return truncate_old_assistant(content);
-    }
     let count = content.chars().count();
     if count <= MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS {
         return content.to_string();
@@ -810,13 +805,17 @@ mod tests {
     }
 
     #[test]
-    fn archived_keeps_user_full_and_last_nonempty_assistant_truncated() {
+    fn archived_keeps_user_full_and_bounds_winning_assistant_without_classification() {
+        let long_answer = format!(
+            "{}TAIL",
+            "X".repeat(MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS + 500)
+        );
         let turn = vec![
             user("please do the long thing with lots of detail ...full text..."),
             assistant_empty_with_tool_call(),
             tool("terminal", "c1", "exit 0"),
-            assistant(&"X".repeat(500)), // last non-empty assistant — wins, truncated
-            assistant(""),               // later empty — loses
+            assistant(&long_answer), // last non-empty assistant — wins, bounded
+            assistant(""),           // later empty — loses
         ];
         let out = render_turn(
             &turn,
@@ -832,10 +831,11 @@ mod tests {
             "user text survives in full"
         );
         assert!(
-            joined.contains(&"X".repeat(MAX_OLD_ASSISTANT_CONTENT_CHARS)),
-            "assistant truncated to cap"
+            joined.contains(&"X".repeat(400)),
+            "assistant head is retained"
         );
-        assert!(!joined.contains(&"X".repeat(MAX_OLD_ASSISTANT_CONTENT_CHARS + 1)));
+        assert!(joined.contains("TAIL"), "assistant tail is retained");
+        assert!(!joined.contains(&long_answer));
         assert!(
             joined.contains("terminal: -> exit 0"),
             "tool result summarized deterministically"

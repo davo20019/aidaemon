@@ -1361,6 +1361,24 @@ impl Agent {
             )
             .await;
 
+            // The immutable event stream is the lifecycle authority. Refresh
+            // the compatibility proof graph on every scheduler pass so a
+            // provider retry, crash recovery, or replan cannot resurrect stale
+            // in-memory obligations or overwrite already-proved work.
+            match self
+                .event_store
+                .task_run_aggregate(session_id, &task_id)
+                .await
+            {
+                Ok(aggregate) => completion_progress.reconcile_with_run_aggregate(&aggregate),
+                Err(error) => warn!(
+                    session_id,
+                    task_id = %task_id,
+                    %error,
+                    "Could not refresh durable task-kernel projection"
+                ),
+            }
+
             // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {
                 if ct.is_cancelled() {
@@ -1721,7 +1739,6 @@ impl Agent {
                     heartbeat: &heartbeat,
                     empty_response_retry_pending: llm_recovery.empty_response_retry_pending,
                     empty_response_retry_note: llm_recovery.empty_response_retry_note,
-                    identity_prefill_text: llm_directives.identity_prefill_text,
                     deferred_no_tool_streak: llm_counters.deferred_no_tool_streak,
                     execution_requirement: &execution_requirement,
                     completion_contract: &turn_context.completion_contract,
@@ -2363,6 +2380,11 @@ mod stuck_fallback_tests {
                 idempotency_key: None,
                 policy_rev: None,
                 risk_score: None,
+                stable_operation_key: None,
+                obligation_ids: Vec::new(),
+                max_operation_attempts: None,
+                max_operation_invocations: None,
+                operation_lineage: None,
                 turn_id: None,
             },
             result: crate::events::ToolResultData {

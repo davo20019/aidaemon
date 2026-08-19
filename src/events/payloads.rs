@@ -215,9 +215,44 @@ pub struct ToolCallData {
     /// Optional risk score (0.0-1.0) observed at tool-call time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_score: Option<f32>,
+    /// Canonical operation identity assigned by the durable task kernel before
+    /// adapter dispatch. Model call IDs and plan-step IDs are intentionally not
+    /// operation identities because both can change during replanning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_operation_key: Option<String>,
+    /// Exact task-local obligations this proposal is eligible to satisfy.
+    /// The kernel assigns these IDs before the claim is persisted; downstream
+    /// reducers never reconstruct cardinality ownership from tool-name overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligation_ids: Vec<String>,
+    /// Producer-declared ceilings captured with the durable claim. These are
+    /// replay inputs, not mutable in-process counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_operation_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_operation_invocations: Option<usize>,
+    /// Typed lineage for a proposal which does not represent an unrelated
+    /// fresh operation. Durable replay reuses an existing receipt without
+    /// consuming invocation cardinality; reconciliation records that a tool's
+    /// postcondition check invalidated that exact receipt before re-execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_lineage: Option<ToolOperationLineage>,
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOperationLineage {
+    DurableReplay {
+        source_operation_id: String,
+        source_result_id: String,
+    },
+    ReconcileInvalidated {
+        source_operation_id: String,
+        source_result_id: String,
+    },
 }
 
 /// Data for ToolResult event
@@ -1474,6 +1509,11 @@ impl ToolCallData {
             idempotency_key: None,
             policy_rev: None,
             risk_score: None,
+            stable_operation_key: None,
+            obligation_ids: Vec::new(),
+            max_operation_attempts: None,
+            max_operation_invocations: None,
+            operation_lineage: None,
             turn_id: None,
         }
     }
@@ -1487,6 +1527,25 @@ impl ToolCallData {
         self.idempotency_key = idempotency_key;
         self.policy_rev = policy_rev;
         self.risk_score = risk_score;
+        self
+    }
+
+    pub fn with_kernel_claim(
+        mut self,
+        stable_operation_key: impl Into<String>,
+        obligation_ids: Vec<String>,
+        max_operation_attempts: usize,
+        max_operation_invocations: usize,
+    ) -> Self {
+        self.stable_operation_key = Some(stable_operation_key.into());
+        self.obligation_ids = obligation_ids;
+        self.max_operation_attempts = Some(max_operation_attempts.max(1));
+        self.max_operation_invocations = Some(max_operation_invocations.max(1));
+        self
+    }
+
+    pub fn with_operation_lineage(mut self, lineage: Option<ToolOperationLineage>) -> Self {
+        self.operation_lineage = lineage;
         self
     }
 
@@ -1872,6 +1931,11 @@ mod tests {
             idempotency_key: None,
             policy_rev: None,
             risk_score: None,
+            stable_operation_key: None,
+            obligation_ids: Vec::new(),
+            max_operation_attempts: None,
+            max_operation_invocations: None,
+            operation_lineage: None,
             turn_id: Some("t1".to_string()),
         };
         let back: ToolCallData =

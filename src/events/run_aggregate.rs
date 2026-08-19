@@ -8,9 +8,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
-    AssistantResponseData, Event, EventType, TaskContractCompiledData, ToolCallData, ToolResultData,
+    AssistantResponseData, AssistantResponseDisposition, Event, EventType, ResponseDeliveryData,
+    ResponseDeliveryState, TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData,
+    TaskStatus, ToolCallData, ToolResultData,
 };
 use crate::traits::{
     EvidenceTemporalScope, RequestReceiptPredicate, RequestResponseContract, ToolMutationEffects,
@@ -61,6 +64,14 @@ pub(crate) struct RunOperation {
     pub operation_id: String,
     pub tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_operation_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligation_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_invocations: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ToolOutcomeStatus>,
@@ -68,6 +79,47 @@ pub(crate) struct RunOperation {
     pub dispatched: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_lineage: Option<super::ToolOperationLineage>,
+}
+
+/// End-to-end lifecycle projection. Execution completion and user-visible
+/// delivery are deliberately separate states; a generated response is not a
+/// transport acknowledgement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskKernelPhase {
+    Initialized,
+    Running,
+    WorkPending,
+    WorkSucceeded,
+    ResponsePrepared,
+    DeliveryQueued,
+    DeliveryFailed,
+    Delivered,
+    Partial,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskKernelOperationClaim {
+    pub operation_id: String,
+    pub stable_operation_key: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub obligation_ids: Vec<String>,
+    pub max_attempts: usize,
+    pub max_invocations: usize,
+    pub idempotency_key: Option<String>,
+    pub operation_lineage: Option<super::ToolOperationLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskKernelAdmission {
+    Admitted,
+    Rejected { code: &'static str, detail: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +140,8 @@ pub(crate) struct RunAggregate {
     pub task_id: String,
     #[serde(default)]
     pub contract_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_fingerprint: Option<String>,
     #[serde(default)]
     pub effect_revision: u64,
     #[serde(default)]
@@ -106,16 +160,29 @@ pub(crate) struct RunAggregate {
     pub primary_causal_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invariant_violations: Vec<String>,
+    #[serde(default)]
+    pub started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_task_status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_task_outcome: Option<TaskOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delivery_states: BTreeMap<String, ResponseDeliveryState>,
 }
 
 impl RunAggregate {
-    pub const SCHEMA_VERSION: u16 = 3;
+    pub const SCHEMA_VERSION: u16 = 4;
 
     pub(crate) fn new(task_id: impl Into<String>) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             task_id: task_id.into(),
             contract_present: false,
+            contract_fingerprint: None,
             effect_revision: 0,
             obligations: BTreeMap::new(),
             response_contract: None,
@@ -124,6 +191,12 @@ impl RunAggregate {
             cardinality_violations: 0,
             primary_causal_operation_id: None,
             invariant_violations: Vec::new(),
+            started: false,
+            parent_task_id: None,
+            recorded_task_status: None,
+            recorded_task_outcome: None,
+            prepared_response_id: None,
+            delivery_states: BTreeMap::new(),
         }
     }
 
@@ -140,6 +213,13 @@ impl RunAggregate {
 
     pub(crate) fn apply(&mut self, event: &Event) {
         match event.event_type {
+            EventType::TaskStart => {
+                if let Ok(start) = event.parse_data::<TaskStartData>() {
+                    self.record_task_start(start);
+                } else {
+                    self.record_invariant("task_start_payload_invalid");
+                }
+            }
             EventType::TaskContractCompiled => {
                 if let Ok(compiled) = event.parse_data::<TaskContractCompiledData>() {
                     if compiled.task_id == self.task_id {
@@ -172,16 +252,52 @@ impl RunAggregate {
                     self.record_invariant("assistant_response_payload_invalid");
                 }
             }
+            EventType::ResponseDelivery => {
+                if let Ok(delivery) = event.parse_data::<ResponseDeliveryData>() {
+                    self.record_delivery(delivery);
+                } else {
+                    self.record_invariant("response_delivery_payload_invalid");
+                }
+            }
+            EventType::TaskEnd => {
+                if let Ok(end) = event.parse_data::<TaskEndData>() {
+                    self.record_task_end(end);
+                } else {
+                    self.record_invariant("task_end_payload_invalid");
+                }
+            }
             _ => {}
         }
     }
 
+    fn record_task_start(&mut self, start: TaskStartData) {
+        if start.task_id != self.task_id {
+            self.record_invariant("task_start_identity_mismatch");
+            return;
+        }
+        if self.started {
+            if self.parent_task_id != start.parent_task_id {
+                self.record_invariant("conflicting_task_start");
+            }
+            return;
+        }
+        self.started = true;
+        self.parent_task_id = start.parent_task_id;
+    }
+
     fn install_contract(&mut self, compiled: TaskContractCompiledData) {
+        let fingerprint = serde_json::to_vec(&compiled).ok().map(|bytes| {
+            let digest = Sha256::digest(bytes);
+            format!("{digest:x}")
+        });
         if self.contract_present {
-            self.record_invariant("duplicate_contract_installation");
+            if self.contract_fingerprint != fingerprint {
+                self.record_invariant("conflicting_contract_installation");
+            }
             return;
         }
         self.contract_present = true;
+        self.contract_fingerprint = fingerprint;
         self.obligations.clear();
         self.response_contract = compiled.contract.response_contract.clone();
         self.allowed_tool_names = compiled
@@ -305,19 +421,31 @@ impl RunAggregate {
             self.record_invariant("tool_call_task_identity_mismatch");
             return;
         }
-        if !self.allowed_tool_names.is_empty() && !self.allowed_tool_names.contains(&call.name) {
-            self.record_invariant("operation_outside_allowed_tool_set");
+        if let Some(existing) = self.operations.get(&call.tool_call_id) {
+            if existing.tool_name != call.name
+                || existing.stable_operation_key != call.stable_operation_key
+                || existing.obligation_ids != call.obligation_ids
+            {
+                self.record_invariant("conflicting_operation_claim");
+            }
+            return;
         }
-        self.operations
-            .entry(call.tool_call_id.clone())
-            .or_insert(RunOperation {
+        self.operations.insert(
+            call.tool_call_id.clone(),
+            RunOperation {
                 operation_id: call.tool_call_id,
                 tool_name: call.name,
+                stable_operation_key: call.stable_operation_key,
+                obligation_ids: call.obligation_ids,
+                max_attempts: call.max_operation_attempts,
+                max_invocations: call.max_operation_invocations,
                 idempotency_key: call.idempotency_key,
                 outcome: None,
                 dispatched: false,
                 result_id: None,
-            });
+                operation_lineage: call.operation_lineage,
+            },
+        );
     }
 
     fn record_result(&mut self, result: ToolResultData) {
@@ -363,16 +491,33 @@ impl RunAggregate {
             .or_insert(RunOperation {
                 operation_id: result.tool_call_id.clone(),
                 tool_name: result.name.clone(),
+                stable_operation_key: None,
+                obligation_ids: Vec::new(),
+                max_attempts: None,
+                max_invocations: None,
                 idempotency_key: receipt.idempotency_key.clone(),
                 outcome: None,
                 dispatched: false,
                 result_id: None,
+                operation_lineage: None,
             });
         operation.outcome = Some(receipt.outcome_status);
         operation.dispatched = receipt.invocation_stage.reached_dispatch();
         operation.result_id = Some(result_id.clone());
+        let claimed_obligation_ids = operation.obligation_ids.clone();
+        let is_durable_replay = matches!(
+            operation.operation_lineage.as_ref(),
+            Some(super::ToolOperationLineage::DurableReplay { .. })
+        );
+        if operation.dispatched
+            && !self.allowed_tool_names.is_empty()
+            && !self.allowed_tool_names.contains(&operation.tool_name)
+        {
+            self.record_invariant("dispatched_operation_outside_allowed_tool_set");
+        }
 
-        let completed_mutation = result.succeeded()
+        let completed_mutation = !is_durable_replay
+            && result.succeeded()
             && receipt.invocation_stage.reached_dispatch()
             && receipt.semantics.mutates_state();
         if completed_mutation {
@@ -399,10 +544,13 @@ impl RunAggregate {
                 continue;
             }
             let explicitly_proven = explicit_ids.contains(&obligation.id);
-            let predicate_proven = obligation
-                .receipt
-                .as_ref()
-                .is_some_and(|predicate| receipt_matches_predicate(&result, predicate));
+            let claim_allows_proof = claimed_obligation_ids.is_empty()
+                || claimed_obligation_ids.contains(&obligation.id);
+            let predicate_proven = claim_allows_proof
+                && obligation
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|predicate| receipt_matches_predicate(&result, predicate));
             let effect_proven = obligation.class == RunObligationClass::Achieve
                 && !obligation.required_effect.is_empty()
                 && result.succeeded()
@@ -466,6 +614,12 @@ impl RunAggregate {
         {
             return;
         }
+        if response.disposition == AssistantResponseDisposition::BackgroundHandoff {
+            return;
+        }
+        // Any terminal assistant artifact is prepared output. Whether it
+        // satisfies an exact response obligation is decided separately below.
+        self.prepared_response_id = response.message_id.clone();
         let Some(expected) = self
             .response_contract
             .as_ref()
@@ -494,6 +648,40 @@ impl RunAggregate {
         }
     }
 
+    fn record_delivery(&mut self, delivery: ResponseDeliveryData) {
+        if delivery.task_id != self.task_id {
+            self.record_invariant("response_delivery_task_identity_mismatch");
+            return;
+        }
+        if self
+            .prepared_response_id
+            .as_deref()
+            .is_some_and(|response_id| response_id != delivery.response_id)
+        {
+            self.record_invariant("response_delivery_identity_mismatch");
+            return;
+        }
+        self.delivery_states
+            .insert(delivery.response_id, delivery.state);
+    }
+
+    fn record_task_end(&mut self, end: TaskEndData) {
+        if !end.task_id.is_empty() && end.task_id != self.task_id {
+            self.record_invariant("task_end_identity_mismatch");
+            return;
+        }
+        if self.recorded_task_status.is_some() {
+            if self.recorded_task_status != Some(end.status)
+                || self.recorded_task_outcome != Some(end.effective_outcome())
+            {
+                self.record_invariant("conflicting_task_end");
+            }
+            return;
+        }
+        self.recorded_task_status = Some(end.status);
+        self.recorded_task_outcome = Some(end.effective_outcome());
+    }
+
     fn reconcile_cardinality(&mut self) {
         self.cardinality_violations = 0;
         for obligation in self.obligations.values() {
@@ -507,9 +695,22 @@ impl RunAggregate {
                 .operations
                 .values()
                 .filter(|operation| {
-                    operation.result_id.is_some()
-                        && (predicate.tool_names.is_empty()
-                            || predicate.tool_names.contains(&operation.tool_name))
+                    if matches!(
+                        operation.operation_lineage,
+                        Some(super::ToolOperationLineage::DurableReplay { .. })
+                    ) {
+                        return false;
+                    }
+                    if !operation.obligation_ids.is_empty() {
+                        operation.obligation_ids.contains(&obligation.id)
+                    } else {
+                        // Compatibility for events written before kernel-owned
+                        // obligation bindings. New rows never infer ownership from
+                        // overlapping tool predicates.
+                        operation.result_id.is_some()
+                            && (predicate.tool_names.is_empty()
+                                || predicate.tool_names.contains(&operation.tool_name))
+                    }
                 })
                 .count();
             self.cardinality_violations = self
@@ -623,9 +824,20 @@ impl RunAggregate {
                 self.operations
                     .values()
                     .filter(|operation| {
-                        operation.result_id.is_some()
-                            && (predicate.tool_names.is_empty()
-                                || predicate.tool_names.contains(&operation.tool_name))
+                        if matches!(
+                            operation.operation_lineage,
+                            Some(super::ToolOperationLineage::DurableReplay { .. })
+                        ) {
+                            return false;
+                        }
+                        if !operation.obligation_ids.is_empty() {
+                            operation.obligation_ids.contains(&obligation.id)
+                        } else {
+                            // Compatibility for pre-kernel claims only.
+                            operation.result_id.is_some()
+                                && (predicate.tool_names.is_empty()
+                                    || predicate.tool_names.contains(&operation.tool_name))
+                        }
                     })
                     .count()
                     >= limit
@@ -635,6 +847,201 @@ impl RunAggregate {
             RunTerminalDecision::Failed
         } else {
             RunTerminalDecision::Pending
+        }
+    }
+
+    /// Decide admission from durable history. This is the only correctness
+    /// gate for operation retry and request cardinality; in-memory ledgers are
+    /// compatibility telemetry and cannot veto an admitted claim.
+    pub(crate) fn admit_operation(&self, claim: &TaskKernelOperationClaim) -> TaskKernelAdmission {
+        if self.recorded_task_status.is_some() {
+            return TaskKernelAdmission::Rejected {
+                code: "task_already_terminal",
+                detail: "The task already has a durable terminal transition.".to_string(),
+            };
+        }
+        if !self.allowed_tool_names.is_empty()
+            && !self.allowed_tool_names.contains(&claim.tool_name)
+        {
+            return TaskKernelAdmission::Rejected {
+                code: "tool_outside_authority",
+                detail: format!(
+                    "`{}` is outside the compiled task capability set.",
+                    claim.tool_name
+                ),
+            };
+        }
+        let lineage_source = claim
+            .operation_lineage
+            .as_ref()
+            .map(|lineage| match lineage {
+                super::ToolOperationLineage::DurableReplay {
+                    source_operation_id,
+                    source_result_id,
+                }
+                | super::ToolOperationLineage::ReconcileInvalidated {
+                    source_operation_id,
+                    source_result_id,
+                } => (source_operation_id, source_result_id),
+            });
+        if let Some((source_operation_id, source_result_id)) = lineage_source {
+            let Some(source) = self.operations.get(source_operation_id) else {
+                return TaskKernelAdmission::Rejected {
+                    code: "operation_lineage_source_missing",
+                    detail: "The claimed source operation is not in durable task history."
+                        .to_string(),
+                };
+            };
+            if source.result_id.as_deref() != Some(source_result_id.as_str())
+                || source.tool_name != claim.tool_name
+                || source.idempotency_key != claim.idempotency_key
+                || source.obligation_ids != claim.obligation_ids
+            {
+                return TaskKernelAdmission::Rejected {
+                    code: "operation_lineage_mismatch",
+                    detail: "The replay/reconciliation claim does not match its durable source."
+                        .to_string(),
+                };
+            }
+            if matches!(
+                claim.operation_lineage,
+                Some(super::ToolOperationLineage::DurableReplay { .. })
+            ) {
+                return TaskKernelAdmission::Admitted;
+            }
+        }
+        let is_reconciliation = matches!(
+            claim.operation_lineage,
+            Some(super::ToolOperationLineage::ReconcileInvalidated { .. })
+        );
+        let operation_invocations = self
+            .operations
+            .values()
+            .filter(|operation| {
+                !matches!(
+                    operation.operation_lineage,
+                    Some(super::ToolOperationLineage::DurableReplay { .. })
+                ) && operation.stable_operation_key.as_deref()
+                    == Some(claim.stable_operation_key.as_str())
+            })
+            .count();
+        if !is_reconciliation && operation_invocations >= claim.max_invocations.max(1) {
+            return TaskKernelAdmission::Rejected {
+                code: "operation_invocations_exhausted",
+                detail: format!(
+                    "The durable operation has reached its {}-invocation ceiling.",
+                    claim.max_invocations.max(1)
+                ),
+            };
+        }
+        let dispatched_attempts = self
+            .operations
+            .values()
+            .filter(|operation| {
+                !matches!(
+                    operation.operation_lineage,
+                    Some(super::ToolOperationLineage::DurableReplay { .. })
+                ) && operation.stable_operation_key.as_deref()
+                    == Some(claim.stable_operation_key.as_str())
+                    && operation.dispatched
+            })
+            .count();
+        if !is_reconciliation && dispatched_attempts >= claim.max_attempts.max(1) {
+            return TaskKernelAdmission::Rejected {
+                code: "operation_attempts_exhausted",
+                detail: format!(
+                    "The durable operation has reached its {}-attempt ceiling.",
+                    claim.max_attempts.max(1)
+                ),
+            };
+        }
+        for obligation_id in &claim.obligation_ids {
+            let Some(obligation) = self.obligations.get(obligation_id) else {
+                return TaskKernelAdmission::Rejected {
+                    code: "unknown_obligation",
+                    detail: format!("Operation references unknown obligation `{obligation_id}`."),
+                };
+            };
+            let Some(limit) = obligation
+                .receipt
+                .as_ref()
+                .and_then(|predicate| predicate.max_invocations)
+            else {
+                continue;
+            };
+            let used = self
+                .operations
+                .values()
+                .filter(|operation| operation.obligation_ids.contains(obligation_id))
+                .filter(|operation| {
+                    !matches!(
+                        operation.operation_lineage,
+                        Some(super::ToolOperationLineage::DurableReplay { .. })
+                    )
+                })
+                .count();
+            if used >= limit.max(1) {
+                return TaskKernelAdmission::Rejected {
+                    code: "obligation_cardinality_exhausted",
+                    detail: format!(
+                        "Obligation `{obligation_id}` has reached its {}-invocation ceiling.",
+                        limit.max(1)
+                    ),
+                };
+            }
+        }
+        TaskKernelAdmission::Admitted
+    }
+
+    pub(crate) fn lifecycle_phase(&self) -> TaskKernelPhase {
+        if let Some(status) = self.recorded_task_status {
+            match status {
+                TaskStatus::Cancelled => return TaskKernelPhase::Cancelled,
+                TaskStatus::Interrupted => return TaskKernelPhase::Interrupted,
+                TaskStatus::Failed => return TaskKernelPhase::Failed,
+                TaskStatus::Completed => {}
+            }
+            match self.recorded_task_outcome {
+                Some(TaskOutcome::Failed) => return TaskKernelPhase::Failed,
+                Some(TaskOutcome::Partial) => return TaskKernelPhase::Partial,
+                _ => {}
+            }
+        }
+        if self.delivery_states.values().any(|state| {
+            matches!(
+                state,
+                ResponseDeliveryState::PlatformAcknowledged
+                    | ResponseDeliveryState::Edited
+                    | ResponseDeliveryState::Rendered
+                    | ResponseDeliveryState::Read
+            )
+        }) {
+            return TaskKernelPhase::Delivered;
+        }
+        if self.delivery_states.values().any(|state| {
+            matches!(
+                state,
+                ResponseDeliveryState::Queued | ResponseDeliveryState::Sent
+            )
+        }) {
+            return TaskKernelPhase::DeliveryQueued;
+        }
+        if self
+            .delivery_states
+            .values()
+            .any(|state| *state == ResponseDeliveryState::Failed)
+        {
+            return TaskKernelPhase::DeliveryFailed;
+        }
+        if self.prepared_response_id.is_some() {
+            return TaskKernelPhase::ResponsePrepared;
+        }
+        match self.terminal_decision() {
+            RunTerminalDecision::Succeeded => TaskKernelPhase::WorkSucceeded,
+            RunTerminalDecision::Failed => TaskKernelPhase::Failed,
+            RunTerminalDecision::Pending => TaskKernelPhase::WorkPending,
+            RunTerminalDecision::Unspecified if self.started => TaskKernelPhase::Running,
+            RunTerminalDecision::Unspecified => TaskKernelPhase::Initialized,
         }
     }
 }
@@ -777,8 +1184,27 @@ mod tests {
                 idempotency_key: Some(format!("operation:{id}")),
                 policy_rev: None,
                 risk_score: None,
+                stable_operation_key: None,
+                obligation_ids: Vec::new(),
+                max_operation_attempts: None,
+                max_operation_invocations: None,
+                operation_lineage: None,
                 turn_id: None,
             },
+        )
+    }
+
+    fn claimed_call(id: &str, tool: &str, stable_key: &str, obligation_ids: &[&str]) -> Event {
+        event(
+            EventType::ToolCall,
+            ToolCallData::from_tool_call(id, tool, json!({}), Some("task-1".to_string()))
+                .with_policy_metadata(Some(format!("operation:{id}")), None, None)
+                .with_kernel_claim(
+                    stable_key,
+                    obligation_ids.iter().map(|id| (*id).to_string()).collect(),
+                    1,
+                    1,
+                ),
         )
     }
 
@@ -1129,6 +1555,13 @@ mod tests {
                 vec!["write_file".to_string()],
             ),
             call("unexpected", "terminal"),
+            result(
+                "unexpected",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
         ];
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
@@ -1137,7 +1570,7 @@ mod tests {
         let aggregate = RunAggregate::replay("task-1", &events);
         assert!(aggregate
             .invariant_violations
-            .contains(&"operation_outside_allowed_tool_set".to_string()));
+            .contains(&"dispatched_operation_outside_allowed_tool_set".to_string()));
         assert!(aggregate.projected_success_response().is_none());
         assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
     }
@@ -1217,6 +1650,78 @@ mod tests {
     }
 
     #[test]
+    fn typed_replay_reuses_proof_without_consuming_cardinality() {
+        let obligation = "task:task-1/obligation:evidence:0";
+        let source_call = claimed_call("run", "terminal", "operation:run", &[obligation]);
+        let source_result = result(
+            "run",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::observation(),
+        );
+        let lineage = crate::events::ToolOperationLineage::DurableReplay {
+            source_operation_id: "run".to_string(),
+            source_result_id: "result:run".to_string(),
+        };
+        let replay_call = event(
+            EventType::ToolCall,
+            ToolCallData::from_tool_call(
+                "run-replay",
+                "terminal",
+                json!({}),
+                Some("task-1".to_string()),
+            )
+            .with_policy_metadata(Some("operation:run".to_string()), None, None)
+            .with_kernel_claim("operation:run", vec![obligation.to_string()], 1, 1)
+            .with_operation_lineage(Some(lineage.clone())),
+        );
+        let mut replay_result = result(
+            "run-replay",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::observation(),
+        );
+        replay_result.data["receipt"]["invocation_stage"] = json!("replayed");
+        replay_result.data["receipt"]["outcome_evidence"] = json!("durable_replay");
+        replay_result.data["receipt"]["result_provenance"]["result_id"] = json!("result:run");
+        replay_result.data["receipt"]["idempotency_key"] = json!("operation:run");
+
+        let mut source_events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            source_call,
+            source_result,
+        ];
+        for (index, event) in source_events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let source = RunAggregate::replay("task-1", &source_events);
+        assert_eq!(
+            source.admit_operation(&TaskKernelOperationClaim {
+                operation_id: "run-replay".to_string(),
+                stable_operation_key: "operation:run".to_string(),
+                tool_name: "terminal".to_string(),
+                obligation_ids: vec![obligation.to_string()],
+                max_attempts: 1,
+                max_invocations: 1,
+                idempotency_key: Some("operation:run".to_string()),
+                operation_lineage: Some(lineage),
+            }),
+            TaskKernelAdmission::Admitted
+        );
+
+        source_events.extend([replay_call, replay_result]);
+        for (index, event) in source_events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let replayed = RunAggregate::replay("task-1", &source_events);
+        assert_eq!(replayed.cardinality_violations, 0);
+        assert_eq!(replayed.satisfied_count(), 1);
+        assert_eq!(replayed.operations.len(), 2);
+    }
+
+    #[test]
     fn later_mutation_invalidates_current_observation_not_historical_accomplishment() {
         let current = RequestEvidenceRequirement {
             summary: "synthetic current state".to_string(),
@@ -1264,5 +1769,132 @@ mod tests {
             obligation.class == RunObligationClass::Observe
                 && obligation.state == RunObligationState::Invalidated
         }));
+    }
+
+    #[test]
+    fn durable_claims_allocate_overlapping_obligations_without_cross_satisfaction() {
+        let obligation_zero = "task:task-1/obligation:evidence:0";
+        let obligation_one = "task:task-1/obligation:evidence:1";
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0), requirement("terminal", 0)]),
+            claimed_call(
+                "phase-1",
+                "terminal",
+                "operation:phase-1",
+                &[obligation_zero],
+            ),
+            result(
+                "phase-1",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+
+        let first = RunAggregate::replay("task-1", &events);
+        assert_eq!(first.satisfied_count(), 1);
+        assert_eq!(first.terminal_decision(), RunTerminalDecision::Pending);
+        assert_eq!(
+            first.admit_operation(&TaskKernelOperationClaim {
+                operation_id: "phase-1-retry".to_string(),
+                stable_operation_key: "operation:phase-1".to_string(),
+                tool_name: "terminal".to_string(),
+                obligation_ids: vec![obligation_zero.to_string()],
+                max_attempts: 1,
+                max_invocations: 1,
+                idempotency_key: None,
+                operation_lineage: None,
+            }),
+            TaskKernelAdmission::Rejected {
+                code: "operation_invocations_exhausted",
+                detail: "The durable operation has reached its 1-invocation ceiling.".to_string(),
+            }
+        );
+        assert_eq!(
+            first.admit_operation(&TaskKernelOperationClaim {
+                operation_id: "phase-2".to_string(),
+                stable_operation_key: "operation:phase-2".to_string(),
+                tool_name: "terminal".to_string(),
+                obligation_ids: vec![obligation_one.to_string()],
+                max_attempts: 1,
+                max_invocations: 1,
+                idempotency_key: None,
+                operation_lineage: None,
+            }),
+            TaskKernelAdmission::Admitted
+        );
+
+        events.push(claimed_call(
+            "phase-2",
+            "terminal",
+            "operation:phase-2",
+            &[obligation_one],
+        ));
+        events.push(result(
+            "phase-2",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::observation(),
+        ));
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+    }
+
+    #[test]
+    fn response_preparation_and_transport_ack_are_distinct_lifecycle_states() {
+        let response = RequestResponseContract::ExactText {
+            success_text: "synthetic complete".to_string(),
+            source_message_hash: "synthetic-hash".to_string(),
+        };
+        let mut events = vec![
+            event(
+                EventType::TaskStart,
+                TaskStartData {
+                    task_id: "task-1".to_string(),
+                    description: "synthetic lifecycle".to_string(),
+                    parent_task_id: None,
+                    user_message: None,
+                    turn_id: None,
+                },
+            ),
+            contract_with_response(Vec::new(), Some(Box::new(response))),
+            assistant_response("response-1", "synthetic complete"),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).lifecycle_phase(),
+            TaskKernelPhase::ResponsePrepared
+        );
+
+        events.push(event(
+            EventType::ResponseDelivery,
+            ResponseDeliveryData {
+                response_id: "response-1".to_string(),
+                task_id: "task-1".to_string(),
+                turn_id: None,
+                platform: "synthetic".to_string(),
+                state: ResponseDeliveryState::PlatformAcknowledged,
+                platform_message_ids: vec!["platform-1".to_string()],
+                error_code: None,
+                occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        ));
+        events.last_mut().unwrap().id = 4;
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).lifecycle_phase(),
+            TaskKernelPhase::Delivered
+        );
     }
 }

@@ -19,7 +19,7 @@ use crate::agent::loop_state::{
 };
 use crate::agent::self_correction::AttemptDecision;
 use crate::agent::*;
-use crate::events::TaskOutcome;
+use crate::events::{TaskKernelAdmission, TaskKernelOperationClaim, TaskOutcome};
 use crate::traits::{MandateDecisionOutcome, ToolCallAccessManifest, ToolCallSemantics};
 
 // ── Correction gate (P2.4) ───────────────────────────────────────────────────
@@ -522,6 +522,40 @@ async fn persist_pre_dispatch_outcome(
             contract_rejected,
             semantics,
             access_manifest,
+        )
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_claimed_pre_dispatch_outcome(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_call: &ToolCall,
+    effective_arguments: &str,
+    result_text: String,
+    outcome_status: crate::traits::ToolOutcomeStatus,
+    invocation_stage: crate::traits::ToolInvocationStage,
+    contract_rejected: bool,
+    semantics: ToolCallSemantics,
+    access_manifest: Option<ToolCallAccessManifest>,
+    kernel_claim: &TaskKernelOperationClaim,
+) -> anyhow::Result<()> {
+    agent
+        .persist_pre_dispatch_outcome_with_kernel_claim(
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            effective_arguments,
+            result_text,
+            outcome_status,
+            invocation_stage,
+            contract_rejected,
+            semantics,
+            access_manifest,
+            Some(kernel_claim),
         )
         .await
 }
@@ -1380,6 +1414,34 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tool_caps,
             &task_authorized_project_scopes,
         );
+        let obligation_ids = pending_evidence_requirement_indices(
+            &turn_context.completion_contract,
+            &tc.name,
+            &call_semantics,
+            &effective_arguments,
+            &crate::traits::ToolCallMetadata {
+                semantics: call_semantics.clone(),
+                access_manifest: Some(access_manifest.clone()),
+                ..crate::traits::ToolCallMetadata::default()
+            },
+        )
+        .into_iter()
+        .map(|index| format!("task:{task_id}/obligation:evidence:{index}"))
+        .collect::<Vec<_>>();
+        let operation_ceiling = step_plan
+            .cardinality_limit
+            .unwrap_or(step_plan.retry_policy.max_invocations)
+            .max(1);
+        let operation_claim = TaskKernelOperationClaim {
+            operation_id: tc.id.clone(),
+            stable_operation_key: step_plan.operation_key.clone(),
+            tool_name: tc.name.clone(),
+            obligation_ids,
+            max_attempts: operation_ceiling.max(step_plan.retry_policy.max_attempts),
+            max_invocations: operation_ceiling,
+            idempotency_key: step_plan.idempotency_key.clone(),
+            operation_lineage: None,
+        };
         execution_state.stage_step(step_plan.clone());
         if matches!(
             step_plan.approval_requirement,
@@ -1438,7 +1500,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 reason: scope_reason.clone(),
             }
             .render();
-            persist_pre_dispatch_outcome(
+            persist_claimed_pre_dispatch_outcome(
                 agent,
                 emitter,
                 session_id,
@@ -1451,6 +1513,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 false,
                 call_semantics.clone(),
                 Some(access_manifest.clone()),
+                &operation_claim,
             )
             .await?;
             execution_state.record_tool_call();
@@ -1977,19 +2040,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             None
         };
 
-        let operation_admitted = execution_state.begin_staged_step();
-        let explicit_cardinality_closed = !operation_admitted
-            && step_plan.cardinality_key.is_some()
-            && step_plan.cardinality_limit.is_some_and(|limit| {
-                step_plan.cardinality_key.as_ref().is_some_and(|key| {
-                    execution_state
-                        .obligation_invocations
-                        .get(key)
-                        .copied()
-                        .unwrap_or_default()
-                        >= limit
-                })
-            });
         let io = super::execution_io::execute_tool_call_io(
             agent,
             tc,
@@ -2011,9 +2061,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 heartbeat,
                 emitter,
                 policy_bundle,
-                dispatch_block_reason: (!operation_admitted).then_some(
-                    "The stable operation has exhausted its producer-declared retry budget.",
-                ),
+                stable_operation_key: &operation_claim.stable_operation_key,
+                obligation_ids: &operation_claim.obligation_ids,
+                max_operation_attempts: operation_claim.max_attempts,
+                max_operation_invocations: operation_claim.max_invocations,
                 correction_preapproved: io_correction_preapproved,
                 suppress_trusted_session: io_suppress_trusted_session,
                 mandate_authority: mandate_authority_grant.as_ref(),
@@ -2022,6 +2073,15 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             },
         )
         .await;
+        let (operation_admitted, explicit_cardinality_closed) = match &io.kernel_admission {
+            TaskKernelAdmission::Admitted => (true, false),
+            TaskKernelAdmission::Rejected { code, .. } => {
+                (false, *code == "obligation_cardinality_exhausted")
+            }
+        };
+        if operation_admitted {
+            execution_state.record_kernel_admitted_step();
+        }
         execution_state.record_tool_call();
         execution_state.mark_persisted_now();
         let mut result_text = io.result_text;
