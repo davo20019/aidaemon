@@ -458,15 +458,63 @@ fn compile_obligations(
     let mut evidence = Vec::new();
     let mut invocations = Vec::new();
 
+    // A receipt predicate is the only durable identity available for an
+    // invocation obligation.  If a producer emits several obligations with
+    // the same predicate but different cardinality fields, those obligations
+    // are observationally indistinguishable: no later receipt can prove which
+    // one it belonged to.  Keeping them as separate proof nodes makes the
+    // runtime derive a shared retry gate from the smallest limit, so an
+    // exact-three obligation paired with two redundant exact-one obligations
+    // is incorrectly closed after the first call.  Coalesce the equivalent
+    // predicates here and retain the strongest required cardinality.  Truly
+    // distinct obligations must carry a distinct typed predicate (tool,
+    // outcome, target, or another protocol field); they are not merged.
+    let coalesce_invocation = |invocations: &mut Vec<RequestReceiptPredicate>,
+                               receipt: RequestReceiptPredicate| {
+        let normalized = receipt;
+        if let Some(existing) = invocations.iter_mut().find(|existing| {
+            let mut existing_identity = (*existing).clone();
+            let mut candidate_identity = normalized.clone();
+            existing_identity.min_invocations = None;
+            existing_identity.max_invocations = None;
+            candidate_identity.min_invocations = None;
+            candidate_identity.max_invocations = None;
+            existing_identity == candidate_identity
+        }) {
+            let minimum = existing
+                .min_invocations
+                .into_iter()
+                .chain(normalized.min_invocations)
+                .max();
+            let maximum = match (existing.max_invocations, normalized.max_invocations) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, _) | (_, None) => None,
+            };
+            // A malformed overlapping pair such as min=3/max=3 together
+            // with min=1/max=1 must not become an impossible min=3/max=1
+            // predicate. The largest explicit minimum is the only
+            // distinguishable requirement, so lift the maximum to it.
+            existing.min_invocations = minimum;
+            existing.max_invocations = match (maximum, minimum) {
+                (Some(maximum), Some(minimum)) => Some(maximum.max(minimum)),
+                (maximum, _) => maximum,
+            };
+            true
+        } else {
+            // Keep the vector's ownership model simple: only append after
+            // checking the canonical identity above.
+            invocations.push(normalized);
+            false
+        }
+    };
+
     let mut add_invocation = |receipt: &RequestReceiptPredicate| {
         let receipt = normalize_receipt_for_tool_protocol(
             normalize_receipt_predicate(receipt.clone()),
             available_tool_receipt_kinds,
         );
-        if valid_receipt(&receipt, available_tool_names, available_tool_receipt_kinds)
-            && !invocations.contains(&receipt)
-        {
-            invocations.push(receipt);
+        if valid_receipt(&receipt, available_tool_names, available_tool_receipt_kinds) {
+            coalesce_invocation(&mut invocations, receipt);
         }
     };
     for receipt in invocation_candidates {
@@ -1257,6 +1305,32 @@ mod tests {
             [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
         );
         assert_eq!(compiled.required_invocations[0].exit_codes, [1]);
+    }
+
+    #[test]
+    fn equivalent_receipt_obligations_coalesce_to_the_strongest_cardinality() {
+        let mut signals = base_signals();
+        let receipt = |minimum: usize, maximum: usize| RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            exit_codes: vec![0],
+            outcome_condition: Some(RequestedOutcomeCondition::Succeeded),
+            min_invocations: Some(minimum),
+            max_invocations: Some(maximum),
+            ..RequestReceiptPredicate::default()
+        };
+        // These predicates carry no typed distinction that could identify
+        // which terminal receipt belongs to which obligation. Keeping them as
+        // three independent gates would make the runtime choose the smallest
+        // max (one) and reject the second concrete operation. The exact-three
+        // requirement is the strongest distinguishable contract.
+        signals.required_invocations = Some(vec![receipt(3, 3), receipt(1, 1), receipt(1, 1)]);
+
+        let compiled = compile(&signals);
+
+        assert_eq!(compiled.required_invocations.len(), 1);
+        let predicate = &compiled.required_invocations[0];
+        assert_eq!(predicate.min_invocations, Some(3));
+        assert_eq!(predicate.max_invocations, Some(3));
     }
 
     #[test]
