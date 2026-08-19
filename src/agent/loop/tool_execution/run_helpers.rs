@@ -464,24 +464,6 @@ pub(super) fn access_manifest_scope_violation(
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
 ) -> Option<String> {
-    // This layer attenuates an existing capability; it does not create the
-    // authority boundary itself. If neither the semantic task contract nor a
-    // channel workspace supplied a boundary, leave authorization to the
-    // ordinary tool policy/approval layer. Treating an absent optional
-    // manifest as an empty grant turns this composable check into deny-all.
-    if task.is_none() && fallback_scopes.is_empty() {
-        return None;
-    }
-
-    let fallback = fallback_scopes
-        .iter()
-        .filter_map(|scope| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope.clone()))
-        .collect::<Vec<_>>();
-    let (read_grants, write_grants) = if let Some(task) = task {
-        (task.read_targets.clone(), task.write_targets.clone())
-    } else {
-        (fallback.clone(), fallback)
-    };
     // Filesystem capabilities are monotone: a directory grant may authorize
     // descendants, while an exact-path grant never authorizes its parent or a
     // sibling. Project discovery has a separate near-ancestor convenience
@@ -505,11 +487,73 @@ pub(super) fn access_manifest_scope_violation(
             }
             _ => false,
         };
+    let covered_by = |candidate: &ToolTargetHint, grants: &[ToolTargetHint]| {
+        grants
+            .iter()
+            .any(|grant| capability_grant_allows(grant, candidate))
+    };
+    let protected_reads = call
+        .read_targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+            ) && crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+                &target.value,
+            )) && !covered_by(target, &call.adapter_read_targets)
+        })
+        .map(|target| target.value.clone())
+        .collect::<Vec<_>>();
+    let protected_writes = call
+        .write_targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+            ) && crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+                &target.value,
+            ))
+        })
+        .map(|target| target.value.clone())
+        .collect::<Vec<_>>();
+    if !protected_reads.is_empty() || !protected_writes.is_empty() {
+        return Some(format!(
+            "protected host-data capability violation (protected reads: {}; protected writes: {})",
+            if protected_reads.is_empty() {
+                "none".to_string()
+            } else {
+                protected_reads.join(", ")
+            },
+            if protected_writes.is_empty() {
+                "none".to_string()
+            } else {
+                protected_writes.join(", ")
+            }
+        ));
+    }
+
+    // This layer attenuates an existing capability; it does not create the
+    // authority boundary itself. If neither the semantic task contract nor a
+    // channel workspace supplied a boundary, leave authorization to the
+    // ordinary tool policy/approval layer. Treating an absent optional
+    // manifest as an empty grant turns this composable check into deny-all.
+    if task.is_none() && fallback_scopes.is_empty() {
+        return None;
+    }
+
+    let fallback = fallback_scopes
+        .iter()
+        .filter_map(|scope| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, scope.clone()))
+        .collect::<Vec<_>>();
+    let (read_grants, write_grants) = if let Some(task) = task {
+        (task.read_targets.clone(), task.write_targets.clone())
+    } else {
+        (fallback.clone(), fallback)
+    };
     let outside = |candidate: &ToolTargetHint, grants: &[ToolTargetHint]| {
-        grants.is_empty()
-            || !grants
-                .iter()
-                .any(|grant| capability_grant_allows(grant, candidate))
+        grants.is_empty() || !covered_by(candidate, grants)
     };
     let invalid_reads = call
         .read_targets
@@ -2520,6 +2564,28 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         };
         assert!(
             access_manifest_scope_violation("terminal", &undeclared, Some(&task), &[]).is_some()
+        );
+    }
+
+    #[test]
+    fn semantic_task_grant_cannot_widen_into_protected_host_data() {
+        let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
+        let task = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
+            ..crate::traits::ToolCallAccessManifest::default()
+        };
+        let call = task.clone();
+        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[])
+            .expect("host data remains protected independently of task assessment");
+        assert!(violation.contains("protected host-data capability violation"));
+
+        let adapter_only = crate::traits::ToolCallAccessManifest {
+            adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
+            ..crate::traits::ToolCallAccessManifest::default()
+        };
+        assert!(
+            access_manifest_scope_violation("terminal", &adapter_only, None, &[]).is_none(),
+            "adapter runtime capability is not task data"
         );
     }
 

@@ -63,6 +63,12 @@ impl Default for CompiledAuthority {
 pub(crate) struct CompiledTaskContract {
     pub core: Option<CompiledCompletionCore>,
     pub authority: CompiledAuthority,
+    /// Authority is itself a product: an invalid mutation lane must not erase
+    /// a valid tool restriction (or vice versa). Invalid lanes retain the
+    /// no-op defaults in `authority`, so applying either valid sibling can
+    /// only attenuate the pre-existing runtime contract.
+    pub mutation_authority_valid: bool,
+    pub tool_authority_valid: bool,
     pub evidence_policy: CompiledEvidencePolicy,
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     pub required_invocations: Vec<RequestReceiptPredicate>,
@@ -75,6 +81,10 @@ pub(crate) struct CompiledTaskContract {
 pub(crate) struct ContractCompilerInput<'a> {
     pub signals: &'a PlannedContractSignals,
     pub task_shape: Option<&'a PlannedTaskShape>,
+    /// Independently assessed dialogue/resource domain for the current turn.
+    /// This is used to reconcile evidence routing, never to grant a tool or a
+    /// filesystem capability.
+    pub request_semantic_scope: Option<ToolSemanticScope>,
     pub available_tool_names: &'a [String],
     pub available_tool_receipt_kinds: &'a [(String, crate::traits::ToolReceiptKind)],
     pub structural_filesystem_resources: &'a [String],
@@ -434,6 +444,7 @@ fn canonical_invocation_requirement(
 
 fn compile_obligations(
     signals: &PlannedContractSignals,
+    request_semantic_scope: Option<ToolSemanticScope>,
     available_tool_names: &[String],
     available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
 ) -> (
@@ -484,11 +495,21 @@ fn compile_obligations(
             || candidate.acceptable_scopes.is_empty()
             || candidate.acceptable_scopes.len() > 3
             || candidate.target.is_some()
-            || !crate::agent::inquiry::requirement_has_builtin_evidence_route(candidate)
         {
             continue;
         }
         let mut normalized = candidate.clone();
+        if let Some(scope) = request_semantic_scope {
+            if !normalized.acceptable_scopes.contains(&scope) {
+                if normalized.acceptable_scopes.len() >= 3 {
+                    normalized.acceptable_scopes.pop();
+                }
+                normalized.acceptable_scopes.push(scope);
+            }
+        }
+        if !crate::agent::inquiry::requirement_has_builtin_evidence_route(&normalized) {
+            continue;
+        }
         normalized.required_content_markers.clear();
         normalized
             .acceptable_scopes
@@ -538,9 +559,11 @@ fn compile_obligations(
 fn compile_authority(
     signals: &PlannedContractSignals,
     available_tool_names: &[String],
-) -> (CompiledAuthority, Vec<ContractLaneDecision>) {
+) -> (CompiledAuthority, bool, bool, Vec<ContractLaneDecision>) {
     let mut authority = CompiledAuthority::default();
     let mut decisions = Vec::new();
+    let mut mutation_authority_valid = false;
+    let mut tool_authority_valid = false;
 
     let forbidden_actions = signals
         .forbidden_actions
@@ -553,13 +576,16 @@ fn compile_authority(
         .map(|scope| scope.trim().to_ascii_lowercase());
     match mutation_scope.as_deref() {
         Some("allowed") if forbidden_actions.is_empty() => {
+            mutation_authority_valid = true;
             decisions.push(decision("mutation_authority", true, "accepted", 1, 1));
         }
         Some("read_only" | "read-only") => {
+            mutation_authority_valid = true;
             authority.mutation_scope = "read_only";
             decisions.push(decision("mutation_authority", true, "accepted", 1, 1));
         }
         Some("scoped") if !forbidden_actions.is_empty() => {
+            mutation_authority_valid = true;
             authority.mutation_scope = "scoped";
             authority.forbidden_actions = forbidden_actions;
             decisions.push(decision("mutation_authority", true, "accepted", 1, 1));
@@ -583,14 +609,18 @@ fn compile_authority(
         .as_deref()
         .map(|scope| scope.trim().to_ascii_lowercase());
     match tool_scope.as_deref() {
-        Some("allowed") if signals.allowed_tool_names.is_empty() => decisions.push(decision(
-            "tool_authority",
-            true,
-            "accepted",
-            1 + signals.forbidden_tool_scopes.len(),
-            1 + authority.forbidden_tool_scopes.len(),
-        )),
+        Some("allowed") if signals.allowed_tool_names.is_empty() => {
+            tool_authority_valid = true;
+            decisions.push(decision(
+                "tool_authority",
+                true,
+                "accepted",
+                1 + signals.forbidden_tool_scopes.len(),
+                1 + authority.forbidden_tool_scopes.len(),
+            ));
+        }
         Some("forbidden") if signals.allowed_tool_names.is_empty() => {
+            tool_authority_valid = true;
             authority.forbids_tool_use = true;
             decisions.push(decision("tool_authority", true, "accepted", 1, 1));
         }
@@ -612,6 +642,7 @@ fn compile_authority(
                     0,
                 ));
             } else {
+                tool_authority_valid = true;
                 authority.allowed_tool_names = names;
                 decisions.push(decision(
                     "tool_authority",
@@ -634,7 +665,15 @@ fn compile_authority(
             0,
         )),
     }
-    (authority, decisions)
+    if !tool_authority_valid {
+        authority.forbidden_tool_scopes.clear();
+    }
+    (
+        authority,
+        mutation_authority_valid,
+        tool_authority_valid,
+        decisions,
+    )
 }
 
 fn resolve_structural_path(
@@ -905,6 +944,7 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
 
     let (evidence, invocations, obligation_decision) = compile_obligations(
         input.signals,
+        input.request_semantic_scope,
         input.available_tool_names,
         input.available_tool_receipt_kinds,
     );
@@ -917,15 +957,18 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     compiled.evidence_policy = evidence_policy;
     compiled.decisions.extend(evidence_policy_decisions);
 
-    let (authority, authority_decisions) =
+    let (authority, mutation_authority_valid, tool_authority_valid, authority_decisions) =
         compile_authority(input.signals, input.available_tool_names);
     compiled.authority = authority;
+    compiled.mutation_authority_valid = mutation_authority_valid;
+    compiled.tool_authority_valid = tool_authority_valid;
     compiled.decisions.extend(authority_decisions);
 
     if compiled.core.as_ref().is_some_and(|core| {
         core.expects_mutation
-            && (compiled.authority.mutation_scope == "read_only"
-                || compiled.authority.forbids_tool_use)
+            && ((compiled.mutation_authority_valid
+                && compiled.authority.mutation_scope == "read_only")
+                || (compiled.tool_authority_valid && compiled.authority.forbids_tool_use))
     }) {
         let reason = if compiled.authority.forbids_tool_use {
             "mutation_lifecycle_conflicts_with_tool_prohibition"
@@ -940,6 +983,21 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
         compiled
             .decisions
             .push(decision("composition", true, "accepted", 2, 2));
+    }
+
+    if compiled.core.as_ref().is_some_and(|core| {
+        core.requires_observation
+            && compiled.evidence_requirements.is_empty()
+            && compiled.required_invocations.is_empty()
+    }) {
+        compiled.core = None;
+        compiled.decisions.push(decision(
+            "composition",
+            false,
+            "observation_lifecycle_missing_typed_obligation",
+            1,
+            0,
+        ));
     }
 
     compiled.decisions.push(decision(
@@ -1033,6 +1091,7 @@ mod tests {
         compile_task_contract(ContractCompilerInput {
             signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["manage_mandates".to_string(), "terminal".to_string()],
             available_tool_receipt_kinds: &receipt_kinds,
             structural_filesystem_resources: &[],
@@ -1052,15 +1111,85 @@ mod tests {
         }]);
         signals.tool_scope = Some("restricted".to_string());
         signals.allowed_tool_names = vec!["unregistered_capability".to_string()];
+        signals.forbidden_tool_scopes = vec![ToolSemanticScope::ExternalRemote];
 
         let compiled = compile(&signals);
         assert!(compiled.core.is_some());
         assert_eq!(compiled.required_invocations.len(), 1);
+        assert!(compiled.mutation_authority_valid);
+        assert!(!compiled.tool_authority_valid);
         assert!(compiled.authority.allowed_tool_names.is_empty());
+        assert!(compiled.authority.forbidden_tool_scopes.is_empty());
         assert!(compiled.decisions.iter().any(|decision| {
             decision.lane == "tool_authority"
                 && !decision.accepted
                 && decision.reason_code == "no_registered_allowed_capability"
+        }));
+    }
+
+    #[test]
+    fn valid_tool_restriction_survives_an_invalid_mutation_sibling() {
+        let mut signals = base_signals();
+        signals.mutation_scope = Some("invalid".to_string());
+        signals.tool_scope = Some("restricted".to_string());
+        signals.allowed_tool_names = vec!["manage_mandates".to_string()];
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["manage_mandates".to_string()],
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        assert!(compiled.core.is_some());
+        assert!(!compiled.mutation_authority_valid);
+        assert!(compiled.tool_authority_valid);
+        assert_eq!(
+            compiled.authority.allowed_tool_names,
+            vec!["manage_mandates".to_string()]
+        );
+    }
+
+    #[test]
+    fn independent_request_scope_reconciles_evidence_routing_without_parsing_prose() {
+        let mut signals = base_signals();
+        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
+            summary: "Inspect the durable autonomous objective".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Canonical,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            request_semantic_scope: Some(ToolSemanticScope::GoalState),
+            available_tool_names: &["scheduled_goal_runs".to_string()],
+            available_tool_receipt_kinds: &[(
+                "scheduled_goal_runs".to_string(),
+                crate::traits::ToolReceiptKind::Generic,
+            )],
+            structural_filesystem_resources: &[],
+            structural_project_scopes: &[],
+            project_alias_roots: &[],
+            current_user_text: "synthetic request",
+        });
+
+        assert_eq!(compiled.evidence_requirements.len(), 1);
+        assert!(compiled.evidence_requirements[0]
+            .acceptable_scopes
+            .contains(&ToolSemanticScope::GoalState));
+    }
+
+    #[test]
+    fn ungrounded_observation_lane_cannot_install_a_generic_success_gate() {
+        let compiled = compile(&base_signals());
+        assert!(compiled.core.is_none());
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "composition"
+                && !decision.accepted
+                && decision.reason_code == "observation_lifecycle_missing_typed_obligation"
         }));
     }
 
@@ -1178,6 +1307,8 @@ mod tests {
 
         let compiled = compile(&signals);
         assert!(compiled.core.is_none());
+        assert!(compiled.mutation_authority_valid);
+        assert!(compiled.tool_authority_valid);
         assert_eq!(compiled.authority.mutation_scope, "read_only");
         assert!(compiled.decisions.iter().any(|decision| {
             decision.lane == "composition"
@@ -1246,6 +1377,11 @@ mod tests {
     #[test]
     fn malformed_response_artifact_is_rejected_without_affecting_execution() {
         let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["manage_mandates".to_string()],
+            outcome_condition: Some(RequestedOutcomeCondition::Succeeded),
+            ..RequestReceiptPredicate::default()
+        }]);
         signals.response_contract = Some(super::super::task_planning::PlannedResponseContract {
             mode: "unsupported_mode".to_string(),
             success_text: Some("synthetic".to_string()),
@@ -1334,6 +1470,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1379,6 +1516,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1412,6 +1550,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1445,6 +1584,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1486,6 +1626,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["write_file".to_string()],
             available_tool_receipt_kinds: &[(
                 "write_file".to_string(),
@@ -1523,6 +1664,7 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
+            request_semantic_scope: None,
             available_tool_names: &["write_file".to_string()],
             available_tool_receipt_kinds: &[(
                 "write_file".to_string(),

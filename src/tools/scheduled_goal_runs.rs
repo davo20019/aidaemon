@@ -296,6 +296,102 @@ impl ScheduledGoalRunsTool {
             })
     }
 
+    /// Return one canonical, read-only snapshot of every scheduled objective,
+    /// its schedule state, and its latest durable execution. Discovery and run
+    /// inspection belong on the same capability surface: requiring callers to
+    /// first guess an ID (or route through the memory tool) makes absence and
+    /// cross-object audits impossible to establish reliably.
+    async fn overview(&self, limit: usize, include_diagnostics: bool) -> anyhow::Result<String> {
+        let mut goals = self.state.get_scheduled_goals().await?;
+        goals.sort_by(|left, right| {
+            let left_rank = usize::from(left.status != "active");
+            let right_rank = usize::from(right.status != "active");
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+
+        let total = goals.len();
+        let limit = limit.clamp(1, 100);
+        let mut records = Vec::new();
+        for goal in goals.into_iter().take(limit) {
+            let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+            let mut tasks = self.state.get_tasks_for_goal(&goal.id).await?;
+            tasks.sort_by(|left, right| {
+                let left_time = left
+                    .completed_at
+                    .as_deref()
+                    .or(left.started_at.as_deref())
+                    .unwrap_or(&left.created_at);
+                let right_time = right
+                    .completed_at
+                    .as_deref()
+                    .or(right.started_at.as_deref())
+                    .unwrap_or(&right.created_at);
+                right_time.cmp(left_time)
+            });
+            let active_schedule_count = schedules
+                .iter()
+                .filter(|schedule| !schedule.is_paused)
+                .count();
+            let latest_run = tasks.first().map(|task| {
+                let mut run = json!({
+                    "status": task.status,
+                    "created_at": task.created_at,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                });
+                if include_diagnostics {
+                    run["task_id"] = Value::String(task.id.clone());
+                }
+                run
+            });
+            let next_run_at = schedules
+                .iter()
+                .filter(|schedule| !schedule.is_paused)
+                .map(|schedule| schedule.next_run_at.as_str())
+                .min();
+            let last_run_at = schedules
+                .iter()
+                .filter_map(|schedule| schedule.last_run_at.as_deref())
+                .max();
+            let mut record = json!({
+                "objective": Self::truncate(&goal.description, 240),
+                "goal_status": goal.status,
+                "schedule_count": schedules.len(),
+                "active_schedule_count": active_schedule_count,
+                "schedule_state": if schedules.is_empty() {
+                    "missing"
+                } else if active_schedule_count > 0 {
+                    "active"
+                } else {
+                    "paused"
+                },
+                "next_run_at": next_run_at,
+                "last_run_at": last_run_at,
+                "latest_run": latest_run,
+            });
+            if include_diagnostics {
+                record["goal_id"] = Value::String(goal.id);
+                record["schedule_ids"] = Value::Array(
+                    schedules
+                        .iter()
+                        .map(|schedule| Value::String(schedule.id.clone()))
+                        .collect(),
+                );
+            }
+            records.push(record);
+        }
+
+        Ok(serde_json::to_string_pretty(&json!({
+            "snapshot": "scheduled_objectives",
+            "complete": records.len() == total,
+            "total": total,
+            "returned": records.len(),
+            "objectives": records,
+        }))?)
+    }
+
     fn infer_hints(problem_text: &str, has_blocked: bool) -> Vec<&'static str> {
         let mut hints = Vec::new();
         let text = problem_text.to_ascii_lowercase();
@@ -906,7 +1002,7 @@ fn scheduled_goal_runs_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions"]
+                    "enum": ["overview", "run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions"]
                 },
                 "goal_id": {
                     "type": "string"
@@ -929,11 +1025,10 @@ fn scheduled_goal_runs_schema() -> Value {
                 "run_requirement": string_enum(&["must_complete", "best_effort"]),
                 "insufficient_evidence": string_enum(&["use_public_sources", "use_best_available", "skip_run"]),
                 "include_diagnostics": {
-                    "type": "boolean",
-                    "description": "True only for user-requested internal IDs."
+                    "type": "boolean"
                 }
             },
-            "required": ["action", "goal_id"],
+            "required": ["action"],
             "additionalProperties": false
         }
     })
@@ -946,7 +1041,7 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn description(&self) -> &str {
-        "Run, update, and inspect scheduled goals without terminal/sqlite access"
+        "Inspect all scheduled autonomous objectives and their latest durable runs, or manage one scheduled goal, without memory, terminal, or sqlite access. Use action=overview for discovery and state audits; it does not require goal_id."
     }
 
     fn schema(&self) -> Value {
@@ -955,6 +1050,14 @@ impl Tool for ScheduledGoalRunsTool {
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if action == "overview" {
+            return Ok(());
+        }
         let has_goal_id = parsed
             .as_ref()
             .and_then(|value| value.get("goal_id"))
@@ -963,11 +1066,6 @@ impl Tool for ScheduledGoalRunsTool {
         if has_goal_id {
             return Ok(());
         }
-        let action = parsed
-            .as_ref()
-            .and_then(|value| value.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
         Err(ToolArgumentContractViolation::new(format!(
             "action `{action}` requires `goal_id` for `scheduled_goal_runs`"
         ))
@@ -977,7 +1075,7 @@ impl Tool for ScheduledGoalRunsTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,
-            &["run_history", "last_failure", "unblock_hints"],
+            &["overview", "run_history", "last_failure", "unblock_hints"],
             ToolMutationEffects::NONE,
         )
     }
@@ -996,6 +1094,13 @@ impl Tool for ScheduledGoalRunsTool {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
         match args.action.as_str() {
+	            "overview" => {
+	                self.overview(
+	                    args.limit.unwrap_or(50),
+	                    args.include_diagnostics.unwrap_or(false),
+	                )
+	                .await
+	            }
 	            "run_now" => {
 	                let goal_id = args
 	                    .goal_id
@@ -1063,7 +1168,7 @@ impl Tool for ScheduledGoalRunsTool {
                     .await
 	            }
 	            other => Ok(format!(
-	                "Unknown action: '{}'. Use run_now, run_history, last_failure, unblock_hints, set_budget, or update_instructions.",
+	                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, or update_instructions.",
 	                other
 	            )),
 	        }
@@ -1129,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_marks_goal_id_required() {
+    async fn schema_supports_id_free_overview_but_targeted_actions_require_goal_id() {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state);
         let schema = tool.schema();
@@ -1140,8 +1245,76 @@ mod tests {
             .expect("required array exists");
         let required_values: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(required_values.contains(&"action"));
-        assert!(required_values.contains(&"goal_id"));
+        assert!(!required_values.contains(&"goal_id"));
         assert!(schema["parameters"]["properties"]["include_diagnostics"].is_object());
+        assert!(tool.validate_arguments(r#"{"action":"overview"}"#).is_ok());
+        assert!(tool
+            .validate_arguments(r#"{"action":"run_history"}"#)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn overview_returns_schedule_and_latest_run_without_internal_ids() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous(
+            "Publish a synthetic weekly report",
+            "synthetic-session",
+            Some(1000),
+            Some(5000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: Some(now.clone()),
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let schedule_id = schedule.id.clone();
+        state.create_goal_schedule(&schedule).await.unwrap();
+        let task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.clone(),
+            description: "Synthetic scheduled run".to_string(),
+            status: "blocked".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: Some("Synthetic blocker".to_string()),
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let task_id = task.id.clone();
+        state.create_task(&task).await.unwrap();
+
+        let output = tool.call(r#"{"action":"overview"}"#).await.unwrap();
+        let snapshot: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(snapshot["snapshot"], "scheduled_objectives");
+        assert_eq!(snapshot["complete"], true);
+        assert_eq!(snapshot["objectives"][0]["schedule_state"], "active");
+        assert_eq!(snapshot["objectives"][0]["latest_run"]["status"], "blocked");
+        assert!(!output.contains(&goal_id));
+        assert!(!output.contains(&schedule_id));
+        assert!(!output.contains(&task_id));
     }
 
     #[tokio::test]

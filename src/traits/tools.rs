@@ -1291,11 +1291,7 @@ fn string_to_target_hint(key: &str, value: &str) -> Option<ToolTargetHint> {
             | "repo_path"
             | "repo_dir"
             | "resource_path"
-    ) || trimmed.starts_with('/')
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-        || trimmed.starts_with("~/")
-    {
+    ) {
         return ToolTargetHint::new(ToolTargetHintKind::Path, trimmed);
     }
 
@@ -1835,6 +1831,15 @@ mod tests {
         let manifest = tool.call_access_manifest(
             r#"{"url":"https://example.test/status","resource_id":"remote-1"}"#,
         );
+        assert!(manifest.read_targets.is_empty());
+        assert!(manifest.write_targets.is_empty());
+    }
+
+    #[test]
+    fn default_manifest_does_not_treat_opaque_payload_text_as_a_path_capability() {
+        let tool = ManageTool;
+        let manifest = tool
+            .call_access_manifest(r#"{"command":"/usr/bin/false","prompt":"inspect /etc/hosts"}"#);
         assert!(manifest.read_targets.is_empty());
         assert!(manifest.write_targets.is_empty());
     }

@@ -239,12 +239,16 @@ pub(super) async fn apply_result_learning(
     env: &ResultLearningEnv<'_>,
     state: &mut ResultLearningState<'_>,
 ) -> anyhow::Result<ResultLearningOutcome> {
-    // Mandate workers are isolated from the owner's global behavioral-memory
-    // plane. They still receive deterministic local retry/control guidance,
-    // but may neither retrieve prior solutions/telemetry nor write patterns,
-    // reflections, or recovery outcomes. A provenance-scoped mandate learning
-    // store can be added separately in a later version.
-    let global_learning_allowed = agent.mandate_execution.is_none();
+    // Mandate workers and turns whose compiled memory pipeline is suppressed
+    // are isolated from the owner's global behavioral-memory plane. They still
+    // receive deterministic local retry/control guidance, but may neither
+    // retrieve prior solutions nor write patterns, reflections, or recovery
+    // outcomes. This applies the same task-level capability decision to every
+    // automatic memory consumer, not only bootstrap retrieval/persistence.
+    let global_learning_allowed = global_learning_is_allowed(
+        agent.mandate_execution.is_some(),
+        state.learning_ctx.memory_persistence_allowed,
+    );
     if is_error {
         *state.no_evidence_result_streak = 0;
         *state.iteration_had_tool_failures = true;
@@ -899,9 +903,24 @@ fn should_nudge_vary_terms(streak: usize) -> bool {
     streak > 0 && streak.is_multiple_of(3)
 }
 
+fn global_learning_is_allowed(
+    mandate_execution_active: bool,
+    memory_persistence_allowed: bool,
+) -> bool {
+    !mandate_execution_active && memory_persistence_allowed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_learning_obeys_the_compiled_memory_capability() {
+        assert!(global_learning_is_allowed(false, true));
+        assert!(!global_learning_is_allowed(false, false));
+        assert!(!global_learning_is_allowed(true, true));
+        assert!(!global_learning_is_allowed(true, false));
+    }
 
     #[test]
     fn negative_lookup_strategy_uses_typed_outcome_and_scope() {

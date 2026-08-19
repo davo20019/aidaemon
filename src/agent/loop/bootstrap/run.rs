@@ -253,6 +253,19 @@ async fn finalize_turn_assessment(
             super::contract_compiler::ContractCompilerInput {
                 signals,
                 task_shape: plan.and_then(|plan| plan.task_shape.as_ref()),
+                request_semantic_scope: relationship_shape
+                    .and_then(|shape| shape.semantic_scope.as_deref())
+                    .and_then(|scope| match scope {
+                        "goal_state" => Some(crate::traits::ToolSemanticScope::GoalState),
+                        "user_memory" => Some(crate::traits::ToolSemanticScope::UserMemory),
+                        "conversation_history" => {
+                            Some(crate::traits::ToolSemanticScope::ConversationHistory)
+                        }
+                        "external_remote" => Some(crate::traits::ToolSemanticScope::ExternalRemote),
+                        "local_workspace" => Some(crate::traits::ToolSemanticScope::LocalWorkspace),
+                        "host_local" => Some(crate::traits::ToolSemanticScope::HostLocal),
+                        _ => None,
+                    }),
                 available_tool_names,
                 available_tool_receipt_kinds,
                 structural_filesystem_resources: &structural_filesystem_resources,
@@ -265,7 +278,8 @@ async fn finalize_turn_assessment(
         compiled_evidence_requirements = compiled.evidence_requirements.clone();
         compiled_required_invocations = compiled.required_invocations.clone();
         compiled_response_contract = compiled.response_contract.clone();
-        compiled_authority = Some(compiled.authority.clone());
+        compiled_authority = (compiled.mutation_authority_valid || compiled.tool_authority_valid)
+            .then(|| compiled.authority.clone());
         compiled_evidence_policy = Some(compiled.evidence_policy.clone());
         compiled_filesystem_access = compiled.filesystem_access.clone();
         compiled_project_scope = compiled.project_scope.clone();
@@ -443,6 +457,10 @@ async fn finalize_turn_assessment(
                     );
                     metadata["assessment_mode"] = json!(plan.mode.as_str());
                     metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                    metadata["full_contract_complete"] = json!(plan
+                        .contract
+                        .as_ref()
+                        .is_some_and(super::task_planning::planned_contract_is_complete));
                     metadata["semantic_contract_applied"] = json!(semantic_contract_applied);
                     metadata["contract_lane_decisions"] = json!(contract_lane_decisions);
                     metadata["completion_contract"] = json!({

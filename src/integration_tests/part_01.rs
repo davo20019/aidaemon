@@ -283,7 +283,15 @@ async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
         MockProvider::text_response("Recovered after reflection."),
         MockProvider::text_response("Recovered after reflection."),
         MockProvider::text_response("Recovered after reflection."),
-    ]);
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "answer",
+        false,
+        false,
+        &[],
+        "new_request",
+        "general",
+    )]);
 
     let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
         provider,

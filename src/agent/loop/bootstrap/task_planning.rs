@@ -774,13 +774,14 @@ fn decode_task_plan_result(
             "unsupported_schema_version:{received_schema_version};supported:{TASK_CONTRACT_SCHEMA_VERSION}"
         )
     })?;
-    if parsed
-        .contract
-        .as_ref()
-        .is_some_and(|contract| !planned_contract_is_complete(contract))
-    {
-        return Err("incomplete_task_contract".to_string());
-    }
+    // Decode the semantic envelope as a product of independent lanes. The
+    // contract compiler validates completion core, authority, obligations,
+    // filesystem access, and presentation separately and installs only valid
+    // products. Rejecting the entire model response here erased valid hard
+    // constraints whenever an unrelated lane was imperfect, leaving the main
+    // loop with less information and weaker safety. Full completeness remains
+    // available as diagnostics/tests, but is not an all-or-nothing admission
+    // gate.
     if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return Err("empty_semantic_envelope".to_string());
     }
@@ -2487,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn live_decoder_rejects_an_observation_contract_without_provable_needs() {
+    fn live_decoder_preserves_partial_contract_for_lane_compilation() {
         let response = crate::testing::MockProvider::text_response(
             &serde_json::to_string(&json!({
                 "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
@@ -2524,11 +2525,12 @@ mod tests {
             .expect("json"),
         );
 
-        assert_eq!(
-            decode_task_plan_result(&response, TaskAssessmentMode::AutonomousRouting)
-                .expect_err("missing proof propositions must fail live decoding"),
-            "incomplete_task_contract"
-        );
+        let plan = decode_task_plan_result(&response, TaskAssessmentMode::AutonomousRouting)
+            .expect("a partial semantic product must reach the lane compiler");
+        let contract = plan.contract.expect("contract is preserved");
+        assert!(!planned_contract_is_complete(&contract));
+        assert_eq!(contract.requires_observation, Some(true));
+        assert!(contract.evidence_requirements.unwrap().is_empty());
     }
 
     #[test]

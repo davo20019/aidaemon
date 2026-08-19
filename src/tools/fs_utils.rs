@@ -726,6 +726,65 @@ pub fn is_sensitive_path(path: &Path) -> bool {
     })
 }
 
+/// Whether a path belongs to the host operating system's protected data
+/// plane rather than task/workspace data. Raw file and terminal tools do not
+/// receive access to these trees even when a semantic assessment repeats the
+/// requested path; host inspection must go through a purpose-built typed tool
+/// whose adapter owns and redacts that capability.
+///
+/// This is a structural filesystem policy, not natural-language matching.
+/// Executable and dynamic-library reads needed to start a process remain in
+/// `adapter_read_targets` and are evaluated separately from task data.
+pub fn is_protected_host_data_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        const PROTECTED_ROOTS: &[&str] = &[
+            "/System",
+            "/Library",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/etc",
+            "/private/etc",
+            "/private/var/root",
+            "/var/root",
+            "/dev",
+            "/proc",
+            "/sys",
+        ];
+        if PROTECTED_ROOTS
+            .iter()
+            .any(|root| path == Path::new(root) || path.starts_with(root))
+        {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let normalized = path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        if [
+            "c:\\windows",
+            "c:\\program files",
+            "c:\\program files (x86)",
+        ]
+        .iter()
+        .any(|root| normalized == *root || normalized.starts_with(&format!("{root}\\")))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Check if a file appears to be binary by reading first 8KB and looking for null bytes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn is_binary_file(path: &Path) -> anyhow::Result<bool> {
@@ -1117,6 +1176,23 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/home/user/.gnupg/key")));
         assert!(!is_sensitive_path(Path::new("/home/user/code/main.rs")));
         assert!(!is_sensitive_path(Path::new("/repo/src/environment.rs")));
+    }
+
+    #[test]
+    fn protected_host_data_is_separate_from_workspace_and_temporary_data() {
+        #[cfg(unix)]
+        {
+            assert!(is_protected_host_data_path(Path::new("/etc/hosts")));
+            assert!(is_protected_host_data_path(Path::new(
+                "/private/var/root/result.txt"
+            )));
+            assert!(!is_protected_host_data_path(Path::new(
+                "/tmp/synthetic-result.txt"
+            )));
+            assert!(!is_protected_host_data_path(Path::new(
+                "/workspace/synthetic-project/src/main.rs"
+            )));
+        }
     }
 
     #[tokio::test]
