@@ -2333,6 +2333,8 @@ mod stuck_fallback_tests {
         });
         let mut metadata = crate::traits::ToolCallMetadata {
             outcome_status: Some(status),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            receipt_kind: crate::traits::ToolReceiptKind::Process,
             exit_code: Some(exit_code),
             semantics: crate::traits::ToolCallSemantics::observation()
                 .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
@@ -2399,6 +2401,7 @@ mod stuck_fallback_tests {
                     outcome_statuses: vec![
                         crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
                     ],
+                    outcome_condition: None,
                     requires_output: false,
                     contract_rejected: None,
                     max_invocations: None,

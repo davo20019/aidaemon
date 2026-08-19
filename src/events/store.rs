@@ -25,6 +25,7 @@ pub struct GeneratedResponseRef {
     pub task_id: String,
     pub turn_id: Option<String>,
     pub referenced_receipts: Vec<super::CompletionProofReference>,
+    pub disposition: super::AssistantResponseDisposition,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,12 @@ fn generated_response_from_event(event: &Event) -> Option<CapturedGeneratedRespo
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
+    let disposition = event
+        .data
+        .get("disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     Some(CapturedGeneratedResponse {
         content,
         response: GeneratedResponseRef {
@@ -108,6 +115,7 @@ fn generated_response_from_event(event: &Event) -> Option<CapturedGeneratedRespo
             task_id,
             turn_id,
             referenced_receipts,
+            disposition,
         },
     })
 }
@@ -194,49 +202,19 @@ fn receipt_matches_predicate(
     if !tool_matches {
         return false;
     }
-    if let Some(expected_rejection) = predicate.contract_rejected {
-        if receipt.contract_rejected != expected_rejection {
-            return false;
-        }
-    } else if receipt.contract_rejected
-        && !predicate
-            .outcome_statuses
-            .contains(&crate::traits::ToolOutcomeStatus::Blocked)
-    {
+    if !predicate.rejection_matches(receipt.contract_rejected) {
         return false;
     }
-    if !predicate.exit_codes.is_empty()
-        && !receipt
-            .exit_code
-            .is_some_and(|code| predicate.exit_codes.contains(&code))
-    {
+    if !predicate.exit_matches(receipt.receipt_kind, receipt.exit_code) {
         return false;
     }
-    if !predicate.outcome_statuses.is_empty()
-        && !predicate.outcome_statuses.contains(&receipt.outcome_status)
-    {
-        // A normal process exit with a non-zero status is a completed
-        // observation, not an adapter failure. Older assessments only knew
-        // `failed_permanent` for this branch; preserve that typed contract
-        // across the receipt-vocabulary upgrade without accepting arbitrary
-        // API/transport failures as proof.
-        let legacy_process_negative = receipt.outcome_status
-            == crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
-            && receipt.receipt_kind == crate::traits::ToolReceiptKind::Process
-            && receipt.exit_code.is_some_and(|code| code != 0)
-            && predicate
-                .outcome_statuses
-                .contains(&crate::traits::ToolOutcomeStatus::FailedPermanent);
-        if !legacy_process_negative {
-            return false;
-        }
-    }
-    if predicate.contract_rejected != Some(true)
-        && !receipt.invocation_stage.reached_dispatch()
-        && !predicate
-            .outcome_statuses
-            .contains(&crate::traits::ToolOutcomeStatus::Blocked)
-    {
+    if !predicate.outcome_matches(
+        receipt.outcome_status,
+        receipt.invocation_stage,
+        receipt.contract_rejected,
+        receipt.receipt_kind,
+        receipt.exit_code,
+    ) {
         return false;
     }
     if predicate.requires_output {
@@ -754,11 +732,17 @@ impl EventStore {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
+        let disposition = data
+            .get("disposition")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
         Ok(Some(GeneratedResponseRef {
             response_id,
             task_id,
             turn_id: row.try_get("turn_id")?,
             referenced_receipts,
+            disposition,
         }))
     }
 
@@ -4232,6 +4216,11 @@ mod tests {
                             "turn_id": format!("turn-{task_id}"),
                             "message_id": message_id,
                             "content": content,
+                            "disposition": if session_id == "session-a" {
+                                "background_handoff"
+                            } else {
+                                "terminal"
+                            },
                             "referenced_receipts": []
                         }),
                     ))
@@ -4264,6 +4253,10 @@ mod tests {
         assert_eq!(captured[0].content, "returned response");
         assert_eq!(captured[0].response.response_id, "response-a");
         assert_eq!(captured[0].response.task_id, "task-a");
+        assert_eq!(
+            captured[0].response.disposition,
+            crate::events::AssistantResponseDisposition::BackgroundHandoff
+        );
     }
 
     #[tokio::test]

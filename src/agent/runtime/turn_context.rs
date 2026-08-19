@@ -21,6 +21,7 @@ use super::project_scope::{
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::{ToolCallAccessManifest, ToolCallSemantics};
+use futures::future::BoxFuture;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct TurnContext {
@@ -642,94 +643,134 @@ impl Agent {
         Ok(event_id)
     }
 
-    pub(super) async fn append_assistant_message_with_event(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        msg: &Message,
-        model: &str,
+    pub(super) fn append_assistant_message_with_event<'a>(
+        &'a self,
+        emitter: &'a crate::events::EventEmitter,
+        msg: &'a Message,
+        model: &'a str,
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
-    ) -> anyhow::Result<()> {
-        let mut normalized_msg = normalize_message_resources(msg);
-        if normalized_msg.tool_calls_json.is_none() {
-            if let Some(task_id) = emitter.task_id() {
-                if let Ok(aggregate) = self
-                    .event_store
-                    .task_run_aggregate(&normalized_msg.session_id, task_id)
-                    .await
-                {
-                    if let Some(projected) = aggregate.projected_success_response() {
-                        if normalized_msg.content.as_deref() != Some(projected) {
-                            tracing::info!(
-                                task_id,
-                                response_id = %normalized_msg.id,
-                                "Projected typed successful response artifact"
-                            );
-                            normalized_msg.content = Some(projected.to_string());
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.append_assistant_message_with_event_disposition(
+            emitter,
+            msg,
+            model,
+            input_tokens,
+            output_tokens,
+            crate::events::AssistantResponseDisposition::Terminal,
+        )
+    }
+
+    pub(super) fn append_background_handoff_message_with_event<'a>(
+        &'a self,
+        emitter: &'a crate::events::EventEmitter,
+        msg: &'a Message,
+        model: &'a str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.append_assistant_message_with_event_disposition(
+            emitter,
+            msg,
+            model,
+            input_tokens,
+            output_tokens,
+            crate::events::AssistantResponseDisposition::BackgroundHandoff,
+        )
+    }
+
+    fn append_assistant_message_with_event_disposition<'a>(
+        &'a self,
+        emitter: &'a crate::events::EventEmitter,
+        msg: &'a Message,
+        model: &'a str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        disposition: crate::events::AssistantResponseDisposition,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let mut normalized_msg = normalize_message_resources(msg);
+            if normalized_msg.tool_calls_json.is_none() {
+                if let Some(task_id) = emitter.task_id() {
+                    if let Ok(aggregate) = self
+                        .event_store
+                        .task_run_aggregate(&normalized_msg.session_id, task_id)
+                        .await
+                    {
+                        if let Some(projected) = aggregate.projected_success_response() {
+                            if normalized_msg.content.as_deref() != Some(projected) {
+                                tracing::info!(
+                                    task_id,
+                                    response_id = %normalized_msg.id,
+                                    "Projected typed successful response artifact"
+                                );
+                                normalized_msg.content = Some(projected.to_string());
+                            }
                         }
                     }
                 }
             }
-        }
-        let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
-        let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
-            serde_json::from_str::<Vec<ToolCall>>(raw)
-                .ok()
-                .map(|calls| {
-                    calls
-                        .into_iter()
-                        .map(|tc| ToolCallInfo {
-                            id: tc.id,
-                            name: tc.name,
-                            arguments: serde_json::from_str(&tc.arguments)
-                                .unwrap_or(serde_json::json!({})),
-                            extra_content: tc.extra_content,
-                        })
-                        .collect::<Vec<_>>()
-                })
-        });
-        let referenced_receipts = if normalized_msg
-            .content
-            .as_deref()
-            .is_some_and(|content| !content.trim().is_empty())
-            && tool_calls.is_none()
-        {
-            match emitter.task_id() {
-                Some(task_id) => self
-                    .event_store
-                    .task_completion_proof_references(task_id)
-                    .await
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        emitter
-            .emit(
-                EventType::AssistantResponse,
-                AssistantResponseData {
-                    message_id: Some(normalized_msg.id.clone()),
-                    content: normalized_msg.content.clone(),
-                    model: model.to_string(),
-                    tool_calls,
-                    input_tokens,
-                    output_tokens,
-                    annotations: normalized_msg.annotations.clone(),
-                    turn_id: turn_id.clone(),
-                    task_id: emitter.task_id().map(str::to_string),
-                    referenced_receipts,
-                },
+            let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
+            let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
+                serde_json::from_str::<Vec<ToolCall>>(raw)
+                    .ok()
+                    .map(|calls| {
+                        calls
+                            .into_iter()
+                            .map(|tc| ToolCallInfo {
+                                id: tc.id,
+                                name: tc.name,
+                                arguments: serde_json::from_str(&tc.arguments)
+                                    .unwrap_or(serde_json::json!({})),
+                                extra_content: tc.extra_content,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+            });
+            let referenced_receipts = if normalized_msg
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+                && tool_calls.is_none()
+            {
+                match emitter.task_id() {
+                    Some(task_id) => self
+                        .event_store
+                        .task_completion_proof_references(task_id)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            emitter
+                .emit(
+                    EventType::AssistantResponse,
+                    AssistantResponseData {
+                        message_id: Some(normalized_msg.id.clone()),
+                        content: normalized_msg.content.clone(),
+                        model: model.to_string(),
+                        tool_calls,
+                        input_tokens,
+                        output_tokens,
+                        annotations: normalized_msg.annotations.clone(),
+                        turn_id: turn_id.clone(),
+                        task_id: emitter.task_id().map(str::to_string),
+                        referenced_receipts,
+                        disposition,
+                    },
+                )
+                .await?;
+            self.append_message_canonical(&normalized_msg).await?;
+            super::dialogue_state::record_dialogue_assistant_message(
+                self,
+                &normalized_msg.session_id,
+                &normalized_msg,
             )
             .await?;
-        self.append_message_canonical(&normalized_msg).await?;
-        super::dialogue_state::record_dialogue_assistant_message(
-            self,
-            &normalized_msg.session_id,
-            &normalized_msg,
-        )
-        .await?;
-        Ok(())
+            Ok(())
+        })
     }
 
     #[cfg(test)]

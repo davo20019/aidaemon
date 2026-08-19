@@ -1053,28 +1053,17 @@ fn evaluate_receipt_predicate(
         || receipt.tool_names.iter().any(|name| {
             name == requested_tool_name || metadata.effective_tool_name.as_deref() == Some(name)
         });
-    let exit_compatible = receipt.exit_codes.is_empty()
-        || metadata.receipt_kind != crate::traits::ToolReceiptKind::Process
-        || metadata
-            .exit_code
-            .is_some_and(|actual| receipt.exit_codes.contains(&actual));
-    // A pre-I/O contract rejection is its own typed terminal disposition. A
-    // schema-v7 producer represented that disposition as
-    // `completed_with_negative_result`; newer runtimes persist it as
-    // `blocked` so it can never masquerade as a dispatched operation. When a
-    // contract explicitly asks to observe the rejection, the rejection bit is
-    // therefore the cross-version outcome predicate. Generic requirements and
-    // predicates expecting `contract_rejected: false` still require the exact
-    // terminal status below.
-    let explicitly_expects_rejection = receipt.contract_rejected == Some(true);
-    let outcome_compatible = (metadata.contract_rejected && explicitly_expects_rejection)
-        || receipt.outcome_statuses.is_empty()
-        || metadata
-            .outcome_status
-            .is_some_and(|actual| receipt.outcome_statuses.contains(&actual));
-    let rejection_compatible = receipt
-        .contract_rejected
-        .is_none_or(|expected| metadata.contract_rejected == expected);
+    let exit_compatible = receipt.exit_matches(metadata.receipt_kind, metadata.exit_code);
+    let outcome_compatible = metadata.outcome_status.is_some_and(|outcome| {
+        receipt.outcome_matches(
+            outcome,
+            metadata.invocation_stage,
+            metadata.contract_rejected,
+            metadata.receipt_kind,
+            metadata.exit_code,
+        )
+    });
+    let rejection_compatible = receipt.rejection_matches(metadata.contract_rejected);
     let has_output = metadata
         .result_provenance
         .as_ref()
@@ -1273,8 +1262,14 @@ pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
 ) -> bool {
     requirement.receipt.as_ref().is_some_and(|receipt| {
         metadata.outcome_status.is_some_and(|actual| {
-            receipt.outcome_statuses.contains(&actual)
-                || (metadata.contract_rejected && receipt.contract_rejected == Some(true))
+            actual != crate::traits::ToolOutcomeStatus::Succeeded
+                && receipt.outcome_matches(
+                    actual,
+                    metadata.invocation_stage,
+                    metadata.contract_rejected,
+                    metadata.receipt_kind,
+                    metadata.exit_code,
+                )
         })
     })
 }
@@ -1510,6 +1505,7 @@ mod tests {
                     tool_names: vec!["run_command".to_string()],
                     exit_codes: vec![1],
                     outcome_statuses: vec![ToolOutcomeStatus::CompletedWithNegativeResult],
+                    outcome_condition: None,
                     requires_output: false,
                     contract_rejected: Some(false),
                     max_invocations: None,
@@ -1592,6 +1588,7 @@ mod tests {
                     tool_names: vec!["run_command".to_string()],
                     exit_codes: vec![0],
                     outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
+                    outcome_condition: None,
                     requires_output: true,
                     contract_rejected: Some(false),
                     max_invocations: None,
@@ -1652,6 +1649,7 @@ mod tests {
                     tool_names: vec!["manage_mandates".to_string()],
                     exit_codes: vec![0],
                     outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
+                    outcome_condition: None,
                     requires_output: true,
                     contract_rejected: Some(false),
                     max_invocations: None,
@@ -2970,6 +2968,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
                         ToolOutcomeStatus::Succeeded,
                         ToolOutcomeStatus::CompletedWithNegativeResult,
                     ],
+                    outcome_condition: None,
                     requires_output: false,
                     contract_rejected: Some(false),
                     max_invocations: Some(1),

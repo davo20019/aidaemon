@@ -82,6 +82,17 @@ pub struct UserMessageData {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
 }
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantResponseDisposition {
+    /// A completed response that must be delivered as a new platform event.
+    #[default]
+    Terminal,
+    /// A nonterminal acknowledgement whose platform surface remains owned by
+    /// the background lifecycle for later progress and completion updates.
+    BackgroundHandoff,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantResponseData {
     /// Canonical conversation message ID
@@ -115,6 +126,10 @@ pub struct AssistantResponseData {
     /// This is a graph edge, not a claim inferred later from response prose.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub referenced_receipts: Vec<CompletionProofReference>,
+    /// Typed lifecycle role consumed by channel delivery. Transports must not
+    /// infer this state from response wording.
+    #[serde(default)]
+    pub disposition: AssistantResponseDisposition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -841,7 +856,7 @@ pub struct TaskContractCompiledData {
 }
 
 impl TaskContractCompiledData {
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1841,6 +1856,7 @@ mod tests {
             turn_id: Some("t1".to_string()),
             task_id: Some("task-1".to_string()),
             referenced_receipts: Vec::new(),
+            disposition: AssistantResponseDisposition::Terminal,
         };
         let back: AssistantResponseData =
             serde_json::from_value(serde_json::to_value(&ar).unwrap()).unwrap();

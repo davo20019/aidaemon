@@ -30,7 +30,7 @@ pub use dialogue::{
     AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
     QuestionKind, RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction,
     RequestReceiptPredicate, RequestResponseContract, RequestTaskKind, RequestVerificationTarget,
-    RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
+    RequestVerificationTargetKind, RequestedOutcomeCondition, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,

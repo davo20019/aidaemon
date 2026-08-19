@@ -14,7 +14,7 @@ use super::{
 };
 use crate::traits::{
     EvidenceTemporalScope, RequestReceiptPredicate, RequestResponseContract, ToolMutationEffects,
-    ToolOutcomeStatus, ToolReceiptKind,
+    ToolOutcomeStatus,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +94,10 @@ pub(crate) struct RunAggregate {
     pub obligations: BTreeMap<String, RunObligation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<Box<RequestResponseContract>>,
+    /// Empty means unrestricted. A non-empty set is the request's exact
+    /// capability allowlist and is replay-checked against every operation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_tool_names: BTreeSet<String>,
     #[serde(default)]
     pub operations: BTreeMap<String, RunOperation>,
     #[serde(default)]
@@ -105,7 +109,7 @@ pub(crate) struct RunAggregate {
 }
 
 impl RunAggregate {
-    pub const SCHEMA_VERSION: u16 = 2;
+    pub const SCHEMA_VERSION: u16 = 3;
 
     pub(crate) fn new(task_id: impl Into<String>) -> Self {
         Self {
@@ -115,6 +119,7 @@ impl RunAggregate {
             effect_revision: 0,
             obligations: BTreeMap::new(),
             response_contract: None,
+            allowed_tool_names: BTreeSet::new(),
             operations: BTreeMap::new(),
             cardinality_violations: 0,
             primary_causal_operation_id: None,
@@ -179,6 +184,12 @@ impl RunAggregate {
         self.contract_present = true;
         self.obligations.clear();
         self.response_contract = compiled.contract.response_contract.clone();
+        self.allowed_tool_names = compiled
+            .contract
+            .allowed_tool_names
+            .iter()
+            .cloned()
+            .collect();
         self.cardinality_violations = 0;
 
         for (index, requirement) in compiled.contract.evidence_requirements.iter().enumerate() {
@@ -289,6 +300,9 @@ impl RunAggregate {
         {
             self.record_invariant("tool_call_task_identity_mismatch");
             return;
+        }
+        if !self.allowed_tool_names.is_empty() && !self.allowed_tool_names.contains(&call.name) {
+            self.record_invariant("operation_outside_allowed_tool_set");
         }
         self.operations
             .entry(call.tool_call_id.clone())
@@ -466,18 +480,18 @@ impl RunAggregate {
             let Some(limit) = predicate.max_invocations else {
                 continue;
             };
-            let dispatches = self
+            let proposals = self
                 .operations
                 .values()
                 .filter(|operation| {
-                    operation.dispatched
+                    operation.result_id.is_some()
                         && (predicate.tool_names.is_empty()
                             || predicate.tool_names.contains(&operation.tool_name))
                 })
                 .count();
             self.cardinality_violations = self
                 .cardinality_violations
-                .saturating_add(dispatches.saturating_sub(limit));
+                .saturating_add(proposals.saturating_sub(limit));
         }
     }
 
@@ -504,6 +518,7 @@ impl RunAggregate {
     pub(crate) fn is_fulfilled(&self) -> bool {
         self.contract_present
             && self.cardinality_violations == 0
+            && self.invariant_violations.is_empty()
             && !self.obligations.is_empty()
             && self.obligations.values().all(|obligation| {
                 matches!(
@@ -517,7 +532,10 @@ impl RunAggregate {
     /// remain. This is deliberately separate from terminal success: preparing
     /// the requested response artifact closes the `Deliver` obligation later.
     pub(crate) fn work_is_fulfilled(&self) -> bool {
-        if !self.contract_present || self.cardinality_violations > 0 {
+        if !self.contract_present
+            || self.cardinality_violations > 0
+            || !self.invariant_violations.is_empty()
+        {
             return false;
         }
         let mut work_obligations = self
@@ -557,6 +575,9 @@ impl RunAggregate {
         if !self.contract_present || self.obligations.is_empty() {
             return RunTerminalDecision::Unspecified;
         }
+        if !self.invariant_violations.is_empty() {
+            return RunTerminalDecision::Failed;
+        }
         if self.is_fulfilled() {
             return RunTerminalDecision::Succeeded;
         }
@@ -579,7 +600,7 @@ impl RunAggregate {
                 self.operations
                     .values()
                     .filter(|operation| {
-                        operation.dispatched
+                        operation.result_id.is_some()
                             && (predicate.tool_names.is_empty()
                                 || predicate.tool_names.contains(&operation.tool_name))
                     })
@@ -609,44 +630,19 @@ pub(crate) fn receipt_matches_predicate(
     if !tool_matches {
         return false;
     }
-    if let Some(expected_rejection) = predicate.contract_rejected {
-        if receipt.contract_rejected != expected_rejection {
-            return false;
-        }
-    } else if receipt.contract_rejected
-        && !predicate
-            .outcome_statuses
-            .contains(&ToolOutcomeStatus::Blocked)
-    {
+    if !predicate.rejection_matches(receipt.contract_rejected) {
         return false;
     }
-    if !predicate.exit_codes.is_empty()
-        && !receipt
-            .exit_code
-            .is_some_and(|code| predicate.exit_codes.contains(&code))
-    {
+    if !predicate.exit_matches(receipt.receipt_kind, receipt.exit_code) {
         return false;
     }
-    if !predicate.outcome_statuses.is_empty()
-        && !predicate.outcome_statuses.contains(&receipt.outcome_status)
-    {
-        let legacy_process_negative = receipt.outcome_status
-            == ToolOutcomeStatus::CompletedWithNegativeResult
-            && receipt.receipt_kind == ToolReceiptKind::Process
-            && receipt.exit_code.is_some_and(|code| code != 0)
-            && predicate
-                .outcome_statuses
-                .contains(&ToolOutcomeStatus::FailedPermanent);
-        if !legacy_process_negative {
-            return false;
-        }
-    }
-    if predicate.contract_rejected != Some(true)
-        && !receipt.invocation_stage.reached_dispatch()
-        && !predicate
-            .outcome_statuses
-            .contains(&ToolOutcomeStatus::Blocked)
-    {
+    if !predicate.outcome_matches(
+        receipt.outcome_status,
+        receipt.invocation_stage,
+        receipt.contract_rejected,
+        receipt.receipt_kind,
+        receipt.exit_code,
+    ) {
         return false;
     }
     !predicate.requires_output || receipt.result_provenance.authoritative_chars > 0
@@ -660,7 +656,8 @@ mod tests {
     };
     use crate::traits::{
         EvidenceAuthority, EvidencePurpose, RequestCompletionContract, RequestEvidenceRequirement,
-        ToolCallEffect, ToolCallSemantics, ToolInvocationStage, ToolResultProvenance,
+        ToolCallEffect, ToolCallSemantics, ToolInvocationStage, ToolReceiptKind,
+        ToolResultProvenance,
     };
     use serde_json::json;
 
@@ -691,6 +688,14 @@ mod tests {
         requirements: Vec<RequestEvidenceRequirement>,
         response_contract: Option<Box<RequestResponseContract>>,
     ) -> Event {
+        contract_with_response_and_tools(requirements, response_contract, Vec::new())
+    }
+
+    fn contract_with_response_and_tools(
+        requirements: Vec<RequestEvidenceRequirement>,
+        response_contract: Option<Box<RequestResponseContract>>,
+        allowed_tool_names: Vec<String>,
+    ) -> Event {
         event(
             EventType::TaskContractCompiled,
             TaskContractCompiledData {
@@ -704,7 +709,7 @@ mod tests {
                     required_mutation_effects: ToolMutationEffects::NONE,
                     forbids_mutation: false,
                     forbids_tool_use: false,
-                    allowed_tool_names: Vec::new(),
+                    allowed_tool_names,
                     forbidden_tool_scopes: Vec::new(),
                     required_response_fields: Vec::new(),
                     response_contract,
@@ -824,6 +829,7 @@ mod tests {
                 turn_id: None,
                 task_id: Some("task-1".to_string()),
                 referenced_receipts: Vec::new(),
+                disposition: crate::events::AssistantResponseDisposition::Terminal,
             },
         )
     }
@@ -954,6 +960,92 @@ mod tests {
             delivered.terminal_decision(),
             RunTerminalDecision::Succeeded
         );
+    }
+
+    #[test]
+    fn expected_non_success_is_objective_success_and_projects_its_response() {
+        let response = RequestResponseContract::ExactText {
+            success_text: "phase=synthetic; prerequisite=blocked".to_string(),
+            source_message_hash: "synthetic-hash".to_string(),
+        };
+        let requirement = RequestEvidenceRequirement {
+            summary: "Observe one terminal non-success".to_string(),
+            acceptable_scopes: Vec::new(),
+            purpose: EvidencePurpose::Outcome,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Historical,
+            required_content_markers: Vec::new(),
+            receipt: Some(RequestReceiptPredicate {
+                tool_names: vec!["write_file".to_string()],
+                outcome_condition: Some(
+                    crate::traits::RequestedOutcomeCondition::NonSuccessTerminal,
+                ),
+                max_invocations: Some(1),
+                ..RequestReceiptPredicate::default()
+            }),
+            target: None,
+        };
+        let mut events = vec![
+            contract_with_response_and_tools(
+                vec![requirement],
+                Some(Box::new(response)),
+                vec!["write_file".to_string()],
+            ),
+            call("write", "write_file"),
+            result(
+                "write",
+                "write_file",
+                ToolOutcomeStatus::FailedPermanent,
+                -1,
+                ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.work_is_fulfilled());
+        assert_eq!(
+            aggregate.projected_success_response(),
+            Some("phase=synthetic; prerequisite=blocked")
+        );
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+
+        events.push(assistant_response(
+            "exact-negative",
+            "phase=synthetic; prerequisite=blocked",
+        ));
+        events.last_mut().unwrap().id = 4;
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+    }
+
+    #[test]
+    fn restricted_tool_contract_rejects_out_of_set_operation_during_replay() {
+        let mut events = vec![
+            contract_with_response_and_tools(
+                Vec::new(),
+                Some(Box::new(RequestResponseContract::ExactText {
+                    success_text: "synthetic".to_string(),
+                    source_message_hash: "synthetic-hash".to_string(),
+                })),
+                vec!["write_file".to_string()],
+            ),
+            call("unexpected", "terminal"),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate
+            .invariant_violations
+            .contains(&"operation_outside_allowed_tool_set".to_string()));
+        assert!(aggregate.projected_success_response().is_none());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
     }
 
     #[test]

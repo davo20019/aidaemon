@@ -2728,6 +2728,7 @@ mod tests {
                 turn_id: None,
                 task_id: Some("parent-1".to_string()),
                 referenced_receipts: Vec::new(),
+                disposition: crate::events::AssistantResponseDisposition::Terminal,
             },
             Some("parent-1"),
         )

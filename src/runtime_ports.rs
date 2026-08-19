@@ -163,6 +163,7 @@ pub(crate) struct AgentResponseEnvelope {
     pub turn_id: Option<String>,
     pub text: String,
     pub referenced_receipts: Vec<crate::events::CompletionProofReference>,
+    pub disposition: crate::events::AssistantResponseDisposition,
 }
 
 impl AgentResponseEnvelope {

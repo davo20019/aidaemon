@@ -632,7 +632,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 10;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 11;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -664,7 +664,7 @@ fn decode_task_plan_response(envelope: &Value) -> Option<TaskPlanResponse> {
 fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
     match parsed.schema_version {
         TASK_CONTRACT_SCHEMA_VERSION => Some(parsed),
-        7..=9 => {
+        7..=10 => {
             if let Some(contract) = parsed.contract.as_mut() {
                 let invocations = contract.required_invocations.get_or_insert_with(Vec::new);
                 for requirement in contract
@@ -694,6 +694,30 @@ fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanRe
     }
 }
 
+fn uses_current_receipt_dialect(contract: Option<&PlannedContractSignals>) -> bool {
+    let Some(contract) = contract else {
+        return true;
+    };
+    contract
+        .required_invocations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .chain(
+            contract
+                .evidence_requirements
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|requirement| requirement.receipt.as_ref()),
+        )
+        .all(|receipt| {
+            receipt.outcome_condition.is_some()
+                && receipt.outcome_statuses.is_empty()
+                && receipt.contract_rejected.is_none()
+        })
+}
+
 /// Result of the task-start assessment call.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -721,6 +745,11 @@ fn decode_task_plan_result(
     let parsed =
         decode_task_plan_response(&envelope).ok_or_else(|| "response_not_object".to_string())?;
     let received_schema_version = parsed.schema_version;
+    if received_schema_version == TASK_CONTRACT_SCHEMA_VERSION
+        && !uses_current_receipt_dialect(parsed.contract.as_ref())
+    {
+        return Err("invalid_current_receipt_dialect".to_string());
+    }
     let parsed = migrate_task_plan_response(parsed).ok_or_else(|| {
         format!(
             "unsupported_schema_version:{received_schema_version};supported:{TASK_CONTRACT_SCHEMA_VERSION}"
@@ -1086,7 +1115,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 10,\n\
+           \"schema_version\": 11,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -1116,9 +1145,8 @@ pub(crate) async fn generate_task_plan(
                  \"receipt\": {{\n\
                    \"tool_names\": [\"exact required tool identifier\"],\n\
                    \"exit_codes\": [0],\n\
-                   \"outcome_statuses\": [],\n\
+                   \"outcome_condition\": \"succeeded\",\n\
                    \"requires_output\": false,\n\
-                   \"contract_rejected\": false,\n\
                    \"max_invocations\": null\n\
                  }}\n\
                }}\n\
@@ -1127,9 +1155,8 @@ pub(crate) async fn generate_task_plan(
                {{\n\
                  \"tool_names\": [\"exact required tool identifier\"],\n\
                  \"exit_codes\": [0],\n\
-                 \"outcome_statuses\": [],\n\
+                 \"outcome_condition\": \"succeeded\",\n\
                  \"requires_output\": false,\n\
-                 \"contract_rejected\": false,\n\
                  \"max_invocations\": null\n\
                }}\n\
              ],\n\
@@ -1225,12 +1252,14 @@ pub(crate) async fn generate_task_plan(
            and must be []. Subject words and response prose are not lifecycle proof. Put machine \
            invocation facts in receipt.\n\
          - receipt contains only machine-checkable invocation facts explicitly required by the CURRENT \
-           request. tool_names are exact required tool identifiers (not suggestions); exit_codes and \
-           outcome_statuses are alternative acceptable results; requires_output means authoritative result \
-           content must be nonempty; contract_rejected is the required pre-I/O validation disposition. \
-           Each outcome_statuses item is one exact enum value: succeeded, completed_with_negative_result, \
-           failed_retryable, failed_permanent, blocked, or backgrounded; do not combine enum values in one \
-           string. \
+           request. tool_names are exact required tool identifiers (not suggestions); exit_codes are \
+           alternative acceptable process results; requires_output means authoritative result content must \
+           be nonempty. outcome_condition is the request-level terminal condition: any_terminal, succeeded, \
+           completed_with_negative_result, failed, blocked, contract_rejected, or non_success_terminal. Use \
+           non_success_terminal when any refusal, blocked outcome, completed negative result, or dispatched \
+           failure would satisfy the request without predetermining which execution boundary produces it. \
+           Do not emit low-level outcome_statuses or contract_rejected fields; the deterministic reducer \
+           evaluates this semantic condition against the typed receipt protocol. \
            max_invocations is the positive maximum number of tool-call proposals for that operation; set it \
            only when the current request explicitly limits call count or forbids retries, otherwise null. \
            Omit receipt when no invocation fact is required. Every purpose=outcome entry must have a \
@@ -1855,7 +1884,7 @@ mod tests {
             };
             Ok(crate::testing::MockProvider::text_response(
                 &json!({
-                    "schema_version": 10,
+                    "schema_version": 11,
                     "goal": goal,
                     "steps": [],
                     "success_criteria": [],
@@ -1949,6 +1978,76 @@ mod tests {
         .expect("JSON object");
 
         assert!(migrate_task_plan_response(decoded).is_none());
+    }
+
+    #[test]
+    fn task_plan_decoder_migrates_legacy_contracts_without_reinterpreting_them() {
+        let decoded = decode_task_plan_response(&json!({
+            "schema_version": 10,
+            "goal": "Synthetic legacy receipt",
+            "contract": {
+                "required_invocations": [{
+                    "tool_names": ["terminal"],
+                    "exit_codes": [1],
+                    "outcome_statuses": ["completed_with_negative_result"],
+                    "contract_rejected": false,
+                    "max_invocations": 1
+                }]
+            }
+        }))
+        .expect("legacy JSON object");
+
+        let migrated = migrate_task_plan_response(decoded).expect("supported legacy schema");
+        assert_eq!(migrated.schema_version, TASK_CONTRACT_SCHEMA_VERSION);
+        let predicate = &migrated
+            .contract
+            .expect("contract")
+            .required_invocations
+            .expect("invocations")[0];
+        assert_eq!(
+            predicate.outcome_statuses,
+            [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
+        );
+        assert_eq!(predicate.outcome_condition, None);
+    }
+
+    #[test]
+    fn current_contract_schema_rejects_retired_adapter_predicates() {
+        let decoded = decode_task_plan_response(&json!({
+            "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+            "goal": "Synthetic invalid current receipt",
+            "contract": {
+                "required_invocations": [{
+                    "tool_names": ["write_file"],
+                    "outcome_statuses": ["failed_permanent"],
+                    "contract_rejected": true
+                }]
+            }
+        }))
+        .expect("current JSON object");
+
+        assert!(!uses_current_receipt_dialect(decoded.contract.as_ref()));
+        let response = crate::testing::MockProvider::text_response(
+            &serde_json::to_string(&json!({
+                "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+                "goal": "Synthetic invalid current receipt",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "required_invocations": [{
+                        "tool_names": ["write_file"],
+                        "outcome_statuses": ["failed_permanent"],
+                        "contract_rejected": true
+                    }]
+                }
+            }))
+            .expect("JSON"),
+        );
+        assert_eq!(
+            decode_task_plan_result(&response, TaskAssessmentMode::AutonomousRouting)
+                .expect_err("retired dialect must fail current-schema validation"),
+            "invalid_current_receipt_dialect"
+        );
     }
 
     #[test]
@@ -2491,7 +2590,7 @@ mod tests {
     async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
         let response = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 10,
+                "schema_version": 11,
                 "goal": "Update one file",
                 "steps": [{"description": "Micromanaged step", "tool_hint": "edit_file"}],
                 "success_criteria": ["Micromanaged criterion"],
@@ -2563,7 +2662,7 @@ mod tests {
         let invalid = crate::testing::MockProvider::text_response("");
         let valid = crate::testing::MockProvider::text_response(
             r#"{
-                "schema_version": 10,
+                "schema_version": 11,
                 "goal": "Observe one synthetic process result",
                 "steps": [],
                 "success_criteria": [],
@@ -2585,9 +2684,8 @@ mod tests {
                     "required_invocations": [{
                         "tool_names": ["terminal"],
                         "exit_codes": [1],
-                        "outcome_statuses": ["completed_with_negative_result"],
+                        "outcome_condition": "completed_with_negative_result",
                         "requires_output": false,
-                        "contract_rejected": false,
                         "max_invocations": 1
                     }],
                     "filesystem_access": {
@@ -2633,8 +2731,8 @@ mod tests {
                 .as_ref()
                 .and_then(|contract| contract.required_invocations.as_ref())
                 .expect("typed invocation")[0]
-                .outcome_statuses,
-            [crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult]
+                .outcome_condition,
+            Some(crate::traits::RequestedOutcomeCondition::CompletedWithNegativeResult)
         );
         assert_eq!(
             assessment

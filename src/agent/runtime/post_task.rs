@@ -853,17 +853,6 @@ fn redact_error_line_for_summary(key_line: &str) -> String {
 /// `user_request` is the user's original message. The gist line is omitted
 /// when it is empty or itself an internal/synthetic re-engagement prompt
 /// (so we never echo `[Background command …]` machinery back to the user).
-/// Recognize a reply produced by [`build_friendly_background_handoff`].
-///
-/// The Telegram handler uses this to register the delivered handoff message
-/// as the session's background status surface, so the terminal notifier can
-/// EDIT it into the completion ping instead of stacking a third message.
-/// The heading below is our own generated text (never user/model content), so
-/// prefix-matching it is a stable structural contract, pinned by test.
-pub(crate) fn is_friendly_background_handoff(reply: &str) -> bool {
-    reply.trim_start().starts_with("⏳ **Still on it**")
-}
-
 pub(in crate::agent) fn build_friendly_background_handoff(user_request: &str) -> String {
     let mut msg = String::from(
         "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the \
@@ -1098,24 +1087,6 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::StateStore;
     use std::sync::Arc;
-
-    #[test]
-    fn handoff_predicate_matches_builder_output_only() {
-        // The predicate and the builder form one structural contract: every
-        // builder output must match, and ordinary replies must not.
-        assert!(is_friendly_background_handoff(
-            &build_friendly_background_handoff("How many PDF files are in my projects folder?")
-        ));
-        assert!(is_friendly_background_handoff(
-            &build_friendly_background_handoff("")
-        ));
-        assert!(!is_friendly_background_handoff(
-            "Your biggest project is `aidaemon`, which takes up 51GB."
-        ));
-        assert!(!is_friendly_background_handoff(
-            "⏳ Running du -sh on your projects…"
-        ));
-    }
 
     #[test]
     fn test_friendly_background_handoff_is_warm_and_internal_free() {

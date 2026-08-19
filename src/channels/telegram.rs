@@ -107,13 +107,6 @@ struct SetupLoginResult {
     urls: Vec<String>,
 }
 
-fn should_send_standalone_task_error(
-    is_stale_watchdog: bool,
-    delivered_via_live_surface: bool,
-) -> bool {
-    !is_stale_watchdog && !delivered_via_live_surface
-}
-
 use crate::wizard::CloudflaredZoneValidation;
 
 use crate::cli_agent_flags::{self, AGENT_FLAGS_CACHE_TTL_SECS, SUPPORTED_TERMINAL_AGENTS};
@@ -4849,25 +4842,36 @@ impl TelegramChannel {
                         let mut platform_message_ids = Vec::new();
                         let mut delivery_error = None;
                         if !reply.trim().is_empty() {
-                            let handled = if let (Some(live_owner), Some(live_sink)) =
-                                (live_owner.as_ref(), live_sink.as_ref())
-                            {
-                                use crate::channels::live_status::SurfaceSink;
-                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                live_owner
-                                    .lock()
-                                    .await
-                                    .finalize_text(sink_ref, &reply)
-                                    .await
+                            let background_handoff = envelope.disposition
+                                == crate::events::AssistantResponseDisposition::BackgroundHandoff;
+                            // Progress edits are not terminal delivery: Telegram
+                            // can acknowledge editMessageText while a connected
+                            // client delays rendering the update. Ordinary final
+                            // answers therefore use a fresh sendMessage, which
+                            // creates a new delivery event for clients. Only the
+                            // explicitly nonterminal background-handoff surface
+                            // remains editable for later progress/completion.
+                            let handled = if background_handoff {
+                                if let (Some(live_owner), Some(live_sink)) =
+                                    (live_owner.as_ref(), live_sink.as_ref())
+                                {
+                                    use crate::channels::live_status::SurfaceSink;
+                                    let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                                    live_owner
+                                        .lock()
+                                        .await
+                                        .finalize_text(sink_ref, &reply)
+                                        .await
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
                             };
-                            // A delivered background handoff ("⏳ **Still on it**")
-                            // becomes the session's status surface: the terminal
-                            // notifier EDITS it into the completion ping instead of
-                            // stacking a third message. Registered before reset()
+                            // A delivered background handoff becomes the
+                            // session's status surface. Registered before reset()
                             // clears the surface id below.
-                            if handled && crate::agent::is_friendly_background_handoff(&reply) {
+                            if handled && background_handoff {
                                 if let (Some(hub), Some(live_owner)) =
                                     (status_hub.as_ref(), live_owner.as_ref())
                                 {
@@ -4892,7 +4896,27 @@ impl TelegramChannel {
                             }
                             if !handled {
                                 match send_full_or_expandable_reply(&bot, chat_id, &reply).await {
-                                    Ok(message_ids) => platform_message_ids.extend(message_ids),
+                                    Ok(message_ids) => {
+                                        platform_message_ids.extend(message_ids);
+                                        if let (Some(live_owner), Some(live_sink)) =
+                                            (live_owner.as_ref(), live_sink.as_ref())
+                                        {
+                                            use crate::channels::live_status::SurfaceSink;
+                                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                                            live_owner.lock().await.finalize_done(sink_ref).await;
+                                        }
+                                        if background_handoff {
+                                            if let (Some(hub), Some(id)) =
+                                                (status_hub.as_ref(), platform_message_ids.last())
+                                            {
+                                                hub.register_background_status_surface(
+                                                    &session_id,
+                                                    id,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
                                     Err(e) => {
                                         warn!("Failed to send Telegram message: {}", e);
                                         delivery_state =
@@ -4948,32 +4972,22 @@ impl TelegramChannel {
                             } else {
                                 warn!("Agent error: {}", e);
                             }
-                            let delivered_via_live_surface =
-                                if let (Some(live_owner), Some(live_sink)) =
-                                    (live_owner.as_ref(), live_sink.as_ref())
-                                {
-                                    use crate::channels::live_status::SurfaceSink;
-                                    let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                    let delivered = live_owner
-                                        .lock()
-                                        .await
-                                        .finalize_text(sink_ref, &format!("⚠️ {error_msg}"))
-                                        .await;
-                                    live_owner.lock().await.reset();
-                                    delivered
-                                } else if let Some(live_owner) = live_owner.as_ref() {
-                                    live_owner.lock().await.reset();
-                                    false
-                                } else {
-                                    false
-                                };
-                            if should_send_standalone_task_error(
-                                is_stale_watchdog,
-                                delivered_via_live_surface,
-                            ) {
-                                // No live "Working" surface exists to finalize, so
-                                // deliver one standalone terminal error.
+                            if !is_stale_watchdog {
+                                // Terminal failures use a fresh platform message
+                                // for the same reason as successful final answers:
+                                // a progress-message edit is not a client-visible
+                                // delivery receipt.
                                 let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                            }
+                            if let (Some(live_owner), Some(live_sink)) =
+                                (live_owner.as_ref(), live_sink.as_ref())
+                            {
+                                use crate::channels::live_status::SurfaceSink;
+                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                                live_owner.lock().await.finalize_done(sink_ref).await;
+                            }
+                            if let Some(live_owner) = live_owner.as_ref() {
+                                live_owner.lock().await.reset();
                             }
                         }
                     }
@@ -6289,13 +6303,6 @@ mod tests {
     fn fallback_session_namespace_sanitizes_invalid_chars() {
         let ns = fallback_session_namespace_from_token("12$34:^secret");
         assert_eq!(ns, "tg1234");
-    }
-
-    #[test]
-    fn terminal_error_sends_standalone_unless_live_finalization_succeeded() {
-        assert!(!should_send_standalone_task_error(false, true));
-        assert!(should_send_standalone_task_error(false, false));
-        assert!(!should_send_standalone_task_error(true, false));
     }
 
     #[test]

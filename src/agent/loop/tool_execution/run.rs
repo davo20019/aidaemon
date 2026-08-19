@@ -3036,7 +3036,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 ..Message::runtime_defaults()
             };
             agent
-                .append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
+                .append_assistant_message_with_event(
+                    emitter,
+                    &assistant_msg,
+                    "system",
+                    None,
+                    None,
+                )
                 .await?;
             agent
                 .emit_task_end(

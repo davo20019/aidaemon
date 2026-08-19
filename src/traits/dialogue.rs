@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::tools::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolMutationEffects,
-    ToolSemanticScope,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolInvocationStage,
+    ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind, ToolSemanticScope,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +87,68 @@ pub struct RequestVerificationTarget {
 /// requirement. Receipt metadata and observed subject content are deliberately
 /// separate: an exit code must never be encoded as a prose marker that stdout
 /// is then expected to contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedOutcomeCondition {
+    /// Any terminal disposition, including a normal success.
+    AnyTerminal,
+    Succeeded,
+    CompletedWithNegativeResult,
+    /// A dispatched adapter/runtime failure, excluding policy rejection.
+    Failed,
+    Blocked,
+    /// A pre-I/O validation or policy rejection.
+    ContractRejected,
+    /// Any terminal disposition other than success. This is the canonical
+    /// condition for an expected refusal/failure where the exact boundary is
+    /// intentionally not predetermined by the requester.
+    NonSuccessTerminal,
+}
+
+impl RequestedOutcomeCondition {
+    pub fn matches(
+        self,
+        outcome: ToolOutcomeStatus,
+        invocation_stage: ToolInvocationStage,
+        contract_rejected: bool,
+    ) -> bool {
+        let terminal = outcome != ToolOutcomeStatus::Backgrounded;
+        let terminal_observed = terminal
+            && (invocation_stage.reached_dispatch()
+                || contract_rejected
+                || outcome == ToolOutcomeStatus::Blocked);
+        match self {
+            Self::AnyTerminal => terminal_observed,
+            Self::Succeeded => {
+                outcome == ToolOutcomeStatus::Succeeded
+                    && invocation_stage.reached_dispatch()
+                    && !contract_rejected
+            }
+            Self::CompletedWithNegativeResult => {
+                outcome == ToolOutcomeStatus::CompletedWithNegativeResult
+                    && invocation_stage.reached_dispatch()
+                    && !contract_rejected
+            }
+            Self::Failed => {
+                matches!(
+                    outcome,
+                    ToolOutcomeStatus::FailedRetryable | ToolOutcomeStatus::FailedPermanent
+                ) && invocation_stage.reached_dispatch()
+                    && !contract_rejected
+            }
+            Self::Blocked => outcome == ToolOutcomeStatus::Blocked,
+            // The rejection bit is the cross-version fact. Durable replay is
+            // represented by `invocation_stage=replayed`, so requiring a
+            // non-dispatch stage here would make a valid persisted rejection
+            // stop satisfying its original contract after hydration.
+            Self::ContractRejected => contract_rejected,
+            Self::NonSuccessTerminal => {
+                terminal_observed && (contract_rejected || outcome != ToolOutcomeStatus::Succeeded)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestReceiptPredicate {
     /// Exact requested or effective tool identifiers that may satisfy this
@@ -99,6 +161,12 @@ pub struct RequestReceiptPredicate {
     /// Alternative acceptable typed invocation outcomes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outcome_statuses: Vec<super::tools::ToolOutcomeStatus>,
+    /// Request-level outcome policy. Semantic assessment chooses this compact
+    /// condition; deterministic receipt matching evaluates it against the
+    /// adapter-specific protocol. Legacy low-level fields remain readable for
+    /// persisted contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_condition: Option<RequestedOutcomeCondition>,
     /// Whether some authoritative result content must exist.
     #[serde(default)]
     pub requires_output: bool,
@@ -117,9 +185,54 @@ impl RequestReceiptPredicate {
         self.tool_names.is_empty()
             && self.exit_codes.is_empty()
             && self.outcome_statuses.is_empty()
+            && self.outcome_condition.is_none()
             && !self.requires_output
             && self.contract_rejected.is_none()
             && self.max_invocations.is_none()
+    }
+
+    pub fn exit_matches(&self, receipt_kind: ToolReceiptKind, exit_code: Option<i32>) -> bool {
+        self.exit_codes.is_empty()
+            // Exit codes are a process-adapter field. Older persisted
+            // contracts could carry a provider-defaulted exit-code predicate
+            // for generic receipts, where it has no meaning and must not veto
+            // otherwise valid typed evidence.
+            || receipt_kind != ToolReceiptKind::Process
+            || exit_code.is_some_and(|actual| self.exit_codes.contains(&actual))
+    }
+
+    pub fn outcome_matches(
+        &self,
+        outcome: ToolOutcomeStatus,
+        invocation_stage: ToolInvocationStage,
+        contract_rejected: bool,
+        receipt_kind: ToolReceiptKind,
+        exit_code: Option<i32>,
+    ) -> bool {
+        if let Some(condition) = self.outcome_condition {
+            return condition.matches(outcome, invocation_stage, contract_rejected);
+        }
+        if contract_rejected && self.contract_rejected == Some(true) {
+            return true;
+        }
+        if self.outcome_statuses.is_empty() || self.outcome_statuses.contains(&outcome) {
+            return true;
+        }
+        // Compatibility for contracts persisted before normal nonzero process
+        // exits received their own domain-outcome enum.
+        outcome == ToolOutcomeStatus::CompletedWithNegativeResult
+            && receipt_kind == ToolReceiptKind::Process
+            && exit_code.is_some_and(|code| code != 0)
+            && self
+                .outcome_statuses
+                .contains(&ToolOutcomeStatus::FailedPermanent)
+    }
+
+    pub fn rejection_matches(&self, contract_rejected: bool) -> bool {
+        self.outcome_condition.is_some()
+            || self
+                .contract_rejected
+                .is_none_or(|expected| contract_rejected == expected)
     }
 }
 
@@ -477,6 +590,46 @@ impl DialogueState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_success_terminal_condition_spans_rejection_and_dispatched_failure() {
+        let condition = RequestedOutcomeCondition::NonSuccessTerminal;
+        assert!(condition.matches(
+            ToolOutcomeStatus::Blocked,
+            ToolInvocationStage::RejectedBeforeDispatch,
+            true,
+        ));
+        assert!(condition.matches(
+            ToolOutcomeStatus::FailedPermanent,
+            ToolInvocationStage::Dispatched,
+            false,
+        ));
+        assert!(condition.matches(
+            ToolOutcomeStatus::CompletedWithNegativeResult,
+            ToolInvocationStage::Dispatched,
+            false,
+        ));
+        assert!(!condition.matches(
+            ToolOutcomeStatus::Succeeded,
+            ToolInvocationStage::Dispatched,
+            false,
+        ));
+        assert!(!condition.matches(
+            ToolOutcomeStatus::Backgrounded,
+            ToolInvocationStage::Dispatched,
+            false,
+        ));
+        assert!(!condition.matches(
+            ToolOutcomeStatus::FailedPermanent,
+            ToolInvocationStage::Unknown,
+            false,
+        ));
+        assert!(RequestedOutcomeCondition::ContractRejected.matches(
+            ToolOutcomeStatus::Blocked,
+            ToolInvocationStage::Replayed,
+            true,
+        ));
+    }
 
     #[test]
     fn obligation_graph_uses_typed_request_and_question_state() {

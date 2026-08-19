@@ -5,8 +5,9 @@ use super::task_planning::{
 use crate::agent::CompletionTaskKind;
 use crate::traits::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-    RequestReceiptPredicate, RequestResponseContract, ToolCallAccessManifest, ToolMutationEffects,
-    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
+    RequestReceiptPredicate, RequestResponseContract, RequestedOutcomeCondition,
+    ToolCallAccessManifest, ToolMutationEffects, ToolSemanticScope, ToolTargetHint,
+    ToolTargetHintKind,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -350,7 +351,16 @@ fn valid_receipt(
 /// failure. Leaving a model-produced incompatible conjunction in the contract
 /// creates an obligation no real receipt can satisfy.
 fn normalize_receipt_predicate(mut receipt: RequestReceiptPredicate) -> RequestReceiptPredicate {
-    if receipt.contract_rejected == Some(true) {
+    if let Some(condition) = receipt.outcome_condition {
+        // The semantic producer owns only the request-level condition. Clear
+        // any concurrently emitted protocol fields so they cannot turn an OR
+        // policy such as `non_success_terminal` into an impossible conjunction.
+        receipt.outcome_statuses.clear();
+        receipt.contract_rejected = None;
+        if condition == RequestedOutcomeCondition::ContractRejected {
+            receipt.exit_codes.clear();
+        }
+    } else if receipt.contract_rejected == Some(true) {
         // Rejection is an independent typed disposition that may occur at an
         // adapter-validation or dispatcher-policy boundary. It causally rules
         // out a process exit code, but it does not imply one universal domain
@@ -1056,6 +1066,7 @@ mod tests {
             tool_names: vec!["manage_mandates".to_string()],
             exit_codes: vec![0],
             outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+            outcome_condition: None,
             requires_output: true,
             contract_rejected: Some(false),
             max_invocations: None,
@@ -1125,6 +1136,28 @@ mod tests {
         let compiled = compile(&signals);
         assert!(compiled.required_invocations[0].exit_codes.is_empty());
         assert!(compiled.required_invocations[0].outcome_statuses.is_empty());
+    }
+
+    #[test]
+    fn semantic_non_success_condition_replaces_low_level_protocol_conjunctions() {
+        let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["manage_mandates".to_string()],
+            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::Succeeded],
+            outcome_condition: Some(RequestedOutcomeCondition::NonSuccessTerminal),
+            contract_rejected: Some(true),
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        let predicate = &compiled.required_invocations[0];
+        assert_eq!(
+            predicate.outcome_condition,
+            Some(RequestedOutcomeCondition::NonSuccessTerminal)
+        );
+        assert!(predicate.outcome_statuses.is_empty());
+        assert_eq!(predicate.contract_rejected, None);
     }
 
     #[test]

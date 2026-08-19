@@ -493,7 +493,13 @@ pub(super) async fn run_stopping_phase(
             ..Message::runtime_defaults()
         };
         agent
-            .append_assistant_message_with_event(emitter, &assistant_msg, &model, None, None)
+            .append_assistant_message_with_event(
+                emitter,
+                &assistant_msg,
+                &model,
+                None,
+                None,
+            )
             .await?;
         agent
             .emit_task_end(
@@ -585,7 +591,7 @@ pub(super) async fn run_stopping_phase(
                     ..Message::runtime_defaults()
                 };
                 agent
-                    .append_assistant_message_with_event(
+                    .append_background_handoff_message_with_event(
                         emitter,
                         &assistant_msg,
                         &model,
@@ -1471,7 +1477,13 @@ pub(super) async fn run_stopping_phase(
             ..Message::runtime_defaults()
         };
         agent
-            .append_assistant_message_with_event(emitter, &assistant_msg, &model, None, None)
+            .append_assistant_message_with_event(
+                emitter,
+                &assistant_msg,
+                &model,
+                None,
+                None,
+            )
             .await?;
 
         agent
@@ -1532,7 +1544,13 @@ pub(super) async fn run_stopping_phase(
                 ..Message::runtime_defaults()
             };
             agent
-                .append_assistant_message_with_event(emitter, &assistant_msg, &model, None, None)
+                .append_assistant_message_with_event(
+                    emitter,
+                    &assistant_msg,
+                    &model,
+                    None,
+                    None,
+                )
                 .await?;
 
             agent

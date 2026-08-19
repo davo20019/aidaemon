@@ -5209,10 +5209,8 @@ impl TerminalTool {
                                                     crate::tools::sanitize::sanitize_user_facing_reply(
                                                         &envelope.text,
                                                     );
-                                                followup_still_working =
-                                                    crate::agent::is_friendly_background_handoff(
-                                                        &reply,
-                                                    );
+                                                followup_still_working = envelope.disposition
+                                                    == crate::events::AssistantResponseDisposition::BackgroundHandoff;
                                                 // Send the agent's analysis to the user
                                                 if !reply.trim().is_empty() {
                                                     let delivery_allowed = {

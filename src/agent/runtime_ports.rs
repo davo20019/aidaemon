@@ -125,6 +125,7 @@ impl ConversationRuntime for Agent {
             turn_id: generated.turn_id,
             text,
             referenced_receipts: generated.referenced_receipts,
+            disposition: generated.disposition,
         })
     }
 
@@ -167,6 +168,7 @@ impl AgentIngress for Agent {
             turn_id: generated.turn_id,
             text,
             referenced_receipts: generated.referenced_receipts,
+            disposition: generated.disposition,
         })
     }
 
@@ -270,6 +272,7 @@ mod tests {
                 task_id: "task-synthetic".to_string(),
                 turn_id: Some("turn-synthetic".to_string()),
                 referenced_receipts: Vec::new(),
+                disposition: crate::events::AssistantResponseDisposition::Terminal,
             },
         };
 
