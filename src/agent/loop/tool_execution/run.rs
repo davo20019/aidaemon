@@ -1177,14 +1177,26 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // manifest. This is a typed contract edge, not a command-text guess:
         // only a mutation task with an exact required terminal operation may
         // receive the task's already-authorized directory capability.
+        // Required invocations are compiled into evidence requirements during
+        // bootstrap, so this remains a single typed contract edge.
         let terminal_is_required_mutation = tc.name == "terminal"
-            && turn_context.completion_contract.expects_mutation
+            // A required terminal invocation plus an already-compiled write
+            // capability is sufficient evidence of a mutation edge.  Do not
+            // make propagation depend on the model's redundant mutation bit:
+            // stale/incomplete producers have historically omitted that bit,
+            // leaving a valid disposable workflow with no directory
+            // capability.  The typed write manifest remains the authority.
             && turn_context
+                .filesystem_access
+                .as_ref()
+                .is_some_and(|access| !access.write_targets.is_empty())
+            && (turn_context
                 .completion_contract
                 .evidence_requirements
                 .iter()
                 .filter_map(|requirement| requirement.receipt.as_ref())
-                .any(|predicate| predicate.tool_names.iter().any(|name| name == &tc.name));
+                .any(|predicate| predicate.tool_names.iter().any(|name| name == &tc.name))
+                );
         // Project-scope grants are directory capabilities, not just a set of
         // exact child paths. When a terminal mutation already carries a
         // writable call, project the authorized roots into its typed argument
