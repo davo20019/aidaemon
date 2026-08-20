@@ -1003,11 +1003,13 @@ async fn completed_negative_observation_is_reportable_when_semantic_assessment_i
 }
 
 #[tokio::test]
-async fn failed_task_and_no_progress_metrics_are_observable() {
+async fn policy_blocked_calls_are_no_progress_without_false_failed_task_tokens() {
     let before = policy_metrics_snapshot();
 
     // Iteration 1: unknown tool call (blocked) => no successful tools => no-progress increment.
-    // Iterations 2..: repeated valid tool call => repetitive-loop failure path.
+    // Iterations 2..: repeated valid tool calls eventually hit their typed
+    // policy budget. Policy-rejected calls do not enter the repetition guard,
+    // because enforcement itself must not fabricate an agent-loop failure.
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("no_such_tool", "{}"),
         MockProvider::tool_call_response("system_info", "{}"),
@@ -1042,9 +1044,9 @@ async fn failed_task_and_no_progress_metrics_are_observable() {
         .no_progress_iterations_total
         .saturating_sub(before.no_progress_iterations_total);
 
-    assert!(
-        failed_tokens_delta > 0,
-        "expected tokens_failed_tasks_total to increase; before={} after={}",
+    assert_eq!(
+        failed_tokens_delta, 0,
+        "policy-blocked calls followed by a normal answer must not be charged as a failed task; before={} after={}",
         before.tokens_failed_tasks_total,
         after.tokens_failed_tasks_total
     );

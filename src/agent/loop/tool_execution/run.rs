@@ -540,6 +540,7 @@ async fn persist_claimed_pre_dispatch_outcome(
     contract_rejected: bool,
     semantics: ToolCallSemantics,
     access_manifest: Option<ToolCallAccessManifest>,
+    access_denial: Option<crate::traits::ToolAccessDenial>,
     kernel_claim: &TaskKernelOperationClaim,
 ) -> anyhow::Result<()> {
     agent
@@ -555,6 +556,7 @@ async fn persist_claimed_pre_dispatch_outcome(
             contract_rejected,
             semantics,
             access_manifest,
+            access_denial,
             Some(kernel_claim),
         )
         .await
@@ -1510,9 +1512,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 result_text,
                 crate::traits::ToolOutcomeStatus::Blocked,
                 crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
+                true,
                 call_semantics.clone(),
                 Some(access_manifest.clone()),
+                Some(crate::traits::ToolAccessDenial {
+                    reason_code: "controller_scope_contract_rejected".to_string(),
+                    enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
+                    exit_code: None,
+                }),
                 &operation_claim,
             )
             .await?;

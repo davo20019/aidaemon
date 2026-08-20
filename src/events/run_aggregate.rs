@@ -412,7 +412,7 @@ impl RunAggregate {
         self.obligations.insert(obligation.id.clone(), obligation);
     }
 
-    fn record_call(&mut self, call: ToolCallData) {
+    fn record_call(&mut self, mut call: ToolCallData) {
         if call
             .task_id
             .as_deref()
@@ -430,6 +430,7 @@ impl RunAggregate {
             }
             return;
         }
+        call.obligation_ids = self.effective_obligation_ids(&call.obligation_ids);
         self.operations.insert(
             call.tool_call_id.clone(),
             RunOperation {
@@ -446,6 +447,59 @@ impl RunAggregate {
                 operation_lineage: call.operation_lineage,
             },
         );
+    }
+
+    /// Bind a proposal to the currently open subset of its eligible proof
+    /// obligations. One call may be structurally compatible with several
+    /// predicates, but a predicate that was already satisfied by an earlier
+    /// receipt must not consume or veto a later operation needed by another
+    /// still-open predicate. If every eligible obligation is already closed,
+    /// retain the original set so an extra proposal is still checked against
+    /// the user's maximum cardinality instead of escaping the contract.
+    pub(crate) fn effective_operation_claim(
+        &self,
+        claim: &TaskKernelOperationClaim,
+    ) -> TaskKernelOperationClaim {
+        let mut effective = claim.clone();
+        effective.obligation_ids = self.effective_obligation_ids(&claim.obligation_ids);
+        if effective.obligation_ids != claim.obligation_ids {
+            if let Some(active_ceiling) = effective
+                .obligation_ids
+                .iter()
+                .filter_map(|id| self.obligations.get(id))
+                .filter_map(|obligation| obligation.receipt.as_ref())
+                .filter_map(|predicate| predicate.max_invocations)
+                .min()
+            {
+                // The producer computed its operation ceiling from every
+                // statically compatible predicate. Once a stricter sibling is
+                // closed, its smaller ceiling no longer governs the remaining
+                // proof. Re-derive the ceiling from open obligations.
+                effective.max_invocations = active_ceiling.max(1);
+                effective.max_attempts = effective.max_attempts.max(effective.max_invocations);
+            }
+        }
+        effective
+    }
+
+    fn effective_obligation_ids(&self, eligible: &[String]) -> Vec<String> {
+        let open = eligible
+            .iter()
+            .filter(|id| {
+                self.obligations.get(*id).is_some_and(|obligation| {
+                    matches!(
+                        obligation.state,
+                        RunObligationState::Pending | RunObligationState::Invalidated
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if open.is_empty() {
+            eligible.to_vec()
+        } else {
+            open
+        }
     }
 
     fn record_result(&mut self, result: ToolResultData) {
@@ -1206,6 +1260,87 @@ mod tests {
                     1,
                 ),
         )
+    }
+
+    #[test]
+    fn operation_claim_projects_away_closed_sibling_cardinality() {
+        let exact_three = RequestEvidenceRequirement {
+            summary: "Observe three synthetic receipts".to_string(),
+            acceptable_scopes: Vec::new(),
+            purpose: EvidencePurpose::Outcome,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Historical,
+            required_content_markers: Vec::new(),
+            receipt: Some(RequestReceiptPredicate {
+                tool_names: vec!["terminal".to_string()],
+                exit_codes: vec![0],
+                min_invocations: Some(3),
+                max_invocations: Some(3),
+                ..RequestReceiptPredicate::default()
+            }),
+            target: None,
+        };
+        let exact_one_with_output = RequestEvidenceRequirement {
+            summary: "Observe one synthetic output receipt".to_string(),
+            receipt: Some(RequestReceiptPredicate {
+                tool_names: vec!["terminal".to_string()],
+                exit_codes: vec![0],
+                requires_output: true,
+                min_invocations: Some(1),
+                max_invocations: Some(1),
+                ..RequestReceiptPredicate::default()
+            }),
+            ..exact_three.clone()
+        };
+        let first_obligation = "task:task-1/obligation:evidence:0";
+        let second_obligation = "task:task-1/obligation:evidence:1";
+        let mut events = vec![
+            contract(vec![exact_three, exact_one_with_output]),
+            claimed_call(
+                "first",
+                "terminal",
+                "operation:first",
+                &[first_obligation, second_obligation],
+            ),
+            result(
+                "first",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations[second_obligation].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            aggregate.obligations[first_obligation].state,
+            RunObligationState::Pending
+        );
+
+        let proposed = TaskKernelOperationClaim {
+            operation_id: "second".to_string(),
+            stable_operation_key: "operation:second".to_string(),
+            tool_name: "terminal".to_string(),
+            obligation_ids: vec![first_obligation.to_string(), second_obligation.to_string()],
+            max_attempts: 1,
+            max_invocations: 1,
+            idempotency_key: None,
+            operation_lineage: None,
+        };
+        let effective = aggregate.effective_operation_claim(&proposed);
+        assert_eq!(effective.obligation_ids, [first_obligation]);
+        assert_eq!(effective.max_invocations, 3);
+        assert_eq!(effective.max_attempts, 3);
+        assert_eq!(
+            aggregate.admit_operation(&effective),
+            TaskKernelAdmission::Admitted
+        );
     }
 
     fn result(

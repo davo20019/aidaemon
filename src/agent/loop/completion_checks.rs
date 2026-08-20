@@ -80,6 +80,19 @@ pub(super) fn build_receipt_closeout_reply(
         .as_ref()
         .map(|receipt| receipt.invocation_stage.as_str())
         .unwrap_or("unknown");
+    let receipt_facts = result.receipt.as_ref().map(|receipt| {
+        let denial = receipt
+            .access_denial
+            .as_ref()
+            .map(|denial| denial.reason_code.as_str())
+            .unwrap_or("none");
+        format!(
+            " Receipt facts: dispatched={}; contract_rejected={}; authoritative_chars={}; access_denial=`{denial}`.",
+            receipt.invocation_stage.reached_dispatch(),
+            receipt.contract_rejected,
+            receipt.result_provenance.authoritative_chars,
+        )
+    }).unwrap_or_default();
     let detail = result
         .error
         .as_deref()
@@ -105,7 +118,7 @@ pub(super) fn build_receipt_closeout_reply(
         .map(|detail| format!(" Detail: {detail}."))
         .unwrap_or_default();
     format!(
-        "The {} operation ended with durable typed outcome `{status}` at `{stage}`{exit}, but it did not satisfy all requested obligations.{detail} No successful completion is claimed.",
+        "The {} operation ended with durable typed outcome `{status}` at `{stage}`{exit}, but it did not satisfy all requested obligations.{receipt_facts}{detail} No successful completion is claimed.",
         result.name,
     )
 }

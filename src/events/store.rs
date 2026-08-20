@@ -1172,7 +1172,7 @@ impl EventStore {
     /// admission is the only dispatch authority.
     pub(crate) async fn admit_and_append_tool_call(
         &self,
-        event: Event,
+        mut event: Event,
         claim: &crate::events::TaskKernelOperationClaim,
     ) -> anyhow::Result<(i64, crate::events::TaskKernelAdmission)> {
         anyhow::ensure!(
@@ -1182,7 +1182,8 @@ impl EventStore {
         let task_id = event
             .task_id
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("kernel tool claim requires task identity"))?;
+            .ok_or_else(|| anyhow::anyhow!("kernel tool claim requires task identity"))?
+            .to_string();
         let persisted_claim: ToolCallData = serde_json::from_value(event.data.clone())?;
         anyhow::ensure!(
             persisted_claim.tool_call_id == claim.operation_id
@@ -1207,11 +1208,21 @@ impl EventStore {
             "#,
         )
         .bind(&event.session_id)
-        .bind(task_id)
+        .bind(&task_id)
         .fetch_all(&mut *tx)
         .await?;
-        let aggregate = RunAggregate::replay(task_id, &self.rows_to_events(rows)?);
-        let admission = aggregate.admit_operation(claim);
+        let aggregate = RunAggregate::replay(&task_id, &self.rows_to_events(rows)?);
+        let effective_claim = aggregate.effective_operation_claim(claim);
+        let admission = aggregate.admit_operation(&effective_claim);
+
+        // Persist the kernel's effective binding, not the producer's static
+        // compatibility set. This makes replay and live admission share the
+        // same authoritative ownership after sibling obligations close.
+        let mut effective_call = persisted_claim;
+        effective_call.obligation_ids = effective_claim.obligation_ids;
+        effective_call.max_operation_attempts = Some(effective_claim.max_attempts);
+        effective_call.max_operation_invocations = Some(effective_claim.max_invocations);
+        event.data = serde_json::to_value(effective_call)?;
 
         let data_json = serde_json::to_string(&event.data)?;
         let result = sqlx::query(

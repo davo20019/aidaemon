@@ -421,8 +421,52 @@ fn normalize_receipt_for_tool_protocol(
         receipt.outcome_statuses.retain(|status| {
             *status != crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
         });
+        if receipt.outcome_condition == Some(RequestedOutcomeCondition::CompletedWithNegativeResult)
+        {
+            // A "completed negative" is specifically a normal process exit.
+            // Generic and HTTP adapters expose only terminal success,
+            // failure, blocking, or contract rejection. Preserve the user's
+            // negative-result intent in the adapter's actual outcome algebra
+            // instead of installing a predicate no receipt can satisfy.
+            receipt.outcome_condition = Some(RequestedOutcomeCondition::NonSuccessTerminal);
+            receipt.requires_output = false;
+        } else if matches!(
+            receipt.outcome_condition,
+            Some(RequestedOutcomeCondition::ContractRejected)
+                | Some(RequestedOutcomeCondition::Blocked)
+        ) {
+            // These dispositions can occur before the adapter produces result
+            // bytes. Their typed receipt is authoritative evidence by itself.
+            receipt.requires_output = false;
+        }
     }
     receipt
+}
+
+fn semantic_scope_fallback_requirement(scope: ToolSemanticScope) -> RequestEvidenceRequirement {
+    let (purpose, temporal_scope) = if scope == ToolSemanticScope::ConversationHistory {
+        (
+            EvidencePurpose::HistoricalRecord,
+            EvidenceTemporalScope::Historical,
+        )
+    } else {
+        (
+            EvidencePurpose::CurrentState,
+            EvidenceTemporalScope::Current,
+        )
+    };
+    RequestEvidenceRequirement {
+        // The summary is advisory investigation guidance. Typed scope,
+        // purpose, authority, and time are the proof invariant.
+        summary: format!("Observe the requested {} state", scope.as_str()),
+        acceptable_scopes: vec![scope],
+        purpose,
+        minimum_authority: EvidenceAuthority::Direct,
+        temporal_scope,
+        required_content_markers: Vec::new(),
+        receipt: None,
+        target: None,
+    }
 }
 
 fn canonical_invocation_requirement(
@@ -577,12 +621,35 @@ fn compile_obligations(
         }
     }
 
+    // Relationship assessment and completion assessment are independent
+    // producer lanes. A typed subject domain cannot be discarded merely
+    // because the completion producer emitted an empty/conversational core;
+    // doing so lets state-dependent questions complete without observing the
+    // state. Reconcile the lanes here, below prose and above execution.
+    if evidence.is_empty() && invocations.is_empty() {
+        if let Some(scope) = request_semantic_scope {
+            // Conversation continuity is already supplied as a typed,
+            // task-bounded context projection. Requiring an additional tool
+            // receipt for that same lane would turn ordinary follow-ups into
+            // history-search loops. Durable resource domains, by contrast,
+            // are not present unless an observation reads them.
+            if scope != ToolSemanticScope::ConversationHistory {
+                let fallback = semantic_scope_fallback_requirement(scope);
+                if crate::agent::inquiry::requirement_has_builtin_evidence_route(&fallback) {
+                    evidence.push(fallback);
+                }
+            }
+        }
+    }
+
     // Keep the invocation lane separate in the compiled value. Installation
     // creates its canonical proof nodes once, after every producer has passed
     // through this same compiler.
     let installed_count = evidence.len() + invocations.len();
     let accepted = candidate_count == 0 || installed_count > 0;
-    let reason = if candidate_count == 0 {
+    let reason = if candidate_count == 0 && installed_count > 0 {
+        "semantic_scope_reconciled"
+    } else if candidate_count == 0 {
         "empty"
     } else if installed_count == candidate_count {
         "accepted"
@@ -1081,6 +1148,9 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     if let Some(core) = compiled.core.as_mut() {
         core.requires_observation |=
             !compiled.evidence_requirements.is_empty() || !compiled.required_invocations.is_empty();
+        if core.requires_observation && core.task_kind == CompletionTaskKind::Conversational {
+            core.task_kind = CompletionTaskKind::Check;
+        }
     }
 
     // Ensure the helper remains the sole canonical constructor for receipt
@@ -1231,6 +1301,65 @@ mod tests {
     }
 
     #[test]
+    fn typed_state_scope_repairs_an_empty_conversational_completion_lane() {
+        let mut signals = base_signals();
+        signals.task_kind = Some("conversational".to_string());
+        signals.requires_observation = Some(false);
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            request_semantic_scope: Some(ToolSemanticScope::GoalState),
+            available_tool_names: &["scheduled_goal_runs".to_string()],
+            available_tool_receipt_kinds: &[(
+                "scheduled_goal_runs".to_string(),
+                crate::traits::ToolReceiptKind::Generic,
+            )],
+            structural_filesystem_resources: &[],
+            structural_project_scopes: &[],
+            project_alias_roots: &[],
+            current_user_text: "synthetic request",
+        });
+
+        let core = compiled.core.expect("reconciled core");
+        assert_eq!(core.task_kind, CompletionTaskKind::Check);
+        assert!(core.requires_observation);
+        assert_eq!(compiled.evidence_requirements.len(), 1);
+        assert_eq!(
+            compiled.evidence_requirements[0].acceptable_scopes,
+            [ToolSemanticScope::GoalState]
+        );
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "obligations" && decision.reason_code == "semantic_scope_reconciled"
+        }));
+    }
+
+    #[test]
+    fn typed_conversation_projection_does_not_require_a_duplicate_tool_read() {
+        let mut signals = base_signals();
+        signals.task_kind = Some("conversational".to_string());
+        signals.requires_observation = Some(false);
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            request_semantic_scope: Some(ToolSemanticScope::ConversationHistory),
+            available_tool_names: &["search_history".to_string()],
+            available_tool_receipt_kinds: &[(
+                "search_history".to_string(),
+                crate::traits::ToolReceiptKind::Generic,
+            )],
+            structural_filesystem_resources: &[],
+            structural_project_scopes: &[],
+            project_alias_roots: &[],
+            current_user_text: "synthetic request",
+        });
+
+        let core = compiled.core.expect("conversational core");
+        assert_eq!(core.task_kind, CompletionTaskKind::Conversational);
+        assert!(!core.requires_observation);
+        assert!(compiled.evidence_requirements.is_empty());
+    }
+
+    #[test]
     fn ungrounded_observation_lane_cannot_install_a_generic_success_gate() {
         let compiled = compile(&base_signals());
         assert!(compiled.core.is_none());
@@ -1284,6 +1413,46 @@ mod tests {
             predicate.outcome_statuses,
             [crate::traits::ToolOutcomeStatus::Succeeded]
         );
+    }
+
+    #[test]
+    fn generic_adapter_translates_process_only_negative_condition() {
+        let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["manage_mandates".to_string()],
+            outcome_condition: Some(RequestedOutcomeCondition::CompletedWithNegativeResult),
+            requires_output: true,
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        let predicate = &compiled.required_invocations[0];
+        assert_eq!(
+            predicate.outcome_condition,
+            Some(RequestedOutcomeCondition::NonSuccessTerminal)
+        );
+        assert!(!predicate.requires_output);
+    }
+
+    #[test]
+    fn process_adapter_preserves_completed_negative_condition_and_output() {
+        let mut signals = base_signals();
+        signals.required_invocations = Some(vec![RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            outcome_condition: Some(RequestedOutcomeCondition::CompletedWithNegativeResult),
+            requires_output: true,
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        }]);
+
+        let compiled = compile(&signals);
+        let predicate = &compiled.required_invocations[0];
+        assert_eq!(
+            predicate.outcome_condition,
+            Some(RequestedOutcomeCondition::CompletedWithNegativeResult)
+        );
+        assert!(predicate.requires_output);
     }
 
     #[test]

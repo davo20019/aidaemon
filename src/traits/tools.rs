@@ -998,13 +998,17 @@ pub enum ToolAccessEnforcement {
     NotApplicable,
     /// A delegated sandbox adapter accepted the manifest.
     AdapterEnforced,
+    /// The daemon controller rejected the proposal before adapter dispatch
+    /// because it exceeded the compiled task capability.
+    ControllerEnforced,
     /// The daemon installed a kernel-enforced policy from the exact manifest.
     KernelEnforced,
 }
 
-/// Typed diagnostic emitted when a dispatched process is rejected by the
-/// installed filesystem policy. This is audit telemetry only; the manifest
-/// remains the authority and this record never widens it.
+/// Typed diagnostic emitted when a proposal is rejected by the controller or
+/// an adapter is denied by its installed filesystem policy. This is audit
+/// telemetry only; the manifest remains the authority and this record never
+/// widens it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolAccessDenial {
     pub reason_code: String,

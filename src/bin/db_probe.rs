@@ -1975,9 +1975,55 @@ async fn main() -> anyhow::Result<()> {
                     .replace('\n', " ")
             );
             if let Some(data) = parsed.as_ref() {
+                if row.get::<String, _>("event_type") == "task_contract_compiled" {
+                    let contract = data.get("contract").unwrap_or(&serde_json::Value::Null);
+                    let evidence = contract
+                        .get("evidence_requirements")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let invocations = data
+                        .get("required_invocations")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    println!(
+                        "  contract: task_kind={} requires_observation={} evidence={} invocations={} allowed_tools={}",
+                        contract.get("task_kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                        contract.get("requires_observation").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        evidence.len(),
+                        invocations.len(),
+                        contract.get("allowed_tool_names").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                    );
+                    for (index, requirement) in evidence.iter().enumerate() {
+                        println!(
+                            "  evidence[{index}]: purpose={} authority={} temporal={} scopes={} target={} receipt={}",
+                            requirement.get("purpose").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                            requirement.get("minimum_authority").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                            requirement.get("temporal_scope").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                            requirement.get("acceptable_scopes").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                            requirement.get("target").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement.get("receipt").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        );
+                    }
+                    for (index, predicate) in invocations.iter().enumerate() {
+                        println!("  invocation[{index}]: {predicate}");
+                    }
+                }
+                if row.get::<String, _>("event_type") == "tool_call" {
+                    println!(
+                        "  claim: call_id={} stable_key={} obligations={} max_attempts={} max_invocations={} lineage={}",
+                        data.get("tool_call_id").and_then(serde_json::Value::as_str).unwrap_or("none"),
+                        data.get("stable_operation_key").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_attempts").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_invocations").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("operation_lineage").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                    );
+                }
                 if let Some(receipt) = data.get("receipt") {
                     println!(
-                        "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={}",
+                        "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={} closes={} continues={}",
                         data.get("tool_call_id").and_then(|value| value.as_str()).unwrap_or("none"),
                         receipt.get("outcome_status").and_then(|value| value.as_str()).unwrap_or("unknown"),
                         receipt.get("outcome_evidence").and_then(|value| value.as_str()).unwrap_or("unknown"),
@@ -1987,6 +2033,8 @@ async fn main() -> anyhow::Result<()> {
                         receipt.pointer("/result_provenance/model_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
                         receipt.pointer("/result_provenance/durable_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
                         receipt.pointer("/authorization_preflight/status").and_then(|value| value.as_str()).unwrap_or("none"),
+                        receipt.get("completion_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        receipt.get("continuation_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                 }
                 let metadata = data.get("metadata");

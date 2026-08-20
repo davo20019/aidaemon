@@ -920,6 +920,7 @@ impl Agent {
             semantics,
             access_manifest,
             None,
+            None,
         )
         .await
     }
@@ -941,6 +942,7 @@ impl Agent {
         contract_rejected: bool,
         semantics: ToolCallSemantics,
         access_manifest: Option<ToolCallAccessManifest>,
+        access_denial: Option<crate::traits::ToolAccessDenial>,
         kernel_claim: Option<&crate::events::TaskKernelOperationClaim>,
     ) -> anyhow::Result<()> {
         let mut call_data = crate::events::ToolCallData::from_tool_call(
@@ -957,12 +959,21 @@ impl Agent {
                 claim.max_invocations,
             );
         }
-        emitter
-            .emit(crate::events::EventType::ToolCall, call_data)
-            .await?;
+        if let Some(claim) = kernel_claim {
+            // Pre-dispatch denials are still task-kernel proposals. Persist
+            // them through the same atomic admission/reducer boundary as
+            // adapter I/O so obligation ownership and cardinality cannot
+            // diverge by invocation stage.
+            let _ = emitter.emit_admitted_tool_call(call_data, claim).await?;
+        } else {
+            emitter
+                .emit(crate::events::EventType::ToolCall, call_data)
+                .await?;
+        }
 
         let metadata = crate::traits::ToolCallMetadata {
             access_manifest,
+            access_denial,
             outcome_status: Some(outcome_status),
             invocation_stage,
             contract_rejected,
@@ -1089,6 +1100,80 @@ mod tests {
             receipt.invocation_stage,
             crate::traits::ToolInvocationStage::RejectedBeforeDispatch
         );
+    }
+
+    #[tokio::test]
+    async fn claimed_pre_dispatch_denial_uses_kernel_admission_and_typed_enforcement() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .expect("test harness");
+        let task_id = "task-claimed-pre-dispatch";
+        let session_id = "session-claimed-pre-dispatch";
+        let emitter =
+            crate::events::EventEmitter::new(harness.agent.event_store.clone(), session_id)
+                .with_task_id(task_id);
+        let call = ToolCall {
+            id: "call-claimed-pre-dispatch".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path":"/synthetic/denied","content":"x"}"#.to_string(),
+            extra_content: None,
+        };
+        let claim = crate::events::TaskKernelOperationClaim {
+            operation_id: call.id.clone(),
+            stable_operation_key: "synthetic:denied-write".to_string(),
+            tool_name: call.name.clone(),
+            obligation_ids: Vec::new(),
+            max_attempts: 1,
+            max_invocations: 1,
+            idempotency_key: None,
+            operation_lineage: None,
+        };
+        let denial = crate::traits::ToolAccessDenial {
+            reason_code: "controller_scope_contract_rejected".to_string(),
+            enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
+            exit_code: None,
+        };
+
+        harness
+            .agent
+            .persist_pre_dispatch_outcome_with_kernel_claim(
+                &emitter,
+                session_id,
+                task_id,
+                &call,
+                &call.arguments,
+                "synthetic scope refusal".to_string(),
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                true,
+                ToolCallSemantics::default(),
+                None,
+                Some(denial.clone()),
+                Some(&claim),
+            )
+            .await
+            .expect("persist claimed pre-dispatch outcome");
+
+        let events = harness
+            .agent
+            .event_store
+            .query_task_events_for_session(session_id, task_id)
+            .await
+            .expect("query events");
+        assert_eq!(events.len(), 2);
+        let persisted_call = events[0]
+            .parse_data::<crate::events::ToolCallData>()
+            .expect("typed call");
+        assert_eq!(
+            persisted_call.stable_operation_key.as_deref(),
+            Some("synthetic:denied-write")
+        );
+        let result = events[1]
+            .parse_data::<ToolResultData>()
+            .expect("typed result");
+        let receipt = result.receipt.expect("canonical receipt");
+        assert!(receipt.contract_rejected);
+        assert_eq!(receipt.access_denial, Some(denial));
     }
 
     #[test]
