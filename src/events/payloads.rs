@@ -744,6 +744,13 @@ pub struct LlmCallData {
     /// Final provider/recovery error for failed calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Typed terminal provider cause. This is the stable operational signal;
+    /// `error` remains human-readable context and is never parsed for health or
+    /// recovery decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1704,6 +1711,8 @@ mod tests {
             token_usage_evidence: TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
+            provider_error_kind: Some(crate::providers::ProviderErrorKind::Auth),
+            provider_status: Some(401),
         };
         let json = serde_json::to_value(&data).expect("serialize");
         let back: LlmCallData = serde_json::from_value(json).expect("deserialize");
@@ -1735,6 +1744,11 @@ mod tests {
         assert!(back.force_text);
         assert!(!back.failed);
         assert!(back.error.is_none());
+        assert_eq!(
+            back.provider_error_kind,
+            Some(crate::providers::ProviderErrorKind::Auth)
+        );
+        assert_eq!(back.provider_status, Some(401));
     }
 
     #[test]

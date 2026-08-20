@@ -438,6 +438,35 @@ pub struct LlmStats {
     pub avg_output_tokens: u64,
 }
 
+/// Durable, non-invasive readiness projection for the configured model
+/// provider. It observes completed call outcomes; it never spends tokens by
+/// issuing a synthetic probe.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProviderReadiness {
+    pub observed_calls: u64,
+    pub consecutive_failures: u64,
+    pub last_call_at: Option<DateTime<Utc>>,
+    pub latest_failed: bool,
+    pub failure_kind: Option<crate::providers::ProviderErrorKind>,
+    pub provider_status: Option<u16>,
+}
+
+impl ProviderReadiness {
+    /// A terminal account/configuration failure makes the provider unavailable
+    /// immediately. Transient failures require repetition so one network blip
+    /// does not flap service readiness.
+    pub fn is_unavailable(&self) -> bool {
+        self.latest_failed
+            && (matches!(
+                self.failure_kind,
+                Some(
+                    crate::providers::ProviderErrorKind::Auth
+                        | crate::providers::ProviderErrorKind::Billing
+                )
+            ) || self.consecutive_failures >= 3)
+    }
+}
+
 /// Per-task rollup of `LlmCall` telemetry. Powers the self-diagnosis LLM
 /// summary (Tier 1) and the per-turn efficiency reflection signal (Tier 2).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -449,6 +478,10 @@ pub struct TaskLlmSummary {
     pub failed_est_input_tokens: u64,
     /// Most recent terminal provider error, when any call failed.
     pub last_error: Option<String>,
+    /// Typed cause from the latest failed physical call. Goal recovery and
+    /// diagnostics consume this field instead of parsing `last_error` prose.
+    pub last_provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+    pub last_provider_status: Option<u16>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_input_tokens: u64,
@@ -2906,6 +2939,50 @@ impl EventStore {
         })
     }
 
+    /// Project provider readiness from the latest durable physical-call
+    /// outcomes. A later success closes an earlier incident by construction.
+    pub async fn get_provider_readiness(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<ProviderReadiness> {
+        let rows = sqlx::query(
+            r#"
+            SELECT data, created_at
+            FROM events
+            WHERE event_type = 'llm_call'
+              AND created_at >= ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+            "#,
+        )
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut readiness = ProviderReadiness::default();
+        for row in rows {
+            let data: String = row.get("data");
+            let Ok(call) = serde_json::from_str::<LlmCallData>(&data) else {
+                continue;
+            };
+            let created_at: String = row.get("created_at");
+            let observed_at = DateTime::parse_from_rfc3339(&created_at)
+                .ok()
+                .map(|value| value.with_timezone(&Utc));
+            if readiness.observed_calls == 0 {
+                readiness.last_call_at = observed_at;
+                readiness.latest_failed = call.failed;
+                readiness.failure_kind = call.provider_error_kind;
+                readiness.provider_status = call.provider_status;
+            }
+            readiness.observed_calls = readiness.observed_calls.saturating_add(1);
+            if call.failed && readiness.consecutive_failures + 1 == readiness.observed_calls {
+                readiness.consecutive_failures = readiness.consecutive_failures.saturating_add(1);
+            }
+        }
+        Ok(readiness)
+    }
+
     /// Roll up `LlmCall` telemetry for a single task. Used by `self_diagnose`
     /// (Tier 1) and the per-turn efficiency signal at task end (Tier 2).
     pub async fn get_task_llm_stats(&self, task_id: &str) -> anyhow::Result<TaskLlmSummary> {
@@ -2942,6 +3019,10 @@ impl EventStore {
                     .saturating_add(call.est_input_tokens.map(u64::from).unwrap_or_default());
                 if call.error.is_some() {
                     summary.last_error = call.error.clone();
+                }
+                if call.provider_error_kind.is_some() {
+                    summary.last_provider_error_kind = call.provider_error_kind;
+                    summary.last_provider_status = call.provider_status;
                 }
             }
             summary.total_input_tokens += call.input_tokens as u64;
@@ -5769,6 +5850,8 @@ mod tests {
             token_usage_evidence: crate::events::TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
+            provider_error_kind: None,
+            provider_status: None,
         };
         append_event_at(
             store,
@@ -5778,6 +5861,34 @@ mod tests {
             created_at,
         )
         .await;
+    }
+
+    #[test]
+    fn provider_readiness_uses_typed_terminal_causes_and_bounded_transients() {
+        let auth = ProviderReadiness {
+            observed_calls: 1,
+            consecutive_failures: 1,
+            latest_failed: true,
+            failure_kind: Some(crate::providers::ProviderErrorKind::Auth),
+            ..ProviderReadiness::default()
+        };
+        assert!(auth.is_unavailable());
+
+        let one_timeout = ProviderReadiness {
+            observed_calls: 1,
+            consecutive_failures: 1,
+            latest_failed: true,
+            failure_kind: Some(crate::providers::ProviderErrorKind::Timeout),
+            ..ProviderReadiness::default()
+        };
+        assert!(!one_timeout.is_unavailable());
+
+        let repeated_timeout = ProviderReadiness {
+            observed_calls: 3,
+            consecutive_failures: 3,
+            ..one_timeout
+        };
+        assert!(repeated_timeout.is_unavailable());
     }
 
     #[tokio::test]
@@ -5880,7 +5991,9 @@ mod tests {
                 "latency_ms": 42,
                 "est_input_tokens": 777,
                 "failed": true,
-                "error": "LLM request was malformed (400)"
+                "error": "synthetic provider auth rejection",
+                "provider_error_kind": "auth",
+                "provider_status": 401
             }),
             Utc::now(),
         )
@@ -5896,8 +6009,13 @@ mod tests {
         assert_eq!(summary.total_attempts, 2);
         assert_eq!(
             summary.last_error.as_deref(),
-            Some("LLM request was malformed (400)")
+            Some("synthetic provider auth rejection")
         );
+        assert_eq!(
+            summary.last_provider_error_kind,
+            Some(crate::providers::ProviderErrorKind::Auth)
+        );
+        assert_eq!(summary.last_provider_status, Some(401));
         assert!(summary.is_inefficient());
     }
 

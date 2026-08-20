@@ -167,6 +167,36 @@ impl ChatGptSubscriptionImageBackend {
             credentials,
         }
     }
+
+    async fn send_authenticated(
+        &self,
+        url: &str,
+        body: &Value,
+        turn_id: Option<&str>,
+        credentials: &chatgpt_codex::ChatGptCredentials,
+    ) -> Result<reqwest::Response, ImageGenerationError> {
+        let mut request_builder = self
+            .client
+            .post(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", credentials.access_token),
+            )
+            .header("chatgpt-account-id", &credentials.account_id)
+            .header("originator", ORIGINATOR)
+            .header("User-Agent", image_user_agent())
+            .header("accept", "application/json")
+            .header("content-type", "application/json")
+            .json(body);
+        if let Some(turn_id) = turn_id.map(str::trim).filter(|value| !value.is_empty()) {
+            request_builder = request_builder.header("x-codex-image-turn-id", turn_id);
+        }
+        request_builder.send().await.map_err(|error| {
+            ImageGenerationError::retryable(format!(
+                "ChatGPT image request could not be sent: {error}"
+            ))
+        })
+    }
 }
 
 fn normalize_base_url(base_url: Option<&str>) -> String {
@@ -201,7 +231,7 @@ impl ImageGenerationBackend for ChatGptSubscriptionImageBackend {
         &self,
         request: &ImageGenerationRequest,
     ) -> Result<GeneratedImage, ImageGenerationError> {
-        let credentials = self
+        let mut credentials = self
             .credentials
             .usable_credentials(&self.client)
             .await
@@ -237,33 +267,36 @@ impl ImageGenerationBackend for ChatGptSubscriptionImageBackend {
                     .collect(),
             );
         }
-        let mut request_builder = self
-            .client
-            .post(url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", credentials.access_token),
-            )
-            .header("chatgpt-account-id", credentials.account_id)
-            .header("originator", ORIGINATOR)
-            .header("User-Agent", image_user_agent())
-            .header("accept", "application/json")
-            .header("content-type", "application/json")
-            .json(&body);
-        if let Some(turn_id) = request
+        let turn_id = request
             .turn_id
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            request_builder = request_builder.header("x-codex-image-turn-id", turn_id);
+            .filter(|value| !value.is_empty());
+        let mut response = self
+            .send_authenticated(&url, &body, turn_id, &credentials)
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let rejected = credentials.access_token.clone();
+            let _ = response.bytes().await;
+            credentials = self
+                .credentials
+                .refresh_after_rejection(&self.client, &rejected)
+                .await
+                .map_err(|error| ImageGenerationError::blocked(error.to_string()))?;
+            response = self
+                .send_authenticated(&url, &body, turn_id, &credentials)
+                .await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                let response_body = response.text().await.unwrap_or_default();
+                self.credentials
+                    .mark_rejected(
+                        &credentials.access_token,
+                        "ChatGPT image authentication remained rejected after automatic refresh",
+                    )
+                    .await;
+                return Err(chatgpt_image_http_error(401, &response_body));
+            }
         }
-
-        let response = request_builder.send().await.map_err(|error| {
-            ImageGenerationError::retryable(format!(
-                "ChatGPT image request could not be sent: {error}"
-            ))
-        })?;
         let status = response.status();
         let response_body = response.text().await.unwrap_or_default();
         if !status.is_success() {

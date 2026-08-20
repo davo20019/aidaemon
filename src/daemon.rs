@@ -1,14 +1,30 @@
-use axum::{routing::get, Json, Router};
+use std::sync::Arc;
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde_json::json;
+use sqlx::SqlitePool;
 use tracing::info;
+
+#[derive(Clone)]
+struct HealthServerState {
+    pool: SqlitePool,
+    event_store: Arc<crate::events::EventStore>,
+}
 
 /// Start the health check HTTP server.
 ///
 /// Binds to `bind_addr` (default "127.0.0.1") to avoid exposing the
 /// endpoint on all interfaces. Set to "0.0.0.0" in config if external
 /// access is needed.
-pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<()> {
-    let app = Router::new().route("/health", get(health_handler));
+pub async fn start_health_server(
+    port: u16,
+    bind_addr: &str,
+    pool: SqlitePool,
+    event_store: Arc<crate::events::EventStore>,
+) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .with_state(HealthServerState { pool, event_store });
 
     let ip: std::net::IpAddr = bind_addr
         .parse()
@@ -22,8 +38,132 @@ pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+async fn health_handler(State(state): State<HealthServerState>) -> impl IntoResponse {
+    health_response(&state.pool, Some(state.event_store.as_ref())).await
+}
+
+/// Build the shared liveness/readiness response used by both the health-only
+/// server and dashboard. No active provider request is made: readiness comes
+/// from typed durable outcomes and database reachability.
+pub async fn health_response(
+    pool: &SqlitePool,
+    event_store: Option<&crate::events::EventStore>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let database_ready = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(pool)
+        .await
+        .is_ok();
+    let readiness = if let Some(event_store) = event_store {
+        event_store
+            .get_provider_readiness(chrono::Utc::now() - chrono::Duration::hours(24))
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let recent = readiness.as_ref().is_some_and(|readiness| {
+        readiness
+            .last_call_at
+            .is_some_and(|at| at >= chrono::Utc::now() - chrono::Duration::minutes(15))
+    });
+    let provider_unavailable = recent
+        && readiness
+            .as_ref()
+            .is_some_and(crate::events::ProviderReadiness::is_unavailable);
+    let healthy = database_ready && !provider_unavailable;
+    let provider_status = match readiness.as_ref() {
+        Some(_) if provider_unavailable => "unavailable",
+        Some(readiness) if readiness.observed_calls == 0 => "unknown",
+        Some(_) if !recent => "stale",
+        Some(readiness) if readiness.latest_failed => "recovering",
+        Some(_) => "ready",
+        None => "unknown",
+    };
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if healthy { "ok" } else { "degraded" },
+            "components": {
+                "database": { "status": if database_ready { "ready" } else { "unavailable" } },
+                "provider": {
+                    "status": provider_status,
+                    "last_call_at": readiness.as_ref().and_then(|value| value.last_call_at),
+                    "consecutive_failures": readiness.as_ref().map(|value| value.consecutive_failures).unwrap_or_default(),
+                    "failure_kind": readiness.as_ref().and_then(|value| value.failure_kind),
+                    "provider_status": readiness.as_ref().and_then(|value| value.provider_status),
+                }
+            }
+        })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn health_fixture() -> (
+        SqlitePool,
+        Arc<crate::events::EventStore>,
+        tempfile::NamedTempFile,
+    ) {
+        let file = tempfile::NamedTempFile::new().expect("temporary health database");
+        let pool = SqlitePool::connect(&format!("sqlite:{}", file.path().display()))
+            .await
+            .expect("connect health database");
+        let event_store = Arc::new(
+            crate::events::EventStore::new(pool.clone())
+                .await
+                .expect("event store"),
+        );
+        (pool, event_store, file)
+    }
+
+    async fn append_provider_outcome(
+        event_store: &crate::events::EventStore,
+        failed: bool,
+        kind: Option<crate::providers::ProviderErrorKind>,
+    ) {
+        event_store
+            .append(crate::events::Event::new(
+                "synthetic-health-session",
+                crate::events::EventType::LlmCall,
+                json!({
+                    "task_id": "synthetic-health-task",
+                    "model": "synthetic-model",
+                    "latency_ms": 1,
+                    "failed": failed,
+                    "provider_error_kind": kind,
+                    "provider_status": if failed { Some(401) } else { None::<u16> }
+                }),
+            ))
+            .await
+            .expect("append provider outcome");
+    }
+
+    #[tokio::test]
+    async fn health_is_degraded_by_typed_auth_failure_and_closed_by_later_success() {
+        let (pool, event_store, _file) = health_fixture().await;
+        append_provider_outcome(
+            event_store.as_ref(),
+            true,
+            Some(crate::providers::ProviderErrorKind::Auth),
+        )
+        .await;
+
+        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["components"]["provider"]["status"], "unavailable");
+
+        append_provider_outcome(event_store.as_ref(), false, None).await;
+        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["components"]["provider"]["status"], "ready");
+    }
 }
 
 /// Generate and write a systemd service file (Linux).

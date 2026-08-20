@@ -183,6 +183,8 @@ pub async fn record_background_model_call_telemetry(
                 token_usage_evidence: super::TokenUsageEvidence::Unavailable,
                 failed: false,
                 error: None,
+                provider_error_kind: None,
+                provider_status: None,
             },
             token_usage: response.usage.clone(),
         },

@@ -630,6 +630,8 @@ pub(crate) fn spawn_dashboard_or_health_server(
     } = dependencies;
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
+    let health_pool = pool.clone();
+    let health_event_store = event_store.clone();
 
     if config.daemon.dashboard_enabled {
         match crate::dashboard::get_or_create_dashboard_token() {
@@ -672,7 +674,13 @@ pub(crate) fn spawn_dashboard_or_health_server(
                     "Dashboard token init failed, falling back to health-only server"
                 );
                 tokio::spawn(async move {
-                    if let Err(error) = daemon::start_health_server(health_port, &health_bind).await
+                    if let Err(error) = daemon::start_health_server(
+                        health_port,
+                        &health_bind,
+                        health_pool,
+                        health_event_store,
+                    )
+                    .await
                     {
                         tracing::error!(%error, "Health server error");
                     }
@@ -681,7 +689,14 @@ pub(crate) fn spawn_dashboard_or_health_server(
         }
     } else {
         tokio::spawn(async move {
-            if let Err(error) = daemon::start_health_server(health_port, &health_bind).await {
+            if let Err(error) = daemon::start_health_server(
+                health_port,
+                &health_bind,
+                health_pool,
+                health_event_store,
+            )
+            .await
+            {
                 tracing::error!(%error, "Health server error");
             }
         });

@@ -1189,6 +1189,8 @@ pub(super) async fn run_llm_phase(
         token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
         failed: false,
         error: None,
+        provider_error_kind: None,
+        provider_status: None,
     };
     // Keep the heartbeat alive for the duration of the LLM call so the
     // channel stale-watchdog does not cancel a slow-but-progressing
@@ -1241,6 +1243,7 @@ pub(super) async fn run_llm_phase(
             )
             .await;
             let error_message = error.to_string();
+            let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
             let mut failed_call = base_llm_call.clone();
             failed_call.final_model = Some(if llm_telemetry.final_model.is_empty() {
                 effective_model.to_string()
@@ -1252,6 +1255,8 @@ pub(super) async fn run_llm_phase(
             failed_call.latency_ms = llm_call_start.elapsed().as_millis() as u64;
             failed_call.failed = true;
             failed_call.error = Some(error_message.clone());
+            failed_call.provider_error_kind = provider_error.map(|error| error.kind);
+            failed_call.provider_status = provider_error.and_then(|error| error.status);
             crate::events::record_model_call_telemetry(
                 emitter,
                 services.agent.state.as_ref(),
@@ -1354,6 +1359,7 @@ pub(super) async fn run_llm_phase(
             failed_call.latency_ms = llm_call_start.elapsed().as_millis() as u64;
             failed_call.failed = true;
             failed_call.error = Some(timeout_message.clone());
+            failed_call.provider_error_kind = Some(crate::providers::ProviderErrorKind::Timeout);
             crate::events::record_model_call_telemetry(
                 emitter,
                 services.agent.state.as_ref(),

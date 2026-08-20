@@ -36,8 +36,8 @@ pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]
 pub use store::{
     ContinuationToolEvidence, EventEmitter, EventStore, LlmStats, PolicyGraduationReport,
-    SessionWriteDrift, TaskLlmSummary, TaskReceiptClosure, TaskWindowStats, ToolStats,
-    WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
+    ProviderReadiness, SessionWriteDrift, TaskLlmSummary, TaskReceiptClosure, TaskWindowStats,
+    ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
 };
 #[allow(unused_imports)]
 pub use terminal_state::TerminalState;

@@ -1604,7 +1604,10 @@ async fn main() -> anyhow::Result<()> {
         r#"
         SELECT
           json_extract(data, '$.call_id') AS call_id,
-          json_extract(data, '$.token_usage_present') AS token_usage_present
+          json_extract(data, '$.token_usage_present') AS token_usage_present,
+          json_extract(data, '$.token_usage_evidence') AS token_usage_evidence,
+          json_extract(data, '$.est_input_tokens') AS est_input_tokens,
+          json_extract(data, '$.failed') AS failed
         FROM events
         WHERE event_type = 'llm_call'
           AND created_at >= ?
@@ -1615,6 +1618,9 @@ async fn main() -> anyhow::Result<()> {
     .await
     .unwrap_or_default();
     let mut events_with_usage = 0i64;
+    let mut estimate_only_calls = 0u64;
+    let mut estimate_only_input_tokens = 0u64;
+    let mut failed_calls_without_provider_usage = 0u64;
     let mut event_rows = Vec::with_capacity(llm_rows.len());
     for row in &llm_rows {
         let call_id = row.try_get::<Option<String>, _>("call_id").unwrap_or(None);
@@ -1624,6 +1630,23 @@ async fn main() -> anyhow::Result<()> {
             == Some(1);
         if token_usage_present {
             events_with_usage += 1;
+        }
+        let evidence = row
+            .try_get::<Option<String>, _>("token_usage_evidence")
+            .unwrap_or(None);
+        if evidence.as_deref() == Some("estimated_input_only") {
+            estimate_only_calls = estimate_only_calls.saturating_add(1);
+            estimate_only_input_tokens = estimate_only_input_tokens.saturating_add(
+                row.try_get::<Option<i64>, _>("est_input_tokens")
+                    .unwrap_or(None)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+            );
+        }
+        let failed = row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1);
+        if failed && !token_usage_present {
+            failed_calls_without_provider_usage =
+                failed_calls_without_provider_usage.saturating_add(1);
         }
         event_rows.push((call_id, token_usage_present));
     }
@@ -1658,6 +1681,10 @@ async fn main() -> anyhow::Result<()> {
         &event_rows,
         &all_token_call_ids,
         &all_event_rows,
+    );
+    println!(
+        "- provider_usage_unavailable_failed_calls={} estimate_only_calls={} estimated_input_tokens={} (estimate; not provider-measured billing)",
+        failed_calls_without_provider_usage, estimate_only_calls, estimate_only_input_tokens
     );
     println!(
         "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} unattributed_legacy_token_rows={} unattributed_legacy_event_rows={}",
@@ -1830,6 +1857,11 @@ async fn main() -> anyhow::Result<()> {
             json_extract(data, '$.cached_input_tokens') AS cached_input_tokens,
             json_extract(data, '$.fresh_input_tokens') AS fresh_input_tokens,
             json_extract(data, '$.cache_creation_input_tokens') AS cache_creation_input_tokens
+            ,json_extract(data, '$.est_input_tokens') AS est_input_tokens
+            ,json_extract(data, '$.token_usage_evidence') AS token_usage_evidence
+            ,json_extract(data, '$.failed') AS failed
+            ,json_extract(data, '$.provider_error_kind') AS provider_error_kind
+            ,json_extract(data, '$.provider_status') AS provider_status
         FROM events
         WHERE event_type = 'llm_call'
         ORDER BY id DESC
@@ -1856,7 +1888,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => None,
             };
             println!(
-                "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} at={}",
+                "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={:?} usage_evidence={:?} failed={} failure_kind={:?} provider_status={:?} at={}",
                 row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
                 row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
@@ -1871,6 +1903,11 @@ async fn main() -> anyhow::Result<()> {
                 row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                     .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
+                row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None),
+                row.try_get::<Option<String>, _>("token_usage_evidence").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1),
+                row.try_get::<Option<String>, _>("provider_error_kind").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("provider_status").unwrap_or(None),
                 row.get::<String, _>("created_at"),
             );
         }

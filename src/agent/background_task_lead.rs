@@ -50,13 +50,19 @@ fn count_successful_completed_work(
         .count()
 }
 
-fn task_failed_only_due_to_provider_infrastructure(task: &crate::traits::Task) -> bool {
-    task.status == "failed"
-        && task
-            .error
-            .as_deref()
-            .or(task.result.as_deref())
-            .is_some_and(crate::providers::is_provider_infra_error_text)
+async fn task_failed_only_due_to_provider_infrastructure(
+    task: &crate::traits::Task,
+    event_store: &crate::events::EventStore,
+) -> bool {
+    if task.status != "failed" {
+        return false;
+    }
+    event_store
+        .get_task_llm_stats(&task.id)
+        .await
+        .ok()
+        .and_then(|summary| summary.last_provider_error_kind)
+        .is_some_and(crate::providers::ProviderErrorKind::is_infrastructure_failure)
 }
 
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
@@ -1908,7 +1914,12 @@ pub fn spawn_background_task_lead(
             // block the run.
             if !is_mandate_run && task_lead_outcome == Some(TaskOutcome::Succeeded) {
                 for task in &mut trigger_work_tasks {
-                    if !task_failed_only_due_to_provider_infrastructure(task) {
+                    if !task_failed_only_due_to_provider_infrastructure(
+                        task,
+                        agent.event_store.as_ref(),
+                    )
+                    .await
+                    {
                         continue;
                     }
                     let mut superseded = task.clone();
@@ -2264,9 +2275,13 @@ pub fn spawn_background_task_lead(
                     match classify_continuous_dispatch_outcome(
                         dispatch_made_progress,
                         result.is_err(),
-                        result.as_ref().err().is_some_and(|error| {
-                            crate::providers::is_provider_infra_error_text(&error.to_string())
-                        }),
+                        result
+                            .as_ref()
+                            .err()
+                            .and_then(|error| {
+                                error.downcast_ref::<crate::providers::ProviderError>()
+                            })
+                            .is_some_and(|error| error.kind.is_infrastructure_failure()),
                         all_remaining_blocked && !tasks.is_empty(),
                     ) {
                         ContinuousDispatchOutcome::Progress => {
@@ -3668,40 +3683,6 @@ mod tests {
             classify_continuous_dispatch_outcome(false, true, true, false),
             ContinuousDispatchOutcome::TransientInfrastructureFailure
         );
-    }
-
-    #[test]
-    fn only_provider_infrastructure_failures_can_be_superseded_by_direct_recovery() {
-        let failed_task = |error: &str| crate::traits::Task {
-            id: "work-1".to_string(),
-            goal_id: "goal-1".to_string(),
-            description: "Publish synthetic artifact".to_string(),
-            status: "failed".to_string(),
-            priority: "medium".to_string(),
-            task_order: 0,
-            parallel_group: None,
-            depends_on: None,
-            agent_id: None,
-            context: None,
-            result: None,
-            error: Some(error.to_string()),
-            blocker: None,
-            idempotent: false,
-            retry_count: 0,
-            max_retries: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            started_at: None,
-            completed_at: Some(chrono::Utc::now().to_rfc3339()),
-        };
-
-        assert!(task_failed_only_due_to_provider_infrastructure(
-            &failed_task(
-                "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
-            )
-        ));
-        assert!(!task_failed_only_due_to_provider_infrastructure(
-            &failed_task("Verification failed: the public URL returned HTTP 404")
-        ));
     }
 
     #[test]

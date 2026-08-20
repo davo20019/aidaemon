@@ -490,7 +490,7 @@ impl Agent {
                         kind = ?provider_err.kind,
                         "Provider recovery graph reached a terminal state"
                     );
-                    return Err(anyhow::anyhow!("{}", provider_err.user_message()));
+                    return Err(provider_err.into());
                 }
                 let provider_label =
                     provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());

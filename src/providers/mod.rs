@@ -14,9 +14,6 @@ use reqwest::Client;
 use tracing::warn;
 
 pub use anthropic_native::AnthropicNativeProvider;
-// Re-exported for goal-dispatch healing (consumed from src/agent/ in later tasks).
-#[allow(unused_imports)]
-pub use error::is_provider_infra_error_text;
 pub(crate) use error::ProviderRecoveryRoute;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;

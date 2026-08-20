@@ -68,6 +68,11 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
 /// straddle the boundary.
 const REFRESH_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 
+/// A credential rejected by the remote authority must not be retried on every
+/// model candidate or task. The token endpoint remains the recovery authority;
+/// this cooldown only prevents a tight loop after that recovery also fails.
+const AUTH_REJECTION_COOLDOWN: chrono::Duration = chrono::Duration::minutes(1);
+
 fn client_id() -> String {
     std::env::var("AIDAEMON_CHATGPT_CLIENT_ID")
         .ok()
@@ -104,64 +109,205 @@ impl ChatGptCredentials {
 /// an individual model or image provider, prevents concurrent adapters from
 /// refreshing the same token and invalidating one another.
 pub struct ChatGptCredentialManager {
-    credentials: Mutex<Option<ChatGptCredentials>>,
+    state: Mutex<CredentialState>,
+    token_url: String,
+    persist_refreshes: bool,
+}
+
+#[derive(Default)]
+struct CredentialState {
+    credentials: Option<ChatGptCredentials>,
+    rejection: Option<CredentialRejection>,
+}
+
+#[derive(Clone)]
+struct CredentialRejection {
+    access_token: String,
+    observed_at: DateTime<Utc>,
+    detail: String,
 }
 
 impl ChatGptCredentialManager {
     fn new() -> Self {
         Self {
-            credentials: Mutex::new(None),
+            state: Mutex::new(CredentialState::default()),
+            token_url: TOKEN_URL.to_string(),
+            persist_refreshes: true,
         }
     }
 
     /// Return a usable access token, refreshing and persisting it under one
     /// process-wide lock when it is close to expiry.
     pub async fn usable_credentials(&self, client: &reqwest::Client) -> Result<ChatGptCredentials> {
-        let mut guard = self.credentials.lock().await;
+        let mut state = self.state.lock().await;
 
-        if guard.is_none() {
-            *guard = load_credentials();
+        if state.credentials.is_none() {
+            state.credentials = load_credentials();
         }
 
-        let current = guard.clone().ok_or_else(|| {
+        let current = state.credentials.clone().ok_or_else(|| {
             anyhow!(
                 "No ChatGPT subscription login found. Run `aidaemon auth login openai` to connect \
                  your ChatGPT account."
             )
         })?;
 
+        if let Some(rejection) = state.rejection.as_ref().filter(|rejection| {
+            rejection.access_token == current.access_token
+                && rejection.observed_at + AUTH_REJECTION_COOLDOWN > Utc::now()
+        }) {
+            return Err(anyhow!(rejection.detail.clone()));
+        }
+
         if !current.needs_refresh(Utc::now()) {
             return Ok(current);
         }
 
         debug!("Refreshing ChatGPT subscription access token");
-        match refresh_credentials(client, &current).await {
+        match refresh_credentials_at(client, &current, &self.token_url).await {
             Ok(refreshed) => {
                 // Persist immediately: OpenAI rotates refresh tokens and the
                 // old token may already be dead.
-                if let Err(error) = store_credentials(&refreshed) {
-                    warn!(%error, "Refreshed ChatGPT tokens could not be persisted");
+                if self.persist_refreshes {
+                    if let Err(error) = store_credentials(&refreshed) {
+                        warn!(%error, "Refreshed ChatGPT tokens could not be persisted");
+                    }
                 }
-                *guard = Some(refreshed.clone());
+                state.credentials = Some(refreshed.clone());
+                state.rejection = None;
                 Ok(refreshed)
             }
             Err(error) => {
-                // Reload storage on the next call instead of retrying a token
-                // that is already known to be unusable.
-                *guard = None;
+                state.rejection = Some(CredentialRejection {
+                    access_token: current.access_token,
+                    observed_at: Utc::now(),
+                    detail: error.to_string(),
+                });
                 Err(error)
             }
         }
     }
 
+    /// Recover after the resource server rejects an access token even though
+    /// its locally stored expiry is still in the future.
+    ///
+    /// The rejected token is compared while holding the process-wide refresh
+    /// lock. If another request already rotated it, that newer credential is
+    /// reused instead of refreshing twice. Otherwise refresh is forced once,
+    /// independent of the local clock, and the rotated chain is persisted.
+    pub async fn refresh_after_rejection(
+        &self,
+        client: &reqwest::Client,
+        rejected_access_token: &str,
+    ) -> Result<ChatGptCredentials> {
+        self.refresh_after_rejection_with(
+            rejected_access_token,
+            self.persist_refreshes,
+            |current| async move { refresh_credentials_at(client, &current, &self.token_url).await },
+        )
+        .await
+    }
+
+    async fn refresh_after_rejection_with<F, Fut>(
+        &self,
+        rejected_access_token: &str,
+        persist: bool,
+        refresh: F,
+    ) -> Result<ChatGptCredentials>
+    where
+        F: FnOnce(ChatGptCredentials) -> Fut,
+        Fut: std::future::Future<Output = Result<ChatGptCredentials>>,
+    {
+        let mut state = self.state.lock().await;
+        if state.credentials.is_none() {
+            state.credentials = load_credentials();
+        }
+        let current = state.credentials.clone().ok_or_else(|| {
+            anyhow!(
+                "No ChatGPT subscription login found. Run `aidaemon auth login openai` to connect \
+                 your ChatGPT account."
+            )
+        })?;
+
+        if current.access_token != rejected_access_token {
+            return Ok(current);
+        }
+        if let Some(rejection) = state.rejection.as_ref().filter(|rejection| {
+            rejection.access_token == current.access_token
+                && rejection.observed_at + AUTH_REJECTION_COOLDOWN > Utc::now()
+        }) {
+            return Err(anyhow!(rejection.detail.clone()));
+        }
+
+        debug!("Refreshing ChatGPT credentials after remote authentication rejection");
+        match refresh(current.clone()).await {
+            Ok(refreshed) => {
+                if persist {
+                    if let Err(error) = store_credentials(&refreshed) {
+                        warn!(%error, "Remotely recovered ChatGPT tokens could not be persisted");
+                    }
+                }
+                state.credentials = Some(refreshed.clone());
+                state.rejection = None;
+                Ok(refreshed)
+            }
+            Err(error) => {
+                state.rejection = Some(CredentialRejection {
+                    access_token: current.access_token,
+                    observed_at: Utc::now(),
+                    detail: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Record that the one post-refresh replay was also rejected. Subsequent
+    /// calls fail fast during the cooldown rather than amplifying bad auth
+    /// across planning, relationship, finalizer, and model-candidate lanes.
+    pub async fn mark_rejected(&self, rejected_access_token: &str, detail: impl Into<String>) {
+        let mut state = self.state.lock().await;
+        if state
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_token == rejected_access_token)
+        {
+            state.rejection = Some(CredentialRejection {
+                access_token: rejected_access_token.to_string(),
+                observed_at: Utc::now(),
+                detail: detail.into(),
+            });
+        }
+    }
+
     async fn replace_cached(&self, credentials: Option<ChatGptCredentials>) {
-        *self.credentials.lock().await = credentials;
+        *self.state.lock().await = CredentialState {
+            credentials,
+            rejection: None,
+        };
     }
 
     #[cfg(test)]
     pub(crate) fn with_credentials(credentials: ChatGptCredentials) -> Self {
         Self {
-            credentials: Mutex::new(Some(credentials)),
+            state: Mutex::new(CredentialState {
+                credentials: Some(credentials),
+                rejection: None,
+            }),
+            token_url: TOKEN_URL.to_string(),
+            persist_refreshes: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_token_url(credentials: ChatGptCredentials, token_url: String) -> Self {
+        Self {
+            state: Mutex::new(CredentialState {
+                credentials: Some(credentials),
+                rejection: None,
+            }),
+            token_url,
+            persist_refreshes: false,
         }
     }
 }
@@ -376,12 +522,13 @@ pub async fn exchange_code(
 ///
 /// OpenAI rotates refresh tokens, so the returned credentials must be persisted —
 /// continuing to use the old refresh token can invalidate the chain.
-pub async fn refresh_credentials(
+async fn refresh_credentials_at(
     client: &reqwest::Client,
     previous: &ChatGptCredentials,
+    token_url: &str,
 ) -> Result<ChatGptCredentials> {
     let resp = client
-        .post(TOKEN_URL)
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", &client_id()),
@@ -760,6 +907,78 @@ mod tests {
             ..soon.clone()
         };
         assert!(!later.needs_refresh(now));
+    }
+
+    fn synthetic_credentials(access_token: &str) -> ChatGptCredentials {
+        ChatGptCredentials {
+            access_token: access_token.to_string(),
+            refresh_token: "synthetic-refresh".into(),
+            account_id: "acct-synthetic-1".into(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_rejection_forces_refresh_before_local_expiry() {
+        let manager = ChatGptCredentialManager::with_credentials(synthetic_credentials("old"));
+        let refreshed = manager
+            .refresh_after_rejection_with("old", false, |_current| async {
+                Ok(synthetic_credentials("rotated"))
+            })
+            .await
+            .expect("forced refresh");
+
+        assert_eq!(refreshed.access_token, "rotated");
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .credentials
+                .as_ref()
+                .unwrap()
+                .access_token,
+            "rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rejection_reuses_concurrently_rotated_credentials() {
+        let manager = ChatGptCredentialManager::with_credentials(synthetic_credentials("rotated"));
+        let refresh_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = refresh_calls.clone();
+        let credentials = manager
+            .refresh_after_rejection_with("old", false, move |_current| async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(synthetic_credentials("unexpected"))
+            })
+            .await
+            .expect("newer credential should be reusable");
+
+        assert_eq!(credentials.access_token, "rotated");
+        assert_eq!(refresh_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_remote_recovery_opens_bounded_auth_circuit() {
+        let manager = ChatGptCredentialManager::with_credentials(synthetic_credentials("bad"));
+        let first = manager
+            .refresh_after_rejection_with("bad", false, |_current| async {
+                Err(anyhow!("synthetic refresh rejection"))
+            })
+            .await;
+        assert!(first.is_err());
+
+        let refresh_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = refresh_calls.clone();
+        let second = manager
+            .refresh_after_rejection_with("bad", false, move |_current| async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(synthetic_credentials("unexpected"))
+            })
+            .await;
+        assert!(second.is_err());
+        assert_eq!(refresh_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -21,7 +21,8 @@ pub enum MalformedResponseReason {
     Shape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
     /// 401/403 — bad API key or permissions.
     Auth,
@@ -62,6 +63,14 @@ pub(crate) enum ProviderRecoveryRoute {
 }
 
 impl ProviderError {
+    /// Whether changing only the model cannot recover this failure. Candidate
+    /// lists in the agent are model alternatives behind one provider/account;
+    /// an account authentication rejection therefore applies to the whole
+    /// candidate domain and must fail fast instead of amplifying requests.
+    pub fn prevents_model_fallback(&self) -> bool {
+        self.kind == ProviderErrorKind::Auth
+    }
+
     pub(crate) fn recovery_route(&self, single_attempt_fail_closed: bool) -> ProviderRecoveryRoute {
         use ProviderRecoveryRoute::*;
 
@@ -251,6 +260,24 @@ impl ProviderError {
     }
 }
 
+impl ProviderErrorKind {
+    /// Provider/account/platform failures that should preserve autonomous work
+    /// for a later retry rather than count as semantic no-progress. Request
+    /// shape and malformed-response failures are deliberately excluded.
+    pub fn is_infrastructure_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Auth
+                | Self::Billing
+                | Self::RateLimit
+                | Self::NotFound
+                | Self::Timeout
+                | Self::Network
+                | Self::ServerError
+        )
+    }
+}
+
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(status) = self.status {
@@ -307,47 +334,6 @@ fn parse_affordable_from_text(text: &str) -> Option<u32> {
     let after = &text[pos + marker.len()..];
     let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     num_str.parse::<u32>().ok().filter(|&n| n > 0)
-}
-
-/// Multi-word markers for provider-infrastructure failures (rate limits,
-/// timeouts, network, server errors, auth, billing, model-unavailable).
-/// These match the strings produced by `user_message()` /
-/// `recovery_failed_message()` above plus common raw provider phrasing.
-/// Multi-word `.contains()` matching is intentional here (see CLAUDE.md
-/// keyword-matching exceptions): each phrase is specific enough to avoid
-/// false positives on task-semantic failures.
-///
-/// `BadRequest` and `MalformedResponse` are deliberately excluded: they can
-/// indicate persistent prompt/schema bugs rather than transient outages, so
-/// retrying them blindly would loop.
-#[allow(dead_code)]
-const PROVIDER_INFRA_ERROR_MARKERS: &[&str] = &[
-    "fallback recovery did not succeed",
-    "remained rate limited during recovery",
-    "kept timing out during recovery",
-    "could not reach the llm provider",
-    "kept returning server errors",
-    "llm api authentication failed",
-    "llm api billing error",
-    "llm request timed out",
-    "rate limited. retrying",
-    "llm provider is experiencing issues",
-    "cannot reach llm provider",
-    "falling back to previous model",
-    "our servers are currently overloaded",
-    "codex stream failed",
-];
-
-/// True when an error string describes a transient/provider-infrastructure
-/// failure rather than a semantic task failure. Used by the goal dispatch
-/// circuit breaker: infra failures should be retried later, never counted
-/// as goal-level "no progress".
-#[allow(dead_code)]
-pub fn is_provider_infra_error_text(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    PROVIDER_INFRA_ERROR_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
 }
 
 /// Truncate a string to at most `max_len` bytes, respecting UTF-8 char boundaries.
@@ -445,48 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn infra_classifier_matches_recovery_failure_strings() {
-        // Exact string observed in production task.error rows (goal 6bfe3a13).
-        assert!(is_provider_infra_error_text(
-            "The configured LLM model could not be used, and fallback recovery did not succeed. Check model settings."
-        ));
-        assert!(is_provider_infra_error_text(
-            "The LLM provider remained rate limited during recovery. Try again shortly."
-        ));
-        assert!(is_provider_infra_error_text(
-            "LLM requests kept timing out during recovery. Try again shortly."
-        ));
-        assert!(is_provider_infra_error_text(
-            "Could not reach the LLM provider during recovery. Check connectivity or try again shortly."
-        ));
-        assert!(is_provider_infra_error_text(
-            "The LLM provider kept returning server errors during recovery. Try again later or switch providers."
-        ));
-        assert!(is_provider_infra_error_text(
-            "LLM API authentication failed. Check your API key in config.toml."
-        ));
-        assert!(is_provider_infra_error_text(
-            "LLM API billing error — your account quota may be exhausted."
-        ));
-        assert!(is_provider_infra_error_text(
-            "Model not found. Falling back to previous model."
-        ));
-        assert!(is_provider_infra_error_text(
-            "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
-        ));
-    }
-
-    #[test]
-    fn infra_classifier_rejects_semantic_failures() {
-        assert!(!is_provider_infra_error_text(
-            "The file /tmp/report.csv does not exist"
-        ));
-        assert!(!is_provider_infra_error_text(
-            "Verification failed: tweet was not posted"
-        ));
-        assert!(!is_provider_infra_error_text(""));
-        assert!(!is_provider_infra_error_text(
-            "Task cancelled: goal stalled (no progress after 3 dispatch cycles)"
-        ));
+    fn infrastructure_classification_is_typed() {
+        assert!(ProviderErrorKind::Auth.is_infrastructure_failure());
+        assert!(ProviderErrorKind::ServerError.is_infrastructure_failure());
+        assert!(!ProviderErrorKind::BadRequest.is_infrastructure_failure());
+        assert!(!ProviderErrorKind::MalformedResponse.is_infrastructure_failure());
+        assert!(!ProviderErrorKind::Unknown.is_infrastructure_failure());
     }
 }

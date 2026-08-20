@@ -949,6 +949,9 @@ enum TaskAssessmentAttempt {
         model: String,
         latency_ms: u64,
         error: String,
+        prevents_model_fallback: bool,
+        provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+        provider_status: Option<u16>,
     },
     Timeout {
         candidate_index: usize,
@@ -1032,6 +1035,8 @@ async fn record_auxiliary_model_call(
                 token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
                 failed: attempt_telemetry.validation_error.is_some(),
                 error: attempt_telemetry.validation_error,
+                provider_error_kind: None,
+                provider_status: None,
             },
             token_usage: response.usage.clone(),
         },
@@ -1048,6 +1053,8 @@ async fn record_auxiliary_model_failure(
     attempt: u32,
     fell_back: bool,
     est_input_tokens: Option<u32>,
+    provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+    provider_status: Option<u16>,
     error: impl Into<String>,
 ) {
     let Some(telemetry) = telemetry else {
@@ -1102,6 +1109,8 @@ async fn record_auxiliary_model_failure(
                 token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
                 failed: true,
                 error: Some(error.into()),
+                provider_error_kind,
+                provider_status,
             },
             token_usage: None,
         },
@@ -1414,12 +1423,19 @@ pub(crate) async fn generate_task_plan(
                 response,
                 latency_ms: call_start.elapsed().as_millis() as u64,
             },
-            Ok(Err(error)) => TaskAssessmentAttempt::ProviderError {
-                candidate_index,
-                model: model.clone(),
-                latency_ms: call_start.elapsed().as_millis() as u64,
-                error: error.to_string(),
-            },
+            Ok(Err(error)) => {
+                let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
+                TaskAssessmentAttempt::ProviderError {
+                    candidate_index,
+                    model: model.clone(),
+                    latency_ms: call_start.elapsed().as_millis() as u64,
+                    prevents_model_fallback: provider_error
+                        .is_some_and(crate::providers::ProviderError::prevents_model_fallback),
+                    provider_error_kind: provider_error.map(|error| error.kind),
+                    provider_status: provider_error.and_then(|error| error.status),
+                    error: error.to_string(),
+                }
+            }
             Err(_) => TaskAssessmentAttempt::Timeout {
                 candidate_index,
                 model: model.clone(),
@@ -1479,6 +1495,9 @@ pub(crate) async fn generate_task_plan(
                 model,
                 latency_ms,
                 error,
+                prevents_model_fallback,
+                provider_error_kind,
+                provider_status,
             } => {
                 record_auxiliary_model_failure(
                     telemetry,
@@ -1488,10 +1507,15 @@ pub(crate) async fn generate_task_plan(
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
+                    provider_error_kind,
+                    provider_status,
                     format!("provider_error: {error}"),
                 )
                 .await;
                 warn!(%error, %model, "Task assessment attempt failed");
+                if prevents_model_fallback {
+                    break;
+                }
             }
             TaskAssessmentAttempt::Timeout {
                 candidate_index,
@@ -1506,6 +1530,8 @@ pub(crate) async fn generate_task_plan(
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
+                    None,
+                    None,
                     "timeout",
                 )
                 .await;
@@ -1604,6 +1630,9 @@ pub(crate) async fn generate_task_relationship_candidates(
         {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
+                let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
+                let prevents_model_fallback = provider_error
+                    .is_some_and(crate::providers::ProviderError::prevents_model_fallback);
                 record_auxiliary_model_failure(
                     telemetry,
                     "task_relationship_fallback",
@@ -1612,10 +1641,15 @@ pub(crate) async fn generate_task_relationship_candidates(
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
+                    provider_error.map(|error| error.kind),
+                    provider_error.and_then(|error| error.status),
                     format!("provider_error: {error}"),
                 )
                 .await;
                 warn!(%error, %model, "Task relationship fallback failed");
+                if prevents_model_fallback {
+                    break;
+                }
                 continue;
             }
             Err(_) => {
@@ -1627,6 +1661,8 @@ pub(crate) async fn generate_task_relationship_candidates(
                     (candidate_index + 1) as u32,
                     candidate_index > 0,
                     est_input_tokens,
+                    None,
+                    None,
                     "timeout",
                 )
                 .await;
@@ -1886,6 +1922,31 @@ pub(crate) fn summarize_tool_calls_for_replan(tool_calls: &[String], max_entries
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ModelInvariantAuthFailureProvider {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelInvariantAuthFailureProvider {
+        async fn chat(
+            &self,
+            model: &str,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<ProviderResponse> {
+            self.calls.lock().unwrap().push(model.to_string());
+            Err(
+                crate::providers::ProviderError::from_status(401, "synthetic auth rejection")
+                    .into(),
+            )
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[derive(Default)]
     struct ModelPriorityTestProvider {
@@ -2752,6 +2813,54 @@ mod tests {
         assert_eq!(assessment.goal, "primary contract");
         let calls = provider.calls.lock().expect("call ledger");
         assert_eq!(calls.as_slice(), ["configured-primary"]);
+    }
+
+    #[tokio::test]
+    async fn semantic_contract_does_not_amplify_model_invariant_auth_failure() {
+        let models = vec![
+            "synthetic-primary".to_string(),
+            "synthetic-fallback-a".to_string(),
+            "synthetic-fallback-b".to_string(),
+        ];
+        let provider = Arc::new(ModelInvariantAuthFailureProvider::default());
+        let assessment = generate_task_plan(
+            provider.clone(),
+            &models,
+            "Give a synthetic answer.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await;
+
+        assert!(assessment.is_none());
+        assert_eq!(
+            provider.calls.lock().unwrap().as_slice(),
+            ["synthetic-primary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn relationship_lane_does_not_amplify_model_invariant_auth_failure() {
+        let models = vec![
+            "synthetic-primary".to_string(),
+            "synthetic-fallback-a".to_string(),
+            "synthetic-fallback-b".to_string(),
+        ];
+        let provider = Arc::new(ModelInvariantAuthFailureProvider::default());
+        let relationship = generate_task_relationship_candidates(
+            provider.clone(),
+            &models,
+            "Continue the synthetic task.",
+            "- [message_id=synthetic-1] U: Start the synthetic task.",
+            None,
+        )
+        .await;
+
+        assert!(relationship.is_none());
+        assert_eq!(
+            provider.calls.lock().unwrap().as_slice(),
+            ["synthetic-primary"]
+        );
     }
 
     #[tokio::test]

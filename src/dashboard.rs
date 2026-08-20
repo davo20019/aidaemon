@@ -176,8 +176,8 @@ async fn auth_middleware(
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+async fn health_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    crate::daemon::health_response(&state.pool, state.event_store.as_deref()).await
 }
 
 /// Authenticated, content-free webhook ingress for proactive mandate wake-ups.

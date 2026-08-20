@@ -130,7 +130,7 @@ impl OpenAiChatGptProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> Result<ProviderResponse, ProviderError> {
-        let creds = self.credentials().await?;
+        let mut creds = self.credentials().await?;
         let body = build_request_body(
             model,
             messages,
@@ -142,21 +142,32 @@ impl OpenAiChatGptProvider {
                 .or(self.reasoning_effort.as_deref()),
         );
 
-        let url = format!("{}/responses", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", creds.access_token))
-            .header("chatgpt-account-id", &creds.account_id)
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", ORIGINATOR)
-            .header("User-Agent", user_agent())
-            .header("accept", "text/event-stream")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::network(&e))?;
+        let mut response = self.send_authenticated(&creds, &body).await?;
+
+        // The resource server is authoritative about token validity. Access
+        // tokens can be revoked before their JWT/local expiry, so recover once
+        // through the shared refresh-token state machine and replay this
+        // side-effect-free inference request with the rotated credential.
+        if response.status().as_u16() == 401 {
+            let rejected = creds.access_token.clone();
+            // Consume the response before reusing the connection and ensure no
+            // credential or large body survives into diagnostics.
+            let _ = response.bytes().await;
+            creds = self
+                .credentials
+                .refresh_after_rejection(&self.client, &rejected)
+                .await
+                .map_err(|error| ProviderError::from_status(401, &error.to_string()))?;
+            response = self.send_authenticated(&creds, &body).await?;
+            if response.status().as_u16() == 401 {
+                let body = response.text().await.unwrap_or_default();
+                let detail = annotate_error_body(401, &body);
+                self.credentials
+                    .mark_rejected(&creds.access_token, detail.clone())
+                    .await;
+                return Err(ProviderError::from_status(401, &detail));
+            }
+        }
 
         let status = response.status();
         if !status.is_success() {
@@ -186,6 +197,27 @@ impl OpenAiChatGptProvider {
         }
 
         collector.finish()
+    }
+
+    async fn send_authenticated(
+        &self,
+        creds: &ChatGptCredentials,
+        body: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let url = format!("{}/responses", self.base_url);
+        self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", creds.access_token))
+            .header("chatgpt-account-id", &creds.account_id)
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", ORIGINATOR)
+            .header("User-Agent", user_agent())
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| ProviderError::network(&error))
     }
 }
 
@@ -741,8 +773,115 @@ impl ModelProvider for OpenAiChatGptProvider {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct AuthRecoveryFixture {
+        response_calls: std::sync::atomic::AtomicUsize,
+        refresh_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn auth_recovery_responses(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<AuthRecoveryFixture>>,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state
+            .response_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer synthetic-rotated-access")
+        {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "synthetic rejected access"})),
+            )
+                .into_response();
+        }
+        let stream = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"synthetic-model\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"recovered\"}]}],\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            stream,
+        )
+            .into_response()
+    }
+
+    async fn auth_recovery_token(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<AuthRecoveryFixture>>,
+    ) -> axum::Json<Value> {
+        state
+            .refresh_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        axum::Json(json!({
+            "access_token": "synthetic-rotated-access",
+            "refresh_token": "synthetic-rotated-refresh",
+            "expires_in": 3600
+        }))
+    }
+
     fn options() -> ChatOptions {
         ChatOptions::default()
+    }
+
+    #[tokio::test]
+    async fn remote_401_forces_one_refresh_and_replays_inference_once() {
+        use axum::routing::post;
+
+        let fixture = std::sync::Arc::new(AuthRecoveryFixture::default());
+        let app = axum::Router::new()
+            .route("/responses", post(auth_recovery_responses))
+            .route("/token", post(auth_recovery_token))
+            .with_state(fixture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind synthetic provider");
+        let address = listener.local_addr().expect("synthetic provider address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let credentials = ChatGptCredentialManager::with_test_token_url(
+            ChatGptCredentials {
+                access_token: "synthetic-rejected-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                account_id: "acct-synthetic-1".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+            format!("http://{address}/token"),
+        );
+        let provider = OpenAiChatGptProvider {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            reasoning_effort: None,
+            credentials: std::sync::Arc::new(credentials),
+        };
+        let response = provider
+            .chat(
+                "synthetic-model",
+                &[json!({"role": "user", "content": "synthetic request"})],
+                &[],
+            )
+            .await
+            .expect("provider should recover");
+        server.abort();
+
+        assert_eq!(response.content.as_deref(), Some("recovered"));
+        assert_eq!(
+            fixture
+                .response_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            fixture
+                .refresh_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
