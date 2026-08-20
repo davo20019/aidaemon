@@ -559,6 +559,17 @@ impl RunAggregate {
         operation.dispatched = receipt.invocation_stage.reached_dispatch();
         operation.result_id = Some(result_id.clone());
         let claimed_obligation_ids = operation.obligation_ids.clone();
+        // Cardinality is about distinct durable invocations, not distinct
+        // output bytes. Two real calls may legitimately return identical (or
+        // empty) content. A durable replay reuses its source invocation's proof
+        // identity so replay remains idempotent and consumes no new cardinality.
+        let proof_receipt_id = match operation.operation_lineage.as_ref() {
+            Some(super::ToolOperationLineage::DurableReplay {
+                source_operation_id,
+                ..
+            }) => source_operation_id.clone(),
+            _ => result.tool_call_id.clone(),
+        };
         let is_durable_replay = matches!(
             operation.operation_lineage.as_ref(),
             Some(super::ToolOperationLineage::DurableReplay { .. })
@@ -627,8 +638,13 @@ impl RunAggregate {
                 explicitly_proven || effect_proven || generic_observation
             };
             if proven {
-                if !obligation.satisfying_receipt_ids.contains(&result_id) {
-                    obligation.satisfying_receipt_ids.push(result_id.clone());
+                if !obligation
+                    .satisfying_receipt_ids
+                    .contains(&proof_receipt_id)
+                {
+                    obligation
+                        .satisfying_receipt_ids
+                        .push(proof_receipt_id.clone());
                 }
                 let minimum = obligation
                     .receipt
@@ -1493,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn one_receipt_cannot_satisfy_a_three_receipt_obligation() {
+    fn cardinality_counts_distinct_invocations_even_when_output_digests_match() {
         let mut required = requirement("terminal", 0);
         let predicate = required.receipt.as_mut().expect("receipt predicate");
         predicate.min_invocations = Some(3);
@@ -1526,6 +1542,16 @@ mod tests {
                 0,
                 ToolCallSemantics::observation(),
             ));
+        }
+        // Create/cleanup-style calls often both have empty output. Their
+        // content identity is equal, but their durable invocation receipts are
+        // distinct and must each count toward an exact call cardinality.
+        for event in events
+            .iter_mut()
+            .filter(|event| event.event_type == EventType::ToolResult)
+        {
+            event.data["receipt"]["result_provenance"]["result_id"] =
+                json!("sha256:synthetic-shared-output");
         }
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;

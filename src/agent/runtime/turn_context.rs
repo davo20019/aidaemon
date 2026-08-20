@@ -952,12 +952,7 @@ impl Agent {
             Some(task_id.to_string()),
         );
         if let Some(claim) = kernel_claim {
-            call_data = call_data.with_kernel_claim(
-                &claim.stable_operation_key,
-                claim.obligation_ids.clone(),
-                claim.max_attempts,
-                claim.max_invocations,
-            );
+            call_data = call_data.with_task_kernel_claim(claim);
         }
         if let Some(claim) = kernel_claim {
             // Pre-dispatch denials are still task-kernel proposals. Persist
@@ -1125,7 +1120,7 @@ mod tests {
             obligation_ids: Vec::new(),
             max_attempts: 1,
             max_invocations: 1,
-            idempotency_key: None,
+            idempotency_key: Some("synthetic:denied-write:key".to_string()),
             operation_lineage: None,
         };
         let denial = crate::traits::ToolAccessDenial {
@@ -1167,6 +1162,10 @@ mod tests {
         assert_eq!(
             persisted_call.stable_operation_key.as_deref(),
             Some("synthetic:denied-write")
+        );
+        assert_eq!(
+            persisted_call.idempotency_key.as_deref(),
+            Some("synthetic:denied-write:key")
         );
         let result = events[1]
             .parse_data::<ToolResultData>()

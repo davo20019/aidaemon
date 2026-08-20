@@ -1551,6 +1551,26 @@ impl ToolCallData {
         self
     }
 
+    /// Project one authoritative task-kernel claim into its persisted call.
+    ///
+    /// Admission compares every claim field atomically. Keeping that projection
+    /// in one constructor prevents dispatched and pre-dispatch-rejected paths
+    /// from drifting on idempotency, lineage, ownership, or cardinality.
+    pub(crate) fn with_task_kernel_claim(
+        mut self,
+        claim: &super::TaskKernelOperationClaim,
+    ) -> Self {
+        self.tool_call_id = claim.operation_id.clone();
+        self.name = claim.tool_name.clone();
+        self.idempotency_key = claim.idempotency_key.clone();
+        self.stable_operation_key = Some(claim.stable_operation_key.clone());
+        self.obligation_ids = claim.obligation_ids.clone();
+        self.max_operation_attempts = Some(claim.max_attempts.max(1));
+        self.max_operation_invocations = Some(claim.max_invocations.max(1));
+        self.operation_lineage = claim.operation_lineage.clone();
+        self
+    }
+
     pub fn with_operation_lineage(mut self, lineage: Option<ToolOperationLineage>) -> Self {
         self.operation_lineage = lineage;
         self

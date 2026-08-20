@@ -224,13 +224,7 @@ pub(super) async fn execute_tool_call_io(
                 Some(ctx.policy_bundle.policy.policy_rev),
                 Some(ctx.policy_bundle.risk_score),
             )
-            .with_kernel_claim(
-                ctx.stable_operation_key,
-                ctx.obligation_ids.to_vec(),
-                ctx.max_operation_attempts,
-                ctx.max_operation_invocations,
-            )
-            .with_operation_lineage(operation_lineage),
+            .with_task_kernel_claim(&kernel_claim),
             &kernel_claim,
         )
         .await;
