@@ -430,6 +430,9 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     let evidence_requirements = signals.evidence_requirements.as_deref().unwrap_or_default();
     let required_invocations = signals.required_invocations.as_deref().unwrap_or_default();
     let filesystem_access = signals.filesystem_access.as_ref().expect("checked above");
+    let has_filesystem_read_capability =
+        !filesystem_access.read_paths.is_empty() || !filesystem_access.read_roots.is_empty();
+    let has_process_context = filesystem_access.execution_cwd.is_some();
     if evidence_requirements.len() > 8
         || required_invocations.len() > 8
         || filesystem_access.read_paths.len() > 8
@@ -450,6 +453,16 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         || !expects_mutation
             && (!filesystem_access.write_paths.is_empty()
                 || !filesystem_access.write_roots.is_empty())
+        // A read capability or process context is an execution input, not
+        // conversational metadata. It cannot coexist with a zero-observation,
+        // zero-invocation lifecycle even if the semantic producer mislabeled
+        // the task kind. This is a typed cross-field invariant; no request text
+        // is inspected here.
+        || has_filesystem_read_capability && signals.requires_observation != Some(true)
+        || has_process_context
+            && !expects_mutation
+            && evidence_requirements.is_empty()
+            && required_invocations.is_empty()
         // A check is an evidence-producing lifecycle kind. Treating it as a
         // zero-observation answer would let the model assert current-run or
         // current-state facts without any proof edge.
@@ -612,6 +625,87 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     true
 }
 
+/// Validate the authoritative lifecycle product without coupling it to
+/// independent sibling lanes such as mutation/tool authority, presentation,
+/// or research policy. A malformed sibling may still be quarantined by the
+/// contract compiler, but the execution lifecycle is usable only when its
+/// core and proof graph agree. This is intentionally narrower than
+/// `planned_contract_is_complete`.
+pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSignals) -> bool {
+    let (Some(expects_mutation), Some(requires_observation), Some(task_kind)) = (
+        signals.expects_mutation,
+        signals.requires_observation,
+        signals
+            .task_kind
+            .as_deref()
+            .and_then(crate::agent::parse_planned_task_kind),
+    ) else {
+        return false;
+    };
+    let mutation_capable = matches!(
+        task_kind,
+        crate::agent::CompletionTaskKind::Change
+            | crate::agent::CompletionTaskKind::Deliver
+            | crate::agent::CompletionTaskKind::Schedule
+            | crate::agent::CompletionTaskKind::Monitor
+    );
+    if expects_mutation != mutation_capable {
+        return false;
+    }
+    let Some(effect_names) = signals.required_effects.as_deref() else {
+        return false;
+    };
+    let effects_valid = if expects_mutation {
+        crate::agent::parse_planned_mutation_effects(effect_names).is_some_and(|effects| {
+            if effects.is_empty()
+                || effects.contains(crate::traits::ToolMutationEffects::DESTRUCTIVE)
+            {
+                return false;
+            }
+            if effects.contains(crate::traits::ToolMutationEffects::REMOTE_MUTATION)
+                && effects.intersects(
+                    crate::traits::ToolMutationEffects::REMOTE_DEPLOY
+                        .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY),
+                )
+            {
+                return false;
+            }
+            task_kind != crate::agent::CompletionTaskKind::Deliver
+                || effects.contains(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
+        })
+    } else {
+        effect_names.is_empty()
+    };
+    if !effects_valid {
+        return false;
+    }
+
+    let (Some(evidence), Some(invocations)) = (
+        signals.evidence_requirements.as_deref(),
+        signals.required_invocations.as_deref(),
+    ) else {
+        return false;
+    };
+    let has_proof_obligation = !evidence.is_empty() || !invocations.is_empty();
+    if requires_observation != has_proof_obligation
+        || task_kind == crate::agent::CompletionTaskKind::Check && !requires_observation
+    {
+        return false;
+    }
+
+    if let Some(filesystem) = signals.filesystem_access.as_ref() {
+        let has_read_capability =
+            !filesystem.read_paths.is_empty() || !filesystem.read_roots.is_empty();
+        let has_process_context = filesystem.execution_cwd.is_some();
+        if has_read_capability && !requires_observation
+            || has_process_context && !expects_mutation && !has_proof_obligation
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// How much task scaffolding the active model needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskAssessmentMode {
@@ -747,6 +841,10 @@ pub(crate) struct TaskPlan {
     pub contract: Option<PlannedContractSignals>,
     pub task_shape: Option<PlannedTaskShape>,
     pub mode: TaskAssessmentMode,
+    /// True only when the completion producer emitted one internally coherent
+    /// lifecycle contract. Partial products may still carry attenuating
+    /// authority, but they cannot authorize execution or completion.
+    pub contract_complete: bool,
 }
 
 fn decode_task_plan_result(
@@ -774,17 +872,18 @@ fn decode_task_plan_result(
             "unsupported_schema_version:{received_schema_version};supported:{TASK_CONTRACT_SCHEMA_VERSION}"
         )
     })?;
-    // Decode the semantic envelope as a product of independent lanes. The
-    // contract compiler validates completion core, authority, obligations,
-    // filesystem access, and presentation separately and installs only valid
-    // products. Rejecting the entire model response here erased valid hard
-    // constraints whenever an unrelated lane was imperfect, leaving the main
-    // loop with less information and weaker safety. Full completeness remains
-    // available as diagnostics/tests, but is not an all-or-nothing admission
-    // gate.
+    // Decode the semantic envelope as a product of independent lanes. Keep a
+    // partial product so valid attenuating constraints can survive, but mark
+    // it non-authoritative for execution and completion. The producer loop
+    // uses this typed invariant to repair or fail over before bootstrap.
     if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return Err("empty_semantic_envelope".to_string());
     }
+
+    let contract_complete = parsed
+        .contract
+        .as_ref()
+        .is_some_and(planned_contract_lifecycle_is_coherent);
 
     let mut steps = parsed.steps;
     let mut success_criteria = parsed.success_criteria;
@@ -800,6 +899,7 @@ fn decode_task_plan_result(
         contract: parsed.contract,
         task_shape: parsed.task_shape,
         mode,
+        contract_complete,
     })
 }
 
@@ -939,13 +1039,11 @@ struct AuxiliaryAttemptTelemetry {
 
 enum TaskAssessmentAttempt {
     Response {
-        candidate_index: usize,
         model: String,
         response: ProviderResponse,
         latency_ms: u64,
     },
     ProviderError {
-        candidate_index: usize,
         model: String,
         latency_ms: u64,
         error: String,
@@ -954,7 +1052,6 @@ enum TaskAssessmentAttempt {
         provider_status: Option<u16>,
     },
     Timeout {
-        candidate_index: usize,
         model: String,
         latency_ms: u64,
     },
@@ -1383,163 +1480,192 @@ pub(crate) async fn generate_task_plan(
         }
         budgets
     };
-    let aggregate_timeout = attempt_budgets
+    let candidate_timeout = attempt_budgets
         .iter()
         .copied()
-        .fold(Duration::ZERO, Duration::saturating_add)
+        .fold(Duration::ZERO, Duration::saturating_add);
+    // A lone configured producer has no model fallback. Reserve one explicit
+    // protocol-repair attempt for malformed or internally incoherent output;
+    // provider failures and timeouts are not blindly retried. With multiple
+    // configured producers, the next producer is the repair path.
+    let validation_repair_timeout = if model_candidates.len() == 1 {
+        attempt_budgets.first().copied().unwrap_or_default()
+    } else {
+        Duration::ZERO
+    };
+    let aggregate_timeout = candidate_timeout
+        .saturating_add(validation_repair_timeout)
         .min(TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT);
     if aggregate_timeout.is_zero() {
         return None;
     }
-    let est_input_tokens = Some(
-        crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
-            .min(u32::MAX as usize) as u32,
-    );
     // Candidates are alternatives, not a fan-out ensemble. Attempt them in
     // configured priority order under one deadline and stop after the first
     // valid typed product. This prevents a successful primary from still
     // paying for every speculative fallback and makes each failed transition
     // individually attributable in telemetry.
     let deadline = Instant::now() + aggregate_timeout;
+    let mut physical_attempt = 0_u32;
+    let mut partial_plan = None;
+    let mut stop_fallback = false;
     for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
         let Some(configured_timeout) = attempt_budgets.get(candidate_index).copied() else {
             continue;
         };
-        let attempt_timeout = configured_timeout.min(remaining);
-        let call_start = Instant::now();
-        let attempt = match tokio::time::timeout(
-            attempt_timeout,
-            provider.chat_with_options(model, &messages, &[], &options),
-        )
-        .await
-        {
-            Ok(Ok(response)) => TaskAssessmentAttempt::Response {
-                candidate_index,
-                model: model.clone(),
-                response,
-                latency_ms: call_start.elapsed().as_millis() as u64,
-            },
-            Ok(Err(error)) => {
-                let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
-                TaskAssessmentAttempt::ProviderError {
-                    candidate_index,
+        let max_attempts = if model_candidates.len() == 1 { 2 } else { 1 };
+        for validation_attempt in 0..max_attempts {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let attempt_timeout = configured_timeout.min(remaining);
+            let mut attempt_messages = messages.clone();
+            if validation_attempt > 0 {
+                attempt_messages.push(json!({
+                    "role": "user",
+                    "content": "The prior object was rejected by the typed lifecycle validator. Return a complete replacement object for the original request. The completion contract must be internally coherent: requires_observation must agree with nonempty typed evidence_requirements or required_invocations, and every required contract field must be present. Return only the replacement JSON object."
+                }));
+            }
+            physical_attempt = physical_attempt.saturating_add(1);
+            let est_input_tokens = Some(
+                crate::memory::context_window::estimate_multimodal_message_tokens(&attempt_messages)
+                    .min(u32::MAX as usize) as u32,
+            );
+            let call_start = Instant::now();
+            let attempt = match tokio::time::timeout(
+                attempt_timeout,
+                provider.chat_with_options(model, &attempt_messages, &[], &options),
+            )
+            .await
+            {
+                Ok(Ok(response)) => TaskAssessmentAttempt::Response {
+                    model: model.clone(),
+                    response,
+                    latency_ms: call_start.elapsed().as_millis() as u64,
+                },
+                Ok(Err(error)) => {
+                    let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
+                    TaskAssessmentAttempt::ProviderError {
+                        model: model.clone(),
+                        latency_ms: call_start.elapsed().as_millis() as u64,
+                        prevents_model_fallback: provider_error
+                            .is_some_and(crate::providers::ProviderError::prevents_model_fallback),
+                        provider_error_kind: provider_error.map(|error| error.kind),
+                        provider_status: provider_error.and_then(|error| error.status),
+                        error: error.to_string(),
+                    }
+                }
+                Err(_) => TaskAssessmentAttempt::Timeout {
                     model: model.clone(),
                     latency_ms: call_start.elapsed().as_millis() as u64,
-                    prevents_model_fallback: provider_error
-                        .is_some_and(crate::providers::ProviderError::prevents_model_fallback),
-                    provider_error_kind: provider_error.map(|error| error.kind),
-                    provider_status: provider_error.and_then(|error| error.status),
-                    error: error.to_string(),
-                }
-            }
-            Err(_) => TaskAssessmentAttempt::Timeout {
-                candidate_index,
-                model: model.clone(),
-                latency_ms: call_start.elapsed().as_millis() as u64,
-            },
-        };
-        match attempt {
-            TaskAssessmentAttempt::Response {
-                candidate_index,
-                model,
-                response,
-                latency_ms,
-            } => match decode_task_plan_result(&response, mode) {
-                Ok(plan) => {
-                    record_auxiliary_model_call(
-                        telemetry,
-                        "task_assessment",
-                        &model,
-                        &response,
-                        latency_ms,
-                        AuxiliaryAttemptTelemetry {
-                            attempt: (candidate_index + 1) as u32,
-                            fell_back: candidate_index > 0,
-                            validation_error: None,
-                        },
-                    )
-                    .await;
-                    info!(
-                        goal = %plan.goal,
-                        step_count = plan.steps.len(),
-                        assessment_mode = mode.as_str(),
-                        %model,
-                        fallback = candidate_index > 0,
-                        "Task assessment selected by configured model priority"
-                    );
-                    return Some(plan);
-                }
-                Err(error) => {
-                    record_auxiliary_model_call(
-                        telemetry,
-                        "task_assessment",
-                        &model,
-                        &response,
-                        latency_ms,
-                        AuxiliaryAttemptTelemetry {
-                            attempt: (candidate_index + 1) as u32,
-                            fell_back: candidate_index > 0,
-                            validation_error: Some(error.clone()),
-                        },
-                    )
-                    .await;
-                    warn!(%model, %error, "Task assessment response rejected");
-                }
-            },
-            TaskAssessmentAttempt::ProviderError {
-                candidate_index,
-                model,
-                latency_ms,
-                error,
-                prevents_model_fallback,
-                provider_error_kind,
-                provider_status,
-            } => {
-                record_auxiliary_model_failure(
-                    telemetry,
-                    "task_assessment",
-                    &model,
+                },
+            };
+            match attempt {
+                TaskAssessmentAttempt::Response {
+                    model,
+                    response,
                     latency_ms,
-                    (candidate_index + 1) as u32,
-                    candidate_index > 0,
-                    est_input_tokens,
+                    ..
+                } => match decode_task_plan_result(&response, mode) {
+                    Ok(plan) => {
+                        let validation_error = (!plan.contract_complete)
+                            .then(|| "incomplete_completion_contract".to_string());
+                        record_auxiliary_model_call(
+                            telemetry,
+                            "task_assessment",
+                            &model,
+                            &response,
+                            latency_ms,
+                            AuxiliaryAttemptTelemetry {
+                                attempt: physical_attempt,
+                                fell_back: physical_attempt > 1,
+                                validation_error: validation_error.clone(),
+                            },
+                        )
+                        .await;
+                        if plan.contract_complete {
+                            info!(
+                                goal = %plan.goal,
+                                step_count = plan.steps.len(),
+                                assessment_mode = mode.as_str(),
+                                %model,
+                                fallback = physical_attempt > 1,
+                                "Task assessment selected by configured model priority"
+                            );
+                            return Some(plan);
+                        }
+                        warn!(%model, "Task assessment returned an incomplete lifecycle contract");
+                        partial_plan.get_or_insert(plan);
+                    }
+                    Err(error) => {
+                        record_auxiliary_model_call(
+                            telemetry,
+                            "task_assessment",
+                            &model,
+                            &response,
+                            latency_ms,
+                            AuxiliaryAttemptTelemetry {
+                                attempt: physical_attempt,
+                                fell_back: physical_attempt > 1,
+                                validation_error: Some(error.clone()),
+                            },
+                        )
+                        .await;
+                        warn!(%model, %error, "Task assessment response rejected");
+                    }
+                },
+                TaskAssessmentAttempt::ProviderError {
+                    model,
+                    latency_ms,
+                    error,
+                    prevents_model_fallback,
                     provider_error_kind,
                     provider_status,
-                    format!("provider_error: {error}"),
-                )
-                .await;
-                warn!(%error, %model, "Task assessment attempt failed");
-                if prevents_model_fallback {
+                    ..
+                } => {
+                    record_auxiliary_model_failure(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        latency_ms,
+                        physical_attempt,
+                        physical_attempt > 1,
+                        est_input_tokens,
+                        provider_error_kind,
+                        provider_status,
+                        format!("provider_error: {error}"),
+                    )
+                    .await;
+                    warn!(%error, %model, "Task assessment attempt failed");
+                    stop_fallback = prevents_model_fallback;
+                    break;
+                }
+                TaskAssessmentAttempt::Timeout {
+                    model, latency_ms, ..
+                } => {
+                    record_auxiliary_model_failure(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        latency_ms,
+                        physical_attempt,
+                        physical_attempt > 1,
+                        est_input_tokens,
+                        None,
+                        None,
+                        "timeout",
+                    )
+                    .await;
+                    warn!(%model, "Task assessment attempt timed out");
                     break;
                 }
             }
-            TaskAssessmentAttempt::Timeout {
-                candidate_index,
-                model,
-                latency_ms,
-            } => {
-                record_auxiliary_model_failure(
-                    telemetry,
-                    "task_assessment",
-                    &model,
-                    latency_ms,
-                    (candidate_index + 1) as u32,
-                    candidate_index > 0,
-                    est_input_tokens,
-                    None,
-                    None,
-                    "timeout",
-                )
-                .await;
-                warn!(%model, "Task assessment attempt timed out");
-            }
+        }
+        if stop_fallback {
+            break;
         }
     }
-    None
+    partial_plan
 }
 
 /// Recover only the typed dialogue edge when the broad task assessment is
@@ -2361,6 +2487,14 @@ mod tests {
         };
         assert!(planned_contract_is_complete(&complete));
 
+        let mut invalid_authority_sibling = complete.clone();
+        invalid_authority_sibling.mutation_scope = Some("invalid".to_string());
+        assert!(!planned_contract_is_complete(&invalid_authority_sibling));
+        assert!(
+            planned_contract_lifecycle_is_coherent(&invalid_authority_sibling),
+            "an invalid authority sibling must not erase a coherent lifecycle product"
+        );
+
         let mut restricted = complete.clone();
         restricted.expects_mutation = Some(false);
         restricted.required_effects = Some(Vec::new());
@@ -2435,6 +2569,22 @@ mod tests {
         assert!(
             !planned_contract_is_complete(&observational_write_grant),
             "an observational task cannot receive a filesystem write capability"
+        );
+
+        let mut conversational_read_grant = restricted.clone();
+        conversational_read_grant.task_kind = Some("conversational".to_string());
+        conversational_read_grant.requires_observation = Some(false);
+        conversational_read_grant.tool_scope = Some("allowed".to_string());
+        conversational_read_grant.allowed_tool_names.clear();
+        conversational_read_grant.evidence_requirements = Some(Vec::new());
+        conversational_read_grant.required_invocations = Some(Vec::new());
+        conversational_read_grant.filesystem_access = Some(PlannedFilesystemAccess {
+            read_paths: vec!["/tmp/synthetic-input".to_string()],
+            ..PlannedFilesystemAccess::default()
+        });
+        assert!(
+            !planned_contract_is_complete(&conversational_read_grant),
+            "filesystem read authority cannot hide inside a zero-observation lifecycle"
         );
 
         let mut no_tools = complete.clone();
@@ -2588,6 +2738,7 @@ mod tests {
 
         let plan = decode_task_plan_result(&response, TaskAssessmentMode::AutonomousRouting)
             .expect("a partial semantic product must reach the lane compiler");
+        assert!(!plan.contract_complete);
         let contract = plan.contract.expect("contract is preserved");
         assert!(!planned_contract_is_complete(&contract));
         assert_eq!(contract.requires_observation, Some(true));
@@ -2961,6 +3112,130 @@ mod tests {
             ) && call.options.reasoning_effort_override.as_deref() == Some("low")
                 && call.options.tool_choice == crate::traits::ToolChoiceMode::None
                 && call.options.single_attempt_fail_closed
+        }));
+    }
+
+    #[tokio::test]
+    async fn lone_semantic_producer_repairs_an_incoherent_lifecycle_contract_once() {
+        let incomplete = crate::testing::MockProvider::text_response(
+            &serde_json::to_string(&json!({
+                "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+                "goal": "Observe one synthetic terminal disposition",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true,
+                    "required_effects": [],
+                    "mutation_scope": "read_only",
+                    "forbidden_actions": [],
+                    "tool_scope": "restricted",
+                    "allowed_tool_names": ["terminal"],
+                    "forbidden_tool_scopes": ["user_memory"],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [],
+                    "filesystem_access": {
+                        "execution_cwd": "/tmp",
+                        "read_paths": ["/tmp/synthetic-protected-input"],
+                        "write_paths": [],
+                        "read_roots": [],
+                        "write_roots": []
+                    },
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "continue_inline_after_background_start": false
+                }
+            }))
+            .expect("JSON"),
+        );
+        let repaired = crate::testing::MockProvider::text_response(
+            &serde_json::to_string(&json!({
+                "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+                "goal": "Observe one synthetic terminal disposition",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true,
+                    "required_effects": [],
+                    "mutation_scope": "read_only",
+                    "forbidden_actions": [],
+                    "tool_scope": "restricted",
+                    "allowed_tool_names": ["terminal"],
+                    "forbidden_tool_scopes": ["user_memory"],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [{
+                        "tool_names": ["terminal"],
+                        "exit_codes": [],
+                        "outcome_condition": "contract_rejected",
+                        "requires_output": false,
+                        "min_invocations": 1,
+                        "max_invocations": 1
+                    }],
+                    "filesystem_access": {
+                        "execution_cwd": "/tmp",
+                        "read_paths": ["/tmp/synthetic-protected-input"],
+                        "write_paths": [],
+                        "read_roots": [],
+                        "write_roots": []
+                    },
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "continue_inline_after_background_start": false
+                }
+            }))
+            .expect("JSON"),
+        );
+        let mut mock = crate::testing::MockProvider::with_responses(vec![incomplete, repaired]);
+        mock.skip_planning_calls = false;
+        let provider = Arc::new(mock);
+
+        let assessment = generate_task_plan(
+            provider.clone(),
+            &["synthetic-primary".to_string()],
+            "Observe one synthetic terminal disposition.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("repaired assessment");
+
+        assert!(assessment.contract_complete);
+        assert_eq!(
+            assessment
+                .contract
+                .as_ref()
+                .and_then(|contract| contract.required_invocations.as_ref())
+                .expect("typed invocation")[0]
+                .outcome_condition,
+            Some(crate::traits::RequestedOutcomeCondition::ContractRejected)
+        );
+        let calls = provider.call_log.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("typed lifecycle validator"))
         }));
     }
 

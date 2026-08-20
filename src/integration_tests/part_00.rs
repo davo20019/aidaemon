@@ -644,10 +644,11 @@ async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical
 
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
-    // A simple conversational turn records the one authoritative structured
-    // task-assessment attempt and the main response. The mock response reports
-    // 10 input / 5 output tokens; the intercepted invalid assessment reports
-    // zero and is durably classified as failed validation.
+    // A simple conversational turn records both physical structured-assessment
+    // attempts and the main response. The mock deliberately returns an invalid
+    // assessment, so the lone producer gets its one bounded repair attempt.
+    // Both invalid attempts report zero usage and are durably classified as
+    // failed validation; the main response reports 10 input / 5 output tokens.
     let harness =
         setup_test_agent_with_models(MockProvider::new(), "gpt-5.6-terra", "gpt-5.6-terra")
             .await
@@ -676,13 +677,13 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .expect("llm stats should compute");
 
     assert_eq!(
-        stats.total_calls, 2,
-        "expected one contract assessment and one response event"
+        stats.total_calls, 3,
+        "expected an assessment, its bounded repair, and one response event"
     );
-    assert_eq!(stats.failed_calls, 1);
-    assert_eq!(stats.avg_input_tokens, 5);
-    assert_eq!(stats.avg_output_tokens, 2);
-    assert_eq!(stats.fell_back_count, 0);
+    assert_eq!(stats.failed_calls, 2);
+    assert_eq!(stats.avg_input_tokens, 3);
+    assert_eq!(stats.avg_output_tokens, 1);
+    assert_eq!(stats.fell_back_count, 1);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);
 }

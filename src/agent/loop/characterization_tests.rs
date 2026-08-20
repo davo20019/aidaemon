@@ -1037,18 +1037,30 @@ async fn policy_blocked_calls_are_no_progress_without_false_failed_task_tokens()
         .unwrap();
 
     let after = policy_metrics_snapshot();
-    let failed_tokens_delta = after
-        .tokens_failed_tasks_total
-        .saturating_sub(before.tokens_failed_tasks_total);
     let no_progress_delta = after
         .no_progress_iterations_total
         .saturating_sub(before.no_progress_iterations_total);
 
-    assert_eq!(
-        failed_tokens_delta, 0,
-        "policy-blocked calls followed by a normal answer must not be charged as a failed task; before={} after={}",
-        before.tokens_failed_tasks_total,
-        after.tokens_failed_tasks_total
+    // Global counters are legitimately updated by other concurrently running
+    // tests. Assert the durable task-local cost projection instead of racing a
+    // process-wide before/after snapshot.
+    let task_end_json: String = sqlx::query_scalar(
+        "SELECT data FROM events
+         WHERE session_id = 'metrics_failure_no_progress' AND event_type = 'task_end'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .expect("task-local end event");
+    let task_end: crate::events::TaskEndData =
+        serde_json::from_str(&task_end_json).expect("task end payload");
+    assert!(
+        !task_end
+            .harness_eval
+            .expect("task-local harness evaluation")
+            .cost
+            .tokens_failed_waste,
+        "policy-blocked calls followed by a normal answer must not be charged as failed-task waste"
     );
     assert!(
         no_progress_delta >= 1,

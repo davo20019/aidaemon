@@ -81,10 +81,6 @@ pub(crate) struct CompiledTaskContract {
 pub(crate) struct ContractCompilerInput<'a> {
     pub signals: &'a PlannedContractSignals,
     pub task_shape: Option<&'a PlannedTaskShape>,
-    /// Independently assessed dialogue/resource domain for the current turn.
-    /// This is used to reconcile evidence routing, never to grant a tool or a
-    /// filesystem capability.
-    pub request_semantic_scope: Option<ToolSemanticScope>,
     pub available_tool_names: &'a [String],
     pub available_tool_receipt_kinds: &'a [(String, crate::traits::ToolReceiptKind)],
     pub structural_filesystem_resources: &'a [String],
@@ -443,32 +439,6 @@ fn normalize_receipt_for_tool_protocol(
     receipt
 }
 
-fn semantic_scope_fallback_requirement(scope: ToolSemanticScope) -> RequestEvidenceRequirement {
-    let (purpose, temporal_scope) = if scope == ToolSemanticScope::ConversationHistory {
-        (
-            EvidencePurpose::HistoricalRecord,
-            EvidenceTemporalScope::Historical,
-        )
-    } else {
-        (
-            EvidencePurpose::CurrentState,
-            EvidenceTemporalScope::Current,
-        )
-    };
-    RequestEvidenceRequirement {
-        // The summary is advisory investigation guidance. Typed scope,
-        // purpose, authority, and time are the proof invariant.
-        summary: format!("Observe the requested {} state", scope.as_str()),
-        acceptable_scopes: vec![scope],
-        purpose,
-        minimum_authority: EvidenceAuthority::Direct,
-        temporal_scope,
-        required_content_markers: Vec::new(),
-        receipt: None,
-        target: None,
-    }
-}
-
 fn canonical_invocation_requirement(
     receipt: RequestReceiptPredicate,
 ) -> RequestEvidenceRequirement {
@@ -488,7 +458,6 @@ fn canonical_invocation_requirement(
 
 fn compile_obligations(
     signals: &PlannedContractSignals,
-    request_semantic_scope: Option<ToolSemanticScope>,
     available_tool_names: &[String],
     available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
 ) -> (
@@ -591,14 +560,6 @@ fn compile_obligations(
             continue;
         }
         let mut normalized = candidate.clone();
-        if let Some(scope) = request_semantic_scope {
-            if !normalized.acceptable_scopes.contains(&scope) {
-                if normalized.acceptable_scopes.len() >= 3 {
-                    normalized.acceptable_scopes.pop();
-                }
-                normalized.acceptable_scopes.push(scope);
-            }
-        }
         if !crate::agent::inquiry::requirement_has_builtin_evidence_route(&normalized) {
             continue;
         }
@@ -621,35 +582,12 @@ fn compile_obligations(
         }
     }
 
-    // Relationship assessment and completion assessment are independent
-    // producer lanes. A typed subject domain cannot be discarded merely
-    // because the completion producer emitted an empty/conversational core;
-    // doing so lets state-dependent questions complete without observing the
-    // state. Reconcile the lanes here, below prose and above execution.
-    if evidence.is_empty() && invocations.is_empty() {
-        if let Some(scope) = request_semantic_scope {
-            // Conversation continuity is already supplied as a typed,
-            // task-bounded context projection. Requiring an additional tool
-            // receipt for that same lane would turn ordinary follow-ups into
-            // history-search loops. Durable resource domains, by contrast,
-            // are not present unless an observation reads them.
-            if scope != ToolSemanticScope::ConversationHistory {
-                let fallback = semantic_scope_fallback_requirement(scope);
-                if crate::agent::inquiry::requirement_has_builtin_evidence_route(&fallback) {
-                    evidence.push(fallback);
-                }
-            }
-        }
-    }
-
     // Keep the invocation lane separate in the compiled value. Installation
     // creates its canonical proof nodes once, after every producer has passed
     // through this same compiler.
     let installed_count = evidence.len() + invocations.len();
     let accepted = candidate_count == 0 || installed_count > 0;
-    let reason = if candidate_count == 0 && installed_count > 0 {
-        "semantic_scope_reconciled"
-    } else if candidate_count == 0 {
+    let reason = if candidate_count == 0 {
         "empty"
     } else if installed_count == candidate_count {
         "accepted"
@@ -1059,7 +997,6 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
 
     let (evidence, invocations, obligation_decision) = compile_obligations(
         input.signals,
-        input.request_semantic_scope,
         input.available_tool_names,
         input.available_tool_receipt_kinds,
     );
@@ -1209,7 +1146,6 @@ mod tests {
         compile_task_contract(ContractCompilerInput {
             signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["manage_mandates".to_string(), "terminal".to_string()],
             available_tool_receipt_kinds: &receipt_kinds,
             structural_filesystem_resources: &[],
@@ -1264,99 +1200,6 @@ mod tests {
             compiled.authority.allowed_tool_names,
             vec!["manage_mandates".to_string()]
         );
-    }
-
-    #[test]
-    fn independent_request_scope_reconciles_evidence_routing_without_parsing_prose() {
-        let mut signals = base_signals();
-        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
-            summary: "Inspect the durable autonomous objective".to_string(),
-            acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
-            purpose: EvidencePurpose::CurrentState,
-            minimum_authority: EvidenceAuthority::Canonical,
-            temporal_scope: EvidenceTemporalScope::Current,
-            required_content_markers: Vec::new(),
-            receipt: None,
-            target: None,
-        }]);
-        let compiled = compile_task_contract(ContractCompilerInput {
-            signals: &signals,
-            task_shape: None,
-            request_semantic_scope: Some(ToolSemanticScope::GoalState),
-            available_tool_names: &["scheduled_goal_runs".to_string()],
-            available_tool_receipt_kinds: &[(
-                "scheduled_goal_runs".to_string(),
-                crate::traits::ToolReceiptKind::Generic,
-            )],
-            structural_filesystem_resources: &[],
-            structural_project_scopes: &[],
-            project_alias_roots: &[],
-            current_user_text: "synthetic request",
-        });
-
-        assert_eq!(compiled.evidence_requirements.len(), 1);
-        assert!(compiled.evidence_requirements[0]
-            .acceptable_scopes
-            .contains(&ToolSemanticScope::GoalState));
-    }
-
-    #[test]
-    fn typed_state_scope_repairs_an_empty_conversational_completion_lane() {
-        let mut signals = base_signals();
-        signals.task_kind = Some("conversational".to_string());
-        signals.requires_observation = Some(false);
-        let compiled = compile_task_contract(ContractCompilerInput {
-            signals: &signals,
-            task_shape: None,
-            request_semantic_scope: Some(ToolSemanticScope::GoalState),
-            available_tool_names: &["scheduled_goal_runs".to_string()],
-            available_tool_receipt_kinds: &[(
-                "scheduled_goal_runs".to_string(),
-                crate::traits::ToolReceiptKind::Generic,
-            )],
-            structural_filesystem_resources: &[],
-            structural_project_scopes: &[],
-            project_alias_roots: &[],
-            current_user_text: "synthetic request",
-        });
-
-        let core = compiled.core.expect("reconciled core");
-        assert_eq!(core.task_kind, CompletionTaskKind::Check);
-        assert!(core.requires_observation);
-        assert_eq!(compiled.evidence_requirements.len(), 1);
-        assert_eq!(
-            compiled.evidence_requirements[0].acceptable_scopes,
-            [ToolSemanticScope::GoalState]
-        );
-        assert!(compiled.decisions.iter().any(|decision| {
-            decision.lane == "obligations" && decision.reason_code == "semantic_scope_reconciled"
-        }));
-    }
-
-    #[test]
-    fn typed_conversation_projection_does_not_require_a_duplicate_tool_read() {
-        let mut signals = base_signals();
-        signals.task_kind = Some("conversational".to_string());
-        signals.requires_observation = Some(false);
-        let compiled = compile_task_contract(ContractCompilerInput {
-            signals: &signals,
-            task_shape: None,
-            request_semantic_scope: Some(ToolSemanticScope::ConversationHistory),
-            available_tool_names: &["search_history".to_string()],
-            available_tool_receipt_kinds: &[(
-                "search_history".to_string(),
-                crate::traits::ToolReceiptKind::Generic,
-            )],
-            structural_filesystem_resources: &[],
-            structural_project_scopes: &[],
-            project_alias_roots: &[],
-            current_user_text: "synthetic request",
-        });
-
-        let core = compiled.core.expect("conversational core");
-        assert_eq!(core.task_kind, CompletionTaskKind::Conversational);
-        assert!(!core.requires_observation);
-        assert!(compiled.evidence_requirements.is_empty());
     }
 
     #[test]
@@ -1713,7 +1556,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1759,7 +1601,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1793,7 +1634,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1827,7 +1667,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["terminal".to_string()],
             available_tool_receipt_kinds: &[(
                 "terminal".to_string(),
@@ -1869,7 +1708,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["write_file".to_string()],
             available_tool_receipt_kinds: &[(
                 "write_file".to_string(),
@@ -1907,7 +1745,6 @@ mod tests {
         let compiled = compile_task_contract(ContractCompilerInput {
             signals: &signals,
             task_shape: None,
-            request_semantic_scope: None,
             available_tool_names: &["write_file".to_string()],
             available_tool_receipt_kinds: &[(
                 "write_file".to_string(),

@@ -253,19 +253,6 @@ async fn finalize_turn_assessment(
             super::contract_compiler::ContractCompilerInput {
                 signals,
                 task_shape: plan.and_then(|plan| plan.task_shape.as_ref()),
-                request_semantic_scope: relationship_shape
-                    .and_then(|shape| shape.semantic_scope.as_deref())
-                    .and_then(|scope| match scope {
-                        "goal_state" => Some(crate::traits::ToolSemanticScope::GoalState),
-                        "user_memory" => Some(crate::traits::ToolSemanticScope::UserMemory),
-                        "conversation_history" => {
-                            Some(crate::traits::ToolSemanticScope::ConversationHistory)
-                        }
-                        "external_remote" => Some(crate::traits::ToolSemanticScope::ExternalRemote),
-                        "local_workspace" => Some(crate::traits::ToolSemanticScope::LocalWorkspace),
-                        "host_local" => Some(crate::traits::ToolSemanticScope::HostLocal),
-                        _ => None,
-                    }),
                 available_tool_names,
                 available_tool_receipt_kinds,
                 structural_filesystem_resources: &structural_filesystem_resources,
@@ -275,40 +262,49 @@ async fn finalize_turn_assessment(
             },
         );
         contract_lane_decisions = compiled.decisions.clone();
-        compiled_evidence_requirements = compiled.evidence_requirements.clone();
-        compiled_required_invocations = compiled.required_invocations.clone();
-        compiled_response_contract = compiled.response_contract.clone();
+        let lifecycle_contract_complete = plan.is_some_and(|plan| plan.contract_complete);
+        if lifecycle_contract_complete {
+            compiled_evidence_requirements = compiled.evidence_requirements.clone();
+            compiled_required_invocations = compiled.required_invocations.clone();
+            compiled_response_contract = compiled.response_contract.clone();
+            compiled_evidence_policy = Some(compiled.evidence_policy.clone());
+            compiled_filesystem_access = compiled.filesystem_access.clone();
+            compiled_project_scope = compiled.project_scope.clone();
+        }
+        // Valid authority lanes are attenuation-only and survive an incomplete
+        // lifecycle product. They can remove capabilities while the task
+        // assessment repairs or fails closed, but can never grant execution or
+        // manufacture proof obligations on their own.
         compiled_authority = (compiled.mutation_authority_valid || compiled.tool_authority_valid)
             .then(|| compiled.authority.clone());
-        compiled_evidence_policy = Some(compiled.evidence_policy.clone());
-        compiled_filesystem_access = compiled.filesystem_access.clone();
-        compiled_project_scope = compiled.project_scope.clone();
 
-        if let Some(core) = compiled.core.as_ref() {
-            crate::agent::install_semantic_completion_contract(
-                &mut turn_context.completion_contract,
-                crate::agent::SemanticCompletionRequirements {
-                    expects_mutation: core.expects_mutation,
-                    requires_observation: core.requires_observation,
-                    task_kind: core.task_kind,
-                    required_mutation_effects: core.required_mutation_effects,
-                },
-            );
-            if turn_context.inherited_completion_contract {
-                turn_context.completion_contract = if turn_context.inherited_outstanding_obligations
-                {
-                    crate::agent::inherit_unfinished_request_contract(
-                        turn_context.completion_contract,
-                        &before_contract,
-                    )
-                } else {
-                    crate::agent::inherit_request_constraints(
-                        turn_context.completion_contract,
-                        &before_contract,
-                    )
-                };
+        if lifecycle_contract_complete {
+            if let Some(core) = compiled.core.as_ref() {
+                crate::agent::install_semantic_completion_contract(
+                    &mut turn_context.completion_contract,
+                    crate::agent::SemanticCompletionRequirements {
+                        expects_mutation: core.expects_mutation,
+                        requires_observation: core.requires_observation,
+                        task_kind: core.task_kind,
+                        required_mutation_effects: core.required_mutation_effects,
+                    },
+                );
+                if turn_context.inherited_completion_contract {
+                    turn_context.completion_contract =
+                        if turn_context.inherited_outstanding_obligations {
+                            crate::agent::inherit_unfinished_request_contract(
+                                turn_context.completion_contract,
+                                &before_contract,
+                            )
+                        } else {
+                            crate::agent::inherit_request_constraints(
+                                turn_context.completion_contract,
+                                &before_contract,
+                            )
+                        };
+                }
+                semantic_contract_applied = true;
             }
-            semantic_contract_applied = true;
         }
     }
 
@@ -435,16 +431,26 @@ async fn finalize_turn_assessment(
 
     if let Some(plan) = plan {
         let contract_changed = turn_context.completion_contract != before_contract;
+        let assessment_complete = plan.contract_complete && semantic_contract_applied;
         agent
             .emit_decision_point(
                 emitter,
                 task_id,
                 0,
                 assessment_decision_type,
-                "Task assessment succeeded".to_string(),
+                if assessment_complete {
+                    "Task assessment succeeded"
+                } else {
+                    "Task assessment retained constraints but failed lifecycle validation"
+                }
+                .to_string(),
                 {
                     let mut metadata = crate::agent::hand_holding_telemetry::planner_result_metadata(
-                        "succeeded",
+                        if assessment_complete {
+                            "succeeded"
+                        } else {
+                            "invalid_partial"
+                        },
                         model,
                         planner_trust_tier,
                         crate::agent::hand_holding_telemetry::PlannerResultStats {
@@ -453,10 +459,11 @@ async fn finalize_turn_assessment(
                             contract_present: plan.contract.is_some(),
                             contract_changed,
                         },
-                        None,
+                        (!assessment_complete).then_some("incomplete_completion_contract"),
                     );
                     metadata["assessment_mode"] = json!(plan.mode.as_str());
                     metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                    metadata["lifecycle_contract_coherent"] = json!(plan.contract_complete);
                     metadata["full_contract_complete"] = json!(plan
                         .contract
                         .as_ref()
