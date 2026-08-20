@@ -95,6 +95,11 @@ pub(crate) struct PlannedContractSignals {
     /// tools remain allowed. This is a typed deny-set, not a tool-name list.
     #[serde(default)]
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
+    /// Typed conditional lane closures emitted by the semantic producer.
+    /// Execution consumes these as receipt-triggered state transitions; no
+    /// request wording is reinterpreted downstream.
+    #[serde(default)]
+    pub dispatch_stop_rules: Option<Vec<crate::traits::RequestDispatchStopRule>>,
     /// Legacy schema field. Contract compilation never matches user prose;
     /// retained only so older planner responses remain deserializable.
     #[serde(default)]
@@ -244,6 +249,9 @@ fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSig
     let required_invocations = object
         .contains_key("required_invocations")
         .then(|| decode_array_items(object, "required_invocations"));
+    let dispatch_stop_rules = object
+        .contains_key("dispatch_stop_rules")
+        .then(|| decode_array_items(object, "dispatch_stop_rules"));
 
     Some(PlannedContractSignals {
         confidence: decode_optional_field(object, "confidence"),
@@ -267,6 +275,7 @@ fn decode_planned_contract_candidate(value: &Value) -> Option<PlannedContractSig
         requires_exact_history: decode_optional_field(object, "requires_exact_history"),
         evidence_requirements,
         required_invocations,
+        dispatch_stop_rules,
         filesystem_access,
         project_reference: decode_optional_field(object, "project_reference"),
     })
@@ -347,6 +356,7 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         || signals.requires_exact_history.is_none()
         || signals.evidence_requirements.is_none()
         || signals.required_invocations.is_none()
+        || signals.dispatch_stop_rules.is_none()
         || signals.filesystem_access.is_none()
         || signals.tool_scope.is_none()
     {
@@ -429,12 +439,14 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
 
     let evidence_requirements = signals.evidence_requirements.as_deref().unwrap_or_default();
     let required_invocations = signals.required_invocations.as_deref().unwrap_or_default();
+    let dispatch_stop_rules = signals.dispatch_stop_rules.as_deref().unwrap_or_default();
     let filesystem_access = signals.filesystem_access.as_ref().expect("checked above");
     let has_filesystem_read_capability =
         !filesystem_access.read_paths.is_empty() || !filesystem_access.read_roots.is_empty();
     let has_process_context = filesystem_access.execution_cwd.is_some();
     if evidence_requirements.len() > 8
         || required_invocations.len() > 8
+        || dispatch_stop_rules.len() > 8
         || filesystem_access.read_paths.len() > 8
         || filesystem_access.write_paths.len() > 8
         || filesystem_access.read_roots.len() > 8
@@ -572,6 +584,22 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                         .tool_names
                         .iter()
                         .any(|name| !signals.allowed_tool_names.contains(name))
+        })
+        || dispatch_stop_rules.iter().any(|rule| {
+            rule.trigger.is_empty()
+                || !required_invocations.contains(&rule.trigger)
+                || (rule.blocked_tool_names.is_empty() && rule.blocked_receipt_kinds.is_empty())
+                || rule.blocked_tool_names.len() > 8
+                || rule.blocked_receipt_kinds.len() > 3
+                || rule.blocked_tool_names.iter().any(|name| {
+                    name.is_empty()
+                        || name.len() > 80
+                        || !name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
         })
     {
         return false;
@@ -745,7 +773,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 12;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 13;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -777,7 +805,7 @@ fn decode_task_plan_response(envelope: &Value) -> Option<TaskPlanResponse> {
 fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanResponse> {
     match parsed.schema_version {
         TASK_CONTRACT_SCHEMA_VERSION => Some(parsed),
-        7..=11 => {
+        7..=12 => {
             if let Some(contract) = parsed.contract.as_mut() {
                 let invocations = contract.required_invocations.get_or_insert_with(Vec::new);
                 for requirement in contract
@@ -799,6 +827,7 @@ fn migrate_task_plan_response(mut parsed: TaskPlanResponse) -> Option<TaskPlanRe
                 contract
                     .filesystem_access
                     .get_or_insert_with(PlannedFilesystemAccess::default);
+                contract.dispatch_stop_rules.get_or_insert_with(Vec::new);
             }
             parsed.schema_version = TASK_CONTRACT_SCHEMA_VERSION;
             Some(parsed)
@@ -1248,7 +1277,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 12,\n\
+           \"schema_version\": 13,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -1263,6 +1292,20 @@ pub(crate) async fn generate_task_plan(
              \"tool_scope\": \"allowed|forbidden|restricted\",\n\
              \"allowed_tool_names\": [\"check_environment\"],\n\
              \"forbidden_tool_scopes\": [\"user_memory\"],\n\
+             \"dispatch_stop_rules\": [\n\
+               {{\n\
+                 \"trigger\": {{\n\
+                   \"tool_names\": [\"prerequisite tool identifier\"],\n\
+                   \"exit_codes\": [],\n\
+                   \"outcome_condition\": \"non_success_terminal\",\n\
+                   \"requires_output\": false,\n\
+                   \"min_invocations\": 1,\n\
+                   \"max_invocations\": 1\n\
+                 }},\n\
+                 \"blocked_receipt_kinds\": [\"process\"],\n\
+                 \"blocked_tool_names\": [\"dependent tool identifier\"]\n\
+               }}\n\
+             ],\n\
              \"response_contract\": {{\"mode\": \"exact_text\", \"success_text\": \"literal user-authored response\"}},\n\
              \"minimum_sources\": 0,\n\
              \"requires_primary_sources\": false,\n\
@@ -1351,6 +1394,14 @@ pub(crate) async fn generate_task_plan(
            denies user_memory without denying conversation_history or local_workspace. Never infer \
            a deny-set from the topic or an older turn. Otherwise use tool_scope=allowed, \
            forbidden_tool_scopes=[], and allowed_tool_names=[].\n\
+         - dispatch_stop_rules expresses a conditional workflow edge: once the trigger receipt \
+           has occurred, every dependent capability is removed from subsequent planning and rejected \
+           before adapter I/O if proposed anyway. Use it when the CURRENT request explicitly says \
+           that a later tool/capability must not run after a typed prerequisite result. The trigger \
+           must duplicate one required_invocations predicate exactly. Put protocol-wide dependencies \
+           in blocked_receipt_kinds using generic, process, or http; use blocked_tool_names only for \
+           registered exact tool identifiers explicitly singled out by the request. Use [] when no stop \
+           exists. This field only attenuates execution; it never grants a tool or proves an obligation.\n\
          - required_response_fields is a retired compatibility field and must be []. Final prose \
            is never execution proof and is not matched by labels or markers.\n\
          - response_contract is null unless the CURRENT user explicitly supplies the complete \
@@ -2465,6 +2516,7 @@ mod tests {
             tool_scope: Some("allowed".to_string()),
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
+            dispatch_stop_rules: Some(Vec::new()),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),
             response_contract: None,

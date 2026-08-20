@@ -225,6 +225,7 @@ async fn finalize_turn_assessment(
     let mut contract_lane_decisions = Vec::new();
     let mut compiled_evidence_requirements = Vec::new();
     let mut compiled_required_invocations = Vec::new();
+    let mut compiled_dispatch_stop_rules = Vec::new();
     let mut compiled_response_contract = None;
     let mut compiled_authority = None;
     let mut compiled_evidence_policy = None;
@@ -266,6 +267,7 @@ async fn finalize_turn_assessment(
         if lifecycle_contract_complete {
             compiled_evidence_requirements = compiled.evidence_requirements.clone();
             compiled_required_invocations = compiled.required_invocations.clone();
+            compiled_dispatch_stop_rules = compiled.dispatch_stop_rules.clone();
             compiled_response_contract = compiled.response_contract.clone();
             compiled_evidence_policy = Some(compiled.evidence_policy.clone());
             compiled_filesystem_access = compiled.filesystem_access.clone();
@@ -359,6 +361,18 @@ async fn finalize_turn_assessment(
         &mut turn_context.completion_contract,
         &effective_required_invocations,
     );
+    for rule in compiled_dispatch_stop_rules {
+        if !turn_context
+            .completion_contract
+            .dispatch_stop_rules
+            .contains(&rule)
+        {
+            turn_context
+                .completion_contract
+                .dispatch_stop_rules
+                .push(rule);
+        }
+    }
     // Presentation follows the request lifecycle, not session recency. A new
     // external request clears it; a structural resume or a validated adoption
     // of unfinished obligations retains the parent artifact unless the current

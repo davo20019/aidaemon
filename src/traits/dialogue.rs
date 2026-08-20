@@ -2,8 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::tools::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolInvocationStage,
-    ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind, ToolSemanticScope,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolEvidenceCapability,
+    ToolInvocationStage, ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind,
+    ToolSemanticScope,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +243,27 @@ impl RequestReceiptPredicate {
     }
 }
 
+/// A task-local conditional transition that closes selected execution lanes
+/// after a typed receipt has occurred.
+///
+/// This is deliberately a receipt-to-capability edge rather than a phrase or
+/// command rule. It lets a semantic producer express workflows such as “after
+/// the prerequisite is permanently rejected, do not start its dependent
+/// process”, while leaving unrelated recovery tools available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestDispatchStopRule {
+    pub trigger: RequestReceiptPredicate,
+    /// Receipt protocol families closed by this transition. The compiler
+    /// resolves these capabilities against the registered tool set and
+    /// persists the resulting exact adapter names for atomic admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_receipt_kinds: Vec<ToolReceiptKind>,
+    /// Optional exact adapter lanes. This is useful when the request names a
+    /// particular tool rather than an entire capability family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tool_names: Vec<String>,
+}
+
 /// One material information need that must be supported before a request can
 /// complete successfully. The natural-language summary guides investigation;
 /// the typed fields are the completion invariant.
@@ -265,6 +287,15 @@ pub struct RequestEvidenceRequirement {
     pub receipt: Option<RequestReceiptPredicate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<RequestVerificationTarget>,
+}
+
+impl RequestEvidenceRequirement {
+    pub fn supports_capability(&self, capability: &ToolEvidenceCapability) -> bool {
+        self.acceptable_scopes.contains(&capability.scope)
+            && capability.purposes.contains(&self.purpose)
+            && capability.authority.satisfies(self.minimum_authority)
+            && capability.temporal_scope.satisfies(self.temporal_scope)
+    }
 }
 
 /// Stable proof-graph identity retained when a typed continuation adopts an
@@ -307,6 +338,11 @@ pub struct RequestCompletionContract {
     /// leaving unrelated tools available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_tool_scopes: Vec<ToolSemanticScope>,
+    /// Conditional task-local stop transitions. A triggered rule removes only
+    /// its selected tools; it cannot grant authority or block unrelated
+    /// recovery capabilities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_stop_rules: Vec<RequestDispatchStopRule>,
     /// Exact user-authored labels required in the substantive final answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_response_fields: Vec<String>,

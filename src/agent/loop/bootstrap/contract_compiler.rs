@@ -4,10 +4,10 @@ use super::task_planning::{
 };
 use crate::agent::CompletionTaskKind;
 use crate::traits::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
-    RequestReceiptPredicate, RequestResponseContract, RequestedOutcomeCondition,
-    ToolCallAccessManifest, ToolMutationEffects, ToolSemanticScope, ToolTargetHint,
-    ToolTargetHintKind,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestDispatchStopRule,
+    RequestEvidenceRequirement, RequestReceiptPredicate, RequestResponseContract,
+    RequestedOutcomeCondition, ToolCallAccessManifest, ToolMutationEffects, ToolSemanticScope,
+    ToolTargetHint, ToolTargetHintKind,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -72,6 +72,7 @@ pub(crate) struct CompiledTaskContract {
     pub evidence_policy: CompiledEvidencePolicy,
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     pub required_invocations: Vec<RequestReceiptPredicate>,
+    pub dispatch_stop_rules: Vec<RequestDispatchStopRule>,
     pub response_contract: Option<Box<RequestResponseContract>>,
     pub filesystem_access: Option<ToolCallAccessManifest>,
     pub project_scope: Option<String>,
@@ -609,6 +610,84 @@ fn compile_obligations(
     )
 }
 
+fn compile_dispatch_stop_rules(
+    signals: &PlannedContractSignals,
+    compiled_invocations: &[RequestReceiptPredicate],
+    available_tool_names: &[String],
+    available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
+) -> (Vec<RequestDispatchStopRule>, ContractLaneDecision) {
+    let candidates = signals.dispatch_stop_rules.as_deref().unwrap_or_default();
+    let mut installed = Vec::new();
+    for candidate in candidates {
+        let trigger = normalize_receipt_for_tool_protocol(
+            normalize_receipt_predicate(candidate.trigger.clone()),
+            available_tool_receipt_kinds,
+        );
+        // A stop trigger must be the exact identity of a compiled invocation
+        // obligation. This makes the transition replayable from the same
+        // durable receipt instead of introducing a second outcome authority.
+        if !compiled_invocations.contains(&trigger) {
+            continue;
+        }
+        let mut blocked_receipt_kinds = Vec::new();
+        for kind in candidate.blocked_receipt_kinds.iter().copied() {
+            if !blocked_receipt_kinds.contains(&kind) {
+                blocked_receipt_kinds.push(kind);
+            }
+        }
+        let mut blocked_tool_names = candidate
+            .blocked_tool_names
+            .iter()
+            .filter(|name| available_tool_names.contains(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        // Resolve protocol-wide capabilities once against the registered tool
+        // set. Durable admission then uses exact installed adapter identities,
+        // without teaching the controller aliases or parsing command prose.
+        blocked_tool_names.extend(
+            available_tool_receipt_kinds
+                .iter()
+                .filter(|(_, kind)| blocked_receipt_kinds.contains(kind))
+                .map(|(name, _)| name.clone()),
+        );
+        blocked_tool_names.sort();
+        blocked_tool_names.dedup();
+        if blocked_tool_names.is_empty() {
+            continue;
+        }
+        let rule = RequestDispatchStopRule {
+            trigger,
+            blocked_receipt_kinds,
+            blocked_tool_names,
+        };
+        if !installed.contains(&rule) {
+            installed.push(rule);
+        }
+    }
+    let candidate_count = candidates.len();
+    let installed_count = installed.len();
+    let accepted = candidate_count == 0 || installed_count > 0;
+    let reason = if candidate_count == 0 {
+        "empty"
+    } else if installed_count == candidate_count {
+        "accepted"
+    } else if installed_count > 0 {
+        "partially_accepted"
+    } else {
+        "no_valid_typed_transition"
+    };
+    (
+        installed,
+        decision(
+            "dispatch_stop_rules",
+            accepted,
+            reason,
+            candidate_count,
+            installed_count,
+        ),
+    )
+}
+
 fn compile_authority(
     signals: &PlannedContractSignals,
     available_tool_names: &[String],
@@ -1004,6 +1083,15 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     compiled.required_invocations = invocations;
     compiled.decisions.push(obligation_decision);
 
+    let (dispatch_stop_rules, dispatch_stop_decision) = compile_dispatch_stop_rules(
+        input.signals,
+        &compiled.required_invocations,
+        input.available_tool_names,
+        input.available_tool_receipt_kinds,
+    );
+    compiled.dispatch_stop_rules = dispatch_stop_rules;
+    compiled.decisions.push(dispatch_stop_decision);
+
     let (evidence_policy, evidence_policy_decisions) =
         compile_evidence_policy(input.signals, &compiled.evidence_requirements);
     compiled.evidence_policy = evidence_policy;
@@ -1119,6 +1207,7 @@ mod tests {
             tool_scope: Some("allowed".to_string()),
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
+            dispatch_stop_rules: Some(Vec::new()),
             tool_constraint_evidence: Vec::new(),
             required_response_fields: Vec::new(),
             response_contract: None,
@@ -1153,6 +1242,40 @@ mod tests {
             project_alias_roots: &[],
             current_user_text: "synthetic request",
         })
+    }
+
+    #[test]
+    fn dispatch_stop_rule_is_bound_to_one_compiled_receipt_trigger() {
+        let mut signals = base_signals();
+        let trigger = RequestReceiptPredicate {
+            tool_names: vec!["manage_mandates".to_string()],
+            outcome_condition: Some(RequestedOutcomeCondition::NonSuccessTerminal),
+            min_invocations: Some(1),
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        };
+        signals.required_invocations = Some(vec![trigger.clone()]);
+        signals.dispatch_stop_rules = Some(vec![RequestDispatchStopRule {
+            trigger,
+            blocked_receipt_kinds: vec![crate::traits::ToolReceiptKind::Process],
+            blocked_tool_names: Vec::new(),
+        }]);
+
+        let compiled = compile(&signals);
+        assert_eq!(compiled.dispatch_stop_rules.len(), 1);
+        assert_eq!(
+            compiled.dispatch_stop_rules[0].blocked_tool_names,
+            ["terminal"]
+        );
+        assert_eq!(
+            compiled.dispatch_stop_rules[0].blocked_receipt_kinds,
+            [crate::traits::ToolReceiptKind::Process]
+        );
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "dispatch_stop_rules"
+                && decision.accepted
+                && decision.reason_code == "accepted"
+        }));
     }
 
     #[test]

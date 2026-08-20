@@ -898,7 +898,7 @@ pub struct TaskContractCompiledData {
 }
 
 impl TaskContractCompiledData {
-    pub const SCHEMA_VERSION: u16 = 2;
+    pub const SCHEMA_VERSION: u16 = 3;
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

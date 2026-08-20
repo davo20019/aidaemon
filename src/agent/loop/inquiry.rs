@@ -352,14 +352,7 @@ pub(in crate::agent) fn capability_supports_requirement(
     capability: &ToolEvidenceCapability,
     requirement: &RequestEvidenceRequirement,
 ) -> bool {
-    requirement.acceptable_scopes.contains(&capability.scope)
-        && capability.purposes.contains(&requirement.purpose)
-        && capability
-            .authority
-            .satisfies(requirement.minimum_authority)
-        && capability
-            .temporal_scope
-            .satisfies(requirement.temporal_scope)
+    requirement.supports_capability(capability)
 }
 
 pub(in crate::agent) fn requirement_is_exact_invocation(

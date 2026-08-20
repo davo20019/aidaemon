@@ -3973,6 +3973,7 @@ mod tests {
             forbids_tool_use: false,
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
+            dispatch_stop_rules: Vec::new(),
             required_response_fields: Vec::new(),
             response_contract: None,
             forbidden_actions: Vec::new(),

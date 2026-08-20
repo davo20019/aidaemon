@@ -20,6 +20,26 @@ fn build_stuck_no_output_fallback(_user_text: &str) -> String {
         .to_string()
 }
 
+/// Project durable task-kernel lane closures into the next model step. The
+/// base definition set is immutable so a later, unrelated task starts with the
+/// complete registered capability set again.
+fn tool_definitions_after_dispatch_stops(
+    tool_defs: &[serde_json::Value],
+    stopped_tools: &std::collections::BTreeSet<String>,
+) -> Vec<serde_json::Value> {
+    tool_defs
+        .iter()
+        .filter(|definition| {
+            definition
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|name| !stopped_tools.contains(name))
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContinuationReceiptAssimilation {
     outcome_status: crate::traits::ToolOutcomeStatus,
@@ -1365,19 +1385,25 @@ impl Agent {
             // the compatibility proof graph on every scheduler pass so a
             // provider retry, crash recovery, or replan cannot resurrect stale
             // in-memory obligations or overwrite already-proved work.
-            match self
+            let triggered_dispatch_stop_tools = match self
                 .event_store
                 .task_run_aggregate(session_id, &task_id)
                 .await
             {
-                Ok(aggregate) => completion_progress.reconcile_with_run_aggregate(&aggregate),
-                Err(error) => warn!(
-                    session_id,
-                    task_id = %task_id,
-                    %error,
-                    "Could not refresh durable task-kernel projection"
-                ),
-            }
+                Ok(aggregate) => {
+                    completion_progress.reconcile_with_run_aggregate(&aggregate);
+                    aggregate.triggered_dispatch_stop_tools()
+                }
+                Err(error) => {
+                    warn!(
+                        session_id,
+                        task_id = %task_id,
+                        %error,
+                        "Could not refresh durable task-kernel projection"
+                    );
+                    std::collections::BTreeSet::new()
+                }
+            };
 
             // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {
@@ -1646,6 +1672,10 @@ impl Agent {
             let message_build_directives = turn_state.directives.for_message_build_phase();
             let message_build_recovery = turn_state.recovery.for_message_build_phase();
             let message_build_start = Instant::now();
+            let iteration_tool_defs = tool_definitions_after_dispatch_stops(
+                &tool_defs,
+                &triggered_dispatch_stop_tools,
+            );
             let MessageBuildData {
                 mut messages,
                 tool_defs: effective_tool_defs,
@@ -1670,7 +1700,7 @@ impl Agent {
                         .filter(|_| preserve_archived_context)
                         .filter(|summary| summary.last_turn_seq.is_some())
                         .map(|summary| summary.last_message_id.as_str()),
-                    tool_defs: &tool_defs,
+                    tool_defs: &iteration_tool_defs,
                     policy_bundle: &policy_bundle,
                     pending_system_messages: message_build_directives.pending_system_messages,
                     empty_response_retry_pending: message_build_recovery
@@ -1686,7 +1716,9 @@ impl Agent {
                 },
             )
             .await?;
-            let context_drops = tool_defs.len().saturating_sub(effective_tool_defs.len()) as u32;
+            let context_drops = iteration_tool_defs
+                .len()
+                .saturating_sub(effective_tool_defs.len()) as u32;
             turn_state
                 .with_harness_eval(|eval| {
                     eval.record_message_build(
@@ -2338,6 +2370,33 @@ mod characterization_tests;
 #[cfg(test)]
 mod stuck_fallback_tests {
     use super::*;
+
+    #[test]
+    fn durable_dispatch_stop_projection_removes_only_closed_tool_lanes() {
+        let definition = |name: &str| {
+            json!({
+                "type": "function",
+                "function": {"name": name, "parameters": {"type": "object"}}
+            })
+        };
+        let all = vec![
+            definition("terminal"),
+            definition("run_command"),
+            definition("read_file"),
+            definition("system_info"),
+        ];
+        let stopped =
+            std::collections::BTreeSet::from(["run_command".to_string(), "terminal".to_string()]);
+
+        let projected = tool_definitions_after_dispatch_stops(&all, &stopped);
+        let names = projected
+            .iter()
+            .filter_map(|value| value.pointer("/function/name")?.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["read_file", "system_info"]);
+        assert_eq!(all.len(), 4, "the registered base set remains immutable");
+    }
 
     fn detached_command_evidence(
         status: crate::traits::ToolOutcomeStatus,

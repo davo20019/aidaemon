@@ -108,6 +108,10 @@ pub(super) struct CompletionContract {
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
+    /// Typed receipt-triggered lane closures for conditional workflows.
+    /// These are task-local attenuation rules, never inferred from prose at
+    /// execution time and never allowed to grant a capability.
+    pub dispatch_stop_rules: Vec<crate::traits::RequestDispatchStopRule>,
     /// Retained for persisted-schema compatibility. Final prose is not proof;
     /// runtime completion deliberately ignores these legacy labels.
     pub required_response_fields: Vec<String>,
@@ -182,6 +186,7 @@ pub(super) fn persistable_completion_contract(
         forbids_tool_use: contract.forbids_tool_use,
         allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
+        dispatch_stop_rules: contract.dispatch_stop_rules.clone(),
         required_response_fields: contract.required_response_fields.clone(),
         response_contract: contract.response_contract.clone(),
         forbidden_actions: contract
@@ -254,6 +259,7 @@ pub(super) fn completion_contract_from_persisted(
         forbids_tool_use: contract.forbids_tool_use,
         allowed_tool_names: contract.allowed_tool_names.clone(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
+        dispatch_stop_rules: contract.dispatch_stop_rules.clone(),
         required_response_fields: contract.required_response_fields.clone(),
         response_contract: contract.response_contract.clone(),
         forbidden_mutation_actions: contract
@@ -402,6 +408,11 @@ pub(super) fn inherit_unfinished_request_contract(
     for scope in &unfinished.forbidden_tool_scopes {
         if !current.forbidden_tool_scopes.contains(scope) {
             current.forbidden_tool_scopes.push(*scope);
+        }
+    }
+    for rule in &unfinished.dispatch_stop_rules {
+        if !current.dispatch_stop_rules.contains(rule) {
+            current.dispatch_stop_rules.push(rule.clone());
         }
     }
     for field in &unfinished.required_response_fields {
@@ -777,6 +788,7 @@ pub(super) fn install_semantic_completion_contract(
         forbids_tool_use: false,
         allowed_tool_names: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
+        dispatch_stop_rules: Vec::new(),
         required_response_fields: Vec::new(),
         response_contract: None,
         forbidden_mutation_actions: Vec::new(),
@@ -2739,6 +2751,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         forbids_tool_use: false,
         allowed_tool_names: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
+        dispatch_stop_rules: Vec::new(),
         required_response_fields: Vec::new(),
         response_contract: None,
         forbidden_mutation_actions,
@@ -2775,6 +2788,7 @@ mod tests {
             forbids_tool_use: false,
             allowed_tool_names: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
+            dispatch_stop_rules: Vec::new(),
             required_response_fields: Vec::new(),
             response_contract: None,
             forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
@@ -4589,6 +4603,7 @@ mod tests {
                 class: crate::events::RunObligationClass::Perform,
                 state: crate::events::RunObligationState::Satisfied,
                 receipt: Some(crate::traits::RequestReceiptPredicate::default()),
+                evidence_requirement: None,
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["receipt-1".to_string()],

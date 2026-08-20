@@ -16,8 +16,9 @@ use super::{
     TaskStatus, ToolCallData, ToolResultData,
 };
 use crate::traits::{
-    EvidenceTemporalScope, RequestReceiptPredicate, RequestResponseContract, ToolMutationEffects,
-    ToolOutcomeStatus,
+    EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
+    RequestReceiptPredicate, RequestResponseContract, RequestVerificationTargetKind,
+    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +52,11 @@ pub(crate) struct RunObligation {
     pub state: RunObligationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<RequestReceiptPredicate>,
+    /// Full typed evidence identity for observation obligations. Earlier
+    /// projections retained only the class and accidentally let any successful
+    /// read satisfy any subject scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_requirement: Option<RequestEvidenceRequirement>,
     #[serde(default)]
     pub required_effect: ToolMutationEffects,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +158,8 @@ pub(crate) struct RunAggregate {
     /// capability allowlist and is replay-checked against every operation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub allowed_tool_names: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_stop_rules: Vec<RequestDispatchStopRule>,
     #[serde(default)]
     pub operations: BTreeMap<String, RunOperation>,
     #[serde(default)]
@@ -187,6 +195,7 @@ impl RunAggregate {
             obligations: BTreeMap::new(),
             response_contract: None,
             allowed_tool_names: BTreeSet::new(),
+            dispatch_stop_rules: Vec::new(),
             operations: BTreeMap::new(),
             cardinality_violations: 0,
             primary_causal_operation_id: None,
@@ -306,6 +315,7 @@ impl RunAggregate {
             .iter()
             .cloned()
             .collect();
+        self.dispatch_stop_rules = compiled.contract.dispatch_stop_rules.clone();
         self.cardinality_violations = 0;
 
         for (index, requirement) in compiled.contract.evidence_requirements.iter().enumerate() {
@@ -327,6 +337,7 @@ impl RunAggregate {
                 class,
                 state: RunObligationState::Pending,
                 receipt: requirement.receipt.clone(),
+                evidence_requirement: Some(requirement.clone()),
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
@@ -349,6 +360,7 @@ impl RunAggregate {
                 class: RunObligationClass::Perform,
                 state: RunObligationState::Pending,
                 receipt: Some(predicate),
+                evidence_requirement: None,
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
@@ -371,6 +383,7 @@ impl RunAggregate {
                 class: RunObligationClass::Achieve,
                 state: RunObligationState::Pending,
                 receipt: None,
+                evidence_requirement: None,
                 required_effect: effect,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
@@ -389,6 +402,7 @@ impl RunAggregate {
                 // request. Fail closed at the persisted lifecycle boundary.
                 state: RunObligationState::Unverifiable,
                 receipt: None,
+                evidence_requirement: None,
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
@@ -401,6 +415,7 @@ impl RunAggregate {
                 class: RunObligationClass::Deliver,
                 state: RunObligationState::Pending,
                 receipt: None,
+                evidence_requirement: None,
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
@@ -608,7 +623,12 @@ impl RunAggregate {
             if obligation.state == RunObligationState::Unverifiable {
                 continue;
             }
-            let explicitly_proven = explicit_ids.contains(&obligation.id);
+            let observation_compatible = obligation
+                .evidence_requirement
+                .as_ref()
+                .is_none_or(|requirement| evidence_receipt_supports(requirement, receipt));
+            let explicitly_proven = explicit_ids.contains(&obligation.id)
+                && (obligation.class != RunObligationClass::Observe || observation_compatible);
             let claim_allows_proof = claimed_obligation_ids.is_empty()
                 || claimed_obligation_ids.contains(&obligation.id);
             let predicate_proven = claim_allows_proof
@@ -627,7 +647,8 @@ impl RunAggregate {
                 && obligation.receipt.is_none()
                 && result.completed_observation()
                 && receipt.invocation_stage.reached_dispatch()
-                && receipt.semantics.observes_state();
+                && receipt.semantics.observes_state()
+                && observation_compatible;
             // Receipt-bound obligations are replayed from their predicate,
             // never trusted from an upstream completion-ID annotation. This
             // keeps the reducer authoritative if an intermediate matcher is
@@ -941,6 +962,18 @@ impl RunAggregate {
                 ),
             };
         }
+        if self
+            .triggered_dispatch_stop_tools()
+            .contains(&claim.tool_name)
+        {
+            return TaskKernelAdmission::Rejected {
+                code: "dispatch_stop_rule_triggered",
+                detail: format!(
+                    "`{}` is closed by a satisfied task-local prerequisite transition.",
+                    claim.tool_name
+                ),
+            };
+        }
         let lineage_source = claim
             .operation_lineage
             .as_ref()
@@ -1063,6 +1096,22 @@ impl RunAggregate {
         TaskKernelAdmission::Admitted
     }
 
+    /// Exact tool lanes closed by already-satisfied receipt triggers. The
+    /// projection is deterministic from durable obligations and is safe to use
+    /// both for model tool visibility and atomic admission.
+    pub(crate) fn triggered_dispatch_stop_tools(&self) -> BTreeSet<String> {
+        self.dispatch_stop_rules
+            .iter()
+            .filter(|rule| {
+                self.obligations.values().any(|obligation| {
+                    obligation.state == RunObligationState::Satisfied
+                        && obligation.receipt.as_ref() == Some(&rule.trigger)
+                })
+            })
+            .flat_map(|rule| rule.blocked_tool_names.iter().cloned())
+            .collect()
+    }
+
     pub(crate) fn lifecycle_phase(&self) -> TaskKernelPhase {
         if let Some(status) = self.recorded_task_status {
             match status {
@@ -1148,6 +1197,41 @@ pub(crate) fn receipt_matches_predicate(
     !predicate.requires_output || receipt.result_provenance.authoritative_chars > 0
 }
 
+fn evidence_receipt_supports(
+    requirement: &RequestEvidenceRequirement,
+    receipt: &super::ToolReceiptV1,
+) -> bool {
+    if !receipt
+        .semantics
+        .evidence
+        .iter()
+        .any(|capability| requirement.supports_capability(capability))
+    {
+        return false;
+    }
+    let Some(target) = requirement.target.as_ref() else {
+        return true;
+    };
+    receipt
+        .semantics
+        .target_hints
+        .iter()
+        .any(|hint| match (target.kind, hint.kind) {
+            (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => {
+                target.value == hint.value
+            }
+            (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
+                let expected = crate::execution::normalize_active_path_lexically(&target.value);
+                let actual = crate::execution::normalize_active_path_lexically(&hint.value);
+                expected
+                    .ok()
+                    .zip(actual.ok())
+                    .is_some_and(|(left, right)| left == right)
+            }
+            _ => false,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,8 +1240,8 @@ mod tests {
     };
     use crate::traits::{
         EvidenceAuthority, EvidencePurpose, RequestCompletionContract, RequestEvidenceRequirement,
-        ToolCallEffect, ToolCallSemantics, ToolInvocationStage, ToolReceiptKind,
-        ToolResultProvenance,
+        RequestedOutcomeCondition, ToolCallEffect, ToolCallSemantics, ToolEvidenceCapability,
+        ToolInvocationStage, ToolReceiptKind, ToolResultProvenance, ToolSemanticScope,
     };
     use serde_json::json;
 
@@ -1211,6 +1295,7 @@ mod tests {
                     forbids_tool_use: false,
                     allowed_tool_names,
                     forbidden_tool_scopes: Vec::new(),
+                    dispatch_stop_rules: Vec::new(),
                     required_response_fields: Vec::new(),
                     response_contract,
                     forbidden_actions: Vec::new(),
@@ -1432,6 +1517,137 @@ mod tests {
                 disposition: crate::events::AssistantResponseDisposition::Terminal,
             },
         )
+    }
+
+    #[test]
+    fn triggered_dispatch_stop_rule_closes_only_the_dependent_lane() {
+        let trigger = RequestReceiptPredicate {
+            tool_names: vec!["write_file".to_string()],
+            outcome_condition: Some(RequestedOutcomeCondition::NonSuccessTerminal),
+            min_invocations: Some(1),
+            max_invocations: Some(1),
+            ..RequestReceiptPredicate::default()
+        };
+        let mut contract_event = contract(vec![RequestEvidenceRequirement {
+            summary: "Observe the prerequisite terminal result".to_string(),
+            acceptable_scopes: Vec::new(),
+            purpose: EvidencePurpose::Outcome,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Historical,
+            required_content_markers: Vec::new(),
+            receipt: Some(trigger.clone()),
+            target: None,
+        }]);
+        contract_event.data["contract"]["dispatch_stop_rules"] =
+            serde_json::to_value(vec![RequestDispatchStopRule {
+                trigger,
+                blocked_receipt_kinds: vec![ToolReceiptKind::Process],
+                blocked_tool_names: vec!["run_command".to_string(), "terminal".to_string()],
+            }])
+            .expect("serialize stop rule");
+        let obligation = "task:task-1/obligation:evidence:0";
+        let mut events = vec![
+            contract_event,
+            claimed_call("denied", "write_file", "operation:denied", &[obligation]),
+            result(
+                "denied",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                1,
+                ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.triggered_dispatch_stop_tools(),
+            BTreeSet::from(["run_command".to_string(), "terminal".to_string()])
+        );
+
+        let claim = |tool_name: &str| TaskKernelOperationClaim {
+            operation_id: format!("operation-{tool_name}"),
+            stable_operation_key: format!("stable-{tool_name}"),
+            tool_name: tool_name.to_string(),
+            obligation_ids: Vec::new(),
+            max_attempts: 1,
+            max_invocations: 1,
+            idempotency_key: None,
+            operation_lineage: None,
+        };
+        assert!(matches!(
+            aggregate.admit_operation(&claim("run_command")),
+            TaskKernelAdmission::Rejected {
+                code: "dispatch_stop_rule_triggered",
+                ..
+            }
+        ));
+        assert_eq!(
+            aggregate.admit_operation(&claim("read_file")),
+            TaskKernelAdmission::Admitted,
+            "an independent recovery tool must remain available"
+        );
+    }
+
+    #[test]
+    fn observation_obligation_preserves_scope_in_durable_reducer() {
+        let requirement = RequestEvidenceRequirement {
+            summary: "Observe one local workspace resource".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::LocalWorkspace],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let mut events = vec![
+            contract(vec![requirement]),
+            call("host", "system_info"),
+            result(
+                "host",
+                "system_info",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation().with_evidence(vec![ToolEvidenceCapability::new(
+                    ToolSemanticScope::HostLocal,
+                    &[EvidencePurpose::CurrentState],
+                    EvidenceAuthority::Direct,
+                    EvidenceTemporalScope::Current,
+                )]),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        let obligation = &aggregate.obligations["task:task-1/obligation:evidence:0"];
+        assert_eq!(obligation.state, RunObligationState::Pending);
+
+        let next_id = events.len() as i64 + 1;
+        let mut read_call = call("workspace", "read_file");
+        read_call.id = next_id;
+        events.push(read_call);
+        let mut read_result = result(
+            "workspace",
+            "read_file",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::observation().with_evidence(vec![ToolEvidenceCapability::new(
+                ToolSemanticScope::LocalWorkspace,
+                &[EvidencePurpose::CurrentState],
+                EvidenceAuthority::Direct,
+                EvidenceTemporalScope::Current,
+            )]),
+        );
+        read_result.id = next_id + 1;
+        events.push(read_result);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:evidence:0"].state,
+            RunObligationState::Satisfied
+        );
     }
 
     #[test]
@@ -1902,7 +2118,13 @@ mod tests {
             ToolCallSemantics {
                 effect: ToolCallEffect::Observation,
                 ..ToolCallSemantics::default()
-            },
+            }
+            .with_evidence(vec![ToolEvidenceCapability::new(
+                ToolSemanticScope::HostLocal,
+                &[EvidencePurpose::CurrentState],
+                EvidenceAuthority::Direct,
+                EvidenceTemporalScope::Current,
+            )]),
         );
         observation.data["receipt"]["completion_obligation_ids"] =
             json!(["task:task-1/obligation:evidence:0"]);
