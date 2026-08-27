@@ -2471,6 +2471,23 @@ async fn native_sandbox_runtime_support(
             support.add_read(runtime_root.clone());
             support.add_executable(runtime_root);
         }
+        // A conda/miniforge environment is an immutable toolchain prefix: its
+        // executables read prefix-relative configuration at startup (for
+        // example `<prefix>/ssl/openssl.cnf` for node/python) and load
+        // `<prefix>/lib`. Recognize it by its `conda-meta` marker directory
+        // and grant the prefix read-only, exactly like a Homebrew Cellar root.
+        for location in [resolved.as_str(), canonical.as_str()] {
+            if let Some(prefix) = std::path::Path::new(location)
+                .parent()
+                .and_then(|bin| bin.parent())
+            {
+                if prefix.join("conda-meta").is_dir() {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    support.add_read(prefix.clone());
+                    support.add_executable(prefix);
+                }
+            }
+        }
         // Standard prefix layout: an executable under `<prefix>/bin` loads
         // shared libraries from the sibling `<prefix>/lib` (and helpers from
         // `<prefix>/libexec`). Without them a relocatable runtime such as a
@@ -7498,6 +7515,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_sandbox_runtime_grants_a_conda_prefix_by_its_marker() {
+        let backend = active_execution_backend();
+        // Find any resolvable executable whose prefix carries `conda-meta`.
+        let mut conda_prefix = None;
+        for program in ["node", "python3", "python"] {
+            if let Some(resolved) = backend.resolve_executable(program).await.unwrap() {
+                let canonical = backend
+                    .canonicalize(&resolved)
+                    .await
+                    .unwrap_or(resolved.clone());
+                for location in [resolved.as_str(), canonical.as_str()] {
+                    if let Some(prefix) = std::path::Path::new(location)
+                        .parent()
+                        .and_then(|bin| bin.parent())
+                    {
+                        if prefix.join("conda-meta").is_dir() {
+                            conda_prefix = Some((program, prefix.to_string_lossy().to_string()));
+                        }
+                    }
+                }
+            }
+            if conda_prefix.is_some() {
+                break;
+            }
+        }
+        let Some((program, prefix)) = conda_prefix else {
+            return;
+        };
+        let support = native_sandbox_runtime_support(&backend, &format!("{program} --version"))
+            .await
+            .expect("support");
+        assert!(support.read_paths.iter().any(|path| path == &prefix));
+        assert!(support.executable_paths.iter().any(|path| path == &prefix));
+        assert!(!support
+            .read_paths
+            .iter()
+            .any(|path| path == &backend.home_hint().to_string()));
+    }
+
+    #[tokio::test]
     async fn native_sandbox_runtime_grants_git_its_own_config_files_only_for_git() {
         let backend = active_execution_backend();
         if backend.resolve_executable("git").await.unwrap().is_none() {
@@ -10635,5 +10692,47 @@ mod tests {
              (expected denial message), got: {}",
             result.output
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_dump_probe {
+    use super::*;
+
+    /// Operator probe: write the exact seatbelt policy the daemon would use
+    /// for a build in a given project so it can be replayed with sandbox-exec.
+    /// Run with: AIDAEMON_POLICY_PROBE_DIR=<dir> AIDAEMON_POLICY_PROBE_CMD='npm run build'
+    ///   cargo test --lib policy_dump_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn dump_policy_for_project_build() {
+        let Ok(dir) = std::env::var("AIDAEMON_POLICY_PROBE_DIR") else {
+            return;
+        };
+        let command =
+            std::env::var("AIDAEMON_POLICY_PROBE_CMD").unwrap_or_else(|_| "npm run build".into());
+        let backend = active_execution_backend();
+        let writes = vec![format!("{dir}/dist"), dir.clone()];
+        let request = confined_terminal_execution_request(
+            &backend,
+            &command,
+            Some(&dir),
+            &[dir.clone()],
+            &writes,
+        )
+        .await
+        .expect("confined request");
+        match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => {
+                let policy = args.get(1).cloned().unwrap_or_default();
+                std::fs::write("/tmp/aidaemon-policy-probe.sb", &policy).unwrap();
+                println!("ARGS={}", serde_json::to_string(args).unwrap());
+                println!(
+                    "ENV={}",
+                    serde_json::to_string(&request.env.iter().collect::<Vec<_>>()).unwrap()
+                );
+            }
+            other => println!("NON-ARGV: {other:?}"),
+        }
     }
 }
