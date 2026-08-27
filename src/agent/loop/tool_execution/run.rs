@@ -1267,10 +1267,26 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             && !terminal_is_required_mutation
             && access_manifest.read_targets.is_empty()
         {
-            let authorized_read_roots = fallback_read_authorities(
+            let mut authorized_read_roots = fallback_read_authorities(
                 turn_context.filesystem_access.as_ref(),
                 &task_authorized_project_scopes,
             );
+            // An owner's request with no compiled scope and no channel grant
+            // still has a workspace: the process runs in the execution
+            // backend's workspace root (or the resolved project directory).
+            // That directory is the baseline read authority for an
+            // observation command; guests keep the explicit-grant rule.
+            if authorized_read_roots.is_empty() && user_role != crate::types::UserRole::Guest {
+                let baseline = known_project_dir.clone().unwrap_or_else(|| {
+                    crate::execution::active_execution_backend()
+                        .workspace_root()
+                        .as_str()
+                        .to_string()
+                });
+                if !baseline.trim().is_empty() {
+                    authorized_read_roots.push(baseline);
+                }
+            }
             if !authorized_read_roots.is_empty() {
                 if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
                     if let Some(object) = arguments.as_object_mut() {
@@ -1583,6 +1599,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &operation_claim,
             )
             .await?;
+            // The denial is a typed terminal observation of the request's
+            // authority boundary; finalization uses this count to let the
+            // model narrate it instead of demanding another evidence pass.
+            execution_state.record_operation_result(
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                true,
+            );
             execution_state.record_tool_call();
             validation_state.record_failure(ValidationFailure::ScopeViolation);
             validation_state.note_replan();
