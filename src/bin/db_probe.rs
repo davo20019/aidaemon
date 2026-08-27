@@ -1109,11 +1109,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|w| w[1].clone())
     {
         // Operator action: give an escalated objective its automatic recovery
-        // attempts back (for example after fixing the cause). The escalation
-        // itself, the pause, and the failure history are untouched.
+        // attempts back (for example after fixing the cause) and make the next
+        // attempt eligible on the next heartbeat tick. The escalation itself,
+        // the pause, and the failure history are untouched.
         let result = sqlx::query(
             "UPDATE scheduled_recovery_state
-                SET recovery_attempts = 0, last_recovery_attempt_at = NULL
+                SET recovery_attempts = 0,
+                    last_recovery_attempt_at = datetime('now', '-2 days')
               WHERE goal_id = ? AND disposition = 'escalated'",
         )
         .bind(&goal_id)
@@ -2422,8 +2424,8 @@ async fn print_query_rows(pool: &SqlitePool, title: &str, sql: &str) -> anyhow::
                         .try_get::<String, _>(name)
                         .map(|v| {
                             let v = v.replace('\n', " ");
-                            if v.chars().count() > 160 {
-                                format!("{}…", v.chars().take(160).collect::<String>())
+                            if v.chars().count() > 4000 {
+                                format!("{}…", v.chars().take(4000).collect::<String>())
                             } else {
                                 v
                             }

@@ -1544,6 +1544,47 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }),
             )
             .await;
+        // Attenuate over-declared read roots before the capability check so a
+        // superfluous `/tmp` root cannot veto an otherwise authorized call.
+        if tc.name == "terminal" {
+            if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
+                let stripped = attenuate_unauthorized_read_roots(
+                    &mut arguments,
+                    turn_context.filesystem_access.as_ref(),
+                    &task_authorized_project_scopes,
+                    known_project_dir.as_deref(),
+                );
+                if !stripped.is_empty() {
+                    effective_arguments = serde_json::to_string(&arguments)?;
+                    if let Some(tool) = registered_tool {
+                        if let Ok(prepared) = tool.prepare_invocation(&effective_arguments) {
+                            // Dropping a read root does not change what the
+                            // call does; only the access manifest is refreshed.
+                            effective_arguments = prepared.canonical_arguments;
+                            access_manifest = prepared.access_manifest;
+                            let adapter_manifest =
+                                tool.adapter_owned_access_manifest(&effective_arguments);
+                            access_manifest.adapter_read_targets =
+                                adapter_manifest.adapter_read_targets;
+                        }
+                    }
+                    agent
+                        .emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Attenuated unauthorized declared read roots".to_string(),
+                            json!({
+                                "condition": "read_roots_attenuated",
+                                "tool": tc.name,
+                                "stripped_read_roots": stripped,
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
         let access_scope_violation = access_manifest_scope_violation(
             &tc.name,
             &access_manifest,

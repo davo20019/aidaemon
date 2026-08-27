@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Over-declared terminal read roots no longer veto an authorized call.** A declared `read_roots` entry the task is not authorized for is stripped before the capability check (the sandbox is prepared with the authorized subset only); exact reads and write roots are still checked strictly.
 - **Provider recovery works again for the ChatGPT subscription provider.** It returned every failure as a plain string, so the recovery layer could not classify it: transient server errors were never retried, cascaded, failed over, deferred, or recorded by kind. The typed error is now preserved end to end.
 - **A response template is never shipped as the answer.** An "exact text" artifact that still contains placeholder syntax (`{value}`, `<status>`) is rejected at compile time, and the model always narrates before any artifact is applied; projection only fills an empty or daemon-built reply.
 - **Escalated scheduled objectives now recover on their own.** After the failure budget pauses a schedule, the heartbeat launches a typed recovery run once the cool-down elapses (six hours, at most three attempts); a verified success resumes the paused schedules through the existing budget machinery. Blocked manual and recovery occurrences no longer wedge the recurring schedule, a blocked-then-closed occurrence is counted once against the budget, and superseded blocked children are marked as such instead of lingering as open owner work.

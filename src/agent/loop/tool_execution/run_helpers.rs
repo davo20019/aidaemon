@@ -256,6 +256,57 @@ pub(super) fn narrowest_authorized_path_scopes(scopes: &[String]) -> Vec<String>
 /// A project path used only for read/cwd confinement must never become a write
 /// grant by fallback. The promotion is allowed only for a contract that
 /// explicitly expects mutation and has not installed a hard read-only fence.
+/// Declared `read_roots` are a request for sandbox read authority, not a read.
+/// A root the task is not authorized for must not veto the whole operation
+/// when the operation's exact reads are authorized: strip it so the sandbox
+/// is prepared with the authorized subset only, and let the process fail
+/// with a typed sandbox denial if it genuinely needed the wider root. Write
+/// roots are never attenuated; an unauthorized write stays a violation.
+/// Returns the stripped roots (empty when nothing changed).
+pub(super) fn attenuate_unauthorized_read_roots(
+    arguments: &mut Value,
+    task: Option<&crate::traits::ToolCallAccessManifest>,
+    fallback_scopes: &[String],
+    execution_cwd: Option<&str>,
+) -> Vec<String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Vec::new();
+    };
+    let Some(roots) = object.get("read_roots").and_then(Value::as_array).cloned() else {
+        return Vec::new();
+    };
+    if roots.is_empty() || (task.is_none() && fallback_scopes.is_empty()) {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut stripped = Vec::new();
+    for root in roots {
+        let Some(value) = root.as_str() else {
+            continue;
+        };
+        let Some(hint) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, value) else {
+            continue;
+        };
+        let probe = crate::traits::ToolCallAccessManifest {
+            execution_cwd: execution_cwd.map(str::to_string),
+            read_targets: vec![hint],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        if access_manifest_scope_violation("terminal", &probe, task, fallback_scopes, execution_cwd)
+            .is_none()
+        {
+            kept.push(Value::String(value.to_string()));
+        } else {
+            stripped.push(value.to_string());
+        }
+    }
+    if !stripped.is_empty() {
+        object.insert("read_roots".to_string(), Value::Array(kept));
+    }
+    stripped
+}
+
 /// Directory read capabilities an observation-only process may inherit: the
 /// compiled task manifest's directory read grants, else the task's authorized
 /// project scopes (channel workspace or current-request scope). Exact-file
@@ -2862,6 +2913,71 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             None
         )
         .is_some());
+    }
+
+    #[test]
+    fn unauthorized_declared_read_roots_are_stripped_not_fatal() {
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some("/tmp".to_string()),
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::Path,
+                "/tmp/synthetic-out/result.txt",
+            )
+            .expect("read")],
+            write_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/synthetic-out",
+            )
+            .expect("write")],
+            adapter_read_targets: Vec::new(),
+        };
+        let mut arguments = serde_json::json!({
+            "action": "run",
+            "command": "cat /tmp/synthetic-out/result.txt",
+            "read_paths": ["/tmp/synthetic-out/result.txt"],
+            "read_roots": ["/tmp", "/tmp/synthetic-out"],
+            "write_roots": ["/tmp/synthetic-out"],
+        });
+        let stripped =
+            attenuate_unauthorized_read_roots(&mut arguments, Some(&task), &[], Some("/tmp"));
+        assert_eq!(
+            stripped,
+            vec!["/tmp".to_string(), "/tmp/synthetic-out".to_string()]
+        );
+        assert_eq!(arguments["read_roots"], serde_json::json!([]));
+        // Exact reads and write roots are untouched: the capability check
+        // still evaluates them.
+        assert_eq!(
+            arguments["read_paths"],
+            serde_json::json!(["/tmp/synthetic-out/result.txt"])
+        );
+        assert_eq!(
+            arguments["write_roots"],
+            serde_json::json!(["/tmp/synthetic-out"])
+        );
+
+        // An authorized root is kept.
+        let scoped = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/synthetic-out",
+            )
+            .expect("read")],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        let mut arguments = serde_json::json!({ "read_roots": ["/tmp/synthetic-out", "/etc"] });
+        let stripped = attenuate_unauthorized_read_roots(&mut arguments, Some(&scoped), &[], None);
+        assert_eq!(stripped, vec!["/etc".to_string()]);
+        assert_eq!(
+            arguments["read_roots"],
+            serde_json::json!(["/tmp/synthetic-out"])
+        );
+
+        // Without any authority boundary nothing is attenuated.
+        let mut arguments = serde_json::json!({ "read_roots": ["/tmp"] });
+        assert!(attenuate_unauthorized_read_roots(&mut arguments, None, &[], None).is_empty());
     }
 
     #[test]
