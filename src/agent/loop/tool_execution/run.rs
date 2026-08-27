@@ -1267,6 +1267,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             && !terminal_is_required_mutation
             && access_manifest.read_targets.is_empty()
         {
+            // Boxed: keeps this block's locals off the parent future's frame.
+            Box::pin(async {
             let mut authorized_read_roots = fallback_read_authorities(
                 turn_context.filesystem_access.as_ref(),
                 &task_authorized_project_scopes,
@@ -1317,6 +1319,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     }
                 }
             }
+            anyhow::Ok(())
+            })
+            .await?;
         }
         if (call_semantics.mutates_state() || terminal_is_required_mutation)
             && matches!(tc.name.as_str(), "terminal" | "cli_agent")
@@ -1547,6 +1552,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // Attenuate over-declared read roots before the capability check so a
         // superfluous `/tmp` root cannot veto an otherwise authorized call.
         if tc.name == "terminal" {
+            Box::pin(async {
             if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
                 let stripped = attenuate_unauthorized_read_roots(
                     &mut arguments,
@@ -1584,6 +1590,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         .await;
                 }
             }
+            anyhow::Ok(())
+            })
+            .await?;
         }
         let access_scope_violation = access_manifest_scope_violation(
             &tc.name,
