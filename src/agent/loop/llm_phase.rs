@@ -801,27 +801,20 @@ pub(super) async fn run_llm_phase(
         .task_run_aggregate(session_id, task_id)
         .await
         .ok();
+    // A ready response artifact is never shipped without narration: the
+    // model always gets to answer with the receipts in context, and the
+    // completion phase applies the artifact only when the reply is empty or
+    // daemon-built. Skipping the provider here shipped planner templates and
+    // markers the user never saw the model confirm.
     if aggregate_before_provider
         .as_ref()
         .is_some_and(aggregate_should_close_before_provider)
     {
-        if let Some(reply) = finalize_durable_receipt_after_provider_failure(
-            services.agent,
-            emitter,
-            task_id,
+        info!(
             session_id,
             iteration,
-            task_start,
-            learning_ctx,
-            model,
-            "typed response artifact ready",
-            completion_contract,
-            completion_progress,
-        )
-        .await?
-        {
-            return Ok(LlmPhaseOutcome::Return(Ok(reply)));
-        }
+            "Typed response artifact is ready; letting the model narrate before projection"
+        );
     }
     // A failed decision is a fact the model has not yet been allowed to
     // describe. Let it narrate exactly once with the receipts in context; skip

@@ -759,9 +759,13 @@ impl ModelProvider for OpenAiChatGptProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
+        // Return the typed error itself. Flattening it into its user message
+        // hid the kind from the recovery layer, which could then neither
+        // retry a transient server error, cascade, defer the request, nor
+        // record the failure kind in telemetry.
         self.send(model, messages, tools, options)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e.user_message()))
+            .map_err(anyhow::Error::from)
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {

@@ -173,6 +173,35 @@ fn compile_core(signals: &PlannedContractSignals) -> Result<CompiledCompletionCo
     })
 }
 
+/// Whether an "exact" response still contains template placeholder syntax:
+/// `{name}` or `<name>` where the inner token is a bare identifier (letters,
+/// digits, `_`, `-`, `|`, spaces). Braces around JSON-like content (`{"a":1}`)
+/// or angle brackets around a URL are not placeholders.
+pub(crate) fn exact_text_has_unresolved_placeholder(text: &str) -> bool {
+    for (open, close) in [('{', '}'), ('<', '>')] {
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len_utf8()..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            let inner = after[..end].trim();
+            let identifier_like = !inner.is_empty()
+                && inner.len() <= 40
+                && inner
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '|' | ' ' | '.'))
+                && inner.chars().any(char::is_alphabetic)
+                && !inner.contains("://");
+            if identifier_like {
+                return true;
+            }
+            rest = &after[end + close.len_utf8()..];
+        }
+    }
+    false
+}
+
 fn compile_response_contract(
     signals: &PlannedContractSignals,
     current_user_text: &str,
@@ -222,6 +251,23 @@ fn compile_response_contract(
                 "response_presentation",
                 false,
                 "exact_text_contains_control",
+                1,
+                0,
+            ),
+        );
+    }
+    // An exact artifact must be fully resolved text. A value that still
+    // carries template placeholder syntax (`{value}`, `<status>`) is the
+    // request's *format*, not its answer; projecting it would ship the
+    // template to the user. This is a structural syntax check on the typed
+    // value, not an interpretation of the request's wording.
+    if exact_text_has_unresolved_placeholder(success_text) {
+        return (
+            None,
+            decision(
+                "response_presentation",
+                false,
+                "exact_text_is_template",
                 1,
                 0,
             ),
@@ -1581,6 +1627,46 @@ mod tests {
                 && decision.accepted
                 && decision.reason_code == "accepted"
         }));
+    }
+
+    #[test]
+    fn template_placeholders_are_not_exact_response_artifacts() {
+        for template in [
+            "version={value}",
+            "lines={count}",
+            "phase=PR-AUTO-1 blog_schedule=<present|absent> latest_blog_run=<status>",
+            "branch={branch}; subject={subject}",
+        ] {
+            assert!(
+                exact_text_has_unresolved_placeholder(template),
+                "{template} should read as a template"
+            );
+            let mut signals = base_signals();
+            signals.response_contract =
+                Some(super::super::task_planning::PlannedResponseContract {
+                    mode: "exact_text".to_string(),
+                    success_text: Some(template.to_string()),
+                });
+            let compiled = compile(&signals);
+            assert!(compiled.response_contract.is_none(), "{template}");
+            assert!(compiled.decisions.iter().any(|decision| {
+                decision.lane == "response_presentation"
+                    && !decision.accepted
+                    && decision.reason_code == "exact_text_is_template"
+            }));
+        }
+        for literal in [
+            "phase=PR-SAFE-1; protected_read=denied; leak=no; calls=1",
+            "version=0.12.1",
+            "{\"ok\": true}",
+            "see <https://example.com/docs>",
+            "done",
+        ] {
+            assert!(
+                !exact_text_has_unresolved_placeholder(literal),
+                "{literal} should read as literal text"
+            );
+        }
     }
 
     #[test]

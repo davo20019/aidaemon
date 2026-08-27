@@ -185,7 +185,11 @@ impl Agent {
             }
         }
 
-        Err(anyhow::anyhow!("{}", final_err.recovery_failed_message()))
+        // Keep the typed provider error as the cause so callers (deferred
+        // retry, telemetry) can still classify it; the recovery message is the
+        // user-facing context.
+        let message = final_err.recovery_failed_message();
+        Err(anyhow::Error::new(final_err).context(message))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -440,7 +444,8 @@ impl Agent {
                         malformed_reason: None,
                     };
                     if options.single_attempt_fail_closed {
-                        return Err(anyhow::anyhow!("{}", billing_err.user_message()));
+                        let message = billing_err.user_message();
+                        return Err(anyhow::Error::new(billing_err).context(message));
                     }
                     return self
                         .cascade_fallback(
@@ -610,7 +615,10 @@ impl Agent {
                                 }
                             }
                         }
-                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                        {
+                            let message = provider_err.user_message();
+                            Err(anyhow::Error::new(provider_err).context(message))
+                        }
                     }
 
                     // --- Rate limit: exponential backoff, then cascade fallback ---
@@ -792,7 +800,10 @@ impl Agent {
                             return Ok(resp);
                         }
 
-                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                        {
+                            let message = provider_err.user_message();
+                            Err(anyhow::Error::new(provider_err).context(message))
+                        }
                     }
 
                     // --- NotFound (bad model name): cascade fallback immediately ---
