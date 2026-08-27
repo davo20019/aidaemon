@@ -1327,7 +1327,10 @@ impl HeartbeatCoordinator {
                         .await
                         .ok()
                         .flatten()
-                        .filter(|run| run.trigger_type == "scheduled")
+                        // An automatic recovery occurrence is a valid current
+                        // cycle of a scheduled objective: its root task must be
+                        // dispatched, never retired as a stale child.
+                        .filter(|run| matches!(run.trigger_type.as_str(), "scheduled" | "recovery"))
                         // Legacy/repair-created open runs can contain old child
                         // rows without an execution root. They are not a valid
                         // current scheduled cycle and must keep using the stale
@@ -4473,6 +4476,122 @@ mod tests {
             .unwrap();
         assert_eq!(reconciled.status, "failed");
         assert!(reconciled.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn escalated_goal_gets_one_automatic_recovery_run_whose_root_survives_dispatch() {
+        let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let sqlite = Arc::new(
+            SqliteStateStore::new(db_path.to_str().unwrap(), 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = sqlite.pool();
+        let state: Arc<dyn StateStore> = sqlite.clone();
+        let goal = Goal::new_continuous(
+            "Publish the synthetic daily digest",
+            "session-1",
+            None,
+            None,
+        );
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now();
+        let escalated_at = (now - chrono::Duration::hours(12)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("0 6 * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.to_rfc3339(),
+            created_at: escalated_at.clone(),
+            updated_at: escalated_at.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+        let failed_run = state
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        state
+            .finish_goal_run(&failed_run.id, "failed", Some("synthetic"))
+            .await
+            .unwrap();
+        // Escalate through the store's own failure accounting so the paused
+        // schedule is owned by the recovery machine.
+        for _ in 0..3 {
+            let run = state
+                .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+                .await
+                .unwrap();
+            state
+                .finish_goal_run(&run.id, "failed", Some("synthetic"))
+                .await
+                .unwrap();
+        }
+        let recovery = state
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .expect("recovery state");
+        assert_eq!(
+            recovery.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Escalated
+        );
+        // Age the escalation past the cool-down.
+        sqlx::query("UPDATE scheduled_recovery_state SET updated_at = ? WHERE goal_id = ?")
+            .bind(&escalated_at)
+            .bind(&goal.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let runs = state.get_goal_runs(&goal.id).await.unwrap();
+        let recovery_run = runs
+            .iter()
+            .find(|run| run.trigger_type == "recovery")
+            .expect("automatic recovery run");
+        assert!(matches!(
+            recovery_run.status.as_str(),
+            "pending" | "running"
+        ));
+        let root = state
+            .get_task(recovery_run.root_task_id.as_deref().expect("root task"))
+            .await
+            .unwrap()
+            .expect("root task row");
+        assert_ne!(
+            root.status, "cancelled",
+            "recovery root must not be retired as stale"
+        );
+        assert!(root
+            .description
+            .contains("automatic recovery attempt 1 of 3"));
+        let state_after = state
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_after.recovery_attempts, 1);
+
+        // A second tick inside the cool-down launches nothing more.
+        coordinator.tick().await.unwrap();
+        let runs = state.get_goal_runs(&goal.id).await.unwrap();
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.trigger_type == "recovery")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

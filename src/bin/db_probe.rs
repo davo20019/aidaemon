@@ -1103,6 +1103,29 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(goal_id) = args
+        .windows(2)
+        .find(|w| w[0] == "--reset-recovery-attempts")
+        .map(|w| w[1].clone())
+    {
+        // Operator action: give an escalated objective its automatic recovery
+        // attempts back (for example after fixing the cause). The escalation
+        // itself, the pause, and the failure history are untouched.
+        let result = sqlx::query(
+            "UPDATE scheduled_recovery_state
+                SET recovery_attempts = 0, last_recovery_attempt_at = NULL
+              WHERE goal_id = ? AND disposition = 'escalated'",
+        )
+        .bind(&goal_id)
+        .execute(&pool)
+        .await?;
+        anyhow::ensure!(
+            result.rows_affected() == 1,
+            "goal is not an escalated scheduled objective or does not exist"
+        );
+        println!("Reset automatic recovery attempts for escalated goal {goal_id}.");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--goals") {
         print_scheduled_goal_state(&pool).await?;
         return Ok(());
