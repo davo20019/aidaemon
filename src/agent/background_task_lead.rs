@@ -1623,7 +1623,11 @@ pub fn spawn_background_task_lead(
                     Some(AgentRole::TaskLead),
                     Some(goal_id.as_str()),
                     dispatch_trigger_task_id.as_deref(),
-                    None,
+                    // The resolved/bound objective workspace is the lead's
+                    // project scope; its tools and every executor it spawns
+                    // inherit it. Without this the lead and its children ran
+                    // in the daemon's own checkout.
+                    dispatch_project_scope.as_deref(),
                     None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
                     Some(&session_id),
                     dispatch_attempt.clone(),

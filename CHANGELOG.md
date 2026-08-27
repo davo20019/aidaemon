@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Task leads run in the objective's workspace.** The scheduled/recovery task lead was spawned without its resolved project scope, so its tools and every executor it delegated to ran in the daemon's own checkout (worktrees were even created from the wrong repository). The lead now inherits the bound or resolved objective directory and passes it down.
 - **`scheduled_goal_runs` actions accept an objective phrase as the goal handle.** The overview stays free of internal ids; `goal_id` now resolves an id, an id prefix, or a distinctive phrase from the objective text, so a run can bind or inspect the goal it just listed.
 - **Relocatable runtimes load their libraries inside the native sandbox.** An executable under `<prefix>/bin` gets read/execute on the sibling `<prefix>/lib` and `<prefix>/libexec`, and JavaScript package runners (npm, npx, yarn, pnpm, bun, corepack, vite, tsx) also pull in `node`'s runtime roots, and a conda/miniforge environment is recognized by its `conda-meta` marker and granted read-only as a toolchain prefix (its `node` reads `<prefix>/ssl/openssl.cnf` at startup), so a confined `npm run build` completes instead of aborting.
 - **Over-declared terminal read roots no longer veto an authorized call.** A declared `read_roots` entry the task is not authorized for is stripped before the capability check (the sandbox is prepared with the authorized subset only); exact reads and write roots are still checked strictly.
