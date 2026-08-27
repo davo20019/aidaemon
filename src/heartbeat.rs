@@ -2433,6 +2433,24 @@ impl HeartbeatCoordinator {
             if goal.status != "active" {
                 continue;
             }
+            // Automatic recovery is admission-controlled by the owner's daily
+            // budget exactly like a scheduled fire; it never spends past it.
+            let budget_today = chrono::Utc::now().date_naive().to_string();
+            if !daily_budget_has_run_capacity(
+                goal.budget_daily,
+                goal.budget_per_check,
+                goal.tokens_used_today,
+                &goal.tokens_used_day,
+                &budget_today,
+            ) {
+                info!(
+                    goal_id = %goal_id,
+                    tokens_used = goal.tokens_used_today,
+                    budget = ?goal.budget_daily,
+                    "Deferring automatic recovery — today's goal daily budget cannot admit a run"
+                );
+                continue;
+            }
             // An open occurrence (of any trigger type) means work is still in
             // flight or wedged; reconcile first and try again next tick.
             match self.reconcile_open_scheduled_runs_for_goal(&goal_id).await {
@@ -2483,7 +2501,7 @@ impl HeartbeatCoordinator {
                 id: recovery_task_id.clone(),
                 goal_id: goal_id.clone(),
                 description: format!(
-                    "Directly recover and finish: {} [SYSTEM: automatic recovery attempt {attempt} of {} after {} consecutive failed runs (typed cause {}). The schedule is paused until this run completes with verified receipts. If the objective's repository or workspace is not present in the attempt workspace, locate it with project_inspect and bind it with scheduled_goal_runs bind_workspace before reporting a blocker.]",
+                    "Directly recover and finish: {} [SYSTEM: automatic recovery attempt {attempt} of {} after {} consecutive failed runs (typed cause {}). The schedule is paused until this run completes with verified receipts. Earlier failures recorded in the ledger are historical evidence from a previous environment, not proof that their cause persists: re-run the previously failing step once in this attempt and judge from its fresh receipt before concluding that recovery is exhausted. If the objective's repository or workspace is not present in the attempt workspace, locate it with project_inspect and bind it with scheduled_goal_runs bind_workspace before reporting a blocker.]",
                     goal.description,
                     Self::ESCALATED_RECOVERY_MAX_ATTEMPTS,
                     recovery.consecutive_failures,
