@@ -2436,7 +2436,12 @@ impl HeartbeatCoordinator {
             // Automatic recovery is admission-controlled by the owner's daily
             // budget exactly like a scheduled fire; it never spends past it.
             let budget_today = chrono::Utc::now().date_naive().to_string();
-            if !daily_budget_has_run_capacity(
+            if daily_budget_exhausted(
+                goal.budget_daily,
+                goal.tokens_used_today,
+                &goal.tokens_used_day,
+                &budget_today,
+            ) || !daily_budget_has_run_capacity(
                 goal.budget_daily,
                 goal.budget_per_check,
                 goal.tokens_used_today,
