@@ -1309,37 +1309,59 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
     ) -> anyhow::Result<Option<crate::traits::ScheduledRecoveryState>> {
         let row = sqlx::query(
             "SELECT goal_id, consecutive_failures, failure_budget, disposition,
-                    latest_failure_kind, last_failed_run_id, last_recovery_run_id, updated_at
+                    latest_failure_kind, last_failed_run_id, last_recovery_run_id,
+                    recovery_attempts, last_recovery_attempt_at, updated_at
              FROM scheduled_recovery_state WHERE goal_id = ?",
         )
         .bind(goal_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            let disposition_raw: String = row.get("disposition");
-            let latest_failure_raw: Option<String> = row.get("latest_failure_kind");
-            Ok(crate::traits::ScheduledRecoveryState {
-                goal_id: row.get("goal_id"),
-                consecutive_failures: u16::try_from(row.get::<i64, _>("consecutive_failures"))?,
-                failure_budget: u16::try_from(row.get::<i64, _>("failure_budget"))?,
-                disposition: crate::traits::ScheduledRecoveryDisposition::parse(&disposition_raw)
-                    .ok_or_else(|| {
-                    anyhow::anyhow!("invalid scheduled recovery disposition `{disposition_raw}`")
-                })?,
-                latest_failure_kind: latest_failure_raw
-                    .as_deref()
-                    .map(|value| {
-                        crate::traits::ScheduledFailureKind::parse(value).ok_or_else(|| {
-                            anyhow::anyhow!("invalid scheduled failure kind `{value}`")
-                        })
-                    })
-                    .transpose()?,
-                last_failed_run_id: row.get("last_failed_run_id"),
-                last_recovery_run_id: row.get("last_recovery_run_id"),
-                updated_at: row.get("updated_at"),
-            })
-        })
-        .transpose()
+        row.map(scheduled_recovery_state_from_row).transpose()
+    }
+
+    async fn list_escalated_recovery_candidates(
+        &self,
+        cooldown_secs: i64,
+        max_attempts: u16,
+    ) -> anyhow::Result<Vec<crate::traits::ScheduledRecoveryState>> {
+        // Only objectives the recovery machine itself paused are eligible;
+        // an owner's independent pause never triggers automatic recovery.
+        let rows = sqlx::query(
+            "SELECT r.goal_id, r.consecutive_failures, r.failure_budget, r.disposition,
+                    r.latest_failure_kind, r.last_failed_run_id, r.last_recovery_run_id,
+                    r.recovery_attempts, r.last_recovery_attempt_at, r.updated_at
+             FROM scheduled_recovery_state r
+             JOIN goals g ON g.id = r.goal_id
+             WHERE r.disposition = 'escalated'
+               AND g.status = 'active'
+               AND r.recovery_attempts < ?
+               AND EXISTS (SELECT 1 FROM scheduled_recovery_paused_schedules p
+                            WHERE p.goal_id = r.goal_id)
+               AND (julianday('now') - julianday(COALESCE(r.last_recovery_attempt_at, r.updated_at)))
+                   * 86400.0 >= ?
+             ORDER BY r.updated_at ASC",
+        )
+        .bind(i64::from(max_attempts))
+        .bind(cooldown_secs)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(scheduled_recovery_state_from_row)
+            .collect()
+    }
+
+    async fn record_scheduled_recovery_attempt(&self, goal_id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE scheduled_recovery_state
+                SET recovery_attempts = recovery_attempts + 1,
+                    last_recovery_attempt_at = ?
+              WHERE goal_id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(goal_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn delete_scheduled_run_state(&self, goal_id: &str) -> anyhow::Result<bool> {
@@ -1620,4 +1642,34 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
 
         Ok(result.rows_affected())
     }
+}
+
+fn scheduled_recovery_state_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<crate::traits::ScheduledRecoveryState> {
+    let disposition_raw: String = row.get("disposition");
+    let latest_failure_raw: Option<String> = row.get("latest_failure_kind");
+    Ok(crate::traits::ScheduledRecoveryState {
+        goal_id: row.get("goal_id"),
+        consecutive_failures: u16::try_from(row.get::<i64, _>("consecutive_failures"))?,
+        failure_budget: u16::try_from(row.get::<i64, _>("failure_budget"))?,
+        disposition: crate::traits::ScheduledRecoveryDisposition::parse(&disposition_raw)
+            .ok_or_else(|| {
+                anyhow::anyhow!("invalid scheduled recovery disposition `{disposition_raw}`")
+            })?,
+        latest_failure_kind: latest_failure_raw
+            .as_deref()
+            .map(|value| {
+                crate::traits::ScheduledFailureKind::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("invalid scheduled failure kind `{value}`"))
+            })
+            .transpose()?,
+        last_failed_run_id: row.get("last_failed_run_id"),
+        last_recovery_run_id: row.get("last_recovery_run_id"),
+        recovery_attempts: u16::try_from(row.try_get::<i64, _>("recovery_attempts").unwrap_or(0))?,
+        last_recovery_attempt_at: row
+            .try_get::<Option<String>, _>("last_recovery_attempt_at")
+            .unwrap_or(None),
+        updated_at: row.get("updated_at"),
+    })
 }

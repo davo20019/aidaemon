@@ -2798,9 +2798,10 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(!call_log.is_empty(), "expected at least one provider call");
     assert!(
-        call_log
-            .iter()
-            .all(|entry| entry.options == ChatOptions::default()),
+        call_log.iter().all(|entry| ChatOptions {
+            uncommitted_work: false,
+            ..entry.options.clone()
+        } == ChatOptions::default()),
         "expected default chat options when the text-only pass is disabled"
     );
 }

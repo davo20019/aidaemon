@@ -65,6 +65,35 @@ async fn task_failed_only_due_to_provider_infrastructure(
         .is_some_and(crate::providers::ProviderErrorKind::is_infrastructure_failure)
 }
 
+/// Project roots to search when a mission names a project by name or site
+/// hostname. When the operator configured none, the parent directory of the
+/// execution workspace is the structural default: sibling projects of the
+/// daemon's own checkout live there, whatever that directory is called.
+fn effective_alias_roots(configured: &[String]) -> Vec<String> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    let workspace = crate::execution::active_execution_backend()
+        .workspace_root()
+        .to_string();
+    std::path::Path::new(&workspace)
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .map(|parent| vec![parent.to_string_lossy().to_string()])
+        .unwrap_or_default()
+}
+
+/// A workspace the goal/task was explicitly bound to (`context.project_scope`)
+/// takes precedence over anything derived from mission text. The binding is
+/// typed durable state written by `scheduled_goal_runs bind_workspace` or an
+/// earlier recovery; it must be an existing absolute directory.
+fn bound_project_scope_from_context(context: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
+    let scope = value.get("project_scope")?.as_str()?.trim();
+    let path = std::path::Path::new(scope);
+    (path.is_absolute() && path.is_dir()).then(|| scope.to_string())
+}
+
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
     let mut scopes = Vec::new();
     super::project_scope::extract_explicit_path_scopes_from_text(
@@ -1132,8 +1161,24 @@ pub fn spawn_background_task_lead(
             let fallback_channel_ctx = channel_ctx.clone();
             let dispatch_channel_ctx = channel_ctx.clone();
             let fallback_user_role = user_role;
+            let trigger_task_context =
+                if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
+                    state
+                        .get_task(trigger_task_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|task| task.context)
+                } else {
+                    None
+                };
             let dispatch_project_scope =
-                resolve_dispatch_project_scope(&mission, &agent.path_aliases.projects);
+                bound_project_scope_from_context(trigger_task_context.as_deref()).or_else(|| {
+                    resolve_dispatch_project_scope(
+                        &mission,
+                        &effective_alias_roots(&agent.path_aliases.projects),
+                    )
+                });
 
             // Heartbeat dispatch claims a "trigger" task before spawning this background
             // lead. Keep it in "running" state (not "pending") so dispatch_pending_tasks
@@ -4072,5 +4117,39 @@ mod tests {
         );
         assert_eq!(recurring_run_terminal_outcome(Some("running")), None);
         assert_eq!(recurring_run_terminal_outcome(None), None);
+    }
+
+    #[test]
+    fn bound_project_scope_requires_an_existing_absolute_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let bound = serde_json::json!({ "project_scope": path }).to_string();
+        assert_eq!(
+            bound_project_scope_from_context(Some(&bound)),
+            Some(path.clone())
+        );
+        let missing = serde_json::json!({ "project_scope": format!("{path}/absent") }).to_string();
+        assert_eq!(bound_project_scope_from_context(Some(&missing)), None);
+        let relative = serde_json::json!({ "project_scope": "projects/blog" }).to_string();
+        assert_eq!(bound_project_scope_from_context(Some(&relative)), None);
+        assert_eq!(bound_project_scope_from_context(Some("not json")), None);
+        assert_eq!(bound_project_scope_from_context(None), None);
+    }
+
+    #[test]
+    fn effective_alias_roots_prefer_configuration_then_workspace_parent() {
+        let configured = vec!["/tmp/synthetic-projects".to_string()];
+        assert_eq!(effective_alias_roots(&configured), configured);
+        let derived = effective_alias_roots(&[]);
+        let workspace = crate::execution::active_execution_backend()
+            .workspace_root()
+            .to_string();
+        let parent = std::path::Path::new(&workspace)
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string());
+        match parent.filter(|parent| std::path::Path::new(parent).is_dir()) {
+            Some(parent) => assert_eq!(derived, vec![parent]),
+            None => assert!(derived.is_empty()),
+        }
     }
 }

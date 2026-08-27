@@ -231,6 +231,8 @@ mod completion_contract;
 mod completion_phase;
 #[path = "runtime/core_prompt.rs"]
 mod core_prompt;
+#[path = "runtime/deferred_retry.rs"]
+mod deferred_retry;
 #[path = "runtime/dialogue_state.rs"]
 mod dialogue_state;
 #[path = "runtime/followup.rs"]
@@ -989,6 +991,10 @@ impl Agent {
 
     /// Maximum number of retries for transient LLM errors.
     const MAX_LLM_RETRIES: u32 = 3;
+    /// Transient-error retries when the request has committed no tool work.
+    const MAX_LLM_RETRIES_UNCOMMITTED: u32 = 5;
+    /// Cap on a single transient-error backoff sleep.
+    const TRANSIENT_RETRY_MAX_DELAY_SECS: u64 = 30;
     /// Base delay for exponential backoff on transient errors (seconds).
     const RETRY_BASE_DELAY_SECS: u64 = 2;
     /// Single retry budget for malformed payloads that are likely deterministic

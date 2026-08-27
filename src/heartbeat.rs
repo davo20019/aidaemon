@@ -265,11 +265,12 @@ pub(crate) fn task_blocks_later_schedule_fire(
     if !matches!(run.status.as_str(), "pending" | "running" | "blocked") {
         return false;
     }
-    // A blocked scheduled run has no active worker and terminates that
-    // occurrence. Keeping it resumable is useful for explicit recovery, but it
-    // must not suppress every later occurrence of a recurring schedule. Manual
-    // blockers and blockers in a still-running scheduled occurrence remain open.
-    !(run.trigger_type == "scheduled" && run.status == "blocked") && task_blocks_schedule_fire(task)
+    // A blocked run has no active worker and terminates that occurrence,
+    // whatever triggered it (scheduled, manual, or recovery). Keeping it
+    // resumable is useful for explicit recovery, but it must not suppress
+    // every later occurrence of a recurring schedule. Blockers inside a
+    // still-running occurrence remain open.
+    run.status != "blocked" && task_blocks_schedule_fire(task)
 }
 
 fn task_is_terminal_schedule_failure(task: &crate::traits::Task) -> bool {
@@ -287,13 +288,26 @@ fn scheduled_run_reconciliation_status(
     run: &crate::traits::GoalRun,
     tasks: &[crate::traits::Task],
 ) -> Option<&'static str> {
-    if run.trigger_type != "scheduled"
-        || !matches!(run.status.as_str(), "pending" | "running")
+    if !matches!(
+        run.trigger_type.as_str(),
+        "scheduled" | "manual" | "recovery"
+    ) || !matches!(run.status.as_str(), "pending" | "running")
         || tasks.is_empty()
     {
         return None;
     }
-    if tasks.iter().any(task_is_terminal_schedule_failure) {
+    // A blocked child terminates a scheduled occurrence. In a manual or
+    // recovery occurrence the lead may still be waiting on an owner decision,
+    // so only hard task failures reconcile it; the run-level `blocked` state
+    // (the lead already ended the occurrence) is handled at fire time.
+    let terminal_failure = tasks.iter().any(|task| {
+        if run.trigger_type == "scheduled" {
+            task_is_terminal_schedule_failure(task)
+        } else {
+            matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
+        }
+    });
+    if terminal_failure {
         Some("failed")
     } else if tasks
         .iter()
@@ -453,6 +467,15 @@ pub struct HeartbeatCoordinator {
 }
 
 impl HeartbeatCoordinator {
+    /// Wait between an escalation (or the previous automatic attempt) and the
+    /// next automatic recovery run. Long enough for a transient external
+    /// cause to clear; short enough that a daily objective is not lost for a
+    /// week.
+    const ESCALATED_RECOVERY_COOLDOWN_SECS: i64 = 6 * 3600;
+    /// Automatic recovery attempts per escalation before the objective waits
+    /// for the owner.
+    const ESCALATED_RECOVERY_MAX_ATTEMPTS: u16 = 3;
+
     pub fn new(
         state: Arc<dyn StateStore>,
         tick_interval_secs: u64,
@@ -826,6 +849,11 @@ impl HeartbeatCoordinator {
         // observably "running" until tomorrow's recurrence happens to wake it.
         self.reconcile_open_scheduled_runs().await;
 
+        // Phase 2b': Escalated scheduled objectives get a bounded, cooled-down
+        // automatic recovery run. Escalation pauses the cron so it cannot
+        // keep failing; without this phase nothing would ever run again.
+        self.launch_escalated_recoveries().await;
+
         // Phase 2c: Fire due schedules (recurring + one-shot)
         self.check_due_goal_schedules().await;
 
@@ -873,6 +901,15 @@ impl HeartbeatCoordinator {
 
         // Phase 5: Deliver notifications for completed/failed goals
         self.deliver_notifications().await;
+
+        // Phase 6: Re-run user requests that failed only because the model
+        // provider was unavailable before any tool work committed.
+        if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
+            let dispatched = agent.retry_deferred_provider_requests().await;
+            if dispatched > 0 {
+                info!(dispatched, "Re-ran requests deferred by a provider outage");
+            }
+        }
 
         Ok(())
     }
@@ -2362,6 +2399,135 @@ impl HeartbeatCoordinator {
         Ok(open_runs)
     }
 
+    /// Launch one automatic recovery run per escalated objective once its
+    /// cool-down has elapsed, up to a fixed attempt cap. The recovery run is
+    /// the same typed recovery lineage the task lead creates inline
+    /// (`terminal_recovery` + `recovery_for_run`), so a verified success
+    /// resets the failure budget and resumes the paused schedules through
+    /// `finish_goal_run`, and a failure lands in the same budget accounting.
+    /// The paused schedules stay paused during recovery so the cron cannot
+    /// double-fire.
+    async fn launch_escalated_recoveries(&self) {
+        let candidates = match self
+            .state
+            .list_escalated_recovery_candidates(
+                Self::ESCALATED_RECOVERY_COOLDOWN_SECS,
+                Self::ESCALATED_RECOVERY_MAX_ATTEMPTS,
+            )
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                error!(%error, "Failed to list escalated recovery candidates");
+                return;
+            }
+        };
+        for recovery in candidates {
+            let goal_id = recovery.goal_id.clone();
+            let Ok(Some(goal)) = self.state.get_goal(&goal_id).await else {
+                continue;
+            };
+            if goal.status != "active" {
+                continue;
+            }
+            // An open occurrence (of any trigger type) means work is still in
+            // flight or wedged; reconcile first and try again next tick.
+            match self.reconcile_open_scheduled_runs_for_goal(&goal_id).await {
+                Ok(open_runs) if !open_runs.is_empty() => {
+                    let stale = open_runs.iter().all(|run| run.status == "blocked");
+                    if !stale {
+                        continue;
+                    }
+                    for run in &open_runs {
+                        let _ = self
+                            .state
+                            .finish_goal_run(
+                                &run.id,
+                                "failed",
+                                Some("Closed before automatic recovery."),
+                            )
+                            .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(goal_id = %goal_id, %error, "Could not reconcile before recovery");
+                    continue;
+                }
+            }
+            // Bump the attempt counter before creating any work so a crash
+            // between the two cannot hot-loop recovery launches.
+            if let Err(error) = self.state.record_scheduled_recovery_attempt(&goal_id).await {
+                warn!(goal_id = %goal_id, %error, "Failed to record recovery attempt");
+                continue;
+            }
+            let attempt = recovery.recovery_attempts.saturating_add(1);
+            let now = chrono::Utc::now().to_rfc3339();
+            let recovery_task_id = uuid::Uuid::new_v4().to_string();
+            let mut context = goal
+                .context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            context["recovery_for_run"] = serde_json::json!(recovery.last_failed_run_id);
+            context["terminal_recovery"] = serde_json::json!(true);
+            context["recovery_attempt"] = serde_json::json!(attempt);
+            context["recovery_cause"] = serde_json::json!(recovery
+                .latest_failure_kind
+                .map(crate::traits::ScheduledFailureKind::as_str));
+            let task = crate::traits::Task {
+                id: recovery_task_id.clone(),
+                goal_id: goal_id.clone(),
+                description: format!(
+                    "Directly recover and finish: {} [SYSTEM: automatic recovery attempt {attempt} of {} after {} consecutive failed runs (typed cause {}). The schedule is paused until this run completes with verified receipts. If the objective's repository or workspace is not present in the attempt workspace, locate it with project_inspect and bind it with scheduled_goal_runs bind_workspace before reporting a blocker.]",
+                    goal.description,
+                    Self::ESCALATED_RECOVERY_MAX_ATTEMPTS,
+                    recovery.consecutive_failures,
+                    recovery
+                        .latest_failure_kind
+                        .map_or("unknown", crate::traits::ScheduledFailureKind::as_str),
+                ),
+                status: "pending".to_string(),
+                priority: "high".to_string(),
+                task_order: 0,
+                parallel_group: None,
+                depends_on: None,
+                agent_id: None,
+                context: Some(context.to_string()),
+                result: None,
+                error: None,
+                blocker: None,
+                idempotent: false,
+                retry_count: 0,
+                max_retries: 0,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+            };
+            if let Err(error) = self
+                .state
+                .start_goal_run(&goal_id, "recovery", None, Some(&recovery_task_id))
+                .await
+            {
+                warn!(goal_id = %goal_id, %error, "Failed to start automatic recovery run");
+                continue;
+            }
+            match self.state.create_task(&task).await {
+                Ok(()) => info!(
+                    goal_id = %goal_id,
+                    task_id = %recovery_task_id,
+                    attempt,
+                    max_attempts = Self::ESCALATED_RECOVERY_MAX_ATTEMPTS,
+                    "Launched automatic recovery run for escalated scheduled objective"
+                ),
+                Err(error) => {
+                    warn!(goal_id = %goal_id, %error, "Failed to create automatic recovery task")
+                }
+            }
+        }
+    }
+
     async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
         // Guardrails (unknown policy/tz -> treat as coalesce/local-only).
         if schedule.tz != "local" {
@@ -2633,6 +2799,21 @@ impl HeartbeatCoordinator {
                     } else {
                         "completed"
                     };
+                    // A blocked child of the superseded occurrence is an
+                    // audit record now; mark it so it never reads as open
+                    // work waiting on an owner.
+                    for task in run_tasks.iter().filter(|task| task.status == "blocked") {
+                        let mut superseded = task.clone();
+                        superseded.status = "superseded".to_string();
+                        superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        superseded.result = Some(format!(
+                            "Superseded by the next scheduled occurrence. Prior blocker: {}",
+                            task.blocker.as_deref().unwrap_or("none")
+                        ));
+                        if let Err(error) = self.state.update_task(&superseded).await {
+                            warn!(task_id = %task.id, %error, "Failed to supersede blocked task");
+                        }
+                    }
                     let _ = self
                         .state
                         .finish_goal_run(
@@ -2989,15 +3170,30 @@ mod tests {
         manual_run.status = "blocked".to_string();
 
         assert!(!task_blocks_later_schedule_fire(&scheduled_run, &blocked,));
-        assert!(task_blocks_later_schedule_fire(&manual_run, &blocked));
+        // A blocked manual or recovery occurrence is equally terminal for
+        // backpressure: it must never suppress the recurring schedule forever.
+        assert!(!task_blocks_later_schedule_fire(&manual_run, &blocked));
+        let mut recovery_run = crate::traits::GoalRun::new("goal-1", "default", "recovery");
+        recovery_run.status = "blocked".to_string();
+        assert!(!task_blocks_later_schedule_fire(&recovery_run, &blocked));
         assert!(!task_blocks_later_schedule_fire(
             &scheduled_run,
             &provider_blocked,
         ));
-        assert!(task_blocks_later_schedule_fire(
+        assert!(!task_blocks_later_schedule_fire(
             &manual_run,
             &provider_blocked,
         ));
+        // A still-running manual occurrence keeps its backpressure.
+        manual_run.status = "running".to_string();
+        assert!(task_blocks_later_schedule_fire(&manual_run, &blocked));
+        assert_eq!(
+            scheduled_run_reconciliation_status(
+                &manual_run,
+                &[synthetic_task("manual root", "completed")]
+            ),
+            Some("completed")
+        );
         assert!(!task_blocks_later_schedule_fire(&scheduled_run, &pending,));
 
         scheduled_run.status = "running".to_string();

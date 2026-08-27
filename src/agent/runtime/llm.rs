@@ -670,20 +670,33 @@ impl Agent {
                                 return Ok(resp);
                             }
                         }
-                        for attempt in 0..Self::MAX_LLM_RETRIES {
-                            let wait = crate::backoff::exponential_backoff(
-                                Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
-                                attempt,
-                                Duration::MAX,
-                            )
-                            .as_secs();
+                        // Before any tool work has committed, a transient
+                        // outage is cheap to wait out: use the longer bounded
+                        // ladder (2+4+8+16+30s ≈ 60s, jittered). Once work has
+                        // committed, keep the short ladder so a half-done task
+                        // closes from its receipts instead of idling.
+                        let max_retries = if options.uncommitted_work {
+                            Self::MAX_LLM_RETRIES_UNCOMMITTED
+                        } else {
+                            Self::MAX_LLM_RETRIES
+                        };
+                        for attempt in 0..max_retries {
+                            let wait = crate::backoff::jittered_delay(
+                                crate::backoff::exponential_backoff(
+                                    Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
+                                    attempt,
+                                    Duration::from_secs(Self::TRANSIENT_RETRY_MAX_DELAY_SECS),
+                                ),
+                                0.2,
+                            );
                             info!(
-                                wait_secs = wait,
+                                wait_secs = wait.as_secs(),
                                 attempt = attempt + 1,
-                                max = Self::MAX_LLM_RETRIES,
+                                max = max_retries,
+                                uncommitted_work = options.uncommitted_work,
                                 "Retrying after transient error"
                             );
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            tokio::time::sleep(wait).await;
                             telemetry.attempts += 1;
                             match provider
                                 .chat_with_options(model, messages, tool_defs, options)

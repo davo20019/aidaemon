@@ -1103,6 +1103,25 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.iter().any(|a| a == "--goals") {
+        print_scheduled_goal_state(&pool).await?;
+        return Ok(());
+    }
+    if let Some(sql) = args
+        .windows(2)
+        .find(|w| w[0] == "--sql")
+        .map(|w| w[1].clone())
+    {
+        // Read-only ad hoc inspection. Anything other than a single SELECT
+        // is refused so this flag can never mutate the daemon's state.
+        let trimmed = sql.trim();
+        anyhow::ensure!(
+            trimmed.to_ascii_lowercase().starts_with("select ") && !trimmed.contains(';'),
+            "--sql accepts exactly one SELECT statement"
+        );
+        print_query_rows(&pool, "sql", trimmed).await?;
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--dynamic-bots") {
         let rows = sqlx::query(
             "SELECT id, channel_type, allowed_user_ids, extra_config, created_at, bot_token, app_token \
@@ -2350,5 +2369,104 @@ async fn main() -> anyhow::Result<()> {
     }
 
     pool.close().await;
+    Ok(())
+}
+
+/// Render rows of an arbitrary query as `col=value` pairs. Diagnostic only:
+/// values are rendered as text without interpretation.
+async fn print_query_rows(pool: &SqlitePool, title: &str, sql: &str) -> anyhow::Result<()> {
+    use sqlx::{Column, Row, TypeInfo, ValueRef};
+    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    println!("== {title} ({}) ==", rows.len());
+    for row in rows {
+        let mut parts = Vec::new();
+        for column in row.columns() {
+            let name = column.name();
+            let raw = row.try_get_raw(name)?;
+            let rendered = if raw.is_null() {
+                "NULL".to_string()
+            } else {
+                match raw.type_info().name() {
+                    "INTEGER" | "BOOLEAN" => row
+                        .try_get::<i64, _>(name)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "?".to_string()),
+                    "REAL" => row
+                        .try_get::<f64, _>(name)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "?".to_string()),
+                    _ => row
+                        .try_get::<String, _>(name)
+                        .map(|v| {
+                            let v = v.replace('\n', " ");
+                            if v.chars().count() > 160 {
+                                format!("{}…", v.chars().take(160).collect::<String>())
+                            } else {
+                                v
+                            }
+                        })
+                        .unwrap_or_else(|_| "?".to_string()),
+                }
+            };
+            parts.push(format!("{name}={rendered}"));
+        }
+        println!("- {}", parts.join(" "));
+    }
+    Ok(())
+}
+
+/// Scheduled/continuous goal control state: schedules, recovery budget,
+/// paused schedules, recent runs, and open tasks. This is the view an
+/// operator needs to answer "why is this objective not running".
+async fn print_scheduled_goal_state(pool: &SqlitePool) -> anyhow::Result<()> {
+    print_query_rows(
+        pool,
+        "Goals with schedules",
+        "SELECT g.id, g.status, g.goal_type, substr(g.description,1,120) AS description, g.updated_at
+           FROM goals g
+          WHERE EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = g.id)
+             OR g.goal_type = 'continuous'
+          ORDER BY g.updated_at DESC LIMIT 20",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "goal_schedules",
+        "SELECT * FROM goal_schedules ORDER BY next_run_at",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "scheduled_recovery_state",
+        "SELECT * FROM scheduled_recovery_state ORDER BY goal_id",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "scheduled_recovery_paused_schedules",
+        "SELECT * FROM scheduled_recovery_paused_schedules",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "goal_run_recovery_links",
+        "SELECT * FROM goal_run_recovery_links ORDER BY rowid DESC LIMIT 20",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "recent goal_runs",
+        "SELECT * FROM goal_runs ORDER BY started_at DESC LIMIT 15",
+    )
+    .await?;
+    print_query_rows(
+        pool,
+        "open goal tasks",
+        "SELECT id, goal_id, goal_run_id, status, substr(description,1,100) AS description, created_at, updated_at
+           FROM tasks
+          WHERE goal_id IS NOT NULL AND status IN ('pending','running','blocked')
+          ORDER BY created_at DESC LIMIT 20",
+    )
+    .await?;
     Ok(())
 }

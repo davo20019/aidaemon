@@ -56,6 +56,12 @@ pub struct ChatOptions {
     /// cascading, or stripping controls; otherwise failed attempts can consume
     /// unknowable tokens outside a hard aggregate budget.
     pub single_attempt_fail_closed: bool,
+    /// True when the current request has committed no tool work yet. A
+    /// transient provider outage at that point costs nothing to wait out, so
+    /// the recovery ladder may use a longer bounded backoff window before it
+    /// gives up; once work has committed the ladder stays short so a
+    /// half-done task closes from its receipts quickly.
+    pub uncommitted_work: bool,
     /// llama.cpp KV-cache slot pin (`id_slot`) for this call only.
     ///
     /// `None` (the default) means "use the provider's background slot" when slot

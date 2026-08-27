@@ -573,7 +573,11 @@ impl WorkCoordinationStore for SqliteStateStore {
                     .await?;
             } else if (matches!(status, "failed" | "blocked")
                 || status == "completed" && !recovery_completion_verified)
-                && !(prior_status == "blocked" && status == "blocked")
+                // A run already counted when it blocked must not be counted a
+                // second time when its close-out relabels it `failed`;
+                // otherwise a three-failure budget escalates after one or two
+                // real occurrences.
+                && prior_status != "blocked"
             {
                 let authorization_blocked = sqlx::query_scalar::<_, i64>(
                     "SELECT 1 FROM events e

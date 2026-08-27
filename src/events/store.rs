@@ -1598,10 +1598,90 @@ impl EventStore {
         session_id: &str,
         task_id: &str,
     ) -> anyhow::Result<RunAggregate> {
-        let events = self
+        let mut events = self
             .query_task_events_for_session(session_id, task_id)
             .await?;
+        self.adopt_continuation_evidence(session_id, task_id, &mut events)
+            .await?;
         Ok(RunAggregate::replay(task_id, &events))
+    }
+
+    /// A background continuation child inherits the parent's observation
+    /// obligations, but the parent's completion receipt is stamped with the
+    /// parent task id and would never enter the child's replay. Every typed
+    /// `BackgroundContinuationLinked` edge names that exact receipt; adopt it
+    /// into the child's history as a durable replay of the parent operation
+    /// so the kernel projection can credit the inherited obligation (or close
+    /// the run by evidence) instead of demanding a receipt that already
+    /// exists. Correlation is fail-closed: session, parent task, call id, and
+    /// result id must all agree, exactly as the proof graph requires.
+    async fn adopt_continuation_evidence(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        events: &mut Vec<Event>,
+    ) -> anyhow::Result<()> {
+        let mut adopted = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            if event.event_type != EventType::BackgroundContinuationLinked {
+                continue;
+            }
+            let Ok(link) = serde_json::from_value::<super::BackgroundContinuationLinkedData>(
+                event.data.clone(),
+            ) else {
+                continue;
+            };
+            if link.child_task_id != task_id {
+                continue;
+            }
+            let Some(parent_result_id) = link.parent_result_id.as_deref() else {
+                continue;
+            };
+            let Some(evidence) = self
+                .continuation_tool_evidence(
+                    session_id,
+                    &link.parent_task_id,
+                    &link.parent_tool_call_id,
+                    parent_result_id,
+                )
+                .await?
+            else {
+                continue;
+            };
+            if evidence.result.receipt.is_none() {
+                continue;
+            }
+            let mut call = evidence.call;
+            call.task_id = Some(task_id.to_string());
+            call.operation_lineage = Some(super::ToolOperationLineage::DurableReplay {
+                source_operation_id: call.tool_call_id.clone(),
+                source_result_id: parent_result_id.to_string(),
+            });
+            let mut result = evidence.result;
+            result.task_id = Some(task_id.to_string());
+            let mut call_event = Event::new(
+                session_id,
+                EventType::ToolCall,
+                serde_json::to_value(&call)?,
+            );
+            call_event.id = event.id;
+            call_event.task_id = Some(task_id.to_string());
+            let mut result_event = Event::new(
+                session_id,
+                EventType::ToolResult,
+                serde_json::to_value(&result)?,
+            );
+            result_event.id = event.id;
+            result_event.task_id = Some(task_id.to_string());
+            adopted.push((index, call_event, result_event));
+        }
+        // Insert after the link so the stable id sort keeps contract
+        // installation before the adopted operation.
+        for (index, call_event, result_event) in adopted.into_iter().rev() {
+            events.insert(index + 1, result_event);
+            events.insert(index + 1, call_event);
+        }
+        Ok(())
     }
 
     /// Fold one event kind for an exact task. Terminal telemetry uses this
@@ -4617,6 +4697,50 @@ mod tests {
             proof[0].obligation_ids,
             ["task:task-child/obligation:background-result"]
         );
+
+        // The child's durable projection adopts the exact parent receipt as a
+        // replayed operation: the run has evidence even though the receipt
+        // event itself is stamped with the parent task.
+        let child = store
+            .task_run_aggregate("session-a", "task-child")
+            .await
+            .unwrap();
+        let adopted = child
+            .operations
+            .get("call-exact")
+            .expect("adopted operation");
+        assert!(matches!(
+            adopted.operation_lineage,
+            Some(crate::events::ToolOperationLineage::DurableReplay { ref source_result_id, .. })
+                if source_result_id == "result-exact"
+        ));
+        assert_eq!(
+            adopted.outcome,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        // A link that names the wrong result id adopts nothing (fail closed).
+        let mut wrong = serde_json::to_value(crate::events::BackgroundContinuationLinkedData {
+            parent_task_id: "task-parent".to_string(),
+            child_task_id: "task-other-child".to_string(),
+            parent_tool_call_id: "call-exact".to_string(),
+            parent_result_id: Some("result-other".to_string()),
+            child_response_id: None,
+        })
+        .unwrap();
+        wrong["task_id"] = json!("task-other-child");
+        store
+            .append(Event::new(
+                "session-a",
+                EventType::BackgroundContinuationLinked,
+                wrong,
+            ))
+            .await
+            .unwrap();
+        let other = store
+            .task_run_aggregate("session-a", "task-other-child")
+            .await
+            .unwrap();
+        assert!(other.operations.is_empty());
     }
 
     #[tokio::test]

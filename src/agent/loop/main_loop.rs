@@ -2283,8 +2283,26 @@ impl Agent {
                 crate::events::TaskStatus::Failed,
             )
         } else {
+            // Nothing committed: the request is a pure re-runnable input.
+            // Queue it for an automatic re-run when the provider recovers
+            // instead of making the user resend it. A retry that fails the
+            // same way re-enters here and re-queues with attempts + 1.
+            let deferred = if internal_continuation && continuation_parent_task_id.is_some() {
+                None
+            } else {
+                self.defer_request_for_provider_recovery(session_id, user_text, user_role, &error)
+                    .await
+            };
+            let reply = match deferred {
+                Some(0) => "The model provider is unavailable right now. I saved this request and will retry it automatically once the provider recovers, then reply here.".to_string(),
+                Some(attempt) => format!(
+                    "The model provider is still unavailable (automatic retry {attempt} of {}). I will keep retrying with a longer wait and reply here when it succeeds.",
+                    crate::agent::deferred_retry::MAX_DEFERRED_ATTEMPTS
+                ),
+                None => "I couldn't complete this request because the response provider failed before a confirmed result was available.".to_string(),
+            };
             (
-                "I couldn't complete this request because the response provider failed before a confirmed result was available.".to_string(),
+                reply,
                 TaskOutcome::Failed,
                 crate::events::TaskStatus::Failed,
             )

@@ -2492,6 +2492,23 @@ pub(super) async fn run_completion_phase(
                         .operations
                         .values()
                         .any(|operation| operation.result_id.is_some());
+                // A reply that differs from the exact artifact only by
+                // surrounding whitespace or one trailing sentence terminator
+                // is the same answer with the model's punctuation habit; the
+                // exact artifact is what the user asked for. This is a
+                // structural equivalence on the whole line, not a phrase rule.
+                let equivalent_modulo_terminator = {
+                    let candidate = reply.trim();
+                    let stripped = candidate
+                        .strip_suffix('.')
+                        .or_else(|| candidate.strip_suffix('!'))
+                        .unwrap_or(candidate)
+                        .trim_end();
+                    stripped == projected.trim() && candidate != projected.trim()
+                };
+                if equivalent_modulo_terminator {
+                    reply = projected.to_string();
+                }
                 if reply != projected {
                     agent
                         .emit_decision_point(

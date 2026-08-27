@@ -360,7 +360,14 @@ impl ModelProvider for MockProvider {
             options: options.clone(),
         });
 
-        if self.reject_non_default_options && *options != ChatOptions::default() {
+        // `uncommitted_work` is an advisory recovery hint for the agent's own
+        // retry ladder, not a provider option; a provider that rejects
+        // non-default options never sees it.
+        let provider_facing = ChatOptions {
+            uncommitted_work: false,
+            ..options.clone()
+        };
+        if self.reject_non_default_options && provider_facing != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
         }
 

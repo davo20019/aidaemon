@@ -1446,6 +1446,16 @@ impl CompletionProgress {
                 self.evidence_receipt_ids[index] = obligation.satisfying_receipt_ids.clone();
             }
         }
+        // The durable decision is authoritative: once the kernel has closed
+        // the run (by contract or by receipt evidence), no in-memory
+        // verification obligation may reopen it.
+        if matches!(
+            aggregate.terminal_decision(),
+            crate::events::RunTerminalDecision::Succeeded
+                | crate::events::RunTerminalDecision::SucceededByEvidence
+        ) {
+            verification_pending = false;
+        }
         self.verification_pending = verification_pending;
     }
 

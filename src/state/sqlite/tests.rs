@@ -4845,3 +4845,106 @@ async fn completing_a_task_refreshes_goal_last_useful_action() {
     );
     assert!(g2.last_useful_action.is_some());
 }
+
+#[tokio::test]
+async fn escalated_recovery_candidates_respect_pause_ownership_cooldown_and_cap() {
+    let (store, _db) = setup_test_store().await;
+    let pool = store.pool();
+    let goal = Goal::new_continuous("Publish the synthetic daily digest", "test", None, None);
+    store.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 6 * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("0 6 * * *".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: true,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    store.create_goal_schedule(&schedule).await.unwrap();
+    let escalated_at = (chrono::Utc::now() - chrono::Duration::hours(12)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO scheduled_recovery_state
+            (goal_id, consecutive_failures, failure_budget, disposition, latest_failure_kind,
+             last_failed_run_id, last_recovery_run_id, updated_at)
+         VALUES (?, 3, 3, 'escalated', 'task_failed', NULL, NULL, ?)",
+    )
+    .bind(&goal.id)
+    .bind(&escalated_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Paused by the owner (no recovery-owned pause row): never a candidate.
+    assert!(store
+        .list_escalated_recovery_candidates(6 * 3600, 3)
+        .await
+        .unwrap()
+        .is_empty());
+
+    sqlx::query(
+        "INSERT INTO scheduled_recovery_paused_schedules (schedule_id, goal_id, paused_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&schedule.id)
+    .bind(&goal.id)
+    .bind(&escalated_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let candidates = store
+        .list_escalated_recovery_candidates(6 * 3600, 3)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].goal_id, goal.id);
+    assert_eq!(candidates[0].recovery_attempts, 0);
+
+    // A fresh attempt starts the cool-down again.
+    store
+        .record_scheduled_recovery_attempt(&goal.id)
+        .await
+        .unwrap();
+    assert!(store
+        .list_escalated_recovery_candidates(6 * 3600, 3)
+        .await
+        .unwrap()
+        .is_empty());
+    let state = store
+        .get_scheduled_recovery_state(&goal.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.recovery_attempts, 1);
+    assert!(state.last_recovery_attempt_at.is_some());
+
+    // The cap is enforced even when the cool-down has elapsed.
+    sqlx::query(
+        "UPDATE scheduled_recovery_state SET recovery_attempts = 3, last_recovery_attempt_at = ?
+          WHERE goal_id = ?",
+    )
+    .bind(&escalated_at)
+    .bind(&goal.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(store
+        .list_escalated_recovery_candidates(6 * 3600, 3)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_escalated_recovery_candidates(6 * 3600, 4)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

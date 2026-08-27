@@ -1612,6 +1612,18 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // Additive columns for automatic post-escalation recovery attempts.
+    let _ = sqlx::query(
+        "ALTER TABLE scheduled_recovery_state
+            ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "ALTER TABLE scheduled_recovery_state ADD COLUMN last_recovery_attempt_at TEXT",
+    )
+    .execute(pool)
+    .await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS goal_run_recovery_links (
             failed_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,

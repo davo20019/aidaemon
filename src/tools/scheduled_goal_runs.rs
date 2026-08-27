@@ -50,6 +50,84 @@ impl ScheduledGoalRunsTool {
         compiled
     }
 
+    /// Bind every run of a scheduled goal to one existing project directory.
+    /// The binding is typed durable state (`context.project_scope`) that the
+    /// task lead honors before any mission-text inference, so a run whose
+    /// objective lives in a sibling repository never starts in an empty
+    /// synthetic workspace again.
+    async fn bind_workspace(
+        &self,
+        goal_id_input: &str,
+        workspace_path: &str,
+    ) -> anyhow::Result<String> {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
+            Ok(id) => id,
+            Err(error) => return Ok(error.to_string()),
+        };
+        let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
+            return Ok(format!("Scheduled goal not found: {resolved_goal_id}"));
+        };
+        let raw = workspace_path.trim();
+        if raw.is_empty() {
+            return Ok("Provide a non-empty workspace_path.".to_string());
+        }
+        let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+            match dirs::home_dir() {
+                Some(home) => home.join(rest),
+                None => return Ok("Cannot resolve ~ without a home directory.".to_string()),
+            }
+        } else {
+            std::path::PathBuf::from(raw)
+        };
+        if !expanded.is_absolute() {
+            return Ok("workspace_path must be absolute (or start with ~/).".to_string());
+        }
+        let canonical = match std::fs::canonicalize(&expanded) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(format!(
+                    "workspace_path does not exist or is not accessible: {} ({error})",
+                    expanded.display()
+                ))
+            }
+        };
+        if !canonical.is_dir() {
+            return Ok(format!(
+                "workspace_path is not a directory: {}",
+                canonical.display()
+            ));
+        }
+        if crate::tools::fs_utils::is_protected_host_data_path(&canonical) {
+            return Ok(
+                "workspace_path points at protected host data; choose a project directory."
+                    .to_string(),
+            );
+        }
+        let mut context = goal
+            .context
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let scope = canonical.to_string_lossy().to_string();
+        let previous = context
+            .get("project_scope")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        context["project_scope"] = Value::String(scope.clone());
+        context["project_scope_bound_at"] = Value::String(chrono::Utc::now().to_rfc3339());
+        goal.context = Some(context.to_string());
+        goal.updated_at = chrono::Utc::now().to_rfc3339();
+        self.state.update_goal(&goal).await?;
+        Ok(format!(
+            "Bound scheduled goal workspace to {scope}{}. Future runs (including automatic recovery) execute there.",
+            previous
+                .filter(|prior| prior != &scope)
+                .map(|prior| format!(" (previously {prior})"))
+                .unwrap_or_default()
+        ))
+    }
+
     async fn update_instructions(
         &self,
         goal_id_input: &str,
@@ -355,9 +433,20 @@ impl ScheduledGoalRunsTool {
                 .iter()
                 .filter_map(|schedule| schedule.last_run_at.as_deref())
                 .max();
+            let workspace_binding = goal
+                .context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|context| {
+                    context
+                        .get("project_scope")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
             let mut record = json!({
                 "objective": Self::truncate(&goal.description, 240),
                 "goal_status": goal.status,
+                "workspace_binding": workspace_binding,
                 "schedule_count": schedules.len(),
                 "active_schedule_count": active_schedule_count,
                 "schedule_state": if schedules.is_empty() {
@@ -1000,6 +1089,8 @@ struct ScheduledGoalRunsArgs {
     #[serde(default)]
     include_diagnostics: Option<bool>,
     #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
     _user_role: Option<String>,
 }
 
@@ -1016,9 +1107,12 @@ fn scheduled_goal_runs_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["overview", "run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions"]
+                    "enum": ["overview", "run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions", "bind_workspace"]
                 },
                 "goal_id": {
+                    "type": "string"
+                },
+                "workspace_path": {
                     "type": "string"
                 },
                 "schedule_id": {
@@ -1181,8 +1275,25 @@ impl Tool for ScheduledGoalRunsTool {
                     )
                     .await
 	            }
+	            "bind_workspace" => {
+	                let is_guest = args
+	                    ._user_role
+	                    .as_deref()
+	                    .is_some_and(|role| role.eq_ignore_ascii_case("guest"));
+	                if is_guest {
+	                    return Ok("Guests cannot bind scheduled goal workspaces.".to_string());
+	                }
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for bind_workspace"))?;
+	                let workspace_path = args.workspace_path.as_deref().ok_or_else(|| {
+	                    anyhow::anyhow!("'workspace_path' is required for bind_workspace")
+	                })?;
+	                self.bind_workspace(goal_id, workspace_path).await
+	            }
 	            other => Ok(format!(
-	                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, or update_instructions.",
+	                "Unknown action: '{}'. Use overview, run_now, run_history, last_failure, unblock_hints, set_budget, update_instructions, or bind_workspace.",
 	                other
 	            )),
 	        }

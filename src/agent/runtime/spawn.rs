@@ -2549,6 +2549,7 @@ impl Agent {
                 - Set `task_order` for display ordering\n\
                 - Set `worker_profile` to the best named profile: profile-code, profile-research, profile-review, profile-browser-verifier, profile-artifact-writer, profile-comms-draft, or profile-executor\n\
                 - Use `workspace_policy: isolated` for a new project, `worktree` for parallel or collision-prone edits in an existing Git project, and `shared` only for one explicit existing project\n\
+                - If the objective concerns an existing repository or site that is NOT present in the attempt workspace (empty directory, no Git repository, no build/deploy workflow), do not block: locate the project under the configured project roots with `project_inspect` (a site hostname usually matches a sibling directory name), then bind it durably with `scheduled_goal_runs(action=\"bind_workspace\", goal_id=..., workspace_path=...)` and create the work tasks against that directory. Report a blocker only when no such directory exists anywhere.\n\
              2. Before spawning an executor, claim the task: manage_goal_tasks(claim_task, task_id=...)\n\
                 - This verifies dependencies are met and atomically reserves the task\n\
                 - If claiming fails due to unmet dependencies, work on other available tasks first\n\

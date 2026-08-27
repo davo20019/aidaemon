@@ -119,6 +119,12 @@ pub struct ScheduledRecoveryState {
     pub latest_failure_kind: Option<ScheduledFailureKind>,
     pub last_failed_run_id: Option<String>,
     pub last_recovery_run_id: Option<String>,
+    /// Automatic recovery runs launched by the heartbeat after escalation.
+    /// Bounded so an unfixable objective cannot retry forever.
+    #[serde(default)]
+    pub recovery_attempts: u16,
+    #[serde(default)]
+    pub last_recovery_attempt_at: Option<String>,
     pub updated_at: String,
 }
 

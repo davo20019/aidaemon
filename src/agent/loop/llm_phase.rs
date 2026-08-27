@@ -885,6 +885,9 @@ pub(super) async fn run_llm_phase(
     // the provider omits `id_slot` entirely.
     let mut llm_options = ChatOptions {
         id_slot: services.agent.interactive_slot,
+        // No tool work has committed yet: a transient outage can be waited
+        // out with the longer bounded ladder instead of failing the turn.
+        uncommitted_work: learning_ctx.tool_calls.is_empty(),
         ..ChatOptions::default()
     };
     // Escalating recovery for thinking-model truncation.

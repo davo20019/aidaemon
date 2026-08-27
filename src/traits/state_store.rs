@@ -1502,6 +1502,22 @@ pub trait ScheduledRunStore: Send + Sync {
         Ok(None)
     }
 
+    /// Escalated scheduled objectives that the recovery machine itself paused,
+    /// whose cool-down has elapsed and whose automatic recovery attempts are
+    /// still under the cap.
+    async fn list_escalated_recovery_candidates(
+        &self,
+        _cooldown_secs: i64,
+        _max_attempts: u16,
+    ) -> anyhow::Result<Vec<super::ScheduledRecoveryState>> {
+        Ok(Vec::new())
+    }
+
+    /// Record that an automatic recovery run was launched for the goal.
+    async fn record_scheduled_recovery_attempt(&self, _goal_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Delete persisted runtime state for an active scheduled run.
     async fn delete_scheduled_run_state(&self, _goal_id: &str) -> anyhow::Result<bool> {
         Ok(false)
