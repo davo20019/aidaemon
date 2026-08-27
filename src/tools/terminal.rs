@@ -2432,7 +2432,24 @@ async fn native_sandbox_runtime_support(
     command: &str,
 ) -> anyhow::Result<NativeSandboxRuntimeSupport> {
     let mut support = NativeSandboxRuntimeSupport::default();
-    for program in parsed_command_programs(command) {
+    let mut programs = parsed_command_programs(command);
+    // JavaScript package runners delegate to `node` transitively (their own
+    // resolved path is a script under node_modules or a separate native
+    // binary), so node's runtime roots would never be granted from the
+    // top-level command alone. Resolve the interpreter they run as well.
+    let runs_node = programs.iter().any(|program| {
+        matches!(
+            std::path::Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(program.as_str()),
+            "npm" | "npx" | "yarn" | "pnpm" | "bun" | "corepack" | "tsx" | "ts-node" | "vite"
+        )
+    });
+    if runs_node && !programs.iter().any(|program| program == "node") {
+        programs.push("node".to_string());
+    }
+    for program in programs {
         let Some(resolved) = backend.resolve_executable(&program).await? else {
             continue;
         };
@@ -2459,14 +2476,17 @@ async fn native_sandbox_runtime_support(
         // `<prefix>/libexec`). Without them a relocatable runtime such as a
         // conda/miniforge `node` aborts with a missing `@rpath` dylib before
         // it can run. Read-only, library lanes only; no home-directory grant.
-        let canonical_path = std::path::Path::new(canonical.as_str());
-        if canonical_path
-            .parent()
-            .and_then(|dir| dir.file_name())
-            .and_then(|name| name.to_str())
-            == Some("bin")
-        {
-            if let Some(prefix) = canonical_path.parent().and_then(|dir| dir.parent()) {
+        for location in [resolved.as_str(), canonical.as_str()] {
+            let location = std::path::Path::new(location);
+            if location
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                != Some("bin")
+            {
+                continue;
+            }
+            if let Some(prefix) = location.parent().and_then(|dir| dir.parent()) {
                 for lane in ["lib", "libexec"] {
                     let path = prefix.join(lane);
                     if path.is_dir() {
@@ -7442,6 +7462,39 @@ mod tests {
                 .and_then(Value::as_str),
             Some("restricted")
         );
+    }
+
+    #[tokio::test]
+    async fn native_sandbox_runtime_grants_node_libraries_for_package_runners() {
+        let backend = active_execution_backend();
+        let Some(node) = backend.resolve_executable("node").await.unwrap() else {
+            return;
+        };
+        if backend.resolve_executable("npm").await.unwrap().is_none() {
+            return;
+        }
+        let canonical = backend.canonicalize(&node).await.unwrap_or(node.clone());
+        let lib = std::path::Path::new(canonical.as_str())
+            .parent()
+            .and_then(|bin| bin.parent())
+            .map(|prefix| prefix.join("lib"));
+        let Some(lib) = lib.filter(|lib| lib.is_dir()) else {
+            return;
+        };
+        let lib = lib.to_string_lossy().to_string();
+        let npm = native_sandbox_runtime_support(&backend, "npm run build")
+            .await
+            .expect("npm support");
+        assert!(
+            npm.read_paths.iter().any(|path| path == &lib),
+            "npm must carry node's lib: {:?}",
+            npm.read_paths
+        );
+        assert!(npm.executable_paths.iter().any(|path| path == &lib));
+        let plain = native_sandbox_runtime_support(&backend, "/usr/bin/true")
+            .await
+            .expect("plain support");
+        assert!(!plain.read_paths.iter().any(|path| path == &lib));
     }
 
     #[tokio::test]
