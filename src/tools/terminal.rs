@@ -2513,6 +2513,33 @@ async fn native_sandbox_runtime_support(
             }
         }
 
+        // Git aborts (exit 128) when its ordinary configuration files exist
+        // but cannot be opened, so a confined `git status` in an authorized
+        // workspace fails for a reason unrelated to the task's data authority.
+        // Grant only the exact existing config files as runtime support of the
+        // selected executable; credentials, hooks, and the home directory stay
+        // outside the profile.
+        if requested_name == "git" || canonical_name == "git" {
+            for config in [
+                backend.home_hint().join(".gitconfig"),
+                backend.home_hint().join(".config/git/config"),
+                backend.home_hint().join(".config/git/ignore"),
+                backend.home_hint().join(".config/git/attributes"),
+                crate::execution::BackendPath::new("/etc/gitconfig".to_string()),
+            ] {
+                if backend.metadata(&config).await.is_ok() {
+                    support.add_read(config.to_string());
+                }
+            }
+            // Homebrew git consults its own prefix-level gitconfig.
+            if let Some(prefix) = std::path::Path::new(canonical.as_str())
+                .ancestors()
+                .find(|ancestor| ancestor.join("etc/gitconfig").is_file())
+            {
+                support.add_read(prefix.join("etc/gitconfig").to_string_lossy().to_string());
+            }
+        }
+
         // Cargo requires dependency source caches to compile an already
         // resolved project. These roots deliberately exclude credentials and
         // broad home access; network remains denied by the permission profile.
@@ -7392,6 +7419,36 @@ mod tests {
                 .and_then(Value::as_str),
             Some("restricted")
         );
+    }
+
+    #[tokio::test]
+    async fn native_sandbox_runtime_grants_git_its_own_config_files_only_for_git() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("git").await.unwrap().is_none() {
+            return;
+        }
+        let gitconfig = backend.home_hint().join(".gitconfig");
+        if backend.metadata(&gitconfig).await.is_err() {
+            return;
+        }
+        let git = native_sandbox_runtime_support(&backend, "git status")
+            .await
+            .expect("git support");
+        assert!(git
+            .read_paths
+            .iter()
+            .any(|path| path == &gitconfig.to_string()));
+        assert!(!git
+            .read_paths
+            .iter()
+            .any(|path| path == &backend.home_hint().to_string()));
+        let other = native_sandbox_runtime_support(&backend, "/usr/bin/true")
+            .await
+            .expect("other support");
+        assert!(!other
+            .read_paths
+            .iter()
+            .any(|path| path == &gitconfig.to_string()));
     }
 
     #[tokio::test]
