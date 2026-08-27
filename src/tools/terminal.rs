@@ -2454,6 +2454,29 @@ async fn native_sandbox_runtime_support(
             support.add_read(runtime_root.clone());
             support.add_executable(runtime_root);
         }
+        // Standard prefix layout: an executable under `<prefix>/bin` loads
+        // shared libraries from the sibling `<prefix>/lib` (and helpers from
+        // `<prefix>/libexec`). Without them a relocatable runtime such as a
+        // conda/miniforge `node` aborts with a missing `@rpath` dylib before
+        // it can run. Read-only, library lanes only; no home-directory grant.
+        let canonical_path = std::path::Path::new(canonical.as_str());
+        if canonical_path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            == Some("bin")
+        {
+            if let Some(prefix) = canonical_path.parent().and_then(|dir| dir.parent()) {
+                for lane in ["lib", "libexec"] {
+                    let path = prefix.join(lane);
+                    if path.is_dir() {
+                        let path = path.to_string_lossy().to_string();
+                        support.add_read(path.clone());
+                        support.add_executable(path);
+                    }
+                }
+            }
+        }
         if let Some(runtime_alias) = homebrew_stable_runtime_alias(&canonical) {
             let alias_path = crate::execution::BackendPath::new(runtime_alias.clone());
             if backend.metadata(&alias_path).await.is_ok() {

@@ -295,6 +295,19 @@ impl ScheduledGoalRunsTool {
         let mut matches: Vec<&Goal> = goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
 
         if matches.is_empty() {
+            // The overview shows objectives, not ids. Accept a distinctive
+            // phrase from the objective text as an explicit handle so the
+            // model can address the goal it just listed. This is handle
+            // syntax for one argument, not request classification.
+            let needle = trimmed.to_lowercase();
+            if needle.chars().count() >= 8 {
+                matches = goals
+                    .iter()
+                    .filter(|g| g.description.to_lowercase().contains(&needle))
+                    .collect();
+            }
+        }
+        if matches.is_empty() {
             anyhow::bail!("Scheduled goal not found: {}", trimmed);
         }
         if matches.len() == 1 {
@@ -1110,7 +1123,8 @@ fn scheduled_goal_runs_schema() -> Value {
                     "enum": ["overview", "run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions", "bind_workspace"]
                 },
                 "goal_id": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "id/prefix/objective phrase"
                 },
                 "workspace_path": {
                     "type": "string"
@@ -1440,6 +1454,47 @@ mod tests {
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));
+    }
+
+    #[tokio::test]
+    async fn goal_id_accepts_a_distinctive_objective_phrase() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous(
+            "Each day, independently manage the synthetic blog at https://blog.example.test/",
+            "user-session",
+            None,
+            None,
+        );
+        state.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("0 6 * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+        assert_eq!(
+            tool.resolve_goal_id("manage the synthetic blog")
+                .await
+                .unwrap(),
+            goal.id
+        );
+        assert_eq!(tool.resolve_goal_id(&goal.id[..8]).await.unwrap(), goal.id);
+        assert!(tool.resolve_goal_id("blog").await.is_err());
+        assert!(tool
+            .resolve_goal_id("no such objective anywhere")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
