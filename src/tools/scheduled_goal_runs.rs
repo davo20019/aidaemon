@@ -371,6 +371,20 @@ impl ScheduledGoalRunsTool {
                 "last_run_at": last_run_at,
                 "latest_run": latest_run,
             });
+            // The failure budget and recovery disposition are part of the
+            // objective's current state, not a diagnostic detail: a paused
+            // schedule with an escalated budget explains a missing next run.
+            if let Some(recovery) = self.state.get_scheduled_recovery_state(&goal.id).await? {
+                record["recovery"] = json!({
+                    "disposition": recovery.disposition.as_str(),
+                    "consecutive_failures": recovery.consecutive_failures,
+                    "failure_budget": recovery.failure_budget,
+                    "latest_failure_kind": recovery
+                        .latest_failure_kind
+                        .map(crate::traits::ScheduledFailureKind::as_str),
+                    "recovery_run_linked": recovery.last_recovery_run_id.is_some(),
+                });
+            }
             if include_diagnostics {
                 record["goal_id"] = Value::String(goal.id);
                 record["schedule_ids"] = Value::Array(

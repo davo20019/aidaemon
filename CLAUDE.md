@@ -252,6 +252,25 @@ wording layer when possible: construct the typed state/contract directly,
 exercise at least one differently phrased continuation, and retain negative
 coverage for a genuinely separate request or an explicit user constraint.
 
+### Task-Kernel Freeze: Evidence Beats Contract
+
+The completion contract (`RunAggregate` obligations, cardinalities, evidence
+scopes, dispatch-stop rules, response contracts) is an LLM-proposed description
+of the work, produced by a small model several times per turn. It is a planning
+hint and a fail-closed safety boundary, not the arbiter of whether work
+happened. Observed receipts are the ground truth: a run whose terminal receipts
+all succeeded or were credited closes as `succeeded` with
+`proof_basis=evidence` even when the contract could not credit it
+(`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
+
+Do not add new obligation classes, cardinality features, stop-trigger kinds,
+or response-projection rules to make a single live test pass. If a live
+failure shows the contract disagreeing with receipts, fix it by making the
+receipts more typed (adapter/verifier assertions) or by widening what evidence
+closes, never by making the kernel stricter. Measure autonomy changes as
+N-of-M pass rates over repeated runs, not single-shot rounds; a stochastic
+producer makes one pass or one fail meaningless.
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the

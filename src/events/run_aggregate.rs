@@ -132,6 +132,11 @@ pub(crate) enum TaskKernelAdmission {
 pub(crate) enum RunTerminalDecision {
     /// Every accepted obligation has durable proof.
     Succeeded,
+    /// The compiled contract is exhausted without crediting the work, but
+    /// every terminal operation receipt succeeded or was credited. Evidence of
+    /// completed work beats a contract that could not describe it; this is a
+    /// success whose proof basis is the receipt set rather than the contract.
+    SucceededByEvidence,
     /// At least one exact bounded invocation is exhausted without proof.
     Failed,
     /// Work remains and the aggregate still permits progress or recovery.
@@ -708,17 +713,18 @@ impl RunAggregate {
         if response.disposition == AssistantResponseDisposition::BackgroundHandoff {
             return;
         }
-        // Any terminal assistant artifact is prepared output. Whether it
-        // satisfies an exact response obligation is decided separately below.
+        // Any terminal assistant artifact is prepared output. The response
+        // contract is a presentation hint owned by the semantic producer; it
+        // never gates delivery proof. Delivery closes on any non-empty terminal
+        // artifact once the execution work is proved, so a model-authored
+        // answer grounded in receipts is never displaced by a byte-exact
+        // projection requirement.
         self.prepared_response_id = response.message_id.clone();
-        let Some(expected) = self
-            .response_contract
-            .as_ref()
-            .map(|contract| contract.success_text())
-        else {
-            return;
-        };
-        if response.content.as_deref() != Some(expected) || !self.work_is_fulfilled() {
+        let non_empty = response
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty());
+        if !non_empty || !self.work_is_fulfilled() {
             return;
         }
         let proof_id = response
@@ -886,6 +892,45 @@ impl RunAggregate {
             .flatten()
     }
 
+    /// Whether the durable receipt set alone proves completed work: at least
+    /// one operation reached a terminal receipt, no proposal is still dangling
+    /// without one, and every terminal receipt either succeeded outright or
+    /// was credited to an obligation (an expected negative result or denial).
+    ///
+    /// This deliberately ignores whether the compiled obligations were
+    /// credited. A contract is an LLM-proposed description of the work; when
+    /// it cannot describe work that demonstrably completed, the receipts win.
+    /// Integrity invariants and explicit cardinality limits are not contract
+    /// descriptions and still fail closed.
+    pub(crate) fn evidence_closed(&self) -> bool {
+        if !self.contract_present
+            || !self.invariant_violations.is_empty()
+            || self.cardinality_violations > 0
+            || self.operations.is_empty()
+        {
+            return false;
+        }
+        let credited = self
+            .obligations
+            .values()
+            .flat_map(|obligation| obligation.satisfying_receipt_ids.iter())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        self.operations.values().all(|operation| {
+            if operation.result_id.is_none() {
+                return false;
+            }
+            let proof_id = match operation.operation_lineage.as_ref() {
+                Some(super::ToolOperationLineage::DurableReplay {
+                    source_operation_id,
+                    ..
+                }) => source_operation_id.as_str(),
+                _ => operation.operation_id.as_str(),
+            };
+            operation.outcome == Some(ToolOutcomeStatus::Succeeded) || credited.contains(proof_id)
+        })
+    }
+
     pub(crate) fn terminal_decision(&self) -> RunTerminalDecision {
         if !self.contract_present || self.obligations.is_empty() {
             return RunTerminalDecision::Unspecified;
@@ -896,6 +941,9 @@ impl RunAggregate {
         if self.is_fulfilled() {
             return RunTerminalDecision::Succeeded;
         }
+        // Evidence overrides only an otherwise-failed contract. A still
+        // achievable contract stays pending so the loop can finish the work.
+        let evidence_closed = self.evidence_closed();
         let exhausted = self.obligations.values().any(|obligation| {
             if !matches!(
                 obligation.state,
@@ -934,7 +982,9 @@ impl RunAggregate {
                     >= limit
             })
         });
-        if exhausted || self.cardinality_violations > 0 {
+        if exhausted && evidence_closed {
+            RunTerminalDecision::SucceededByEvidence
+        } else if exhausted || self.cardinality_violations > 0 {
             RunTerminalDecision::Failed
         } else {
             RunTerminalDecision::Pending
@@ -1156,7 +1206,9 @@ impl RunAggregate {
             return TaskKernelPhase::ResponsePrepared;
         }
         match self.terminal_decision() {
-            RunTerminalDecision::Succeeded => TaskKernelPhase::WorkSucceeded,
+            RunTerminalDecision::Succeeded | RunTerminalDecision::SucceededByEvidence => {
+                TaskKernelPhase::WorkSucceeded
+            }
             RunTerminalDecision::Failed => TaskKernelPhase::Failed,
             RunTerminalDecision::Pending => TaskKernelPhase::WorkPending,
             RunTerminalDecision::Unspecified if self.started => TaskKernelPhase::Running,
@@ -1802,7 +1854,24 @@ mod tests {
             obligation.class == RunObligationClass::Observe
                 && obligation.state == RunObligationState::Unverifiable
         }));
-        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
+        // The unverifiable proposition can never be credited, but the read
+        // demonstrably completed. A malformed contract loses to the receipt
+        // instead of reporting completed work as failed.
+        assert!(!aggregate.work_is_fulfilled());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::SucceededByEvidence
+        );
+
+        // Without any completed operation the unverifiable contract still
+        // fails closed: absence of work is not evidence.
+        let mut idle = vec![contract(Vec::new())];
+        idle[0].data["contract"]["requires_observation"] = json!(true);
+        idle[0].id = 1;
+        assert_eq!(
+            RunAggregate::replay("task-1", &idle).terminal_decision(),
+            RunTerminalDecision::Failed
+        );
     }
 
     #[test]
@@ -1839,17 +1908,18 @@ mod tests {
             RunTerminalDecision::Pending
         );
 
-        events.push(assistant_response("wrong", "generic summary"));
+        // An empty terminal artifact is not a delivery.
+        events.push(assistant_response("empty", "   "));
         events.last_mut().unwrap().id = 4;
         assert_eq!(
             RunAggregate::replay("task-1", &events).terminal_decision(),
             RunTerminalDecision::Pending
         );
 
-        events.push(assistant_response(
-            "exact",
-            "phase=synthetic; outcome=complete",
-        ));
+        // The response contract is a presentation hint, not a proof gate. A
+        // model-authored answer grounded in the proved work closes delivery
+        // without byte-exact agreement with the planner's proposed text.
+        events.push(assistant_response("grounded", "generic summary"));
         events.last_mut().unwrap().id = 5;
         let delivered = RunAggregate::replay("task-1", &events);
         assert_eq!(delivered.satisfied_count(), 2);
@@ -1978,6 +2048,133 @@ mod tests {
         let aggregate = RunAggregate::replay("task-1", &events);
         assert!(!aggregate.work_is_fulfilled());
         assert!(aggregate.projected_success_response().is_none());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    #[test]
+    fn completed_operations_close_an_exhausted_contract_by_evidence() {
+        // The producer compiled a wrong contract: it expects a negative exit
+        // from `terminal`, but the single bounded invocation succeeded. The
+        // work happened; the contract cannot credit it. Evidence must beat the
+        // contract here instead of reporting the completed work as failed.
+        let mut events = vec![
+            contract(vec![requirement("terminal", 1)]),
+            call("run", "terminal"),
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.satisfied_count(), 0);
+        assert!(aggregate.evidence_closed());
+        assert!(!aggregate.work_is_fulfilled());
+        assert_eq!(aggregate.projected_success_response(), None);
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::SucceededByEvidence
+        );
+        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::WorkSucceeded);
+    }
+
+    #[test]
+    fn evidence_closure_requires_every_terminal_receipt_to_be_credited_or_successful() {
+        // A pre-dispatch denial that no obligation expected is not evidence of
+        // completed work, even when a sibling operation succeeded.
+        let mut events = vec![
+            contract(vec![requirement("terminal", 1)]),
+            call("run", "terminal"),
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+            call("write", "write_file"),
+            result(
+                "write",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                -1,
+                ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(!aggregate.evidence_closed());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
+
+        // A proposal that never produced a terminal receipt is not closed work.
+        let mut dangling = vec![
+            contract(vec![requirement("terminal", 1)]),
+            call("run", "terminal"),
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+            call("second", "terminal"),
+        ];
+        for (index, event) in dangling.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        assert!(!RunAggregate::replay("task-1", &dangling).evidence_closed());
+
+        // Zero operations are never evidence; a contract with no work stays
+        // pending rather than succeeding by absence.
+        let mut empty = vec![contract(vec![requirement("terminal", 1)])];
+        empty[0].id = 1;
+        let aggregate = RunAggregate::replay("task-1", &empty);
+        assert!(!aggregate.evidence_closed());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    #[test]
+    fn evidence_closure_does_not_override_a_pending_contract() {
+        // One of two required invocations happened. The contract is still
+        // achievable, so the run stays pending and the loop may continue.
+        let mut events = vec![
+            contract(vec![
+                requirement("terminal", 0),
+                requirement("read_file", 0),
+            ]),
+            call("run", "terminal"),
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Observation,
+                    ..ToolCallSemantics::default()
+                },
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.evidence_closed());
         assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
     }
 

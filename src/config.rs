@@ -3549,6 +3549,9 @@ fn default_uncertainty_threshold() -> f32 {
 fn default_trust_tier() -> String {
     "auto".to_string()
 }
+fn default_pre_execution_supervision() -> bool {
+    false
+}
 fn default_write_consistency_max_abs_global_delta() -> u64 {
     3
 }
@@ -3800,6 +3803,16 @@ pub struct PolicyConfig {
     /// (supervision gates become telemetry-only). Default: "auto".
     #[serde(default = "default_trust_tier")]
     pub trust_tier: String,
+    /// Opt-in auxiliary supervision calls inside the tool loop for Guided-tier
+    /// models: the pre-execution plan, the pre-execution critique, and the
+    /// per-step re-planner. Each is an extra model call that can bounce the
+    /// proposed tool call into another full loop iteration. Live autonomy
+    /// traces showed these calls cost more failed finalizations (checklist
+    /// tools displacing the required operation, validation budgets consumed by
+    /// re-plans) than they prevented, so they are off by default. Anti-
+    /// fabrication guards, approval gates, and hard caps are unaffected.
+    #[serde(default = "default_pre_execution_supervision")]
+    pub pre_execution_supervision: bool,
     #[serde(default)]
     pub write_consistency: WriteConsistencyConfig,
     /// Models that ignore a forced `tool_choice=required` (return text with
@@ -3831,6 +3844,7 @@ impl Default for PolicyConfig {
             autotune_enforce: default_autotune_enforce(),
             uncertainty_clarify_threshold: default_uncertainty_threshold(),
             trust_tier: default_trust_tier(),
+            pre_execution_supervision: default_pre_execution_supervision(),
             write_consistency: WriteConsistencyConfig::default(),
             required_tool_choice_ignored_models: default_required_tool_choice_ignored_models(),
         }

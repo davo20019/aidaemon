@@ -689,27 +689,12 @@ impl Agent {
         disposition: crate::events::AssistantResponseDisposition,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            let mut normalized_msg = normalize_message_resources(msg);
-            if normalized_msg.tool_calls_json.is_none() {
-                if let Some(task_id) = emitter.task_id() {
-                    if let Ok(aggregate) = self
-                        .event_store
-                        .task_run_aggregate(&normalized_msg.session_id, task_id)
-                        .await
-                    {
-                        if let Some(projected) = aggregate.projected_success_response() {
-                            if normalized_msg.content.as_deref() != Some(projected) {
-                                tracing::info!(
-                                    task_id,
-                                    response_id = %normalized_msg.id,
-                                    "Projected typed successful response artifact"
-                                );
-                                normalized_msg.content = Some(projected.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+            // The persisted assistant artifact is whatever the completion
+            // phase decided to deliver. Response-contract projection is a
+            // completion-phase decision with its own decision point; this
+            // persistence boundary must never silently rewrite a reply that
+            // already passed the completion gates.
+            let normalized_msg = normalize_message_resources(msg);
             let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
             let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
                 serde_json::from_str::<Vec<ToolCall>>(raw)

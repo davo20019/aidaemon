@@ -1126,6 +1126,20 @@ pub struct TaskEndData {
     pub harness_eval: Option<HarnessEvalSnapshot>,
 }
 
+/// What a successful task end is grounded in.
+///
+/// `Contract` means every compiled obligation was credited by the durable
+/// reducer. `Evidence` means the compiled contract could not credit the work
+/// but every terminal operation receipt succeeded or was credited, so the
+/// receipt set is the proof. Telemetry keeps the distinction; downstream
+/// consumers treat both as a success because the requested work happened.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskProofBasis {
+    Contract,
+    Evidence,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskCompletionProofData {
     pub schema_version: u16,
@@ -1137,6 +1151,10 @@ pub struct TaskCompletionProofData {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipt_refs: Vec<CompletionProofReference>,
     pub closed_at: String,
+    /// Present only on successful ends produced after the evidence rule
+    /// shipped; legacy rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_basis: Option<TaskProofBasis>,
 }
 
 impl TaskEndData {

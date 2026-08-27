@@ -2465,9 +2465,14 @@ impl EventStore {
             .task_run_aggregate(session_id, &task_id)
             .await
             .unwrap_or_else(|_| RunAggregate::new(&task_id));
-        let outcome = match (status, aggregate.terminal_decision()) {
+        let terminal_decision = aggregate.terminal_decision();
+        let outcome = match (status, terminal_decision) {
             (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
-            (_, super::RunTerminalDecision::Succeeded) => crate::events::TaskOutcome::Succeeded,
+            (
+                _,
+                super::RunTerminalDecision::Succeeded
+                | super::RunTerminalDecision::SucceededByEvidence,
+            ) => crate::events::TaskOutcome::Succeeded,
             (_, super::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
                 crate::events::TaskOutcome::Succeeded
@@ -2497,6 +2502,15 @@ impl EventStore {
             response_message_ids: self.task_response_message_ids(&task_id).await?,
             receipt_refs: self.task_completion_proof_references(&task_id).await?,
             closed_at: Utc::now().to_rfc3339(),
+            proof_basis: match terminal_decision {
+                super::RunTerminalDecision::Succeeded => {
+                    Some(crate::events::TaskProofBasis::Contract)
+                }
+                super::RunTerminalDecision::SucceededByEvidence => {
+                    Some(crate::events::TaskProofBasis::Evidence)
+                }
+                _ => None,
+            },
         };
         let event = Event::new(
             session_id,
@@ -2659,6 +2673,7 @@ impl EventStore {
                 response_message_ids: self.task_response_message_ids(&task_id).await?,
                 receipt_refs: self.task_completion_proof_references(&task_id).await?,
                 closed_at: Utc::now().to_rfc3339(),
+                proof_basis: None,
             };
 
             let event = Event::new(

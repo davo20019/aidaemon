@@ -531,6 +531,24 @@ pub async fn setup_test_agent_root(provider: MockProvider) -> anyhow::Result<Tes
     setup_test_agent_internal(provider, vec![], None, false, true, false, None).await
 }
 
+/// Root-mode test agent with an explicit policy configuration.
+#[allow(dead_code)]
+pub async fn setup_test_agent_root_with_policy(
+    provider: MockProvider,
+    policy_config: crate::config::PolicyConfig,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(
+        provider,
+        vec![],
+        None,
+        false,
+        true,
+        false,
+        Some(policy_config),
+    )
+    .await
+}
+
 /// Build a root-mode test agent with extra tools and an optional per-LLM timeout.
 #[allow(dead_code)]
 pub async fn setup_test_agent_root_with_extra_tools_and_llm_timeout(
@@ -690,7 +708,7 @@ async fn setup_test_agent_internal(
             progressive_facts: false,
             ..Default::default()
         },
-        policy_config: policy_config.unwrap_or_default(),
+        policy_config: policy_config.unwrap_or_else(test_policy_config),
         path_aliases: crate::config::PathAliasConfig::default(),
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
@@ -738,7 +756,7 @@ pub async fn setup_test_agent_with_models(
         provider,
         primary_model,
         smart_model,
-        crate::config::PolicyConfig::default(),
+        crate::testing::test_policy_config(),
     )
     .await
 }
@@ -909,7 +927,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
             progressive_facts: false,
             ..Default::default()
         },
-        policy_config: crate::config::PolicyConfig::default(),
+        policy_config: crate::testing::test_policy_config(),
         path_aliases: crate::config::PathAliasConfig::default(),
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
@@ -1170,7 +1188,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
             progressive_facts: false,
             ..Default::default()
         },
-        policy_config: crate::config::PolicyConfig::default(),
+        policy_config: crate::testing::test_policy_config(),
         path_aliases: crate::config::PathAliasConfig::default(),
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
@@ -1217,4 +1235,16 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         _skills_dir: skills_dir,
         _approval_task: approval_task,
     })
+}
+
+/// Policy defaults for the in-process harness. The production default keeps
+/// the Guided-tier in-loop supervision calls (pre-execution plan, critique,
+/// re-planner) off; the harness turns them on so the tests that script those
+/// auxiliary calls keep exercising them. Tests that need the production
+/// default construct `PolicyConfig::default()` explicitly.
+pub fn test_policy_config() -> crate::config::PolicyConfig {
+    crate::config::PolicyConfig {
+        pre_execution_supervision: true,
+        ..crate::config::PolicyConfig::default()
+    }
 }

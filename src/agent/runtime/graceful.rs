@@ -1105,11 +1105,14 @@ impl Agent {
             .task_run_aggregate(emitter.session_id(), task_id)
             .await
             .unwrap_or_else(|_| crate::events::RunAggregate::new(task_id));
-        let effective_outcome = match (status, run_aggregate.terminal_decision()) {
+        let terminal_decision = run_aggregate.terminal_decision();
+        let effective_outcome = match (status, terminal_decision) {
             (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
-            (_, crate::events::RunTerminalDecision::Succeeded) => {
-                crate::events::TaskOutcome::Succeeded
-            }
+            (
+                _,
+                crate::events::RunTerminalDecision::Succeeded
+                | crate::events::RunTerminalDecision::SucceededByEvidence,
+            ) => crate::events::TaskOutcome::Succeeded,
             (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
             (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
             (_, crate::events::RunTerminalDecision::Pending)
@@ -1178,6 +1181,24 @@ impl Agent {
         if let Some(ref snapshot) = harness_eval_snapshot {
             super::policy_metrics::record_harness_eval_task(snapshot);
         }
+        let proof_basis = match terminal_decision {
+            crate::events::RunTerminalDecision::Succeeded => {
+                Some(crate::events::TaskProofBasis::Contract)
+            }
+            crate::events::RunTerminalDecision::SucceededByEvidence => {
+                Some(crate::events::TaskProofBasis::Evidence)
+            }
+            _ => None,
+        };
+        if proof_basis == Some(crate::events::TaskProofBasis::Evidence) {
+            tracing::info!(
+                task_id,
+                operation_count = run_aggregate.operations.len(),
+                obligations_required = run_aggregate.required_count(),
+                obligations_satisfied = run_aggregate.satisfied_count(),
+                "Task closed by receipt evidence; compiled contract could not credit completed work"
+            );
+        }
         self.emit_decision_point(
             emitter,
             task_id,
@@ -1191,7 +1212,9 @@ impl Agent {
                 "status": status,
                 "run_aggregate_schema_version": run_aggregate.schema_version,
                 "run_contract_present": run_aggregate.contract_present,
-                "run_terminal_decision": format!("{:?}", run_aggregate.terminal_decision()).to_lowercase(),
+                "run_terminal_decision": format!("{:?}", terminal_decision).to_lowercase(),
+                "proof_basis": proof_basis,
+                "evidence_closed": run_aggregate.evidence_closed(),
                 "task_kernel_phase": format!("{:?}", run_aggregate.lifecycle_phase()).to_lowercase(),
                 "obligations_required": run_aggregate.required_count(),
                 "obligations_satisfied": run_aggregate.satisfied_count(),
@@ -1219,6 +1242,7 @@ impl Agent {
                 .await
                 .unwrap_or_default(),
             closed_at: chrono::Utc::now().to_rfc3339(),
+            proof_basis,
         };
         let _ = emitter
             .emit(

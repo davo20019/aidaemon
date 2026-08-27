@@ -1281,7 +1281,8 @@ pub(super) async fn run_tool_prelude_phase(
     // learning_ctx guard stays false and the plan is re-requested every
     // iteration — adding 2 extra LLM calls (plan + critique) per loop.
     let plan_already_generated = execution_state.current_plan_version.is_some();
-    if agent.mandate_execution.is_none()
+    if agent.policy_config.pre_execution_supervision
+        && agent.mandate_execution.is_none()
         && agent.depth == 0
         && !plan_already_generated
         && !has_completed_side_effecting_tool_call(learning_ctx, available_capabilities)

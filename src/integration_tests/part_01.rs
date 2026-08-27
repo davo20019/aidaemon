@@ -729,6 +729,62 @@ async fn test_multi_step_tool_execution() {
 }
 
 #[tokio::test]
+async fn test_production_policy_skips_pre_execution_plan_gate_by_default() {
+    // Production default: no auxiliary plan/critique call is spent on a
+    // risky tool call. The model's own tool call is the plan.
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"favorite_editor","value":"helix"}"#,
+            );
+            resp.content =
+                Some("I'll store that preference and confirm it back to you.".to_string());
+            resp
+        },
+        MockProvider::text_response("I'll remember that your favorite editor is helix."),
+    ]);
+
+    let harness = crate::testing::setup_test_agent_root_with_policy(
+        provider,
+        crate::config::PolicyConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!crate::config::PolicyConfig::default().pre_execution_supervision);
+    let response = harness
+        .agent
+        .handle_message(
+            "plan_gate_default_off",
+            "remember that my favorite editor is helix",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        response,
+        "I'll remember that your favorite editor is helix."
+    );
+    assert_eq!(
+        call_log.len(),
+        2,
+        "expected tool call + final only; no planning gate call"
+    );
+    assert!(
+        call_log.iter().all(|call| !matches!(
+            call.options.response_mode,
+            crate::traits::ResponseMode::JsonSchema { .. }
+        )),
+        "no schema-constrained auxiliary call may run when supervision is off"
+    );
+}
+
+#[tokio::test]
 async fn test_risky_tool_calls_trigger_structured_pre_execution_plan() {
     let provider = MockProvider::with_responses(vec![
         {
@@ -2571,7 +2627,7 @@ async fn test_evidence_gate_blocks_blind_edit_on_guided_tier() {
 
     let harness = setup_test_agent_with_policy(
         provider,
-        crate::config::PolicyConfig::default(),
+        crate::testing::test_policy_config(),
         vec![Arc::new(EditFileTool)],
     )
     .await

@@ -454,6 +454,22 @@ impl MandateObjectiveControl {
             ObjectiveMetricDirection::AtMost => value_micros <= self.target_micros,
         }
     }
+
+    /// When the next measurement is due: one cadence after the latest
+    /// recorded observation, or one cadence after the baseline when nothing
+    /// has been measured yet. A value in the past means a measurement is due
+    /// now. Returns `None` only when neither timestamp parses.
+    pub fn next_measurement_at(&self, latest_observed_at: Option<&str>) -> Option<String> {
+        let anchor = latest_observed_at
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .or_else(|| chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).ok())?;
+        let cadence = chrono::Duration::seconds(self.measurement_cadence_secs.max(0));
+        Some(
+            (anchor + cadence)
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
 }
 
 /// One immutable observation in the objective's control loop. Receipt IDs
@@ -2884,6 +2900,22 @@ mod tests {
         assert!(control.validate().is_ok());
         assert!(!control.target_reached(7_999_999));
         assert!(control.target_reached(8_000_000));
+        // Next measurement anchors on the latest observation, else the
+        // baseline; either way it is exactly one cadence later.
+        assert_eq!(
+            control.next_measurement_at(None).as_deref(),
+            Some("2026-08-15T01:00:00Z")
+        );
+        assert_eq!(
+            control
+                .next_measurement_at(Some("2026-08-16T12:30:00+02:00"))
+                .as_deref(),
+            Some("2026-08-16T11:30:00Z")
+        );
+        assert_eq!(
+            control.next_measurement_at(Some("not a time")).as_deref(),
+            Some("2026-08-15T01:00:00Z")
+        );
 
         control.target_micros = control.baseline_micros;
         assert!(control.validate().is_err());

@@ -2053,9 +2053,12 @@ impl Agent {
 
             // Guided-only re-planner. Autonomous models self-direct and never
             // spend an auxiliary model call evaluating their own step progress.
-            if self.mandate_execution.is_none()
+            // The re-planner is also an operator opt-in: it is one more
+            // auxiliary model call per step whose verdict can stall the loop.
+            if self.policy_config.pre_execution_supervision
+                && self.mandate_execution.is_none()
                 && self.trust_tier_for_model(&model)
-                == crate::agent::trust_tier::ModelTrustTier::Guided
+                    == crate::agent::trust_tier::ModelTrustTier::Guided
             {
                 let tool_calls_this_round = learning_ctx
                     .tool_calls
@@ -2235,7 +2238,11 @@ impl Agent {
             };
         let receipt_closed = latest_result.as_ref().is_some_and(|result| {
             if run_aggregate.contract_present {
-                run_aggregate.terminal_decision() == crate::events::RunTerminalDecision::Succeeded
+                matches!(
+                    run_aggregate.terminal_decision(),
+                    crate::events::RunTerminalDecision::Succeeded
+                        | crate::events::RunTerminalDecision::SucceededByEvidence
+                )
             } else {
                 result.receipt.as_ref().is_some_and(|receipt| {
                     // A proof-bound receipt is the strongest closeout. When

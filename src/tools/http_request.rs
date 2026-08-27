@@ -2151,14 +2151,40 @@ impl Tool for HttpRequestTool {
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
+        let authenticated_request = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("auth_profile")
+                    .and_then(Value::as_str)
+                    .map(|profile| !profile.trim().is_empty())
+            })
+            .unwrap_or(false);
         let authorization_preflight = if exec_ctx.mandate_execution {
             Some(self.mandate_authorization_preflight(arguments).await)
+        } else if authenticated_request {
+            // Scheduled goals and interactive turns are not fenced mandates,
+            // so the preflight is record-only here: it never blocks I/O, but
+            // it refreshes an expiring credential and leaves a typed record
+            // that lets a scheduled run's failure be classified as
+            // authorization-blocked instead of an unproven outcome. Account
+            // pinning is a mandate-only rule, so those reason codes are not
+            // recorded outside a mandate.
+            let record = self.mandate_authorization_preflight(arguments).await;
+            let account_pinning_only = matches!(
+                record.reason_code.as_deref(),
+                Some(
+                    "credential_account_missing"
+                        | "credential_profile_account_missing"
+                        | "credential_account_mismatch"
+                )
+            );
+            (!account_pinning_only).then_some(record)
         } else {
             None
         };
         if let Some(preflight) = authorization_preflight
             .as_ref()
-            .filter(|preflight| !preflight.permits_io())
+            .filter(|preflight| exec_ctx.mandate_execution && !preflight.permits_io())
         {
             let reason_code = preflight.reason_code.as_deref().unwrap_or("unverifiable");
             let recovery = match reason_code {

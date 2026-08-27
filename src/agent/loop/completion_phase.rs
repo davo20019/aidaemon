@@ -1811,8 +1811,11 @@ pub(super) async fn run_completion_phase(
                         .filter(|result| result.receipt.is_some())
                     {
                         let fulfilled = if aggregate.contract_present {
-                            aggregate.terminal_decision()
-                                == crate::events::RunTerminalDecision::Succeeded
+                            matches!(
+                                aggregate.terminal_decision(),
+                                crate::events::RunTerminalDecision::Succeeded
+                                    | crate::events::RunTerminalDecision::SucceededByEvidence
+                            )
                         } else {
                             result.completed_observation()
                                 && result.receipt.as_ref().is_some_and(|receipt| {
@@ -1821,9 +1824,34 @@ pub(super) async fn run_completion_phase(
                                             && !receipt.semantics.mutates_state())
                                 })
                         };
-                        reply = super::completion_checks::build_receipt_closeout_reply(
-                            result, fulfilled,
-                        );
+                        // When the durable receipts prove the work and the
+                        // model authored a non-empty answer, that answer is the
+                        // grounded narration. Only replace it with a daemon
+                        // closeout when there is no model text to keep or the
+                        // receipts do not prove the work.
+                        let keep_model_reply = fulfilled
+                            && reply == model_authored_reply
+                            && !model_authored_reply.trim().is_empty();
+                        if keep_model_reply {
+                            agent
+                                .emit_decision_point(
+                                    emitter,
+                                    task_id,
+                                    iteration,
+                                    DecisionType::PostExecutionValidation,
+                                    "Kept model-authored reply over receipt closeout".to_string(),
+                                    json!({
+                                        "condition": "receipt_grounded_model_reply_kept",
+                                        "run_terminal_decision": format!("{:?}", aggregate.terminal_decision()).to_lowercase(),
+                                        "reply_chars": reply.chars().count(),
+                                    }),
+                                )
+                                .await;
+                        } else {
+                            reply = super::completion_checks::build_receipt_closeout_reply(
+                                result, fulfilled,
+                            );
+                        }
                         terminal_cause = (!fulfilled).then_some(TaskTerminalCause::HardFailure);
                     } else {
                         let (request, cause) = build_terminal_verification_request(
@@ -2422,6 +2450,17 @@ pub(super) async fn run_completion_phase(
             .await
         {
             if let Some(projected) = aggregate.projected_success_response() {
+                // The planner's exact response text is a presentation hint.
+                // A non-empty reply the model authored after real tool work
+                // is receipt-grounded narration and is never displaced by
+                // the projection; the projection fills in only when the
+                // reply is daemon-built, empty, or the run had no operations.
+                let receipt_grounded_model_reply = reply == model_authored_reply
+                    && !reply.trim().is_empty()
+                    && aggregate
+                        .operations
+                        .values()
+                        .any(|operation| operation.result_id.is_some());
                 if reply != projected {
                     agent
                         .emit_decision_point(
@@ -2429,9 +2468,18 @@ pub(super) async fn run_completion_phase(
                             task_id,
                             iteration,
                             DecisionType::PostExecutionValidation,
-                            "Projected typed successful response artifact".to_string(),
+                            if receipt_grounded_model_reply {
+                                "Kept receipt-grounded model reply over projected response artifact"
+                            } else {
+                                "Projected typed successful response artifact"
+                            }
+                            .to_string(),
                             json!({
-                                "condition": "response_contract_projected",
+                                "condition": if receipt_grounded_model_reply {
+                                    "response_contract_projection_skipped"
+                                } else {
+                                    "response_contract_projected"
+                                },
                                 "run_aggregate_schema_version": aggregate.schema_version,
                                 "execution_obligations_satisfied": true,
                                 "candidate_chars": reply.chars().count(),
@@ -2439,7 +2487,9 @@ pub(super) async fn run_completion_phase(
                             }),
                         )
                         .await;
-                    reply = projected.to_string();
+                    if !receipt_grounded_model_reply {
+                        reply = projected.to_string();
+                    }
                 }
             }
         }

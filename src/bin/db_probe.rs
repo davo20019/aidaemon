@@ -401,6 +401,7 @@ mod tests {
             response_message_ids: vec![task.response_id.clone()],
             receipt_refs: vec![receipt],
             closed_at: "2026-08-15T00:00:01Z".to_string(),
+            proof_basis: None,
         };
 
         assert!(completion_claim_has_closed_proof(

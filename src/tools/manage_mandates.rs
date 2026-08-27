@@ -917,6 +917,33 @@ impl ManageMandatesTool {
                 } else {
                     Vec::new()
                 };
+                let recent_objective_measurements = self
+                    .state
+                    .list_mandate_objective_measurements(&mandate.id, 10)
+                    .await?;
+                let latest_measurement_observed_at = recent_objective_measurements
+                    .iter()
+                    .map(|measurement| measurement.observed_at.as_str())
+                    .max();
+                let next_measurement_at = mandate.objective_control.as_ref().and_then(|control| {
+                    control.next_measurement_at(latest_measurement_observed_at)
+                });
+                let objective_progress = mandate.objective_control.as_ref().map(|control| {
+                    let current = recent_objective_measurements
+                        .iter()
+                        .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
+                        .map(|measurement| measurement.value_micros);
+                    json!({
+                        "metric_name": control.metric_name,
+                        "unit": control.unit,
+                        "baseline_micros": control.baseline_micros,
+                        "current_micros": current,
+                        "target_micros": control.target_micros,
+                        "direction": control.direction,
+                        "target_reached": current.map(|value| control.target_reached(value)),
+                        "measurement_count": recent_objective_measurements.len(),
+                    })
+                });
                 json!({
                     "schema_version": 2,
                     "section": "summary",
@@ -961,10 +988,9 @@ impl ManageMandatesTool {
                     },
                     "strategy": strategy,
                     "objective_control": mandate.objective_control,
-                    "recent_objective_measurements": self
-                        .state
-                        .list_mandate_objective_measurements(&mandate.id, 10)
-                        .await?,
+                    "objective_progress": objective_progress,
+                    "next_measurement_at": next_measurement_at,
+                    "recent_objective_measurements": recent_objective_measurements,
                     "latest_goal_run": latest_goal_run,
                     "latest_decision": latest_decision,
                     "latest_intention": latest_intention,

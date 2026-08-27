@@ -10,13 +10,15 @@ use serde_json::{json, Value};
 
 use crate::traits::{
     Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,
-    MandateMutationQuotaState, MandateStrategyRevisionKind, StateStore,
+    MandateMutationQuotaState, MandateObjectiveControl, MandateObjectiveMeasurement,
+    MandateStrategyRevisionKind, StateStore,
 };
 
 const MAX_DECISIONS: i64 = 5;
 const MAX_INTENTIONS: i64 = 16;
 const MAX_ACTIONS: usize = 16;
 const MAX_LEARNING_NOTES: i64 = 12;
+const MAX_MEASUREMENTS: i64 = 12;
 const MAX_HISTORY_BYTES: usize = 24 * 1024;
 
 #[derive(Debug)]
@@ -26,10 +28,16 @@ struct HistoryRecord {
 }
 
 /// Build the sole historical context available to a mandate worker.
+///
+/// `objective_control` is the mandate's current owner-confirmed control
+/// policy. It is passed in (never re-read here) so the derived
+/// `next_measurement_due` cannot disagree with the immutable policy the
+/// worker was fenced with.
 pub(crate) async fn build_mandate_history_block(
     state: &dyn StateStore,
     mandate_id: &str,
     as_of: &str,
+    objective_control: Option<&MandateObjectiveControl>,
 ) -> anyhow::Result<String> {
     let decisions = state
         .list_mandate_decisions(mandate_id, MAX_DECISIONS)
@@ -107,13 +115,73 @@ pub(crate) async fn build_mandate_history_block(
         "mandate quota history crossed its authority boundary"
     );
 
+    let measurements = if objective_control.is_some() {
+        let measurements = state
+            .list_mandate_objective_measurements(mandate_id, MAX_MEASUREMENTS)
+            .await?;
+        anyhow::ensure!(
+            measurements
+                .iter()
+                .all(|measurement| measurement.mandate_id == mandate_id),
+            "mandate measurement history crossed its authority boundary"
+        );
+        measurements
+    } else {
+        Vec::new()
+    };
+    let objective = objective_control.map(|control| {
+        let latest_observed_at = measurements
+            .iter()
+            .map(|measurement| measurement.observed_at.as_str())
+            .max();
+        objective_value(control, &measurements, latest_observed_at)
+    });
+
     render_bounded_history(
         decision_records,
         action_records,
         learning_notes,
         strategy_nodes,
         quota,
+        objective,
     )
+}
+
+/// Objective control-loop state: baseline, current, target, trend, and when
+/// the next measurement is due. Measurement records carry only the typed
+/// value, confidence, receipt IDs, and time; run and row identifiers stay
+/// private.
+fn objective_value(
+    control: &MandateObjectiveControl,
+    measurements: &[MandateObjectiveMeasurement],
+    latest_observed_at: Option<&str>,
+) -> Value {
+    let mut ordered = measurements.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.observed_at.cmp(&right.observed_at));
+    let current = ordered.last().map(|measurement| measurement.value_micros);
+    json!({
+        "metric_name": control.metric_name,
+        "unit": control.unit,
+        "baseline_micros": control.baseline_micros,
+        "baseline_observed_at": control.baseline_observed_at,
+        "current_micros": current,
+        "target_micros": control.target_micros,
+        "direction": control.direction,
+        "target_reached": current.map(|value| control.target_reached(value)),
+        "minimum_effect_micros": control.minimum_effect_micros,
+        "max_stagnant_measurements": control.max_stagnant_measurements,
+        "measurement_source": control.measurement_source,
+        "measurement_cadence_secs": control.measurement_cadence_secs,
+        "next_measurement_due": control.next_measurement_at(latest_observed_at),
+        "objective_measurements": ordered.iter().map(|measurement| json!({
+            "mandate_version": measurement.mandate_version,
+            "value_micros": measurement.value_micros,
+            "confidence_bps": measurement.confidence_bps,
+            "evidence_receipt_ids": measurement.evidence_receipt_ids,
+            "attributed_intention_ids": measurement.attributed_intention_ids,
+            "observed_at": measurement.observed_at,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn decision_value(decision: &MandateDecisionCycle, intentions: &[Intention]) -> Value {
@@ -160,6 +228,7 @@ fn render_bounded_history(
     mut learning_notes: Vec<MandateLearningNote>,
     mut strategy_nodes: Vec<crate::traits::MandateStrategyRevision>,
     quota: Option<MandateMutationQuotaState>,
+    objective: Option<Value>,
 ) -> anyhow::Result<String> {
     learning_notes.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     strategy_nodes.sort_by(|left, right| left.strategy_key.cmp(&right.strategy_key));
@@ -168,6 +237,7 @@ fn render_bounded_history(
             "provenance": "autonomous_mandate_history_untrusted",
             "authority": false,
             "scope": "same_mandate_typed_history_only",
+            "objective_control_state": objective,
             "decision_outcomes": decisions.iter().map(|record| &record.value).collect::<Vec<_>>(),
             "mutation_receipts": actions.iter().map(|record| &record.value).collect::<Vec<_>>(),
             "advisory_learning_notes": learning_notes.iter().map(|note| json!({
@@ -259,6 +329,58 @@ mod tests {
     }
 
     #[test]
+    fn objective_state_reports_trend_and_next_measurement_without_private_ids() {
+        let control = MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic followers".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 100_000_000,
+            target_micros: 150_000_000,
+            direction: crate::traits::ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-analytics".to_string(),
+            measurement_cadence_secs: 86_400,
+            experiment_cohort: "synthetic-cohort-a".to_string(),
+            experiment_window_secs: 604_800,
+            minimum_effect_micros: 1_000_000,
+            max_stagnant_measurements: 3,
+            run_failure_budget: 3,
+            baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
+        };
+        let mut older = MandateObjectiveMeasurement::new(
+            "mandate-1",
+            2,
+            "run-private-id",
+            120_000_000,
+            9_000,
+            vec!["receipt-1".to_string()],
+            "2026-08-02T00:00:00Z",
+        );
+        older.id = "measurement-private-id".to_string();
+        let newer = MandateObjectiveMeasurement::new(
+            "mandate-1",
+            2,
+            "run-private-id",
+            130_000_000,
+            9_500,
+            vec!["receipt-2".to_string()],
+            "2026-08-03T00:00:00Z",
+        );
+        let value = objective_value(&control, &[newer, older], Some("2026-08-03T00:00:00Z"));
+        assert_eq!(value["current_micros"], 130_000_000);
+        assert_eq!(value["target_reached"], false);
+        assert_eq!(value["next_measurement_due"], "2026-08-04T00:00:00Z");
+        let rendered = value.to_string();
+        let series = &rendered[rendered.find("objective_measurements").unwrap()..];
+        assert!(series.find("120000000").unwrap() < series.find("130000000").unwrap());
+        assert!(!rendered.contains("run-private-id"));
+        assert!(!rendered.contains("measurement-private-id"));
+
+        let unmeasured = objective_value(&control, &[], None);
+        assert!(unmeasured["current_micros"].is_null());
+        assert_eq!(unmeasured["next_measurement_due"], "2026-08-02T00:00:00Z");
+    }
+
+    #[test]
     fn action_history_excludes_internal_ids_and_content_fields() {
         let rendered = action_value(&attempt()).to_string();
         assert!(rendered.contains("auth_profile:twitter-prod"));
@@ -315,9 +437,15 @@ mod tests {
             timestamp: "2026-08-01T01:00:00Z".to_string(),
             value: json!({"status": "succeeded"}),
         };
-        let rendered =
-            render_bounded_history(vec![huge, recent], Vec::new(), Vec::new(), Vec::new(), None)
-                .unwrap();
+        let rendered = render_bounded_history(
+            vec![huge, recent],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(rendered.len() <= MAX_HISTORY_BYTES);
         assert!(!rendered.contains("typed_identifier"));
         assert!(rendered.contains("succeeded"));

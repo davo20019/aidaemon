@@ -660,8 +660,12 @@ async fn finalize_durable_receipt_after_provider_failure(
     let receipt_closed = if aggregate.contract_present {
         // A response-presentation obligation is closed by the assistant event
         // emitted below. Do not spend a provider call merely to narrate work
-        // that the aggregate has already proved.
+        // that the aggregate has already proved. Work proved by the receipt
+        // set alone (an exhausted contract that could not credit it) closes
+        // the same way: the receipts are the proof.
         aggregate.work_is_fulfilled()
+            || aggregate.terminal_decision()
+                == crate::events::RunTerminalDecision::SucceededByEvidence
     } else {
         result.receipt.as_ref().is_some_and(|receipt| {
             !receipt.completion_obligation_ids.is_empty()
