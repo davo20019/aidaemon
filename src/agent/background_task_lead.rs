@@ -2738,7 +2738,11 @@ pub fn spawn_background_task_lead(
                 let recovery_task = crate::traits::Task {
                     id: recovery_task_id.clone(),
                     goal_id: goal_id.clone(),
-                    description: format!("Directly recover and finish: {user_text}"),
+                    description: if user_text.starts_with("Directly recover and finish: ") {
+                        user_text.to_string()
+                    } else {
+                        format!("Directly recover and finish: {user_text}")
+                    },
                     status: "pending".to_string(),
                     priority: "high".to_string(),
                     task_order: final_run_tasks
