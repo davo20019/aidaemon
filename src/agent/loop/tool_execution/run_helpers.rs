@@ -608,12 +608,23 @@ pub(super) fn access_manifest_scope_violation(
     let outside = |candidate: &ToolTargetHint, grants: &[ToolTargetHint]| {
         grants.is_empty() || !covered_by(candidate, grants)
     };
+    // A write-only manifest still implies the ability to observe what the
+    // task may write: a request authorized only to create `/tmp/x/result.txt`
+    // must be able to read it back. When the producer declared explicit read
+    // grants, those remain the exact read authority and a write directory
+    // stays a write-only dropbox. Writes are always checked against write
+    // grants only.
+    let read_authorities = if read_grants.is_empty() {
+        write_grants.clone()
+    } else {
+        read_grants.clone()
+    };
     let invalid_reads = call
         .read_targets
         .iter()
         .filter(|candidate| {
             let resolved = resolve_candidate(candidate);
-            (outside(candidate, &read_grants) && outside(&resolved, &read_grants))
+            (outside(candidate, &read_authorities) && outside(&resolved, &read_authorities))
                 && outside(candidate, &call.adapter_read_targets)
         })
         .map(|target| target.value.clone())
@@ -2782,6 +2793,72 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             &call("Cargo.toml"),
             None,
             &scopes,
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn directory_write_grant_authorizes_reading_the_same_directory() {
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: Vec::new(),
+            write_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/synthetic-disposable",
+            )
+            .expect("write")],
+            adapter_read_targets: Vec::new(),
+        };
+        let read_back = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::Path,
+                "/tmp/synthetic-disposable/result.txt",
+            )
+            .expect("read")],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        assert!(
+            access_manifest_scope_violation("terminal", &read_back, Some(&task), &[], None)
+                .is_none()
+        );
+        // With explicit read grants the write directory stays write-only.
+        let explicit_reads = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::Path,
+                "/tmp/synthetic-input.txt",
+            )
+            .expect("read")],
+            ..task.clone()
+        };
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &read_back,
+            Some(&explicit_reads),
+            &[],
+            None
+        )
+        .is_some());
+        // The implication is one-way: a read grant never authorizes a write.
+        let read_only_task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: task.write_targets.clone(),
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        let write_attempt = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: Vec::new(),
+            write_targets: read_back.read_targets.clone(),
+            adapter_read_targets: Vec::new(),
+        };
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &write_attempt,
+            Some(&read_only_task),
+            &[],
             None
         )
         .is_some());

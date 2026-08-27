@@ -823,17 +823,13 @@ pub(super) async fn run_llm_phase(
             return Ok(LlmPhaseOutcome::Return(Ok(reply)));
         }
     }
-    // A failed decision built only from pre-dispatch policy denials is a
-    // boundary the model has not yet been allowed to describe. Let it narrate
-    // once; skip the provider only when adapter I/O actually happened or a
-    // terminal reply already exists (a retry loop, not a first narration).
+    // A failed decision is a fact the model has not yet been allowed to
+    // describe. Let it narrate exactly once with the receipts in context; skip
+    // the provider only when a terminal reply already exists, which means
+    // this is a retry loop after narration rather than the first closeout.
     if aggregate_before_provider.as_ref().is_some_and(|aggregate| {
         aggregate.terminal_decision() == crate::events::RunTerminalDecision::Failed
-            && (aggregate.prepared_response_id.is_some()
-                || aggregate
-                    .operations
-                    .values()
-                    .any(|operation| operation.dispatched))
+            && aggregate.prepared_response_id.is_some()
     }) {
         if let Some(reply) = finalize_durable_receipt_after_provider_failure(
             services.agent,
