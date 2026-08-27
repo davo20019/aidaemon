@@ -675,6 +675,31 @@ pub(super) async fn run_completion_phase(
         // bounce model-authored pastes — a daemon-built reply is deliberate,
         // already policy-gated at its build site.
         let model_authored_reply = reply.clone();
+        // A typed pre-dispatch policy denial with no completed operation is a
+        // terminal observation of the request's authority boundary. Retrying
+        // cannot cross it, so the model's non-empty reply describing that
+        // boundary is the closeout; finalization must not demand another
+        // evidence-seeking or verification pass.
+        let terminal_policy_denial = execution_state.policy_denied_results > 0
+            && execution_state.completed_operation_results == 0
+            && !model_authored_reply.trim().is_empty();
+        if terminal_policy_denial {
+            agent
+                .emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::PostExecutionValidation,
+                    "Policy denial accepted as terminal observation; model reply narrates it"
+                        .to_string(),
+                    json!({
+                        "condition": "policy_denial_terminal_observation",
+                        "policy_denied_results": execution_state.policy_denied_results,
+                        "reply_chars": model_authored_reply.chars().count(),
+                    }),
+                )
+                .await;
+        }
 
         let context_floor_result = emitter.session_context_boundary().await;
         let context_floor_event_id = context_floor_result.as_ref().ok().copied().flatten();
@@ -963,7 +988,8 @@ pub(super) async fn run_completion_phase(
                 "Force-text fast-path: bypassing all tool-requiring guards"
             );
             // Fall through to the normal completion path (sanitize + return)
-        } else if should_enforce_no_tool_text_when_tools_required(
+        } else if !terminal_policy_denial
+            && should_enforce_no_tool_text_when_tools_required(
             &reply,
             execution_tool_recovery,
             execution_state.completed_operation_results
@@ -1678,6 +1704,7 @@ pub(super) async fn run_completion_phase(
             // If the standard observation contract is also still pending, handle it
             if completion_progress.verification_pending
                 && turn_context.completion_contract.requires_observation
+                && !terminal_policy_denial
             {
                 let has_concrete_progress = super::stopping_progress::has_any_concrete_execution(
                     turn_context,
@@ -1829,8 +1856,12 @@ pub(super) async fn run_completion_phase(
                         // grounded narration. Only replace it with a daemon
                         // closeout when there is no model text to keep or the
                         // receipts do not prove the work.
-                        let keep_model_reply = fulfilled
-                            && reply == model_authored_reply
+                        // The reply already passed the anti-fabrication gates
+                        // above; whether the run is credited or not, the
+                        // model's narration of the durable receipt is the
+                        // user-facing text. Outcome and terminal cause still
+                        // follow the receipt, never the prose.
+                        let keep_model_reply = reply == model_authored_reply
                             && !model_authored_reply.trim().is_empty();
                         if keep_model_reply {
                             agent

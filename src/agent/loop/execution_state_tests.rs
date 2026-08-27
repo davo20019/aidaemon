@@ -1638,3 +1638,30 @@ fn nonrecoverable_failure_remains_open_until_a_later_satisfying_result() {
     state.completed_operation_results = 1;
     assert!(!state.has_unresolved_nonrecoverable_failure());
 }
+
+#[test]
+fn pre_dispatch_policy_denial_is_counted_as_a_terminal_observation_not_a_result() {
+    let mut state = test_execution_state();
+    state.record_operation_result(
+        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+        false,
+        true,
+    );
+    assert_eq!(state.policy_denied_results, 1);
+    assert_eq!(state.operation_results_observed, 0);
+    assert_eq!(state.completed_operation_results, 0);
+
+    // A rejection without a typed policy denial (e.g. argument validation)
+    // is not an authority observation.
+    state.record_operation_result(
+        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+        false,
+        false,
+    );
+    assert_eq!(state.policy_denied_results, 1);
+
+    // Dispatched results are unaffected by the flag.
+    state.record_operation_result(crate::traits::ToolInvocationStage::Dispatched, true, false);
+    assert_eq!(state.operation_results_observed, 1);
+    assert_eq!(state.completed_operation_results, 1);
+}

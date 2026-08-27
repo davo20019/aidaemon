@@ -348,6 +348,12 @@ pub struct ExecutionState {
     /// Operation results whose typed domain outcome satisfied the request.
     #[serde(default)]
     pub completed_operation_results: usize,
+    /// Proposals rejected before dispatch by a typed policy/capability
+    /// boundary (scope lock, controller contract, protected host data). These
+    /// are terminal observations of the request's authority, not retryable
+    /// adapter failures.
+    #[serde(default)]
+    pub policy_denied_results: usize,
     /// Distinct outcome-bearing tool results that have earned additional
     /// execution runway. Persisting the keys prevents a resumed task from
     /// receiving fresh capacity for replaying evidence it already observed.
@@ -445,6 +451,7 @@ impl ExecutionState {
             last_mutation_operation_base: None,
             operation_results_observed: 0,
             completed_operation_results: 0,
+            policy_denied_results: 0,
             progress_credit_keys: BTreeSet::new(),
             progress_extensions_used: 0,
             observation_extensions_used: 0,
@@ -775,8 +782,17 @@ impl ExecutionState {
         &mut self,
         stage: crate::traits::ToolInvocationStage,
         outcome_satisfied: bool,
+        policy_denied: bool,
     ) {
         if !stage.reached_dispatch() {
+            // A typed pre-dispatch policy denial is not adapter I/O, but it is
+            // a terminal observation of the request's authority boundary:
+            // retrying the same operation cannot cross it. Count it separately
+            // so finalization can let the model narrate the denial instead of
+            // demanding another evidence-seeking pass.
+            if policy_denied {
+                self.policy_denied_results = self.policy_denied_results.saturating_add(1);
+            }
             return;
         }
         self.operation_results_observed = self.operation_results_observed.saturating_add(1);

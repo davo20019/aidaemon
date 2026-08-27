@@ -256,6 +256,27 @@ pub(super) fn narrowest_authorized_path_scopes(scopes: &[String]) -> Vec<String>
 /// A project path used only for read/cwd confinement must never become a write
 /// grant by fallback. The promotion is allowed only for a contract that
 /// explicitly expects mutation and has not installed a hard read-only fence.
+/// Directory read capabilities an observation-only process may inherit: the
+/// compiled task manifest's directory read grants, else the task's authorized
+/// project scopes (channel workspace or current-request scope). Exact-file
+/// read grants are deliberately not promoted to directory authority.
+pub(super) fn fallback_read_authorities(
+    task_access: Option<&crate::traits::ToolCallAccessManifest>,
+    task_scopes: &[String],
+) -> Vec<String> {
+    task_access
+        .map(|access| {
+            access
+                .read_targets
+                .iter()
+                .filter(|target| target.kind == ToolTargetHintKind::ProjectScope)
+                .map(|target| target.value.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|targets| !targets.is_empty())
+        .unwrap_or_else(|| task_scopes.to_vec())
+}
+
 pub(super) fn fallback_write_authorities(
     task_access: Option<&crate::traits::ToolCallAccessManifest>,
     expects_mutation: bool,
@@ -463,7 +484,39 @@ pub(super) fn access_manifest_scope_violation(
     call: &crate::traits::ToolCallAccessManifest,
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
+    execution_cwd: Option<&str>,
 ) -> Option<String> {
+    // Tools resolve relative targets against the execution cwd, so the
+    // capability check must compare the same absolute path a directory grant
+    // covers. A relative `Cargo.toml` inside an authorized workspace is not a
+    // capability escape; `../outside` still resolves outside and is rejected.
+    let resolve_candidate = |candidate: &ToolTargetHint| -> ToolTargetHint {
+        if !matches!(
+            candidate.kind,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+        ) {
+            return candidate.clone();
+        }
+        let path = std::path::Path::new(&candidate.value);
+        if path.is_absolute() {
+            return candidate.clone();
+        }
+        let Some(cwd) = execution_cwd.filter(|cwd| std::path::Path::new(cwd).is_absolute()) else {
+            return candidate.clone();
+        };
+        let mut resolved = std::path::PathBuf::new();
+        for component in std::path::Path::new(cwd).join(path).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                other => resolved.push(other.as_os_str()),
+            }
+        }
+        ToolTargetHint::new(candidate.kind, resolved.to_string_lossy().to_string())
+            .unwrap_or_else(|| candidate.clone())
+    };
     // Filesystem capabilities are monotone: a directory grant may authorize
     // descendants, while an exact-path grant never authorizes its parent or a
     // sibling. Project discovery has a separate near-ancestor convenience
@@ -559,14 +612,19 @@ pub(super) fn access_manifest_scope_violation(
         .read_targets
         .iter()
         .filter(|candidate| {
-            outside(candidate, &read_grants) && outside(candidate, &call.adapter_read_targets)
+            let resolved = resolve_candidate(candidate);
+            (outside(candidate, &read_grants) && outside(&resolved, &read_grants))
+                && outside(candidate, &call.adapter_read_targets)
         })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
     let invalid_writes = call
         .write_targets
         .iter()
-        .filter(|candidate| outside(candidate, &write_grants))
+        .filter(|candidate| {
+            let resolved = resolve_candidate(candidate);
+            outside(candidate, &write_grants) && outside(&resolved, &write_grants)
+        })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
     if invalid_reads.is_empty() && invalid_writes.is_empty() {
@@ -2527,14 +2585,17 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation("cli_agent", &valid, Some(&task), &[]).is_none());
+        assert!(
+            access_manifest_scope_violation("cli_agent", &valid, Some(&task), &[], None).is_none()
+        );
 
         let invalid = crate::traits::ToolCallAccessManifest {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/workspace/project")],
             ..valid
         };
-        let violation = access_manifest_scope_violation("cli_agent", &invalid, Some(&task), &[])
-            .expect("write must be rejected");
+        let violation =
+            access_manifest_scope_violation("cli_agent", &invalid, Some(&task), &[], None)
+                .expect("write must be rejected");
         assert!(violation.contains("/workspace/project"));
     }
 
@@ -2554,7 +2615,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
         };
         assert!(
-            access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_none(),
+            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_none(),
             "adapter-owned runtime reads must be independently grantable"
         );
 
@@ -2563,7 +2624,8 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             ..call
         };
         assert!(
-            access_manifest_scope_violation("terminal", &undeclared, Some(&task), &[]).is_some()
+            access_manifest_scope_violation("terminal", &undeclared, Some(&task), &[], None)
+                .is_some()
         );
     }
 
@@ -2575,7 +2637,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             ..crate::traits::ToolCallAccessManifest::default()
         };
         let call = task.clone();
-        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[])
+        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[], None)
             .expect("host data remains protected independently of task assessment");
         assert!(violation.contains("protected host-data capability violation"));
 
@@ -2584,7 +2646,7 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             ..crate::traits::ToolCallAccessManifest::default()
         };
         assert!(
-            access_manifest_scope_violation("terminal", &adapter_only, None, &[]).is_none(),
+            access_manifest_scope_violation("terminal", &adapter_only, None, &[], None).is_none(),
             "adapter runtime capability is not task data"
         );
     }
@@ -2604,15 +2666,22 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/.keep")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation("write_file", &call, Some(&task), &[]).is_none());
+        assert!(
+            access_manifest_scope_violation("write_file", &call, Some(&task), &[], None).is_none()
+        );
 
         let read_escape = crate::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/secret")],
             ..call
         };
-        assert!(
-            access_manifest_scope_violation("write_file", &read_escape, Some(&task), &[]).is_some()
-        );
+        assert!(access_manifest_scope_violation(
+            "write_file",
+            &read_escape,
+            Some(&task),
+            &[],
+            None
+        )
+        .is_some());
     }
 
     #[test]
@@ -2631,7 +2700,9 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_some());
+        assert!(
+            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_some()
+        );
     }
 
     #[test]
@@ -2648,7 +2719,9 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(access_manifest_scope_violation("terminal", &call, Some(&task), &[]).is_none());
+        assert!(
+            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_none()
+        );
     }
 
     #[test]
@@ -2664,7 +2737,83 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             adapter_read_targets: Vec::new(),
         };
 
-        assert!(access_manifest_scope_violation("synthetic", &call, None, &[]).is_none());
+        assert!(access_manifest_scope_violation("synthetic", &call, None, &[], None).is_none());
+    }
+
+    #[test]
+    fn relative_targets_resolve_against_execution_cwd_before_capability_check() {
+        let workspace = "/tmp/synthetic-workspace";
+        let call = |value: &str| crate::traits::ToolCallAccessManifest {
+            execution_cwd: Some(workspace.to_string()),
+            read_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, value).expect("read")],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        let scopes = vec![workspace.to_string()];
+        // Inside the authorized workspace: `Cargo.toml` and `./src/../Cargo.toml`.
+        assert!(access_manifest_scope_violation(
+            "read_file",
+            &call("Cargo.toml"),
+            None,
+            &scopes,
+            Some(workspace)
+        )
+        .is_none());
+        assert!(access_manifest_scope_violation(
+            "read_file",
+            &call("./src/../Cargo.toml"),
+            None,
+            &scopes,
+            Some(workspace)
+        )
+        .is_none());
+        // Escapes still resolve outside and are rejected.
+        assert!(access_manifest_scope_violation(
+            "read_file",
+            &call("../outside.txt"),
+            None,
+            &scopes,
+            Some(workspace)
+        )
+        .is_some());
+        // Without a cwd a relative target cannot be proven inside any grant.
+        assert!(access_manifest_scope_violation(
+            "read_file",
+            &call("Cargo.toml"),
+            None,
+            &scopes,
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn fallback_read_authorities_promote_only_directory_grants() {
+        let task = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/exact.txt").expect("read"),
+            ],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        let scopes = vec!["/tmp/synthetic-workspace".to_string()];
+        assert_eq!(fallback_read_authorities(Some(&task), &scopes), scopes);
+        let directory = crate::traits::ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::ProjectScope,
+                "/tmp/disposable",
+            )
+            .expect("read")],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        };
+        assert_eq!(
+            fallback_read_authorities(Some(&directory), &scopes),
+            vec!["/tmp/disposable".to_string()]
+        );
+        assert!(fallback_read_authorities(None, &[]).is_empty());
     }
 
     #[test]

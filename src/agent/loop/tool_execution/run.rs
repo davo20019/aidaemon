@@ -1255,6 +1255,53 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             }
         }
+        // Observation-only terminal commands inherit the task's authorized
+        // directory read capabilities when the model declared none. The
+        // native sandbox otherwise grants no data reads at all, so a plain
+        // `git status` or `cat Cargo.toml` inside the authorized workspace
+        // fails with a policy denial. This propagates authority the scope
+        // lock already recognizes; it never widens beyond it and never
+        // touches write authority.
+        if tc.name == "terminal"
+            && !call_semantics.mutates_state()
+            && !terminal_is_required_mutation
+            && access_manifest.read_targets.is_empty()
+        {
+            let authorized_read_roots = fallback_read_authorities(
+                turn_context.filesystem_access.as_ref(),
+                &task_authorized_project_scopes,
+            );
+            if !authorized_read_roots.is_empty() {
+                if let Ok(mut arguments) = serde_json::from_str::<Value>(&effective_arguments) {
+                    if let Some(object) = arguments.as_object_mut() {
+                        let declared_roots = object
+                            .get("read_roots")
+                            .and_then(Value::as_array)
+                            .is_some_and(|values| !values.is_empty());
+                        let declared_paths = object
+                            .get("read_paths")
+                            .and_then(Value::as_array)
+                            .is_some_and(|values| !values.is_empty());
+                        if !declared_roots && !declared_paths {
+                            object.insert("read_roots".to_string(), json!(authorized_read_roots));
+                            effective_arguments = serde_json::to_string(&arguments)?;
+                            if let Some(tool) = registered_tool {
+                                if let Ok(prepared) = tool.prepare_invocation(&effective_arguments)
+                                {
+                                    effective_arguments = prepared.canonical_arguments;
+                                    call_semantics = prepared.semantics;
+                                    access_manifest = prepared.access_manifest;
+                                    let adapter_manifest =
+                                        tool.adapter_owned_access_manifest(&effective_arguments);
+                                    access_manifest.adapter_read_targets =
+                                        adapter_manifest.adapter_read_targets;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (call_semantics.mutates_state() || terminal_is_required_mutation)
             && matches!(tc.name.as_str(), "terminal" | "cli_agent")
             && access_manifest.write_targets.is_empty()
@@ -1486,6 +1533,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             &access_manifest,
             turn_context.filesystem_access.as_ref(),
             &task_authorized_project_scopes,
+            known_project_dir.as_deref(),
         );
         let step_scope_violation =
             target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
@@ -2461,6 +2509,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             execution_state.record_operation_result(
                 result_metadata.invocation_stage,
                 outcome_satisfied || lazy_observation_completed,
+                result_metadata.access_denial.is_some(),
             );
             // Advance linear intent step pointer on successful external mutation
             if domain_outcome_satisfied && planned_step.is_some() {
