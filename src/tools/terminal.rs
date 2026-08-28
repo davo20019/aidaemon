@@ -1712,15 +1712,20 @@ fn extract_absolute_paths(line: &str) -> Vec<String> {
 
 fn confined_opaque_failure_hint(
     exit_code: Option<i32>,
-    stdout: &str,
+    _stdout: &str,
     stderr: &str,
 ) -> Option<String> {
     let code = exit_code.filter(|code| *code != 0)?;
-    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+    // Fire when the failure carries no error text. A wrapper's own banner on
+    // stdout (npm's `> pkg build > vite ...`) is not a diagnostic; when a
+    // child aborts at startup its stderr can be lost, leaving a failure the
+    // agent cannot act on. Empty stderr on a non-zero exit is that case,
+    // regardless of a stdout banner.
+    if !stderr.trim().is_empty() {
         return None;
     }
     Some(format!(
-        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} with no output. A silent non-zero exit is almost never the task itself failing — it is usually the program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
+        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} without a captured error. A non-zero exit with no error text is almost never the task itself failing — it is usually a child program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path, and its error was not captured is almost never the task itself failing — it is usually the program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
     ))
 }
 
@@ -8982,9 +8987,11 @@ mod tests {
         let hint = confined_opaque_failure_hint(Some(255), "", "  \n").expect("hint");
         assert!(hint.contains("$TMPDIR"));
         assert!(hint.contains("verbose") || hint.contains("--debug"));
-        // Any real output suppresses the hint (the agent can see the cause).
+        // Real error text suppresses the hint (the agent can see the cause).
         assert!(confined_opaque_failure_hint(Some(255), "", "Error: boom").is_none());
-        assert!(confined_opaque_failure_hint(Some(1), "some stdout", "").is_none());
+        // A wrapper banner on stdout with NO stderr still gets the hint: the
+        // child's real error was lost (npm prints its banner, vite aborts).
+        assert!(confined_opaque_failure_hint(Some(1), "> pkg build > vite build", "").is_some());
         // Success never gets a hint.
         assert!(confined_opaque_failure_hint(Some(0), "", "").is_none());
         assert!(confined_opaque_failure_hint(None, "", "").is_none());
