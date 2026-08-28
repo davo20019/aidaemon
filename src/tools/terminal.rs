@@ -1710,6 +1710,35 @@ fn extract_absolute_paths(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// Human-readable name for the common POSIX termination signals a build tool
+/// is realistically killed by. Anything else is shown by number.
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        2 => "SIGINT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => "unknown signal",
+    }
+}
+
+/// Point the agent at the likely cause for a given kill signal, so a
+/// signal-terminated command becomes an actionable next step rather than an
+/// opaque failure.
+fn signal_remedy_hint(signal: i32) -> &'static str {
+    match signal {
+        9 => "SIGKILL is usually the OS running the process out of memory, or a hard resource limit — retry with a lower concurrency/memory footprint (e.g. a single-threaded build) or split the work.",
+        6 => "SIGABRT is the program aborting itself on an unrecoverable startup error — re-run the underlying binary directly (not through a wrapper like npm/npx) or add its verbose flag to see the assertion or missing-dependency message it printed before aborting.",
+        11 => "SIGSEGV is a crash inside the program — often a corrupt install or an ABI mismatch; reinstalling the tool's dependencies is the usual fix.",
+        13 => "SIGPIPE means the process wrote to a closed pipe — usually harmless downstream of a command that exited early; check the first command in the pipeline.",
+        _ => "re-run the underlying program directly with a verbose flag to see what it reported before it was terminated.",
+    }
+}
+
 fn confined_opaque_failure_hint(
     exit_code: Option<i32>,
     _stdout: &str,
@@ -1725,7 +1754,7 @@ fn confined_opaque_failure_hint(
         return None;
     }
     Some(format!(
-        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} without a captured error. A non-zero exit with no error text is almost never the task itself failing — it is usually a child program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path, and its error was not captured is almost never the task itself failing — it is usually the program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
+        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} without a captured error. A non-zero exit with no error text is almost never the task itself failing — it is usually a child program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path, and its error was written to the OS security log rather than to stderr. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
     ))
 }
 
@@ -4780,13 +4809,26 @@ impl TerminalTool {
         let stdout_buf_c = stdout_buf.clone();
         let stderr_buf_c = stderr_buf.clone();
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
+        // Side channel for the child's terminating signal (if any). `code()`
+        // is None for a signal-killed child, so the exit-code path alone cannot
+        // distinguish "the program exited N" from "the kernel/sandbox killed it
+        // with signal M" — the two demand different remedies. Capturing the
+        // signal here lets a confined opaque failure be diagnosed truthfully.
+        let signal_slot = Arc::new(Mutex::new(None::<i32>));
+        let signal_slot_c = signal_slot.clone();
 
         // Spawn a task that drains both streams and then waits for the child to exit.
         let reader_handle = tokio::spawn(async move {
             let stdout_drain = drain_to_buffer(stdout_pipe, stdout_buf_c);
             let stderr_drain = drain_to_buffer(stderr_pipe, stderr_buf_c);
             tokio::join!(stdout_drain, stderr_drain);
-            let exit_code = child.wait().await.ok().and_then(|status| status.code());
+            let status = child.wait().await.ok();
+            let exit_code = status.as_ref().and_then(|status| status.code());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                *signal_slot_c.lock().await = status.as_ref().and_then(|status| status.signal());
+            }
             let _ = completion_tx.send(exit_code);
             exit_code
         });
@@ -4810,8 +4852,26 @@ impl TerminalTool {
                 let mut stdout = String::from_utf8_lossy(&stdout_data).into_owned();
                 let mut stderr = String::from_utf8_lossy(&stderr_data).into_owned();
                 let mut exit_code = exit_code;
+                let terminating_signal = *signal_slot.lock().await;
                 drop(stdout_data);
                 drop(stderr_data);
+                // Ground-truth capture: when a confined command fails, record
+                // the child's raw termination in the daemon log. A failure that
+                // reaches the user as a bare "exit 255" with empty stderr is
+                // otherwise undiagnosable from outside the daemon; this line ties
+                // the exit code, the terminating signal, and the captured stream
+                // sizes together so the true cause is visible in the daemon's own
+                // log even when the child wrote nothing the agent can see.
+                if exit_code != Some(0) {
+                    warn!(
+                        exit_code = ?exit_code,
+                        terminating_signal = ?terminating_signal,
+                        stdout_bytes = stdout.len(),
+                        stderr_bytes = stderr.len(),
+                        command = %command.chars().take(200).collect::<String>(),
+                        "Confined command finished with a non-zero result"
+                    );
+                }
                 let mut self_heal_note = String::new();
                 // Self-heal: if a confined command failed because the sandbox
                 // denied a config file the tool needs at startup, grant that
@@ -4870,6 +4930,21 @@ impl TerminalTool {
                 }
                 if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
                     output.push_str(&hint);
+                }
+                // A signal-killed child reports no exit code, so the hint above
+                // (which keys on a non-zero code) stays silent for what is often
+                // the most confusing failure. Name the signal explicitly: it is
+                // the difference between "the program chose to exit" and "the OS
+                // killed it" (a sandbox denial the kernel enforces by SIGKILL, an
+                // out-of-memory kill, or a crash), which point at different fixes.
+                if exit_code != Some(0) {
+                    if let Some(signal) = terminating_signal {
+                        output.push_str(&format!(
+                            "\n[SYSTEM diagnostic] The command was terminated by signal {signal} ({}), not by exiting on its own. This is the OS killing the process, not the task failing: {}",
+                            signal_name(signal),
+                            signal_remedy_hint(signal),
+                        ));
+                    }
                 }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
@@ -8979,6 +9054,18 @@ mod tests {
             vec!["/opt/homebrew/lib/libnode.dylib".to_string()]
         );
         assert!(extract_absolute_paths("no paths here").is_empty());
+    }
+
+    #[test]
+    fn signal_diagnostics_name_the_kill_and_point_at_a_remedy() {
+        assert_eq!(signal_name(9), "SIGKILL");
+        assert_eq!(signal_name(6), "SIGABRT");
+        assert_eq!(signal_name(123), "unknown signal");
+        // SIGKILL should point at the OOM/resource remedy, not a generic one.
+        assert!(signal_remedy_hint(9).to_lowercase().contains("memory"));
+        // SIGABRT should push toward running the binary directly / verbose.
+        let abrt = signal_remedy_hint(6).to_lowercase();
+        assert!(abrt.contains("directly") || abrt.contains("verbose"));
     }
 
     #[test]
