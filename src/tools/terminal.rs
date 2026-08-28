@@ -2828,6 +2828,20 @@ async fn add_manifest_runtime_environment(
     };
     let future_scratch_root =
         preferred_root.is_some() && script_via_stdin && !preferred_is_directory;
+    // A declared write root that does not exist yet is the command's future
+    // OUTPUT directory (e.g. a heredoc target). Create it before execution so
+    // the confined process can write into it. This is independent of which
+    // directory backs TMPDIR/caches below.
+    if future_scratch_root {
+        if let Some(path) = preferred_root.as_ref() {
+            if let Err(error) = backend
+                .create_dir_all(&crate::execution::BackendPath::new(path.clone()))
+                .await
+            {
+                tracing::warn!(path = %path, %error, "Failed to prepare declared future write root");
+            }
+        }
+    }
     let mut scratch_root = (preferred_is_directory || future_scratch_root)
         .then(|| preferred_root.clone())
         .flatten();
@@ -2878,10 +2892,12 @@ async fn add_manifest_runtime_environment(
         return;
     };
 
-    if future_scratch_root {
+    // The scratch root is either the managed dir (already created) or an
+    // existing declared directory; a declared future root was created above.
+    if !std::path::Path::new(&scratch_root).exists() {
         let path = crate::execution::BackendPath::new(scratch_root.clone());
         if let Err(error) = backend.create_dir_all(&path).await {
-            tracing::warn!(path = %scratch_root, %error, "Failed to prepare declared runtime scratch root");
+            tracing::warn!(path = %scratch_root, %error, "Failed to prepare runtime scratch root");
             return;
         }
     }
@@ -7683,14 +7699,10 @@ mod tests {
             root.is_dir(),
             "runtime scratch root must exist before shell parsing"
         );
-        let canonical_root = backend
-            .canonicalize(&crate::execution::BackendPath::new(
-                root.to_string_lossy().to_string(),
-            ))
-            .await
-            .expect("canonical scratch root")
-            .to_string();
-        assert_eq!(request.env.get("TMPDIR"), Some(&canonical_root));
+        // TMPDIR points at the private managed scratch, not the command's
+        // declared output root (which the command may empty).
+        let tmpdir = request.env.get("TMPDIR").cloned().expect("TMPDIR");
+        assert!(tmpdir.contains("aidaemon-scratch"));
         let output = backend
             .execute(request, Duration::from_secs(30))
             .await
