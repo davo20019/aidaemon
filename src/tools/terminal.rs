@@ -2868,9 +2868,12 @@ async fn add_manifest_runtime_environment(
         }
         selected
     };
-    // A declared write lane wins (least privilege), else the daemon-managed
-    // per-invocation scratch guarantees every command has a writable cache.
-    let scratch_root = scratch_root.or_else(|| managed_scratch.map(str::to_string));
+    // The private per-invocation managed scratch is preferred for TMPDIR and
+    // caches. A declared write lane is the command's OUTPUT directory (e.g.
+    // `dist`), which build tools routinely empty — putting TMPDIR or the npm
+    // config there means a `vite build`/`rm -rf dist` wipes them mid-run. Only
+    // fall back to a declared directory when no managed scratch exists.
+    let scratch_root = managed_scratch.map(str::to_string).or(scratch_root);
     let Some(scratch_root) = scratch_root else {
         return;
     };
@@ -7830,6 +7833,14 @@ mod tests {
             .expect("managed scratch TMPDIR");
         assert_eq!(request.env.get("NPM_CONFIG_CACHE"), Some(&scratch));
         assert_eq!(request.env.get("XDG_CACHE_HOME"), Some(&scratch));
+        // npm must be pointed at a neutral user config in the scratch (never
+        // the owner's ~/.npmrc), and that file must exist before exec.
+        let userconfig = request
+            .env
+            .get("NPM_CONFIG_USERCONFIG")
+            .expect("neutral npm userconfig");
+        assert!(userconfig.starts_with(&scratch));
+        assert!(std::path::Path::new(userconfig).is_file());
         assert!(
             std::path::Path::new(&scratch).is_dir(),
             "scratch must exist before exec: {scratch}"
@@ -7959,22 +7970,16 @@ mod tests {
             .await
             .expect("canonical project root")
             .to_string();
-        assert_eq!(
-            request.env.get("TMPDIR").map(String::as_str),
-            Some(canonical_cwd.as_str())
-        );
-        assert_eq!(
-            request.env.get("TMP").map(String::as_str),
-            Some(canonical_cwd.as_str())
-        );
-        assert_eq!(
-            request.env.get("TEMP").map(String::as_str),
-            Some(canonical_cwd.as_str())
-        );
-        assert_eq!(
-            request.env.get("XDG_CACHE_HOME").map(String::as_str),
-            Some(canonical_cwd.as_str())
-        );
+        // TMPDIR/cache point at the private managed scratch (preferred over
+        // the declared output dir, which build tools may empty). The scratch
+        // must be a real writable directory and NOT the project cwd.
+        let tmpdir = request.env.get("TMPDIR").cloned().expect("TMPDIR");
+        assert!(tmpdir.contains("aidaemon-scratch"));
+        assert!(std::path::Path::new(&tmpdir).is_dir());
+        assert_ne!(tmpdir, canonical_cwd);
+        assert_eq!(request.env.get("TMP"), Some(&tmpdir));
+        assert_eq!(request.env.get("TEMP"), Some(&tmpdir));
+        assert_eq!(request.env.get("XDG_CACHE_HOME"), Some(&tmpdir));
         let git_config = backend.home_hint().join(".gitconfig").to_string();
         if backend
             .metadata(&crate::execution::BackendPath::new(git_config.clone()))
