@@ -260,9 +260,10 @@ impl RunCommandTool {
 
         // Reject shell operators
         if fs_utils::contains_shell_operator(trimmed) {
-            anyhow::bail!(
-                "Shell operators (;, |, &&, ||, $(), etc.) are not allowed. Use 'terminal' for complex commands."
-            );
+            return Ok(routing_rejection(
+                "Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands.".to_string(),
+                "terminal",
+            ));
         }
 
         // Validate against safe prefixes
@@ -271,20 +272,24 @@ impl RunCommandTool {
             if trimmed.chars().count() > 140 {
                 preview.push('…');
             }
-            anyhow::bail!(
-                "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command.\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
-                preview,
-                SAFE_NPM_PREFIX_HINT
-            );
+            return Ok(routing_rejection(
+                format!(
+                    "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command.\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
+                    preview, SAFE_NPM_PREFIX_HINT
+                ),
+                "terminal",
+            ));
         }
 
         let daemon_hits = detect_daemonization_primitives(trimmed);
         if !daemon_hits.is_empty() {
-            anyhow::bail!(
-                "Daemonization primitives are blocked in run_command ({}). \
-                 Use terminal and explicit owner approval if detached/background execution is truly needed.",
-                daemon_hits.join(", ")
-            );
+            return Ok(routing_rejection(
+                format!(
+                    "Daemonization primitives are blocked in run_command ({}). Use terminal and explicit owner approval if detached/background execution is truly needed.",
+                    daemon_hits.join(", ")
+                ),
+                "terminal",
+            ));
         }
 
         let backend = active_execution_backend();
@@ -415,6 +420,26 @@ impl RunCommandTool {
                 ..ToolCallMetadata::default()
             },
         })
+    }
+}
+
+/// A pre-dispatch rejection that routes the model to a different tool. It
+/// never ran a command, so it is typed as a blocked, rejected-before-dispatch
+/// observation — not a failed mutation. Typing it this way keeps a routing
+/// hint out of the external-mutation ledger, so a later successful `terminal`
+/// retry is the run's outcome instead of this superseded rejection.
+fn routing_rejection(message: String, route_to: &str) -> ToolCallOutcome {
+    ToolCallOutcome {
+        output: message,
+        metadata: ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Blocked),
+            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            contract_rejected: true,
+            effective_tool_name: Some(route_to.to_string()),
+            semantics: ToolCallSemantics::observation(),
+            access_enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
+            ..ToolCallMetadata::default()
+        },
     }
 }
 
@@ -705,43 +730,34 @@ mod tests {
     #[tokio::test]
     async fn test_run_unsafe_command_rejected() {
         let args = json!({"command": "rm -rf /"}).to_string();
-        let result = RunCommandTool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not in the safe command list"));
+        // A routing rejection is a typed outcome, not an error, so a later
+        // successful terminal retry can supersede it.
+        let out = RunCommandTool.call(&args).await.unwrap();
+        assert!(out.contains("not in the safe command list"));
     }
 
     #[tokio::test]
     async fn test_run_npm_install_rejected_with_actionable_guidance() {
         let args = json!({"command": "npm install tailwindcss"}).to_string();
-        let result = RunCommandTool.call(&args).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not in the safe command list for run_command"));
-        assert!(err.contains("Allowed npm prefixes"));
-        assert!(err.contains("npm test"));
-        assert!(err.contains("use `terminal`"));
+        let out = RunCommandTool.call(&args).await.unwrap();
+        assert!(out.contains("not in the safe command list for run_command"));
+        assert!(out.contains("Allowed npm prefixes"));
+        assert!(out.contains("npm test"));
+        assert!(out.contains("use `terminal`"));
     }
 
     #[tokio::test]
     async fn test_run_shell_operator_rejected() {
         let args = json!({"command": "ls | grep foo"}).to_string();
-        let result = RunCommandTool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Shell operators"));
+        let out = RunCommandTool.call(&args).await.unwrap();
+        assert!(out.contains("Shell operators"));
     }
 
     #[tokio::test]
     async fn test_run_daemonization_rejected() {
         let args = json!({"command": "cargo test &"}).to_string();
-        let result = RunCommandTool.call(&args).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Daemonization primitives"));
+        let out = RunCommandTool.call(&args).await.unwrap();
+        assert!(out.contains("Daemonization primitives"));
     }
 
     #[tokio::test]
@@ -755,6 +771,27 @@ mod tests {
 
         let result = RunCommandTool.call(&args).await.unwrap();
         assert!(result.contains("exit: 0"));
+    }
+
+    #[tokio::test]
+    async fn npm_run_routing_rejection_is_a_non_mutating_pre_dispatch_block() {
+        // `npm run build` is not on the safe list; the rejection routes to
+        // terminal and must not read as a dispatched, failed mutation — else
+        // a later successful terminal retry is overwritten by this rejection.
+        let outcome = RunCommandTool
+            .run_outcome(&serde_json::json!({ "command": "npm run build" }).to_string())
+            .await
+            .expect("routing rejection is a typed outcome, not an error");
+        let meta = &outcome.metadata;
+        assert_eq!(meta.outcome_status, Some(ToolOutcomeStatus::Blocked));
+        assert_eq!(
+            meta.invocation_stage,
+            crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+        );
+        assert!(meta.contract_rejected);
+        assert_eq!(meta.effective_tool_name.as_deref(), Some("terminal"));
+        assert!(!meta.semantics.mutates_state());
+        assert!(outcome.output.contains("Use 'terminal'"));
     }
 
     #[test]
