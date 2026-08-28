@@ -1968,7 +1968,10 @@ async fn confined_terminal_execution_request_inner(
     if !runtime_support.path_prefixes.is_empty() {
         sandbox_environment.insert(
             "PATH".to_string(),
-            native_sandbox_search_path(&runtime_support.path_prefixes),
+            native_sandbox_search_path(
+                &runtime_support.path_prefixes,
+                &runtime_support.executable_paths,
+            ),
         );
     }
     sandbox_environment.extend(runtime_support.environment);
@@ -2088,6 +2091,21 @@ fn seatbelt_ancestor_clause(path: &str) -> Option<String> {
     (path != "/").then(|| format!("(path-ancestors \"{path}\")"))
 }
 
+/// `<ancestor>/node_modules` for every strict ancestor of `cwd`, in npm's
+/// PATH order (nearest first). These are lookup targets only.
+#[cfg(target_os = "macos")]
+fn npm_ancestor_bin_lookup_paths(cwd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = std::path::Path::new(cwd).parent();
+    while let Some(dir) = current {
+        let name = dir.to_string_lossy();
+        let name = name.trim_end_matches('/');
+        out.push(format!("{name}/node_modules"));
+        current = dir.parent();
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 fn macos_manifest_sandbox_policy(
     traversal_cwd: Option<&str>,
@@ -2109,6 +2127,23 @@ fn macos_manifest_sandbox_policy(
         policy.push_str(&format!(
             "\n(allow file-read* file-test-existence\n  {clauses})\n"
         ));
+        // npm's run-script prepends `<ancestor>/node_modules/.bin` for every
+        // ancestor of the project to the child PATH and then spawns a bare
+        // `sh`. execvp(3) keeps walking PATH on ENOENT/EACCES but aborts on
+        // any other errno, and seatbelt reports an undeclared path as EPERM —
+        // so every `npx`/`npm run` under $HOME died with `spawn EPERM` before
+        // printing anything. Metadata-only grants on exactly those entries
+        // turn the denial into ENOENT; sibling file contents stay unreadable.
+        let bin_clauses = npm_ancestor_bin_lookup_paths(&path)
+            .into_iter()
+            .map(|dir| format!("(literal \"{dir}\") (subpath \"{dir}/.bin\")"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        if !bin_clauses.is_empty() {
+            policy.push_str(&format!(
+                "\n(allow file-read-metadata file-test-existence\n  {bin_clauses})\n"
+            ));
+        }
     }
     if !read_paths.is_empty() {
         let paths = read_paths
@@ -3036,27 +3071,73 @@ async fn run_confined_once(
     ))
 }
 
-fn native_sandbox_search_path(prefixes: &[String]) -> String {
+fn native_sandbox_search_path(prefixes: &[String], readable_roots: &[String]) -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    native_sandbox_search_path_from(
+        prefixes,
+        readable_roots,
+        dirs::home_dir().as_deref(),
+        &current,
+    )
+}
+
+/// Compose the confined child's PATH. The daemon's own PATH is inherited only
+/// where the sandbox can actually read it: an entry under the owner's home
+/// that no runtime/task grant covers contributes nothing but an EPERM that
+/// aborts execvp(3)-style lookups (see `npm_ancestor_bin_lookup_paths`).
+fn native_sandbox_search_path_from(
+    prefixes: &[String],
+    readable_roots: &[String],
+    home: Option<&std::path::Path>,
+    inherited_path: &str,
+) -> String {
+    // Base system directories the seatbelt policy always grants read /
+    // test-existence on (see macos_terminal_sandbox.sbpl). These are the only
+    // non-manifest directories a confined child may safely resolve executables
+    // from. `/opt/homebrew` and `/usr/local` are deliberately NOT here: the
+    // base policy does not grant them, so a binary living there cannot be
+    // exec'd confined anyway — and keeping them in PATH actively breaks
+    // unrelated lookups (see below).
+    const BASE_SYSTEM_BIN_DIRS: [&str; 5] =
+        ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec"];
+
     let mut paths = prefixes
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<std::path::PathBuf>>();
-    if let Some(current) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&current) {
-            if path.is_absolute() && !paths.contains(&path) {
-                paths.push(path);
-            }
+    let readable = readable_roots
+        .iter()
+        .chain(prefixes.iter())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let is_base_system_dir = |path: &std::path::Path| {
+        BASE_SYSTEM_BIN_DIRS
+            .iter()
+            .any(|dir| path == std::path::Path::new(dir))
+    };
+    let _ = home;
+    for path in std::env::split_paths(inherited_path) {
+        if !path.is_absolute() || paths.contains(&path) {
+            continue;
         }
+        // Bare-name resolution (execvp(3), as libuv/`sh` do) probes each PATH
+        // directory in order. On seatbelt, probing a directory the sandbox does
+        // NOT grant returns EPERM, and that EPERM aborts the entire lookup
+        // before it can reach a grantable binary later in PATH — so a confined
+        // `sh -c` that spawns a bare `sh`/`node`/`cc` fails with `spawn EPERM`
+        // and an opaque exit 255, even though `/bin/sh` is readable. The
+        // confined PATH must therefore contain ONLY directories the policy
+        // grants: a per-invocation read/exec root, or a base system dir.
+        // Everything else (ungranted home dirs AND ungranted non-home dirs like
+        // /opt/homebrew, /opt/*, /System/Cryptexes, plugin caches) is dropped.
+        let granted = readable.iter().any(|root| path.starts_with(root));
+        if !granted && !is_base_system_dir(&path) {
+            continue;
+        }
+        paths.push(path);
     }
-    for path in [
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ] {
-        let path = PathBuf::from(path);
+    for dir in BASE_SYSTEM_BIN_DIRS {
+        let path = PathBuf::from(dir);
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -7610,6 +7691,96 @@ mod tests {
         assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
         assert!(policy.contains("(subpath \"/private/tmp\")"));
         assert!(policy.contains("(literal \"/private/etc/ssl/openssl.cnf\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cwd_policy_makes_npm_ancestor_bin_lookups_fail_with_enoent() {
+        // npm's run-script prepends `<ancestor>/node_modules/.bin` for every
+        // ancestor of the project to the child PATH and spawns bare `sh`.
+        // execvp(3) keeps walking on ENOENT/EACCES but aborts on EPERM, which
+        // is what seatbelt returns for an undeclared path — so an npm child
+        // died with `spawn EPERM` (exit 255, no output). Metadata-only grants
+        // on those exact entries turn the denial into ENOENT.
+        let policy = macos_manifest_sandbox_policy(
+            Some("/Users/alice/projects/site"),
+            &["/Users/alice/projects/site".to_string()],
+            &[],
+            &[],
+            false,
+        )
+        .expect("policy");
+        for ancestor in ["/Users/alice/projects", "/Users/alice", "/Users"] {
+            let clause = format!(
+                "(literal \"{ancestor}/node_modules\") (subpath \"{ancestor}/node_modules/.bin\")"
+            );
+            assert!(policy.contains(&clause), "missing {clause} in {policy}");
+        }
+        assert!(policy.contains("(literal \"/node_modules\") (subpath \"/node_modules/.bin\")"));
+        // Metadata only: never file contents of a sibling tree.
+        let section = policy
+            .split("(allow file-read-metadata file-test-existence")
+            .nth(1)
+            .expect("metadata grant section");
+        assert!(!section
+            .split("\n(")
+            .next()
+            .unwrap_or("")
+            .contains("file-read*"));
+        assert!(!policy.contains("(subpath \"/Users/alice/node_modules\")"));
+    }
+
+    #[test]
+    fn native_sandbox_search_path_keeps_only_granted_and_base_system_dirs() {
+        let home = std::path::Path::new("/Users/alice");
+        let path = native_sandbox_search_path_from(
+            &["/Users/alice/miniforge3/bin".to_string()],
+            &["/Users/alice/miniforge3".to_string()],
+            Some(home),
+            "/Users/alice/.local/bin:/Users/alice/.nvm/versions/node/v24/bin:/opt/homebrew/bin:/opt/pmk/env/global/bin:/Users/alice/miniforge3/condabin",
+        );
+        let entries = path.split(':').collect::<Vec<_>>();
+        // Granted manifest roots survive, in order, ahead of the system dirs.
+        assert_eq!(entries[0], "/Users/alice/miniforge3/bin");
+        assert!(entries.contains(&"/Users/alice/miniforge3/condabin"));
+        // Base system dirs are always present so bare `sh`/`cc`/`env` resolve.
+        assert!(entries.contains(&"/usr/bin"));
+        assert!(entries.contains(&"/bin"));
+        // Ungranted home dirs are dropped (they were before this fix too).
+        assert!(!entries.iter().any(|e| e.starts_with("/Users/alice/.local")));
+        assert!(!entries.iter().any(|e| e.starts_with("/Users/alice/.nvm")));
+        // The actual bug: ungranted NON-home dirs must be dropped as well. A
+        // single one of these earlier in PATH than /bin makes execvp abort with
+        // EPERM, so a confined `sh -c` spawning a bare `sh` fails with an opaque
+        // exit 255. They contribute nothing (their binaries are not grantable).
+        assert!(
+            !entries.contains(&"/opt/homebrew/bin"),
+            "ungranted /opt/homebrew/bin must not appear in the confined PATH"
+        );
+        assert!(
+            !entries.contains(&"/opt/pmk/env/global/bin"),
+            "ungranted /opt/pmk/... must not appear in the confined PATH"
+        );
+    }
+
+    #[test]
+    fn native_sandbox_search_path_keeps_explicitly_granted_nonhome_dir() {
+        // If a homebrew (or other non-home) directory IS granted for this
+        // invocation, it must be preserved — the drop only targets UNGRANTED
+        // directories, never grants the daemon deliberately made.
+        let path = native_sandbox_search_path_from(
+            &["/opt/homebrew/bin".to_string()],
+            &["/opt/homebrew".to_string()],
+            Some(std::path::Path::new("/Users/alice")),
+            "/opt/homebrew/bin:/opt/homebrew/opt/node/bin:/opt/other/bin",
+        );
+        let entries = path.split(':').collect::<Vec<_>>();
+        assert!(entries.contains(&"/opt/homebrew/bin"));
+        assert!(entries.contains(&"/opt/homebrew/opt/node/bin"));
+        assert!(
+            !entries.contains(&"/opt/other/bin"),
+            "an ungranted sibling is still dropped"
+        );
     }
 
     #[cfg(target_os = "macos")]
