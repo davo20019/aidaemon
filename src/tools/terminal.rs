@@ -11139,7 +11139,10 @@ mod policy_dump_probe {
         let command =
             std::env::var("AIDAEMON_POLICY_PROBE_CMD").unwrap_or_else(|_| "npm run build".into());
         let backend = active_execution_backend();
-        let writes = vec![format!("{dir}/dist"), dir.clone()];
+        let writes = std::env::var("AIDAEMON_POLICY_PROBE_WRITES")
+            .ok()
+            .map(|w| w.split(':').map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![format!("{dir}/dist"), dir.clone()]);
         let request = confined_terminal_execution_request(
             &backend,
             &command,
