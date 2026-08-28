@@ -1615,6 +1615,26 @@ fn format_output(
     (result, truncation)
 }
 
+/// A confined command that exits non-zero while producing no output at all is
+/// the hardest failure for an autonomous agent to act on: the real cause
+/// (a runtime that could not read a startup file, a denied path, or an abort
+/// before any diagnostic was flushed) is invisible. Return a deterministic,
+/// tool-agnostic next-step ladder so the agent can surface the cause itself
+/// instead of reporting an opaque blocker. Tool-neutral: no command parsing.
+fn confined_opaque_failure_hint(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    let code = exit_code.filter(|code| *code != 0)?;
+    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} with no output. A silent non-zero exit is almost never the task itself failing — it is usually the program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
+    ))
+}
+
 /// Upper bound (chars / lines) on a background command's output that is
 /// delivered to the user *directly* instead of through the agent
 /// re-engagement loop. Short, complete results — a `wc -l` count, a path, a
@@ -1784,6 +1804,21 @@ async fn confined_terminal_execution_request_inner(
         }
     }
 
+    // Every confined command gets a private, per-invocation writable scratch
+    // directory, even a read-only one. Build and package tools (npm, npx,
+    // cargo, pip, wrangler, vite) must write a cache/temp somewhere to run at
+    // all; without an authorized scratch they fail opaquely, and the agent's
+    // own recovery move (setting a cache path) is then rejected by the scope
+    // lock. This is least-privilege — a fresh dir under the daemon scratch
+    // root, never the host's global /tmp — and it is exported as TMPDIR/cache
+    // below so no command has to discover or declare it.
+    let managed_scratch = provision_managed_scratch(backend).await;
+    if let Some(scratch) = managed_scratch.as_ref() {
+        if !writes.contains(scratch) {
+            writes.push(scratch.clone());
+        }
+    }
+
     // Task data authority and executable runtime support are separate lanes.
     // A native sandbox still needs to execute owner-installed toolchains, but
     // granting their entire home directory would expose unrelated data and
@@ -1795,6 +1830,7 @@ async fn confined_terminal_execution_request_inner(
         backend,
         &resolved_write_paths,
         &resolved_write_roots,
+        managed_scratch.as_deref(),
         script_via_stdin,
         &mut runtime_support,
     )
@@ -2637,6 +2673,41 @@ async fn native_sandbox_runtime_support(
     Ok(support)
 }
 
+/// Create a private, per-invocation writable scratch directory under the
+/// daemon scratch root and prune abandoned siblings. Returned as a canonical
+/// path so the sandbox policy and the child environment agree. Best-effort:
+/// returns `None` if the directory cannot be created, in which case the
+/// caller falls back to any declared write root.
+async fn provision_managed_scratch(backend: &SharedExecutionBackend) -> Option<String> {
+    let parent = std::env::temp_dir().join("aidaemon-scratch");
+    let parent_path = crate::execution::BackendPath::new(parent.to_string_lossy().to_string());
+    backend.create_dir_all(&parent_path).await.ok()?;
+    // Prune scratch dirs older than 6 hours so a long-lived daemon does not
+    // accumulate them. Best-effort; a busy directory is simply skipped.
+    if let Ok(entries) = std::fs::read_dir(&parent) {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 3600);
+        for entry in entries.flatten() {
+            if entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified < cutoff)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let dir = parent.join(uuid::Uuid::new_v4().to_string());
+    let dir_path = crate::execution::BackendPath::new(dir.to_string_lossy().to_string());
+    backend.create_dir_all(&dir_path).await.ok()?;
+    Some(
+        backend
+            .canonicalize(&dir_path)
+            .await
+            .unwrap_or(dir_path)
+            .to_string(),
+    )
+}
+
 /// Give package/build processes a task-scoped scratch location without
 /// reopening the host's global `/tmp`. The location is selected only from an
 /// already-declared writable directory in the access manifest; read-only and
@@ -2645,6 +2716,7 @@ async fn add_manifest_runtime_environment(
     backend: &SharedExecutionBackend,
     write_paths: &[String],
     write_roots: &[String],
+    managed_scratch: Option<&str>,
     script_via_stdin: bool,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
@@ -2707,6 +2779,9 @@ async fn add_manifest_runtime_environment(
         }
         selected
     };
+    // A declared write lane wins (least privilege), else the daemon-managed
+    // per-invocation scratch guarantees every command has a writable cache.
+    let scratch_root = scratch_root.or_else(|| managed_scratch.map(str::to_string));
     let Some(scratch_root) = scratch_root else {
         return;
     };
@@ -2740,6 +2815,12 @@ async fn add_manifest_runtime_environment(
     support
         .environment
         .insert("XDG_CACHE_HOME".to_string(), scratch_root.clone());
+    // npm/npx (and wrangler, which shells out through npx) use this explicit
+    // variable rather than XDG. Keep their cache in the authorized scratch so
+    // a package tool never fails trying to write the owner's home cache.
+    support
+        .environment
+        .insert("NPM_CONFIG_CACHE".to_string(), scratch_root.clone());
     if support.python_cache {
         support
             .environment
@@ -4555,6 +4636,9 @@ impl TerminalTool {
                     if code != 0 {
                         output.push_str(&format!("\n[exit code: {}]", code));
                     }
+                }
+                if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
+                    output.push_str(&hint);
                 }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
@@ -7515,6 +7599,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confined_read_only_command_still_gets_a_writable_managed_scratch() {
+        let backend = active_execution_backend();
+        if backend.kind() != crate::execution::BackendKind::Local {
+            return;
+        }
+        let project = tempfile::tempdir().expect("project");
+        let cwd = project.path().to_string_lossy().to_string();
+        // A read-only observation: no write paths, no write roots declared.
+        let request = confined_terminal_execution_request(
+            &backend,
+            "node --version",
+            Some(&cwd),
+            &[cwd.clone()],
+            &[],
+        )
+        .await
+        .expect("confined request");
+        let scratch = request
+            .env
+            .get("TMPDIR")
+            .cloned()
+            .expect("managed scratch TMPDIR");
+        assert_eq!(request.env.get("NPM_CONFIG_CACHE"), Some(&scratch));
+        assert_eq!(request.env.get("XDG_CACHE_HOME"), Some(&scratch));
+        assert!(
+            std::path::Path::new(&scratch).is_dir(),
+            "scratch must exist before exec: {scratch}"
+        );
+        assert!(
+            scratch.contains("aidaemon-scratch"),
+            "scratch must live under the daemon scratch root: {scratch}"
+        );
+        // The sandbox policy must authorize writing that scratch.
+        let policy = match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => {
+                args.get(1).cloned().unwrap_or_default()
+            }
+            crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
+        };
+        assert!(
+            policy.contains(&scratch),
+            "scratch must be a write grant in the seatbelt policy"
+        );
+    }
+
+    #[tokio::test]
     async fn native_sandbox_runtime_grants_a_conda_prefix_by_its_marker() {
         let backend = active_execution_backend();
         // Find any resolvable executable whose prefix carries `conda-meta`.
@@ -8561,6 +8691,20 @@ mod tests {
         let card = format_background_progress_message(40, &long_line);
         assert!(card.contains("_1 line received so far._"));
         assert!(!card.contains(&"x".repeat(20)));
+    }
+
+    #[test]
+    fn opaque_confined_failure_gets_a_self_diagnostic_hint() {
+        // Silent non-zero exit: a hint is produced.
+        let hint = confined_opaque_failure_hint(Some(255), "", "  \n").expect("hint");
+        assert!(hint.contains("$TMPDIR"));
+        assert!(hint.contains("verbose") || hint.contains("--debug"));
+        // Any real output suppresses the hint (the agent can see the cause).
+        assert!(confined_opaque_failure_hint(Some(255), "", "Error: boom").is_none());
+        assert!(confined_opaque_failure_hint(Some(1), "some stdout", "").is_none());
+        // Success never gets a hint.
+        assert!(confined_opaque_failure_hint(Some(0), "", "").is_none());
+        assert!(confined_opaque_failure_hint(None, "", "").is_none());
     }
 
     #[test]

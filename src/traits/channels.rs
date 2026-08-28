@@ -63,6 +63,12 @@ pub trait Channel: Send + Sync {
         Ok(false)
     }
 
+    /// Delete a previously-sent message. Channels that support deletion
+    /// override this; the default is unsupported.
+    async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Send media (photo/file) to a session.
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
 

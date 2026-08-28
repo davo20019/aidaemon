@@ -708,6 +708,16 @@ impl ChannelHub {
         }
     }
 
+    /// Delete a previously-sent message. Returns `Ok(false)` when no channel
+    /// owns the session or the channel does not support deletion.
+    pub async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
+        if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
+            channel.delete_message(&routed_session, message_id).await
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Send media to the channel that owns a specific session.
     /// Falls back to text caption for channels without media support.
     pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {

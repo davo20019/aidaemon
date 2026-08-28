@@ -476,6 +476,15 @@ pub struct UserTurnSummary {
     pub text: String,
 }
 
+/// Typed lineage from a conversational user turn to the canonical request it
+/// advances. A follow-up remains addressable by its own message ID even though
+/// lifecycle ownership and completion obligations stay on the root request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRequestBinding {
+    pub user_message_id: String,
+    pub request_user_message_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveTaskRef {
     pub task_id: String,
@@ -507,6 +516,10 @@ pub struct DialogueState {
     pub last_assistant_turn: Option<AssistantTurnSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_turn: Option<UserTurnSummary>,
+    /// Recent typed message-to-request lineage used to canonicalize semantic
+    /// antecedents selected from the bounded conversation transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_request_bindings: Vec<UserRequestBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_task: Option<ActiveTaskRef>,
     pub updated_at: DateTime<Utc>,
@@ -526,6 +539,7 @@ impl DialogueState {
             last_closed_question: None,
             last_assistant_turn: None,
             last_user_turn: None,
+            recent_request_bindings: Vec::new(),
             active_task: None,
             updated_at: Utc::now(),
         }

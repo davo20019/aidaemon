@@ -13,6 +13,8 @@ pub trait SurfaceSink: Send + Sync {
     async fn create(&self, text: &str) -> anyhow::Result<Option<String>>;
     /// Edit an existing surface message. `Ok(true)` edited, `Ok(false)` can't edit.
     async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool>;
+    /// Delete an existing surface message. `Ok(true)` deleted, `Ok(false)` can't delete.
+    async fn delete(&self, message_id: &str) -> anyhow::Result<bool>;
 }
 
 /// Per-turn live-status state. Shared as `Arc<tokio::sync::Mutex<LiveStatus>>`
@@ -99,15 +101,18 @@ impl LiveStatus {
         false
     }
 
-    /// Flip the surface to a terminal done-state before a file is delivered.
-    pub async fn finalize_done(&mut self, sink: &dyn SurfaceSink) {
-        if let (Some(id), true) = (&self.message_id, self.edit_supported) {
-            let body = self
-                .checklist
-                .clone()
-                .unwrap_or_else(|| "✅ Done".to_string());
-            let _ = sink.edit(id, &body).await;
+    /// Remove the temporary activity surface once the final response has been
+    /// delivered. A checklist is retained as the completed plan summary, but
+    /// an activity-only surface should not become a separate "Done" bubble.
+    pub async fn clear(&mut self, sink: &dyn SurfaceSink) {
+        if self.checklist.is_some() {
+            return;
         }
+        if let Some(id) = self.message_id.take() {
+            let _ = sink.delete(&id).await;
+        }
+        self.current_line = None;
+        self.edit_supported = true;
     }
 
     /// The surface's editable message id, when one exists and editing still
@@ -156,6 +161,9 @@ impl SurfaceSink for HubSurfaceSink {
     async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool> {
         self.hub.edit_text(&self.session_id, message_id, text).await
     }
+    async fn delete(&self, message_id: &str) -> anyhow::Result<bool> {
+        self.hub.delete_message(&self.session_id, message_id).await
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +176,7 @@ mod tests {
     struct FakeSink {
         creates: StdMutex<Vec<String>>,
         edits: StdMutex<Vec<(String, String)>>,
+        deletes: StdMutex<Vec<String>>,
         edit_ok: bool,
     }
     impl FakeSink {
@@ -175,6 +184,7 @@ mod tests {
             Self {
                 creates: StdMutex::new(vec![]),
                 edits: StdMutex::new(vec![]),
+                deletes: StdMutex::new(vec![]),
                 edit_ok,
             }
         }
@@ -191,6 +201,10 @@ mod tests {
                 .unwrap()
                 .push((message_id.to_string(), text.to_string()));
             Ok(self.edit_ok)
+        }
+        async fn delete(&self, message_id: &str) -> anyhow::Result<bool> {
+            self.deletes.lock().unwrap().push(message_id.to_string());
+            Ok(true)
         }
     }
 
@@ -278,33 +292,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_done_resolves_surface_to_done() {
+    async fn clear_removes_surface_without_done_marker() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
         s.set_activity(&sink, "Working…".into()).await;
-        s.finalize_done(&sink).await;
-        let edits = sink.edits.lock().unwrap();
-        // First edit is from set_activity (second call), last is finalize_done
+        s.clear(&sink).await;
         assert_eq!(
-            edits.last().unwrap().1,
-            "✅ Done",
-            "finalize_done edits surface to '✅ Done' when no checklist is set"
+            *sink.deletes.lock().unwrap(),
+            vec!["m1".to_string()],
+            "clear deletes the temporary surface without editing it to '✅ Done'"
         );
     }
 
     #[tokio::test]
-    async fn finalize_done_resolves_surface_to_checklist() {
+    async fn clear_keeps_checklist_without_done_marker() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
         s.set_checklist(&sink, "📋 Plan\n✅ Step 1\n☐ Step 2".into())
             .await;
-        s.finalize_done(&sink).await;
-        let edits = sink.edits.lock().unwrap();
-        // finalize_done should edit the surface to the checklist body
+        s.clear(&sink).await;
         assert_eq!(
-            edits.last().unwrap().1,
-            "📋 Plan\n✅ Step 1\n☐ Step 2",
-            "finalize_done edits surface to checklist body when checklist is set"
+            sink.deletes.lock().unwrap().len(),
+            0,
+            "clear keeps the completed checklist instead of adding a done marker"
         );
     }
 }

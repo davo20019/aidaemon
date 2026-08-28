@@ -4903,7 +4903,7 @@ impl TelegramChannel {
                                         {
                                             use crate::channels::live_status::SurfaceSink;
                                             let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                            live_owner.lock().await.finalize_done(sink_ref).await;
+                                            live_owner.lock().await.clear(sink_ref).await;
                                         }
                                         if background_handoff {
                                             if let (Some(hub), Some(id)) =
@@ -4932,7 +4932,7 @@ impl TelegramChannel {
                             // stuck on "⏳ Running…" forever.
                             use crate::channels::live_status::SurfaceSink;
                             let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                            live_owner.lock().await.finalize_done(sink_ref).await;
+                            live_owner.lock().await.clear(sink_ref).await;
                         }
                         let _ = agent
                             .record_response_delivery(
@@ -4984,7 +4984,7 @@ impl TelegramChannel {
                             {
                                 use crate::channels::live_status::SurfaceSink;
                                 let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                live_owner.lock().await.finalize_done(sink_ref).await;
+                                live_owner.lock().await.clear(sink_ref).await;
                             }
                             if let Some(live_owner) = live_owner.as_ref() {
                                 live_owner.lock().await.reset();
@@ -5268,6 +5268,29 @@ impl Channel for TelegramChannel {
                 Err(e) => Err(e.into()),
             },
         }
+    }
+
+    async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+        let mid: i32 = match message_id.parse() {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        retry_telegram_rate_limit(|| {
+            self.bot
+                .delete_message(ChatId(chat_id), teloxide::types::MessageId(mid))
+        })
+        .await
+        .map(|_| true)
+        .map_err(Into::into)
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {

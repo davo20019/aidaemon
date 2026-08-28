@@ -6,8 +6,8 @@ use crate::events::{
 use crate::traits::{
     extract_primary_message_content, message_content_is_structural_only, ActiveTaskRef,
     ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState, Message,
-    OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope, UserTurnKind,
-    UserTurnSummary,
+    OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope,
+    UserRequestBinding, UserTurnKind, UserTurnSummary,
 };
 use chrono::Utc;
 
@@ -59,6 +59,36 @@ const OPEN_REQUEST_ANCHOR_TTL_HOURS: i64 = 12;
 /// Durable mandate-input questions are linked by typed mandate identity and do
 /// not depend on the reply's wording.
 const OPEN_QUESTION_IMPLICIT_BIND_TTL_MINUTES: i64 = 30;
+/// Relationship assessment receives at most six recent messages. Retaining a
+/// wider bounded lineage window lets those IDs survive intervening tool and
+/// assistant rows without allowing dialogue state to grow without bound.
+const RECENT_REQUEST_BINDING_LIMIT: usize = 32;
+
+fn bind_user_message_to_request(
+    state: &mut DialogueState,
+    user_message_id: &str,
+    request_user_message_id: &str,
+) {
+    let user_message_id = user_message_id.trim();
+    let request_user_message_id = request_user_message_id.trim();
+    if user_message_id.is_empty() || request_user_message_id.is_empty() {
+        return;
+    }
+    state
+        .recent_request_bindings
+        .retain(|binding| binding.user_message_id != user_message_id);
+    state.recent_request_bindings.push(UserRequestBinding {
+        user_message_id: user_message_id.to_string(),
+        request_user_message_id: request_user_message_id.to_string(),
+    });
+    let excess = state
+        .recent_request_bindings
+        .len()
+        .saturating_sub(RECENT_REQUEST_BINDING_LIMIT);
+    if excess > 0 {
+        state.recent_request_bindings.drain(..excess);
+    }
+}
 
 fn open_request_anchor_expired(request: &OpenRequest, now: chrono::DateTime<Utc>) -> bool {
     match request.status {
@@ -99,21 +129,35 @@ pub(in crate::agent) fn resolved_followup_mode(
     })
 }
 
-/// Validate a model-classified continuation against one exact request node.
-/// A relationship label without this stable edge is advisory only and cannot
-/// inherit context, policy, targets, or completion obligations.
-pub(in crate::agent) fn has_exact_request_antecedent(
-    state: &DialogueState,
+/// Canonicalize a recent conversational user-message ID to the live request
+/// node it advances. The binding alone is never authority: its target must
+/// still be one of the request nodes currently eligible for adoption.
+pub(in crate::agent) fn resolve_request_antecedent<'a>(
+    state: &'a DialogueState,
     user_message_id: &str,
-) -> bool {
+) -> Option<&'a OpenRequest> {
     let candidate = user_message_id.trim();
-    !candidate.is_empty()
-        && state
-            .open_request
+    if candidate.is_empty()
+        || state
+            .last_user_turn
             .as_ref()
-            .into_iter()
-            .chain(state.antecedent_request.as_ref())
-            .any(|request| request.user_message_id == candidate)
+            .is_some_and(|turn| turn.message_id == candidate)
+    {
+        return None;
+    }
+    let canonical_id = state
+        .recent_request_bindings
+        .iter()
+        .rev()
+        .find(|binding| binding.user_message_id == candidate)
+        .map(|binding| binding.request_user_message_id.as_str())
+        .unwrap_or(candidate);
+    state
+        .open_request
+        .as_ref()
+        .into_iter()
+        .chain(state.antecedent_request.as_ref())
+        .find(|request| request.user_message_id == canonical_id)
 }
 
 /// Resolve the only structurally possible antecedent for the current user
@@ -318,6 +362,25 @@ fn apply_user_message(
         UserTurnKind::Courtesy | UserTurnKind::Unknown => {}
     }
 
+    if matches!(
+        turn_kind,
+        UserTurnKind::NewRequest | UserTurnKind::Followup | UserTurnKind::ClarificationAnswer
+    ) {
+        let request_user_message_id = state
+            .open_request
+            .as_ref()
+            .map(|request| request.user_message_id.clone())
+            .or_else(|| {
+                state
+                    .last_closed_question
+                    .as_ref()
+                    .and_then(|question| question.related_user_message_id.clone())
+            });
+        if let Some(request_user_message_id) = request_user_message_id {
+            bind_user_message_to_request(state, message_id, &request_user_message_id);
+        }
+    }
+
     state.touch();
 }
 
@@ -372,7 +435,7 @@ fn apply_semantic_user_turn_assessment(
             {
                 state.antecedent_request = state.open_request.take();
                 state.open_request = Some(OpenRequest {
-                    user_message_id: message_id,
+                    user_message_id: message_id.clone(),
                     text: text.trim().to_string(),
                     status: if state.active_task.is_some() {
                         OpenRequestStatus::InProgress
@@ -422,6 +485,24 @@ fn apply_semantic_user_turn_assessment(
             }
         }
         UserTurnKind::Courtesy | UserTurnKind::Unknown => {}
+    }
+    if matches!(
+        kind,
+        UserTurnKind::NewRequest | UserTurnKind::Followup | UserTurnKind::ClarificationAnswer
+    ) {
+        let request_user_message_id = state
+            .open_request
+            .as_ref()
+            .map(|request| request.user_message_id.clone())
+            .or_else(|| {
+                state
+                    .last_closed_question
+                    .as_ref()
+                    .and_then(|question| question.related_user_message_id.clone())
+            });
+        if let Some(request_user_message_id) = request_user_message_id {
+            bind_user_message_to_request(state, &message_id, &request_user_message_id);
+        }
     }
     state.touch();
 }
@@ -1110,7 +1191,11 @@ mod tests {
                 .map(|request| request.user_message_id.as_str()),
             Some("u2")
         );
-        assert!(has_exact_request_antecedent(&state, "u1"));
+        assert_eq!(
+            resolve_request_antecedent(&state, "u1")
+                .map(|request| request.user_message_id.as_str()),
+            Some("u1")
+        );
 
         apply_semantic_user_turn_assessment(
             &mut state,
@@ -1128,6 +1213,101 @@ mod tests {
             "semantic adoption restores the exact typed request rather than reparsing prose"
         );
         assert!(state.antecedent_request.is_none());
+    }
+
+    #[test]
+    fn chained_followup_message_resolves_to_canonical_request() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("synthetic-session");
+        state.open_request = Some(request_with(
+            OpenRequestStatus::Answered,
+            now - chrono::Duration::minutes(2),
+            Some(now - chrono::Duration::minutes(1)),
+        ));
+
+        apply_user_message(
+            &mut state,
+            "u2",
+            "Are there any uncommitted files?",
+            &[],
+            now,
+        );
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "Are there any uncommitted files?",
+            UserTurnKind::Followup,
+            Some(ToolSemanticScope::LocalWorkspace),
+            now,
+        );
+        assert_eq!(
+            state
+                .recent_request_bindings
+                .iter()
+                .find(|binding| binding.user_message_id == "u2")
+                .map(|binding| binding.request_user_message_id.as_str()),
+            Some("u1"),
+            "the follow-up message must remain a typed alias of its root request"
+        );
+
+        apply_user_message(
+            &mut state,
+            "u3",
+            "How can that be possible?",
+            &[],
+            now + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            resolve_request_antecedent(&state, "u2")
+                .map(|request| request.user_message_id.as_str()),
+            Some("u1"),
+            "a second-order follow-up must resolve through the prior follow-up"
+        );
+
+        apply_semantic_user_turn_assessment(
+            &mut state,
+            "How can that be possible?",
+            UserTurnKind::Followup,
+            Some(ToolSemanticScope::LocalWorkspace),
+            now + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .map(|request| request.user_message_id.as_str()),
+            Some("u1")
+        );
+        assert_eq!(
+            state
+                .recent_request_bindings
+                .iter()
+                .find(|binding| binding.user_message_id == "u3")
+                .map(|binding| binding.request_user_message_id.as_str()),
+            Some("u1")
+        );
+    }
+
+    #[test]
+    fn stale_followup_binding_cannot_revive_an_ineligible_request() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("synthetic-session");
+        state.open_request = Some(request_with(OpenRequestStatus::Answered, now, Some(now)));
+        bind_user_message_to_request(&mut state, "u2", "u1");
+
+        let mut next = request_with(OpenRequestStatus::Open, now, None);
+        next.user_message_id = "u3".to_string();
+        state.open_request = Some(next);
+        state.antecedent_request = None;
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "u4".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Inspect a separate synthetic project.".to_string(),
+        });
+
+        assert!(
+            resolve_request_antecedent(&state, "u2").is_none(),
+            "lineage may canonicalize identity but must not grant eligibility"
+        );
     }
 
     #[test]

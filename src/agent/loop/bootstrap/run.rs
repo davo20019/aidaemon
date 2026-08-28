@@ -119,7 +119,9 @@ async fn finalize_turn_assessment(
             )
         });
 
+    let mut requested_antecedent_user_message_id = None;
     let mut committed_antecedent_user_message_id = None;
+    let mut resolved_request_user_message_id = None;
     if !internal_continuation {
         let dialogue_state = agent
             .state
@@ -141,13 +143,20 @@ async fn finalize_turn_assessment(
                 .as_deref()
                 .map(str::trim)
                 .filter(|message_id| !message_id.is_empty());
+            requested_antecedent_user_message_id = requested_antecedent.map(str::to_string);
             let resolved_antecedent = dialogue_state.as_ref().and_then(|state| {
                 if let Some(message_id) = requested_antecedent {
-                    crate::agent::dialogue_state::has_exact_request_antecedent(state, message_id)
-                        .then_some(message_id)
+                    crate::agent::dialogue_state::resolve_request_antecedent(state, message_id)
+                        .map(|request| (message_id.to_string(), request.user_message_id.clone()))
                 } else {
-                    crate::agent::dialogue_state::unambiguous_request_antecedent(state)
-                        .map(|request| request.user_message_id.as_str())
+                    crate::agent::dialogue_state::unambiguous_request_antecedent(state).map(
+                        |request| {
+                            (
+                                request.user_message_id.clone(),
+                                request.user_message_id.clone(),
+                            )
+                        },
+                    )
                 }
             });
             let exact_antecedent = resolved_antecedent.is_some();
@@ -158,8 +167,13 @@ async fn finalize_turn_assessment(
                 _ => "new_request",
             };
             if relationship == "continuation" {
-                committed_antecedent_user_message_id = resolved_antecedent.map(str::to_string);
+                committed_antecedent_user_message_id = resolved_antecedent
+                    .as_ref()
+                    .map(|(message_id, _)| message_id.clone());
             }
+            resolved_request_user_message_id = resolved_antecedent
+                .as_ref()
+                .map(|(_, request_id)| request_id.clone());
             let reason = if requested == "continuation" && !exact_antecedent {
                 "continuation_missing_exact_antecedent"
             } else {
@@ -203,7 +217,9 @@ async fn finalize_turn_assessment(
                     "relationship": relationship,
                     "semantic_scope": semantic_scope,
                     "reason_code": reason_code,
+                    "requested_antecedent_user_message_id": requested_antecedent_user_message_id,
                     "antecedent_user_message_id": committed_antecedent_user_message_id,
+                    "resolved_request_user_message_id": resolved_request_user_message_id,
                 }),
             )
             .await;
