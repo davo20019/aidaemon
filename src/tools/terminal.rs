@@ -1621,6 +1621,95 @@ fn format_output(
 /// before any diagnostic was flushed) is invisible. Return a deterministic,
 /// tool-agnostic next-step ladder so the agent can surface the cause itself
 /// instead of reporting an opaque blocker. Tool-neutral: no command parsing.
+/// Extract absolute paths a confined process was denied that are safe to
+/// auto-grant read on a single self-heal retry. This encodes the manual
+/// debugging step "the sandbox denied path X that the tool needs at startup,
+/// so grant X read-only and re-run" — generally, for any tool, without a
+/// per-tool table. It is deliberately conservative: only existing regular
+/// files in recognized read-only *configuration* locations, never a secret
+/// store, never a directory, never a write.
+fn self_healable_denied_reads(output: &str, home: &str, already_granted: &[String]) -> Vec<String> {
+    // SECURITY: the command's own stdout/stderr is attacker-controlled (a
+    // malicious build script can print a fabricated denial naming any path).
+    // We therefore never grant a path merely because the output names it as
+    // denied. A candidate is granted only when its *basename* is on a strict
+    // allowlist of known NON-secret configuration files. Nothing that can hold
+    // a credential (.npmrc, .netrc, .env, .pgpass, key material, shell history)
+    // is on the list, so a forged denial can at most re-grant a harmless file
+    // the tool would read anyway. Match is basename equality after
+    // canonicalization; the untrusted text only nominates candidates.
+    const SAFE_CONFIG_BASENAMES: &[&str] = &[
+        ".node-version",
+        ".nvmrc",
+        ".python-version",
+        ".ruby-version",
+        ".tool-versions",
+        ".editorconfig",
+        ".browserslistrc",
+        ".yarnrc",
+        "yarnrc",
+        ".swcrc",
+        "tsconfig.json",
+        "jsconfig.json",
+    ];
+    let looks_denied = |line: &str| {
+        let l = line.to_ascii_lowercase();
+        l.contains("operation not permitted")
+            || l.contains("permission denied")
+            || l.contains("eperm")
+            || l.contains("eacces")
+            || l.contains("blocked by sandbox")
+    };
+    let _ = home;
+    let mut found: Vec<String> = Vec::new();
+    for line in output.lines() {
+        if !looks_denied(line) {
+            continue;
+        }
+        for path in extract_absolute_paths(line) {
+            let basename = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !SAFE_CONFIG_BASENAMES.contains(&basename) {
+                continue;
+            }
+            // Canonicalize so a `..`-laden nomination cannot resolve elsewhere,
+            // and require the resolved path to still carry the allowlisted
+            // basename and be an existing regular file.
+            let Ok(canonical) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if canonical.file_name().and_then(|name| name.to_str()) != Some(basename) {
+                continue;
+            }
+            if !canonical.is_file() {
+                continue;
+            }
+            let canonical = canonical.to_string_lossy().to_string();
+            if already_granted.iter().any(|granted| granted == &canonical)
+                || found.contains(&canonical)
+            {
+                continue;
+            }
+            found.push(canonical);
+        }
+    }
+    found
+}
+
+/// Pull absolute filesystem paths out of one diagnostic line. Handles quoted
+/// and bare `/a/b` forms; stops a bare path at whitespace or a trailing
+/// punctuation the shell/tool commonly appends.
+fn extract_absolute_paths(line: &str) -> Vec<String> {
+    const BOUNDARY: [char; 6] = [' ', '\'', '"', ')', '(', '\t'];
+    line.split(BOUNDARY)
+        .filter(|token| token.starts_with('/'))
+        .map(|token| token.trim_end_matches(['.', ',', ':', ';']).to_string())
+        .filter(|token| token.len() > 1)
+        .collect()
+}
+
 fn confined_opaque_failure_hint(
     exit_code: Option<i32>,
     stdout: &str,
@@ -2821,11 +2910,77 @@ async fn add_manifest_runtime_environment(
     support
         .environment
         .insert("NPM_CONFIG_CACHE".to_string(), scratch_root.clone());
+    // Point npm/npx at a neutral per-run user config inside the scratch dir
+    // instead of the owner's `~/.npmrc`. npm reads its user config at startup
+    // and aborts (EPERM) when the sandbox denies the home file; more
+    // importantly `~/.npmrc` can hold a private-registry auth token that an
+    // untrusted build must never read. A neutral empty config removes both the
+    // failure and the exposure. Offline builds need no registry auth.
+    let neutral_npmrc = format!("{scratch_root}/.aidaemon-npmrc");
+    if backend
+        .write(
+            &crate::execution::BackendPath::new(neutral_npmrc.clone()),
+            b"",
+            crate::execution::WriteMode::Overwrite,
+            true,
+        )
+        .await
+        .is_ok()
+    {
+        support
+            .environment
+            .insert("NPM_CONFIG_USERCONFIG".to_string(), neutral_npmrc);
+    }
     if support.python_cache {
         support
             .environment
             .insert("PIP_CACHE_DIR".to_string(), scratch_root);
     }
+}
+
+/// Run one confined command to completion and return (exit_code, stdout,
+/// stderr). Used by the self-heal retry: it rebuilds the sandbox request with
+/// additional authorized reads and re-executes, without touching the tracked
+/// background-process machinery.
+#[allow(clippy::too_many_arguments)]
+async fn run_confined_once(
+    backend: &SharedExecutionBackend,
+    command: &str,
+    script_via_stdin: bool,
+    working_dir: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+    write_roots: &[String],
+    timeout: Duration,
+) -> anyhow::Result<(Option<i32>, String, String)> {
+    let request = if script_via_stdin {
+        confined_terminal_script_execution_request(
+            backend,
+            command,
+            working_dir,
+            read_paths,
+            write_paths,
+            write_roots,
+        )
+        .await?
+    } else {
+        confined_terminal_execution_request_inner(
+            backend,
+            command,
+            false,
+            working_dir,
+            read_paths,
+            write_paths,
+            write_roots,
+        )
+        .await?
+    };
+    let output = backend.execute(request, timeout).await?;
+    Ok((
+        Some(output.exit_code),
+        output.stdout_lossy(),
+        output.stderr_lossy(),
+    ))
 }
 
 fn native_sandbox_search_path(prefixes: &[String]) -> String {
@@ -4628,14 +4783,66 @@ impl TerminalTool {
                 let exit_code = reader_handle.await.ok().flatten();
                 let stdout_data = stdout_buf.lock().await;
                 let stderr_data = stderr_buf.lock().await;
-                let stdout = String::from_utf8_lossy(&stdout_data);
-                let stderr = String::from_utf8_lossy(&stderr_data);
+                let mut stdout = String::from_utf8_lossy(&stdout_data).into_owned();
+                let mut stderr = String::from_utf8_lossy(&stderr_data).into_owned();
+                let mut exit_code = exit_code;
+                drop(stdout_data);
+                drop(stderr_data);
+                let mut self_heal_note = String::new();
+                // Self-heal: if a confined command failed because the sandbox
+                // denied a config file the tool needs at startup, grant that
+                // exact read-only path and re-run ONCE. This is the general
+                // form of the manual "grant the denied path and retry" fix —
+                // no per-tool table, one bounded attempt, secret stores excluded.
+                if exit_code != Some(0) && !detach {
+                    let home = self.backend.home_hint().to_string();
+                    let combined = format!("{stdout}\n{stderr}");
+                    let heal_paths = self_healable_denied_reads(&combined, &home, read_paths);
+                    if !heal_paths.is_empty() {
+                        let mut augmented = read_paths.to_vec();
+                        augmented.extend(heal_paths.iter().cloned());
+                        match run_confined_once(
+                            &self.backend,
+                            command,
+                            script_via_stdin,
+                            working_dir,
+                            &augmented,
+                            write_paths,
+                            write_roots,
+                            self.initial_timeout,
+                        )
+                        .await
+                        {
+                            Ok((retry_exit, retry_out, retry_err)) => {
+                                info!(
+                                    granted = ?heal_paths,
+                                    prior_exit = ?exit_code,
+                                    retry_exit = ?retry_exit,
+                                    "Self-healed a confined sandbox denial and re-ran the command"
+                                );
+                                self_heal_note = format!(
+                                    "\n[SYSTEM] The first attempt was denied read access to {}, which the tool needs; the daemon granted it read-only and re-ran the command automatically.",
+                                    heal_paths.join(", ")
+                                );
+                                stdout = retry_out;
+                                stderr = retry_err;
+                                exit_code = retry_exit;
+                            }
+                            Err(error) => {
+                                warn!(%error, "Self-heal retry failed to execute");
+                            }
+                        }
+                    }
+                }
                 let (mut output, truncation) =
                     format_output(&stdout, &stderr, self.max_output_chars);
                 if let Some(code) = exit_code {
                     if code != 0 {
                         output.push_str(&format!("\n[exit code: {}]", code));
                     }
+                }
+                if !self_heal_note.is_empty() {
+                    output.push_str(&self_heal_note);
                 }
                 if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
                     output.push_str(&hint);
@@ -8691,6 +8898,65 @@ mod tests {
         let card = format_background_progress_message(40, &long_line);
         assert!(card.contains("_1 line received so far._"));
         assert!(!card.contains(&"x".repeat(20)));
+    }
+
+    #[test]
+    fn self_heal_extracts_and_safety_filters_denied_config_paths() {
+        let home = std::env::temp_dir().join(format!("aidaemon-heal-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // An allowlisted NON-secret config the tool may need at startup.
+        let nodever = home.join(".node-version");
+        std::fs::write(&nodever, "22.13.0\n").unwrap();
+        let nodever_canon = std::fs::canonicalize(&nodever)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // Secret-bearing files must NEVER be granted, even when named in a denial.
+        let npmrc = home.join(".npmrc");
+        std::fs::write(&npmrc, "//registry/:_authToken=SECRET\n").unwrap();
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let id = ssh.join("id_rsa");
+        std::fs::write(&id, "SECRET").unwrap();
+        let home_s = home.to_string_lossy().to_string();
+
+        // Allowlisted basename → granted (basename equality after canonicalize).
+        let out = format!(
+            "EPERM: operation not permitted, open '{}'",
+            nodever.display()
+        );
+        assert_eq!(
+            self_healable_denied_reads(&out, &home_s, &[]),
+            vec![nodever_canon.clone()]
+        );
+        // .npmrc holds an auth token → NEVER auto-granted even if a (possibly
+        // attacker-controlled) build script prints a denial naming it.
+        let forged = format!("EPERM: operation not permitted, open '{}'", npmrc.display());
+        assert!(self_healable_denied_reads(&forged, &home_s, &[]).is_empty());
+        // Key material → never.
+        let secret_out = format!("Permission denied: {}", id.display());
+        assert!(self_healable_denied_reads(&secret_out, &home_s, &[]).is_empty());
+        // A non-denial line yields nothing.
+        assert!(
+            self_healable_denied_reads(&format!("read {}", nodever.display()), &home_s, &[])
+                .is_empty()
+        );
+        // Already-granted paths are not repeated.
+        assert!(self_healable_denied_reads(&out, &home_s, &[nodever_canon]).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn extract_absolute_paths_handles_quoted_and_bare_forms() {
+        assert_eq!(
+            extract_absolute_paths("open '/Users/x/.npmrc' failed"),
+            vec!["/Users/x/.npmrc".to_string()]
+        );
+        assert_eq!(
+            extract_absolute_paths("tried: /opt/homebrew/lib/libnode.dylib (no such file),"),
+            vec!["/opt/homebrew/lib/libnode.dylib".to_string()]
+        );
+        assert!(extract_absolute_paths("no paths here").is_empty());
     }
 
     #[test]
