@@ -727,36 +727,21 @@ pub(crate) fn repair_planned_contract_lifecycle(
         )
     };
     match task_kind {
-        Some(kind) if !expects_mutation && mutation_capable(kind) => {
-            signals.task_kind = Some(
-                if requires_observation {
-                    "check"
-                } else {
-                    "answer"
-                }
-                .to_string(),
-            );
+        // A mutating kind with no mutation but WITH obligations is a check.
+        // Without obligations the producer omitted content; never downgrade
+        // that to a conversational answer — it must stay incoherent so the
+        // producer chain repairs or fails over instead of accepting a contract
+        // that asks for nothing.
+        Some(kind) if !expects_mutation && mutation_capable(kind) && requires_observation => {
+            signals.task_kind = Some("check".to_string());
             repaired.push("task_kind_non_mutating");
         }
         Some(kind) if expects_mutation && !mutation_capable(kind) => {
             signals.task_kind = Some("change".to_string());
             repaired.push("task_kind_mutating");
         }
-        Some(crate::agent::CompletionTaskKind::Check) if !requires_observation => {
-            signals.task_kind = Some("answer".to_string());
-            repaired.push("task_kind_check_without_observation");
-        }
-        None if signals.task_kind.is_none() => {
-            signals.task_kind = Some(
-                if expects_mutation {
-                    "change"
-                } else if requires_observation {
-                    "check"
-                } else {
-                    "answer"
-                }
-                .to_string(),
-            );
+        None if signals.task_kind.is_none() && (expects_mutation || requires_observation) => {
+            signals.task_kind = Some(if expects_mutation { "change" } else { "check" }.to_string());
             repaired.push("task_kind_from_lanes");
         }
         _ => {}
