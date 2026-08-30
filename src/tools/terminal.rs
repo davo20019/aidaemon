@@ -4345,7 +4345,7 @@ impl TerminalTool {
                 }
             }
 
-            let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
+            let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
             metadata.semantics = semantics;
             let mut completed = self.completed.lock().await;
@@ -6475,7 +6475,7 @@ impl TerminalTool {
                     output.push_str(&format!("\n[exit code: {}]", code));
                 }
             }
-            let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
+            let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
             metadata.semantics = semantics;
             Ok(ToolCallOutcome { output, metadata })
@@ -6513,10 +6513,10 @@ impl TerminalTool {
                 "\n\nUse action=\"check\" pid={} to check again, or action=\"kill\" pid={} to stop.",
                 pid, pid
             ));
-            let mut metadata = tracked_background_metadata(
+            let mut metadata = background_observation_metadata(
+                ToolOutcomeStatus::Backgrounded,
                 proc.detached,
                 proc.notifier_active && !proc.detached,
-                None,
             );
             metadata.semantics = proc.semantics.clone();
             Ok(ToolCallOutcome { output, metadata })
@@ -6541,7 +6541,8 @@ impl TerminalTool {
         let (output, truncation) = self
             .terminate_running_process(pid, proc, "manual kill")
             .await?;
-        let mut metadata = tracked_background_metadata(detached, false, None);
+        let mut metadata =
+            background_observation_metadata(ToolOutcomeStatus::Succeeded, detached, false);
         metadata.truncation = truncation;
         Ok(ToolCallOutcome { output, metadata })
     }
@@ -7021,11 +7022,19 @@ impl TerminalTool {
                 }
 
                 // A typed root grant is allowed to name a future directory.
-                // Prepare only the topmost explicit roots, after all approval
-                // and checkpoint gates, so the confined process can create
-                // descendants without relying on ambient /tmp access. Exact
-                // file grants and roots nested under another declared grant
-                // never enter this path: the command owns those leaves.
+                // The write grant itself authorizes the confined process to
+                // create that root (the sandbox checks the created path
+                // against the granted literal/subpath), so the command owns
+                // its own "create the leaf" step. Pre-creating the leaf here
+                // made the canonical first step of a create-a-workspace
+                // request — a plain `mkdir <root>` — fail with EEXIST against
+                // the runtime's own directory, and the post-failure undo then
+                // contradicted the reported state. The runtime therefore
+                // prepares only what the leaf's creation depends on: the
+                // root's PARENT CHAIN (validated typed, so a dispatcher can
+                // repair an unpreparable projection it authored without
+                // involving the model), and the full root only when it is the
+                // command's working directory, which must exist before exec.
                 let mut created_future_roots: Vec<crate::execution::BackendPath> = Vec::new();
                 if !args.write_roots.is_empty() {
                     let cwd = if let Some(path) = args.working_dir.as_deref() {
@@ -7056,8 +7065,22 @@ impl TerminalTool {
                                     ));
                                 }
                             };
-                        let existed = self.backend.metadata(&resolved).await.is_ok();
-                        if let Err(error) = self.backend.create_dir_all(&resolved).await {
+                        let prepare_target = if cwd.as_ref() == Some(&resolved) {
+                            Some(resolved.clone())
+                        } else {
+                            std::path::Path::new(resolved.as_str())
+                                .parent()
+                                .map(|parent| {
+                                    crate::execution::BackendPath::new(
+                                        parent.to_string_lossy().to_string(),
+                                    )
+                                })
+                        };
+                        let Some(prepare_target) = prepare_target else {
+                            continue;
+                        };
+                        let existed = self.backend.metadata(&prepare_target).await.is_ok();
+                        if let Err(error) = self.backend.create_dir_all(&prepare_target).await {
                             return Ok(ToolCallOutcome::runtime_preparation_failure(
                                 "write_roots",
                                 root,
@@ -7065,7 +7088,7 @@ impl TerminalTool {
                             ));
                         }
                         if !existed {
-                            created_future_roots.push(resolved);
+                            created_future_roots.push(prepare_target);
                         }
                     }
                 }
@@ -7352,25 +7375,36 @@ pub(crate) fn confined_process_access_enforcement() -> crate::traits::ToolAccess
     }
 }
 
-fn tracked_background_metadata(
-    detached: bool,
-    completion_notifications_enabled: bool,
-    exit_code: Option<i32>,
-) -> ToolCallMetadata {
+/// Receipt for a background process that has FINISHED (collected by
+/// `action="check"` or the reaper). This is a terminal completion receipt:
+/// `background_started` is reserved for launch receipts, because the loop's
+/// detach boundary treats it as "this call moved work to the background" and
+/// ends the task with a handoff. A finished process's receipt must instead
+/// let its result be delivered and credited like any process completion.
+fn background_completion_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     ToolCallMetadata {
-        outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+        outcome_status: exit_code.map(ToolOutcomeStatus::from_process_exit_code),
         exit_code,
         invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
         access_enforcement: confined_process_access_enforcement(),
-        timed_out: true,
-        background_started: true,
+        ..Default::default()
+    }
+}
+
+/// Receipt for observing a STILL-RUNNING background process
+/// (`action="check"`) or terminating one (`action="kill"`). Observations and
+/// kills never claim `background_started`; only the launch receipt does.
+fn background_observation_metadata(
+    outcome_status: ToolOutcomeStatus,
+    detached: bool,
+    completion_notifications_enabled: bool,
+) -> ToolCallMetadata {
+    ToolCallMetadata {
+        outcome_status: Some(outcome_status),
+        invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+        access_enforcement: confined_process_access_enforcement(),
         detached,
         completion_notifications_enabled,
-        transport_error: None,
-        http_status: None,
-        direct_response: None,
-        semantics: ToolCallSemantics::default(),
-        read_file: None,
         ..Default::default()
     }
 }
@@ -9192,6 +9226,9 @@ mod tests {
             MockProvider::text_response(
                 r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
             ),
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Exits with a fixed status"]}"#,
+            ),
         ]));
         let tool = TerminalTool::new(
             vec![],
@@ -9208,10 +9245,11 @@ mod tests {
         let parent = tempfile::tempdir().expect("parent");
         let root = parent.path().join("synthetic-lone-root");
         let file = root.join("result.txt");
-        // The residual type confusion: a lone future FILE declared as the
-        // only write root. The contract says roots are directories, so the
-        // runtime prepares it as one and the redirect fails — but the runtime
-        // must then undo its own directory so the path is free again.
+        // A lone future FILE declared as the only write root. The runtime
+        // prepares the parent chain but never the declared leaf itself — the
+        // grant covers creating the leaf, and pre-creating it as a directory
+        // used to make this redirect fail with "Is a directory". The command
+        // now owns the leaf and the write succeeds.
         let args = serde_json::json!({
             "action": "run",
             "command": format!("printf SYNTHETIC_LONE_OK > '{}'", file.display()),
@@ -9221,14 +9259,33 @@ mod tests {
             "_user_role": "Owner"
         });
         let output = tool.call(&args.to_string()).await.unwrap();
-        assert!(output.contains("Is a directory"), "{output}");
+        assert!(!output.contains("Is a directory"), "{output}");
         assert!(
-            !file.exists(),
-            "runtime-created directory must be removed after the failed run"
+            file.is_file(),
+            "the command must own and create the declared leaf"
         );
         assert!(
             root.is_dir(),
             "the parent chain the runtime created may remain"
+        );
+
+        // When the command fails, a parent-chain directory the runtime
+        // created for it is undone if still empty, so a bad declaration
+        // cannot leave directories squatting on future paths.
+        let failed_root = parent.path().join("synthetic-failed-chain");
+        let failed_leaf = failed_root.join("never-created");
+        let args = serde_json::json!({
+            "action": "run",
+            "command": "exit 7",
+            "working_dir": parent.path().to_string_lossy(),
+            "write_roots": [failed_leaf.to_string_lossy()],
+            "_session_id": "telegram:synthetic-owner",
+            "_user_role": "Owner"
+        });
+        let _ = tool.call(&args.to_string()).await.unwrap();
+        assert!(
+            !failed_root.exists(),
+            "runtime-created chain must be removed after the failed run"
         );
     }
 
@@ -9653,12 +9710,24 @@ mod tests {
     }
 
     #[test]
-    fn tracked_background_metadata_marks_background_and_detached() {
-        let metadata = tracked_background_metadata(true, false, None);
-        assert!(metadata.background_started);
-        assert!(metadata.timed_out);
-        assert!(metadata.detached);
-        assert!(!metadata.completion_notifications_enabled);
+    fn background_report_metadata_never_claims_launch() {
+        // Completion and observation receipts describe an already-tracked
+        // process; only the launch receipt may set background_started.
+        let completed = background_completion_metadata(Some(0));
+        assert!(!completed.background_started);
+        assert!(!completed.timed_out);
+        assert!(!completed.detached);
+        assert_eq!(completed.outcome_status, Some(ToolOutcomeStatus::Succeeded));
+        assert_eq!(
+            background_completion_metadata(Some(2)).outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+
+        let observed =
+            background_observation_metadata(ToolOutcomeStatus::Backgrounded, true, false);
+        assert!(!observed.background_started);
+        assert!(!observed.timed_out);
+        assert!(observed.detached);
     }
 
     #[tokio::test]
@@ -9765,6 +9834,282 @@ mod tests {
             .unwrap();
         assert!(!outcome.metadata.background_started);
         assert_eq!(outcome.metadata.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn checking_finished_background_process_returns_completion_receipt() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 2; echo done-marker","_session_id":"sess_check_done","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&outcome.output);
+
+        // Poll until the process has finished and the check returns the
+        // terminal result.
+        let mut finished = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let check = tool.handle_check(pid).await.unwrap();
+            if check.output.contains("finished after") {
+                finished = Some(check);
+                break;
+            }
+        }
+        let finished = finished.expect("background process should finish");
+
+        // A receipt for a FINISHED process is a completion receipt, not a
+        // launch receipt: it must never re-trigger the background-detach
+        // handoff that ends the task with "Still on it".
+        assert!(
+            !finished.metadata.background_started,
+            "finished-process check receipt must not claim background_started"
+        );
+        assert!(!finished.metadata.timed_out);
+        assert_eq!(finished.metadata.exit_code, Some(0));
+        assert_eq!(
+            finished.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert!(finished.output.contains("done-marker"));
+    }
+
+    #[tokio::test]
+    async fn checking_reaped_background_process_returns_completion_receipt() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 2; echo reap-marker","_session_id":"sess_reap_done","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&outcome.output);
+
+        // Wait for process exit, then force the reap path so the completed-map
+        // receipt (the one served to a later check) is the one under test.
+        let mut reaped = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            tool.reap_finished().await;
+            if !tool.running.lock().await.contains_key(&pid) {
+                reaped = true;
+                break;
+            }
+        }
+        assert!(reaped, "background process should be reaped");
+
+        let check = tool.handle_check(pid).await.unwrap();
+        assert!(check.output.contains("finished after"), "{}", check.output);
+        assert!(
+            !check.metadata.background_started,
+            "reaped-process receipt must not claim background_started"
+        );
+        assert!(!check.metadata.timed_out);
+        assert_eq!(check.metadata.exit_code, Some(0));
+        assert_eq!(
+            check.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn still_running_check_and_kill_receipts_are_not_background_launches() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 30","_session_id":"sess_check_kill","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&outcome.output);
+
+        // Observing a still-running process is an observation, not a fresh
+        // detach: only the launch receipt carries background_started.
+        let check = tool.handle_check(pid).await.unwrap();
+        assert!(check.output.contains("still running"), "{}", check.output);
+        assert!(!check.metadata.background_started);
+        assert!(!check.metadata.timed_out);
+        assert_eq!(
+            check.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded)
+        );
+
+        let kill = tool.handle_kill(pid).await.unwrap();
+        assert!(
+            !kill.metadata.background_started,
+            "kill receipt must not claim background_started"
+        );
+        assert!(!kill.metadata.timed_out);
+        assert_eq!(
+            kill.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_command_can_create_its_own_declared_write_root() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+
+        let root = std::env::temp_dir().join(format!("aid-own-root-{}", uuid::Uuid::new_v4()));
+        let root_str = root.to_string_lossy().to_string();
+        // The declared write-root grant itself authorizes creating the root:
+        // a plain `mkdir <root>` (the canonical first step of a "create a
+        // workspace" request) must succeed, not collide with a runtime
+        // pre-created directory and fail with EEXIST.
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("mkdir {}", root_str),
+            "write_roots": [root_str],
+            "_session_id": "sess_own_root",
+            "_user_role": "Owner",
+        });
+        let outcome = tool
+            .call_with_status_outcome(&args.to_string(), None)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.output.contains("File exists"),
+            "runtime must not pre-create the command's own target: {}",
+            outcome.output
+        );
+        assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
+        assert!(
+            root.is_dir(),
+            "command should have created its declared root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn future_write_root_used_as_working_dir_is_prepared_for_spawn() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+
+        let root = std::env::temp_dir().join(format!("aid-cwd-root-{}", uuid::Uuid::new_v4()));
+        let root_str = root.to_string_lossy().to_string();
+        // A declared future root that is also the working directory must
+        // exist before exec; this is the one preparation the runtime still
+        // owns.
+        let args = serde_json::json!({
+            "action": "run",
+            "command": "pwd",
+            "working_dir": root_str,
+            "write_roots": [root_str],
+            "_session_id": "sess_cwd_root",
+            "_user_role": "Owner",
+        });
+        let outcome = tool
+            .call_with_status_outcome(&args.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
