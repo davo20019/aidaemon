@@ -5267,6 +5267,18 @@ impl TerminalTool {
                         ));
                     }
                 }
+                if detach {
+                    // Receipt facts, so a reply never claims a background
+                    // handoff the ledger does not record. `detach` keeps a
+                    // long-lived process alive past task end; it does not
+                    // launch-and-return. A command that finished within the
+                    // foreground window simply ran to completion.
+                    output.push_str(
+                        "\n[SYSTEM receipt facts] detach=true had no effect: the command completed \
+                         before the background threshold (background_started=false, detached=false). \
+                         Report it as a completed synchronous run, not as backgrounded.",
+                    );
+                }
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
                 metadata.semantics = command_semantics.clone();
@@ -7637,7 +7649,7 @@ impl Tool for TerminalTool {
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "Keep the process alive after the task ends"
+                        "description": "Keep a long-lived process alive after the task ends. This does not launch-and-return: a command that finishes within the foreground window runs to completion and is reported as a synchronous run (background_started=false)."
                     },
                     "pid": {
                         "type": "integer",
