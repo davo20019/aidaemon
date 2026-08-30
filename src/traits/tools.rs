@@ -268,7 +268,17 @@ impl ToolMutationEffects {
         let generic_required = required.intersects(Self::UNSPECIFIED);
         let generic_satisfied = !generic_required || !self.is_empty();
         let specific_required = Self(required.0 & !Self::UNSPECIFIED.0);
-        generic_satisfied && self.contains(specific_required)
+        // A precisely typed local write (source file, derived output) is a
+        // workspace write: the broader requirement is satisfied by the more
+        // specific receipt, never the reverse.
+        let widened = if self.intersects(Self::LOCAL_SOURCE_WRITE)
+            || self.intersects(Self::LOCAL_DERIVED_WRITE)
+        {
+            Self(self.0 | Self::LOCAL_WORKSPACE_WRITE.0)
+        } else {
+            self
+        };
+        generic_satisfied && widened.contains(specific_required)
     }
 }
 

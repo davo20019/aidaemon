@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssistantResponseData, AssistantResponseDisposition, Event, EventType,
+    AssistantResponseData, AssistantResponseDisposition, Event, EventType, ExecutorExpectationItem,
     ExecutorExpectationsDeclaredData, ResponseDeliveryData, ResponseDeliveryState,
     TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData, TaskStatus, ToolCallData,
     ToolResultData,
@@ -19,7 +19,7 @@ use super::{
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
     RequestReceiptPredicate, RequestResponseContract, RequestVerificationTargetKind,
-    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
+    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +69,10 @@ pub(crate) struct RunObligation {
     /// write cannot close every "write something" item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_target: Option<crate::traits::RequestVerificationTarget>,
+    /// Human-readable statement of the obligation for demand rendering
+    /// (executor-declared items carry their own description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +106,11 @@ pub(crate) struct RunOperation {
     /// observation obligation it was attempting to satisfy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_capabilities: Vec<crate::traits::ToolEvidenceCapability>,
+    /// Subjects the operation touched or proposed to touch (semantic target
+    /// hints plus the declared access manifest), retained so a refused
+    /// operation can be bound to the resource an obligation concerns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ToolTargetHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,6 +228,11 @@ pub(crate) struct RunAggregate {
     /// The executing model declared typed expectations of its own.
     #[serde(default)]
     pub executor_expectations_present: bool,
+    /// Exact resources the request named for verification (from the
+    /// compiled contract). A refusal touching one of them binds every
+    /// untargeted observation obligation to that boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_targets: Vec<crate::traits::RequestVerificationTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_fingerprint: Option<String>,
     #[serde(default)]
@@ -264,6 +278,7 @@ impl RunAggregate {
             task_id: task_id.into(),
             contract_present: false,
             executor_expectations_present: false,
+            verification_targets: Vec::new(),
             contract_fingerprint: None,
             effect_revision: 0,
             obligations: BTreeMap::new(),
@@ -392,6 +407,7 @@ impl RunAggregate {
         }
         self.contract_present = true;
         self.contract_fingerprint = fingerprint;
+        self.verification_targets = compiled.contract.verification_targets.clone();
         self.obligations
             .retain(|id, _| id.contains("/obligation:checklist:"));
         self.response_contract = compiled.contract.response_contract.clone();
@@ -428,6 +444,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                summary: None,
             });
         }
 
@@ -452,6 +469,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                summary: None,
             });
         }
 
@@ -476,6 +494,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                summary: None,
             });
         }
 
@@ -496,6 +515,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                summary: None,
             });
         }
 
@@ -510,6 +530,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                summary: None,
             });
         }
     }
@@ -575,6 +596,7 @@ impl RunAggregate {
                 required_effect,
                 satisfied_at_revision: existing_revision,
                 satisfying_receipt_ids: existing_proof,
+                summary: Some(executor_item_summary(item, class, required_effect)),
                 required_target,
             });
         }
@@ -645,6 +667,7 @@ impl RunAggregate {
                 policy_denied: false,
                 mutating: false,
                 evidence_capabilities: Vec::new(),
+                targets: Vec::new(),
                 result_id: None,
                 operation_lineage: call.operation_lineage,
             },
@@ -757,6 +780,7 @@ impl RunAggregate {
                 policy_denied: false,
                 mutating: false,
                 evidence_capabilities: Vec::new(),
+                targets: Vec::new(),
                 result_id: None,
                 operation_lineage: None,
             });
@@ -771,6 +795,9 @@ impl RunAggregate {
             if let Some(denial) = receipt.access_denial.as_ref() {
                 operation.evidence_capabilities = denial.proposed_evidence.clone();
             }
+        }
+        if operation.targets.is_empty() {
+            operation.targets = receipt_targets(receipt);
         }
         operation.result_id = Some(result_id.clone());
         let claimed_obligation_ids = operation.obligation_ids.clone();
@@ -1159,6 +1186,21 @@ impl RunAggregate {
                     .evidence_capabilities
                     .iter()
                     .any(|capability| requirement.supports_capability(capability))
+                {
+                    return true;
+                }
+                // …or by the resource: a refusal on one of the request's
+                // named verification targets binds an observation obligation
+                // about "the exact resource named by the request" (typed
+                // target when present, otherwise any verification target).
+                let bound_targets: Vec<&crate::traits::RequestVerificationTarget> =
+                    match requirement.target.as_ref() {
+                        Some(target) => vec![target],
+                        None => self.verification_targets.iter().collect(),
+                    };
+                if bound_targets
+                    .iter()
+                    .any(|target| hints_touch_target(target, &operation.targets))
                 {
                     return true;
                 }
@@ -1666,37 +1708,89 @@ fn evidence_receipt_supports(
     receipt_touches_target(target, receipt)
 }
 
-/// Whether the receipt's dispatched subject set — semantic target hints plus
-/// the declared access manifest (read/write paths) — contains the target.
+/// Subjects a receipt touched or proposed to touch: semantic target hints
+/// plus the declared access manifest (read/write paths and scope roots).
+fn receipt_targets(receipt: &super::ToolReceiptV1) -> Vec<ToolTargetHint> {
+    let mut targets = receipt.semantics.target_hints.clone();
+    if let Some(manifest) = receipt.access_manifest.as_ref() {
+        for hint in manifest
+            .read_targets
+            .iter()
+            .chain(manifest.write_targets.iter())
+        {
+            if !targets.contains(hint) {
+                targets.push(hint.clone());
+            }
+        }
+    }
+    targets
+}
+
+/// Whether the receipt's dispatched subject set contains the target. A path
+/// target is touched by an equal `Path` hint or by a `ProjectScope` root that
+/// is the target itself or one of its ancestors (a directory declared as a
+/// write root covers the directory and everything created inside it).
 fn receipt_touches_target(
     target: &crate::traits::RequestVerificationTarget,
     receipt: &super::ToolReceiptV1,
 ) -> bool {
-    let manifest_targets = receipt.access_manifest.iter().flat_map(|manifest| {
-        manifest
-            .read_targets
-            .iter()
-            .chain(manifest.write_targets.iter())
-    });
-    receipt
-        .semantics
-        .target_hints
-        .iter()
-        .chain(manifest_targets)
-        .any(|hint| match (target.kind, hint.kind) {
-            (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => {
-                target.value == hint.value
-            }
-            (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
-                let expected = crate::execution::normalize_active_path_lexically(&target.value);
-                let actual = crate::execution::normalize_active_path_lexically(&hint.value);
-                expected
-                    .ok()
-                    .zip(actual.ok())
-                    .is_some_and(|(left, right)| left == right)
-            }
-            _ => false,
-        })
+    hints_touch_target(target, &receipt_targets(receipt))
+}
+
+fn hints_touch_target(
+    target: &crate::traits::RequestVerificationTarget,
+    hints: &[ToolTargetHint],
+) -> bool {
+    hints.iter().any(|hint| match (target.kind, hint.kind) {
+        (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => target.value == hint.value,
+        (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
+            let expected = crate::execution::normalize_active_path_lexically(&target.value);
+            let actual = crate::execution::normalize_active_path_lexically(&hint.value);
+            expected
+                .ok()
+                .zip(actual.ok())
+                .is_some_and(|(left, right)| left == right)
+        }
+        (RequestVerificationTargetKind::Path, ToolTargetHintKind::ProjectScope) => {
+            let expected = crate::execution::normalize_active_path_lexically(&target.value);
+            let root = crate::execution::normalize_active_path_lexically(&hint.value);
+            expected.ok().zip(root.ok()).is_some_and(|(target, root)| {
+                let target = target.as_str();
+                let root = root.as_str().trim_end_matches('/');
+                target == root || target.starts_with(&format!("{root}/"))
+            })
+        }
+        _ => false,
+    })
+}
+
+fn executor_item_summary(
+    item: &ExecutorExpectationItem,
+    class: RunObligationClass,
+    required_effect: ToolMutationEffects,
+) -> String {
+    let target = item
+        .targets
+        .first()
+        .map(|target| format!(" on {target}"))
+        .unwrap_or_default();
+    match class {
+        RunObligationClass::Achieve => format!(
+            "checklist item {}: {} — needs a succeeded receipt carrying {}{} (declare the path as write access)",
+            item.index + 1,
+            item.description,
+            required_effect
+                .protocol_names()
+                .join("|"),
+            target
+        ),
+        _ => format!(
+            "checklist item {}: {} — needs a completed observation receipt{}",
+            item.index + 1,
+            item.description,
+            target
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3621,5 +3715,139 @@ mod tests {
         assert!(aggregate
             .obligations
             .contains_key("task:task-1/obligation:evidence:0"));
+    }
+
+    #[test]
+    fn a_project_scope_root_hint_proves_a_path_bound_item_under_it() {
+        // Terminal receipts carry `write_roots`/`read_roots` as ProjectScope
+        // hints: `mkdir -p /tmp/x` declared with write_roots=[/tmp/x].
+        let declared = executor_expectations(vec![
+            checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &["/tmp/x"],
+                "pending",
+            ),
+            checklist_item(1, ToolMutationEffects::NONE, true, &["/tmp/x"], "pending"),
+        ]);
+        let root_hint = |semantics: ToolCallSemantics| {
+            semantics.with_target_hint(crate::traits::ToolTargetHintKind::ProjectScope, "/tmp/x")
+        };
+        let mut events = vec![
+            declared,
+            call("mk", "terminal"),
+            result(
+                "mk",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                root_hint(ToolCallSemantics {
+                    effect: ToolCallEffect::ObservationAndMutation,
+                    mutation_effects: ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    ..ToolCallSemantics::default()
+                }),
+            ),
+            call("chk", "terminal"),
+            result(
+                "chk",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                root_hint(terminal_observation_semantics(None)),
+            ),
+        ];
+        renumber(&mut events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).open_executor_expectations(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_typed_source_write_proves_a_workspace_write_item() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &["/tmp/x/f.txt"],
+                "pending",
+            )]),
+            call("w", "write_file"),
+            result(
+                "w",
+                "write_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics {
+                    effect: ToolCallEffect::Mutation,
+                    mutation_effects: ToolMutationEffects::LOCAL_SOURCE_WRITE,
+                    ..ToolCallSemantics::default()
+                }
+                .with_target_hint(crate::traits::ToolTargetHintKind::Path, "/tmp/x/f.txt"),
+            ),
+        ];
+        renumber(&mut events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).open_executor_expectations(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_refusal_on_a_named_verification_target_closes_the_run_at_that_boundary() {
+        // "Attempt exactly one protected write to P; expected to be denied;
+        // stop immediately." The assessor compiled an untargeted observation
+        // ("the exact resource named by the request") with P as a
+        // verification target. The denied write touched P, so the
+        // observation is bound to the boundary and the run closes there.
+        let mut contract_event = contract(vec![RequestEvidenceRequirement {
+            summary: "Observe the current state of one exact resource".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::LocalWorkspace],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+        contract_event.data["contract"]["verification_targets"] =
+            serde_json::json!([{"kind": "path", "value": "/private/var/root/denied.txt"}]);
+        let mut events = vec![
+            contract_event,
+            call("w", "write_file"),
+            result(
+                "w",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                0,
+                ToolCallSemantics::mutation().with_target_hint(
+                    crate::traits::ToolTargetHintKind::Path,
+                    "/private/var/root/denied.txt",
+                ),
+            ),
+        ];
+        events[2].data["receipt"]["invocation_stage"] =
+            serde_json::json!("rejected_before_dispatch");
+        events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
+        events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "controller_scope_contract_rejected",
+            "enforcement": "controller_enforced"
+        });
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.terminal_policy_denial());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::ClosedByPolicyDenial
+        );
+
+        // A refusal on an unrelated path does not bind: the run stays pending.
+        events[2].data["receipt"]["semantics"]["target_hints"] =
+            serde_json::json!([{"kind": "Path", "value": "/private/var/root/other.txt"}]);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
     }
 }

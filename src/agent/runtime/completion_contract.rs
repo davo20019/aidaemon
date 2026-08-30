@@ -1315,6 +1315,10 @@ pub(super) struct CompletionProgress {
     /// work changed what the ledger can credit, never merely because an
     /// expectation is still open.
     pub verification_demanded_at_completed: Option<usize>,
+    /// `completed_operation_results` at the last demand for the executor's
+    /// own declared checklist items. Bounded the same way: one demand per
+    /// ledger state, never a second one for the same unchanged receipts.
+    pub executor_demanded_at_completed: Option<usize>,
     /// Count of times the response-quality nudge has been injected.
     /// Used to prevent infinite nudge loops — only fire once.
     pub quality_nudge_count: usize,
@@ -4664,6 +4668,7 @@ mod tests {
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["receipt-1".to_string()],
                 required_target: None,
+                summary: None,
             },
         );
 

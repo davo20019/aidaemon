@@ -54,6 +54,11 @@ const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 /// so a slow model or a wedged continuation can never strand the user's final
 /// answer or monopolize the global re-engagement serializer indefinitely.
 const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// `detach=true` is a launch-and-return contract: the process is given this
+/// brief startup window so an immediate failure (bad binary, usage error) is
+/// still reported synchronously with its exit code, then it is handed to
+/// background tracking with a typed `process_state` receipt.
+const DETACH_STARTUP_GRACE: Duration = Duration::from_millis(1500);
 
 /// A disowned background process (notifier-active, non-detached) that makes no
 /// progress (no CPU time, disk I/O, output growth, or process-tree change) for
@@ -5151,7 +5156,13 @@ impl TerminalTool {
             exit_code
         });
 
-        // Wait up to initial_timeout for the reader (and thus the process) to finish.
+        // Wait up to initial_timeout for the reader (and thus the process) to
+        // finish. A detached launch waits only for the startup grace.
+        let foreground_wait = if detach {
+            self.initial_timeout.min(DETACH_STARTUP_GRACE)
+        } else {
+            self.initial_timeout
+        };
         let poll_finished = async {
             loop {
                 if reader_handle.is_finished() {
@@ -5161,7 +5172,7 @@ impl TerminalTool {
             }
         };
 
-        match tokio::time::timeout(self.initial_timeout, poll_finished).await {
+        match tokio::time::timeout(foreground_wait, poll_finished).await {
             Ok(()) => {
                 // Process finished within timeout — collect output.
                 let exit_code = reader_handle.await.ok().flatten();
@@ -5317,7 +5328,7 @@ impl TerminalTool {
                 }
 
                 // Non-daemon command: move process to background tracking.
-                let elapsed = self.initial_timeout.as_secs();
+                let elapsed = foreground_wait.as_secs();
                 let partial_stdout = {
                     let b = stdout_buf.lock().await;
                     let tail = if b.len() > 500 {
@@ -5349,7 +5360,7 @@ impl TerminalTool {
                     dedupe_key: Some(dedupe_key.clone()),
                     owner_task_id: owner_task_id.clone(),
                     detached: detach,
-                    started_at: Instant::now() - self.initial_timeout,
+                    started_at: Instant::now() - foreground_wait,
                     stdout_buf,
                     stderr_buf,
                     reader_handle,
@@ -5418,7 +5429,7 @@ impl TerminalTool {
                         let running = self.running.lock().await;
                         running.get(&pid).map(|p| p.stderr_buf.clone())
                     };
-                    let started_at_for_notify = Instant::now() - self.initial_timeout;
+                    let started_at_for_notify = Instant::now() - foreground_wait;
                     let max_output_chars = self.max_output_chars;
                     let status_tx_for_notify = status_tx.clone();
                     if let (Some(stdout_buf), Some(stderr_buf)) =
@@ -6364,13 +6375,25 @@ impl TerminalTool {
                     notify_on_completion.store(false, Ordering::Relaxed);
                 }
 
-                let mut msg = format!(
-                    "Command still running after {}s. Moved to background (pid={}).\n\
-                     IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
-                     You can run other commands (like curl) while this runs in the background.\n\
-                     Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
-                    elapsed, pid, pid, pid
-                );
+                let mut msg = if detach {
+                    format!(
+                        "Detached launch: the process passed its {:.1}s startup check and is running in the background (pid={}).\n\
+                         IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
+                         Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
+                        foreground_wait.as_secs_f32(),
+                        pid,
+                        pid,
+                        pid
+                    )
+                } else {
+                    format!(
+                        "Command still running after {}s. Moved to background (pid={}).\n\
+                         IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
+                         You can run other commands (like curl) while this runs in the background.\n\
+                         Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
+                        elapsed, pid, pid, pid
+                    )
+                };
                 if detach {
                     msg.push_str(
                         "\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
@@ -6387,14 +6410,23 @@ impl TerminalTool {
                 if !partial_stdout.is_empty() {
                     msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
                 }
+                // A process now running independently of this call is a
+                // typed process-state change on top of whatever the command
+                // was declared to observe or write.
+                let background_semantics = ToolCallSemantics::observation_and_mutation_with(
+                    command_semantics
+                        .mutation_effects
+                        .union(ToolMutationEffects::PROCESS_STATE),
+                )
+                .with_verification_mode(ToolVerificationMode::ResultContent);
                 Ok(ToolCallOutcome {
                     metadata: ToolCallMetadata {
                         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
                         background_started: true,
-                        timed_out: true,
+                        timed_out: !detach,
                         detached: detach,
                         completion_notifications_enabled: !detach && notifier_started,
-                        semantics: command_semantics,
+                        semantics: background_semantics,
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
@@ -7637,7 +7669,7 @@ impl Tool for TerminalTool {
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "Keep a long-lived process alive after the task ends. This does not launch-and-return: a command that finishes within the foreground window runs to completion and is reported as a synchronous run (background_started=false)."
+                        "description": "Launch-and-return for a long-lived process: after a ~1.5s startup check the command is handed to background tracking (background_started=true, detached=true, pid returned) and survives task end until explicitly killed. A command that exits within the startup check is reported synchronously with its exit code."
                     },
                     "pid": {
                         "type": "integer",
@@ -9668,6 +9700,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_run_launches_and_returns_after_startup_grace() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        // A 30s foreground window: without launch-and-return, `sleep 5`
+        // would run to completion and be reported synchronously.
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let started = Instant::now();
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 5","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "detach must not wait for the command: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            outcome.output.contains("Detached launch"),
+            "{}",
+            outcome.output
+        );
+        assert!(outcome.metadata.background_started);
+        assert!(outcome.metadata.detached);
+        assert!(!outcome.metadata.timed_out);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded)
+        );
+        assert!(outcome
+            .metadata
+            .semantics
+            .mutation_effects
+            .satisfies(ToolMutationEffects::PROCESS_STATE));
+
+        // An immediate failure inside the startup check is still synchronous.
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"exit 3","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.metadata.background_started);
+        assert_eq!(outcome.metadata.exit_code, Some(3));
+    }
+
+    #[tokio::test]
     async fn timed_out_background_run_clears_notification_metadata_when_unavailable() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
@@ -11500,7 +11600,7 @@ mod tests {
             .await
             .unwrap();
         let pid = extract_pid_from_background_message(&response);
-        assert!(response.contains("Moved to background (pid="));
+        assert!(response.contains("Detached launch"), "{response}");
         assert!(response.contains("Detached mode is enabled"));
 
         tool.on_task_end("task-detach", "s1").await.unwrap();

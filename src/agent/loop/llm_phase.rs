@@ -2395,6 +2395,7 @@ mod tests {
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["result-1".to_string()],
                 required_target: None,
+                summary: None,
             },
         );
         aggregate.operations.insert(
@@ -2412,6 +2413,7 @@ mod tests {
                 policy_denied: false,
                 mutating: false,
                 evidence_capabilities: Vec::new(),
+                targets: Vec::new(),
                 result_id: Some("result-1".to_string()),
                 operation_lineage: None,
             },

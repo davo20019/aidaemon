@@ -130,10 +130,16 @@ impl RequestedOutcomeCondition {
                     && invocation_stage.reached_dispatch()
                     && !contract_rejected
             }
+            // A command that ran and reported a nonzero exit is a failed
+            // invocation from the request's point of view ("run `false`;
+            // expect it to fail") even though the adapter types it as a
+            // negative result rather than a tool failure.
             Self::Failed => {
                 matches!(
                     outcome,
-                    ToolOutcomeStatus::FailedRetryable | ToolOutcomeStatus::FailedPermanent
+                    ToolOutcomeStatus::FailedRetryable
+                        | ToolOutcomeStatus::FailedPermanent
+                        | ToolOutcomeStatus::CompletedWithNegativeResult
                 ) && invocation_stage.reached_dispatch()
                     && !contract_rejected
             }

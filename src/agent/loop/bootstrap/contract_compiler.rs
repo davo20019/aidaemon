@@ -1177,6 +1177,43 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
     compiled.tool_authority_valid = tool_authority_valid;
     compiled.decisions.extend(authority_decisions);
 
+    // A blanket tool prohibition is the assessor's over-approximation of an
+    // enumerated "do not use memory / terminal / filesystem / …" list. When
+    // the same assessment proposes observation obligations, the two lanes
+    // contradict: nothing can be observed with zero
+    // tools, and the run closes "unknown" for every field. The enumerated
+    // forbidden scopes are the typed authority; the blanket flag is dropped so
+    // admissibility is decided per tool scope. Only the flag is narrowed —
+    // forbidden scopes, mutation scope, and allowed tool names are untouched.
+    let observation_candidates = input
+        .signals
+        .evidence_requirements
+        .as_ref()
+        .map_or(0, Vec::len)
+        + input
+            .signals
+            .required_invocations
+            .as_ref()
+            .map_or(0, Vec::len);
+    let observing_lifecycle =
+        !compiled.evidence_requirements.is_empty() || !compiled.required_invocations.is_empty();
+    if compiled.tool_authority_valid
+        && compiled.authority.forbids_tool_use
+        // Enumerated scopes are the evidence that the prohibition was a list
+        // ("no memory, terminal, filesystem…"), not a blanket "no tools".
+        && !compiled.authority.forbidden_tool_scopes.is_empty()
+        && (observation_candidates > 0 || observing_lifecycle)
+    {
+        compiled.authority.forbids_tool_use = false;
+        compiled.decisions.push(decision(
+            "composition",
+            true,
+            "tool_prohibition_narrowed_to_forbidden_scopes",
+            1 + observation_candidates,
+            1 + observation_candidates,
+        ));
+    }
+
     if compiled.core.as_ref().is_some_and(|core| {
         core.expects_mutation
             && ((compiled.mutation_authority_valid
@@ -1613,6 +1650,69 @@ mod tests {
             decision.lane == "composition"
                 && decision.reason_code == "mutation_lifecycle_conflicts_with_tool_prohibition"
         }));
+    }
+
+    #[test]
+    fn tool_prohibition_with_observation_obligations_narrows_to_forbidden_scopes() {
+        // "Read-only audit; do not use memory, terminal, filesystem, … ;
+        // inspect only the existing state needed to report X" compiled to
+        // tool_scope=forbidden AND seven observation obligations. Zero tools
+        // cannot observe anything; the enumerated scopes are the authority.
+        let mut signals = base_signals();
+        signals.task_kind = Some("check".to_string());
+        signals.requires_observation = Some(true);
+        signals.tool_scope = Some("forbidden".to_string());
+        signals.forbidden_tool_scopes = vec![ToolSemanticScope::UserMemory];
+        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
+            summary: "Report the schedule state".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::GoalState],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Canonical,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+
+        let compiled = compile(&signals);
+        assert!(compiled.tool_authority_valid);
+        assert!(!compiled.authority.forbids_tool_use);
+        assert_eq!(
+            compiled.authority.forbidden_tool_scopes,
+            vec![ToolSemanticScope::UserMemory]
+        );
+        assert!(compiled.decisions.iter().any(|decision| {
+            decision.lane == "composition"
+                && decision.reason_code == "tool_prohibition_narrowed_to_forbidden_scopes"
+        }));
+    }
+
+    #[test]
+    fn blanket_tool_prohibition_with_obligations_still_forbids_tools() {
+        // "Do not use any tools" with a current-fact evidence requirement: no
+        // enumerated scopes, so the prohibition is a real blanket and stays.
+        let mut signals = base_signals();
+        signals.tool_scope = Some("forbidden".to_string());
+        signals.evidence_requirements = Some(vec![RequestEvidenceRequirement {
+            summary: "Establish the current release".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Direct,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        }]);
+        let compiled = compile(&signals);
+        assert!(compiled.authority.forbids_tool_use);
+    }
+
+    #[test]
+    fn tool_prohibition_without_obligations_still_forbids_tools() {
+        let mut signals = base_signals();
+        signals.tool_scope = Some("forbidden".to_string());
+        let compiled = compile(&signals);
+        assert!(compiled.authority.forbids_tool_use);
     }
 
     #[test]

@@ -740,7 +740,11 @@ pub(super) async fn run_completion_phase(
         // even after other work completed (bounded by the deferral streak).
         let executor_demands_work = reachable_obligation_ids
             .iter()
-            .any(|id| id.contains("/obligation:checklist:"));
+            .any(|id| id.contains("/obligation:checklist:"))
+            // Bounded by receipts: demand again only after completed work has
+            // changed since the last demand (or none was issued yet).
+            && completion_progress.executor_demanded_at_completed
+                != Some(execution_state.completed_operation_results);
         let compiled_expectation_count = turn_context
             .completion_contract
             .expectations()
@@ -753,7 +757,9 @@ pub(super) async fn run_completion_phase(
                     .iter()
                     .filter_map(|id| aggregate.obligations.get(id))
                     .map(|obligation| {
-                        if let Some(requirement) = obligation.evidence_requirement.as_ref() {
+                        if let Some(summary) = obligation.summary.as_ref() {
+                            summary.clone()
+                        } else if let Some(requirement) = obligation.evidence_requirement.as_ref() {
                             requirement.summary.clone()
                         } else if let Some(predicate) = obligation.receipt.as_ref() {
                             format!("invoke {}", predicate.tool_names.join("/"))
@@ -1148,6 +1154,10 @@ pub(super) async fn run_completion_phase(
                 pending_system_messages.push(SystemDirective::LedgerExpectationsRequired {
                     expectations: reachable_expectations.clone(),
                 });
+                if executor_demands_work {
+                    completion_progress.executor_demanded_at_completed =
+                        Some(execution_state.completed_operation_results);
+                }
                 agent
                     .emit_decision_point(
                         emitter,
