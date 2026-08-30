@@ -680,9 +680,125 @@ pub(super) async fn run_completion_phase(
         // cannot cross it, so the model's non-empty reply describing that
         // boundary is the closeout; finalization must not demand another
         // evidence-seeking or verification pass.
-        let terminal_policy_denial = execution_state.policy_denied_results > 0
-            && execution_state.completed_operation_results == 0
-            && !model_authored_reply.trim().is_empty();
+        // The receipt ledger is the source of truth: any typed pre-dispatch
+        // denial recorded on a receipt (scope lock, read-only contract,
+        // capability constraint, mandate gate) counts, whichever code path
+        // persisted it. The in-memory counter remains as a fallback for
+        // ledger read failures.
+        let ledger = agent
+            .event_store
+            .task_run_aggregate(session_id, task_id)
+            .await
+            .ok();
+        let ledger_terminal_denial = ledger
+            .as_ref()
+            .is_some_and(|aggregate| aggregate.terminal_policy_denial());
+        // Ledger-first closeout verdict (always computed for telemetry;
+        // authoritative under `[policy] ledger_first_closeout`).
+        let ledger_closeout = ledger.as_ref().map(|aggregate| {
+            let authority = super::closeout::ClosingAuthority::from_authority(
+                turn_context.completion_contract.authority(),
+            );
+            let visible_tools = tool_defs
+                .iter()
+                .filter_map(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<Vec<_>>();
+            let read_only = |tool: &str| {
+                agent
+                    .tools
+                    .iter()
+                    .find(|candidate| candidate.name() == tool)
+                    .map(|candidate| candidate.capabilities().read_only)
+            };
+            aggregate.closeout(|obligation| {
+                super::closeout::obligation_admissible(
+                    obligation,
+                    &authority,
+                    &visible_tools,
+                    read_only,
+                )
+            })
+        });
+        // The ledger verdict is authoritative: only a still-reachable
+        // expectation may demand more work. A closed or unreachable ledger is
+        // a terminal closeout. If the ledger could not be read, nothing extra
+        // is demanded (the finalizer re-reads the ledger).
+        let reachable_obligation_ids: Vec<String> = match ledger_closeout.as_ref() {
+            Some(crate::events::CloseoutDecision::Reachable { obligation_ids }) => {
+                obligation_ids.clone()
+            }
+            _ => Vec::new(),
+        };
+        let ledger_demands_work = !reachable_obligation_ids.is_empty();
+        let compiled_expectation_count = turn_context
+            .completion_contract
+            .expectations()
+            .evidence_requirements
+            .len();
+        let reachable_expectations: Vec<String> = ledger
+            .as_ref()
+            .map(|aggregate| {
+                reachable_obligation_ids
+                    .iter()
+                    .filter_map(|id| aggregate.obligations.get(id))
+                    .map(|obligation| {
+                        if let Some(requirement) = obligation.evidence_requirement.as_ref() {
+                            requirement.summary.clone()
+                        } else if let Some(predicate) = obligation.receipt.as_ref() {
+                            format!("invoke {}", predicate.tool_names.join("/"))
+                        } else {
+                            obligation.id.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(decision) = ledger_closeout.as_ref() {
+            let (reachable, blocked): (Vec<String>, Vec<serde_json::Value>) = match decision {
+                crate::events::CloseoutDecision::Reachable { obligation_ids } => {
+                    (obligation_ids.clone(), Vec::new())
+                }
+                crate::events::CloseoutDecision::Unreachable { blocked } => (
+                    Vec::new(),
+                    blocked
+                        .iter()
+                        .map(|(id, reason)| json!({ "obligation_id": id, "reason": reason }))
+                        .collect(),
+                ),
+                crate::events::CloseoutDecision::Closed { .. } => (Vec::new(), Vec::new()),
+            };
+            agent
+                .emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::PostExecutionValidation,
+                    format!("Ledger closeout verdict: {}", decision.verdict()),
+                    json!({
+                        "condition": "ledger_closeout",
+                        "verdict": decision.verdict(),
+                        "proof_basis": match decision {
+                            crate::events::CloseoutDecision::Closed { proof_basis } => Some(*proof_basis),
+                            _ => None,
+                        },
+                        "reachable_obligation_ids": reachable,
+                        "blocked": blocked,
+                        "authoritative": true,
+                        "compiled_expectation_count": compiled_expectation_count,
+                        "legacy_terminal_policy_denial": ledger_terminal_denial,
+                        "legacy_evidence_requirements_satisfied": completion_progress.all_evidence_requirements_satisfied(),
+                        "legacy_verification_pending": completion_progress.verification_pending,
+                    }),
+                )
+                .await;
+        }
+        let terminal_policy_denial =
+            ledger_terminal_denial && !model_authored_reply.trim().is_empty();
         if terminal_policy_denial {
             agent
                 .emit_decision_point(
@@ -694,7 +810,7 @@ pub(super) async fn run_completion_phase(
                         .to_string(),
                     json!({
                         "condition": "policy_denial_terminal_observation",
-                        "policy_denied_results": execution_state.policy_denied_results,
+                        "ledger_terminal_denial": ledger_terminal_denial,
                         "reply_chars": model_authored_reply.chars().count(),
                     }),
                 )
@@ -989,16 +1105,20 @@ pub(super) async fn run_completion_phase(
             );
             // Fall through to the normal completion path (sanitize + return)
         } else if !terminal_policy_denial
-            && should_enforce_no_tool_text_when_tools_required(
-            &reply,
-            execution_tool_recovery,
-            execution_state.completed_operation_results
-                + usize::from(
-                    completion_progress.observation_count > 0
-                        && completion_progress.all_evidence_requirements_satisfied(),
-                ),
-            agent.depth,
-        ) {
+            // Both reasons to ask apply only while no operation has completed.
+            // After the model answers a demand with completed work, its
+            // narrated limitation is accepted and the finalizer labels the run
+            // from receipts — a reachable-but-unmet expectation never holds a
+            // reply hostage a second time. A backgrounded launch is dispatched
+            // but not completed, so an unfulfilled change still gets its pass.
+            && execution_state.completed_operation_results == 0
+            // Either the ledger says an expectation is still reachable, or a
+            // dispatched operation failed with nothing succeeding after it (a
+            // receipt fact, not a contract one) — one bounded recovery pass.
+            && (ledger_demands_work
+                || unresolved_recoverable_failure
+                || unresolved_nonrecoverable_failure)
+        {
             if tool_defs.is_empty() || force_text_response {
                 if !force_text_response {
                     // Only show the "no tools available" message when tools are genuinely
@@ -1017,20 +1137,23 @@ pub(super) async fn run_completion_phase(
                 stall_count = 0;
                 consecutive_clean_iterations = 0;
 
-                pending_system_messages
-                    .push(SystemDirective::ExecutionResolutionEvidenceRequired);
-                agent.emit_decision_point(
-                            emitter,
-                            task_id,
-                            iteration,
-                            DecisionType::IntentGate,
-                            "Execution obligation enforced: evidence-seeking pass required before text completion"
-                                .to_string(),
-                            json!({
-                                "condition":"tools_required_no_tool_response",
-                                "reply_len": reply.len(),
-                                "deferred_no_tool_streak": deferred_no_tool_streak
-                            }),
+                pending_system_messages.push(SystemDirective::LedgerExpectationsRequired {
+                    expectations: reachable_expectations.clone(),
+                });
+                agent
+                    .emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::IntentGate,
+                        "Ledger expectations still reachable: bounded evidence pass requested"
+                            .to_string(),
+                        json!({
+                            "condition": "ledger_expectations_required",
+                            "reachable_obligation_ids": reachable_obligation_ids,
+                            "reply_len": reply.len(),
+                            "deferred_no_tool_streak": deferred_no_tool_streak
+                        }),
                     )
                     .await;
                 warn!(
@@ -1703,8 +1826,8 @@ pub(super) async fn run_completion_phase(
 
             // If the standard observation contract is also still pending, handle it
             if completion_progress.verification_pending
-                && turn_context.completion_contract.requires_observation
                 && !terminal_policy_denial
+                && ledger_demands_work
             {
                 let has_concrete_progress = super::stopping_progress::has_any_concrete_execution(
                     turn_context,
@@ -1842,6 +1965,7 @@ pub(super) async fn run_completion_phase(
                                 aggregate.terminal_decision(),
                                 crate::events::RunTerminalDecision::Succeeded
                                     | crate::events::RunTerminalDecision::SucceededByEvidence
+                | crate::events::RunTerminalDecision::ClosedByPolicyDenial
                             )
                         } else {
                             result.completed_observation()
@@ -2755,9 +2879,17 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
-        // Exact-history obligations are structural and close only from the
-        // canonical history capability, regardless of answer wording.
-        if turn_context.completion_contract.requires_exact_history
+        // Exact-history obligations are structural and close only from a
+        // canonical history capability, regardless of answer wording. Two
+        // capabilities are canonical: a successful `search_history` receipt,
+        // and the runtime's own typed projection of the exact persisted
+        // antecedent into this turn (`required_context_projected`) — the
+        // retained history delivered verbatim, which no tool lookup could
+        // improve on and which a tool-forbidding request cannot otherwise
+        // obtain.
+        let expectations = turn_context.completion_contract.expectations();
+        if expectations.requires_exact_history
+            && !execution_state.exact_context_projected
             && !execution_state
                 .outcome_ledger
                 .iter()
@@ -2790,8 +2922,8 @@ pub(super) async fn run_completion_phase(
         // Explicit source contract: both successful source-page reads and
         // direct citations in the candidate answer are required. Approval
         // prompts cannot count as evidence because they produce neither.
-        if turn_context.completion_contract.minimum_sources > 0 {
-            let required = turn_context.completion_contract.minimum_sources;
+        if expectations.minimum_sources > 0 {
+            let required = expectations.minimum_sources;
             let sources_read = execution_state.web_source_urls.len();
             let sources_cited = execution_state.cited_web_source_count(&reply);
             if sources_read < required || sources_cited < required {

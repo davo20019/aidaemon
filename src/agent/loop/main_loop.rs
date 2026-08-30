@@ -681,6 +681,7 @@ impl Agent {
             })
             .flatten();
 
+        let mut exact_context_projected = false;
         if let Some(antecedent_user_message_id) = preserve_archived_context
             .then_some(turn_context.visible_antecedent_user_message_id.as_deref())
             .flatten()
@@ -693,6 +694,7 @@ impl Agent {
                     task_context_tail.push_str("\n\n");
                 }
                 task_context_tail.push_str(&projection.rendered);
+                exact_context_projected = !projection.truncated;
                 self.emit_decision_point(
                     &emitter,
                     &task_id,
@@ -1086,6 +1088,7 @@ impl Agent {
                 ExecutionPersistence::Ephemeral
             },
         );
+        execution_state.exact_context_projected = exact_context_projected;
         if let Some(snapshot) = resume_execution_snapshot {
             execution_state.execution_id = snapshot.execution_id;
             execution_state.last_outcome = snapshot.last_outcome;
@@ -2242,6 +2245,7 @@ impl Agent {
                     run_aggregate.terminal_decision(),
                     crate::events::RunTerminalDecision::Succeeded
                         | crate::events::RunTerminalDecision::SucceededByEvidence
+                        | crate::events::RunTerminalDecision::ClosedByPolicyDenial
                 )
             } else {
                 result.receipt.as_ref().is_some_and(|receipt| {

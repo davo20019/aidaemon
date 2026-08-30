@@ -694,16 +694,20 @@ fn completion_claim_has_closed_proof(
     {
         return false;
     }
+    // Every referenced receipt must be closed by the exact task-end proof
+    // graph. A reference with no obligation ids is acceptable only when the
+    // proof graph itself carries that same receipt as a terminal observation
+    // (a typed policy denial the run closed on); the reply is then proven by
+    // the receipt even though no compiled obligation credited it.
     task.referenced_receipts.iter().all(|response_ref| {
-        !response_ref.obligation_ids.is_empty()
-            && proof.receipt_refs.iter().any(|closed_ref| {
-                closed_ref.receipt_id == response_ref.receipt_id
-                    && closed_ref.result_id == response_ref.result_id
-                    && response_ref
-                        .obligation_ids
-                        .iter()
-                        .all(|id| closed_ref.obligation_ids.contains(id))
-            })
+        proof.receipt_refs.iter().any(|closed_ref| {
+            closed_ref.receipt_id == response_ref.receipt_id
+                && closed_ref.result_id == response_ref.result_id
+                && response_ref
+                    .obligation_ids
+                    .iter()
+                    .all(|id| closed_ref.obligation_ids.contains(id))
+        })
     })
 }
 

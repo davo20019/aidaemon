@@ -16,6 +16,33 @@ pub enum PermissionMode {
     Yolo,
 }
 
+/// Where `terminal` commands execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalConfinement {
+    /// Run commands directly on the host as the daemon's user, with the
+    /// host's environment, network, and credentials. The default: what a
+    /// person at the shell gets, so deploys, package managers, and
+    /// authenticated CLIs just work.
+    #[default]
+    Host,
+    /// Run every command inside the OS sandbox (macOS seatbelt / Codex
+    /// sandbox) with deny-by-default filesystem and network policy scoped
+    /// to the task. Opt-in for advanced users who want blast-radius
+    /// containment; expect tools that rely on `$HOME` credentials or the
+    /// network to need explicit grants.
+    Sandbox,
+}
+
+impl std::fmt::Display for TerminalConfinement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => write!(f, "host"),
+            Self::Sandbox => write!(f, "sandbox"),
+        }
+    }
+}
+
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -793,9 +793,19 @@ impl EventStore {
              FROM events
              WHERE event_type = 'tool_result' AND task_id = ?
                AND json_extract(data, '$.receipt.schema_version') IS NOT NULL
-               AND json_array_length(
-                    COALESCE(json_extract(data, '$.receipt.completion_obligation_ids'), '[]')
-                   ) > 0
+               AND (
+                    json_array_length(
+                        COALESCE(json_extract(data, '$.receipt.completion_obligation_ids'), '[]')
+                    ) > 0
+                    -- A typed pre-dispatch policy denial is a terminal
+                    -- observation of the request's authority boundary; the
+                    -- reply that narrates it is proven by that receipt even
+                    -- when no compiled obligation credited it.
+                    OR (
+                        json_extract(data, '$.receipt.invocation_stage') = 'rejected_before_dispatch'
+                        AND json_extract(data, '$.receipt.access_denial') IS NOT NULL
+                    )
+               )
              ORDER BY id ASC",
         )
         .bind(task_id)
@@ -2551,7 +2561,8 @@ impl EventStore {
             (
                 _,
                 super::RunTerminalDecision::Succeeded
-                | super::RunTerminalDecision::SucceededByEvidence,
+                | super::RunTerminalDecision::SucceededByEvidence
+                | super::RunTerminalDecision::ClosedByPolicyDenial,
             ) => crate::events::TaskOutcome::Succeeded,
             (_, super::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
@@ -2588,6 +2599,9 @@ impl EventStore {
                 }
                 super::RunTerminalDecision::SucceededByEvidence => {
                     Some(crate::events::TaskProofBasis::Evidence)
+                }
+                super::RunTerminalDecision::ClosedByPolicyDenial => {
+                    Some(crate::events::TaskProofBasis::PolicyDenial)
                 }
                 _ => None,
             },

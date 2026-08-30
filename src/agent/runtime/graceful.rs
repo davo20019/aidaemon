@@ -1105,13 +1105,25 @@ impl Agent {
             .task_run_aggregate(emitter.session_id(), task_id)
             .await
             .unwrap_or_else(|_| crate::events::RunAggregate::new(task_id));
-        let terminal_decision = run_aggregate.terminal_decision();
+        // At task end there is no loop left to make progress: a `Pending`
+        // ledger whose terminal receipts all succeeded or were credited is
+        // closed by evidence (the still-open obligations are descriptions the
+        // contract could not bind to the work that demonstrably happened).
+        let terminal_decision = match run_aggregate.terminal_decision() {
+            crate::events::RunTerminalDecision::Pending
+                if status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
+            {
+                crate::events::RunTerminalDecision::SucceededByEvidence
+            }
+            decision => decision,
+        };
         let effective_outcome = match (status, terminal_decision) {
             (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
             (
                 _,
                 crate::events::RunTerminalDecision::Succeeded
-                | crate::events::RunTerminalDecision::SucceededByEvidence,
+                | crate::events::RunTerminalDecision::SucceededByEvidence
+                | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
             ) => crate::events::TaskOutcome::Succeeded,
             (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
             (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
@@ -1187,6 +1199,9 @@ impl Agent {
             }
             crate::events::RunTerminalDecision::SucceededByEvidence => {
                 Some(crate::events::TaskProofBasis::Evidence)
+            }
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial => {
+                Some(crate::events::TaskProofBasis::PolicyDenial)
             }
             _ => None,
         };

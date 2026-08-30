@@ -843,6 +843,7 @@ pub async fn confirm_skills<'a>(
     candidates: Vec<&'a Skill>,
     user_message: &str,
     state: Option<&Arc<dyn StateStore>>,
+    telemetry: Option<(Arc<crate::events::EventStore>, &str)>,
 ) -> anyhow::Result<Vec<&'a Skill>> {
     if candidates.is_empty() {
         return Ok(candidates);
@@ -867,13 +868,34 @@ pub async fn confirm_skills<'a>(
         json!({"role": "user", "content": prompt}),
     ];
 
+    let started = std::time::Instant::now();
     let response = provider.chat(fast_model, &messages, &[]).await?;
 
-    // Track token usage for skill confirmation LLM calls
-    if let (Some(state), Some(usage)) = (state, &response.usage) {
-        let _ = state
-            .record_token_usage("background:skill_confirmation", usage, None)
+    // Every model call records one correlated llm_call event plus its token
+    // projection under one call id; an uncorrelated token row would show up
+    // as an unattributed legacy row in telemetry reconciliation.
+    match (state, telemetry) {
+        (Some(state), Some((event_store, session_id))) => {
+            crate::events::record_background_model_call_telemetry(
+                event_store,
+                state.as_ref(),
+                session_id,
+                "skill_confirmation",
+                fast_model,
+                &response,
+                started.elapsed(),
+            )
             .await;
+        }
+        (Some(state), None) => {
+            if let Some(usage) = &response.usage {
+                let call_id = uuid::Uuid::new_v4().to_string();
+                let _ = state
+                    .record_token_usage("background:skill_confirmation", usage, Some(&call_id))
+                    .await;
+            }
+        }
+        _ => {}
     }
 
     let text = response

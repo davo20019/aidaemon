@@ -668,18 +668,6 @@ pub(super) async fn latest_task_tool_result_for_completion(
     choose_completion_recovery_candidate(&interaction_results, max_chars)
 }
 
-pub(super) fn should_enforce_no_tool_text_when_tools_required(
-    _reply: &str,
-    execution_recovery_required: bool,
-    completed_execution_results: usize,
-    _depth: usize,
-) -> bool {
-    if !execution_recovery_required || completed_execution_results > 0 {
-        return false;
-    }
-    true
-}
-
 /// Whether the request carries a concrete mutation destination that the
 /// ledger can validate. A filesystem/project target is stronger evidence than
 /// a verb classification such as "write" or "change".
@@ -1028,7 +1016,6 @@ mod tests {
         choose_completion_recovery_candidate, contract_has_concrete_mutation_target,
         looks_like_recovery_message_with_trivial_content,
         reply_acknowledges_outcome_reconciliation, reply_admits_unfulfilled_request,
-        should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output, summarize_structured_tool_output,
         tool_output_completion_prefix, tool_output_paste_recovery_allowed,
         tool_output_requires_final_synthesis, CompletionRecoveryCandidate,
@@ -1635,72 +1622,6 @@ Top-level keys: data
     #[test]
     fn do_not_recover_completion_for_sub_agent_depth() {
         assert!(!should_recover_completion_from_tool_output("Done.", 1, 1));
-    }
-
-    #[test]
-    fn enforce_tools_contract_for_text_reply_without_any_tool_attempt() {
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "The file was not found.",
-            true,
-            0,
-            0
-        ));
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "I can’t adjust the Companion speaker because that control is not exposed.",
-            true,
-            0,
-            0
-        ));
-    }
-
-    #[test]
-    fn typed_execution_requirement_is_not_overridden_by_answer_prose() {
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "I prepared the requested draft and did not activate anything.",
-            true,
-            0,
-            0
-        ));
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "Here is the recap based on our prior conversation.",
-            true,
-            0,
-            0
-        ));
-    }
-
-    #[test]
-    fn do_not_enforce_tools_contract_after_tool_attempts_exist() {
-        assert!(!should_enforce_no_tool_text_when_tools_required(
-            "The command failed.",
-            true,
-            1,
-            0
-        ));
-    }
-
-    #[test]
-    fn do_not_enforce_tools_contract_when_turn_does_not_require_tools() {
-        assert!(!should_enforce_no_tool_text_when_tools_required(
-            "Paris.", false, 0, 0
-        ));
-    }
-
-    #[test]
-    fn enforce_typed_execution_contract_for_empty_reply() {
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "", true, 0, 0
-        ));
-    }
-
-    #[test]
-    fn enforce_tools_contract_for_sub_agent_depth() {
-        assert!(should_enforce_no_tool_text_when_tools_required(
-            "Need to run tools.",
-            true,
-            0,
-            1
-        ));
     }
 
     #[test]

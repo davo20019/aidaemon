@@ -919,11 +919,22 @@ fn compile_filesystem_access(
             .max_by_key(|ancestor| std::path::Path::new(ancestor.as_str()).components().count())
             .cloned()
     };
+    // Disk reality outranks every declaration: a path that already exists
+    // and is not a directory is an exact resource no matter which role the
+    // assessor placed it in. A directory capability on a file would later be
+    // materialized as a directory by the terminal runtime and break the very
+    // write it was meant to authorize. Unknown (future) paths keep the
+    // declared role.
+    let existing_non_directory = |path: &str| {
+        let candidate = std::path::Path::new(path);
+        candidate.exists() && !candidate.is_dir()
+    };
     let is_directory_capability = |path: &str, explicit_roots: &[String]| {
-        explicit_roots.iter().any(|root| root == path)
-            || execution_cwd.as_deref() == Some(path)
-            || resolved_project_scope.as_deref() == Some(path)
-            || std::path::Path::new(path).is_dir()
+        !existing_non_directory(path)
+            && (explicit_roots.iter().any(|root| root == path)
+                || execution_cwd.as_deref() == Some(path)
+                || resolved_project_scope.as_deref() == Some(path)
+                || std::path::Path::new(path).is_dir())
     };
     let mut read_targets = candidate
         .read_paths
@@ -987,15 +998,22 @@ fn compile_filesystem_access(
             .iter()
             .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)),
     );
+    let root_kind = |path: &str| {
+        if existing_non_directory(path) {
+            ToolTargetHintKind::Path
+        } else {
+            ToolTargetHintKind::ProjectScope
+        }
+    };
     read_targets.extend(
         resolved_read_roots
             .iter()
-            .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)),
+            .filter_map(|path| ToolTargetHint::new(root_kind(path), path)),
     );
     write_targets.extend(
         resolved_write_roots
             .iter()
-            .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path)),
+            .filter_map(|path| ToolTargetHint::new(root_kind(path), path)),
     );
     // A semantic project reference is a typed scope identity, not a prose
     // hint. If a confident local-mutation contract omitted a write role, the
@@ -1858,6 +1876,51 @@ mod tests {
             access.write_targets[0].kind,
             ToolTargetHintKind::ProjectScope
         );
+    }
+
+    #[test]
+    fn an_existing_file_declared_as_a_root_compiles_as_an_exact_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("result.txt");
+        std::fs::write(&file, "existing").expect("write");
+        let file = file.to_string_lossy().to_string();
+        let mut signals = base_signals();
+        signals.task_kind = Some("change".to_string());
+        signals.expects_mutation = Some(true);
+        signals.requires_observation = Some(false);
+        signals.required_effects = Some(vec!["local_workspace_write".to_string()]);
+        // The assessor mis-typed the file as a directory root in both roles.
+        signals.filesystem_access = Some(PlannedFilesystemAccess {
+            write_paths: vec![file.clone()],
+            write_roots: vec![file.clone()],
+            ..PlannedFilesystemAccess::default()
+        });
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            available_tool_names: &["terminal".to_string()],
+            available_tool_receipt_kinds: &[(
+                "terminal".to_string(),
+                crate::traits::ToolReceiptKind::Process,
+            )],
+            structural_filesystem_resources: &[file.clone()],
+            structural_project_scopes: &[],
+            project_alias_roots: &[],
+            current_user_text: "synthetic request",
+        });
+        let access = compiled.filesystem_access.expect("filesystem authority");
+        assert!(
+            access
+                .write_targets
+                .iter()
+                .all(|target| target.kind == ToolTargetHintKind::Path),
+            "an existing file must never become a directory capability: {:?}",
+            access.write_targets
+        );
+        assert!(access
+            .write_targets
+            .iter()
+            .any(|target| target.value == file));
     }
 
     #[test]

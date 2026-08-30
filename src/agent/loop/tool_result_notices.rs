@@ -160,7 +160,10 @@ impl ToolResultNotice {
                 policy_tool_budget, tool_name
             ),
             Self::ScopeLockBlockedResult { tool_name, reason } => format!(
-                "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",
+                "[SYSTEM] Scope lock blocked `{}`: {}. Durable receipt facts: this attempt is \
+                 recorded as one invocation receipt (rejected before dispatch, dispatched=false, \
+                 bytes returned=0); count it as one call when the user asks how many calls were \
+                 made. Continue with tools that stay inside the active request scope.",
                 tool_name, reason
             ),
             Self::ProjectInstructionsDiscovered { tool_name, sources } => format!(

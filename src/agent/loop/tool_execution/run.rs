@@ -132,7 +132,11 @@ async fn mandate_gate_for_tool_call(
     if class == crate::mandates::MandateCallClass::ProtocolObservation {
         return Ok(MandateGateDecision::Allow { grant: None });
     }
-    if class == crate::mandates::MandateCallClass::RecordDecision {
+    if matches!(
+        class,
+        crate::mandates::MandateCallClass::RecordDecision
+            | crate::mandates::MandateCallClass::RecordMeasurement
+    ) {
         return Ok(MandateGateDecision::Allow { grant: None });
     }
     if class == crate::mandates::MandateCallClass::Observation {
@@ -208,7 +212,8 @@ async fn mandate_gate_for_tool_call(
         }),
         crate::mandates::MandateCallClass::ProtocolObservation
         | crate::mandates::MandateCallClass::Observation
-        | crate::mandates::MandateCallClass::RecordDecision => unreachable!(),
+        | crate::mandates::MandateCallClass::RecordDecision
+        | crate::mandates::MandateCallClass::RecordMeasurement => unreachable!(),
     }
 }
 
@@ -520,6 +525,34 @@ async fn persist_pre_dispatch_outcome(
             outcome_status,
             invocation_stage,
             contract_rejected,
+            semantics,
+            access_manifest,
+        )
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_pre_dispatch_policy_denial(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_call: &ToolCall,
+    effective_arguments: &str,
+    result_text: String,
+    reason_code: &str,
+    semantics: ToolCallSemantics,
+    access_manifest: Option<ToolCallAccessManifest>,
+) -> anyhow::Result<()> {
+    agent
+        .persist_pre_dispatch_policy_denial(
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            effective_arguments,
+            result_text,
+            reason_code,
             semantics,
             access_manifest,
         )
@@ -877,7 +910,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &tc.name,
                 active_untrusted_external_reference_skills,
             );
-            persist_pre_dispatch_outcome(
+            persist_pre_dispatch_policy_denial(
                 agent,
                 emitter,
                 session_id,
@@ -885,9 +918,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tc,
                 &tc.arguments,
                 result_text,
-                crate::traits::ToolOutcomeStatus::Blocked,
-                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
+                "untrusted_external_reference_blocked",
                 ToolCallSemantics::default(),
                 None,
             )
@@ -977,7 +1008,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tc.name,
                 prohibited_scope.as_str()
             );
-            persist_pre_dispatch_outcome(
+            persist_pre_dispatch_policy_denial(
                 agent,
                 emitter,
                 session_id,
@@ -985,9 +1016,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tc,
                 &tc.arguments,
                 result_text,
-                crate::traits::ToolOutcomeStatus::Blocked,
-                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
+                "forbidden_tool_scope",
                 ToolCallSemantics::default(),
                 None,
             )
@@ -1070,6 +1099,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         }
 
         let mut effective_arguments = tc.arguments.clone();
+        // Ledger of what the prelude projects into the call on the model's
+        // behalf, so a preparation failure can be attributed and repaired.
+        let mut prelude_projections = super::types::PreludeProjections::default();
+        let mut dropped_projections: Vec<(&'static str, String)> = Vec::new();
         let mut injected_project_dir: Option<String> = None;
         // Scoped file tools resolve relative/default paths inside their own
         // canonical gate. Do not inject the host's absolute project root into
@@ -1228,9 +1261,18 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             .or_insert_with(|| Value::Array(Vec::new()));
                         if let Some(values) = roots.as_array_mut() {
                             for root in authorized_roots {
-                                if !values.iter().any(|value| value.as_str() == Some(&root)) {
-                                    values.push(Value::String(root));
+                                if values.iter().any(|value| value.as_str() == Some(&root)) {
+                                    continue;
                                 }
+                                // A projection is verified against reality
+                                // before it becomes authority: an existing
+                                // non-directory cannot be a directory root.
+                                if super::types::projection_conflicts_with_disk(&root) {
+                                    dropped_projections.push(("write_roots", root));
+                                    continue;
+                                }
+                                prelude_projections.write_roots.push(root.clone());
+                                values.push(Value::String(root));
                             }
                         }
                         effective_arguments = serde_json::to_string(&arguments)?;
@@ -1301,6 +1343,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             .and_then(Value::as_array)
                             .is_some_and(|values| !values.is_empty());
                         if !declared_roots && !declared_paths {
+                            prelude_projections
+                                .read_roots
+                                .extend(authorized_read_roots.iter().cloned());
                             object.insert("read_roots".to_string(), json!(authorized_read_roots));
                             effective_arguments = serde_json::to_string(&arguments)?;
                             if let Some(tool) = registered_tool {
@@ -1348,9 +1393,21 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         } else {
                             false
                         };
-                        if tc.name == "terminal" && has_directory_authority {
+                        let directory_projection_valid = !narrow_scopes
+                            .iter()
+                            .any(|scope| super::types::projection_conflicts_with_disk(scope));
+                        if tc.name == "terminal"
+                            && has_directory_authority
+                            && directory_projection_valid
+                        {
+                            prelude_projections
+                                .write_roots
+                                .extend(narrow_scopes.iter().cloned());
                             object.insert("write_roots".to_string(), json!(narrow_scopes));
                         } else {
+                            prelude_projections
+                                .write_paths
+                                .extend(narrow_scopes.iter().cloned());
                             object.insert("write_paths".to_string(), json!(narrow_scopes));
                         }
                         effective_arguments = serde_json::to_string(&arguments)?;
@@ -1371,6 +1428,32 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     }
                 }
             }
+        }
+        if !dropped_projections.is_empty() {
+            // Boxed: keeps this block's locals off the parent future's frame.
+            Box::pin(async {
+                for (field, value) in dropped_projections.drain(..) {
+                    agent
+                        .emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::ExecutionStateSnapshot,
+                            format!(
+                                "Dropped a {} projection that contradicts disk state",
+                                tc.name
+                            ),
+                            json!({
+                                "condition": "projection_dropped_conflicts_with_disk",
+                                "tool": tc.name,
+                                "field": field,
+                                "value": value,
+                            }),
+                        )
+                        .await;
+                }
+            })
+            .await;
         }
         let call_semantics = if tc.name == "cli_agent"
             && turn_context.completion_contract.forbids_mutation
@@ -1594,13 +1677,30 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             })
             .await?;
         }
-        let access_scope_violation = access_manifest_scope_violation(
+        let mut scope_escalation: Option<crate::traits::ScopeEscalation> = None;
+        let access_scope_violation = match access_manifest_scope_check(
             &tc.name,
             &access_manifest,
             turn_context.filesystem_access.as_ref(),
             &task_authorized_project_scopes,
             known_project_dir.as_deref(),
-        );
+        ) {
+            Some(ScopeCheck::Rejected(reason)) => Some(reason),
+            Some(ScopeCheck::Escalatable { reason, escalation }) => {
+                // The compiled task scope is a planning hint; an exact
+                // out-of-scope target the tool declared is carried to the
+                // user's approval prompt, where the real authority lives.
+                info!(
+                    tool = %tc.name,
+                    reads = ?escalation.read_paths,
+                    writes = ?escalation.write_paths,
+                    "Scope escalation routed to tool approval: {reason}"
+                );
+                scope_escalation = Some(escalation);
+                None
+            }
+            None => None,
+        };
         let step_scope_violation =
             target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
         let blocked_dependency = if call_semantics.mutates_state() {
@@ -1649,14 +1749,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &operation_claim,
             )
             .await?;
-            // The denial is a typed terminal observation of the request's
-            // authority boundary; finalization uses this count to let the
-            // model narrate it instead of demanding another evidence pass.
-            execution_state.record_operation_result(
-                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
-                true,
-            );
             execution_state.record_tool_call();
             validation_state.record_failure(ValidationFailure::ScopeViolation);
             validation_state.note_replan();
@@ -2140,7 +2232,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             warn!(task_id = %tid, %error, "Failed to log mandate gate denial");
                         }
                     }
-                    persist_pre_dispatch_outcome(
+                    persist_pre_dispatch_policy_denial(
                         agent,
                         emitter,
                         session_id,
@@ -2148,9 +2240,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         tc,
                         &effective_arguments,
                         result_text,
-                        crate::traits::ToolOutcomeStatus::Blocked,
-                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                        false,
+                        &format!("mandate_authority_{reason}"),
                         call_semantics.clone(),
                         Some(access_manifest.clone()),
                     )
@@ -2211,6 +2301,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 mandate_authority: mandate_authority_grant.as_ref(),
                 mandate_execution: is_mandate_execution,
                 mutation_forbidden: turn_context.completion_contract.forbids_mutation,
+                scope_escalation: scope_escalation.as_ref(),
+                prelude_projections: &prelude_projections,
             },
         )
         .await;
@@ -2583,7 +2675,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             execution_state.record_operation_result(
                 result_metadata.invocation_stage,
                 outcome_satisfied || lazy_observation_completed,
-                result_metadata.access_denial.is_some(),
             );
             // Advance linear intent step pointer on successful external mutation
             if domain_outcome_satisfied && planned_step.is_some() {

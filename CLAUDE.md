@@ -33,6 +33,13 @@ cargo clippy --all-features -- -D warnings
 
 No `rustfmt.toml` is present; use default Rust formatting.
 
+The agent loop is a deep async state machine and debug-profile poll frames are
+large. The daemon runtime already uses an 8 MiB worker stack (`src/lib.rs`);
+CI runs tests with `RUST_MIN_STACK=8388608` so test threads get the same budget. If a local `cargo test` aborts with
+`has overflowed its stack`, run it with that variable set rather than
+shrinking a frame by hand; the suite sits within a few percent of libtest's
+2 MiB default.
+
 ## Pre-Commit Checklist
 
 Before committing release-quality code:
@@ -262,6 +269,16 @@ happened. Observed receipts are the ground truth: a run whose terminal receipts
 all succeeded or were credited closes as `succeeded` with
 `proof_basis=evidence` even when the contract could not credit it
 (`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
+
+The ledger-first arbiter (`RunAggregate::closeout`, admissibility in
+`src/agent/loop/closeout.rs`) is the intended home for any new "may the loop
+demand more work?" decision: authority gates admission, expectations are
+verified by receipts, and only a *reachable* expectation may ask for another
+pass. It is authoritative: the completion phase asks for more work only on a
+`reachable` verdict (`ledger_expectations_required`), and records every
+verdict as a `ledger_closeout` decision point. `CompletionContract::authority()`
+is the only contract view a gate may read; `expectations()` is verified by
+receipts, never enforced directly. Do not add a gate anywhere else.
 
 Do not add new obligation classes, cardinality features, stop-trigger kinds,
 or response-projection rules to make a single live test pass. If a live

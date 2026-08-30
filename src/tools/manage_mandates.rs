@@ -50,6 +50,7 @@ const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
+const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Identifiers of successful tool receipts from this run only: either the tool_call_id you issued (e.g. call_...) or the result_id shown in that result's receipt footer (e.g. sha256:...). Receipts from other runs, failed calls, or invented IDs are rejected.";
 const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
 const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
 const PRIORITY_FIELD_DESCRIPTION: &str = "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.";
@@ -1718,6 +1719,10 @@ impl ManageMandatesTool {
         }
         let rationale =
             required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
+        anyhow::ensure!(
+            !crate::traits::is_runtime_fallback_rationale(rationale),
+            "rationale is reserved for the runtime fallback marker"
+        );
         let mut decision =
             MandateDecisionCycle::new(&mandate.id, &run.id, outcome, rationale, mandate.version);
         decision.activity_level =
@@ -2256,11 +2261,11 @@ impl Tool for ManageMandatesTool {
                     "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
                     "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
-                    "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), "question": bounded_text(MAX_QUESTION_TEXT),
+                    "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "question": bounded_text(MAX_QUESTION_TEXT),
                     "measurement_value_micros": { "type": "integer" }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
                     "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
                     "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
-                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), "strategy_key": bounded_text(64),
+                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "strategy_key": bounded_text(64),
                     "target_session_id": described(bounded_text(256), TRANSFER_SESSION_DESCRIPTION),
                     "strategy_kind": text_enum(STRATEGY_KINDS), "strategy_confidence_bps": integer_range(0, 10000), "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
@@ -2334,7 +2339,9 @@ impl Tool for ManageMandatesTool {
             });
         match action.as_deref() {
             Some("draft" | "list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
-            Some("record_decision" | "record_measurement") => ToolCallSemantics::administrative(),
+            Some(action) if crate::mandates::deliberator_protocol_class(action).is_some() => {
+                ToolCallSemantics::administrative()
+            }
             _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
         }
     }

@@ -659,7 +659,194 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
 /// contract compiler, but the execution lifecycle is usable only when its
 /// core and proof graph agree. This is intentionally narrower than
 /// `planned_contract_is_complete`.
-pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSignals) -> bool {
+/// Normalize a producer's lifecycle lanes where the typed signals already
+/// determine the answer. A contract whose lanes merely disagree in a way the
+/// stronger lane resolves (obligations present but `requires_observation`
+/// unset; a non-mutating task labelled with a mutating kind) is repaired
+/// rather than discarded — discarding it hands authority to a lower-priority
+/// model that may return a weaker contract for the same request. Returns the
+/// lanes that were repaired. Lanes that need content (missing obligations for
+/// an observation task, invalid effects) are never invented here.
+pub(crate) fn repair_planned_contract_lifecycle(
+    signals: &mut PlannedContractSignals,
+) -> Vec<&'static str> {
+    let mut repaired = Vec::new();
+    let has_proof_obligation = signals
+        .evidence_requirements
+        .as_deref()
+        .is_some_and(|evidence| !evidence.is_empty())
+        || signals
+            .required_invocations
+            .as_deref()
+            .is_some_and(|invocations| !invocations.is_empty());
+    let has_effects = signals
+        .required_effects
+        .as_deref()
+        .is_some_and(|effects| !effects.is_empty());
+
+    if signals.expects_mutation.is_none() {
+        signals.expects_mutation = Some(has_effects);
+        repaired.push("expects_mutation_from_effects");
+    }
+    if signals.requires_observation.is_none() {
+        signals.requires_observation = Some(has_proof_obligation);
+        repaired.push("requires_observation_from_obligations");
+    }
+    if signals.requires_observation == Some(false) && has_proof_obligation {
+        // Typed obligations are the stronger signal than the boolean.
+        signals.requires_observation = Some(true);
+        repaired.push("requires_observation_from_obligations");
+    }
+    let expects_mutation = signals.expects_mutation.unwrap_or(false);
+    let requires_observation = signals.requires_observation.unwrap_or(false);
+    if !expects_mutation && signals.required_effects.is_none() {
+        signals.required_effects = Some(Vec::new());
+        repaired.push("required_effects_empty");
+    }
+    if !requires_observation {
+        if signals.evidence_requirements.is_none() {
+            signals.evidence_requirements = Some(Vec::new());
+            repaired.push("evidence_requirements_empty");
+        }
+        if signals.required_invocations.is_none() {
+            signals.required_invocations = Some(Vec::new());
+            repaired.push("required_invocations_empty");
+        }
+    }
+    let task_kind = signals
+        .task_kind
+        .as_deref()
+        .and_then(crate::agent::parse_planned_task_kind);
+    let mutation_capable = |kind: crate::agent::CompletionTaskKind| {
+        matches!(
+            kind,
+            crate::agent::CompletionTaskKind::Change
+                | crate::agent::CompletionTaskKind::Deliver
+                | crate::agent::CompletionTaskKind::Schedule
+                | crate::agent::CompletionTaskKind::Monitor
+        )
+    };
+    match task_kind {
+        Some(kind) if !expects_mutation && mutation_capable(kind) => {
+            signals.task_kind = Some(
+                if requires_observation {
+                    "check"
+                } else {
+                    "answer"
+                }
+                .to_string(),
+            );
+            repaired.push("task_kind_non_mutating");
+        }
+        Some(kind) if expects_mutation && !mutation_capable(kind) => {
+            signals.task_kind = Some("change".to_string());
+            repaired.push("task_kind_mutating");
+        }
+        Some(crate::agent::CompletionTaskKind::Check) if !requires_observation => {
+            signals.task_kind = Some("answer".to_string());
+            repaired.push("task_kind_check_without_observation");
+        }
+        None if signals.task_kind.is_none() => {
+            signals.task_kind = Some(
+                if expects_mutation {
+                    "change"
+                } else if requires_observation {
+                    "check"
+                } else {
+                    "answer"
+                }
+                .to_string(),
+            );
+            repaired.push("task_kind_from_lanes");
+        }
+        _ => {}
+    }
+    repaired
+}
+
+/// Typed proof obligations from a higher-priority producer's partial (but
+/// incoherent) assessment outrank a lower-priority producer's obligation-free
+/// contract for the same request. Obligations only demand more evidence and
+/// the strictest attenuations only remove authority, so carrying them over
+/// can never widen what the run may do. Returns the strengthened plan when
+/// the merge is coherent; otherwise the complete plan unchanged.
+pub(crate) fn strengthen_plan_from_partial(
+    mut plan: TaskPlan,
+    partial: Option<&TaskPlan>,
+) -> TaskPlan {
+    let Some(partial_contract) = partial.and_then(|partial| partial.contract.as_ref()) else {
+        return plan;
+    };
+    let Some(contract) = plan.contract.as_mut() else {
+        return plan;
+    };
+    let has_obligations = |signals: &PlannedContractSignals| {
+        signals
+            .evidence_requirements
+            .as_deref()
+            .is_some_and(|evidence| !evidence.is_empty())
+            || signals
+                .required_invocations
+                .as_deref()
+                .is_some_and(|invocations| !invocations.is_empty())
+    };
+    let mut merged = contract.clone();
+    let mut changed: Vec<&'static str> = Vec::new();
+    if has_obligations(partial_contract)
+        && !has_obligations(&merged)
+        && merged.expects_mutation != Some(true)
+    {
+        merged.evidence_requirements = partial_contract.evidence_requirements.clone();
+        merged.required_invocations = partial_contract.required_invocations.clone();
+        merged.requires_observation = Some(true);
+        if matches!(
+            merged
+                .task_kind
+                .as_deref()
+                .and_then(crate::agent::parse_planned_task_kind),
+            Some(crate::agent::CompletionTaskKind::Answer)
+                | Some(crate::agent::CompletionTaskKind::Conversational)
+                | None
+        ) {
+            merged.task_kind = Some("check".to_string());
+        }
+        changed.push("obligations_from_higher_priority_partial");
+    }
+    for scope in &partial_contract.forbidden_tool_scopes {
+        if !merged.forbidden_tool_scopes.contains(scope) {
+            merged.forbidden_tool_scopes.push(*scope);
+            if !changed.contains(&"forbidden_tool_scopes_from_partial") {
+                changed.push("forbidden_tool_scopes_from_partial");
+            }
+        }
+    }
+    if matches!(
+        partial_contract.mutation_scope.as_deref(),
+        Some("read_only") | Some("read-only")
+    ) && merged.mutation_scope.as_deref() != Some("read_only")
+        && merged.expects_mutation != Some(true)
+    {
+        merged.mutation_scope = Some("read_only".to_string());
+        changed.push("read_only_from_partial");
+    }
+    if changed.is_empty() {
+        return plan;
+    }
+    let _ = repair_planned_contract_lifecycle(&mut merged);
+    if planned_contract_lifecycle_incoherence(&merged).is_some() {
+        return plan;
+    }
+    *contract = merged;
+    plan.contract_repairs.extend(changed);
+    plan
+}
+
+/// The first lifecycle lane that makes the contract incoherent, or `None`
+/// when it is coherent. Naming the lane is what makes a discarded assessment
+/// diagnosable from telemetry.
+pub(crate) fn planned_contract_lifecycle_incoherence(
+    signals: &PlannedContractSignals,
+) -> Option<&'static str> {
     let (Some(expects_mutation), Some(requires_observation), Some(task_kind)) = (
         signals.expects_mutation,
         signals.requires_observation,
@@ -668,7 +855,7 @@ pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSi
             .as_deref()
             .and_then(crate::agent::parse_planned_task_kind),
     ) else {
-        return false;
+        return Some("missing_lifecycle_lane");
     };
     let mutation_capable = matches!(
         task_kind,
@@ -678,10 +865,10 @@ pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSi
             | crate::agent::CompletionTaskKind::Monitor
     );
     if expects_mutation != mutation_capable {
-        return false;
+        return Some("task_kind_mutation_mismatch");
     }
     let Some(effect_names) = signals.required_effects.as_deref() else {
-        return false;
+        return Some("missing_required_effects");
     };
     let effects_valid = if expects_mutation {
         crate::agent::parse_planned_mutation_effects(effect_names).is_some_and(|effects| {
@@ -705,20 +892,21 @@ pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSi
         effect_names.is_empty()
     };
     if !effects_valid {
-        return false;
+        return Some("invalid_required_effects");
     }
 
     let (Some(evidence), Some(invocations)) = (
         signals.evidence_requirements.as_deref(),
         signals.required_invocations.as_deref(),
     ) else {
-        return false;
+        return Some("missing_obligation_lane");
     };
     let has_proof_obligation = !evidence.is_empty() || !invocations.is_empty();
-    if requires_observation != has_proof_obligation
-        || task_kind == crate::agent::CompletionTaskKind::Check && !requires_observation
-    {
-        return false;
+    if requires_observation != has_proof_obligation {
+        return Some("observation_obligation_mismatch");
+    }
+    if task_kind == crate::agent::CompletionTaskKind::Check && !requires_observation {
+        return Some("check_without_observation");
     }
 
     if let Some(filesystem) = signals.filesystem_access.as_ref() {
@@ -728,10 +916,15 @@ pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSi
         if has_read_capability && !requires_observation
             || has_process_context && !expects_mutation && !has_proof_obligation
         {
-            return false;
+            return Some("filesystem_without_obligation");
         }
     }
-    true
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn planned_contract_lifecycle_is_coherent(signals: &PlannedContractSignals) -> bool {
+    planned_contract_lifecycle_incoherence(signals).is_none()
 }
 
 /// How much task scaffolding the active model needs.
@@ -874,6 +1067,10 @@ pub(crate) struct TaskPlan {
     /// lifecycle contract. Partial products may still carry attenuating
     /// authority, but they cannot authorize execution or completion.
     pub contract_complete: bool,
+    /// The lifecycle lane that made the contract incomplete, when it is.
+    pub incoherence: Option<&'static str>,
+    /// Lanes normalized from their typed signals before the coherence check.
+    pub contract_repairs: Vec<&'static str>,
 }
 
 fn decode_task_plan_result(
@@ -909,10 +1106,21 @@ fn decode_task_plan_result(
         return Err("empty_semantic_envelope".to_string());
     }
 
-    let contract_complete = parsed
-        .contract
-        .as_ref()
-        .is_some_and(planned_contract_lifecycle_is_coherent);
+    let mut parsed = parsed;
+    let mut contract_repairs = Vec::new();
+    let mut incoherence = None;
+    if let Some(contract) = parsed.contract.as_mut() {
+        contract_repairs = repair_planned_contract_lifecycle(contract);
+        incoherence = planned_contract_lifecycle_incoherence(contract);
+    }
+    let contract_complete = parsed.contract.is_some() && incoherence.is_none();
+    if !contract_repairs.is_empty() {
+        info!(
+            repairs = ?contract_repairs,
+            complete = contract_complete,
+            "Repaired task assessment lifecycle lanes from their typed signals"
+        );
+    }
 
     let mut steps = parsed.steps;
     let mut success_criteria = parsed.success_criteria;
@@ -929,6 +1137,8 @@ fn decode_task_plan_result(
         task_shape: parsed.task_shape,
         mode,
         contract_complete,
+        incoherence,
+        contract_repairs,
     })
 }
 
@@ -1619,8 +1829,12 @@ pub(crate) async fn generate_task_plan(
                     ..
                 } => match decode_task_plan_result(&response, mode) {
                     Ok(plan) => {
-                        let validation_error = (!plan.contract_complete)
-                            .then(|| "incomplete_completion_contract".to_string());
+                        let validation_error = (!plan.contract_complete).then(|| {
+                            format!(
+                                "incomplete_completion_contract:{}",
+                                plan.incoherence.unwrap_or("unknown")
+                            )
+                        });
                         record_auxiliary_model_call(
                             telemetry,
                             "task_assessment",
@@ -1635,17 +1849,24 @@ pub(crate) async fn generate_task_plan(
                         )
                         .await;
                         if plan.contract_complete {
+                            let plan = strengthen_plan_from_partial(plan, partial_plan.as_ref());
                             info!(
                                 goal = %plan.goal,
                                 step_count = plan.steps.len(),
                                 assessment_mode = mode.as_str(),
                                 %model,
                                 fallback = physical_attempt > 1,
+                                repairs = ?plan.contract_repairs,
                                 "Task assessment selected by configured model priority"
                             );
                             return Some(plan);
                         }
-                        warn!(%model, "Task assessment returned an incomplete lifecycle contract");
+                        warn!(
+                            %model,
+                            lane = plan.incoherence.unwrap_or("unknown"),
+                            repairs = ?plan.contract_repairs,
+                            "Task assessment returned an incomplete lifecycle contract"
+                        );
                         partial_plan.get_or_insert(plan);
                     }
                     Err(error) => {
@@ -2538,6 +2759,105 @@ mod tests {
             project_reference: None,
         };
         assert!(planned_contract_is_complete(&complete));
+
+        // Lane repair: typed signals resolve disagreements the producer left.
+        let mut mislabelled = complete.clone();
+        mislabelled.expects_mutation = Some(false);
+        mislabelled.required_effects = Some(Vec::new());
+        mislabelled.task_kind = Some("monitor".to_string());
+        assert_eq!(
+            planned_contract_lifecycle_incoherence(&mislabelled),
+            Some("task_kind_mutation_mismatch")
+        );
+        let repairs = repair_planned_contract_lifecycle(&mut mislabelled);
+        assert!(repairs.contains(&"task_kind_non_mutating"), "{repairs:?}");
+        assert_eq!(mislabelled.task_kind.as_deref(), Some("check"));
+        assert_eq!(planned_contract_lifecycle_incoherence(&mislabelled), None);
+
+        let mut boolean_lags_obligations = complete.clone();
+        boolean_lags_obligations.expects_mutation = Some(false);
+        boolean_lags_obligations.required_effects = Some(Vec::new());
+        boolean_lags_obligations.task_kind = Some("check".to_string());
+        boolean_lags_obligations.requires_observation = Some(false);
+        assert_eq!(
+            planned_contract_lifecycle_incoherence(&boolean_lags_obligations),
+            Some("observation_obligation_mismatch")
+        );
+        let repairs = repair_planned_contract_lifecycle(&mut boolean_lags_obligations);
+        assert!(repairs.contains(&"requires_observation_from_obligations"));
+        assert_eq!(boolean_lags_obligations.requires_observation, Some(true));
+        assert_eq!(
+            planned_contract_lifecycle_incoherence(&boolean_lags_obligations),
+            None
+        );
+
+        // A lower-priority producer's obligation-free contract is strengthened
+        // by a higher-priority partial that carried typed obligations.
+        let mut partial = complete.clone();
+        partial.expects_mutation = Some(false);
+        partial.required_effects = Some(Vec::new());
+        partial.task_kind = Some("monitor".to_string()); // incoherent lane
+        partial.forbidden_tool_scopes = vec![crate::traits::ToolSemanticScope::UserMemory];
+        let partial_plan = TaskPlan {
+            goal: "partial".to_string(),
+            steps: Vec::new(),
+            success_criteria: Vec::new(),
+            contract: Some(partial),
+            task_shape: None,
+            mode: TaskAssessmentMode::AutonomousRouting,
+            contract_complete: false,
+            incoherence: Some("task_kind_mutation_mismatch"),
+            contract_repairs: Vec::new(),
+        };
+        let mut weak = complete.clone();
+        weak.expects_mutation = Some(false);
+        weak.required_effects = Some(Vec::new());
+        weak.requires_observation = Some(false);
+        weak.task_kind = Some("conversational".to_string());
+        weak.evidence_requirements = Some(Vec::new());
+        weak.required_invocations = Some(Vec::new());
+        assert_eq!(planned_contract_lifecycle_incoherence(&weak), None);
+        let weak_plan = TaskPlan {
+            goal: "weak".to_string(),
+            steps: Vec::new(),
+            success_criteria: Vec::new(),
+            contract: Some(weak),
+            task_shape: None,
+            mode: TaskAssessmentMode::AutonomousRouting,
+            contract_complete: true,
+            incoherence: None,
+            contract_repairs: Vec::new(),
+        };
+        let strengthened = strengthen_plan_from_partial(weak_plan, Some(&partial_plan));
+        let contract = strengthened.contract.as_ref().unwrap();
+        assert_eq!(contract.requires_observation, Some(true));
+        assert_eq!(contract.task_kind.as_deref(), Some("check"));
+        assert!(!contract
+            .evidence_requirements
+            .as_deref()
+            .unwrap()
+            .is_empty());
+        assert!(contract
+            .forbidden_tool_scopes
+            .contains(&crate::traits::ToolSemanticScope::UserMemory));
+        assert_eq!(planned_contract_lifecycle_incoherence(contract), None);
+        assert!(strengthened
+            .contract_repairs
+            .contains(&"obligations_from_higher_priority_partial"));
+
+        // Content the producer omitted is never invented: an observation task
+        // with no obligations stays incomplete and names its lane.
+        let mut hollow = complete.clone();
+        hollow.expects_mutation = Some(false);
+        hollow.required_effects = Some(Vec::new());
+        hollow.task_kind = Some("check".to_string());
+        hollow.evidence_requirements = Some(Vec::new());
+        hollow.required_invocations = Some(Vec::new());
+        let _ = repair_planned_contract_lifecycle(&mut hollow);
+        assert_eq!(
+            planned_contract_lifecycle_incoherence(&hollow),
+            Some("observation_obligation_mismatch")
+        );
 
         let mut invalid_authority_sibling = complete.clone();
         invalid_authority_sibling.mutation_scope = Some("invalid".to_string());

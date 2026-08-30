@@ -51,19 +51,20 @@ pub use history::{
 };
 #[allow(unused_imports)]
 pub use mandates::{
-    Intention, IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority,
-    MandateAuthorityGrant, MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
-    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
-    MandateObjectiveControl, MandateObjectiveMeasurement, MandateOperatingUpdates,
-    MandateOperationKind, MandateOperationScope, MandateReconciliationReason,
-    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
-    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
-    MandateStrategyRevision, MandateStrategyRevisionKind, MandateStrategySnapshot,
-    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
-    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
+    is_runtime_fallback_rationale, Intention, IntentionStatus, Mandate, MandateActivityLevel,
+    MandateAuthority, MandateAuthorityGrant, MandateAutonomyMode, MandateDecisionCycle,
+    MandateDecisionOutcome, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
+    MandateLearningNote, MandateMutationAttempt, MandateMutationAttemptStatus,
+    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationOutcomeProjection,
+    MandateMutationQuotaBlockReason, MandateMutationQuotaState, MandateMutationReservation,
+    MandateMutationTarget, MandateObjectiveControl, MandateObjectiveMeasurement,
+    MandateOperatingUpdates, MandateOperationKind, MandateOperationScope,
+    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
+    MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
+    MandateRunProofCounts, MandateStatus, MandateStrategyRevision, MandateStrategyRevisionKind,
+    MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
+    MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
+    SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[allow(unused_imports)]
 pub use memory::{
@@ -84,14 +85,14 @@ pub use tools::{
     semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
     AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
     EvidenceTemporalScope, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolAccessDenial, ToolAccessEnforcement,
-    ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
-    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,
-    ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
-    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
-    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation, SpecialistKind, Tool,
+    ToolAccessDenial, ToolAccessEnforcement, ToolArgumentContractViolation, ToolCallAccessManifest,
+    ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage,
+    ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
+    ToolResultContentSource, ToolResultPresentation, ToolResultProvenance, ToolRole,
+    ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 

@@ -530,13 +530,54 @@ pub(super) fn target_scope_violation_for_tool_call(
 /// Verify a call's declared read/write capability request against the task's
 /// authority before I/O. Mixed operations must satisfy both sets; execution
 /// cwd selects process location and is never implicit data authority.
+/// Outcome of checking a call's access manifest against task authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ScopeCheck {
+    /// The call must not run: protected host data, a credential store, or an
+    /// undeclared write outside the task boundary.
+    Rejected(String),
+    /// The call declared exact targets outside the task boundary that a user
+    /// may legitimately authorize (a tool's own config dir, a sibling
+    /// project). The tool must obtain that authority before running.
+    Escalatable {
+        reason: String,
+        escalation: crate::traits::ScopeEscalation,
+    },
+}
+
+impl ScopeCheck {
+    pub(super) fn reason(&self) -> &str {
+        match self {
+            ScopeCheck::Rejected(reason) | ScopeCheck::Escalatable { reason, .. } => reason,
+        }
+    }
+}
+
+/// Tools that can carry an out-of-scope target to a user approval prompt
+/// instead of failing closed. Only the confined terminal has an approval
+/// ladder that renders the exact capability being requested.
+fn tool_supports_scope_escalation(tool_name: &str) -> bool {
+    tool_name == "terminal"
+}
+
 pub(super) fn access_manifest_scope_violation(
-    _tool_name: &str,
+    tool_name: &str,
     call: &crate::traits::ToolCallAccessManifest,
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
 ) -> Option<String> {
+    access_manifest_scope_check(tool_name, call, task, fallback_scopes, execution_cwd)
+        .map(|check| check.reason().to_string())
+}
+
+pub(super) fn access_manifest_scope_check(
+    tool_name: &str,
+    call: &crate::traits::ToolCallAccessManifest,
+    task: Option<&crate::traits::ToolCallAccessManifest>,
+    fallback_scopes: &[String],
+    execution_cwd: Option<&str>,
+) -> Option<ScopeCheck> {
     // Tools resolve relative targets against the execution cwd, so the
     // capability check must compare the same absolute path a directory grant
     // covers. A relative `Cargo.toml` inside an authorized workspace is not a
@@ -623,7 +664,7 @@ pub(super) fn access_manifest_scope_violation(
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
     if !protected_reads.is_empty() || !protected_writes.is_empty() {
-        return Some(format!(
+        return Some(ScopeCheck::Rejected(format!(
             "protected host-data capability violation (protected reads: {}; protected writes: {})",
             if protected_reads.is_empty() {
                 "none".to_string()
@@ -635,7 +676,7 @@ pub(super) fn access_manifest_scope_violation(
             } else {
                 protected_writes.join(", ")
             }
-        ));
+        )));
     }
 
     // This layer attenuates an existing capability; it does not create the
@@ -692,7 +733,7 @@ pub(super) fn access_manifest_scope_violation(
     if invalid_reads.is_empty() && invalid_writes.is_empty() {
         return None;
     }
-    Some(format!(
+    let reason = format!(
         "task filesystem capability violation (unauthorized reads: {}; unauthorized writes: {})",
         if invalid_reads.is_empty() {
             "none".to_string()
@@ -704,7 +745,26 @@ pub(super) fn access_manifest_scope_violation(
         } else {
             invalid_writes.join(", ")
         }
-    ))
+    );
+    // An out-of-scope target the user can legitimately authorize (a deploy
+    // tool's config directory, a sibling project) is escalated to the tool's
+    // approval prompt rather than failed closed. Credential stores and other
+    // sensitive paths never escalate: the model cannot ask its way into them.
+    let sensitive =
+        |path: &String| crate::tools::fs_utils::is_sensitive_path(std::path::Path::new(path));
+    if tool_supports_scope_escalation(tool_name)
+        && !invalid_reads.iter().any(sensitive)
+        && !invalid_writes.iter().any(sensitive)
+    {
+        return Some(ScopeCheck::Escalatable {
+            reason,
+            escalation: crate::traits::ScopeEscalation {
+                read_paths: invalid_reads,
+                write_paths: invalid_writes,
+            },
+        });
+    }
+    Some(ScopeCheck::Rejected(reason))
 }
 
 pub(super) fn is_hard_policy_tool_budget_reached(
@@ -3440,6 +3500,100 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
             ToolInvocationStage::RejectedBeforeDispatch,
             false,
             1
+        ));
+    }
+}
+
+#[cfg(test)]
+mod scope_escalation_tests {
+    use super::*;
+    use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+
+    fn task_scope(root: &str) -> ToolCallAccessManifest {
+        let hint = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, root).unwrap();
+        ToolCallAccessManifest {
+            execution_cwd: Some(root.to_string()),
+            read_targets: vec![hint.clone()],
+            write_targets: vec![hint],
+            adapter_read_targets: Vec::new(),
+        }
+    }
+
+    fn call_reading(root: &str, extra: &str) -> ToolCallAccessManifest {
+        ToolCallAccessManifest {
+            execution_cwd: Some(root.to_string()),
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::Path, root).unwrap(),
+                ToolTargetHint::new(ToolTargetHintKind::Path, extra).unwrap(),
+            ],
+            write_targets: Vec::new(),
+            adapter_read_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_out_of_scope_config_dir_escalates_instead_of_rejecting() {
+        let root = "/Users/alice/projects/site";
+        let task = task_scope(root);
+        let call = call_reading(root, "/Users/alice/Library/Preferences/.wrangler");
+        match access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)) {
+            Some(ScopeCheck::Escalatable { escalation, reason }) => {
+                assert_eq!(
+                    escalation.read_paths,
+                    vec!["/Users/alice/Library/Preferences/.wrangler".to_string()]
+                );
+                assert!(escalation.write_paths.is_empty());
+                assert!(reason.contains("unauthorized reads"));
+            }
+            other => panic!("expected escalation, got {other:?}"),
+        }
+        // The string-returning wrapper still reports the violation for
+        // callers that only need the reason.
+        assert!(
+            access_manifest_scope_violation("terminal", &call, Some(&task), &[], Some(root))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn credential_stores_never_escalate() {
+        let root = "/Users/alice/projects/site";
+        let task = task_scope(root);
+        for secret in [
+            "/Users/alice/.ssh",
+            "/Users/alice/.aws/credentials",
+            "/Users/alice/.npmrc",
+        ] {
+            let call = call_reading(root, secret);
+            assert!(
+                matches!(
+                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)),
+                    Some(ScopeCheck::Rejected(_))
+                ),
+                "{secret} must be rejected, not escalated"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_terminal_carries_escalations() {
+        let root = "/Users/alice/projects/site";
+        let task = task_scope(root);
+        let call = call_reading(root, "/Users/alice/Library/Preferences/.wrangler");
+        assert!(matches!(
+            access_manifest_scope_check("read_file", &call, Some(&task), &[], Some(root)),
+            Some(ScopeCheck::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn protected_host_data_is_rejected_before_escalation() {
+        let root = "/Users/alice/projects/site";
+        let task = task_scope(root);
+        let call = call_reading(root, "/private/etc/hosts");
+        assert!(matches!(
+            access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)),
+            Some(ScopeCheck::Rejected(_))
         ));
     }
 }

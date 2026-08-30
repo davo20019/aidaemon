@@ -1742,6 +1742,12 @@ pub struct TerminalConfig {
     /// - "yolo": All approvals persist forever, including critical commands
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// Where commands run: "host" (default) executes directly on this
+    /// machine with the user's environment and credentials; "sandbox" wraps
+    /// every command in the OS sandbox with task-scoped filesystem/network
+    /// policy.
+    #[serde(default)]
+    pub confinement: crate::types::TerminalConfinement,
 }
 
 impl Default for TerminalConfig {
@@ -1759,6 +1765,7 @@ impl Default for TerminalConfig {
             initial_timeout_secs: default_initial_timeout_secs(),
             max_output_chars: default_max_output_chars(),
             permission_mode: PermissionMode::default(),
+            confinement: crate::types::TerminalConfinement::default(),
         }
     }
 }

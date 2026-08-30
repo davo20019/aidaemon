@@ -83,6 +83,19 @@ pub(crate) struct RunOperation {
     pub outcome: Option<ToolOutcomeStatus>,
     #[serde(default)]
     pub dispatched: bool,
+    /// The operation was refused before dispatch by a typed policy boundary
+    /// (scope lock, read-only contract, mandate gate, capability constraint).
+    /// Retrying the same operation cannot cross that boundary.
+    #[serde(default)]
+    pub policy_denied: bool,
+    /// The proposed operation carried mutating semantics.
+    #[serde(default)]
+    pub mutating: bool,
+    /// Evidence the operation would have produced (from its receipt
+    /// semantics), retained so a refused operation can be bound to the
+    /// observation obligation it was attempting to satisfy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_capabilities: Vec<crate::traits::ToolEvidenceCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +141,48 @@ pub(crate) enum TaskKernelAdmission {
     Rejected { code: &'static str, detail: String },
 }
 
+/// Why a pending expectation can no longer be satisfied in this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UnreachableReason {
+    /// An operation bound to it was refused by a typed policy boundary.
+    PolicyDenied,
+    /// Its bounded invocation budget is spent.
+    CardinalityExhausted,
+    /// No visible tool admissible under the request's authority can satisfy it.
+    NoAdmissibleTool,
+}
+
+/// The ledger-first closeout verdict. See [`RunAggregate::closeout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloseoutDecision {
+    /// Nothing more is owed: proven by contract, by evidence, or by a
+    /// credited denial; or the contract carried no obligations.
+    Closed { proof_basis: &'static str },
+    /// These expectations are still satisfiable; the loop may ask for them.
+    Reachable { obligation_ids: Vec<String> },
+    /// Expectations remain but none can be satisfied; the run closes on the
+    /// evidence it has and reports exactly what blocked the rest.
+    Unreachable {
+        blocked: Vec<(String, UnreachableReason)>,
+    },
+}
+
+impl CloseoutDecision {
+    pub(crate) fn verdict(&self) -> &'static str {
+        match self {
+            Self::Closed { .. } => "closed",
+            Self::Reachable { .. } => "reachable",
+            Self::Unreachable { .. } => "unreachable",
+        }
+    }
+
+    /// Whether the loop may still demand more work from the model.
+    pub(crate) fn work_reachable(&self) -> bool {
+        matches!(self, Self::Reachable { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunTerminalDecision {
     /// Every accepted obligation has durable proof.
@@ -137,6 +192,10 @@ pub(crate) enum RunTerminalDecision {
     /// completed work beats a contract that could not describe it; this is a
     /// success whose proof basis is the receipt set rather than the contract.
     SucceededByEvidence,
+    /// Every open obligation was refused by a typed authority boundary before
+    /// dispatch (nothing dispatched). The request could not be carried out
+    /// and the run is complete at that boundary; the reply narrates it.
+    ClosedByPolicyDenial,
     /// At least one exact bounded invocation is exhausted without proof.
     Failed,
     /// Work remains and the aggregate still permits progress or recovery.
@@ -463,6 +522,9 @@ impl RunAggregate {
                 idempotency_key: call.idempotency_key,
                 outcome: None,
                 dispatched: false,
+                policy_denied: false,
+                mutating: false,
+                evidence_capabilities: Vec::new(),
                 result_id: None,
                 operation_lineage: call.operation_lineage,
             },
@@ -572,11 +634,19 @@ impl RunAggregate {
                 idempotency_key: receipt.idempotency_key.clone(),
                 outcome: None,
                 dispatched: false,
+                policy_denied: false,
+                mutating: false,
+                evidence_capabilities: Vec::new(),
                 result_id: None,
                 operation_lineage: None,
             });
         operation.outcome = Some(receipt.outcome_status);
         operation.dispatched = receipt.invocation_stage.reached_dispatch();
+        operation.policy_denied = !operation.dispatched && receipt.access_denial.is_some();
+        operation.mutating = operation.mutating || receipt.semantics.mutates_state();
+        if operation.evidence_capabilities.is_empty() {
+            operation.evidence_capabilities = receipt.semantics.evidence.clone();
+        }
         operation.result_id = Some(result_id.clone());
         let claimed_obligation_ids = operation.obligation_ids.clone();
         // Cardinality is about distinct durable invocations, not distinct
@@ -902,6 +972,187 @@ impl RunAggregate {
     /// it cannot describe work that demonstrably completed, the receipts win.
     /// Integrity invariants and explicit cardinality limits are not contract
     /// descriptions and still fail closed.
+    /// Whether a pending obligation's bounded invocation budget is spent.
+    fn obligation_exhausted(&self, obligation: &RunObligation) -> bool {
+        if obligation.state == RunObligationState::Unverifiable {
+            return true;
+        }
+        let Some(predicate) = obligation.receipt.as_ref() else {
+            return false;
+        };
+        predicate.max_invocations.is_some_and(|limit| {
+            self.operations
+                .values()
+                .filter(|operation| {
+                    if matches!(
+                        operation.operation_lineage,
+                        Some(super::ToolOperationLineage::DurableReplay { .. })
+                    ) {
+                        return false;
+                    }
+                    if !operation.obligation_ids.is_empty() {
+                        operation.obligation_ids.contains(&obligation.id)
+                    } else {
+                        operation.result_id.is_some()
+                            && (predicate.tool_names.is_empty()
+                                || predicate.tool_names.contains(&operation.tool_name))
+                    }
+                })
+                .count()
+                >= limit
+        })
+    }
+
+    /// Whether an operation bound to this obligation was refused before
+    /// dispatch by a typed policy boundary. Retrying cannot cross it.
+    fn obligation_policy_denied(&self, obligation: &RunObligation) -> bool {
+        self.operations.values().any(|operation| {
+            if !operation.policy_denied {
+                return false;
+            }
+            // A denied mutation attempt blocks every effect obligation: the
+            // authority boundary that refused it does not move on retry.
+            if obligation.class == RunObligationClass::Achieve
+                && !obligation.required_effect.is_empty()
+                && operation.mutating
+            {
+                return true;
+            }
+            if !operation.obligation_ids.is_empty() {
+                return operation.obligation_ids.contains(&obligation.id);
+            }
+            // An observation obligation is bound to a refused operation by
+            // the evidence that operation would have produced.
+            if let Some(requirement) = obligation.evidence_requirement.as_ref() {
+                if operation
+                    .evidence_capabilities
+                    .iter()
+                    .any(|capability| requirement.supports_capability(capability))
+                {
+                    return true;
+                }
+            }
+            // Compatibility for pre-kernel claims only: bind by predicate.
+            obligation.receipt.as_ref().is_some_and(|predicate| {
+                predicate.tool_names.is_empty()
+                    || predicate.tool_names.contains(&operation.tool_name)
+            })
+        })
+    }
+
+    /// Every obligation still open was refused by a typed authority boundary
+    /// and nothing dispatched: the run ended at that boundary.
+    fn closed_by_policy_denial(&self) -> bool {
+        if !self.terminal_policy_denial() {
+            return false;
+        }
+        let mut open = 0;
+        for obligation in self.obligations.values() {
+            if matches!(
+                obligation.state,
+                RunObligationState::Satisfied | RunObligationState::Abandoned
+            ) || obligation.class == RunObligationClass::Deliver
+            {
+                continue;
+            }
+            open += 1;
+            if !self.obligation_policy_denied(obligation) {
+                return false;
+            }
+        }
+        open > 0
+    }
+
+    /// Ledger-first closeout arbiter.
+    ///
+    /// The contract's expectations are proposals; the receipt ledger decides
+    /// what is proven and — via `admissible` (Authority ∩ visible tools) —
+    /// what could still be proven. An expectation is *reachable* only when no
+    /// recorded denial or spent budget blocks it and some admissible tool can
+    /// satisfy it. Only a reachable expectation may ask the loop for more
+    /// work; everything else closes on the evidence that exists.
+    pub(crate) fn closeout(&self, admissible: impl Fn(&RunObligation) -> bool) -> CloseoutDecision {
+        if !self.contract_present || self.obligations.is_empty() {
+            return CloseoutDecision::Closed {
+                proof_basis: "no_obligations",
+            };
+        }
+        if self.is_fulfilled() {
+            return CloseoutDecision::Closed {
+                proof_basis: "contract",
+            };
+        }
+        let mut reachable = Vec::new();
+        let mut blocked = Vec::new();
+        for obligation in self.obligations.values() {
+            if matches!(
+                obligation.state,
+                RunObligationState::Satisfied | RunObligationState::Abandoned
+            ) {
+                continue;
+            }
+            // Delivery obligations are satisfied by the closeout itself (the
+            // response being prepared); they can never ask for more work.
+            if obligation.class == RunObligationClass::Deliver {
+                continue;
+            }
+            let reason = if self.obligation_policy_denied(obligation) {
+                Some(UnreachableReason::PolicyDenied)
+            } else if self.obligation_exhausted(obligation) {
+                Some(UnreachableReason::CardinalityExhausted)
+            } else if !admissible(obligation) {
+                Some(UnreachableReason::NoAdmissibleTool)
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) => blocked.push((obligation.id.clone(), reason)),
+                None => reachable.push(obligation.id.clone()),
+            }
+        }
+        reachable.sort();
+        blocked.sort_by(|left, right| left.0.cmp(&right.0));
+        if !reachable.is_empty() {
+            return CloseoutDecision::Reachable {
+                obligation_ids: reachable,
+            };
+        }
+        if self.evidence_closed() {
+            return CloseoutDecision::Closed {
+                proof_basis: if self.terminal_policy_denial() {
+                    "credited_denial"
+                } else {
+                    "evidence"
+                },
+            };
+        }
+        CloseoutDecision::Unreachable { blocked }
+    }
+
+    /// Operations refused before dispatch by a typed policy boundary.
+    pub(crate) fn policy_denied_operations(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|operation| operation.policy_denied)
+            .count()
+    }
+
+    /// Operations whose adapter actually ran.
+    pub(crate) fn dispatched_operations(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|operation| operation.dispatched)
+            .count()
+    }
+
+    /// The run's only terminal receipts are typed policy denials: the model
+    /// observed the request's authority boundary and nothing it can retry
+    /// would cross it. Finalization treats the model's narration of that
+    /// boundary as the closeout instead of demanding more evidence.
+    pub(crate) fn terminal_policy_denial(&self) -> bool {
+        self.policy_denied_operations() > 0 && self.dispatched_operations() == 0
+    }
+
     pub(crate) fn evidence_closed(&self) -> bool {
         if !self.contract_present
             || !self.invariant_violations.is_empty()
@@ -982,8 +1233,18 @@ impl RunAggregate {
                     >= limit
             })
         });
-        if exhausted && evidence_closed {
+        // A typed policy denial that the contract itself credited (the request
+        // asked for the attempt and anticipated its refusal) is the run's
+        // terminal observation: nothing dispatched, nothing can be retried
+        // across that boundary, and the remaining obligations describe work
+        // the request placed beyond it ("if denied, stop"). Evidence closes
+        // the run. An uncredited denial never qualifies because
+        // `evidence_closed` requires every terminal receipt to be credited.
+        let credited_terminal_denial = self.terminal_policy_denial() && evidence_closed;
+        if (exhausted || credited_terminal_denial) && evidence_closed {
             RunTerminalDecision::SucceededByEvidence
+        } else if self.closed_by_policy_denial() {
+            RunTerminalDecision::ClosedByPolicyDenial
         } else if exhausted || self.cardinality_violations > 0 {
             RunTerminalDecision::Failed
         } else {
@@ -1206,9 +1467,9 @@ impl RunAggregate {
             return TaskKernelPhase::ResponsePrepared;
         }
         match self.terminal_decision() {
-            RunTerminalDecision::Succeeded | RunTerminalDecision::SucceededByEvidence => {
-                TaskKernelPhase::WorkSucceeded
-            }
+            RunTerminalDecision::Succeeded
+            | RunTerminalDecision::SucceededByEvidence
+            | RunTerminalDecision::ClosedByPolicyDenial => TaskKernelPhase::WorkSucceeded,
             RunTerminalDecision::Failed => TaskKernelPhase::Failed,
             RunTerminalDecision::Pending => TaskKernelPhase::WorkPending,
             RunTerminalDecision::Unspecified if self.started => TaskKernelPhase::Running,
@@ -2087,6 +2348,388 @@ mod tests {
     }
 
     #[test]
+    fn closeout_asks_only_for_reachable_expectations() {
+        // Two obligations: a write that was refused by policy (credited) and
+        // an observation the contract still wants.
+        let mut denial_requirement = requirement("write_file", 1);
+        {
+            let predicate = denial_requirement.receipt.as_mut().unwrap();
+            predicate.outcome_condition =
+                Some(crate::traits::RequestedOutcomeCondition::NonSuccessTerminal);
+            predicate.exit_codes.clear();
+        }
+        let observe = crate::traits::RequestEvidenceRequirement {
+            summary: "Dependent path remains absent".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let mut events = vec![
+            contract(vec![denial_requirement, observe]),
+            call("attempt", "write_file"),
+            result(
+                "attempt",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                0,
+                ToolCallSemantics::default(),
+            ),
+        ];
+        events[2].data["receipt"]["invocation_stage"] =
+            serde_json::json!("rejected_before_dispatch");
+        events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
+        events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "negative_completion_contract:mutation_forbidden",
+            "enforcement": "controller_enforced"
+        });
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+
+        // Authority still admits a read-only observation: the observation is
+        // reachable, so the loop may ask for exactly that obligation.
+        let decision = aggregate.closeout(|_| true);
+        assert_eq!(
+            decision,
+            CloseoutDecision::Reachable {
+                obligation_ids: vec!["task:task-1/obligation:evidence:1".to_string()],
+            }
+        );
+        assert!(decision.work_reachable());
+
+        // Authority admits nothing ("if denied, stop"): the credited denial
+        // closes the run; nothing is demanded.
+        let decision = aggregate.closeout(|_| false);
+        assert_eq!(
+            decision,
+            CloseoutDecision::Closed {
+                proof_basis: "credited_denial"
+            }
+        );
+        assert!(!decision.work_reachable());
+
+        // An expectation whose bound operation was denied is never reachable
+        // even when its tool is admissible: retrying cannot cross the boundary.
+        let mut uncredited = events.clone();
+        let mut expected_success = requirement("write_file", 0);
+        {
+            let predicate = expected_success.receipt.as_mut().unwrap();
+            predicate.outcome_condition = Some(crate::traits::RequestedOutcomeCondition::Succeeded);
+            predicate.exit_codes.clear();
+        }
+        uncredited[0] = contract(vec![expected_success]);
+        uncredited[0].id = 1;
+        let aggregate = RunAggregate::replay("task-1", &uncredited);
+        assert_eq!(
+            aggregate.closeout(|_| true),
+            CloseoutDecision::Unreachable {
+                blocked: vec![(
+                    "task:task-1/obligation:evidence:0".to_string(),
+                    UnreachableReason::PolicyDenied
+                )],
+            }
+        );
+    }
+
+    #[test]
+    fn closeout_ignores_delivery_and_attributes_a_denied_mutation() {
+        // Live shape: "attempt one protected write; if denied stop". The
+        // contract expects a mutation (an Achieve obligation), credits the
+        // denial through a non_success_terminal predicate, and carries a
+        // response contract (a Deliver obligation). Only the denial receipt
+        // exists. Nothing is reachable; the run closes on the credited denial.
+        let mut denial_requirement = requirement("write_file", 1);
+        {
+            let predicate = denial_requirement.receipt.as_mut().unwrap();
+            predicate.outcome_condition =
+                Some(crate::traits::RequestedOutcomeCondition::NonSuccessTerminal);
+            predicate.exit_codes.clear();
+        }
+        let contract_event = event(
+            EventType::TaskContractCompiled,
+            TaskContractCompiledData {
+                schema_version: TaskContractCompiledData::SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                contract: RequestCompletionContract {
+                    scope_task_id: Some("task-1".to_string()),
+                    adopted_from_task_ids: Vec::new(),
+                    task_kind: crate::traits::RequestTaskKind::Change,
+                    expects_mutation: true,
+                    required_mutation_effects: ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    forbids_mutation: false,
+                    forbids_tool_use: false,
+                    allowed_tool_names: Vec::new(),
+                    forbidden_tool_scopes: Vec::new(),
+                    dispatch_stop_rules: Vec::new(),
+                    required_response_fields: Vec::new(),
+                    response_contract: Some(Box::new(RequestResponseContract::ExactText {
+                        success_text: "phase=SYNTHETIC-RR; protected_write=denied".to_string(),
+                        source_message_hash: "synthetic-hash".to_string(),
+                    })),
+                    forbidden_actions: Vec::new(),
+                    requires_observation: true,
+                    requires_reverification_after_mutation: false,
+                    explicit_verification_requested: true,
+                    minimum_sources: 0,
+                    requires_primary_sources: false,
+                    requires_exact_history: false,
+                    evidence_requirements: vec![denial_requirement],
+                    adopted_evidence_bindings: Vec::new(),
+                    verification_targets: Vec::new(),
+                },
+                required_invocations: Vec::new(),
+            },
+        );
+        let mut events = vec![
+            contract_event,
+            call("attempt", "write_file"),
+            result(
+                "attempt",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                0,
+                ToolCallSemantics::mutation(),
+            ),
+        ];
+        events[2].data["receipt"]["invocation_stage"] =
+            serde_json::json!("rejected_before_dispatch");
+        events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
+        events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "controller_scope_contract_rejected",
+            "enforcement": "controller_enforced"
+        });
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate
+            .obligations
+            .contains_key("task:task-1/obligation:mutation:local_workspace_write"));
+        assert!(aggregate
+            .obligations
+            .contains_key("task:task-1/obligation:deliver:response"));
+        assert!(aggregate.terminal_policy_denial());
+        let decision = aggregate.closeout(|_| true);
+        assert_eq!(
+            decision,
+            CloseoutDecision::Closed {
+                proof_basis: "credited_denial"
+            },
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn uncredited_denial_of_the_only_observation_closes_by_policy_denial() {
+        // "Read /etc/hosts" compiled as a plain observation requirement (no
+        // predicate anticipating refusal). The one attempt is refused by the
+        // protected host-data boundary. The refused operation would have
+        // produced exactly the evidence the obligation needs, so the ledger
+        // binds them: the obligation is unreachable and the run closes at
+        // the authority boundary rather than lingering "pending".
+        let observe = crate::traits::RequestEvidenceRequirement {
+            summary: "Observe the current state of one exact resource".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let semantics = ToolCallSemantics {
+            effect: ToolCallEffect::Observation,
+            evidence: vec![crate::traits::ToolEvidenceCapability {
+                scope: crate::traits::ToolSemanticScope::LocalWorkspace,
+                purposes: vec![crate::traits::EvidencePurpose::CurrentState],
+                authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            }],
+            ..ToolCallSemantics::default()
+        };
+        let mut events = vec![
+            contract(vec![observe]),
+            call("read", "terminal"),
+            result("read", "terminal", ToolOutcomeStatus::Blocked, 0, semantics),
+        ];
+        events[2].data["receipt"]["invocation_stage"] =
+            serde_json::json!("rejected_before_dispatch");
+        events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
+        events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "protected_host_data",
+            "enforcement": "controller_enforced"
+        });
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.terminal_policy_denial());
+        assert!(!aggregate.evidence_closed(), "the denial credited nothing");
+        assert_eq!(
+            aggregate.closeout(|_| true),
+            CloseoutDecision::Unreachable {
+                blocked: vec![(
+                    "task:task-1/obligation:evidence:0".to_string(),
+                    UnreachableReason::PolicyDenied
+                )],
+            }
+        );
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::ClosedByPolicyDenial
+        );
+        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::WorkSucceeded);
+
+        // A refusal of an unrelated capability does not bind: the obligation
+        // stays reachable and the run stays pending.
+        let mut unrelated = events.clone();
+        unrelated[2].data["receipt"]["semantics"]["evidence"] = serde_json::json!([{
+            "scope": "external_remote",
+            "purposes": ["current_state"],
+            "authority": "direct",
+            "temporal_scope": "current"
+        }]);
+        let aggregate = RunAggregate::replay("task-1", &unrelated);
+        assert!(aggregate.closeout(|_| true).work_reachable());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    #[test]
+    fn closeout_reports_spent_budgets_and_missing_tools() {
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            call("run", "terminal"),
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::CompletedWithNegativeResult,
+                1,
+                ToolCallSemantics::default(),
+            ),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        // max_invocations=1 is spent by the negative result: unreachable.
+        assert_eq!(
+            aggregate.closeout(|_| true),
+            CloseoutDecision::Unreachable {
+                blocked: vec![(
+                    "task:task-1/obligation:evidence:0".to_string(),
+                    UnreachableReason::CardinalityExhausted
+                )],
+            }
+        );
+        // Fresh contract, no operations, but authority admits no tool.
+        let fresh = vec![{
+            let mut event = contract(vec![requirement("terminal", 0)]);
+            event.id = 1;
+            event
+        }];
+        let aggregate = RunAggregate::replay("task-1", &fresh);
+        assert_eq!(
+            aggregate.closeout(|_| false),
+            CloseoutDecision::Unreachable {
+                blocked: vec![(
+                    "task:task-1/obligation:evidence:0".to_string(),
+                    UnreachableReason::NoAdmissibleTool
+                )],
+            }
+        );
+        assert!(aggregate.closeout(|_| true).work_reachable());
+    }
+
+    #[test]
+    fn credited_policy_denial_closes_the_run_by_evidence() {
+        // "Attempt one write; if denied, stop." The contract credits the
+        // denial (non_success_terminal) and also carries an observation
+        // obligation the request forbids performing after the denial. The
+        // denial is the terminal observation; evidence closes the run.
+        let mut denial_requirement = requirement("write_file", 1);
+        {
+            let predicate = denial_requirement.receipt.as_mut().unwrap();
+            predicate.outcome_condition =
+                Some(crate::traits::RequestedOutcomeCondition::NonSuccessTerminal);
+            // A refusal has no process exit code; the request did not
+            // predetermine the boundary that produces the refusal.
+            predicate.exit_codes.clear();
+        }
+        let mut events = vec![
+            contract(vec![
+                denial_requirement,
+                crate::traits::RequestEvidenceRequirement {
+                    summary: "Dependent path remains absent".to_string(),
+                    acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+                    purpose: crate::traits::EvidencePurpose::CurrentState,
+                    minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                    temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                    required_content_markers: Vec::new(),
+                    receipt: None,
+                    target: None,
+                },
+            ]),
+            call("attempt", "write_file"),
+            result(
+                "attempt",
+                "write_file",
+                ToolOutcomeStatus::Blocked,
+                0,
+                ToolCallSemantics::default(),
+            ),
+        ];
+        events[2].data["receipt"]["invocation_stage"] =
+            serde_json::json!("rejected_before_dispatch");
+        events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
+        events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "negative_completion_contract:mutation_forbidden",
+            "enforcement": "controller_enforced"
+        });
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.terminal_policy_denial());
+        assert!(
+            aggregate.evidence_closed(),
+            "credited denial must close evidence"
+        );
+        assert!(!aggregate.is_fulfilled());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::SucceededByEvidence
+        );
+
+        // The same denial that NO obligation anticipated stays pending: the
+        // request expected the write to succeed.
+        let mut expected_success = requirement("write_file", 0);
+        {
+            let predicate = expected_success.receipt.as_mut().unwrap();
+            predicate.outcome_condition = Some(crate::traits::RequestedOutcomeCondition::Succeeded);
+            predicate.exit_codes.clear();
+        }
+        let mut unexpected = events.clone();
+        unexpected[0] = contract(vec![expected_success]);
+        unexpected[0].id = 1;
+        let aggregate = RunAggregate::replay("task-1", &unexpected);
+        assert!(aggregate.terminal_policy_denial());
+        assert!(!aggregate.evidence_closed());
+        assert_ne!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::SucceededByEvidence
+        );
+    }
+
+    #[test]
     fn evidence_closure_requires_every_terminal_receipt_to_be_credited_or_successful() {
         // A pre-dispatch denial that no obligation expected is not evidence of
         // completed work, even when a sibling operation succeeded.
@@ -2198,6 +2841,48 @@ mod tests {
             RunAggregate::replay("task-1", &events).terminal_decision(),
             RunTerminalDecision::Failed
         );
+    }
+
+    #[test]
+    fn typed_pre_dispatch_denials_are_terminal_for_the_ledger() {
+        let mut denied = result(
+            "call-denied",
+            "write_file",
+            ToolOutcomeStatus::Blocked,
+            0,
+            ToolCallSemantics::default(),
+        );
+        denied.data["receipt"]["invocation_stage"] = serde_json::json!("rejected_before_dispatch");
+        denied.data["receipt"]["access_denial"] = serde_json::json!({
+            "reason_code": "negative_completion_contract",
+            "enforcement": "controller_enforced"
+        });
+        let aggregate = RunAggregate::replay("task-1", &[denied.clone()]);
+        assert_eq!(aggregate.policy_denied_operations(), 1);
+        assert_eq!(aggregate.dispatched_operations(), 0);
+        assert!(aggregate.terminal_policy_denial());
+
+        // A pre-dispatch block WITHOUT a typed denial (a deferral, a budget
+        // stop, a retry hint) is not a policy boundary.
+        let mut deferred = denied.clone();
+        deferred.data["tool_call_id"] = serde_json::json!("call-deferred");
+        deferred.data["receipt"]["access_denial"] = serde_json::Value::Null;
+        let aggregate = RunAggregate::replay("task-1", &[deferred]);
+        assert_eq!(aggregate.policy_denied_operations(), 0);
+        assert!(!aggregate.terminal_policy_denial());
+
+        // Once anything actually dispatched, the denial is no longer the
+        // run's terminal observation.
+        let ran = result(
+            "call-ran",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        let aggregate = RunAggregate::replay("task-1", &[denied, ran]);
+        assert_eq!(aggregate.policy_denied_operations(), 1);
+        assert!(!aggregate.terminal_policy_denial());
     }
 
     #[test]

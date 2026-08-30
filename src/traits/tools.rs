@@ -1161,6 +1161,11 @@ pub struct ToolCallMetadata {
     /// Image (or other) files produced by the tool for agent vision context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::traits::MessageAttachment>,
+    /// The runtime's own pre-dispatch preparation failed (for example
+    /// materializing a declared write root), attributed to the exact argument
+    /// declaration that caused it. Set only when no domain I/O ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_preparation_failure: Option<Box<RuntimePreparationFailure>>,
     /// Preserve exact, untrusted bytes while still wrapping them as untrusted
     /// tool data. Intended for canonical-history evidence whose wording must
     /// not be rewritten by prompt-injection sanitization.
@@ -1197,6 +1202,20 @@ pub struct ToolCallOutcome {
     pub metadata: ToolCallMetadata,
 }
 
+/// A failure of the runtime's own pre-dispatch preparation, attributed to the
+/// exact argument declaration that caused it. The dispatcher uses this to
+/// decide whether the declaration was its own projection (repairable without
+/// involving the model) or the model's (surfaced as a typed rejection).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePreparationFailure {
+    /// Argument field the declaration came from (for example `write_roots`).
+    pub field: String,
+    /// The exact declared value.
+    pub value: String,
+    /// The underlying runtime error.
+    pub error: String,
+}
+
 impl ToolCallOutcome {
     pub fn from_output(output: String) -> Self {
         Self {
@@ -1231,6 +1250,36 @@ impl ToolCallOutcome {
             output: output.into(),
             metadata: ToolCallMetadata {
                 outcome_status: Some(ToolOutcomeStatus::Blocked),
+                ..ToolCallMetadata::default()
+            },
+        }
+    }
+
+    /// The runtime could not prepare the invocation (no domain I/O ran). The
+    /// failure names the exact declaration so the dispatcher can repair its
+    /// own projections instead of reporting its mistake to the model.
+    pub fn runtime_preparation_failure(
+        field: impl Into<String>,
+        value: impl Into<String>,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        let field = field.into();
+        let value = value.into();
+        let error = error.to_string();
+        Self {
+            output: format!(
+                "Error: the runtime could not prepare `{field}` entry `{value}` before running the command: {error}"
+            ),
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Blocked),
+                invocation_stage: ToolInvocationStage::RejectedBeforeIo,
+                semantics: ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent),
+                runtime_preparation_failure: Some(Box::new(RuntimePreparationFailure {
+                    field,
+                    value,
+                    error,
+                })),
                 ..ToolCallMetadata::default()
             },
         }
@@ -1472,6 +1521,25 @@ pub struct ToolExecutionContext {
     /// Hard negative task contract propagated from the validated request.
     /// Open-ended adapters must prove an operation is observational before I/O.
     pub mutation_forbidden: bool,
+}
+
+/// Filesystem targets a tool call declared that fall outside the compiled
+/// task scope but are not protected host data or credential stores. The
+/// controller does not reject such a call outright; it hands the exact
+/// out-of-scope targets to the tool, which must obtain explicit user approval
+/// (or a persisted capability grant) before running with them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopeEscalation {
+    #[serde(default)]
+    pub read_paths: Vec<String>,
+    #[serde(default)]
+    pub write_paths: Vec<String>,
+}
+
+impl ScopeEscalation {
+    pub fn is_empty(&self) -> bool {
+        self.read_paths.is_empty() && self.write_paths.is_empty()
+    }
 }
 
 /// A tool-owned decision about whether a previously successful durable receipt

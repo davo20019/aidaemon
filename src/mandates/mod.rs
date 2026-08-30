@@ -65,6 +65,25 @@ pub(crate) fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> 
     newest_first
 }
 
+/// Every `manage_mandates` action that only the internal deliberator may
+/// invoke, paired with its kernel class. This is the single source of truth
+/// consumed by the call classifier, the tool's call semantics, and the
+/// role-gate invariant test: a deliberator-reserved action that is not listed
+/// here is unreachable inside a mandate run.
+pub(crate) const DELIBERATOR_PROTOCOL_ACTIONS: &[(&str, MandateCallClass)] = &[
+    ("record_decision", MandateCallClass::RecordDecision),
+    ("record_measurement", MandateCallClass::RecordMeasurement),
+];
+
+/// Kernel class for a deliberator-reserved `manage_mandates` action, or
+/// `None` when the action is not part of the deliberator protocol.
+pub(crate) fn deliberator_protocol_class(action: &str) -> Option<MandateCallClass> {
+    DELIBERATOR_PROTOCOL_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map(|(_, class)| *class)
+}
+
 /// Kernel classification for calls made while a mandate controller is the
 /// resolved goal. These are exact protocol names/actions, never language
 /// inference. Only governed mutations receive an action-budgeted grant.
@@ -78,6 +97,9 @@ pub(crate) enum MandateCallClass {
     Observation,
     /// The single durable ACT/WAIT/ASK/STOP commit point.
     RecordDecision,
+    /// The durable receipt-backed objective metric commit that a controlled
+    /// mandate requires before its decision.
+    RecordMeasurement,
     /// Goal/task orchestration that is useful only after a current ACT. Child
     /// actions remain independently governed by the same mandate.
     ActControl,
@@ -103,11 +125,10 @@ pub(crate) fn classify_mandate_call(
         });
 
     if tool_name == "manage_mandates" {
-        return if action.as_deref() == Some("record_decision") {
-            MandateCallClass::RecordDecision
-        } else {
-            MandateCallClass::Deny
-        };
+        return action
+            .as_deref()
+            .and_then(deliberator_protocol_class)
+            .unwrap_or(MandateCallClass::Deny);
     }
     if tool_name == "manage_goal_tasks" {
         return match action.as_deref() {
@@ -176,7 +197,8 @@ pub(crate) fn role_allows_mandate_call(
         return match class {
             MandateCallClass::ProtocolObservation
             | MandateCallClass::Observation
-            | MandateCallClass::RecordDecision => true,
+            | MandateCallClass::RecordDecision
+            | MandateCallClass::RecordMeasurement => true,
             MandateCallClass::ActControl => {
                 matches!(tool_name, "manage_goal_tasks" | "spawn_agent")
             }
@@ -251,6 +273,34 @@ mod tests {
         assert_eq!(guidance.len(), 1);
         assert_eq!(guidance[0].len(), 1_024);
         assert_eq!(guidance[0].chars().count(), 256);
+    }
+
+    #[test]
+    fn every_deliberator_protocol_action_is_reachable_by_the_task_lead_only() {
+        for (action, expected_class) in DELIBERATOR_PROTOCOL_ACTIONS {
+            let class = classify_mandate_call(
+                "manage_mandates",
+                &format!(r#"{{"action":"{action}"}}"#),
+                &ToolCallSemantics::administrative(),
+            );
+            assert_eq!(class, *expected_class, "action {action}");
+            assert!(
+                role_allows_mandate_call(class, "manage_mandates", true),
+                "task lead must be able to invoke deliberator protocol action {action}"
+            );
+            assert!(
+                !role_allows_mandate_call(class, "manage_mandates", false),
+                "executors must not invoke deliberator protocol action {action}"
+            );
+        }
+        assert_eq!(
+            classify_mandate_call(
+                "manage_mandates",
+                r#"{"action":"record_measurement"}"#,
+                &ToolCallSemantics::administrative(),
+            ),
+            MandateCallClass::RecordMeasurement
+        );
     }
 
     #[test]

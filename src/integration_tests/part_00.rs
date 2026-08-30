@@ -826,6 +826,73 @@ async fn test_multi_turn_conversation() {
 }
 
 #[tokio::test]
+async fn exact_history_follow_up_is_grounded_by_the_projected_antecedent() {
+    // Seed turn (no tools), then a follow-up whose contract requires exact
+    // history while forbidding tools. The runtime projects the persisted
+    // antecedent into the prompt; that projection is the canonical retained
+    // history, so the model's correct recall must ship unchanged instead of
+    // being replaced by a "could not establish the exact wording" blocker.
+    let seed = MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none");
+    let base = MockProvider::semantic_task_assessment(
+        "answer",
+        false,
+        false,
+        &[],
+        "continuation",
+        "conversation_history",
+    );
+    let mut followup: serde_json::Value =
+        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+    followup["contract"]["requires_exact_history"] = serde_json::json!(true);
+    followup["contract"]["tool_scope"] = serde_json::json!("forbidden");
+    let followup = MockProvider::text_response(&followup.to_string());
+    let marker = "context_recalled=CTX_SYNTHETIC_7F2K; source=conversation; memory=not_used; tools=0.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("context_seed=ack"),
+        MockProvider::text_response(marker),
+        MockProvider::text_response(marker),
+    ])
+    .with_task_assessments(vec![seed, followup]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "exact_history_session",
+            "Do not use memory or tools. In this conversation only, note the synthetic marker CTX_SYNTHETIC_7F2K for the next follow-up. Reply exactly context_seed=ack.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "exact_history_session",
+            "Do not use memory or tools. Using only the immediately preceding conversation context, repeat the exact synthetic marker from the prior request.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.trim(), marker, "{response}");
+    // The grounding came from the runtime's typed projection, not a tool.
+    let projected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND event_type = 'decision_point'
+         AND json_extract(data, '$.metadata.condition') = 'required_context_projected'",
+    )
+    .bind("exact_history_session")
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(projected, 1, "exact antecedent must have been projected");
+}
+
+#[tokio::test]
 async fn test_session_isolation() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 

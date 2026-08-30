@@ -140,6 +140,7 @@ async fn test_model_supplied_correction_preapproval_json_key_does_not_preapprove
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -197,6 +198,7 @@ async fn test_dispatcher_correction_preapproval_context_reaches_tool_once() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -244,6 +246,7 @@ async fn test_no_correction_preapproval_key_is_injected_into_args() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -300,6 +303,7 @@ async fn test_channel_context_trusted_does_not_bypass_correction_gate() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -365,6 +369,7 @@ async fn test_scheduled_trust_does_not_bypass_correction_gate() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -508,6 +513,7 @@ async fn test_error_after_allowed_call_no_residue() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await;
@@ -542,6 +548,7 @@ async fn test_error_after_allowed_call_no_residue() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await;
@@ -613,6 +620,7 @@ async fn test_panic_no_residue() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await;
@@ -647,6 +655,7 @@ async fn test_panic_no_residue() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await;
@@ -696,6 +705,7 @@ async fn test_later_correction_call_reclassified_after_block() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await
@@ -732,6 +742,7 @@ async fn test_later_correction_call_reclassified_after_block() {
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
+                scope_escalation: None,
             },
         )
         .await

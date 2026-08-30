@@ -47,6 +47,11 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     /// ungranted local file containing potentially sensitive observations.
     pub mandate_execution: bool,
     pub mutation_forbidden: bool,
+    /// Exact out-of-scope targets carried to the tool's approval ladder.
+    pub scope_escalation: Option<&'a crate::traits::ScopeEscalation>,
+    /// What the prelude projected into `effective_arguments` on the model's
+    /// behalf; consulted to repair runtime preparation failures in place.
+    pub prelude_projections: &'a super::types::PreludeProjections,
 }
 
 fn should_replay_durable_result(
@@ -426,28 +431,102 @@ pub(super) async fn execute_tool_call_io(
         None
     };
 
-    let result = agent
-        .execute_tool_with_watchdog_outcome(
-            &tc.name,
-            ctx.effective_arguments,
-            &tool_exec::ToolExecCtx {
-                session_id: ctx.session_id,
-                task_id: Some(ctx.task_id),
-                status_tx: ctx.status_tx.clone(),
-                channel_visibility: ctx.channel_ctx.visibility,
-                channel_id: ctx.channel_ctx.channel_id.as_deref(),
-                project_scope: ctx.project_scope,
-                trusted: ctx.channel_ctx.trusted,
-                user_role: ctx.user_role,
-                workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
-                correction_preapproved: ctx.correction_preapproved,
-                suppress_trusted_session: ctx.suppress_trusted_session,
-                mandate_authority: ctx.mandate_authority,
-                tool_call_id: Some(tc.id.as_str()),
-                mutation_forbidden: ctx.mutation_forbidden,
-            },
-        )
-        .await;
+    // Boxed: keeps the dispatch loop's locals (the exec context, the
+    // repairable argument buffer) off the parent future's frame. The agent
+    // future is deep enough that an unboxed block here overflows the
+    // debug-test stack.
+    let (result, dispatched_arguments, repaired_projection) = Box::pin(async {
+        let dispatch_ctx = tool_exec::ToolExecCtx {
+            session_id: ctx.session_id,
+            task_id: Some(ctx.task_id),
+            status_tx: ctx.status_tx.clone(),
+            channel_visibility: ctx.channel_ctx.visibility,
+            channel_id: ctx.channel_ctx.channel_id.as_deref(),
+            project_scope: ctx.project_scope,
+            trusted: ctx.channel_ctx.trusted,
+            user_role: ctx.user_role,
+            workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
+            correction_preapproved: ctx.correction_preapproved,
+            suppress_trusted_session: ctx.suppress_trusted_session,
+            mandate_authority: ctx.mandate_authority,
+            tool_call_id: Some(tc.id.as_str()),
+            mutation_forbidden: ctx.mutation_forbidden,
+            scope_escalation: ctx.scope_escalation,
+        };
+        // Runtime-originated pre-dispatch failures are the runtime's to repair.
+        // When the adapter reports that it could not prepare a declaration the
+        // prelude itself projected, drop that projection and re-run the prepared
+        // call once. No domain I/O ran, so nothing is retried on the model's
+        // behalf and the model never sees the runtime's own mistake as a tool
+        // error. A failing declaration the model authored falls through as a
+        // typed pre-I/O rejection.
+        let mut dispatched_arguments = ctx.effective_arguments.to_string();
+        let mut repaired_projection: Option<Box<crate::traits::RuntimePreparationFailure>> = None;
+        let result = loop {
+            let attempt = agent
+                .execute_tool_with_watchdog_outcome(&tc.name, &dispatched_arguments, &dispatch_ctx)
+                .await;
+            let failure = match attempt.as_ref() {
+                Ok(outcome) => outcome.metadata.runtime_preparation_failure.clone(),
+                Err(_) => None,
+            };
+            let Some(failure) = failure else {
+                break attempt;
+            };
+            // Mandate grants are bound to the exact action arguments; a repaired
+            // call must return to deliberation instead of reusing authority.
+            if repaired_projection.is_some()
+                || ctx.mandate_authority.is_some()
+                || !ctx
+                    .prelude_projections
+                    .contains(&failure.field, &failure.value)
+            {
+                break attempt;
+            }
+            let Some(repaired) = super::types::remove_projected_value(
+                &dispatched_arguments,
+                &failure.field,
+                &failure.value,
+            ) else {
+                break attempt;
+            };
+            agent
+                .emit_decision_point(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
+                    crate::events::DecisionType::ExecutionFailureClassification,
+                    format!(
+                        "Repaired a runtime projection that {} could not prepare",
+                        tc.name
+                    ),
+                    json!({
+                        "condition": "runtime_projection_repaired",
+                        "tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "field": failure.field,
+                        "value": failure.value,
+                        "error": failure.error,
+                        "model_iteration_consumed": false,
+                    }),
+                )
+                .await;
+            warn!(
+                session_id = ctx.session_id,
+                task_id = ctx.task_id,
+                tool = %tc.name,
+                field = %failure.field,
+                value = %failure.value,
+                error = %failure.error,
+                "Runtime projection could not be prepared; dropped it and re-ran the prepared call"
+            );
+            repaired_projection = Some(failure);
+            dispatched_arguments = repaired;
+        };
+        (result, dispatched_arguments, repaired_projection)
+    })
+    .await;
+    let dispatched_arguments = dispatched_arguments.as_str();
 
     // _heartbeat_keeper is dropped here (or when the scope ends),
     // which triggers AbortOnDrop to cancel the background task.
@@ -459,11 +538,11 @@ pub(super) async fn execute_tool_call_io(
         .iter()
         .find(|tool| tool.name() == tc.name && tool.is_available());
     let registered_receipt_kind = registered_tool
-        .map(|tool| tool.receipt_kind(ctx.effective_arguments))
+        .map(|tool| tool.receipt_kind(dispatched_arguments))
         .unwrap_or_default();
     let registered_access_manifest = registered_tool.map(|tool| {
-        let mut manifest = tool.call_access_manifest(ctx.effective_arguments);
-        let adapter_manifest = tool.adapter_owned_access_manifest(ctx.effective_arguments);
+        let mut manifest = tool.call_access_manifest(dispatched_arguments);
+        let adapter_manifest = tool.adapter_owned_access_manifest(dispatched_arguments);
         for target in adapter_manifest.adapter_read_targets {
             if !manifest.adapter_read_targets.contains(&target) {
                 manifest.adapter_read_targets.push(target);
@@ -499,7 +578,7 @@ pub(super) async fn execute_tool_call_io(
                 .tools
                 .iter()
                 .find(|tool| tool.name() == tc.name && tool.is_available())
-                .map(|tool| tool.call_semantics(ctx.effective_arguments));
+                .map(|tool| tool.call_semantics(dispatched_arguments));
             if result_metadata.invocation_stage.reached_dispatch()
                 && result_metadata.outcome_status.is_none()
                 && registered_semantics.as_ref().is_some_and(|semantics| {
@@ -584,6 +663,13 @@ pub(super) async fn execute_tool_call_io(
             result_is_err = false;
             result_metadata.transport_error = None;
         }
+    }
+
+    if let Some(repaired) = repaired_projection.as_ref() {
+        result_text = format!(
+            "{}\n\n[runtime: dropped an unpreparable `{}` projection `{}` added by the execution prelude, then ran the call as declared]",
+            result_text, repaired.field, repaired.value
+        );
     }
 
     if let Some(injected_dir) = ctx.injected_project_dir {
@@ -889,6 +975,7 @@ async fn maybe_retry_edit_file_not_found_recovery(
         mandate_authority: None,
         tool_call_id: None,
         mutation_forbidden: ctx.mutation_forbidden,
+        scope_escalation: None,
     };
 
     // Deterministic self-recovery path:

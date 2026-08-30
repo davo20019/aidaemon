@@ -622,6 +622,36 @@ async fn inject_prelude_retry_messages(
     Ok(())
 }
 
+/// Like [`inject_prelude_retry_messages`], but the block is a typed policy
+/// boundary (not a deferral): the receipt carries a `ToolAccessDenial` so the
+/// run ledger recognizes it as a terminal observation.
+async fn inject_prelude_policy_denials(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_calls: &[ToolCall],
+    result_text: String,
+    reason_code: &str,
+) -> anyhow::Result<()> {
+    for tc in tool_calls {
+        agent
+            .persist_pre_dispatch_policy_denial(
+                emitter,
+                session_id,
+                task_id,
+                tc,
+                &tc.arguments,
+                result_text.clone(),
+                reason_code,
+                agent.resolve_tool_call_semantics(tc),
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn defer_prelude_for_new_project_instructions(
     agent: &Agent,
     emitter: &crate::events::EventEmitter,
@@ -926,15 +956,21 @@ pub(super) async fn run_tool_prelude_phase(
                 blocked.name, restriction, restriction
             )
         };
-        inject_prelude_retry_messages(
+        inject_prelude_policy_denials(
             agent,
             emitter,
             session_id,
             task_id,
             &resp.tool_calls,
             notice,
+            &format!("negative_completion_contract:{constraint_kind}"),
         )
         .await?;
+        // The typed denial lives on the persisted receipt; the run ledger
+        // recognizes it as a terminal observation from there.
+        for _ in &resp.tool_calls {
+            ctx.execution_state.record_tool_call();
+        }
         return Ok(ToolPreludeOutcome::ContinueLoop);
     }
 

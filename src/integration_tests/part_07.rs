@@ -532,8 +532,10 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         event
             .parse_data::<crate::events::DecisionPointData>()
             .is_ok_and(|data| {
-                data.metadata.get("condition").and_then(serde_json::Value::as_str)
-                    == Some("tools_required_no_tool_response")
+                matches!(
+                    data.metadata.get("condition").and_then(serde_json::Value::as_str),
+                    Some("ledger_expectations_required")
+                )
             })
     }));
 }

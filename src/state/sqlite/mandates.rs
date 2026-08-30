@@ -10,7 +10,6 @@ use crate::traits::{
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
     MandateStatus, MandateStore, MandateStrategyRevision, MandateStrategyRevisionKind,
     MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
-    SAFE_FALLBACK_WAIT_RATIONALE,
 };
 use sha2::{Digest, Sha256};
 
@@ -409,13 +408,20 @@ async fn validate_current_run_receipt_refs(
             unique.insert(receipt_id),
             "duplicate mandate evidence receipt ID"
         );
+        // A durable receipt has two canonical identities that the model can
+        // legitimately observe: the tool_call_id it issued and the result_id
+        // stamped on the receipt footer it read back. Either one names the
+        // same current-run structured success.
         let found = sqlx::query_scalar::<_, i64>(
             "SELECT 1
              FROM events e
              JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
              WHERE e.event_type = 'tool_result'
                AND t.goal_run_id = ?
-               AND json_extract(e.data, '$.tool_call_id') = ?
+               AND (
+                   json_extract(e.data, '$.tool_call_id') = ?
+                   OR json_extract(e.data, '$.receipt.result_provenance.result_id') = ?
+               )
                AND json_extract(e.data, '$.receipt.schema_version') = ?
                AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
                AND json_extract(e.data, '$.receipt.outcome_evidence')
@@ -423,6 +429,7 @@ async fn validate_current_run_receipt_refs(
              LIMIT 1",
         )
         .bind(goal_run_id)
+        .bind(receipt_id)
         .bind(receipt_id)
         .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION))
         .fetch_optional(&mut *connection)
@@ -2961,7 +2968,24 @@ impl MandateStore for SqliteStateStore {
             &decision.evidence_receipt_ids,
         )
         .await?;
+        // A runtime-authored fallback is a typed review-failure marker, not a
+        // deliberation: it carries no evidence, no intention, and no
+        // authority, so the semantic gates below (measurement, stagnation)
+        // cannot apply to it. Structural gates (lease, version, one decision
+        // per run) still apply.
+        let runtime_fallback = decision.is_runtime_fallback();
+        if runtime_fallback {
+            anyhow::ensure!(
+                decision.outcome == MandateDecisionOutcome::Wait
+                    && decision.evidence_receipt_ids.is_empty()
+                    && decision.action_attempts == 0
+                    && intention.is_none()
+                    && operating_updates.is_none(),
+                "runtime fallback decisions must be bare WAIT markers"
+            );
+        }
         let current_measurement = if mandate.objective_control.is_some()
+            && !runtime_fallback
             && matches!(
                 decision.outcome,
                 MandateDecisionOutcome::Act
@@ -2982,6 +3006,7 @@ impl MandateStore for SqliteStateStore {
             None
         };
         if mandate.objective_control.is_some()
+            && !runtime_fallback
             && matches!(
                 decision.outcome,
                 MandateDecisionOutcome::Act | MandateDecisionOutcome::Wait
@@ -2992,7 +3017,7 @@ impl MandateStore for SqliteStateStore {
                 "controlled mandate decisions require a receipt-backed metric measurement from the current run"
             );
         }
-        if decision.outcome == MandateDecisionOutcome::Wait {
+        if decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
             if let Some(control) = mandate.objective_control.as_ref() {
                 let limit = i64::from(control.max_stagnant_measurements) + 1;
                 let values = sqlx::query_scalar::<_, i64>(
@@ -4376,7 +4401,9 @@ impl MandateStore for SqliteStateStore {
             close_invalid_decision_state!();
         };
         if decision_outcome == MandateDecisionOutcome::Wait
-            && decision_rationale.as_deref() == Some(SAFE_FALLBACK_WAIT_RATIONALE)
+            && decision_rationale
+                .as_deref()
+                .is_some_and(crate::traits::is_runtime_fallback_rationale)
         {
             close_review_failed_retry!(MandateFinalizationRejectReason::DeliberatorFailed);
         }
@@ -7360,6 +7387,152 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn evidence_receipts_accept_either_tool_call_id_or_receipt_result_id() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let task_id = run.root_task_id.as_deref().unwrap();
+        sqlx::query(
+            "INSERT INTO events
+                (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'http_request')",
+        )
+        .bind("owner-session")
+        .bind(
+            serde_json::json!({
+                "task_id": task_id,
+                "tool_call_id": "call_synthetic_metric",
+                "name": "http_request",
+                "result": "synthetic metric value",
+                "success": true,
+                "duration_ms": 1,
+                "receipt": {
+                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "outcome_status": "succeeded",
+                    "outcome_evidence": "structured_metadata",
+                    "result_provenance": { "result_id": "sha256:synthetic-metric-digest" }
+                }
+            })
+            .to_string(),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        for receipt_id in ["call_synthetic_metric", "sha256:synthetic-metric-digest"] {
+            let measurement = MandateObjectiveMeasurement::new(
+                &mandate.id,
+                mandate.version,
+                &run.id,
+                12_000_000,
+                9_500,
+                vec![receipt_id.to_string()],
+                &chrono::Utc::now().to_rfc3339(),
+            );
+            store
+                .record_mandate_objective_measurement(&measurement)
+                .await
+                .unwrap_or_else(|error| panic!("{receipt_id} should be accepted: {error}"));
+        }
+        let invented = MandateObjectiveMeasurement::new(
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            12_000_000,
+            9_500,
+            vec!["sha256:not-a-receipt".to_string()],
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        assert!(store
+            .record_mandate_objective_measurement(&invented)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_fallback_wait_bypasses_semantic_gates_and_finalizes_as_deliberator_failure() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+
+        // A model-authored WAIT on a controlled mandate still needs a
+        // current-run measurement.
+        let model_wait = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "model decided to wait without measuring",
+            mandate.version,
+        );
+        let error = store
+            .record_mandate_decision(&model_wait, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metric measurement"), "{error}");
+
+        // The runtime fallback carries no authority and must always persist,
+        // regardless of objective control state.
+        let fallback =
+            MandateDecisionCycle::runtime_fallback_wait(&mandate, &run.id, chrono::Utc::now());
+        assert!(fallback.is_runtime_fallback());
+        store
+            .record_mandate_decision(&fallback, None, None)
+            .await
+            .unwrap();
+        let mut spoofed = fallback.clone();
+        spoofed.id = uuid::Uuid::new_v4().to_string();
+        spoofed.evidence_receipt_ids = vec!["call_anything".to_string()];
+        assert!(store
+            .record_mandate_decision(&spoofed, None, None)
+            .await
+            .is_err());
+
+        let root_attempt = store
+            .claim_task_with_lease(
+                run.root_task_id.as_deref().unwrap(),
+                "fallback-root",
+                Some("profile-task-lead"),
+                7_200,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .patch_task_from_attempt(
+                &root_attempt.id,
+                &root_attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("task lead returned without a decision".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        let result = store
+            .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                mandate_id: mandate.id.clone(),
+                expected_mandate_version: mandate.version,
+                goal_run_id: run.id.clone(),
+                finalized_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            MandateRunFinalizationResult::Rejected {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed
+            }
+        );
+        let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(current.status, MandateStatus::Active);
     }
 
     #[tokio::test]

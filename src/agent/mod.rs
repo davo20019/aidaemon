@@ -223,6 +223,8 @@ mod computer_use;
 
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
+#[path = "loop/closeout.rs"]
+mod closeout;
 #[path = "loop/completion_checks.rs"]
 mod completion_checks;
 #[path = "runtime/completion_contract.rs"]

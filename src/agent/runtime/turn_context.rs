@@ -910,6 +910,46 @@ impl Agent {
         .await
     }
 
+    /// Persist a typed policy denial: the operation was refused before
+    /// dispatch by an authority boundary (read-only contract, capability
+    /// constraint, mandate gate, scope lock). The receipt carries the typed
+    /// `ToolAccessDenial` so the run ledger — not a caller-maintained counter
+    /// — can recognize the denial as a terminal observation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn persist_pre_dispatch_policy_denial(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        task_id: &str,
+        tool_call: &ToolCall,
+        effective_arguments: &str,
+        result_text: String,
+        reason_code: &str,
+        semantics: ToolCallSemantics,
+        access_manifest: Option<ToolCallAccessManifest>,
+    ) -> anyhow::Result<()> {
+        self.persist_pre_dispatch_outcome_with_kernel_claim(
+            emitter,
+            session_id,
+            task_id,
+            tool_call,
+            effective_arguments,
+            result_text,
+            crate::traits::ToolOutcomeStatus::Blocked,
+            crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+            false,
+            semantics,
+            access_manifest,
+            Some(crate::traits::ToolAccessDenial {
+                reason_code: reason_code.to_string(),
+                enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
+                exit_code: None,
+            }),
+            None,
+        )
+        .await
+    }
+
     /// Persist a pre-dispatch outcome together with the durable operation and
     /// obligation binding that was proposed. This makes denied attempts part
     /// of the same replayable lifecycle as dispatched calls.

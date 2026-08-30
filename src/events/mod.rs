@@ -24,12 +24,12 @@ pub use model_call_telemetry::{
     record_background_model_call_telemetry, record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use payloads::*;
-pub(crate) use run_aggregate::{
-    RunAggregate, RunObligationClass, RunObligationState, RunTerminalDecision, TaskKernelAdmission,
-    TaskKernelOperationClaim,
-};
 #[cfg(test)]
-pub(crate) use run_aggregate::{RunObligation, RunOperation};
+pub(crate) use run_aggregate::RunOperation;
+pub(crate) use run_aggregate::{
+    CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
+    RunTerminalDecision, TaskKernelAdmission, TaskKernelOperationClaim,
+};
 #[cfg(test)]
 pub(crate) use store::GeneratedResponseRef;
 pub(crate) use store::{capture_generated_responses, CapturedGeneratedResponse};

@@ -14,7 +14,7 @@ use crate::events::TaskOutcome;
 use crate::traits::{
     AgentRole, Mandate, MandateDecisionOutcome, MandateFinalizationRejectReason,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateStatus, StateStore, SAFE_FALLBACK_WAIT_RATIONALE,
+    MandateRunNotificationKind, MandateStatus, StateStore,
 };
 use crate::types::{ChannelContext, UserRole};
 
@@ -867,14 +867,11 @@ async fn persist_safe_wait_if_decision_missing(
     if let Some(decision) = existing {
         return decision.mandate_id == mandate.id && decision.mandate_version == mandate.version;
     }
-    let mut decision = crate::traits::MandateDecisionCycle::new(
-        &mandate.id,
+    let decision = crate::traits::MandateDecisionCycle::runtime_fallback_wait(
+        &mandate,
         goal_run_id,
-        MandateDecisionOutcome::Wait,
-        SAFE_FALLBACK_WAIT_RATIONALE,
-        mandate.version,
+        chrono::Utc::now(),
     );
-    decision.reconsider_at = Some(mandate.bounded_next_review_at(None, chrono::Utc::now()));
     if let Err(error) = state.record_mandate_decision(&decision, None, None).await {
         // A concurrent exact decision wins. Reload once before reporting that
         // the safe fallback failed.

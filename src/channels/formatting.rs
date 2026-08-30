@@ -782,6 +782,15 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn plain_multi_line_replies_keep_one_field_per_line() {
+        let reply =
+            "phase=SYNTHETIC\nblog_schedule=absent\nlatest_run=unknown\ncontroller=not_proven";
+        assert_eq!(markdown_to_telegram_html(reply), reply);
+        assert_eq!(markdown_to_telegram_plain_fallback(reply), reply);
+        assert_eq!(markdown_to_telegram_html(reply).lines().count(), 4);
+    }
     use super::*;
 
     #[test]

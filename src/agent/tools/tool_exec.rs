@@ -144,6 +144,10 @@ pub(super) struct ToolExecCtx<'a> {
     pub tool_call_id: Option<&'a str>,
     /// Rust-side hard boundary inherited from the request contract.
     pub mutation_forbidden: bool,
+    /// Exact out-of-scope filesystem targets the controller declined to
+    /// reject outright. Loop-owned; the tool must obtain user authority for
+    /// them before running.
+    pub scope_escalation: Option<&'a crate::traits::ScopeEscalation>,
 }
 
 async fn scoped_workspace_arguments(
@@ -385,10 +389,11 @@ impl Agent {
                 );
                 Ok(true)
             }
-            crate::mandates::MandateCallClass::RecordDecision => {
+            crate::mandates::MandateCallClass::RecordDecision
+            | crate::mandates::MandateCallClass::RecordMeasurement => {
                 anyhow::ensure!(
                     ctx.mandate_authority.is_none(),
-                    "Decision recording cannot carry mutation authority."
+                    "Decision and measurement recording cannot carry mutation authority."
                 );
                 Ok(true)
             }
@@ -720,6 +725,9 @@ impl Agent {
                 // scheduled tasks set this. Never derived from session ID strings.
                 if trusted {
                     map.insert("_trusted_session".to_string(), json!(true));
+                }
+                if let Some(escalation) = ctx.scope_escalation.filter(|e| !e.is_empty()) {
+                    map.insert("_scope_escalation".to_string(), json!(escalation));
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));

@@ -84,6 +84,28 @@ pub(super) fn parse_planned_forbidden_action(value: &str) -> Option<ForbiddenMut
     }
 }
 
+/// The fail-closed half of a compiled contract: what the run may NOT do.
+/// Consumed at admission and by the closeout arbiter's admissibility check.
+/// A gate that decides whether more work may be demanded must not read
+/// anything outside this view except the receipt ledger.
+pub(crate) struct RequestAuthority<'a> {
+    pub forbids_mutation: bool,
+    pub forbids_tool_use: bool,
+    pub allowed_tool_names: &'a [String],
+    pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
+}
+
+/// The advisory half of a compiled contract: what would count as proof.
+/// Expectations are proposals verified by receipts; they never block a reply
+/// on their own.
+pub(crate) struct RequestExpectations<'a> {
+    pub requires_exact_history: bool,
+    pub minimum_sources: usize,
+    /// Evidence requirements are compiled into ledger obligations at
+    /// bootstrap; gates consult the ledger verdict, not this list.
+    pub evidence_requirements: &'a [RequestEvidenceRequirement],
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionContract {
     /// Current task that owns every field, target, requirement, and constraint
@@ -139,6 +161,24 @@ pub(super) struct CompletionContract {
 }
 
 impl CompletionContract {
+    /// The fail-closed authority half of this contract.
+    pub(crate) fn authority(&self) -> RequestAuthority<'_> {
+        RequestAuthority {
+            forbids_mutation: self.forbids_mutation,
+            forbids_tool_use: self.forbids_tool_use,
+            allowed_tool_names: &self.allowed_tool_names,
+            forbidden_tool_scopes: &self.forbidden_tool_scopes,
+        }
+    }
+
+    /// The advisory expectations half of this contract.
+    pub(crate) fn expectations(&self) -> RequestExpectations<'_> {
+        RequestExpectations {
+            requires_exact_history: self.requires_exact_history,
+            minimum_sources: self.minimum_sources,
+            evidence_requirements: &self.evidence_requirements,
+        }
+    }
     pub(super) fn primary_target_hint(&self) -> Option<String> {
         self.verification_targets
             .first()
@@ -1453,6 +1493,7 @@ impl CompletionProgress {
             aggregate.terminal_decision(),
             crate::events::RunTerminalDecision::Succeeded
                 | crate::events::RunTerminalDecision::SucceededByEvidence
+                | crate::events::RunTerminalDecision::ClosedByPolicyDenial
         ) {
             verification_pending = false;
         }

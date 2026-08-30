@@ -447,6 +447,8 @@ pub trait ExecutionBackend: Send + Sync {
     async fn rename(&self, source: &BackendPath, destination: &BackendPath) -> anyhow::Result<()>;
     #[allow(dead_code)]
     async fn remove_file(&self, path: &BackendPath) -> anyhow::Result<()>;
+    /// Remove a directory only if it is empty; never recursive.
+    async fn remove_empty_dir(&self, path: &BackendPath) -> anyhow::Result<()>;
     async fn read_dir(&self, path: &BackendPath) -> anyhow::Result<Vec<BackendDirEntry>>;
     async fn spawn(&self, request: ExecutionRequest) -> anyhow::Result<SpawnedProcess>;
     async fn terminate(&self, handle: &ProcessHandle, grace: Duration) -> anyhow::Result<()>;
@@ -850,6 +852,13 @@ impl ExecutionBackend for LocalBackend {
         let host = self.host_path(path);
         self.ensure_allowed(&host).await?;
         tokio::fs::remove_file(host).await?;
+        Ok(())
+    }
+
+    async fn remove_empty_dir(&self, path: &BackendPath) -> anyhow::Result<()> {
+        let host = self.host_path(path);
+        self.ensure_allowed(&host).await?;
+        tokio::fs::remove_dir(host).await?;
         Ok(())
     }
 
@@ -1300,6 +1309,19 @@ impl RemoteBackendCore {
         Ok(())
     }
 
+    async fn remove_empty_dir(&self, path: &BackendPath) -> anyhow::Result<()> {
+        self.checked_path(path).await?;
+        let output = self
+            .run_transport(
+                &format!("rmdir -- {}", shell_quote(path.as_str())),
+                None,
+                Duration::from_secs(30),
+            )
+            .await?;
+        remote_success("remove empty directory", output)?;
+        Ok(())
+    }
+
     async fn read_dir(&self, path: &BackendPath) -> anyhow::Result<Vec<BackendDirEntry>> {
         self.checked_path(path).await?;
         let output = self
@@ -1608,6 +1630,9 @@ macro_rules! delegate_remote_backend {
             }
             async fn remove_file(&self, path: &BackendPath) -> anyhow::Result<()> {
                 self.core.remove_file(path).await
+            }
+            async fn remove_empty_dir(&self, path: &BackendPath) -> anyhow::Result<()> {
+                self.core.remove_empty_dir(path).await
             }
             async fn read_dir(&self, path: &BackendPath) -> anyhow::Result<Vec<BackendDirEntry>> {
                 self.core.read_dir(path).await

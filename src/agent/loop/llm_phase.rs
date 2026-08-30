@@ -664,8 +664,11 @@ async fn finalize_durable_receipt_after_provider_failure(
         // set alone (an exhausted contract that could not credit it) closes
         // the same way: the receipts are the proof.
         aggregate.work_is_fulfilled()
-            || aggregate.terminal_decision()
-                == crate::events::RunTerminalDecision::SucceededByEvidence
+            || matches!(
+                aggregate.terminal_decision(),
+                crate::events::RunTerminalDecision::SucceededByEvidence
+                    | crate::events::RunTerminalDecision::ClosedByPolicyDenial
+            )
     } else {
         result.receipt.as_ref().is_some_and(|receipt| {
             !receipt.completion_obligation_ids.is_empty()
@@ -2405,6 +2408,9 @@ mod tests {
                 idempotency_key: None,
                 outcome: Some(crate::traits::ToolOutcomeStatus::Succeeded),
                 dispatched: true,
+                policy_denied: false,
+                mutating: false,
+                evidence_capabilities: Vec::new(),
                 result_id: Some("result-1".to_string()),
                 operation_lineage: None,
             },

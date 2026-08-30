@@ -1138,6 +1138,10 @@ pub struct TaskEndData {
 pub enum TaskProofBasis {
     Contract,
     Evidence,
+    /// Every open obligation was refused by a typed authority boundary before
+    /// dispatch and the reply narrates that boundary. Nothing the request
+    /// asked for could be reached; the run is complete at that boundary.
+    PolicyDenial,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

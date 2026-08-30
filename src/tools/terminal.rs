@@ -855,8 +855,14 @@ pub struct TerminalTool {
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
     /// Session-only allowed prefixes (cleared on restart)
     session_approved: Arc<RwLock<HashSet<String>>>,
+    /// Elevated capabilities granted per command key (`network`,
+    /// `read:<path>`, `write:<path>`). Session grants live here only;
+    /// Allow-Always grants are also persisted.
+    capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
     /// Permission persistence mode
     permission_mode: PermissionMode,
+    /// Host vs sandbox execution.
+    confinement: crate::types::TerminalConfinement,
     approval_tx: super::ApprovalBroker,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
@@ -1754,7 +1760,7 @@ fn confined_opaque_failure_hint(
         return None;
     }
     Some(format!(
-        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} without a captured error. A non-zero exit with no error text is almost never the task itself failing — it is usually a child program aborting at startup because it could not read a required file (a runtime config or shared library) or was denied a path, and its error was written to the OS security log rather than to stderr. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, to make it print the real error; (2) a private writable scratch is already available at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME) — you do not need to create or declare one; (3) if the tool writes its own log file, read it; (4) if a specific path was denied, declare it in read_paths/read_roots and retry. Only report a blocker after one such diagnostic run still fails."
+        "\n[SYSTEM diagnostic] The command ran in a confined sandbox and exited {code} without a captured error. That is almost never the task itself failing: a child program aborted at startup because it could not read a required file, was denied a path, or had no network, and its error was not written to stderr. Before reporting this as blocked, self-diagnose: (1) re-run the underlying program directly rather than through a wrapper like npx/npm, or add its verbose/--debug/--verbose flag, so it prints the real error; (2) a private writable scratch already exists at $TMPDIR (also $NPM_CONFIG_CACHE/$XDG_CACHE_HOME); (3) if the tool writes its own log file, read it; (4) if the program needs the network (deploy, publish, install, API call), re-run with network=true; (5) if it needs a config or credential directory under $HOME (macOS: ~/Library/Preferences/<tool> or ~/.config/<tool>), declare it in read_paths (and write_paths if it writes there) and retry — paths outside the task scope prompt the user for approval instead of being silently blocked. Only report a blocker after one such diagnostic run still fails."
     ))
 }
 
@@ -1825,6 +1831,12 @@ fn background_completion_ping_message(
     }
 }
 
+/// Elevated capabilities a confined run was granted beyond filesystem scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfinedCapabilities {
+    pub(crate) network: bool,
+}
+
 pub(crate) async fn confined_terminal_execution_request(
     backend: &SharedExecutionBackend,
     command: &str,
@@ -1840,6 +1852,7 @@ pub(crate) async fn confined_terminal_execution_request(
         read_paths,
         write_paths,
         &[],
+        ConfinedCapabilities::default(),
     )
     .await
 }
@@ -1851,6 +1864,7 @@ async fn confined_terminal_script_execution_request(
     read_paths: &[String],
     write_paths: &[String],
     write_roots: &[String],
+    capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<ExecutionRequest> {
     confined_terminal_execution_request_inner(
         backend,
@@ -1860,10 +1874,12 @@ async fn confined_terminal_script_execution_request(
         read_paths,
         write_paths,
         write_roots,
+        capabilities,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn confined_terminal_execution_request_inner(
     backend: &SharedExecutionBackend,
     shell_source: &str,
@@ -1872,6 +1888,7 @@ async fn confined_terminal_execution_request_inner(
     read_paths: &[String],
     write_paths: &[String],
     write_roots: &[String],
+    capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<ExecutionRequest> {
     let resolved_cwd = match working_dir {
         Some(path) => {
@@ -1986,6 +2003,7 @@ async fn confined_terminal_execution_request_inner(
             &writes,
             &runtime_support.executable_paths,
             sandbox_environment,
+            capabilities,
         )
     }
 
@@ -2002,7 +2020,7 @@ async fn confined_terminal_execution_request_inner(
         .map(ToString::to_string)
         .unwrap_or_else(|| "/".to_string());
     #[cfg(not(target_os = "macos"))]
-    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes)?;
+    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes, capabilities)?;
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -2113,8 +2131,18 @@ fn macos_manifest_sandbox_policy(
     write_paths: &[String],
     executable_paths: &[String],
     script_via_stdin: bool,
+    capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<String> {
     let mut policy = include_str!("macos_terminal_sandbox.sbpl").to_string();
+    if capabilities.network {
+        // Granted through the terminal approval ladder (or a persisted
+        // capability grant), never by default. `system-socket` covers the
+        // resolver's control socket; DNS itself goes through mDNSResponder,
+        // which the base policy already allows a mach lookup for.
+        policy.push_str(
+            "\n;; Elevated capability granted for this run: outbound network.\n(allow network-outbound)\n(allow system-socket)\n",
+        );
+    }
     if let Some(path) = traversal_cwd {
         let path = validated_seatbelt_path(path)?;
         // Execution cwd is location, not implicit authority to read that tree.
@@ -2296,6 +2324,7 @@ fn macos_manifest_sandbox_policy(
     Ok(policy)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "macos")]
 fn macos_manifest_sandbox_request(
     shell_source: &str,
@@ -2305,6 +2334,7 @@ fn macos_manifest_sandbox_request(
     write_paths: &[String],
     executable_paths: &[String],
     sandbox_environment: std::collections::BTreeMap<String, String>,
+    capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<ExecutionRequest> {
     let traversal_cwd = cwd.as_ref().map(crate::execution::BackendPath::as_str);
     let policy = macos_manifest_sandbox_policy(
@@ -2313,6 +2343,7 @@ fn macos_manifest_sandbox_request(
         write_paths,
         executable_paths,
         script_via_stdin,
+        capabilities,
     )?;
     let mut args = vec![
         "-p".to_string(),
@@ -2878,7 +2909,10 @@ async fn add_manifest_runtime_environment(
     script_via_stdin: bool,
     support: &mut NativeSandboxRuntimeSupport,
 ) {
-    let mut declared_roots = write_roots.iter().collect::<Vec<_>>();
+    // A root nested under a declared *future* grant is a leaf the command
+    // owns; it is neither materialized nor eligible as a scratch lane.
+    let topmost_roots = materialized_write_roots(backend, write_roots, write_paths, None).await;
+    let mut declared_roots = topmost_roots.iter().collect::<Vec<_>>();
     // The narrowest declared directory capability is the least-privilege
     // scratch lane. A broad existing cwd such as /tmp must not steal TMPDIR
     // from a more specific future output root merely because it already
@@ -3039,6 +3073,7 @@ async fn run_confined_once(
     read_paths: &[String],
     write_paths: &[String],
     write_roots: &[String],
+    capabilities: ConfinedCapabilities,
     timeout: Duration,
 ) -> anyhow::Result<(Option<i32>, String, String)> {
     let request = if script_via_stdin {
@@ -3049,6 +3084,7 @@ async fn run_confined_once(
             read_paths,
             write_paths,
             write_roots,
+            capabilities,
         )
         .await?
     } else {
@@ -3060,6 +3096,7 @@ async fn run_confined_once(
             read_paths,
             write_paths,
             write_roots,
+            capabilities,
         )
         .await?
     };
@@ -3153,6 +3190,7 @@ fn codex_sandbox_state_json(
     cwd: &str,
     read_paths: &[String],
     write_paths: &[String],
+    capabilities: ConfinedCapabilities,
 ) -> anyhow::Result<String> {
     let mut filesystem_entries = vec![json!({
         "path": {
@@ -3182,12 +3220,95 @@ fn codex_sandbox_state_json(
                 "type": "restricted",
                 "entries": filesystem_entries
             },
-            "network": "restricted"
+            "network": if capabilities.network { "enabled" } else { "restricted" }
         },
         "codexLinuxSandboxExe": Value::Null,
         "sandboxCwd": sandbox_cwd.as_str(),
         "useLegacyLandlock": false
     }))?)
+}
+
+/// Declared write roots that must be materialized as directories before
+/// launch. A root is skipped when it is a strict descendant of another
+/// declared write grant (root or exact path) that does not exist yet, or when
+/// the same future path is also declared as an exact write path. Such an
+/// entry carries no capability information — the future ancestor's grant
+/// already covers it — so it can only be a *target* the command owns, and
+/// creating it as a directory would silently change the command's semantics
+/// (a declared `.../result.txt` would become an unwritable directory). A
+/// future root under an *existing* directory (a project's `dist`) is still
+/// prepared: that entry is the only way to request the output directory.
+/// `on_disk` reports `None` for a missing path, `Some(true)` for a directory
+/// and `Some(false)` for any other existing entry.
+fn select_materialized_write_roots(
+    write_roots: &[String],
+    write_paths: &[String],
+    on_disk: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
+    let exists = |path: &str| on_disk(path).is_some();
+    fn normalized(path: &str) -> std::path::PathBuf {
+        let trimmed = path.trim();
+        let trimmed = trimmed
+            .strip_suffix('/')
+            .filter(|p| !p.is_empty())
+            .unwrap_or(trimmed);
+        std::path::PathBuf::from(trimmed)
+    }
+    let future_grants: Vec<std::path::PathBuf> = write_roots
+        .iter()
+        .chain(write_paths.iter())
+        .filter(|path| !exists(path))
+        .map(|path| normalized(path))
+        .collect();
+    let future_exact_paths: Vec<std::path::PathBuf> = write_paths
+        .iter()
+        .filter(|path| !exists(path))
+        .map(|path| normalized(path))
+        .collect();
+    let mut kept = Vec::new();
+    for root in write_roots {
+        let candidate = normalized(root);
+        // Nested under a future grant: the ancestor covers it.
+        let nested_under_future_grant = future_grants
+            .iter()
+            .any(|grant| candidate != *grant && candidate.starts_with(grant));
+        // Also declared as a future *exact* path: the two declarations
+        // contradict each other and the exact form is the more specific
+        // one, so the entry is an exact file/dir target the command creates.
+        let declared_as_exact_target = future_exact_paths.contains(&candidate);
+        // Already on disk as a file (or other non-directory): it is an exact
+        // target whatever role it was declared in; there is nothing to
+        // prepare and `create_dir_all` would only fail with EEXIST.
+        let existing_non_directory = on_disk(root) == Some(false);
+        if !nested_under_future_grant
+            && !declared_as_exact_target
+            && !existing_non_directory
+            && !kept.contains(root)
+        {
+            kept.push(root.clone());
+        }
+    }
+    kept
+}
+
+/// Backend-aware form of [`select_materialized_write_roots`]: resolves each
+/// declared grant against `cwd` to test existence.
+async fn materialized_write_roots(
+    backend: &SharedExecutionBackend,
+    write_roots: &[String],
+    write_paths: &[String],
+    cwd: Option<&crate::execution::BackendPath>,
+) -> Vec<String> {
+    let mut on_disk = std::collections::HashMap::new();
+    for path in write_roots.iter().chain(write_paths.iter()) {
+        let Ok(resolved) = resolve_access_path(backend, path, cwd).await else {
+            continue;
+        };
+        if let Ok(metadata) = backend.metadata(&resolved).await {
+            on_disk.insert(path.clone(), metadata.is_dir());
+        }
+    }
+    select_materialized_write_roots(write_roots, write_paths, |path| on_disk.get(path).copied())
 }
 
 async fn resolve_access_path(
@@ -3377,12 +3498,47 @@ impl TerminalTool {
                 warn!("Failed to load persisted terminal prefixes: {}", e);
             }
         }
+        let mut persisted_capabilities = HashSet::new();
+        if let Err(error) = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS terminal_capability_grants (
+                backend_scope TEXT NOT NULL,
+                prefix TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (backend_scope, prefix, capability)
+            )",
+        )
+        .execute(&pool)
+        .await
+        {
+            warn!(
+                "Failed to create terminal_capability_grants table: {}",
+                error
+            );
+        }
+        match sqlx::query_as::<_, (String, String)>(
+            "SELECT prefix, capability FROM terminal_capability_grants WHERE backend_scope = ?",
+        )
+        .bind(backend.approval_scope())
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => {
+                for (prefix, capability) in rows {
+                    info!(prefix = %prefix, capability = %capability, "Loaded persisted capability grant");
+                    persisted_capabilities.insert((prefix, capability));
+                }
+            }
+            Err(e) => warn!("Failed to load persisted capability grants: {}", e),
+        }
 
         Self {
             backend,
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
+            capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
             permission_mode,
+            confinement: crate::types::TerminalConfinement::default(),
             approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
@@ -3422,6 +3578,20 @@ impl TerminalTool {
     /// sends the existing user notification.
     pub fn with_self_correction(mut self, config: SelfCorrectionConfig) -> Self {
         self.self_correction = config;
+        self
+    }
+
+    /// Choose host or sandbox execution (see `[terminal] confinement`).
+    pub fn with_confinement(mut self, confinement: crate::types::TerminalConfinement) -> Self {
+        match confinement {
+            crate::types::TerminalConfinement::Host => {
+                info!("Terminal runs commands on the host (set [terminal] confinement = \"sandbox\" to confine them)")
+            }
+            crate::types::TerminalConfinement::Sandbox => {
+                info!("Terminal runs commands inside the OS sandbox with task-scoped policy")
+            }
+        }
+        self.confinement = confinement;
         self
     }
 
@@ -3711,28 +3881,87 @@ impl TerminalTool {
         Ok(response)
     }
 
-    async fn add_prefix(&self, command: &str) {
-        let trimmed = command.trim();
-        // For chained commands, approve each segment's binary; for simple
-        // commands, the first word. Storing segment binaries (rather than the
-        // full chained string) lets "Allow Always" cover re-runs that differ
-        // only in arguments — the same trust grant as Always-allowing each
-        // simple command directly, and what `is_allowed`'s per-segment
-        // chained check matches against.
-        let keys: Vec<String> = if contains_shell_operator(trimmed) {
-            split_command_segments(trimmed)
+    /// Elevated capabilities a run asks for beyond its task scope, as stable
+    /// grant keys: `network`, `read:<path>`, `write:<path>`.
+    fn requested_capabilities(args: &TerminalArgs) -> Vec<String> {
+        let mut capabilities = Vec::new();
+        if args.network {
+            capabilities.push("network".to_string());
+        }
+        if let Some(escalation) = &args._scope_escalation {
+            capabilities.extend(escalation.read_paths.iter().map(|p| format!("read:{p}")));
+            capabilities.extend(escalation.write_paths.iter().map(|p| format!("write:{p}")));
+        }
+        capabilities
+    }
+
+    fn describe_capabilities(capabilities: &[String]) -> String {
+        capabilities
+            .iter()
+            .map(|capability| match capability.split_once(':') {
+                Some(("read", path)) => format!("read outside task scope: {path}"),
+                Some(("write", path)) => format!("write outside task scope: {path}"),
+                _ => "outbound network access".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// True when every requested capability is already granted for every
+    /// binary the command runs (or the owner trusts all commands).
+    async fn capabilities_granted(&self, command: &str, capabilities: &[String]) -> bool {
+        if capabilities.is_empty() {
+            return true;
+        }
+        if self
+            .allowed_prefixes
+            .read()
+            .await
+            .iter()
+            .any(|prefix| prefix == "*")
+        {
+            return true;
+        }
+        let grants = self.capability_grants.read().await;
+        command_grant_keys(command).iter().all(|key| {
+            capabilities
                 .iter()
-                .map(|seg| extract_segment_binary(seg))
-                .filter(|b| !b.is_empty())
-                .map(str::to_string)
-                .collect()
-        } else {
-            vec![trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or(trimmed)
-                .to_string()]
-        };
+                .all(|capability| grants.contains(&(key.clone(), capability.clone())))
+        })
+    }
+
+    async fn add_capability_grants(&self, command: &str, capabilities: &[String], persist: bool) {
+        let keys = command_grant_keys(command);
+        let mut grants = self.capability_grants.write().await;
+        for key in keys {
+            for capability in capabilities {
+                if !grants.insert((key.clone(), capability.clone())) {
+                    continue;
+                }
+                info!(prefix = %key, capability = %capability, persist, "Granted terminal capability");
+                if !persist {
+                    continue;
+                }
+                if let Some(ref pool) = self.pool {
+                    if let Err(e) = sqlx::query(
+                        "INSERT OR IGNORE INTO terminal_capability_grants
+                            (backend_scope, prefix, capability) VALUES (?, ?, ?)",
+                    )
+                    .bind(self.backend.approval_scope())
+                    .bind(&key)
+                    .bind(capability)
+                    .execute(pool)
+                    .await
+                    {
+                        warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn add_prefix(&self, command: &str) {
+        let keys = command_grant_keys(command);
         let mut prefixes = self.allowed_prefixes.write().await;
         for key in keys {
             if key == "*" {
@@ -4821,6 +5050,8 @@ impl TerminalTool {
             task_id,
             tool_call_id,
             detach,
+            network,
+            confined,
             status_tx,
         } = request;
         let has_write_targets = !write_paths.is_empty() || !write_roots.is_empty();
@@ -4855,7 +5086,11 @@ impl TerminalTool {
             });
         }
 
-        let execution_request = if script_via_stdin {
+        let capabilities = ConfinedCapabilities { network };
+        let execution_request = if !confined {
+            host_terminal_execution_request(&self.backend, command, script_via_stdin, working_dir)
+                .await?
+        } else if script_via_stdin {
             confined_terminal_script_execution_request(
                 &self.backend,
                 command,
@@ -4863,6 +5098,7 @@ impl TerminalTool {
                 read_paths,
                 write_paths,
                 write_roots,
+                capabilities,
             )
             .await?
         } else {
@@ -4874,6 +5110,7 @@ impl TerminalTool {
                 read_paths,
                 write_paths,
                 write_roots,
+                capabilities,
             )
             .await?
         };
@@ -4959,7 +5196,7 @@ impl TerminalTool {
                 // exact read-only path and re-run ONCE. This is the general
                 // form of the manual "grant the denied path and retry" fix —
                 // no per-tool table, one bounded attempt, secret stores excluded.
-                if exit_code != Some(0) && !detach {
+                if confined && exit_code != Some(0) && !detach {
                     let home = self.backend.home_hint().to_string();
                     let combined = format!("{stdout}\n{stderr}");
                     let heal_paths = self_healable_denied_reads(&combined, &home, read_paths);
@@ -4974,6 +5211,7 @@ impl TerminalTool {
                             &augmented,
                             write_paths,
                             write_roots,
+                            capabilities,
                             self.initial_timeout,
                         )
                         .await
@@ -5009,8 +5247,10 @@ impl TerminalTool {
                 if !self_heal_note.is_empty() {
                     output.push_str(&self_heal_note);
                 }
-                if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
-                    output.push_str(&hint);
+                if confined {
+                    if let Some(hint) = confined_opaque_failure_hint(exit_code, &stdout, &stderr) {
+                        output.push_str(&hint);
+                    }
                 }
                 // A signal-killed child reports no exit code, so the hint above
                 // (which keys on a non-zero code) stays silent for what is often
@@ -6558,7 +6798,31 @@ impl TerminalTool {
                 //   8. semantic model          → approve only dangerous effects
                 //   9. classifier failure      → fail closed to approval
                 let is_allowed = self.is_allowed(command).await;
-                let needs_approval = if daemonization_approved {
+                let confined = run_is_confined(self.confinement);
+                // On the host the process already has the user's environment,
+                // network, and (non-secret) files; there is no sandbox grant
+                // to escalate. Credential stores stay rejected upstream.
+                let requested_capabilities = if confined {
+                    Self::requested_capabilities(&args)
+                } else {
+                    Vec::new()
+                };
+                let capability_escalation_pending = !requested_capabilities.is_empty()
+                    && !is_trusted_session
+                    && !self
+                        .capabilities_granted(command, &requested_capabilities)
+                        .await;
+                let needs_approval = if capability_escalation_pending {
+                    // Elevated capability is new authority; no command-prefix
+                    // grant or dispatcher preapproval stands in for the user
+                    // seeing exactly what is being requested.
+                    approval_warnings.push(format!(
+                        "Requests elevated capabilities beyond the task scope: {}",
+                        Self::describe_capabilities(&requested_capabilities)
+                    ));
+                    info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
+                    true
+                } else if daemonization_approved {
                     false
                 } else if correction_preapproved {
                     // Dispatcher classified this call as safe; skip the user prompt.
@@ -6682,6 +6946,8 @@ impl TerminalTool {
                         Ok(ApprovalResponse::AllowSession) => {
                             // Save to session-only storage (cleared on restart)
                             self.add_session_prefix(command).await;
+                            self.add_capability_grants(command, &requested_capabilities, false)
+                                .await;
                             if let Some(ref pool) = self.pool {
                                 let _ = record_approval(pool, command).await;
                             }
@@ -6689,6 +6955,8 @@ impl TerminalTool {
                         Ok(ApprovalResponse::AllowAlways) => {
                             // Save to permanent storage (DB)
                             self.add_prefix(command).await;
+                            self.add_capability_grants(command, &requested_capabilities, true)
+                                .await;
                             if let Some(ref pool) = self.pool {
                                 let _ = record_approval(pool, command).await;
                             }
@@ -6721,38 +6989,101 @@ impl TerminalTool {
                 }
 
                 // A typed root grant is allowed to name a future directory.
-                // Prepare only those explicit roots, after all approval and
-                // checkpoint gates, so the confined process can create
+                // Prepare only the topmost explicit roots, after all approval
+                // and checkpoint gates, so the confined process can create
                 // descendants without relying on ambient /tmp access. Exact
-                // file grants never enter this path.
+                // file grants and roots nested under another declared grant
+                // never enter this path: the command owns those leaves.
+                let mut created_future_roots: Vec<crate::execution::BackendPath> = Vec::new();
                 if !args.write_roots.is_empty() {
                     let cwd = if let Some(path) = args.working_dir.as_deref() {
                         Some(self.backend.resolve_path(path).await?)
                     } else {
                         None
                     };
-                    for root in &args.write_roots {
+                    let materialized_roots = materialized_write_roots(
+                        &self.backend,
+                        &args.write_roots,
+                        &args.write_paths,
+                        cwd.as_ref(),
+                    )
+                    .await;
+                    for root in &materialized_roots {
+                        // Preparation failures are the runtime's, not the
+                        // command's: report them typed, attributed to the
+                        // exact declaration, so the dispatcher can repair a
+                        // projection it authored without involving the model.
                         let resolved =
-                            resolve_access_path(&self.backend, root, cwd.as_ref()).await?;
-                        self.backend.create_dir_all(&resolved).await?;
+                            match resolve_access_path(&self.backend, root, cwd.as_ref()).await {
+                                Ok(resolved) => resolved,
+                                Err(error) => {
+                                    return Ok(ToolCallOutcome::runtime_preparation_failure(
+                                        "write_roots",
+                                        root,
+                                        error,
+                                    ));
+                                }
+                            };
+                        let existed = self.backend.metadata(&resolved).await.is_ok();
+                        if let Err(error) = self.backend.create_dir_all(&resolved).await {
+                            return Ok(ToolCallOutcome::runtime_preparation_failure(
+                                "write_roots",
+                                root,
+                                error,
+                            ));
+                        }
+                        if !existed {
+                            created_future_roots.push(resolved);
+                        }
                     }
                 }
 
-                self.handle_run(TerminalRunRequest {
-                    command,
-                    script_via_stdin,
-                    working_dir: args.working_dir.as_deref(),
-                    read_paths: &declared_read_paths,
-                    write_paths: &declared_write_paths,
-                    write_roots: &declared_write_roots,
-                    notify_session_id: &notify_session_id,
-                    notify_goal_id: args._goal_id.as_deref(),
-                    task_id: args._task_id.as_deref(),
-                    tool_call_id: args._tool_call_id.as_deref(),
-                    detach: args.detach,
-                    status_tx,
-                })
-                .await?
+                let run_outcome = self
+                    .handle_run(TerminalRunRequest {
+                        command,
+                        script_via_stdin,
+                        working_dir: args.working_dir.as_deref(),
+                        read_paths: &declared_read_paths,
+                        write_paths: &declared_write_paths,
+                        write_roots: &declared_write_roots,
+                        notify_session_id: &notify_session_id,
+                        notify_goal_id: args._goal_id.as_deref(),
+                        task_id: args._task_id.as_deref(),
+                        tool_call_id: args._tool_call_id.as_deref(),
+                        detach: args.detach,
+                        network: args.network,
+                        confined,
+                        status_tx,
+                    })
+                    .await;
+                // A future root the runtime created is the runtime's own
+                // side effect. If the command did not succeed and that leaf is
+                // still an empty directory, undo it so a mis-typed grant (a
+                // file declared as a root) cannot leave a directory squatting
+                // on the command's target path for the next attempt.
+                let failed = match run_outcome.as_ref() {
+                    Ok(outcome) => outcome
+                        .metadata
+                        .exit_code
+                        .or_else(|| extract_terminal_exit_code(&outcome.output))
+                        .is_some_and(|code| code != 0),
+                    Err(_) => true,
+                };
+                if failed {
+                    for path in created_future_roots.iter().rev() {
+                        let still_empty = self
+                            .backend
+                            .read_dir(path)
+                            .await
+                            .is_ok_and(|entries| entries.is_empty());
+                        if still_empty {
+                            if let Err(error) = self.backend.remove_empty_dir(path).await {
+                                tracing::debug!(path = %path, %error, "Could not undo runtime-created future write root");
+                            }
+                        }
+                    }
+                }
+                run_outcome?
             }
         };
 
@@ -6760,7 +7091,11 @@ impl TerminalTool {
             outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
         }
         if args.action == "run" && outcome.metadata.invocation_stage.reached_dispatch() {
-            outcome.metadata.access_enforcement = confined_process_access_enforcement();
+            outcome.metadata.access_enforcement = if run_is_confined(self.confinement) {
+                confined_process_access_enforcement()
+            } else {
+                crate::traits::ToolAccessEnforcement::NotApplicable
+            };
         }
 
         Ok(outcome)
@@ -6779,7 +7114,69 @@ struct TerminalRunRequest<'a> {
     task_id: Option<&'a str>,
     tool_call_id: Option<&'a str>,
     detach: bool,
+    /// Outbound network granted for this run.
+    network: bool,
+    /// Sandbox this run (false = host execution).
+    confined: bool,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
+}
+
+/// Whether a run is confined: a single configuration switch. Commands from
+/// untrusted external triggers are not sandboxed by exception; they are
+/// protected by the mandatory per-command approval that path already
+/// enforces.
+fn run_is_confined(confinement: crate::types::TerminalConfinement) -> bool {
+    confinement == crate::types::TerminalConfinement::Sandbox
+}
+
+/// Host execution request: the command as the daemon's user, in the resolved
+/// working directory, with the daemon's own environment.
+async fn host_terminal_execution_request(
+    backend: &SharedExecutionBackend,
+    shell_source: &str,
+    script_via_stdin: bool,
+    working_dir: Option<&str>,
+) -> anyhow::Result<ExecutionRequest> {
+    let cwd = match working_dir {
+        Some(path) => Some(backend.resolve_path(path).await?),
+        None => None,
+    };
+    let mut request = if script_via_stdin {
+        let mut request = ExecutionRequest::argv(
+            "/bin/sh".to_string(),
+            vec!["-eu".to_string(), "-s".to_string()],
+        );
+        request.stdin = Some(shell_source.as_bytes().to_vec());
+        request
+    } else {
+        ExecutionRequest::shell(shell_source.to_string())
+    };
+    request.cwd = cwd;
+    Ok(request)
+}
+
+/// Grant keys for a command: each segment's binary for chained commands,
+/// otherwise the first word. Storing segment binaries (rather than the full
+/// chained string) lets "Allow Always" cover re-runs that differ only in
+/// arguments — the same trust grant as Always-allowing each simple command
+/// directly, and what `is_allowed`'s per-segment chained check matches
+/// against.
+fn command_grant_keys(command: &str) -> Vec<String> {
+    let trimmed = command.trim();
+    if contains_shell_operator(trimmed) {
+        split_command_segments(trimmed)
+            .iter()
+            .map(|seg| extract_segment_binary(seg))
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        vec![trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or(trimmed)
+            .to_string()]
+    }
 }
 
 impl Drop for TerminalTool {
@@ -6821,6 +7218,15 @@ struct TerminalArgs {
     /// when the task ends.
     #[serde(default, alias = "background")]
     detach: bool,
+    /// Outbound network for this confined run. Off by default; requesting it
+    /// is a capability escalation that needs user approval or a persisted
+    /// capability grant for the command.
+    #[serde(default)]
+    network: bool,
+    /// Injected by the execution loop: exact declared targets outside the
+    /// compiled task scope that the user may authorize. Never model-supplied.
+    #[serde(default)]
+    _scope_escalation: Option<crate::traits::ScopeEscalation>,
     #[serde(default)]
     _untrusted_source: bool,
     #[serde(default)]
@@ -7202,12 +7608,16 @@ impl Tool for TerminalTool {
                     "read_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Additional exact readable files/directories for a confined run"
+                        "description": "Additional exact readable files/directories for a confined run. Paths outside the task scope (e.g. a deploy tool's config dir under $HOME) are allowed but prompt the user for approval; credential stores such as ~/.ssh or ~/.aws never are."
+                    },
+                    "network": {
+                        "type": "boolean",
+                        "description": "Allow outbound network for this run (deploys, package installs, API calls). Confined runs have no network by default; set true when the command needs it. Prompts the user for approval unless already granted for this command."
                     },
                     "write_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Exact writable files/directories for a confined mutating run. For script workflows, include each writable directory root (including a future root) so the runtime can prepare its private shell/package scratch area before parsing the script."
+                        "description": "Exact files the confined run may create or change (e.g. /tmp/out/result.txt). Never list a file under write_roots: roots are prepared as directories before launch, so a file declared there would be created as a directory and the write would fail. Existing directories you need to write into may also be listed here; use write_roots for directories that must be created."
                     },
                     "read_roots": {
                         "type": "array",
@@ -7217,7 +7627,7 @@ impl Tool for TerminalTool {
                     "write_roots": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Typed directory roots whose descendants the confined run may create or change; future roots are prepared before launch"
+                        "description": "Directories (never files) whose descendants the confined run may create or change. A root that does not exist yet is created as a directory before launch, so list only directories here; put exact output files in write_paths."
                     },
                     "action": {
                         "type": "string",
@@ -7684,13 +8094,131 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_runtime_policy_does_not_widen_task_data_roots() {
-        let policy =
-            macos_manifest_sandbox_policy(None, &["/private/tmp".to_string()], &[], &[], false)
-                .expect("policy");
+        let policy = macos_manifest_sandbox_policy(
+            None,
+            &["/private/tmp".to_string()],
+            &[],
+            &[],
+            false,
+            ConfinedCapabilities::default(),
+        )
+        .expect("policy");
         assert!(!policy.contains("(subpath \"/private/etc\")"));
         assert!(!policy.contains("(literal \"/private/etc/hosts\")"));
         assert!(policy.contains("(subpath \"/private/tmp\")"));
         assert!(policy.contains("(literal \"/private/etc/ssl/openssl.cnf\")"));
+    }
+
+    #[test]
+    fn confinement_is_a_single_switch_defaulting_to_host() {
+        use crate::types::TerminalConfinement;
+        assert_eq!(TerminalConfinement::default(), TerminalConfinement::Host);
+        assert!(!run_is_confined(TerminalConfinement::Host));
+        assert!(run_is_confined(TerminalConfinement::Sandbox));
+        let parsed: crate::types::TerminalConfinement =
+            serde_json::from_str("\"sandbox\"").unwrap();
+        assert_eq!(parsed, TerminalConfinement::Sandbox);
+    }
+
+    #[tokio::test]
+    async fn host_request_runs_the_command_unwrapped_in_the_working_dir() {
+        let backend = active_execution_backend();
+        let request =
+            host_terminal_execution_request(&backend, "npx wrangler deploy", false, Some("/tmp"))
+                .await
+                .expect("host request");
+        match &request.command {
+            crate::execution::CommandSpec::Shell(command) => {
+                assert_eq!(command, "npx wrangler deploy")
+            }
+            other => panic!("expected plain shell command, got {other:?}"),
+        }
+        assert!(request
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd.as_str().ends_with("tmp")));
+        assert!(request.stdin.is_none());
+        let script = host_terminal_execution_request(&backend, "echo one\necho two", true, None)
+            .await
+            .expect("host script request");
+        match &script.command {
+            crate::execution::CommandSpec::Argv { program, args } => {
+                assert_eq!(program, "/bin/sh");
+                assert_eq!(args, &vec!["-eu".to_string(), "-s".to_string()]);
+            }
+            other => panic!("expected sh -s, got {other:?}"),
+        }
+        assert_eq!(
+            script.stdin.as_deref(),
+            Some(b"echo one\necho two".as_slice())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_policy_grants_network_only_when_capability_granted() {
+        let confined = macos_manifest_sandbox_policy(
+            Some("/Users/alice/projects/site"),
+            &[],
+            &[],
+            &[],
+            false,
+            ConfinedCapabilities::default(),
+        )
+        .expect("policy");
+        assert!(!confined.contains("(allow network-outbound)\n"));
+        assert!(!confined.contains("(allow system-socket)"));
+        let networked = macos_manifest_sandbox_policy(
+            Some("/Users/alice/projects/site"),
+            &[],
+            &[],
+            &[],
+            false,
+            ConfinedCapabilities { network: true },
+        )
+        .expect("policy");
+        assert!(networked.contains("(allow network-outbound)\n"));
+        assert!(networked.contains("(allow system-socket)"));
+    }
+
+    #[test]
+    fn requested_capabilities_are_typed_grant_keys() {
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"action":"run","command":"npx wrangler deploy","network":true,
+                "_scope_escalation":{"read_paths":["/Users/alice/Library/Preferences/.wrangler"],
+                                     "write_paths":["/Users/alice/Library/Preferences/.wrangler/logs"]}}"#,
+        )
+        .unwrap();
+        let caps = TerminalTool::requested_capabilities(&args);
+        assert_eq!(
+            caps,
+            vec![
+                "network".to_string(),
+                "read:/Users/alice/Library/Preferences/.wrangler".to_string(),
+                "write:/Users/alice/Library/Preferences/.wrangler/logs".to_string(),
+            ]
+        );
+        let described = TerminalTool::describe_capabilities(&caps);
+        assert!(described.contains("outbound network access"));
+        assert!(described
+            .contains("read outside task scope: /Users/alice/Library/Preferences/.wrangler"));
+        assert!(described
+            .contains("write outside task scope: /Users/alice/Library/Preferences/.wrangler/logs"));
+        let plain: TerminalArgs =
+            serde_json::from_str(r#"{"action":"run","command":"ls"}"#).unwrap();
+        assert!(TerminalTool::requested_capabilities(&plain).is_empty());
+    }
+
+    #[test]
+    fn command_grant_keys_cover_each_chained_binary() {
+        assert_eq!(
+            command_grant_keys("npx wrangler deploy"),
+            vec!["npx".to_string()]
+        );
+        assert_eq!(
+            command_grant_keys("npm run build && npx wrangler deploy"),
+            vec!["npm".to_string(), "npx".to_string()]
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -7708,6 +8236,7 @@ mod tests {
             &[],
             &[],
             false,
+            ConfinedCapabilities::default(),
         )
         .expect("policy");
         for ancestor in ["/Users/alice/projects", "/Users/alice", "/Users"] {
@@ -7786,8 +8315,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_root_cwd_policy_omits_empty_ancestor_relationship() {
-        let policy = macos_manifest_sandbox_policy(Some("/"), &[], &[], &[], false)
-            .expect("root cwd policy");
+        let policy = macos_manifest_sandbox_policy(
+            Some("/"),
+            &[],
+            &[],
+            &[],
+            false,
+            ConfinedCapabilities::default(),
+        )
+        .expect("root cwd policy");
         assert!(policy.contains("(literal \"/\")"));
         assert!(!policy.contains("(path-ancestors \"/\")"));
     }
@@ -7903,6 +8439,7 @@ mod tests {
             &["/tmp".to_string()],
             &[],
             &[],
+            ConfinedCapabilities::default(),
         )
         .await
         .expect("confined script request");
@@ -7920,6 +8457,128 @@ mod tests {
         assert_eq!(output.exit_code, 1, "{}", output.stderr_lossy());
         assert_eq!(output.stdout_lossy().trim(), "SYNTHETIC_BEFORE");
         assert!(!output.stdout_lossy().contains("SYNTHETIC_AFTER"));
+    }
+
+    #[test]
+    fn roots_nested_under_a_future_grant_are_left_to_the_command() {
+        let cwd = "/tmp/synthetic-project".to_string();
+        let dir = "/tmp/synthetic-project/card-root".to_string();
+        let file = "/tmp/synthetic-project/card-root/result.txt".to_string();
+        let only_cwd_exists = |path: &str| (path == cwd).then_some(true);
+        // A root under a declared *future* root carries no capability; it is
+        // the command's target and must not be pre-created.
+        assert_eq!(
+            select_materialized_write_roots(&[dir.clone(), file.clone()], &[], only_cwd_exists),
+            vec![dir.clone()]
+        );
+        // Order and trailing slashes do not matter.
+        assert_eq!(
+            select_materialized_write_roots(
+                &[file.clone(), format!("{dir}/")],
+                &[],
+                only_cwd_exists
+            ),
+            vec![format!("{dir}/")]
+        );
+        // A future exact write path covers descendant roots the same way.
+        assert_eq!(
+            select_materialized_write_roots(&[file.clone()], &[dir.clone()], only_cwd_exists),
+            Vec::<String>::new()
+        );
+        // A future output directory under an EXISTING grant is still prepared
+        // (a project's `dist`): that entry is the only way to request it.
+        assert_eq!(
+            select_materialized_write_roots(&[cwd.clone(), dir.clone()], &[], only_cwd_exists),
+            vec![cwd.clone(), dir.clone()]
+        );
+        assert_eq!(
+            select_materialized_write_roots(&[dir.clone()], &[cwd.clone()], only_cwd_exists),
+            vec![dir.clone()]
+        );
+        // The same FUTURE path declared as both an exact write path and a
+        // root is a contradiction; the exact form wins and nothing is
+        // materialized (the command owns that target).
+        assert_eq!(
+            select_materialized_write_roots(&[file.clone()], &[file.clone()], only_cwd_exists),
+            Vec::<String>::new()
+        );
+        // An existing directory declared in both forms keeps its root grant.
+        assert_eq!(
+            select_materialized_write_roots(&[cwd.clone()], &[cwd.clone()], only_cwd_exists),
+            vec![cwd.clone()]
+        );
+        // Sibling prefixes are not ancestors.
+        assert_eq!(
+            select_materialized_write_roots(
+                &["/tmp/a".to_string(), "/tmp/ab".to_string()],
+                &[],
+                |_| None
+            ),
+            vec!["/tmp/a".to_string(), "/tmp/ab".to_string()]
+        );
+        // A root that already exists as a FILE is an exact target: never
+        // materialized (create_dir_all would fail with EEXIST), whatever
+        // role it was declared in.
+        let file_exists = |path: &str| (path == file).then_some(false);
+        assert_eq!(
+            select_materialized_write_roots(&[file.clone()], &[], file_exists),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_run_does_not_turn_a_declared_descendant_root_into_a_directory() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none()
+            || backend
+                .resolve_executable("printf")
+                .await
+                .unwrap()
+                .is_none()
+        {
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let cwd = parent.path().to_string_lossy().to_string();
+        let root = parent.path().join("synthetic-card-root");
+        let file = root.join("result.txt");
+        assert!(!root.exists());
+        // The model declared both the future directory and the future file as
+        // write roots (a common type confusion). Only the directory may be
+        // prepared; the file must be left for the command's redirect.
+        let script = format!(
+            "mkdir -p '{}' && printf 'SYNTHETIC_CARD_OK' > '{}'\n",
+            root.display(),
+            file.display()
+        );
+        let request = confined_terminal_script_execution_request(
+            &backend,
+            &script,
+            Some(&cwd),
+            &[cwd.clone()],
+            &[],
+            &[
+                root.to_string_lossy().to_string(),
+                file.to_string_lossy().to_string(),
+            ],
+            ConfinedCapabilities::default(),
+        )
+        .await
+        .expect("confined script request");
+        assert!(root.is_dir(), "topmost future root is prepared");
+        assert!(
+            !file.exists(),
+            "a declared descendant root must not be pre-created as a directory"
+        );
+        let output = backend
+            .execute(request, Duration::from_secs(30))
+            .await
+            .expect("sandbox execution");
+        assert_eq!(output.exit_code, 0, "{}", output.stderr_lossy());
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("redirect output"),
+            "SYNTHETIC_CARD_OK"
+        );
     }
 
     #[tokio::test]
@@ -7943,6 +8602,7 @@ mod tests {
             &[cwd.clone()],
             &[],
             &[cwd.clone(), root.to_string_lossy().to_string()],
+            ConfinedCapabilities::default(),
         )
         .await
         .expect("confined script request");
@@ -8010,6 +8670,7 @@ mod tests {
             "/synthetic/work.tree",
             &["/synthetic/read.only/.cache".to_string()],
             &["/synthetic/output.file".to_string()],
+            ConfinedCapabilities::default(),
         )
         .expect("sandbox state");
         let state: Value = serde_json::from_str(&state).expect("valid JSON");
@@ -8464,7 +9125,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
 
         let output = tool
@@ -8476,6 +9138,127 @@ mod tests {
         assert!(output.contains("semantic-ok"), "{output}");
         assert!(!output.contains("approval"), "{output}");
         assert_eq!(provider.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_run_undoes_a_future_root_the_runtime_created() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none() {
+            return;
+        }
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        tokio::spawn(async move {
+            while let Some(req) = approval_rx.recv().await {
+                let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
+            ),
+        ]));
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("synthetic-lone-root");
+        let file = root.join("result.txt");
+        // The residual type confusion: a lone future FILE declared as the
+        // only write root. The contract says roots are directories, so the
+        // runtime prepares it as one and the redirect fails — but the runtime
+        // must then undo its own directory so the path is free again.
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("printf SYNTHETIC_LONE_OK > '{}'", file.display()),
+            "working_dir": parent.path().to_string_lossy(),
+            "write_roots": [file.to_string_lossy()],
+            "_session_id": "telegram:synthetic-owner",
+            "_user_role": "Owner"
+        });
+        let output = tool.call(&args.to_string()).await.unwrap();
+        assert!(output.contains("Is a directory"), "{output}");
+        assert!(
+            !file.exists(),
+            "runtime-created directory must be removed after the failed run"
+        );
+        assert!(
+            root.is_dir(),
+            "the parent chain the runtime created may remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_preparation_failure_is_typed_and_names_the_declaration() {
+        let backend = active_execution_backend();
+        if backend.resolve_executable("codex").await.unwrap().is_none() {
+            return;
+        }
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        tokio::spawn(async move {
+            while let Some(req) = approval_rx.recv().await {
+                let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["local_workspace_write"],"reasons":["Writes one scratch file"]}"#,
+            ),
+        ]));
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+
+        let parent = tempfile::tempdir().expect("parent");
+        let blocker = parent.path().join("blocker");
+        std::fs::write(&blocker, "a file").expect("blocker file");
+        // A root beneath an existing FILE cannot be materialized (ENOTDIR).
+        let impossible_root = blocker.join("sub");
+        let args = serde_json::json!({
+            "action": "run",
+            "command": "printf SYNTHETIC_NEVER_RUNS",
+            "working_dir": parent.path().to_string_lossy(),
+            "write_roots": [impossible_root.to_string_lossy()],
+            "_session_id": "telegram:synthetic-owner",
+            "_user_role": "Owner"
+        });
+        let outcome = tool
+            .execute_terminal(&args.to_string(), None, false, false)
+            .await
+            .expect("typed outcome, not a transport error");
+        let failure = outcome
+            .metadata
+            .runtime_preparation_failure
+            .expect("preparation failure must be typed");
+        assert_eq!(failure.field, "write_roots");
+        assert_eq!(failure.value, impossible_root.to_string_lossy());
+        assert_eq!(
+            outcome.metadata.invocation_stage,
+            crate::traits::ToolInvocationStage::RejectedBeforeIo
+        );
+        assert!(!outcome.output.contains("SYNTHETIC_NEVER_RUNS"));
     }
 
     #[tokio::test]
@@ -8497,7 +9280,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         tool.set_command_risk_runtime(semantic_runtime(provider));
 
         let call = tool.call(
@@ -8536,7 +9320,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
 
         let outcome = tool
@@ -8575,7 +9360,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         let args = serde_json::json!({
             "action": "run",
             "command": format!("touch {}", target.display()),
@@ -8901,7 +9687,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let outcome = tool
             .call_with_status_outcome(
@@ -9400,7 +10187,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
             .call(
@@ -9426,7 +10214,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let outcome = tool
             .call_with_execution_context(
@@ -9459,7 +10248,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
             .call(
@@ -10492,7 +11282,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
             .call(
@@ -10530,7 +11321,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
             .call(
@@ -10644,7 +11436,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let first = tool
             .call(
@@ -10690,7 +11483,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         tokio::spawn(async move {
             while let Some(req) = approval_rx.recv().await {
@@ -10744,7 +11538,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         // Auto-approve the daemonization approval request
         tokio::spawn(async move {
@@ -10796,7 +11591,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         // Build a command >500 chars with UNQUOTED heredoc (should be soft-blocked)
         let large_content = "x".repeat(600);
@@ -10836,7 +11632,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         // Build a command >500 chars with QUOTED heredoc (should be allowed)
         let large_content = "echo 'hello'";
@@ -11034,7 +11831,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         assert!(
@@ -11070,7 +11868,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         let response = tool
@@ -11105,7 +11904,8 @@ mod tests {
             PermissionMode::Default,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
         let response = tool
@@ -11146,7 +11946,8 @@ mod tests {
             PermissionMode::Yolo,
             pool,
         )
-        .await;
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let resp = tool
             .call(r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10","_session_id":"s","_user_role":"Owner"}"#)
@@ -11394,6 +12195,8 @@ mod policy_dump_probe {
     /// Operator probe: write the exact seatbelt policy the daemon would use
     /// for a build in a given project so it can be replayed with sandbox-exec.
     /// Run with: AIDAEMON_POLICY_PROBE_DIR=<dir> AIDAEMON_POLICY_PROBE_CMD='npm run build'
+    /// Optional: AIDAEMON_POLICY_PROBE_READS=<a:b> AIDAEMON_POLICY_PROBE_WRITES=<a:b>
+    ///           AIDAEMON_POLICY_PROBE_NETWORK=1
     ///   cargo test --lib policy_dump_probe -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
@@ -11408,12 +12211,27 @@ mod policy_dump_probe {
             .ok()
             .map(|w| w.split(':').map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_else(|| vec![format!("{dir}/dist"), dir.clone()]);
-        let request = confined_terminal_execution_request(
+        let mut reads = vec![dir.clone()];
+        if let Ok(extra) = std::env::var("AIDAEMON_POLICY_PROBE_READS") {
+            reads.extend(
+                extra
+                    .split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        let capabilities = ConfinedCapabilities {
+            network: std::env::var("AIDAEMON_POLICY_PROBE_NETWORK").is_ok_and(|v| v == "1"),
+        };
+        let request = confined_terminal_execution_request_inner(
             &backend,
             &command,
+            false,
             Some(&dir),
-            &[dir.clone()],
+            &reads,
             &writes,
+            &[],
+            capabilities,
         )
         .await
         .expect("confined request");

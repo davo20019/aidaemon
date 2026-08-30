@@ -84,7 +84,11 @@ pub(in crate::agent) enum SystemDirective {
     /// An actionable request reached text completion before any execution or
     /// observation receipt existed. The model chooses the strategy; the
     /// controller only requires one evidence-seeking pass.
-    ExecutionResolutionEvidenceRequired,
+    /// The run ledger still holds expectations that some admissible tool could
+    /// satisfy. Rendered from typed obligations, never from reply wording.
+    LedgerExpectationsRequired {
+        expectations: Vec<String>,
+    },
     ContradictoryFileEvidenceExplicitPath {
         dir: String,
     },
@@ -404,7 +408,14 @@ impl SystemDirective {
                  Continue working.",
                 old_budget, new_budget
             ),
-            Self::ExecutionResolutionEvidenceRequired => "[SYSTEM] The requested outcome is still unresolved and no tool evidence has been gathered. Choose the best strategy yourself. Use the most relevant available tool either to perform the requested action or to inspect the live capability, authorization, or state that determines whether it is possible. Do not treat the visible tool list as proof that a capability is unsupported, and do not modify source code or firmware unless the user requested development work. After this bounded evidence pass, report the concrete result or limitation honestly.".to_string(),
+            Self::LedgerExpectationsRequired { expectations } => format!(
+                "[SYSTEM] The durable run ledger still has unmet expectations that an available tool could satisfy: {}. Use the most relevant available tool to satisfy them, or state the exact live limitation you observed. After this bounded pass, report the concrete result honestly.",
+                if expectations.is_empty() {
+                    "(unspecified)".to_string()
+                } else {
+                    expectations.join("; ")
+                }
+            ),
             Self::ContradictoryFileEvidenceExplicitPath { dir } => format!(
                 "[SYSTEM] Contradictory file evidence detected for {}: one tool found files while another reported no matches. \
                  You MUST run an explicit-path re-check (search_files/project_inspect) before answering.",
@@ -856,15 +867,6 @@ mod tests {
         assert!(rendered.contains("typed mutation receipt"));
         assert!(rendered.contains("appropriate available tool"));
         assert!(!rendered.contains("write_file"));
-    }
-
-    #[test]
-    fn execution_resolution_directive_leaves_strategy_to_model_but_requires_evidence() {
-        let rendered = SystemDirective::ExecutionResolutionEvidenceRequired.render();
-        assert!(rendered.contains("Choose the best strategy yourself"));
-        assert!(rendered.contains("live capability"));
-        assert!(rendered.contains("no tool evidence"));
-        assert!(rendered.contains("do not modify source code or firmware"));
     }
 
     #[test]

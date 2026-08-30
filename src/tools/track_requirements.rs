@@ -32,7 +32,10 @@ impl Tool for TrackRequirementsTool {
 
     fn description(&self) -> &str {
         "Register and update the checklist of concrete requirements for the current request. \
-         Call this FIRST when a request has multiple steps or a deferred action (e.g. 'do X, then send me the file'). \
+         Use it when a request has several independent deliverables or a deferred action \
+         (e.g. 'do X, then send me the file'), so nothing is dropped. Skip it for a short \
+         sequence of a few direct tool calls, and never when the user constrains the exact \
+         number or kind of operations. \
          Pass the FULL list every time with each item's current status; it replaces the previous list. \
          Mark each item 'completed' as you finish it, or 'deferred' if you intentionally skip it."
     }

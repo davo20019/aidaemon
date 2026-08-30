@@ -4,6 +4,57 @@ use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
 
+/// Ledger of argument values the execution prelude added to a tool call on the
+/// model's behalf (directory capability projections). The dispatcher consults
+/// it when the tool reports a runtime preparation failure: a failing value that
+/// the prelude authored is the runtime's own mistake and is repaired without
+/// involving the model; a failing value the model declared is surfaced to it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(in crate::agent) struct PreludeProjections {
+    pub write_roots: Vec<String>,
+    pub read_roots: Vec<String>,
+    pub write_paths: Vec<String>,
+}
+
+impl PreludeProjections {
+    pub(in crate::agent) fn contains(&self, field: &str, value: &str) -> bool {
+        let values = match field {
+            "write_roots" => &self.write_roots,
+            "read_roots" => &self.read_roots,
+            "write_paths" => &self.write_paths,
+            _ => return false,
+        };
+        values.iter().any(|entry| entry == value)
+    }
+}
+
+/// Remove one projected value from an array argument, returning the repaired
+/// argument JSON. `None` when the arguments do not carry that value.
+pub(in crate::agent) fn remove_projected_value(
+    arguments: &str,
+    field: &str,
+    value: &str,
+) -> Option<String> {
+    let mut parsed: Value = serde_json::from_str(arguments).ok()?;
+    let object = parsed.as_object_mut()?;
+    let entries = object.get_mut(field)?.as_array_mut()?;
+    let before = entries.len();
+    entries.retain(|entry| entry.as_str() != Some(value));
+    if entries.len() == before {
+        return None;
+    }
+    serde_json::to_string(&parsed).ok()
+}
+
+/// A prelude projection that names a directory capability must describe a
+/// directory. A path that already exists as something else contradicts that
+/// claim, and enforcing it would break the very call it was meant to
+/// authorize. Unknown (future) paths keep the projected role.
+pub(in crate::agent) fn projection_conflicts_with_disk(path: &str) -> bool {
+    let candidate = std::path::Path::new(path);
+    candidate.exists() && !candidate.is_dir()
+}
+
 pub(in crate::agent) enum ToolExecutionOutcome {
     Return(anyhow::Result<String>),
     NextIteration,
@@ -118,4 +169,47 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     #[allow(dead_code)]
     pub correction:
         Option<std::sync::Arc<crate::agent::correction_execution::CorrectionExecutionContext>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_ledger_attributes_values_by_field() {
+        let ledger = PreludeProjections {
+            write_roots: vec!["/tmp/synthetic-root".to_string()],
+            ..PreludeProjections::default()
+        };
+        assert!(ledger.contains("write_roots", "/tmp/synthetic-root"));
+        assert!(!ledger.contains("write_paths", "/tmp/synthetic-root"));
+        assert!(!ledger.contains("write_roots", "/tmp/other"));
+        assert!(!ledger.contains("unknown", "/tmp/synthetic-root"));
+    }
+
+    #[test]
+    fn repairing_removes_only_the_offending_projection() {
+        let arguments = r#"{"action":"run","command":"true","write_paths":["/tmp/f"],"write_roots":["/tmp/d","/tmp/f"]}"#;
+        let repaired = remove_projected_value(arguments, "write_roots", "/tmp/f").unwrap();
+        let parsed: Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(parsed["write_roots"], serde_json::json!(["/tmp/d"]));
+        assert_eq!(parsed["write_paths"], serde_json::json!(["/tmp/f"]));
+        assert_eq!(parsed["command"], "true");
+        assert!(remove_projected_value(arguments, "write_roots", "/tmp/absent").is_none());
+        assert!(remove_projected_value(arguments, "read_roots", "/tmp/f").is_none());
+    }
+
+    #[test]
+    fn disk_reality_overrides_a_directory_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("result.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(projection_conflicts_with_disk(&file.to_string_lossy()));
+        assert!(!projection_conflicts_with_disk(
+            &dir.path().to_string_lossy()
+        ));
+        assert!(!projection_conflicts_with_disk(
+            &dir.path().join("future").to_string_lossy()
+        ));
+    }
 }
