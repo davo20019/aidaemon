@@ -31,13 +31,15 @@ impl Tool for TrackRequirementsTool {
     }
 
     fn description(&self) -> &str {
-        "Register and update the checklist of concrete requirements for the current request. \
-         Use it when a request has several independent deliverables or a deferred action \
-         (e.g. 'do X, then send me the file'), so nothing is dropped. Skip it for a short \
-         sequence of a few direct tool calls, and never when the user constrains the exact \
-         number or kind of operations. \
-         Pass the FULL list every time with each item's current status; it replaces the previous list. \
-         Mark each item 'completed' as you finish it, or 'deferred' if you intentionally skip it."
+        "Declare the typed checklist of what the current request requires, BEFORE your first \
+         operation whenever the request names two or more distinct operations, deliverables, or \
+         targets (an ordered sequence like create/write/read/remove/verify is one item per step). \
+         Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation \
+         for reads/verifications. The runtime compiles typed items into obligations closed only by \
+         real tool receipts and will keep asking for open reachable items, so declare exactly what \
+         you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
+         Mark items 'completed' as you finish them, or 'deferred' if you intentionally skip one. \
+         Skip this only for a single direct operation or when the user forbids it."
     }
 
     fn schema(&self) -> Value {

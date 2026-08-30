@@ -920,6 +920,41 @@ impl TaskContractCompiledData {
     pub const SCHEMA_VERSION: u16 = 3;
 }
 
+/// One typed expectation the executing model declared for the current task
+/// (from its `track_requirements` checklist). Only typed content is kept:
+/// mutation effects, an observation flag, exact targets, and the model's own
+/// status. Free text is never an obligation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorExpectationItem {
+    pub index: usize,
+    pub description: String,
+    #[serde(default)]
+    pub requires_observation: bool,
+    #[serde(default)]
+    pub mutation_effects: crate::traits::ToolMutationEffects,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// The model's declared status (`pending`, `in_progress`, `completed`,
+    /// `deferred`, ...). Receipts decide satisfaction; only an explicit
+    /// `deferred`/`skipped` abandons an item.
+    pub status: String,
+}
+
+/// The executing model's own typed statement of what the request requires.
+/// Compiled into ledger obligations exactly like assessor-authored
+/// expectations, but treated as strong: the model declared them with full
+/// context, so leaving them open is incompleteness, not contract noise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorExpectationsDeclaredData {
+    pub schema_version: u16,
+    pub task_id: String,
+    pub items: Vec<ExecutorExpectationItem>,
+}
+
+impl ExecutorExpectationsDeclaredData {
+    pub const SCHEMA_VERSION: u16 = 1;
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPipelineAccess {

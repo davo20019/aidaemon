@@ -735,6 +735,12 @@ pub(super) async fn run_completion_phase(
             _ => Vec::new(),
         };
         let ledger_demands_work = !reachable_obligation_ids.is_empty();
+        // The executor's own declared items are strong: they were authored by
+        // the model with full context, so an open reachable one is demanded
+        // even after other work completed (bounded by the deferral streak).
+        let executor_demands_work = reachable_obligation_ids
+            .iter()
+            .any(|id| id.contains("/obligation:checklist:"));
         let compiled_expectation_count = turn_context
             .completion_contract
             .expectations()
@@ -1105,19 +1111,21 @@ pub(super) async fn run_completion_phase(
             );
             // Fall through to the normal completion path (sanitize + return)
         } else if !terminal_policy_denial
-            // Both reasons to ask apply only while no operation has completed.
-            // After the model answers a demand with completed work, its
-            // narrated limitation is accepted and the finalizer labels the run
-            // from receipts — a reachable-but-unmet expectation never holds a
-            // reply hostage a second time. A backgrounded launch is dispatched
-            // but not completed, so an unfulfilled change still gets its pass.
-            && execution_state.completed_operation_results == 0
-            // Either the ledger says an expectation is still reachable, or a
-            // dispatched operation failed with nothing succeeding after it (a
-            // receipt fact, not a contract one) — one bounded recovery pass.
-            && (ledger_demands_work
-                || unresolved_recoverable_failure
-                || unresolved_nonrecoverable_failure)
+            && (
+                // Assessor-authored expectations and failure recovery apply
+                // only while no operation has completed: after the model
+                // answers a demand with completed work, its narrated
+                // limitation is accepted and the finalizer labels the run from
+                // receipts. A backgrounded launch is dispatched but not
+                // completed, so an unfulfilled change still gets its pass.
+                (execution_state.completed_operation_results == 0
+                    && (ledger_demands_work
+                        || unresolved_recoverable_failure
+                        || unresolved_nonrecoverable_failure))
+                // The executor's own declared items are demanded while
+                // reachable regardless of other completed work.
+                || executor_demands_work
+            )
         {
             if tool_defs.is_empty() || force_text_response {
                 if !force_text_response {

@@ -2394,6 +2394,7 @@ mod tests {
                 required_effect: crate::traits::ToolMutationEffects::NONE,
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["result-1".to_string()],
+                required_target: None,
             },
         );
         aggregate.operations.insert(

@@ -288,6 +288,14 @@ closes, never by making the kernel stricter. Measure autonomy changes as
 N-of-M pass rates over repeated runs, not single-shot rounds; a stochastic
 producer makes one pass or one fail meaningless.
 
+Expectations have two authors. The assessor's contract is one pre-work sample
+and may under-describe the request; the executing model's `track_requirements`
+checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
+model's own typed statement of what it will do, so open reachable checklist
+items are demanded even after other work completed and a run that ends with
+one open is `partial`, not evidence-closed. Only receipts close either kind;
+the assessor keeps the authority lane (forbids, allowed tools, scopes).
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the

@@ -126,6 +126,7 @@ mod tests {
             required_effect: effect,
             satisfied_at_revision: None,
             satisfying_receipt_ids: Vec::new(),
+            required_target: None,
         }
     }
 

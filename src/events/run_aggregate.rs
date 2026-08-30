@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssistantResponseData, AssistantResponseDisposition, Event, EventType, ResponseDeliveryData,
-    ResponseDeliveryState, TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData,
-    TaskStatus, ToolCallData, ToolResultData,
+    AssistantResponseData, AssistantResponseDisposition, Event, EventType,
+    ExecutorExpectationsDeclaredData, ResponseDeliveryData, ResponseDeliveryState,
+    TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData, TaskStatus, ToolCallData,
+    ToolResultData,
 };
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
@@ -63,6 +64,11 @@ pub(crate) struct RunObligation {
     pub satisfied_at_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub satisfying_receipt_ids: Vec<String>,
+    /// Exact subject the proving receipt must have touched (declared path or
+    /// URL). Binds both mutation and observation proof to that subject so one
+    /// write cannot close every "write something" item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_target: Option<crate::traits::RequestVerificationTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +216,9 @@ pub(crate) struct RunAggregate {
     pub task_id: String,
     #[serde(default)]
     pub contract_present: bool,
+    /// The executing model declared typed expectations of its own.
+    #[serde(default)]
+    pub executor_expectations_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_fingerprint: Option<String>,
     #[serde(default)]
@@ -254,6 +263,7 @@ impl RunAggregate {
             schema_version: Self::SCHEMA_VERSION,
             task_id: task_id.into(),
             contract_present: false,
+            executor_expectations_present: false,
             contract_fingerprint: None,
             effect_revision: 0,
             obligations: BTreeMap::new(),
@@ -302,6 +312,17 @@ impl RunAggregate {
                     }
                 } else {
                     self.record_invariant("contract_payload_invalid");
+                }
+            }
+            EventType::ExecutorExpectationsDeclared => {
+                if let Ok(declared) = event.parse_data::<ExecutorExpectationsDeclaredData>() {
+                    if declared.task_id == self.task_id {
+                        self.install_executor_expectations(declared);
+                    } else {
+                        self.record_invariant("executor_expectations_task_identity_mismatch");
+                    }
+                } else {
+                    self.record_invariant("executor_expectations_payload_invalid");
                 }
             }
             EventType::ToolCall => {
@@ -371,7 +392,8 @@ impl RunAggregate {
         }
         self.contract_present = true;
         self.contract_fingerprint = fingerprint;
-        self.obligations.clear();
+        self.obligations
+            .retain(|id, _| id.contains("/obligation:checklist:"));
         self.response_contract = compiled.contract.response_contract.clone();
         self.allowed_tool_names = compiled
             .contract
@@ -405,6 +427,7 @@ impl RunAggregate {
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
+                required_target: None,
             });
         }
 
@@ -428,6 +451,7 @@ impl RunAggregate {
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
+                required_target: None,
             });
         }
 
@@ -451,6 +475,7 @@ impl RunAggregate {
                 required_effect: effect,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
+                required_target: None,
             });
         }
 
@@ -470,6 +495,7 @@ impl RunAggregate {
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
+                required_target: None,
             });
         }
 
@@ -483,8 +509,102 @@ impl RunAggregate {
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
+                required_target: None,
             });
         }
+    }
+
+    /// Compile the executing model's typed checklist into obligations. Each
+    /// typed item becomes one obligation keyed by its index: a mutation item
+    /// is `Achieve` (closed by a succeeded receipt carrying the effect); an
+    /// observation/targeted item is `Observe` (closed by a compatible
+    /// observation receipt, target-bound when a path target was declared).
+    /// Untyped free-text items are not obligations. A later declaration
+    /// replaces the set: kept indices retain their proof, `deferred`/`skipped`
+    /// items are abandoned, removed indices are abandoned.
+    fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
+        self.executor_expectations_present = true;
+        let mut declared_ids = BTreeSet::new();
+        for item in &declared.items {
+            let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
+            let abandoned = matches!(item.status.as_str(), "deferred" | "skipped");
+            let has_effect = !item.mutation_effects.is_empty();
+            let required_target = item.targets.iter().find_map(|target| {
+                let target = target.trim();
+                if target.starts_with('/') || target.starts_with("~/") {
+                    Some(crate::traits::RequestVerificationTarget {
+                        kind: crate::traits::RequestVerificationTargetKind::Path,
+                        value: target.to_string(),
+                    })
+                } else if target.starts_with("http://") || target.starts_with("https://") {
+                    Some(crate::traits::RequestVerificationTarget {
+                        kind: crate::traits::RequestVerificationTargetKind::Url,
+                        value: target.to_string(),
+                    })
+                } else {
+                    None
+                }
+            });
+            let (class, required_effect) = if has_effect {
+                (RunObligationClass::Achieve, item.mutation_effects)
+            } else if item.requires_observation || required_target.is_some() {
+                (RunObligationClass::Observe, ToolMutationEffects::NONE)
+            } else {
+                // Free text without typed content is a note, not an obligation.
+                continue;
+            };
+            declared_ids.insert(id.clone());
+            let existing = self.obligations.get(&id);
+            let existing_proof = existing
+                .map(|o| o.satisfying_receipt_ids.clone())
+                .unwrap_or_default();
+            let existing_revision = existing.and_then(|o| o.satisfied_at_revision);
+            let state = if abandoned {
+                RunObligationState::Abandoned
+            } else if existing.is_some_and(|o| o.state == RunObligationState::Satisfied) {
+                RunObligationState::Satisfied
+            } else {
+                RunObligationState::Pending
+            };
+            self.insert_obligation(RunObligation {
+                id,
+                class,
+                state,
+                receipt: None,
+                evidence_requirement: None,
+                required_effect,
+                satisfied_at_revision: existing_revision,
+                satisfying_receipt_ids: existing_proof,
+                required_target,
+            });
+        }
+        for (id, obligation) in self.obligations.iter_mut() {
+            if id.contains("/obligation:checklist:") && !declared_ids.contains(id) {
+                obligation.state = RunObligationState::Abandoned;
+            }
+        }
+    }
+
+    /// Whether any typed expectations exist to arbitrate: from the compiled
+    /// contract, the executor's own declaration, or both.
+    pub(crate) fn expectations_present(&self) -> bool {
+        self.contract_present || self.executor_expectations_present
+    }
+
+    /// Executor-declared obligations still open. These are the model's own
+    /// statement of unmet work; a run that ends with any open is incomplete,
+    /// not "closed by evidence".
+    pub(crate) fn open_executor_expectations(&self) -> usize {
+        self.obligations
+            .iter()
+            .filter(|(id, obligation)| {
+                id.contains("/obligation:checklist:")
+                    && !matches!(
+                        obligation.state,
+                        RunObligationState::Satisfied | RunObligationState::Abandoned
+                    )
+            })
+            .count()
     }
 
     fn insert_obligation(&mut self, obligation: RunObligation) {
@@ -707,6 +827,10 @@ impl RunAggregate {
                 .evidence_requirement
                 .as_ref()
                 .is_none_or(|requirement| evidence_receipt_supports(requirement, receipt));
+            let target_compatible = obligation
+                .required_target
+                .as_ref()
+                .is_none_or(|target| receipt_touches_target(target, receipt));
             let explicitly_proven = explicit_ids.contains(&obligation.id)
                 && (obligation.class != RunObligationClass::Observe || observation_compatible);
             let claim_allows_proof = claimed_obligation_ids.is_empty()
@@ -718,6 +842,7 @@ impl RunAggregate {
                     .is_some_and(|predicate| receipt_matches_predicate(&result, predicate));
             let effect_proven = obligation.class == RunObligationClass::Achieve
                 && !obligation.required_effect.is_empty()
+                && target_compatible
                 && result.succeeded()
                 && receipt
                     .semantics
@@ -728,7 +853,8 @@ impl RunAggregate {
                 && result.completed_observation()
                 && receipt.invocation_stage.reached_dispatch()
                 && receipt.semantics.observes_state()
-                && observation_compatible;
+                && observation_compatible
+                && target_compatible;
             // Receipt-bound obligations are replayed from their predicate,
             // never trusted from an upstream completion-ID annotation. This
             // keeps the reducer authoritative if an intermediate matcher is
@@ -912,7 +1038,7 @@ impl RunAggregate {
     }
 
     pub(crate) fn is_fulfilled(&self) -> bool {
-        self.contract_present
+        self.expectations_present()
             && self.cardinality_violations == 0
             && self.invariant_violations.is_empty()
             && !self.obligations.is_empty()
@@ -1077,7 +1203,7 @@ impl RunAggregate {
     /// satisfy it. Only a reachable expectation may ask the loop for more
     /// work; everything else closes on the evidence that exists.
     pub(crate) fn closeout(&self, admissible: impl Fn(&RunObligation) -> bool) -> CloseoutDecision {
-        if !self.contract_present || self.obligations.is_empty() {
+        if !self.expectations_present() || self.obligations.is_empty() {
             return CloseoutDecision::Closed {
                 proof_basis: "no_obligations",
             };
@@ -1159,7 +1285,14 @@ impl RunAggregate {
     }
 
     pub(crate) fn evidence_closed(&self) -> bool {
-        if !self.contract_present
+        // Receipts close a run the contract could not credit — but not past
+        // the executor's own declared, still-open work. Those items are the
+        // model's typed statement that more is required, so "every receipt
+        // succeeded" is incompleteness, not proof.
+        if self.open_executor_expectations() > 0 {
+            return false;
+        }
+        if !self.expectations_present()
             || !self.invariant_violations.is_empty()
             || self.cardinality_violations > 0
             || self.operations.is_empty()
@@ -1188,7 +1321,7 @@ impl RunAggregate {
     }
 
     pub(crate) fn terminal_decision(&self) -> RunTerminalDecision {
-        if !self.contract_present || self.obligations.is_empty() {
+        if !self.expectations_present() || self.obligations.is_empty() {
             return RunTerminalDecision::Unspecified;
         }
         if !self.invariant_violations.is_empty() {
@@ -1530,10 +1663,26 @@ fn evidence_receipt_supports(
     let Some(target) = requirement.target.as_ref() else {
         return true;
     };
+    receipt_touches_target(target, receipt)
+}
+
+/// Whether the receipt's dispatched subject set — semantic target hints plus
+/// the declared access manifest (read/write paths) — contains the target.
+fn receipt_touches_target(
+    target: &crate::traits::RequestVerificationTarget,
+    receipt: &super::ToolReceiptV1,
+) -> bool {
+    let manifest_targets = receipt.access_manifest.iter().flat_map(|manifest| {
+        manifest
+            .read_targets
+            .iter()
+            .chain(manifest.write_targets.iter())
+    });
     receipt
         .semantics
         .target_hints
         .iter()
+        .chain(manifest_targets)
         .any(|hint| match (target.kind, hint.kind) {
             (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => {
                 target.value == hint.value
@@ -1554,7 +1703,8 @@ fn evidence_receipt_supports(
 mod tests {
     use super::*;
     use crate::events::{
-        Event, TaskContractCompiledData, ToolOutcomeEvidenceSource, ToolReceiptV1,
+        Event, ExecutorExpectationItem, ExecutorExpectationsDeclaredData, TaskContractCompiledData,
+        ToolOutcomeEvidenceSource, ToolReceiptV1,
     };
     use crate::traits::{
         EvidenceAuthority, EvidencePurpose, RequestCompletionContract, RequestEvidenceRequirement,
@@ -3171,5 +3321,305 @@ mod tests {
             RunAggregate::replay("task-1", &events).lifecycle_phase(),
             TaskKernelPhase::Delivered
         );
+    }
+
+    fn executor_expectations(items: Vec<ExecutorExpectationItem>) -> Event {
+        event(
+            EventType::ExecutorExpectationsDeclared,
+            ExecutorExpectationsDeclaredData {
+                schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                items,
+            },
+        )
+    }
+
+    fn checklist_item(
+        index: usize,
+        effects: ToolMutationEffects,
+        requires_observation: bool,
+        targets: &[&str],
+        status: &str,
+    ) -> ExecutorExpectationItem {
+        ExecutorExpectationItem {
+            index,
+            description: format!("step {index}"),
+            requires_observation,
+            mutation_effects: effects,
+            targets: targets.iter().map(|t| t.to_string()).collect(),
+            status: status.to_string(),
+        }
+    }
+
+    /// Mirrors the live shape: the runtime fills terminal receipts with
+    /// direct, current local-workspace capabilities.
+    fn terminal_observation_semantics(path: Option<&str>) -> ToolCallSemantics {
+        let mut semantics =
+            ToolCallSemantics::observation().with_evidence(vec![ToolEvidenceCapability {
+                scope: ToolSemanticScope::LocalWorkspace,
+                purposes: vec![EvidencePurpose::CurrentState, EvidencePurpose::Outcome],
+                authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+            }]);
+        if let Some(path) = path {
+            semantics = semantics.with_target_hint(crate::traits::ToolTargetHintKind::Path, path);
+        }
+        semantics
+    }
+
+    fn workspace_write_semantics(path: &str) -> ToolCallSemantics {
+        ToolCallSemantics {
+            effect: ToolCallEffect::Mutation,
+            mutation_effects: ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+            ..ToolCallSemantics::default()
+        }
+        .with_target_hint(crate::traits::ToolTargetHintKind::Path, path)
+    }
+
+    fn renumber(events: &mut [Event]) {
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+    }
+
+    #[test]
+    fn executor_declared_items_become_obligations_closed_only_by_receipts() {
+        // The model declares three typed steps with no assessor contract at
+        // all. Each write closes only the item bound to its path; the
+        // observation stays reachable, so the run is neither fulfilled nor
+        // evidence-closed even though every receipt succeeded.
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/a"],
+                    "pending",
+                ),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/a/f"],
+                    "pending",
+                ),
+                checklist_item(2, ToolMutationEffects::NONE, true, &[], "pending"),
+                // Free text without typed content is never an obligation.
+                checklist_item(3, ToolMutationEffects::NONE, false, &[], "pending"),
+            ]),
+            call("mk", "terminal"),
+            result(
+                "mk",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/a"),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.executor_expectations_present);
+        assert!(!aggregate.contract_present);
+        assert!(!aggregate
+            .obligations
+            .contains_key("task:task-1/obligation:checklist:3"));
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        // One write does not close every "write" item: the second is bound
+        // to a different path.
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Pending
+        );
+        assert_eq!(aggregate.open_executor_expectations(), 2);
+        assert!(!aggregate.is_fulfilled());
+        assert!(!aggregate.evidence_closed());
+        match aggregate.closeout(|_| true) {
+            CloseoutDecision::Reachable { obligation_ids } => {
+                assert_eq!(
+                    obligation_ids,
+                    vec![
+                        "task:task-1/obligation:checklist:1".to_string(),
+                        "task:task-1/obligation:checklist:2".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected reachable, got {other:?}"),
+        }
+
+        events.push(call("wr", "terminal"));
+        events.push(result(
+            "wr",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            workspace_write_semantics("/tmp/a/f"),
+        ));
+        events.push(call("ls", "terminal"));
+        events.push(result(
+            "ls",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            terminal_observation_semantics(None),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+        assert!(aggregate.is_fulfilled());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+    }
+
+    #[test]
+    fn executor_redeclaration_keeps_proof_abandons_deferred_and_dropped_items() {
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &[],
+                    "pending",
+                ),
+                checklist_item(1, ToolMutationEffects::NONE, true, &[], "pending"),
+                checklist_item(2, ToolMutationEffects::NONE, true, &["/tmp/x"], "pending"),
+            ]),
+            call("w", "write_file"),
+            result(
+                "w",
+                "write_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/w"),
+            ),
+            // The model re-posts its list: item 0 marked completed (proof is
+            // retained from the receipt, not from the label), item 1 deferred,
+            // item 2 dropped entirely.
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &[],
+                    "completed",
+                ),
+                checklist_item(1, ToolMutationEffects::NONE, true, &[], "deferred"),
+            ]),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Abandoned
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:2"].state,
+            RunObligationState::Abandoned
+        );
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+        assert!(aggregate.is_fulfilled());
+    }
+
+    #[test]
+    fn executor_path_bound_observation_needs_a_receipt_for_that_path() {
+        let declared = executor_expectations(vec![checklist_item(
+            0,
+            ToolMutationEffects::NONE,
+            true,
+            &["/tmp/target.txt"],
+            "pending",
+        )]);
+        let mut wrong = vec![
+            declared.clone(),
+            call("cat", "terminal"),
+            result(
+                "cat",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(Some("/tmp/other.txt")),
+            ),
+        ];
+        for (index, event) in wrong.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        assert_eq!(
+            RunAggregate::replay("task-1", &wrong).open_executor_expectations(),
+            1
+        );
+
+        let mut right = vec![
+            declared,
+            call("cat", "terminal"),
+            result(
+                "cat",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(Some("/tmp/target.txt")),
+            ),
+        ];
+        for (index, event) in right.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        assert_eq!(
+            RunAggregate::replay("task-1", &right).open_executor_expectations(),
+            0
+        );
+    }
+
+    #[test]
+    fn executor_completed_label_does_not_prove_an_item_without_a_receipt() {
+        // Marking an item "completed" is a claim; only a receipt proves it.
+        let mut events = vec![executor_expectations(vec![checklist_item(
+            0,
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+            false,
+            &[],
+            "completed",
+        )])];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.open_executor_expectations(), 1);
+        assert!(!aggregate.is_fulfilled());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    #[test]
+    fn contract_arriving_after_executor_declaration_keeps_checklist_obligations() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                "pending",
+            )]),
+            contract(vec![requirement("terminal", 0)]),
+        ];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate
+            .obligations
+            .contains_key("task:task-1/obligation:checklist:0"));
+        assert!(aggregate
+            .obligations
+            .contains_key("task:task-1/obligation:evidence:0"));
     }
 }

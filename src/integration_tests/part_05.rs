@@ -1586,3 +1586,158 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
         .as_array()
         .is_some_and(Vec::is_empty));
 }
+
+/// The executor's own `track_requirements` checklist is the expectations
+/// lane. The assessor under-describes the request (no contract obligations at
+/// all — the "all unknown" class seen live), the model declares three typed
+/// items, performs one, and tries to stop. The ledger holds it to its own
+/// declaration: the arbiter demands the open reachable items, the model does
+/// them, and only then does the reply ship.
+#[tokio::test]
+async fn test_full_stack_executor_declared_checklist_is_demanded_until_receipts_close_it() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().to_string_lossy().to_string();
+    let dir = workspace.path().join("declared").to_string_lossy().to_string();
+    let file = workspace
+        .path()
+        .join("declared/note.txt")
+        .to_string_lossy()
+        .to_string();
+
+    // Assessor: nothing typed at all — no mutation, no observation.
+    let assessment = MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        false,
+        &[],
+        "new_request",
+        "local_workspace",
+    );
+
+    let checklist_args = serde_json::json!({
+        "items": [
+            {"text": "create the directory", "status": "pending",
+             "mutation_effects": ["local_workspace_write"], "targets": [dir]},
+            {"text": "write the note", "status": "pending",
+             "mutation_effects": ["local_workspace_write"], "targets": [file]},
+            {"text": "read the note back", "status": "pending",
+             "requires_observation": true, "targets": [file]}
+        ]
+    })
+    .to_string();
+    let mkdir_args = serde_json::json!({
+        "command": format!("mkdir -p '{dir}'"),
+        "working_dir": cwd,
+        "write_paths": [dir],
+    })
+    .to_string();
+    let write_args = serde_json::json!({
+        "command": format!("printf SYNTHETIC_NOTE > '{file}'"),
+        "working_dir": cwd,
+        "write_paths": [file],
+    })
+    .to_string();
+    let read_args = serde_json::json!({
+        "command": format!("cat '{file}'"),
+        "working_dir": cwd,
+        "read_paths": [file],
+    })
+    .to_string();
+    let early = "phase=EARLY; directory created, stopping here.";
+    let done = "phase=DONE; directory, note, and read-back all completed.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &checklist_args),
+        MockProvider::tool_call_response("terminal", &mkdir_args),
+        // The model stops after one of its three declared steps.
+        MockProvider::text_response(early),
+        // Demanded by its own declaration, it finishes the rest.
+        MockProvider::tool_call_response("terminal", &write_args),
+        MockProvider::tool_call_response("terminal", &read_args),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+    ])
+    .with_task_assessments(vec![assessment]);
+
+    let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let plan_store = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+    let track = Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(
+        plan_store,
+    ));
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![track as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+
+    let session_id = "executor_declared_checklist";
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            &format!("Create {dir}, write a note file inside it, then read it back to confirm."),
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                workspace_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:synthetic-owner".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&file).ok().as_deref(),
+        Some("SYNTHETIC_NOTE"),
+        "the declared write must have happened"
+    );
+    assert!(
+        response.contains(done) && !response.contains(early),
+        "the early stop must not ship: {response}"
+    );
+    let decision_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id",
+    )
+    .bind(session_id)
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    let conditions: Vec<String> = decision_rows
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter_map(|data| data["metadata"]["condition"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        conditions.iter().any(|c| c == "ledger_expectations_required"),
+        "the executor's open items must have been demanded: {conditions:?}"
+    );
+    let closeouts: Vec<serde_json::Value> = decision_rows
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|data| data["metadata"]["condition"].as_str() == Some("ledger_closeout"))
+        .collect();
+    let last = closeouts.last().expect("ledger closeout recorded");
+    assert_eq!(last["metadata"]["verdict"], "closed", "{last}");
+    assert!(
+        closeouts.iter().any(|c| c["metadata"]["reachable_obligation_ids"]
+            .as_array()
+            .is_some_and(|ids| ids
+                .iter()
+                .any(|id| id.as_str().is_some_and(|id| id.contains("obligation:checklist:"))))),
+        "checklist obligations must have been the reachable expectations: {closeouts:?}"
+    );
+}

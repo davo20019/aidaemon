@@ -3055,6 +3055,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 if let Some(checklist) = parse_checklist_from_result(&result_text) {
                     send_status(&status_tx, StatusUpdate::Checklist { text: checklist });
                 }
+                // The checklist is also the executor's typed statement of what
+                // the request requires. Declare it to the run ledger so its
+                // items become obligations closed by receipts and demanded
+                // while reachable — the model is held to its own plan.
+                if let Some(declared) =
+                    executor_expectations_from_checklist_arguments(task_id, &effective_arguments)
+                {
+                    if let Err(error) = emitter
+                        .emit(crate::events::EventType::ExecutorExpectationsDeclared, declared)
+                        .await
+                    {
+                        warn!(session_id, %error, "Failed to declare executor expectations");
+                    }
+                }
             } else {
                 send_status(
                     &status_tx,
@@ -3968,6 +3982,60 @@ mod correction_gate_tests {
 /// otherwise the rendered checklist would carry the wrapper's trailing
 /// `[END UNTRUSTED EXTERNAL DATA]` marker. Returns None for degraded/error
 /// returns that carry no rendered list, in which case no Checklist is emitted.
+/// Project a `track_requirements` call into the executor's typed expectation
+/// declaration. Only typed content survives: effects, the observation flag,
+/// exact targets, and the declared status.
+fn executor_expectations_from_checklist_arguments(
+    task_id: &str,
+    arguments: &str,
+) -> Option<crate::events::ExecutorExpectationsDeclaredData> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let raw_items = value.get("items")?.as_array()?;
+    let mut items = Vec::with_capacity(raw_items.len());
+    for (index, item) in raw_items.iter().enumerate() {
+        let description = item.get("text")?.as_str()?.to_string();
+        let mut mutation_effects = crate::traits::ToolMutationEffects::NONE;
+        if let Some(effects) = item.get("mutation_effects").and_then(Value::as_array) {
+            for effect in effects.iter().filter_map(Value::as_str) {
+                if let Some(effect) = crate::traits::ToolMutationEffects::from_protocol_name(effect)
+                {
+                    mutation_effects = mutation_effects.union(effect);
+                }
+            }
+        }
+        items.push(crate::events::ExecutorExpectationItem {
+            index,
+            description,
+            requires_observation: item
+                .get("requires_observation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            mutation_effects,
+            targets: item
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                .to_string(),
+        });
+    }
+    (!items.is_empty()).then(|| crate::events::ExecutorExpectationsDeclaredData {
+        schema_version: crate::events::ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        items,
+    })
+}
+
 pub(crate) fn parse_checklist_from_result(result_text: &str) -> Option<String> {
     strip_untrusted_envelope(result_text)
         .split_once(":\n")

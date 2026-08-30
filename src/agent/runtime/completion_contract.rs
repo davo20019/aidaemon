@@ -4663,6 +4663,7 @@ mod tests {
                 required_effect: ToolMutationEffects::NONE,
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["receipt-1".to_string()],
+                required_target: None,
             },
         );
 

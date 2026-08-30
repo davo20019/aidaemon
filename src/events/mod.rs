@@ -269,6 +269,10 @@ pub enum EventType {
     /// diagnostic decision point this event is correctness-critical and is
     /// emitted even when flight-recorder telemetry is disabled.
     TaskContractCompiled,
+    /// The executing model declared its own typed expectations for the task
+    /// (its `track_requirements` checklist). Correctness-critical like the
+    /// contract event: the run ledger compiles it into obligations.
+    ExecutorExpectationsDeclared,
     /// A runtime-generated continuation was linked to the background tool
     /// receipt and parent task that caused it.
     BackgroundContinuationLinked,
