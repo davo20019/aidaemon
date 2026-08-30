@@ -778,6 +778,15 @@ fn compile_authority(
     }
 
     authority.forbidden_tool_scopes = signals.forbidden_tool_scopes.clone();
+    // Exact beats broad: a scope prohibition cannot cover a tool the request
+    // named explicitly in `allowed_tool_names`. Without this, "call terminal
+    // once" plus "no filesystem" compiles to an authority under which the
+    // one requested tool is inadmissible.
+    authority.forbidden_tool_scopes.retain(|scope| {
+        !signals.allowed_tool_names.iter().any(|tool| {
+            crate::agent::tool_execution_phase::fallback_tool_semantic_scope(tool) == Some(*scope)
+        })
+    });
     authority
         .forbidden_tool_scopes
         .sort_by_key(|scope| scope.as_str());
@@ -1844,6 +1853,43 @@ mod tests {
             access.write_targets[0].kind,
             ToolTargetHintKind::ProjectScope
         );
+    }
+
+    #[test]
+    fn an_explicitly_allowed_tool_is_not_covered_by_a_scope_prohibition() {
+        let mut signals = base_signals();
+        signals.tool_scope = Some("restricted".to_string());
+        signals.allowed_tool_names = vec!["terminal".to_string()];
+        signals.tool_constraint_evidence = vec!["Call terminal exactly once".to_string()];
+        signals.forbidden_tool_scopes = vec![
+            crate::traits::ToolSemanticScope::LocalWorkspace,
+            crate::traits::ToolSemanticScope::UserMemory,
+        ];
+        let compiled = compile_task_contract(ContractCompilerInput {
+            signals: &signals,
+            task_shape: None,
+            available_tool_names: &["terminal".to_string()],
+            available_tool_receipt_kinds: &[(
+                "terminal".to_string(),
+                crate::traits::ToolReceiptKind::Process,
+            )],
+            structural_filesystem_resources: &[],
+            structural_project_scopes: &[],
+            project_alias_roots: &[],
+            current_user_text: "synthetic request",
+        });
+        let authority = compiled.authority;
+        assert_eq!(authority.allowed_tool_names, vec!["terminal".to_string()]);
+        assert!(
+            !authority
+                .forbidden_tool_scopes
+                .contains(&crate::traits::ToolSemanticScope::LocalWorkspace),
+            "{:?}",
+            authority.forbidden_tool_scopes
+        );
+        assert!(authority
+            .forbidden_tool_scopes
+            .contains(&crate::traits::ToolSemanticScope::UserMemory));
     }
 
     #[test]

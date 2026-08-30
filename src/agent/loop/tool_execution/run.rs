@@ -982,11 +982,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     .map(|affordances| affordances.scope)
             })
             .or_else(|| fallback_tool_semantic_scope(&tc.name));
+        // Exact beats broad: a tool the request named explicitly in
+        // `allowed_tool_names` is not covered by a scope-level prohibition
+        // (the same rule as an exact write path beating a directory root).
+        let explicitly_allowed_tool = turn_context
+            .completion_contract
+            .allowed_tool_names
+            .iter()
+            .any(|name| name == &tc.name);
         if let Some(prohibited_scope) = tool_semantic_scope.filter(|scope| {
-            turn_context
-                .completion_contract
-                .forbidden_tool_scopes
-                .contains(scope)
+            !explicitly_allowed_tool
+                && turn_context
+                    .completion_contract
+                    .forbidden_tool_scopes
+                    .contains(scope)
         }) {
             *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
             emitter

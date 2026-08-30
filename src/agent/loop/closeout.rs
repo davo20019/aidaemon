@@ -38,15 +38,20 @@ impl<'a> ClosingAuthority<'a> {
         if self.forbids_tool_use {
             return false;
         }
-        if !self.allowed_tool_names.is_empty()
-            && !self.allowed_tool_names.iter().any(|name| name == tool)
-        {
+        let explicitly_allowed = self.allowed_tool_names.iter().any(|name| name == tool);
+        if !self.allowed_tool_names.is_empty() && !explicitly_allowed {
             return false;
         }
-        if let Some(scope) = crate::agent::tool_execution_phase::fallback_tool_semantic_scope(tool)
-        {
-            if self.forbidden_tool_scopes.contains(&scope) {
-                return false;
+        // Exact beats broad: a tool the request named explicitly is admitted
+        // even when a scope-level prohibition would otherwise cover it (the
+        // same rule as an exact write path beating a directory root).
+        if !explicitly_allowed {
+            if let Some(scope) =
+                crate::agent::tool_execution_phase::fallback_tool_semantic_scope(tool)
+            {
+                if self.forbidden_tool_scopes.contains(&scope) {
+                    return false;
+                }
             }
         }
         if self.forbids_mutation && read_only == Some(false) {
@@ -163,6 +168,39 @@ mod tests {
             &authority(true, &[]),
             &["write_file"],
             read_only
+        ));
+    }
+
+    #[test]
+    fn an_explicitly_allowed_tool_beats_a_scope_level_prohibition() {
+        let predicate = RequestReceiptPredicate {
+            tool_names: vec!["terminal".to_string()],
+            ..RequestReceiptPredicate::default()
+        };
+        let obligation = obligation(Some(predicate), None, ToolMutationEffects::NONE);
+        let allowed = vec!["terminal".to_string()];
+        let authority = ClosingAuthority {
+            forbids_tool_use: false,
+            forbids_mutation: false,
+            allowed_tool_names: &allowed,
+            forbidden_tool_scopes: &[ToolSemanticScope::LocalWorkspace],
+        };
+        assert!(obligation_admissible(
+            &obligation,
+            &authority,
+            &["terminal", "read_file"],
+            |_| Some(false)
+        ));
+        let none_allowed: Vec<String> = Vec::new();
+        let authority = ClosingAuthority {
+            allowed_tool_names: &none_allowed,
+            ..authority
+        };
+        assert!(!obligation_admissible(
+            &obligation,
+            &authority,
+            &["terminal", "read_file"],
+            |_| Some(false)
         ));
     }
 
