@@ -1310,6 +1310,11 @@ pub(super) struct CompletionProgress {
     /// while an observation obligation was pending. Completion blocks are
     /// tracked separately and must never masquerade as exhausted retries.
     pub verification_attempt_count: usize,
+    /// `completed_operation_results` at the last verification re-ask. The
+    /// re-ask is bounded by receipts: it fires again only after new completed
+    /// work changed what the ledger can credit, never merely because an
+    /// expectation is still open.
+    pub verification_demanded_at_completed: Option<usize>,
     /// Count of times the response-quality nudge has been injected.
     /// Used to prevent infinite nudge loops — only fire once.
     pub quality_nudge_count: usize,

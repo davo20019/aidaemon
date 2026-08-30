@@ -1828,6 +1828,10 @@ pub(super) async fn run_completion_phase(
             if completion_progress.verification_pending
                 && !terminal_policy_denial
                 && ledger_demands_work
+                // Bounded by receipts: re-ask only when completed work has
+                // changed since the last re-ask (or none was issued yet).
+                && completion_progress.verification_demanded_at_completed
+                    != Some(execution_state.completed_operation_results)
             {
                 let has_concrete_progress = super::stopping_progress::has_any_concrete_execution(
                     turn_context,
@@ -2123,6 +2127,8 @@ pub(super) async fn run_completion_phase(
                     completion_progress.verification_block_count = completion_progress
                         .verification_block_count
                         .saturating_add(1);
+                    completion_progress.verification_demanded_at_completed =
+                        Some(execution_state.completed_operation_results);
                     execution_state.record_validation_round();
 
                     // A blocked completion is not a verification attempt, but

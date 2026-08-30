@@ -504,11 +504,30 @@ impl ToolReceiptV1 {
             _ => "not_applicable".to_string(),
         };
         let result_id = provenance.result_id.as_deref().unwrap_or("unavailable");
+        // Every fact a reply may state about this call is on this one line:
+        // whether anything ran, whether it was backgrounded/detached, the exit
+        // code, how many authoritative bytes came back, and which authority
+        // boundary (if any) refused it. Adapters never need a bespoke note.
+        let exit_code = self
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let denial = self
+            .access_denial
+            .as_ref()
+            .map(|denial| denial.reason_code.as_str())
+            .unwrap_or("none");
         format!(
-            "[Tool receipt v{}: stage={:?}; outcome={}; result_id={}; source={}; model_view={}; durable_view={}; requested_range={}; returned_range={}]",
+            "[Tool receipt v{}: stage={:?}; outcome={}; dispatched={}; background_started={}; detached={}; exit_code={}; bytes_returned={}; denial={}; result_id={}; source={}; model_view={}; durable_view={}; requested_range={}; returned_range={}]",
             self.schema_version,
             self.invocation_stage,
             self.outcome_status.as_str(),
+            self.invocation_stage.reached_dispatch(),
+            self.background_started,
+            self.detached,
+            exit_code,
+            provenance.authoritative_chars,
+            denial,
             result_id,
             provenance.source.as_str(),
             provenance.model_view_completeness.as_str(),
