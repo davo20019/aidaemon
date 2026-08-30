@@ -5061,6 +5061,18 @@ impl TerminalTool {
         } = request;
         let has_write_targets = !write_paths.is_empty() || !write_roots.is_empty();
         let command_semantics = terminal_run_semantics_from_access(true, has_write_targets);
+        // Snapshot which deletion-relevant paths exist before the process
+        // runs, so a successful synchronous run can type observed deletions
+        // (present → absent) on its receipt.
+        let deletion_candidates =
+            deletion_observation_candidates(command, working_dir, write_paths, write_roots);
+        let mut deletion_preexisting: Vec<String> = Vec::new();
+        for path in &deletion_candidates {
+            let backend_path = crate::execution::BackendPath::new(path.clone());
+            if self.backend.metadata(&backend_path).await.is_ok() {
+                deletion_preexisting.push(path.clone());
+            }
+        }
         let execution_mode = if script_via_stdin {
             "script"
         } else {
@@ -5281,6 +5293,33 @@ impl TerminalTool {
                 let mut metadata = foreground_terminal_metadata(exit_code);
                 metadata.truncation = truncation;
                 metadata.semantics = command_semantics.clone();
+                // Type observed deletions on the receipt: a nominated path
+                // that existed before the run and is absent after a
+                // successful exit was destroyed by this process. This is the
+                // only receipt shape that can close an executor checklist
+                // obligation declared `destructive`.
+                if exit_code == Some(0) {
+                    let mut semantics = metadata.semantics.clone();
+                    let mut observed_deletion = false;
+                    for path in &deletion_preexisting {
+                        let backend_path = crate::execution::BackendPath::new(path.clone());
+                        if self.backend.metadata(&backend_path).await.is_err() {
+                            observed_deletion = true;
+                            semantics = semantics
+                                .with_target_hint(crate::traits::ToolTargetHintKind::Path, path);
+                        }
+                    }
+                    if observed_deletion {
+                        semantics.mutation_effects = semantics
+                            .mutation_effects
+                            .union(ToolMutationEffects::DESTRUCTIVE);
+                        if !semantics.mutates_state() {
+                            semantics.effect =
+                                crate::traits::ToolCallEffect::ObservationAndMutation;
+                        }
+                        metadata.semantics = semantics;
+                    }
+                }
                 metadata.access_denial = sandbox_access_denial(stderr.as_ref(), exit_code);
                 Ok(ToolCallOutcome { metadata, output })
             }
@@ -7424,6 +7463,54 @@ fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
     } else {
         crate::traits::ToolReceiptKind::Generic
     }
+}
+
+/// Absolute-path candidates whose existence transition the run may need to
+/// prove: every declared write target plus path operands of structurally
+/// parsed deletion invocations (`rm`, `rmdir`, `unlink`, `shred`,
+/// `find … -delete`). Command syntax only NOMINATES paths to observe — shell
+/// source is program input, not a trusted declaration of effects — so the
+/// receipt's DESTRUCTIVE effect is typed from the observed present→absent
+/// transition, never from a program name alone.
+fn deletion_observation_candidates(
+    command: &str,
+    working_dir: Option<&str>,
+    write_paths: &[String],
+    write_roots: &[String],
+) -> Vec<String> {
+    const MAX_CANDIDATES: usize = 16;
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty() || trimmed.contains(['*', '?', '[']) {
+            return;
+        }
+        let absolute = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else if let Some(cwd) = working_dir.filter(|cwd| cwd.starts_with('/')) {
+            format!("{}/{}", cwd.trim_end_matches('/'), trimmed)
+        } else {
+            return;
+        };
+        if !candidates.contains(&absolute) {
+            candidates.push(absolute);
+        }
+    };
+    for path in write_paths.iter().chain(write_roots.iter()) {
+        push(path);
+    }
+    for (program, args) in parsed_command_invocations(command) {
+        let is_deletion = matches!(program.as_str(), "rm" | "rmdir" | "unlink" | "shred")
+            || (program == "find" && args.iter().any(|arg| arg == "-delete"));
+        if !is_deletion {
+            continue;
+        }
+        for operand in args.iter().filter(|arg| !arg.starts_with('-')) {
+            push(operand);
+        }
+    }
+    candidates.truncate(MAX_CANDIDATES);
+    candidates
 }
 
 /// Derive lifecycle semantics exclusively from the capability manifest that
@@ -9707,6 +9794,123 @@ mod tests {
             ),
             Some(42)
         );
+    }
+
+    #[test]
+    fn deletion_observation_candidates_nominate_declared_targets_and_operands() {
+        // Declared write targets and parsed deletion operands are nominated
+        // for pre/post observation; syntax alone never types the receipt.
+        let candidates = deletion_observation_candidates(
+            "rm -rf /tmp/x/old",
+            Some("/tmp"),
+            &[],
+            &["/tmp/x".to_string()],
+        );
+        assert!(candidates.contains(&"/tmp/x".to_string()));
+        assert!(candidates.contains(&"/tmp/x/old".to_string()));
+
+        // Relative deletion operands resolve against the working directory.
+        let relative =
+            deletion_observation_candidates("rmdir old-dir", Some("/tmp/work"), &[], &[]);
+        assert!(relative.contains(&"/tmp/work/old-dir".to_string()));
+
+        // A deletion program named in quoted DATA is not an invocation and
+        // nominates nothing beyond the declared targets.
+        let quoted = deletion_observation_candidates(
+            "echo 'rm -rf /' > /tmp/x/notes.txt",
+            Some("/tmp"),
+            &["/tmp/x/notes.txt".to_string()],
+            &[],
+        );
+        assert_eq!(quoted, vec!["/tmp/x/notes.txt".to_string()]);
+
+        // Globs are never stat candidates; find only nominates with -delete.
+        let globbed = deletion_observation_candidates("rm -rf /tmp/x/*", Some("/tmp"), &[], &[]);
+        assert!(globbed.is_empty());
+        let find_plain =
+            deletion_observation_candidates("find /tmp/x -name f", Some("/tmp"), &[], &[]);
+        assert!(find_plain.is_empty());
+        let find_delete =
+            deletion_observation_candidates("find /tmp/x -name f -delete", Some("/tmp"), &[], &[]);
+        assert!(find_delete.contains(&"/tmp/x".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deletion_run_receipt_carries_destructive_effect() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        // Under /tmp like the live disposable-workflow paths; the platform
+        // temp dir (/var/folders/…) trips the broad-path delete guard.
+        let root = std::path::PathBuf::from(format!("/tmp/aid-del-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("create disposable dir");
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("rm -rf {}", root.to_string_lossy()),
+            "write_roots": [root.to_string_lossy()],
+            "_session_id": "sess_del_receipt",
+            "_user_role": "Owner",
+        });
+        let outcome = tool
+            .call_with_status_outcome(&args.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
+        assert!(!root.exists());
+        // The receipt is the only thing that can close a checklist obligation
+        // the executor declared `destructive`.
+        assert!(outcome
+            .metadata
+            .semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::DESTRUCTIVE));
+        assert!(outcome
+            .metadata
+            .semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+
+        // A run that leaves its declared target in place gains no
+        // destructive typing: the effect comes from the observed transition,
+        // not from any command vocabulary.
+        let keep = std::path::PathBuf::from(format!("/tmp/aid-keep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&keep).expect("create persistent dir");
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("ls {}", keep.to_string_lossy()),
+            "write_roots": [keep.to_string_lossy()],
+            "_session_id": "sess_del_receipt",
+            "_user_role": "Owner",
+        });
+        let outcome = tool
+            .call_with_status_outcome(&args.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
+        assert!(!outcome
+            .metadata
+            .semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::DESTRUCTIVE));
+        let _ = std::fs::remove_dir_all(&keep);
     }
 
     #[test]

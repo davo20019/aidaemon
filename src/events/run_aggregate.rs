@@ -3571,6 +3571,76 @@ mod tests {
     }
 
     #[test]
+    fn destructive_checklist_item_closes_on_destructive_receipt_not_on_creation() {
+        // Mirrors the live create/remove workflow: the executor declares the
+        // removal step `destructive` on the same path it earlier created. The
+        // creation receipt touching that path must NOT close the removal
+        // obligation, and a deletion receipt typed DESTRUCTIVE (the terminal
+        // adapter types `rm`/`rmdir`/`unlink` syntax) must.
+        let destructive_semantics = ToolCallSemantics {
+            effect: ToolCallEffect::Mutation,
+            mutation_effects: ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+                .union(ToolMutationEffects::DESTRUCTIVE),
+            ..ToolCallSemantics::default()
+        }
+        .with_target_hint(crate::traits::ToolTargetHintKind::Path, "/tmp/card");
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/card"],
+                    "pending",
+                ),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::DESTRUCTIVE,
+                    false,
+                    &["/tmp/card"],
+                    "pending",
+                ),
+            ]),
+            call("mk", "terminal"),
+            result(
+                "mk",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/card"),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Pending,
+            "a creation receipt on the same path must not prove the removal"
+        );
+
+        events.push(call("rm", "terminal"));
+        events.push(result(
+            "rm",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            destructive_semantics,
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+        assert!(aggregate.is_fulfilled());
+    }
+
+    #[test]
     fn executor_redeclaration_keeps_proof_abandons_deferred_and_dropped_items() {
         let mut events = vec![
             executor_expectations(vec![
