@@ -1745,6 +1745,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     reason_code: "controller_scope_contract_rejected".to_string(),
                     enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
                     exit_code: None,
+                    proposed_evidence: Vec::new(),
                 }),
                 &operation_claim,
             )

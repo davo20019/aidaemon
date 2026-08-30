@@ -2096,6 +2096,7 @@ mod tests {
                 reason_code: "filesystem_access_denied".to_string(),
                 enforcement: crate::traits::ToolAccessEnforcement::KernelEnforced,
                 exit_code: Some(1),
+                proposed_evidence: Vec::new(),
             }),
             contract_rejected: true,
             effective_tool_name: Some("terminal".to_string()),

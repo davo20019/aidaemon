@@ -944,6 +944,7 @@ impl Agent {
                 reason_code: reason_code.to_string(),
                 enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
                 exit_code: None,
+                proposed_evidence: Vec::new(),
             }),
             None,
         )
@@ -991,6 +992,19 @@ impl Agent {
                 .await?;
         }
 
+        // A typed denial names what the refused operation would have
+        // produced, so the run ledger can bind it to the obligation it was
+        // attempting. Filled once here for every denial site.
+        let access_denial = access_denial.map(|mut denial| {
+            if denial.proposed_evidence.is_empty() {
+                denial.proposed_evidence =
+                    crate::agent::inquiry::evidence_capabilities_for_tool_call(
+                        &tool_call.name,
+                        effective_arguments,
+                    );
+            }
+            denial
+        });
         let metadata = crate::traits::ToolCallMetadata {
             access_manifest,
             access_denial,
@@ -1152,6 +1166,7 @@ mod tests {
             reason_code: "controller_scope_contract_rejected".to_string(),
             enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
             exit_code: None,
+            proposed_evidence: Vec::new(),
         };
 
         harness

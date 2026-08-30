@@ -7285,6 +7285,7 @@ fn sandbox_access_denial(
         reason_code: "sandbox_policy_denied".to_string(),
         enforcement: confined_process_access_enforcement(),
         exit_code,
+        proposed_evidence: Vec::new(),
     })
 }
 

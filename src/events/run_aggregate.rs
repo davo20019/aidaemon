@@ -647,6 +647,11 @@ impl RunAggregate {
         if operation.evidence_capabilities.is_empty() {
             operation.evidence_capabilities = receipt.semantics.evidence.clone();
         }
+        if operation.evidence_capabilities.is_empty() {
+            if let Some(denial) = receipt.access_denial.as_ref() {
+                operation.evidence_capabilities = denial.proposed_evidence.clone();
+            }
+        }
         operation.result_id = Some(result_id.clone());
         let claimed_obligation_ids = operation.obligation_ids.clone();
         // Cardinality is about distinct durable invocations, not distinct
@@ -2544,28 +2549,33 @@ mod tests {
             receipt: None,
             target: None,
         };
-        let semantics = ToolCallSemantics {
-            effect: ToolCallEffect::Observation,
-            evidence: vec![crate::traits::ToolEvidenceCapability {
-                scope: crate::traits::ToolSemanticScope::LocalWorkspace,
-                purposes: vec![crate::traits::EvidencePurpose::CurrentState],
-                authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            }],
-            ..ToolCallSemantics::default()
-        };
+        // Live rejection receipts carry no observed semantics (nothing ran);
+        // the typed denial names the evidence the refused call proposed.
         let mut events = vec![
             contract(vec![observe]),
             call("read", "terminal"),
-            result("read", "terminal", ToolOutcomeStatus::Blocked, 0, semantics),
+            result(
+                "read",
+                "terminal",
+                ToolOutcomeStatus::Blocked,
+                0,
+                ToolCallSemantics::default(),
+            ),
         ];
         events[2].data["receipt"]["invocation_stage"] =
             serde_json::json!("rejected_before_dispatch");
         events[2].data["receipt"]["exit_code"] = serde_json::Value::Null;
         events[2].data["receipt"]["receipt_kind"] = serde_json::json!("generic");
+        events[2].data["receipt"]["semantics"] = serde_json::json!({});
         events[2].data["receipt"]["access_denial"] = serde_json::json!({
             "reason_code": "protected_host_data",
-            "enforcement": "controller_enforced"
+            "enforcement": "controller_enforced",
+            "proposed_evidence": [{
+                "scope": "local_workspace",
+                "purposes": ["current_state"],
+                "authority": "direct",
+                "temporal_scope": "current"
+            }]
         });
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
@@ -2591,7 +2601,7 @@ mod tests {
         // A refusal of an unrelated capability does not bind: the obligation
         // stays reachable and the run stays pending.
         let mut unrelated = events.clone();
-        unrelated[2].data["receipt"]["semantics"]["evidence"] = serde_json::json!([{
+        unrelated[2].data["receipt"]["access_denial"]["proposed_evidence"] = serde_json::json!([{
             "scope": "external_remote",
             "purposes": ["current_state"],
             "authority": "direct",

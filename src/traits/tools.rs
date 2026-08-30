@@ -1015,6 +1015,12 @@ pub struct ToolAccessDenial {
     pub enforcement: ToolAccessEnforcement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Evidence the refused operation WOULD have produced. A rejection
+    /// receipt carries no observed evidence (nothing ran), but the run ledger
+    /// needs to know which observation obligation the refusal was attempting
+    /// to satisfy; that binding is proposal data, typed on the denial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_evidence: Vec<ToolEvidenceCapability>,
 }
 
 impl ToolOutcomeStatus {
