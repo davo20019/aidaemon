@@ -72,9 +72,11 @@ pub(crate) fn objective_control_facet(
     })
 }
 
-/// The control facet as a typed JSON object for structured surfaces. The
-/// absent case is an explicit value, never a missing key, so an audit can
-/// distinguish "no mandate" from "not inspected".
+/// The control facet as typed JSON for structured surfaces. The absent case
+/// is the literal string "absent" rather than an object: R47 showed that an
+/// audit reads the mere presence of a populated `objective_control` object as
+/// "control exists", so absence must not be expressed through a shape that
+/// exists. Present control is an object; absent control is unmistakably not.
 pub(crate) fn objective_control_json(control: Option<&ObjectiveControlFacet>) -> serde_json::Value {
     match control {
         Some(facet) => serde_json::json!({
@@ -84,12 +86,7 @@ pub(crate) fn objective_control_json(control: Option<&ObjectiveControlFacet>) ->
             "measurement_count": facet.measurement_count,
             "delegated_identities": facet.delegated_identities,
         }),
-        None => serde_json::json!({
-            "mandate_status": "absent",
-            "metric": serde_json::Value::Null,
-            "measurement_count": 0,
-            "delegated_identities": [],
-        }),
+        None => serde_json::json!("absent"),
     }
 }
 
@@ -278,10 +275,7 @@ mod tests {
         assert!(line.contains(
             "control absent (no mandate; no delegated account or credentials; 0 measurements)"
         ));
-        let control_json = objective_control_json(None);
-        assert_eq!(control_json["mandate_status"], "absent");
-        assert_eq!(control_json["measurement_count"], 0);
-        assert_eq!(control_json["delegated_identities"], serde_json::json!([]));
+        assert_eq!(objective_control_json(None), serde_json::json!("absent"));
     }
 
     #[tokio::test]

@@ -111,6 +111,16 @@ pub(crate) struct RunOperation {
     /// operation can be bound to the resource an obligation concerns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<ToolTargetHint>,
+    /// Receipt-typed mutation effects, retained so an obligation declared or
+    /// retargeted after this receipt landed can still be verified against it.
+    #[serde(default)]
+    pub mutation_effects: crate::traits::ToolMutationEffects,
+    /// The terminal receipt carried observation semantics.
+    #[serde(default)]
+    pub observes: bool,
+    /// Effect revision after this operation's terminal receipt was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -605,6 +615,162 @@ impl RunAggregate {
                 obligation.state = RunObligationState::Abandoned;
             }
         }
+        // The executor's natural flow is do-the-work-then-tick-the-item, so
+        // an item's proof must not depend on whether its receipt landed
+        // before or after the declaration that named its targets.
+        self.recredit_checklist_obligations_from_recorded_receipts();
+        self.close_remote_effect_obligations_on_verified_remote_observation();
+    }
+
+    /// Re-verify still-pending checklist obligations against receipts that
+    /// were recorded before the item (or its exact targets) was declared.
+    /// Receipts remain the only thing that can close an obligation; this
+    /// only removes the declaration-order dependency.
+    fn recredit_checklist_obligations_from_recorded_receipts(&mut self) {
+        struct RecordedReceipt {
+            operation_id: String,
+            succeeded: bool,
+            completed_observation: bool,
+            dispatched: bool,
+            mutation_effects: crate::traits::ToolMutationEffects,
+            observes: bool,
+            targets: Vec<ToolTargetHint>,
+            revision: u64,
+        }
+        let receipts: Vec<RecordedReceipt> = self
+            .operations
+            .values()
+            .filter(|operation| operation.result_id.is_some())
+            .map(|operation| RecordedReceipt {
+                operation_id: operation.operation_id.clone(),
+                succeeded: matches!(operation.outcome, Some(ToolOutcomeStatus::Succeeded)),
+                completed_observation: matches!(
+                    operation.outcome,
+                    Some(
+                        ToolOutcomeStatus::Succeeded
+                            | ToolOutcomeStatus::CompletedWithNegativeResult
+                    )
+                ),
+                dispatched: operation.dispatched,
+                mutation_effects: operation.mutation_effects,
+                observes: operation.observes,
+                targets: operation.targets.clone(),
+                revision: operation.result_revision.unwrap_or(self.effect_revision),
+            })
+            .collect();
+        if receipts.is_empty() {
+            return;
+        }
+        for (id, obligation) in self.obligations.iter_mut() {
+            if !id.contains("/obligation:checklist:")
+                || obligation.state != RunObligationState::Pending
+                || obligation.receipt.is_some()
+            {
+                continue;
+            }
+            for receipt in &receipts {
+                let target_compatible = obligation
+                    .required_target
+                    .as_ref()
+                    .is_none_or(|target| hints_touch_target(target, &receipt.targets));
+                let proven = match obligation.class {
+                    RunObligationClass::Achieve => {
+                        !obligation.required_effect.is_empty()
+                            && receipt.succeeded
+                            && receipt
+                                .mutation_effects
+                                .satisfies(obligation.required_effect)
+                            && target_compatible
+                    }
+                    RunObligationClass::Observe => {
+                        receipt.completed_observation
+                            && receipt.dispatched
+                            && receipt.observes
+                            && target_compatible
+                    }
+                    _ => false,
+                };
+                if !proven {
+                    continue;
+                }
+                // Mirror the live staleness rule: an observation credited at
+                // an older revision is stale only when a later mutation could
+                // have changed the observed state.
+                if obligation.class == RunObligationClass::Observe {
+                    let stale = receipts.iter().any(|later| {
+                        later.succeeded
+                            && !later.mutation_effects.is_empty()
+                            && later.revision > receipt.revision
+                            && obligation
+                                .required_target
+                                .as_ref()
+                                .is_none_or(|target| hints_touch_target(target, &later.targets))
+                    });
+                    if stale {
+                        continue;
+                    }
+                }
+                if !obligation
+                    .satisfying_receipt_ids
+                    .contains(&receipt.operation_id)
+                {
+                    obligation
+                        .satisfying_receipt_ids
+                        .push(receipt.operation_id.clone());
+                }
+                obligation.state = RunObligationState::Satisfied;
+                obligation.satisfied_at_revision = Some(receipt.revision);
+                break;
+            }
+        }
+    }
+
+    /// A shell adapter deliberately never carries remote effects in its own
+    /// receipt (it cannot masquerade as a remote mutation), yet a
+    /// repository-documented deploy IS a shell command. Prove the remote
+    /// effect the way an operator proves it: a succeeded mutation happened,
+    /// and an independently declared URL observation verified the remote
+    /// state afterward. The adapter's self-claim alone still proves nothing;
+    /// without a post-mutation URL verification these obligations stay open.
+    fn close_remote_effect_obligations_on_verified_remote_observation(&mut self) {
+        const REMOTE: crate::traits::ToolMutationEffects =
+            crate::traits::ToolMutationEffects::REMOTE_DEPLOY
+                .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY);
+        let Some(observation) = self
+            .obligations
+            .values()
+            .filter(|obligation| {
+                obligation.class == RunObligationClass::Observe
+                    && obligation.state == RunObligationState::Satisfied
+                    && obligation.required_target.as_ref().is_some_and(|target| {
+                        target.kind == crate::traits::RequestVerificationTargetKind::Url
+                    })
+                    && obligation
+                        .satisfied_at_revision
+                        .is_some_and(|revision| revision >= 1)
+            })
+            .max_by_key(|obligation| obligation.satisfied_at_revision)
+        else {
+            return;
+        };
+        let revision = observation.satisfied_at_revision;
+        let proof = observation.satisfying_receipt_ids.clone();
+        for obligation in self.obligations.values_mut() {
+            if obligation.state == RunObligationState::Pending
+                && obligation.class == RunObligationClass::Achieve
+                && obligation.receipt.is_none()
+                && !obligation.required_effect.is_empty()
+                && REMOTE.contains(obligation.required_effect)
+            {
+                obligation.state = RunObligationState::Satisfied;
+                obligation.satisfied_at_revision = revision;
+                for id in &proof {
+                    if !obligation.satisfying_receipt_ids.contains(id) {
+                        obligation.satisfying_receipt_ids.push(id.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Whether any typed expectations exist to arbitrate: from the compiled
@@ -668,6 +834,9 @@ impl RunAggregate {
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
+                mutation_effects: crate::traits::ToolMutationEffects::NONE,
+                observes: false,
+                result_revision: None,
                 result_id: None,
                 operation_lineage: call.operation_lineage,
             },
@@ -781,6 +950,9 @@ impl RunAggregate {
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
+                mutation_effects: crate::traits::ToolMutationEffects::NONE,
+                observes: false,
+                result_revision: None,
                 result_id: None,
                 operation_lineage: None,
             });
@@ -799,6 +971,10 @@ impl RunAggregate {
         if operation.targets.is_empty() {
             operation.targets = receipt_targets(receipt);
         }
+        operation.mutation_effects = operation
+            .mutation_effects
+            .union(receipt.semantics.mutation_effects);
+        operation.observes = operation.observes || receipt.semantics.observes_state();
         operation.result_id = Some(result_id.clone());
         let claimed_obligation_ids = operation.obligation_ids.clone();
         // Cardinality is about distinct durable invocations, not distinct
@@ -829,12 +1005,28 @@ impl RunAggregate {
             && receipt.semantics.mutates_state();
         if completed_mutation {
             self.effect_revision = self.effect_revision.saturating_add(1);
+        }
+        if let Some(operation) = self.operations.get_mut(&operation_id) {
+            operation.result_revision = Some(self.effect_revision);
+        }
+        if completed_mutation {
+            // A mutation only invalidates observations of state it could have
+            // changed: an earlier research read of an external page does not
+            // become stale because a local post file was written afterward.
+            // Target-bound observations survive mutations whose receipt
+            // touches disjoint targets; untargeted observations remain
+            // conservatively revision-bound.
+            let mutation_targets = receipt_targets(receipt);
             for obligation in self.obligations.values_mut() {
                 if obligation.class == RunObligationClass::Observe
                     && obligation.state == RunObligationState::Satisfied
                     && obligation
                         .satisfied_at_revision
                         .is_some_and(|revision| revision < self.effect_revision)
+                    && obligation
+                        .required_target
+                        .as_ref()
+                        .is_none_or(|target| hints_touch_target(target, &mutation_targets))
                 {
                     obligation.state = RunObligationState::Invalidated;
                 }
@@ -911,6 +1103,7 @@ impl RunAggregate {
                 }
             }
         }
+        self.close_remote_effect_obligations_on_verified_remote_observation();
         self.reconcile_cardinality();
         // Keep the last operation that advanced an open aggregate. Once the
         // run is terminal, unrelated late telemetry cannot steal causality.
@@ -3919,5 +4112,196 @@ mod tests {
             serde_json::json!([{"kind": "Path", "value": "/private/var/root/other.txt"}]);
         let aggregate = RunAggregate::replay("task-1", &events);
         assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    fn contract_requiring_effects(effects: ToolMutationEffects) -> Event {
+        let mut contract_event = contract(Vec::new());
+        contract_event.data["contract"]["expects_mutation"] = serde_json::json!(true);
+        contract_event.data["contract"]["required_mutation_effects"] =
+            serde_json::json!(effects.bits());
+        contract_event
+    }
+
+    fn url_observation_semantics(url: &str) -> ToolCallSemantics {
+        ToolCallSemantics::observation()
+            .with_target_hint(crate::traits::ToolTargetHintKind::Url, url)
+    }
+
+    /// Live-shape regression (blog run f535f390, 2026-08-31): a repository's
+    /// documented deploy IS a shell command, and the shell adapter can never
+    /// carry remote effects in its own receipt. The remote obligations close
+    /// on the operator-grade pair — succeeded mutation, then an independently
+    /// declared URL observation verified afterward — and stay open without it.
+    #[test]
+    fn remote_effect_obligations_close_on_post_mutation_url_verification() {
+        let url = "https://blog.example.test/posts/synthetic-post/";
+        let base = vec![
+            contract_requiring_effects(
+                ToolMutationEffects::REMOTE_DEPLOY.union(ToolMutationEffects::EXTERNAL_DELIVERY),
+            ),
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::REMOTE_DEPLOY,
+                    false,
+                    &["/tmp/blog"],
+                    "pending",
+                ),
+                checklist_item(1, ToolMutationEffects::NONE, true, &[url], "pending"),
+            ]),
+            call("deploy", "terminal"),
+            result(
+                "deploy",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/blog"),
+            ),
+        ];
+
+        // Without the URL verification the adapter's local receipt proves
+        // nothing remote: every remote obligation stays open.
+        let mut events = base.clone();
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        for id in [
+            "task:task-1/obligation:checklist:0",
+            "task:task-1/obligation:mutation:remote_deploy",
+            "task:task-1/obligation:mutation:external_delivery",
+        ] {
+            assert_eq!(
+                aggregate.obligations[id].state,
+                RunObligationState::Pending,
+                "{id} must stay open without a post-mutation URL verification"
+            );
+        }
+
+        let mut events = base;
+        events.push(call("verify", "http_request"));
+        events.push(result(
+            "verify",
+            "http_request",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            url_observation_semantics(url),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        for id in [
+            "task:task-1/obligation:checklist:0",
+            "task:task-1/obligation:checklist:1",
+            "task:task-1/obligation:mutation:remote_deploy",
+            "task:task-1/obligation:mutation:external_delivery",
+        ] {
+            assert_eq!(
+                aggregate.obligations[id].state,
+                RunObligationState::Satisfied,
+                "{id} must close once the URL observation verified the deploy"
+            );
+        }
+    }
+
+    /// Live-shape regression: the executor researched two external pages and
+    /// only afterwards declared the checklist item naming those URLs as its
+    /// targets. Proof must not depend on declaration order, and a later
+    /// unrelated local write must not stale an observation of a disjoint
+    /// external target.
+    #[test]
+    fn checklist_targets_declared_after_the_receipt_still_credit() {
+        let url = "https://example.test/observances/synthetic-day";
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &[],
+                "pending",
+            )]),
+            call("research", "web_fetch"),
+            result(
+                "research",
+                "web_fetch",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                url_observation_semantics(url),
+            ),
+            call("write", "write_file"),
+            result(
+                "write",
+                "write_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/blog/post.md"),
+            ),
+            // The item gains its exact researched targets only after the
+            // receipts landed — the executor's natural tick-after-work flow.
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &[url],
+                "completed",
+            )]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied,
+            "the earlier research receipt must credit the later-targeted item"
+        );
+    }
+
+    #[test]
+    fn mutation_invalidates_only_observations_of_state_it_could_have_changed() {
+        let url = "https://blog.example.test/posts/synthetic-post/";
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(0, ToolMutationEffects::NONE, true, &[url], "pending"),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::NONE,
+                    true,
+                    &["/tmp/blog/post.md"],
+                    "pending",
+                ),
+            ]),
+            call("verify", "http_request"),
+            result(
+                "verify",
+                "http_request",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                url_observation_semantics(url),
+            ),
+            call("read", "read_file"),
+            result(
+                "read",
+                "read_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(Some("/tmp/blog/post.md")),
+            ),
+            call("write", "write_file"),
+            result(
+                "write",
+                "write_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/blog/post.md"),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied,
+            "a local write cannot stale an observation of a disjoint URL"
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Invalidated,
+            "a write to the observed path must stale that observation"
+        );
     }
 }

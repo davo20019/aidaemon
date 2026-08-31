@@ -1258,6 +1258,19 @@ impl WorkCoordinationStore for SqliteStateStore {
         Ok(true)
     }
 
+    async fn goal_run_has_live_attempt(&self, run_id: &str) -> anyhow::Result<bool> {
+        let live = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_attempts
+             WHERE goal_run_id = ?
+               AND status IN ('claimed', 'running')
+               AND datetime(lease_expires_at) > datetime('now')",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(live > 0)
+    }
+
     async fn recover_expired_task_attempts(&self) -> anyhow::Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
@@ -2175,6 +2188,47 @@ mod tests {
                 .status,
             "running"
         );
+    }
+
+    #[tokio::test]
+    async fn live_lease_marks_the_goal_run_owned_until_the_lease_ends() {
+        // While any unexpired lease exists on a run's attempt, a worker owns
+        // the run's outcome and lifecycle reconciliation must defer to it.
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_finite("execute exactly once", "session-a");
+        store.create_goal(&goal).await.unwrap();
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let root = task(&goal.id, "scheduled root", None);
+        store.create_task(&root).await.unwrap();
+        assert!(!store.goal_run_has_live_attempt(&run.id).await.unwrap());
+
+        let attempt = store
+            .claim_task_with_lease(&root.id, "worker-a", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("claim succeeds");
+        assert!(store.goal_run_has_live_attempt(&run.id).await.unwrap());
+
+        // A terminal patch ends the attempt and with it the ownership claim.
+        assert!(store
+            .patch_task_from_attempt(
+                &attempt.id,
+                &attempt.lease_token,
+                &TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("done".to_string()),
+                    error: None,
+                    blocker: None,
+                    context: None,
+                    handoff: None,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(!store.goal_run_has_live_attempt(&run.id).await.unwrap());
     }
 
     #[tokio::test]

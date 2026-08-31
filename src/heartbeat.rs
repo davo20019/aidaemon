@@ -2379,6 +2379,16 @@ impl HeartbeatCoordinator {
             .collect::<Vec<_>>();
         let mut open_runs = Vec::new();
         for run in candidate_open_runs {
+            // While any worker holds a live execution lease on this run, that
+            // worker owns the outcome: a supervising task lead may still
+            // salvage a transiently failed child (observed live: the lead
+            // re-completed a research task seconds after its child attempt
+            // failed). Reconciliation is for orphaned runs; it must not race
+            // a live lead, so it defers until every lease is gone.
+            if self.state.goal_run_has_live_attempt(&run.id).await? {
+                open_runs.push(run);
+                continue;
+            }
             let run_tasks = self.state.get_tasks_for_goal_run(&run.id).await?;
             if let Some(status) = scheduled_run_reconciliation_status(&run, &run_tasks) {
                 self.state

@@ -1668,6 +1668,13 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Whether any worker still holds an unexpired execution lease on an
+    /// attempt belonging to this goal run. While one does, that worker owns
+    /// the run's outcome; lifecycle reconciliation must not race it.
+    async fn goal_run_has_live_attempt(&self, _run_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn append_task_journal(&self, _entry: &super::TaskJournalEntry) -> anyhow::Result<()> {
         Ok(())
     }

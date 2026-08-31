@@ -1495,17 +1495,10 @@ mod tests {
         assert_eq!(snapshot["complete"], true);
         assert_eq!(snapshot["objectives"][0]["schedule_state"], "active");
         assert_eq!(snapshot["objectives"][0]["latest_run"]["status"], "blocked");
-        // A goal without a mandate answers the control question explicitly:
-        // absent with zero measurements, never a missing key an audit must
-        // interpret as "unknown".
-        assert_eq!(
-            snapshot["objectives"][0]["objective_control"]["mandate_status"],
-            "absent"
-        );
-        assert_eq!(
-            snapshot["objectives"][0]["objective_control"]["measurement_count"],
-            0
-        );
+        // A goal without a mandate answers the control question with the
+        // literal "absent" — a populated object here reads as control being
+        // present (observed in R47), so absence must not have a shape.
+        assert_eq!(snapshot["objectives"][0]["objective_control"], "absent");
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));
