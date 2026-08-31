@@ -1915,23 +1915,42 @@ pub trait PromptSnapshotStore: Send + Sync {
 
 /// Focused persistence contract used by goal-trace tooling.
 pub trait GoalTraceStore:
-    GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore
+    GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore + ScheduledRunStore
 {
 }
 
 impl<T> GoalTraceStore for T where
-    T: GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore
+    T: GoalStore
+        + GoalScheduleStore
+        + MandateStore
+        + TaskStore
+        + WorkCoordinationStore
+        + ScheduledRunStore
 {
 }
 
-/// Focused persistence contract used by mandate management.
+/// Focused persistence contract used by mandate management. Includes the
+/// schedule and scheduled-run lifecycle so the mandate surface can project
+/// its controller goal's authoritative objective status.
 pub trait MandateToolStore:
-    MandateStore + GoalStore + WorkCoordinationStore + SessionChannelStore + GoalBudgetStore
+    MandateStore
+    + GoalStore
+    + WorkCoordinationStore
+    + SessionChannelStore
+    + GoalBudgetStore
+    + GoalScheduleStore
+    + ScheduledRunStore
 {
 }
 
 impl<T> MandateToolStore for T where
-    T: MandateStore + GoalStore + WorkCoordinationStore + SessionChannelStore + GoalBudgetStore
+    T: MandateStore
+        + GoalStore
+        + WorkCoordinationStore
+        + SessionChannelStore
+        + GoalBudgetStore
+        + GoalScheduleStore
+        + ScheduledRunStore
 {
 }
 

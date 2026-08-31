@@ -850,6 +850,26 @@ impl ManageMandatesTool {
                 mandate.authority.max_mutating_actions_per_cycle,
                 mandate.authority.max_mutating_actions_per_rolling_24h
             ));
+            // The mandate's controller goal carries the objective's live
+            // lifecycle (schedule, latest run, recovery). Project the shared
+            // authoritative readout here so an owner audit that consults the
+            // mandate surface sees the same typed answer as
+            // `scheduled_goal_runs` instead of reporting "unknown".
+            let schedules = self.state.get_schedules_for_goal(&mandate.goal_id).await?;
+            let runs = self.state.get_goal_runs(&mandate.goal_id).await?;
+            let recovery = self
+                .state
+                .get_scheduled_recovery_state(&mandate.goal_id)
+                .await?;
+            let status = crate::tools::objective_status::objective_status(
+                &schedules,
+                &runs,
+                recovery.as_ref(),
+            );
+            output.push_str(&format!(
+                "  objective status: {}\n",
+                crate::tools::objective_status::render_objective_status_line(&status)
+            ));
         }
         Ok(output)
     }
@@ -2961,6 +2981,91 @@ mod tests {
     use super::*;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
+
+    #[tokio::test]
+    async fn mandate_list_projects_the_objective_lifecycle_readout() {
+        // An owner audit that consults the mandate surface must see the same
+        // authoritative schedule/run/recovery answer as scheduled_goal_runs,
+        // not report the objective "unknown".
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Publish the synthetic daily report",
+            "owner-session",
+            None,
+            None,
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Publish the synthetic daily report",
+            "owner-session",
+            MandateAuthority::default(),
+            3_600,
+            21_600,
+            10_800,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = crate::traits::GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: "2026-09-01T10:00:00+00:00".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+        let run = state
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        assert!(state
+            .finish_goal_run(
+                &run.id,
+                "completed",
+                Some("Published and verified the post.")
+            )
+            .await
+            .unwrap());
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let output = tool
+            .call(
+                &json!({
+                    "action": "list",
+                    "_session_id": "owner-session",
+                    "_user_role": "Owner",
+                    "_channel_visibility": "private",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.contains("objective status: schedule active"),
+            "{output}"
+        );
+        assert!(output.contains("last run completed"), "{output}");
+        assert!(
+            output.contains("Published and verified the post."),
+            "{output}"
+        );
+        assert!(
+            output.contains("run history 1 completed / 0 failed"),
+            "{output}"
+        );
+    }
 
     #[test]
     fn confirmation_access_summary_translates_scopes_without_leaking_adapter_json() {

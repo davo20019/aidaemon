@@ -18,6 +18,7 @@ mod manage_mandates;
 mod manage_memories;
 mod manage_people;
 pub(crate) mod memory;
+pub(crate) mod objective_status;
 mod policy_metrics;
 pub mod result_spill;
 pub mod sanitize;

@@ -217,6 +217,26 @@ impl GoalTraceTool {
             out.push_str(&format!("- Task status mix: {}\n", status_str));
         }
 
+        // Shared authoritative lifecycle readout: the same schedule/run/
+        // recovery answer every other objective surface projects, so an
+        // audit consulting the trace lane sees identical typed state.
+        {
+            let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+            let runs = self.state.get_goal_runs(&goal.id).await?;
+            let recovery = self.state.get_scheduled_recovery_state(&goal.id).await?;
+            if !schedules.is_empty() || !runs.is_empty() || recovery.is_some() {
+                let status = crate::tools::objective_status::objective_status(
+                    &schedules,
+                    &runs,
+                    recovery.as_ref(),
+                );
+                out.push_str(&format!(
+                    "- Objective status: {}\n",
+                    crate::tools::objective_status::render_objective_status_line(&status)
+                ));
+            }
+        }
+
         if let Some(mandate) = self.state.get_mandate_for_goal(&goal.id).await? {
             let today = chrono::Utc::now().date_naive().to_string();
             let used_today = if goal.tokens_used_day == today {

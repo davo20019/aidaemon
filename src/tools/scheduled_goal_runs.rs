@@ -456,10 +456,35 @@ impl ScheduledGoalRunsTool {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 });
+            // Terminal run history is the objective's measurement record:
+            // an audit asking "is progress measured?" reads these counts and
+            // the latest outcome directly instead of inferring from task rows.
+            let runs = self.state.get_goal_runs(&goal.id).await?;
+            let runs_completed = runs.iter().filter(|run| run.status == "completed").count();
+            let runs_failed = runs
+                .iter()
+                .filter(|run| matches!(run.status.as_str(), "failed" | "blocked" | "cancelled"))
+                .count();
+            let latest_run_outcome = runs.first().map(|run| {
+                json!({
+                    "status": run.status,
+                    "completed_at": run.completed_at,
+                    "summary": run
+                        .outcome_summary
+                        .as_deref()
+                        .map(|summary| Self::truncate(summary, 200)),
+                })
+            });
             let mut record = json!({
                 "objective": Self::truncate(&goal.description, 240),
                 "goal_status": goal.status,
                 "workspace_binding": workspace_binding,
+                "run_history": {
+                    "completed": runs_completed,
+                    "failed": runs_failed,
+                    "total": runs.len(),
+                },
+                "latest_run_outcome": latest_run_outcome,
                 "schedule_count": schedules.len(),
                 "active_schedule_count": active_schedule_count,
                 "schedule_state": if schedules.is_empty() {
