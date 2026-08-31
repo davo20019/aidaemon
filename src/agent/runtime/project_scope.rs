@@ -467,6 +467,17 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
     }
 }
 
+/// A workspace the goal was explicitly bound to (`context.project_scope`,
+/// written by `scheduled_goal_runs bind_workspace` or an earlier recovery).
+/// Typed durable state: it must be an existing absolute directory. This
+/// binding outranks anything inferred from mission or request text.
+pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
+    let scope = value.get("project_scope")?.as_str()?.trim();
+    let path = std::path::Path::new(scope);
+    (path.is_absolute() && path.is_dir()).then(|| scope.to_string())
+}
+
 pub(super) fn resolve_primary_project_scope(
     extracted_primary_scope: Option<String>,
     inherited_project_scope: Option<&str>,

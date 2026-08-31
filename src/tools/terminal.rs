@@ -3425,7 +3425,11 @@ fn build_background_reengagement_followup(command_summary: &str, output: &str) -
          Continue the exact parent request identified by the attached runtime \
          continuation edge. Treat the linked terminal receipt as authoritative \
          evidence for that invocation and complete only obligations retained by \
-         that parent request."
+         that parent request. Do NOT call the terminal again to re-run or \
+         re-check this command: its completion receipt is already recorded and \
+         credited, and a redundant check counts as an extra tool call against \
+         the user's request. When reporting how many calls the request used, \
+         count only the original invocation."
     )
 }
 

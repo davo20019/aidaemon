@@ -1208,7 +1208,14 @@ impl EventStore {
             "persisted tool claim does not match kernel admission input"
         );
 
-        let mut tx = self.pool.begin().await?;
+        // This transaction reads the task's event stream before writing the
+        // claim. Under WAL, a deferred BEGIN that reads first is aborted with
+        // SQLITE_BUSY — bypassing busy_timeout — when any writer commits
+        // between the read and the write, which turned routine telemetry
+        // contention into fatal "database is locked" tool failures. Take the
+        // write lock up front so the read+admission+insert serializes behind
+        // competing writers instead of losing its snapshot.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query(
             r#"
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
@@ -4826,6 +4833,83 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn durable_tool_claim_waits_for_a_wal_writer_instead_of_losing_its_snapshot() {
+        // The admission transaction reads the task's event stream before
+        // inserting the claim. Under WAL, a deferred BEGIN that reads first
+        // aborts with SQLITE_BUSY (bypassing busy_timeout) if any writer
+        // commits between the read and the write — which converted routine
+        // telemetry contention into "database is locked" tool failures and
+        // blocked goal runs. The claim must take the write lock up front and
+        // wait for the competing writer instead.
+        let (store, _database) = setup_store().await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        // Seed an unrelated event so the admission SELECT has rows to read.
+        store
+            .append(Event::new(
+                "session-wal",
+                EventType::UserMessage,
+                json!({"content": "seed", "task_id": "task-wal"}),
+            ))
+            .await
+            .unwrap();
+
+        let mut competing_writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('session-other', 'user_message', '{}', datetime('now'))",
+        )
+        .execute(&mut *competing_writer)
+        .await
+        .unwrap();
+
+        let store = Arc::new(store);
+        let claim_store = store.clone();
+        let admitted = tokio::spawn(async move {
+            let claim = crate::events::TaskKernelOperationClaim {
+                operation_id: "call-wal".to_string(),
+                stable_operation_key: "stable-wal".to_string(),
+                tool_name: "terminal".to_string(),
+                obligation_ids: Vec::new(),
+                max_attempts: 1,
+                max_invocations: 1,
+                idempotency_key: None,
+                operation_lineage: None,
+            };
+            let call = ToolCallData::from_tool_call(
+                "call-wal",
+                "terminal",
+                json!({"command": "synthetic"}),
+                Some("task-wal".to_string()),
+            )
+            .with_kernel_claim("stable-wal", Vec::new(), 1, 1);
+            claim_store
+                .admit_and_append_tool_call(
+                    Event::new(
+                        "session-wal",
+                        EventType::ToolCall,
+                        serde_json::to_value(call).unwrap(),
+                    ),
+                    &claim,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        competing_writer.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), admitted)
+            .await
+            .expect("claim should resume after the competing writer commits")
+            .unwrap()
+            .expect("claim must persist instead of failing with 'database is locked'");
+        assert_eq!(outcome.1, crate::events::TaskKernelAdmission::Admitted);
     }
 
     #[tokio::test]

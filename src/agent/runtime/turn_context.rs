@@ -458,18 +458,47 @@ impl Agent {
         // The project-root preference is only appropriate for history scopes
         // where we want to pick the most likely intended project among stale
         // references.
-        let primary_project_scope = resolve_primary_project_scope(
-            unify_current_turn_scopes(&current_project_scopes)
-                .or_else(|| choose_primary_project_scope(&project_scopes)),
-            self.inherited_project_scope.as_deref(),
-            allow_multi_project_scope,
-            allow_scope_carryover,
-        );
-        let authorized_project_scopes = if current_project_scopes.is_empty() {
-            primary_project_scope.iter().cloned().collect()
+        // A typed durable workspace binding on this agent's own goal
+        // (`scheduled_goal_runs bind_workspace` → goal.context.project_scope)
+        // is the authoritative scope for that goal's workers. Mission text
+        // routinely names other repositories, hostnames containing a sibling
+        // project's name, or instruction-relative paths like
+        // `src/content/posts`; extracted scopes from such text must not steal
+        // a scheduled objective's workspace. Executors keep their provisioned
+        // attempt workspace. The binding is re-read from the store each turn,
+        // so a bind issued mid-run takes effect on the following turn.
+        let bound_goal_scope = if self.role() == crate::traits::AgentRole::Executor {
+            None
+        } else if let Some(goal_id) = self.goal_id.as_deref() {
+            self.state
+                .get_goal(goal_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|goal| {
+                    super::project_scope::bound_workspace_from_goal_context(goal.context.as_deref())
+                })
         } else {
-            current_project_scopes.clone()
+            None
         };
+        let primary_project_scope = bound_goal_scope.clone().or_else(|| {
+            resolve_primary_project_scope(
+                unify_current_turn_scopes(&current_project_scopes)
+                    .or_else(|| choose_primary_project_scope(&project_scopes)),
+                self.inherited_project_scope.as_deref(),
+                allow_multi_project_scope,
+                allow_scope_carryover,
+            )
+        });
+        // Under a binding, text-extracted paths outside the bound workspace
+        // are not authorized: the binding is the objective's authority
+        // boundary.
+        let authorized_project_scopes =
+            if bound_goal_scope.is_some() || current_project_scopes.is_empty() {
+                primary_project_scope.iter().cloned().collect()
+            } else {
+                current_project_scopes.clone()
+            };
         let contract_text = continuation_request_anchor.unwrap_or(&goal_user_text);
         let mut completion_contract =
             infer_structural_completion_contract(contract_text, &self.path_aliases.projects);
@@ -1380,6 +1409,70 @@ mod tests {
                     })
         }));
     }
+    #[tokio::test]
+    async fn bound_goal_workspace_beats_mission_text_scope_extraction() {
+        use crate::testing::{setup_test_agent_root, MockProvider};
+        use crate::traits::store_prelude::*;
+
+        // Root-mode agent: the binding applies to non-executor roles (the
+        // task lead and direct runs); executors keep their provisioned
+        // attempt workspace.
+        let mut harness = setup_test_agent_root(MockProvider::new())
+            .await
+            .expect("test harness");
+        let workspace = tempfile::tempdir().expect("bound workspace");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let mut goal = crate::traits::Goal::new_finite("Manage the blog daily", "test-session");
+        goal.context = Some(
+            serde_json::json!({
+                "project_scope": workspace_path,
+                "project_scope_bound_at": "2026-08-27T00:00:00Z",
+            })
+            .to_string(),
+        );
+        harness.state.create_goal(&goal).await.expect("create goal");
+        harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+        // The mission text explicitly names an unrelated repository path (the
+        // classic failure: instructions mention `src/content/posts` and a
+        // hostname containing another project's name). The typed durable
+        // workspace binding must win over anything extracted from text.
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                "Each day manage the blog at https://blog.acme-daemon.dev/. Create the \
+                 post in /Users/alice/projects/acme-daemon/src/content/posts, then build \
+                 and deploy with the documented workflow.",
+            )
+            .await;
+
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(workspace_path.as_str()),
+            "typed goal workspace binding must be the authoritative scope"
+        );
+        assert_eq!(
+            turn_context.authorized_project_scopes,
+            vec![workspace_path.clone()],
+            "text-extracted paths outside the binding are not authorized"
+        );
+
+        // Without a binding, text extraction keeps working as before.
+        harness.agent.set_test_goal_id(None);
+        let unbound = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                "Create the post in /Users/alice/projects/acme-daemon/src/content/posts.",
+            )
+            .await;
+        assert_eq!(
+            unbound.primary_project_scope.as_deref(),
+            Some("/Users/alice/projects/acme-daemon/src/content/posts"),
+        );
+    }
+
     #[tokio::test]
     async fn new_task_context_excludes_unrelated_parent_messages() {
         use crate::testing::{setup_test_agent, MockProvider};

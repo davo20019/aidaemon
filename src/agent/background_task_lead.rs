@@ -88,10 +88,7 @@ fn effective_alias_roots(configured: &[String]) -> Vec<String> {
 /// typed durable state written by `scheduled_goal_runs bind_workspace` or an
 /// earlier recovery; it must be an existing absolute directory.
 fn bound_project_scope_from_context(context: Option<&str>) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
-    let scope = value.get("project_scope")?.as_str()?.trim();
-    let path = std::path::Path::new(scope);
-    (path.is_absolute() && path.is_dir()).then(|| scope.to_string())
+    super::project_scope::bound_workspace_from_goal_context(context)
 }
 
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
