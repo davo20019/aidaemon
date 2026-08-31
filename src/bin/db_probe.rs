@@ -1132,6 +1132,100 @@ async fn main() -> anyhow::Result<()> {
         println!("Reset automatic recovery attempts for escalated goal {goal_id}.");
         return Ok(());
     }
+
+    if let Some(goal_id) = args
+        .windows(2)
+        .find(|w| w[0] == "--heal-verified-recovery")
+        .map(|w| w[1].clone())
+    {
+        // Operator action: apply the verified-recovery success bookkeeping for
+        // a goal whose LATEST recovery run durably completed but was
+        // miscounted (for example by a proof-recognition defect fixed after
+        // the fact): mark the objective healthy, credit the run, resume only
+        // the schedules the recovery state machine paused, and move a stale
+        // next occurrence to the genuine next cron time so the resume cannot
+        // immediately coalesce-fire a duplicate run. Fails closed unless that
+        // latest recovery run is `completed`.
+        let latest: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM goal_runs
+              WHERE goal_id = ? AND trigger_type = 'recovery'
+              ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&goal_id)
+        .fetch_optional(&pool)
+        .await?;
+        let Some((run_id, status)) = latest else {
+            anyhow::bail!("goal has no recovery runs");
+        };
+        anyhow::ensure!(
+            status == "completed",
+            "latest recovery run {run_id} is '{status}', not completed"
+        );
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let healed = sqlx::query(
+            "UPDATE scheduled_recovery_state
+                SET consecutive_failures = 0,
+                    disposition = 'healthy',
+                    latest_failure_kind = NULL,
+                    last_recovery_run_id = ?,
+                    updated_at = datetime('now')
+              WHERE goal_id = ?",
+        )
+        .bind(&run_id)
+        .bind(&goal_id)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            healed.rows_affected() == 1,
+            "goal has no scheduled recovery state"
+        );
+        sqlx::query(
+            "UPDATE goal_run_recovery_links SET outcome_status = 'verified'
+              WHERE recovery_run_id = ? AND outcome_status <> 'verified'",
+        )
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await?;
+        let paused: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.id, s.cron_expr FROM goal_schedules s
+              JOIN scheduled_recovery_paused_schedules p ON p.schedule_id = s.id
+             WHERE p.goal_id = ?",
+        )
+        .bind(&goal_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (schedule_id, cron_expr) in &paused {
+            let cron: croner::Cron = cron_expr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("cron '{cron_expr}' did not parse: {e}"))?;
+            let next = cron
+                .find_next_occurrence(&chrono::Local::now(), false)
+                .map_err(|e| anyhow::anyhow!("no next occurrence for '{cron_expr}': {e}"))?
+                .with_timezone(&chrono::Utc);
+            sqlx::query(
+                "UPDATE goal_schedules
+                    SET is_paused = 0, next_run_at = ?, updated_at = datetime('now')
+                  WHERE id = ?",
+            )
+            .bind(next.to_rfc3339())
+            .bind(schedule_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM scheduled_recovery_paused_schedules WHERE goal_id = ?")
+            .bind(&goal_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        println!(
+            "Healed verified recovery for goal {goal_id}: run {run_id} credited; {} schedule(s) resumed.",
+            paused.len()
+        );
+        for (schedule_id, cron_expr) in &paused {
+            println!("  schedule {schedule_id} ({cron_expr}) resumed at its next cron occurrence.");
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--goals") {
         print_scheduled_goal_state(&pool).await?;
         return Ok(());
