@@ -3418,10 +3418,22 @@ async fn run_background_continuation_with_timeout(
 /// file when done" would otherwise be silently dropped, since the model would
 /// just summarize the output instead of completing the requested action.
 fn build_background_reengagement_followup(command_summary: &str, output: &str) -> String {
+    // The typed lifecycle facts below are invariants of this code path: a
+    // continuation only exists because the launching turn handed off
+    // nonterminally, the invocation's receipt recorded it as backgrounded,
+    // and its completion output was queued for delivery through this very
+    // continuation. Stating them here makes the lifecycle readable instead
+    // of something the model must reconstruct from prose — with identical
+    // contexts the self-reported lifecycle used to flip between typed values
+    // and "unknown" across runs.
     format!(
         "[Background command completed]\n\
          Command: `{command_summary}`\n\
          Output:\n{output}\n\n\
+         Typed invocation lifecycle (authoritative, from the durable receipt): \
+         the launching turn ended in a nonterminal background handoff; the \
+         invocation's terminal result is recorded as backgrounded; its \
+         completion output was queued for delivery through this continuation.\n\n\
          Continue the exact parent request identified by the attached runtime \
          continuation edge. Treat the linked terminal receipt as authoritative \
          evidence for that invocation and complete only obligations retained by \
@@ -9718,6 +9730,21 @@ mod tests {
         assert!(
             followup.contains("python3 /tmp/ping_latency.py"),
             "follow-up must include the command: {followup}"
+        );
+        // The self-reported lifecycle flapped between typed values and
+        // "unknown" across identical contexts; the continuation must state
+        // the typed facts so the model reads them instead of guessing.
+        assert!(
+            followup.contains("nonterminal background handoff"),
+            "follow-up must state the typed handoff disposition: {followup}"
+        );
+        assert!(
+            followup.contains("recorded as backgrounded"),
+            "follow-up must state the typed terminal result: {followup}"
+        );
+        assert!(
+            followup.contains("queued for delivery through this continuation"),
+            "follow-up must state the typed delivery state: {followup}"
         );
     }
 

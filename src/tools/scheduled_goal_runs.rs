@@ -517,6 +517,11 @@ impl ScheduledGoalRunsTool {
             );
             record["objective_control"] =
                 crate::tools::objective_status::objective_control_json(control.as_ref());
+            // The recorded-measurement count is a plain fact independent of
+            // whether a control loop exists (zero without a mandate), so it
+            // stays readable even when objective_control is the bare
+            // "absent" scalar.
+            record["objective_measurement_count"] = json!(measurement_count);
             // The failure budget and recovery disposition are part of the
             // objective's current state, not a diagnostic detail: a paused
             // schedule with an escalated budget explains a missing next run.
@@ -1499,6 +1504,7 @@ mod tests {
         // literal "absent" — a populated object here reads as control being
         // present (observed in R47), so absence must not have a shape.
         assert_eq!(snapshot["objectives"][0]["objective_control"], "absent");
+        assert_eq!(snapshot["objectives"][0]["objective_measurement_count"], 0);
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));
@@ -1592,6 +1598,10 @@ mod tests {
         assert_eq!(
             control["delegated_identities"],
             serde_json::json!(["auth_profile:twitter", "account:12345"])
+        );
+        assert_eq!(
+            snapshot["objectives"][0]["objective_measurement_count"],
+            control["measurement_count"]
         );
     }
 
