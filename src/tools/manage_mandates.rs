@@ -861,10 +861,17 @@ impl ManageMandatesTool {
                 .state
                 .get_scheduled_recovery_state(&mandate.goal_id)
                 .await?;
+            let measurement_count = self
+                .state
+                .list_mandate_objective_measurements(&mandate.id, 500)
+                .await?
+                .len();
             let status = crate::tools::objective_status::objective_status(
                 &schedules,
                 &runs,
                 recovery.as_ref(),
+                Some(&mandate),
+                measurement_count,
             );
             output.push_str(&format!(
                 "  objective status: {}\n",
@@ -3063,6 +3070,15 @@ mod tests {
         );
         assert!(
             output.contains("run history 1 completed / 0 failed"),
+            "{output}"
+        );
+        // The same line answers the delegation/control question with typed
+        // state: this mandate has no owner-confirmed metric loop, no
+        // delegated account identities, and no recorded measurements.
+        assert!(
+            output.contains(
+                "control active (bounded; no metric loop; no delegated account; 0 measurements)"
+            ),
             "{output}"
         );
     }

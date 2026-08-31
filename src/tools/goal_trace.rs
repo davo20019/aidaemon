@@ -218,17 +218,29 @@ impl GoalTraceTool {
         }
 
         // Shared authoritative lifecycle readout: the same schedule/run/
-        // recovery answer every other objective surface projects, so an
-        // audit consulting the trace lane sees identical typed state.
+        // recovery/control answer every other objective surface projects, so
+        // an audit consulting the trace lane sees identical typed state.
+        let mandate = self.state.get_mandate_for_goal(&goal.id).await?;
         {
             let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
             let runs = self.state.get_goal_runs(&goal.id).await?;
             let recovery = self.state.get_scheduled_recovery_state(&goal.id).await?;
-            if !schedules.is_empty() || !runs.is_empty() || recovery.is_some() {
+            if !schedules.is_empty() || !runs.is_empty() || recovery.is_some() || mandate.is_some()
+            {
+                let measurement_count = match mandate.as_ref() {
+                    Some(mandate) => self
+                        .state
+                        .list_mandate_objective_measurements(&mandate.id, 500)
+                        .await?
+                        .len(),
+                    None => 0,
+                };
                 let status = crate::tools::objective_status::objective_status(
                     &schedules,
                     &runs,
                     recovery.as_ref(),
+                    mandate.as_ref(),
+                    measurement_count,
                 );
                 out.push_str(&format!(
                     "- Objective status: {}\n",
@@ -237,7 +249,7 @@ impl GoalTraceTool {
             }
         }
 
-        if let Some(mandate) = self.state.get_mandate_for_goal(&goal.id).await? {
+        if let Some(mandate) = mandate {
             let today = chrono::Utc::now().date_naive().to_string();
             let used_today = if goal.tokens_used_day == today {
                 goal.tokens_used_today.max(0)

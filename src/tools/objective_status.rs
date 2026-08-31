@@ -21,6 +21,76 @@ pub(crate) struct ObjectiveStatus {
     /// Terminal run history counts (bounded by the store's returned window).
     pub runs_completed: usize,
     pub runs_failed: usize,
+    /// Delegated control-loop facet; `None` means no mandate governs this
+    /// goal, which every surface must render as an explicit "control absent"
+    /// rather than leaving the question unanswerable.
+    pub control: Option<ObjectiveControlFacet>,
+}
+
+/// Typed delegation/control readout for one goal-backed objective, derived
+/// from the goal's mandate row and its recorded objective measurements.
+pub(crate) struct ObjectiveControlFacet {
+    pub mandate_status: String,
+    pub autonomy_mode: String,
+    /// Owner-confirmed control-loop metric, when the mandate has one.
+    pub metric_name: Option<String>,
+    pub measurement_count: usize,
+    /// Distinct `account:` / `auth_profile:` identities from the mandate's
+    /// authority scopes: the typed answer to "which owned account and
+    /// credentials is this objective delegated to?".
+    pub delegated_identities: Vec<String>,
+}
+
+/// Project the goal's mandate row into the control facet. `None` in means no
+/// mandate exists for the goal; measurement rows without a mandate cannot
+/// exist, so the absent case always carries zero measurements.
+pub(crate) fn objective_control_facet(
+    mandate: Option<&crate::traits::Mandate>,
+    measurement_count: usize,
+) -> Option<ObjectiveControlFacet> {
+    mandate.map(|mandate| {
+        let mut delegated_identities = Vec::new();
+        for scope in &mandate.authority.operation_scopes {
+            for prefix in &scope.target_prefixes {
+                if (prefix.starts_with("account:") || prefix.starts_with("auth_profile:"))
+                    && !delegated_identities.contains(prefix)
+                {
+                    delegated_identities.push(prefix.clone());
+                }
+            }
+        }
+        ObjectiveControlFacet {
+            mandate_status: mandate.status.to_string(),
+            autonomy_mode: mandate.autonomy_mode.to_string(),
+            metric_name: mandate
+                .objective_control
+                .as_ref()
+                .map(|control| control.metric_name.clone()),
+            measurement_count,
+            delegated_identities,
+        }
+    })
+}
+
+/// The control facet as a typed JSON object for structured surfaces. The
+/// absent case is an explicit value, never a missing key, so an audit can
+/// distinguish "no mandate" from "not inspected".
+pub(crate) fn objective_control_json(control: Option<&ObjectiveControlFacet>) -> serde_json::Value {
+    match control {
+        Some(facet) => serde_json::json!({
+            "mandate_status": facet.mandate_status,
+            "autonomy_mode": facet.autonomy_mode,
+            "metric": facet.metric_name,
+            "measurement_count": facet.measurement_count,
+            "delegated_identities": facet.delegated_identities,
+        }),
+        None => serde_json::json!({
+            "mandate_status": "absent",
+            "metric": serde_json::Value::Null,
+            "measurement_count": 0,
+            "delegated_identities": [],
+        }),
+    }
 }
 
 /// Aggregate the typed rows into the snapshot. Pure so every surface —
@@ -30,6 +100,8 @@ pub(crate) fn objective_status(
     schedules: &[crate::traits::GoalSchedule],
     runs: &[crate::traits::GoalRun],
     recovery: Option<&crate::traits::ScheduledRecoveryState>,
+    mandate: Option<&crate::traits::Mandate>,
+    measurement_count: usize,
 ) -> ObjectiveStatus {
     let active_count = schedules
         .iter()
@@ -75,6 +147,7 @@ pub(crate) fn objective_status(
         recovery,
         runs_completed,
         runs_failed,
+        control: objective_control_facet(mandate, measurement_count),
     }
 }
 
@@ -106,6 +179,31 @@ pub(crate) fn render_objective_status_line(status: &ObjectiveStatus) -> String {
         "; run history {} completed / {} failed",
         status.runs_completed, status.runs_failed
     ));
+    match &status.control {
+        Some(control) => {
+            let metric = control
+                .metric_name
+                .as_deref()
+                .map(|name| format!("metric {name}"))
+                .unwrap_or_else(|| "no metric loop".to_string());
+            let identities = if control.delegated_identities.is_empty() {
+                "no delegated account".to_string()
+            } else {
+                format!("delegated to {}", control.delegated_identities.join(", "))
+            };
+            line.push_str(&format!(
+                "; control {} ({}; {}; {}; {} measurements)",
+                control.mandate_status,
+                control.autonomy_mode,
+                metric,
+                identities,
+                control.measurement_count
+            ));
+        }
+        None => line.push_str(
+            "; control absent (no mandate; no delegated account or credentials; 0 measurements)",
+        ),
+    }
     line
 }
 
@@ -154,7 +252,7 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();
         let recovery = state.get_scheduled_recovery_state(&goal.id).await.unwrap();
-        let status = objective_status(&schedules, &runs, recovery.as_ref());
+        let status = objective_status(&schedules, &runs, recovery.as_ref(), None, 0);
         assert_eq!(status.schedule_state, "active");
         assert_eq!(
             status.next_run_at.as_deref(),
@@ -174,6 +272,16 @@ mod tests {
         assert!(line.contains("last run completed"));
         assert!(line.contains("Published and verified the daily post."));
         assert!(line.contains("run history 1 completed / 0 failed"));
+        // Without a mandate the control question still has a typed answer:
+        // explicitly absent with zero measurements, never silently missing.
+        assert!(status.control.is_none());
+        assert!(line.contains(
+            "control absent (no mandate; no delegated account or credentials; 0 measurements)"
+        ));
+        let control_json = objective_control_json(None);
+        assert_eq!(control_json["mandate_status"], "absent");
+        assert_eq!(control_json["measurement_count"], 0);
+        assert_eq!(control_json["delegated_identities"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -212,7 +320,7 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();
         let recovery = state.get_scheduled_recovery_state(&goal.id).await.unwrap();
-        let status = objective_status(&schedules, &runs, recovery.as_ref());
+        let status = objective_status(&schedules, &runs, recovery.as_ref(), None, 0);
         assert_eq!(status.schedule_state, "paused");
         assert_eq!(status.next_run_at, None);
         let (disposition, failures, _) = status.recovery.unwrap();
@@ -222,5 +330,102 @@ mod tests {
         let line = render_objective_status_line(&status);
         assert!(line.contains("schedule paused"));
         assert!(line.contains("recovery escalated (3/3 failures)"));
+    }
+
+    #[tokio::test]
+    async fn objective_status_projects_mandate_control_loop_and_measurements() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = Goal::new_continuous("publish synthetic report", "session-a", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let authority = crate::traits::MandateAuthority::from_operation_scopes(
+            true,
+            serde_json::from_value(serde_json::json!([
+                {
+                    "tool": "http_request",
+                    "operation": "POST",
+                    "kind": "mutation",
+                    "target_prefixes": [
+                        "https://api.x.com/2/tweets",
+                        "auth_profile:twitter",
+                        "account:12345"
+                    ],
+                    "mutation_effects": ["remote_mutation", "external_delivery"]
+                }
+            ]))
+            .unwrap(),
+            1,
+            4,
+            900,
+        );
+        let mut mandate = crate::traits::Mandate::new(
+            &goal.id,
+            None,
+            "publish synthetic report",
+            "session-a",
+            authority,
+            3_600,
+            21_600,
+            10_800,
+        );
+        mandate.objective_control = Some(crate::traits::MandateObjectiveControl {
+            schema_version: crate::traits::MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "daily_visits".to_string(),
+            unit: "visits".to_string(),
+            baseline_micros: 0,
+            target_micros: 1_000_000,
+            direction: crate::traits::ObjectiveMetricDirection::AtLeast,
+            measurement_source: "https://analytics.example.com/api".to_string(),
+            measurement_cadence_secs: 7_200,
+            experiment_cohort: "cohort-a".to_string(),
+            experiment_window_secs: 604_800,
+            minimum_effect_micros: 1,
+            max_stagnant_measurements: 5,
+            run_failure_budget: 3,
+            baseline_observed_at: chrono::Utc::now().to_rfc3339(),
+        });
+
+        let status = objective_status(&[], &[], None, Some(&mandate), 3);
+        let control = status.control.as_ref().unwrap();
+        assert_eq!(control.mandate_status, "active");
+        assert_eq!(control.autonomy_mode, "bounded");
+        assert_eq!(control.metric_name.as_deref(), Some("daily_visits"));
+        assert_eq!(control.measurement_count, 3);
+        assert_eq!(
+            control.delegated_identities,
+            vec![
+                "auth_profile:twitter".to_string(),
+                "account:12345".to_string()
+            ]
+        );
+
+        let line = render_objective_status_line(&status);
+        assert!(
+            line.contains(
+                "control active (bounded; metric daily_visits; delegated to auth_profile:twitter, account:12345; 3 measurements)"
+            ),
+            "{line}"
+        );
+        let json = objective_control_json(status.control.as_ref());
+        assert_eq!(json["mandate_status"], "active");
+        assert_eq!(json["metric"], "daily_visits");
+        assert_eq!(json["measurement_count"], 3);
+        assert_eq!(
+            json["delegated_identities"],
+            serde_json::json!(["auth_profile:twitter", "account:12345"])
+        );
+
+        // A mandate without an owner-confirmed metric loop still projects a
+        // typed answer rather than an unknown.
+        mandate.objective_control = None;
+        mandate.authority.operation_scopes.clear();
+        let status = objective_status(&[], &[], None, Some(&mandate), 0);
+        let line = render_objective_status_line(&status);
+        assert!(
+            line.contains(
+                "control active (bounded; no metric loop; no delegated account; 0 measurements)"
+            ),
+            "{line}"
+        );
     }
 }

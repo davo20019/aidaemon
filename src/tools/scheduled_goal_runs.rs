@@ -498,6 +498,25 @@ impl ScheduledGoalRunsTool {
                 "last_run_at": last_run_at,
                 "latest_run": latest_run,
             });
+            // The delegation/control answer is typed state with an explicit
+            // absent value: an audit asking "does anything control this
+            // objective, and is it measured?" reads this object instead of
+            // reporting the question unanswerable from this surface.
+            let mandate = self.state.get_mandate_for_goal(&goal.id).await?;
+            let measurement_count = match mandate.as_ref() {
+                Some(mandate) => self
+                    .state
+                    .list_mandate_objective_measurements(&mandate.id, 500)
+                    .await?
+                    .len(),
+                None => 0,
+            };
+            let control = crate::tools::objective_status::objective_control_facet(
+                mandate.as_ref(),
+                measurement_count,
+            );
+            record["objective_control"] =
+                crate::tools::objective_status::objective_control_json(control.as_ref());
             // The failure budget and recovery disposition are part of the
             // objective's current state, not a diagnostic detail: a paused
             // schedule with an escalated budget explains a missing next run.
@@ -1476,9 +1495,111 @@ mod tests {
         assert_eq!(snapshot["complete"], true);
         assert_eq!(snapshot["objectives"][0]["schedule_state"], "active");
         assert_eq!(snapshot["objectives"][0]["latest_run"]["status"], "blocked");
+        // A goal without a mandate answers the control question explicitly:
+        // absent with zero measurements, never a missing key an audit must
+        // interpret as "unknown".
+        assert_eq!(
+            snapshot["objectives"][0]["objective_control"]["mandate_status"],
+            "absent"
+        );
+        assert_eq!(
+            snapshot["objectives"][0]["objective_control"]["measurement_count"],
+            0
+        );
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));
+    }
+
+    #[tokio::test]
+    async fn overview_projects_typed_objective_control_with_measurements() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+        let goal = Goal::new_continuous(
+            "Publish a synthetic weekly report",
+            "synthetic-session",
+            None,
+            None,
+        );
+        let authority = crate::traits::MandateAuthority::from_operation_scopes(
+            true,
+            serde_json::from_value(serde_json::json!([
+                {
+                    "tool": "http_request",
+                    "operation": "POST",
+                    "kind": "mutation",
+                    "target_prefixes": [
+                        "https://api.x.com/2/tweets",
+                        "auth_profile:twitter",
+                        "account:12345"
+                    ],
+                    "mutation_effects": ["remote_mutation", "external_delivery"]
+                }
+            ]))
+            .unwrap(),
+            1,
+            4,
+            900,
+        );
+        let mut mandate = crate::traits::Mandate::new(
+            &goal.id,
+            None,
+            "Publish a synthetic weekly report",
+            "synthetic-session",
+            authority,
+            3_600,
+            21_600,
+            10_800,
+        );
+        mandate.objective_control = Some(crate::traits::MandateObjectiveControl {
+            schema_version: crate::traits::MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "weekly_visits".to_string(),
+            unit: "visits".to_string(),
+            baseline_micros: 0,
+            target_micros: 1_000_000,
+            direction: crate::traits::ObjectiveMetricDirection::AtLeast,
+            measurement_source: "https://analytics.example.com/api".to_string(),
+            measurement_cadence_secs: 7_200,
+            experiment_cohort: "cohort-a".to_string(),
+            experiment_window_secs: 604_800,
+            minimum_effect_micros: 1,
+            max_stagnant_measurements: 5,
+            run_failure_budget: 3,
+            baseline_observed_at: chrono::Utc::now().to_rfc3339(),
+        });
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 6 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("daily".to_string()),
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let output = tool.call(r#"{"action":"overview"}"#).await.unwrap();
+        let snapshot: Value = serde_json::from_str(&output).unwrap();
+        let control = &snapshot["objectives"][0]["objective_control"];
+        assert_eq!(control["mandate_status"], "active", "{output}");
+        assert_eq!(control["autonomy_mode"], "bounded");
+        assert_eq!(control["metric"], "weekly_visits");
+        assert_eq!(control["measurement_count"], 0);
+        assert_eq!(
+            control["delegated_identities"],
+            serde_json::json!(["auth_profile:twitter", "account:12345"])
+        );
     }
 
     #[tokio::test]

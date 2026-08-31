@@ -1989,6 +1989,7 @@ pub trait ScheduledGoalRunsStore:
     + TaskStore
     + WorkCoordinationStore
     + SettingsStore
+    + MandateStore
 {
 }
 
@@ -2000,6 +2001,7 @@ impl<T> ScheduledGoalRunsStore for T where
         + TaskStore
         + WorkCoordinationStore
         + SettingsStore
+        + MandateStore
 {
 }
 
