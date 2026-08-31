@@ -426,7 +426,12 @@ impl WorkCoordinationStore for SqliteStateStore {
             Some(chrono::Utc::now().to_rfc3339())
         };
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        // Read-then-write transaction: under WAL a deferred BEGIN loses its
+        // snapshot (SQLITE_BUSY_SNAPSHOT, bypassing busy_timeout) when any
+        // writer commits between the read and the write. Take the write lock
+        // up front so lifecycle reconciliation waits instead of failing with
+        // "database is locked" (same shape as the claim/bind fixes).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let run = sqlx::query(
             "SELECT gr.goal_id, gr.status AS prior_status, gr.trigger_type, gr.root_task_id,
                     g.goal_type, g.session_id,
@@ -512,13 +517,31 @@ impl WorkCoordinationStore for SqliteStateStore {
             .fetch_one(&mut *tx)
             .await?
             .clamp(1, 10);
+            // Live receipts carry the AGENT-LOOP task id, which exists
+            // nowhere in the goals-table task graph. The typed edge from the
+            // recovery task to its receipts is the task ATTEMPT: the worker
+            // session bound to the root task's attempt is the session every
+            // one of its tool_result events is recorded under. Match through
+            // both lanes — the direct task-id join stays for flows that emit
+            // goal-task ids — so a genuinely verified recovery is recognized
+            // instead of being recorded as an unproven failure forever.
             let recovery_proof_receipt_ids = if recovery_for_run.is_some() {
                 sqlx::query_scalar::<_, String>(
                     "SELECT json_extract(e.data, '$.tool_call_id') FROM events e
                      JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
-                     WHERE t.goal_run_id = ? AND e.event_type = 'tool_result'
+                     WHERE t.goal_run_id = ?1 AND e.event_type = 'tool_result'
                        AND json_extract(t.context, '$.terminal_recovery') = 1
-                       AND json_extract(t.context, '$.recovery_for_run') = ?
+                       AND json_extract(t.context, '$.recovery_for_run') = ?2
+                       AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
+                       AND json_extract(e.data, '$.receipt.outcome_evidence')
+                           IN ('tool_reported', 'structured_metadata', 'durable_replay')
+                     UNION
+                     SELECT json_extract(e.data, '$.tool_call_id') FROM events e
+                     JOIN task_attempts ta ON ta.worker_instance_id = e.session_id
+                     JOIN tasks t ON t.id = ta.task_id
+                     WHERE t.goal_run_id = ?1 AND e.event_type = 'tool_result'
+                       AND json_extract(t.context, '$.terminal_recovery') = 1
+                       AND json_extract(t.context, '$.recovery_for_run') = ?2
                        AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
                        AND json_extract(e.data, '$.receipt.outcome_evidence')
                            IN ('tool_reported', 'structured_metadata', 'durable_replay')",
@@ -2941,5 +2964,145 @@ mod tests {
                 .unwrap()
                 .is_paused
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_proof_matches_receipts_emitted_under_the_bound_worker_session() {
+        // Live receipts carry the AGENT-LOOP task id, not the goals-table
+        // task id: the proof of a recovery run's work reaches the ledger as
+        // tool_result events under the worker session that the root task's
+        // attempt was bound to. A verified successful recovery must be
+        // recognized through that typed attempt edge — otherwise every real
+        // success is recorded as an unproven failure and the schedule never
+        // resumes.
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("publish synthetic report", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.create_goal_schedule(&schedule).await.unwrap();
+        for _ in 0..3 {
+            let run = store
+                .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+                .await
+                .unwrap();
+            assert!(store
+                .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
+                .await
+                .unwrap());
+        }
+        let escalated = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            escalated.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Escalated
+        );
+
+        let recovery_run = store
+            .start_goal_run(&goal.id, "recovery", None, None)
+            .await
+            .unwrap();
+        let mut recovery_task = task(&goal.id, "recover the synthetic objective", None);
+        recovery_task.context = Some(
+            serde_json::json!({
+                "recovery_for_run": escalated.last_failed_run_id,
+                "terminal_recovery": true
+            })
+            .to_string(),
+        );
+        store.create_task(&recovery_task).await.unwrap();
+        sqlx::query("UPDATE goal_runs SET root_task_id = ? WHERE id = ?")
+            .bind(&recovery_task.id)
+            .bind(&recovery_run.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET goal_run_id = ? WHERE id = ?")
+            .bind(&recovery_run.id)
+            .bind(&recovery_task.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // Claim the root task and bind its attempt to the worker session, the
+        // way spawn_child_inner does for the task lead.
+        let worker_session = "specialist:task_lead:synthetic-recovery";
+        let attempt = store
+            .claim_task_with_lease(&recovery_task.id, "heartbeat-dispatch", None, 180)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .bind_task_attempt_worker(&attempt.id, &attempt.lease_token, worker_session, None)
+            .await
+            .unwrap());
+
+        // The receipt is emitted under the worker session with an agent-loop
+        // task id that exists nowhere in the tasks table.
+        let proof_receipt_id = "session-edge-recovery-proof";
+        sqlx::query(
+            "INSERT INTO events
+                (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'terminal')",
+        )
+        .bind(worker_session)
+        .bind(
+            serde_json::json!({
+                "task_id": uuid::Uuid::new_v4().to_string(),
+                "tool_call_id": proof_receipt_id,
+                "receipt": {
+                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "outcome_status": "succeeded",
+                    "outcome_evidence": "tool_reported"
+                }
+            })
+            .to_string(),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(Option::<String>::None)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        recovery_task.status = "completed".to_string();
+        recovery_task.result = Some("synthetic recovery verified".to_string());
+        recovery_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        store.update_task(&recovery_task).await.unwrap();
+        assert!(store
+            .finish_goal_run(
+                &recovery_run.id,
+                "completed",
+                Some("verified via session edge")
+            )
+            .await
+            .unwrap());
+
+        let healthy = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            healthy.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Healthy,
+            "a recovery proven by receipts under the bound worker session must heal the objective"
+        );
+        assert_eq!(healthy.consecutive_failures, 0);
     }
 }
