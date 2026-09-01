@@ -1442,7 +1442,7 @@ mod tests {
             .build_turn_context_from_recent_history(
                 "test-session",
                 "Each day manage the blog at https://blog.acme-daemon.dev/. Create the \
-                 post in /Users/alice/projects/acme-daemon/src/content/posts, then build \
+                 post in /tmp/synthetic-alice/projects/acme-daemon/src/content/posts, then build \
                  and deploy with the documented workflow.",
             )
             .await;
@@ -1464,12 +1464,12 @@ mod tests {
             .agent
             .build_turn_context_from_recent_history(
                 "test-session",
-                "Create the post in /Users/alice/projects/acme-daemon/src/content/posts.",
+                "Create the post in /tmp/synthetic-alice/projects/acme-daemon/src/content/posts.",
             )
             .await;
         assert_eq!(
             unbound.primary_project_scope.as_deref(),
-            Some("/Users/alice/projects/acme-daemon/src/content/posts"),
+            Some("/tmp/synthetic-alice/projects/acme-daemon/src/content/posts"),
         );
     }
 

