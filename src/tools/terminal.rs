@@ -12291,7 +12291,7 @@ mod tests {
         let start = Instant::now();
         let response = tool
             .call(
-                r#"{"action":"run","command":"sleep 5 &","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
             )
             .await
             .unwrap();
