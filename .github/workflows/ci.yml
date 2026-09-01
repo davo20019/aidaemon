@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CODEX_CLI_VERSION: "0.151.0"
+  CODEX_CLI_VERSION: "0.114.0"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.

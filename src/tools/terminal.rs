@@ -1980,6 +1980,37 @@ async fn confined_terminal_execution_request_inner(
         &mut runtime_support,
     )
     .await;
+
+    // The Linux sandbox adapter is a Node.js entrypoint (`#!/usr/bin/env
+    // node`). Its interpreter is not necessarily in a base system directory
+    // on hosted runners, and the confined child PATH is intentionally reduced
+    // to granted runtime prefixes. Grant the adapter's own executable prefix
+    // so the outer adapter process can resolve its interpreter without
+    // widening access to unrelated host paths.
+    #[cfg(not(target_os = "macos"))]
+    let codex = backend
+        .resolve_executable("codex")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(
+            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
+        ))?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(parent) = codex.parent() {
+            runtime_support.add_read(parent.to_string());
+            runtime_support.add_path_prefix(parent.to_string());
+            runtime_support.add_executable(parent.to_string());
+        }
+        let canonical = backend
+            .canonicalize(&codex)
+            .await
+            .unwrap_or_else(|_| codex.clone());
+        if let Some(parent) = canonical.parent() {
+            runtime_support.add_read(parent.to_string());
+            runtime_support.add_path_prefix(parent.to_string());
+            runtime_support.add_executable(parent.to_string());
+        }
+    }
     for path in &runtime_support.read_paths {
         if !reads.contains(path) && !writes.contains(path) {
             reads.push(path.clone());
@@ -2012,13 +2043,6 @@ async fn confined_terminal_execution_request_inner(
         )
     }
 
-    #[cfg(not(target_os = "macos"))]
-    let codex = backend
-        .resolve_executable("codex")
-        .await?
-        .ok_or_else(|| anyhow::anyhow!(
-            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
-        ))?;
     #[cfg(not(target_os = "macos"))]
     let sandbox_cwd = cwd
         .as_ref()
