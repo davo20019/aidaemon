@@ -443,6 +443,7 @@ fn routing_rejection(message: String, route_to: &str) -> ToolCallOutcome {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn quote_shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
