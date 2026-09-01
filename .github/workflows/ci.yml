@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CODEX_CLI_VERSION: "0.114.0"
+  CODEX_CLI_VERSION: "0.151.0"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.
@@ -118,6 +118,19 @@ jobs:
           npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
           codex --version
 
+      - name: Configure Linux sandbox namespaces
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Install macOS dependencies
         if: matrix.os == 'macos-14'
         run: brew install ffmpeg
@@ -193,6 +206,18 @@ jobs:
         run: |
           npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
           codex --version
+
+      - name: Configure Linux sandbox namespaces
+        run: |
+          set -euo pipefail
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
