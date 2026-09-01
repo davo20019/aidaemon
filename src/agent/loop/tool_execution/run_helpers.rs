@@ -1036,6 +1036,10 @@ pub(super) fn tool_target_hint_matches_contract_target(
         (ToolTargetHintKind::Url, VerificationTargetKind::Url)
             | (ToolTargetHintKind::Path, VerificationTargetKind::Path)
             | (
+                ToolTargetHintKind::ResourceId,
+                VerificationTargetKind::ResourceId
+            )
+            | (
                 ToolTargetHintKind::ProjectScope,
                 VerificationTargetKind::Path
             )
@@ -1059,6 +1063,9 @@ pub(super) fn tool_target_hint_matches_contract_target(
             normalized_path_value(&target_hint.value)
                 == normalized_path_value(&contract_target.value)
         }
+        (ToolTargetHintKind::ResourceId, VerificationTargetKind::ResourceId) => {
+            target_hint.value == contract_target.value
+        }
         (ToolTargetHintKind::ResourceId, _) => false,
         _ => false,
     }
@@ -1072,6 +1079,10 @@ pub(super) fn verification_target_matches_haystack(
     let needle = match target.kind {
         VerificationTargetKind::Url => normalized_url_value(&target.value),
         VerificationTargetKind::Path => normalized_path_value(&target.value),
+        // Opaque identities are adapter assertions. Merely echoing one in
+        // model-supplied arguments or a shell command is not evidence that the
+        // adapter observed that resource.
+        VerificationTargetKind::ResourceId => None,
     };
     let Some(needle) = needle else {
         return false;
@@ -1181,6 +1192,7 @@ fn requirement_target_matches(
         kind: match target.kind {
             RequestVerificationTargetKind::Url => VerificationTargetKind::Url,
             RequestVerificationTargetKind::Path => VerificationTargetKind::Path,
+            RequestVerificationTargetKind::ResourceId => VerificationTargetKind::ResourceId,
         },
         value: target.value.clone(),
     };
@@ -2551,6 +2563,18 @@ ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
         assert!(!verification_target_matches_haystack(
             &target,
             "read /tmp/project-b/config.toml"
+        ));
+    }
+
+    #[test]
+    fn opaque_resource_id_cannot_be_verified_by_argument_text() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::ResourceId,
+            value: "objective:sha256:synthetic".to_string(),
+        };
+        assert!(!verification_target_matches_haystack(
+            &target,
+            r#"{"subject":"objective:sha256:synthetic"}"#
         ));
     }
 

@@ -235,16 +235,23 @@ impl GoalTraceTool {
                         .len(),
                     None => 0,
                 };
-                let status = crate::tools::objective_status::objective_status(
+                let enumerated_from = if mandate.is_some() && schedules.is_empty() {
+                    crate::tools::objective_status::ObjectiveCollection::MandateControllers
+                } else {
+                    crate::tools::objective_status::ObjectiveCollection::ScheduledGoals
+                };
+                let row = crate::tools::objective_status::objective_portfolio_row(
+                    &goal.id,
+                    enumerated_from,
                     &schedules,
                     &runs,
                     recovery.as_ref(),
                     mandate.as_ref(),
                     measurement_count,
-                );
+                )?;
                 out.push_str(&format!(
                     "- Objective status: {}\n",
-                    crate::tools::objective_status::render_objective_status_line(&status)
+                    crate::tools::objective_status::render_objective_status_line(&row.status)
                 ));
             }
         }

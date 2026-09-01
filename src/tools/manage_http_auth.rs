@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,8 +15,9 @@ use crate::tools::http_request::HttpRequestTool;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolCollectionObservation, ToolMutationEffects,
+    ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint, ToolTargetHintKind,
 };
 use crate::types::ApprovalResponse;
 
@@ -69,6 +71,8 @@ pub struct ManageHttpAuthTool {
 }
 
 impl ManageHttpAuthTool {
+    const AUTH_PROFILE_COLLECTION_ID: &'static str = "auth_profile_collection:configured";
+
     pub fn new(
         config_path: PathBuf,
         profiles: SharedHttpProfiles,
@@ -462,7 +466,7 @@ impl ManageHttpAuthTool {
             .is_some())
     }
 
-    async fn handle_list(&self) -> anyhow::Result<String> {
+    async fn handle_list_snapshot(&self) -> anyhow::Result<(String, Vec<ToolTargetHint>)> {
         let doc = self.load_config_doc().await?;
         let manual_names: Vec<String> = Self::http_auth_table(&doc)
             .map(|table| table.keys().cloned().collect())
@@ -470,11 +474,14 @@ impl ManageHttpAuthTool {
         let oauth_connections = self.state_store.list_oauth_connections().await?;
 
         let mut lines = Vec::new();
+        let mut resource_ids = BTreeSet::new();
         if manual_names.is_empty() {
             lines.push("No manual API auth profiles configured yet.".to_string());
         } else {
             lines.push("Manual API auth profiles:".to_string());
             for name in manual_names {
+                let resource_id = HttpRequestTool::auth_profile_resource_id(&name);
+                resource_ids.insert(resource_id.clone());
                 let table = Self::profile_table(&doc, &name)
                     .ok_or_else(|| anyhow::anyhow!("Profile '{}' is not a table", name))?;
                 match self.resolve_manual_profile(&name, table) {
@@ -485,8 +492,9 @@ impl ManageHttpAuthTool {
                             resolution.allowed_domains.join(", ")
                         };
                         lines.push(format!(
-                            "- {} [{}] domains: {} ({})",
+                            "- {} [resource_id: {}] [{}] domains: {} ({})",
                             name,
+                            resource_id,
                             Self::auth_type_name(&resolution.auth_type),
                             domains,
                             resolution.status_label()
@@ -505,9 +513,11 @@ impl ManageHttpAuthTool {
             }
             lines.push("OAuth-managed profiles:".to_string());
             for connection in oauth_connections {
+                let resource_id = HttpRequestTool::auth_profile_resource_id(&connection.service);
+                resource_ids.insert(resource_id.clone());
                 lines.push(format!(
-                    "- {} [{}] manage with OAuth flow tools",
-                    connection.service, connection.auth_type
+                    "- {} [resource_id: {}] [{}] manage with OAuth flow tools",
+                    connection.service, resource_id, connection.auth_type
                 ));
             }
         }
@@ -522,7 +532,17 @@ impl ManageHttpAuthTool {
             );
         }
 
-        Ok(lines.join("\n"))
+        let subjects = resource_ids
+            .into_iter()
+            .filter_map(|resource_id| {
+                ToolTargetHint::new(ToolTargetHintKind::ResourceId, resource_id)
+            })
+            .collect();
+        Ok((lines.join("\n"), subjects))
+    }
+
+    async fn handle_list(&self) -> anyhow::Result<String> {
+        self.handle_list_snapshot().await.map(|(output, _)| output)
     }
 
     async fn handle_describe(&self, profile_name: &str) -> anyhow::Result<String> {
@@ -1071,11 +1091,28 @@ impl Tool for ManageHttpAuthTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
+        let mut semantics = semantics_for_exact_read_actions(
             arguments,
             &["list", "describe", "verify"],
             ToolMutationEffects::CONFIGURATION,
-        )
+        );
+        if let Ok(args) = serde_json::from_str::<ManageHttpAuthArgs>(arguments) {
+            if args.action == "list" {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    Self::AUTH_PROFILE_COLLECTION_ID,
+                );
+            }
+            if let Some(profile) = args.profile.as_deref() {
+                if let Ok(profile) = Self::validate_profile_name(profile) {
+                    semantics = semantics.with_target_hint(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&profile),
+                    );
+                }
+            }
+        }
+        semantics
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1140,6 +1177,58 @@ impl Tool for ManageHttpAuthTool {
                 other
             )),
         }
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
+        let (output, list_members) = if args.action == "list" {
+            let (output, members) = self.handle_list_snapshot().await?;
+            (output, Some(members))
+        } else {
+            (self.call(arguments).await?, None)
+        };
+        let mut observations = Vec::new();
+        let mut collections = Vec::new();
+        if let Some(members) = list_members {
+            observations.extend(members.iter().cloned().map(|subject| {
+                ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
+            }));
+            collections.push(ToolCollectionObservation::complete(
+                ToolTargetHint::new(
+                    ToolTargetHintKind::ResourceId,
+                    Self::AUTH_PROFILE_COLLECTION_ID,
+                )
+                .expect("auth profile collection ID is nonempty"),
+                &[ToolSemanticFacet::Authorization],
+                members,
+            ));
+        } else if matches!(args.action.as_str(), "describe" | "verify") {
+            if let Some(profile) = args.profile.as_deref() {
+                if let Ok(profile) = Self::validate_profile_name(profile) {
+                    if let Some(subject) = ToolTargetHint::new(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&profile),
+                    ) {
+                        observations.push(ToolObservationEvidence::new(
+                            subject,
+                            &[ToolSemanticFacet::Authorization],
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                observations,
+                collection_observations: collections,
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 }
 
@@ -1282,6 +1371,49 @@ allowed_domains = ["api.example.com"]
         let runtime = profiles.read().await;
         let profile = runtime.get("demo").expect("runtime profile inserted");
         assert_eq!(profile.token.as_deref(), Some("secret-demo-token"));
+    }
+
+    #[tokio::test]
+    async fn list_emits_exact_profile_readiness_and_complete_collection_evidence() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(
+            config_file.path(),
+            r#"
+[http_auth.synthetic_social]
+auth_type = "bearer"
+allowed_domains = ["api.example.test"]
+"#,
+        );
+        let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tool = test_tool(config_file.path().to_path_buf(), profiles)
+            .await
+            .unwrap();
+        let outcome = tool
+            .call_with_status_outcome(r#"{"action":"list"}"#, None)
+            .await
+            .unwrap();
+        let resource_id = HttpRequestTool::auth_profile_resource_id("synthetic_social");
+        assert!(outcome.output.contains(&resource_id));
+        assert!(outcome.metadata.observations.iter().any(|observation| {
+            observation.subject.value == resource_id
+                && observation
+                    .facets
+                    .contains(&ToolSemanticFacet::Authorization)
+        }));
+        let collection = outcome
+            .metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value == ManageHttpAuthTool::AUTH_PROFILE_COLLECTION_ID
+            })
+            .expect("auth profile collection coverage");
+        assert_eq!(
+            collection.completeness,
+            crate::traits::ToolCollectionCompleteness::Complete
+        );
+        assert_eq!(collection.members.len(), 1);
+        assert_eq!(collection.members[0].value, resource_id);
     }
 
     #[test]

@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::plans::{ChecklistItem, PlanStore, StepStatus};
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects};
+use crate::traits::{
+    RequestObservationTarget, Tool, ToolArgumentContractViolation, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, ToolSemanticFacet,
+};
 
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
@@ -22,6 +25,49 @@ impl TrackRequirementsTool {
 
 fn parse_status(s: &str) -> StepStatus {
     StepStatus::from_str(s).unwrap_or(StepStatus::Pending)
+}
+
+/// Decode checklist evidence targets once for both persistence and the durable
+/// executor-expectation event. String targets retain the original path/URL
+/// behavior; every other string is an exact opaque resource ID and therefore
+/// cannot silently degrade into an untargeted observation.
+pub(crate) fn parse_expectation_targets(
+    raw_targets: Option<&Value>,
+) -> Result<(Vec<String>, Vec<RequestObservationTarget>), String> {
+    let Some(raw_targets) = raw_targets else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let values = raw_targets
+        .as_array()
+        .ok_or_else(|| "targets must be an array".to_string())?;
+    let mut legacy_targets = Vec::with_capacity(values.len());
+    let mut observation_targets = Vec::with_capacity(values.len());
+    for value in values {
+        let target = if let Some(value) = value.as_str() {
+            RequestObservationTarget::from_legacy_exact(value)
+                .ok_or_else(|| "target strings must not be empty".to_string())?
+        } else {
+            serde_json::from_value::<RequestObservationTarget>(value.clone())
+                .map_err(|error| format!("invalid structured target: {error}"))?
+        };
+        if target.subject.value.trim().is_empty() {
+            return Err("target subject must not be empty".to_string());
+        }
+        if let Some(coverage) = target.collection_coverage.as_ref() {
+            if coverage.collection.value.trim().is_empty() {
+                return Err("collection target must not be empty".to_string());
+            }
+            if target.facets.is_empty() {
+                return Err(
+                    "collection-backed targets must declare at least one semantic facet"
+                        .to_string(),
+                );
+            }
+        }
+        legacy_targets.push(target.subject.value.clone());
+        observation_targets.push(target);
+    }
+    Ok((legacy_targets, observation_targets))
 }
 
 #[async_trait]
@@ -43,6 +89,18 @@ impl Tool for TrackRequirementsTool {
     }
 
     fn schema(&self) -> Value {
+        let exact_target = json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["url", "path", "resource_id"]
+                },
+                "value": { "type": "string", "minLength": 1 }
+            },
+            "required": ["kind", "value"],
+            "additionalProperties": false
+        });
         json!({
             "name": "track_requirements",
             "description": self.description(),
@@ -87,8 +145,41 @@ impl Tool for TrackRequirementsTool {
                                 },
                                 "targets": {
                                     "type": "array",
-                                    "description": "Exact canonical receipt targets.",
-                                    "items": { "type": "string", "minLength": 1 },
+                                    "description": "Exact receipt evidence targets. Prefer a structured subject/facet binding and never invent a resource ID. Use an ID returned by a tool; for objective discovery, the stable collection subjects are objective_collection:scheduled_goals and objective_collection:mandate_controllers. Legacy strings remain exact: absolute paths and URLs retain their type; every other value is an opaque resource ID that must exactly match a receipt.",
+                                    "items": {
+                                        "oneOf": [
+                                            { "type": "string", "minLength": 1 },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "subject": exact_target.clone(),
+                                                    "facets": {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "type": "string",
+                                                            "enum": ToolSemanticFacet::PROTOCOL_NAMES
+                                                        },
+                                                        "uniqueItems": true
+                                                    },
+                                                    "collection_coverage": {
+                                                        "type": "object",
+                                                        "description": "Require coverage of an exact collection. Set subject equal to collection to require the whole collection; otherwise complete coverage can prove exact membership or non-membership, while partial coverage cannot prove absence.",
+                                                        "properties": {
+                                                            "collection": exact_target,
+                                                            "minimum_completeness": {
+                                                                "type": "string",
+                                                                "enum": ["complete"]
+                                                            }
+                                                        },
+                                                        "required": ["collection", "minimum_completeness"],
+                                                        "additionalProperties": false
+                                                    }
+                                                },
+                                                "required": ["subject", "facets"],
+                                                "additionalProperties": false
+                                            }
+                                        ]
+                                    },
                                     "uniqueItems": true
                                 }
                             },
@@ -101,6 +192,22 @@ impl Tool for TrackRequirementsTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let value: Value = serde_json::from_str(arguments).map_err(|error| {
+            ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
+        })?;
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                parse_expectation_targets(item.get("targets")).map_err(|error| {
+                    ToolArgumentContractViolation::new(format!(
+                        "item {index} has invalid evidence targets: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -173,24 +280,12 @@ impl Tool for TrackRequirementsTool {
                     required_mutation_effects = required_mutation_effects.union(effect);
                 }
             }
-            let expected_targets = match item.get("targets") {
-                None => Vec::new(),
-                Some(Value::Array(values)) => {
-                    let Some(targets) = values
-                        .iter()
-                        .map(|value| value.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        return Ok(format!(
-                            "track_requirements: item {item_index} has an invalid exact target."
-                        ));
-                    };
-                    targets
-                }
-                Some(_) => {
+            let expected_targets = match parse_expectation_targets(item.get("targets")) {
+                Ok((targets, _)) => targets,
+                Err(error) => {
                     return Ok(format!(
-                        "track_requirements: item {item_index} targets must be an array."
-                    ))
+                    "track_requirements: item {item_index} has invalid evidence targets: {error}."
+                ))
                 }
             };
             items.push(ChecklistItem {
@@ -285,6 +380,68 @@ mod tests {
             !semantics.mutates_state(),
             "checklist writes must not count as contract mutations"
         );
+    }
+
+    #[test]
+    fn legacy_free_form_target_is_an_exact_resource_not_untargeted() {
+        let raw = json!(["opaque-subject-that-no-adapter-reported"]);
+        let (legacy, typed) = parse_expectation_targets(Some(&raw)).unwrap();
+        assert_eq!(legacy, vec!["opaque-subject-that-no-adapter-reported"]);
+        assert_eq!(typed.len(), 1);
+        assert_eq!(
+            typed[0].subject.kind,
+            crate::traits::RequestVerificationTargetKind::ResourceId
+        );
+        assert_eq!(
+            typed[0].subject.value,
+            "opaque-subject-that-no-adapter-reported"
+        );
+    }
+
+    #[test]
+    fn structured_target_retains_subject_facet_and_complete_collection() {
+        let raw = json!([{
+            "subject": {"kind": "resource_id", "value": "goal:synthetic-goal-1"},
+            "facets": ["schedule", "recovery"],
+            "collection_coverage": {
+                "collection": {
+                    "kind": "resource_id",
+                    "value": "goal_collection:scheduled_goals"
+                },
+                "minimum_completeness": "complete"
+            }
+        }]);
+        let (_, typed) = parse_expectation_targets(Some(&raw)).unwrap();
+        assert_eq!(
+            typed[0].facets,
+            vec![
+                crate::traits::ToolSemanticFacet::Schedule,
+                crate::traits::ToolSemanticFacet::Recovery
+            ]
+        );
+        assert_eq!(
+            typed[0]
+                .collection_coverage
+                .as_ref()
+                .map(|coverage| coverage.collection.value.as_str()),
+            Some("goal_collection:scheduled_goals")
+        );
+    }
+
+    #[test]
+    fn collection_target_without_facets_is_rejected() {
+        let raw = json!([{
+            "subject": {"kind": "resource_id", "value": "goal:synthetic-goal-1"},
+            "facets": [],
+            "collection_coverage": {
+                "collection": {
+                    "kind": "resource_id",
+                    "value": "goal_collection:scheduled_goals"
+                },
+                "minimum_completeness": "complete"
+            }
+        }]);
+        assert!(parse_expectation_targets(Some(&raw)).is_err());
     }
 
     #[tokio::test]

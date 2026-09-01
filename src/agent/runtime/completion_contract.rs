@@ -39,6 +39,7 @@ pub(super) enum CompletionTaskKind {
 pub(super) enum VerificationTargetKind {
     Url,
     Path,
+    ResourceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +257,7 @@ pub(super) fn persistable_completion_contract(
                 kind: match target.kind {
                     VerificationTargetKind::Url => RequestVerificationTargetKind::Url,
                     VerificationTargetKind::Path => RequestVerificationTargetKind::Path,
+                    VerificationTargetKind::ResourceId => RequestVerificationTargetKind::ResourceId,
                 },
                 value: target.value.clone(),
             })
@@ -340,6 +342,7 @@ pub(super) fn completion_contract_from_persisted(
                 kind: match target.kind {
                     RequestVerificationTargetKind::Url => VerificationTargetKind::Url,
                     RequestVerificationTargetKind::Path => VerificationTargetKind::Path,
+                    RequestVerificationTargetKind::ResourceId => VerificationTargetKind::ResourceId,
                 },
                 value: target.value.clone(),
             })
@@ -4668,6 +4671,7 @@ mod tests {
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["receipt-1".to_string()],
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             },
         );

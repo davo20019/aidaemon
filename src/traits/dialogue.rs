@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::tools::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolEvidenceCapability,
-    ToolInvocationStage, ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind,
-    ToolSemanticScope,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolCollectionCompleteness,
+    ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolOutcomeStatus,
+    ToolReceiptKind, ToolSemanticFacet, ToolSemanticScope,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,12 +76,69 @@ impl RequestResponseContract {
 pub enum RequestVerificationTargetKind {
     Url,
     Path,
+    /// Stable opaque identity emitted by the adapter. Unlike a display label,
+    /// it is matched exactly and cannot degrade to an untargeted observation.
+    ResourceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestVerificationTarget {
     pub kind: RequestVerificationTargetKind,
     pub value: String,
+}
+
+impl RequestVerificationTarget {
+    pub fn new(kind: RequestVerificationTargetKind, value: impl Into<String>) -> Option<Self> {
+        let value = value.into().trim().to_string();
+        (!value.is_empty()).then_some(Self { kind, value })
+    }
+
+    /// Decode the original string-only checklist protocol. Absolute paths and
+    /// URLs retain their historical meaning. Every other nonempty string is an
+    /// exact opaque resource identity, so an unrecognized value fails closed
+    /// instead of silently becoming an untargeted observation.
+    pub fn from_legacy_exact(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        let trimmed = value.trim();
+        let kind = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+            RequestVerificationTargetKind::Path
+        } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            RequestVerificationTargetKind::Url
+        } else {
+            RequestVerificationTargetKind::ResourceId
+        };
+        Self::new(kind, trimmed)
+    }
+}
+
+/// Complete-collection proof requested for an exact observation. Presence of
+/// this value means a row-level receipt is insufficient: the receipt must also
+/// carry coverage for this exact collection at the requested completeness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestCollectionCoverageRequirement {
+    pub collection: RequestVerificationTarget,
+    pub minimum_completeness: ToolCollectionCompleteness,
+}
+
+/// Exact evidence identity declared by the executing model. The subject and
+/// facet tuple is structural; `description` text is never consulted for proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestObservationTarget {
+    pub subject: RequestVerificationTarget,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facets: Vec<ToolSemanticFacet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_coverage: Option<RequestCollectionCoverageRequirement>,
+}
+
+impl RequestObservationTarget {
+    pub fn from_legacy_exact(value: impl Into<String>) -> Option<Self> {
+        RequestVerificationTarget::from_legacy_exact(value).map(|subject| Self {
+            subject,
+            facets: Vec::new(),
+            collection_coverage: None,
+        })
+    }
 }
 
 /// Machine-checkable facts about the receipt that must support one evidence

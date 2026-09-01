@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CODEX_CLI_VERSION: "0.151.0"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.
@@ -95,7 +96,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +111,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Install Codex sandbox adapter
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
+          codex --version
 
       - name: Install macOS dependencies
         if: matrix.os == 'macos-14'
@@ -181,6 +188,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Install Codex sandbox adapter
+        run: |
+          npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
+          codex --version
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

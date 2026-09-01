@@ -18,8 +18,10 @@ use super::{
 };
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
-    RequestReceiptPredicate, RequestResponseContract, RequestVerificationTargetKind,
-    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
+    RequestObservationTarget, RequestReceiptPredicate, RequestResponseContract,
+    RequestVerificationTargetKind, ToolCollectionObservation, ToolMutationEffects,
+    ToolObservationEvidence, ToolOutcomeStatus, ToolSemanticFacet, ToolTargetHint,
+    ToolTargetHintKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +71,11 @@ pub(crate) struct RunObligation {
     /// write cannot close every "write something" item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_target: Option<crate::traits::RequestVerificationTarget>,
+    /// Exact subject/facet selectors declared by the executor. Every selector
+    /// must be supported by the same completed receipt; opaque targets never
+    /// degrade into a generic observation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_targets: Vec<RequestObservationTarget>,
     /// Human-readable statement of the obligation for demand rendering
     /// (executor-declared items carry their own description).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +118,12 @@ pub(crate) struct RunOperation {
     /// operation can be bound to the resource an obligation concerns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<ToolTargetHint>,
+    /// Exact result assertions retained for declaration-order-independent
+    /// recredit. These are terminal receipt facts, not proposed semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ToolObservationEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collection_observations: Vec<ToolCollectionObservation>,
     /// Receipt-typed mutation effects, retained so an obligation declared or
     /// retargeted after this receipt landed can still be verified against it.
     #[serde(default)]
@@ -125,6 +138,19 @@ pub(crate) struct RunOperation {
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_lineage: Option<super::ToolOperationLineage>,
+}
+
+impl RunOperation {
+    /// A background handoff is an intermediate receipt for an invocation that
+    /// is still running. Derive the state from the existing outcome field so
+    /// aggregates serialized before this lifecycle distinction remain valid.
+    fn is_background_in_flight(&self) -> bool {
+        self.outcome == Some(ToolOutcomeStatus::Backgrounded)
+    }
+
+    fn has_terminal_receipt(&self) -> bool {
+        self.result_id.is_some() && !self.is_background_in_flight()
+    }
 }
 
 /// End-to-end lifecycle projection. Execution completion and user-visible
@@ -454,6 +480,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             });
         }
@@ -479,6 +506,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             });
         }
@@ -504,6 +532,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             });
         }
@@ -525,6 +554,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             });
         }
@@ -540,6 +570,7 @@ impl RunAggregate {
                 satisfied_at_revision: None,
                 satisfying_receipt_ids: Vec::new(),
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             });
         }
@@ -548,51 +579,72 @@ impl RunAggregate {
     /// Compile the executing model's typed checklist into obligations. Each
     /// typed item becomes one obligation keyed by its index: a mutation item
     /// is `Achieve` (closed by a succeeded receipt carrying the effect); an
-    /// observation/targeted item is `Observe` (closed by a compatible
-    /// observation receipt, target-bound when a path target was declared).
+    /// observation/targeted item is `Observe` (closed by a compatible exact
+    /// subject/facet receipt). Opaque identifiers are exact resource IDs; they
+    /// never fall back to an untargeted observation.
     /// Untyped free-text items are not obligations. A later declaration
     /// replaces the set: kept indices retain their proof, `deferred`/`skipped`
     /// items are abandoned, removed indices are abandoned.
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
         self.executor_expectations_present = true;
+        let exact_resource_targets = declared.schema_version >= 2;
         let mut declared_ids = BTreeSet::new();
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
             let abandoned = matches!(item.status.as_str(), "deferred" | "skipped");
             let has_effect = !item.mutation_effects.is_empty();
-            let required_target = item.targets.iter().find_map(|target| {
-                let target = target.trim();
-                if target.starts_with('/') || target.starts_with("~/") {
-                    Some(crate::traits::RequestVerificationTarget {
-                        kind: crate::traits::RequestVerificationTargetKind::Path,
-                        value: target.to_string(),
+            let declared_observation_targets = if item.observation_targets.is_empty() {
+                item.targets
+                    .iter()
+                    .filter_map(|target| {
+                        let parsed = RequestObservationTarget::from_legacy_exact(target)?;
+                        (exact_resource_targets
+                            || parsed.subject.kind != RequestVerificationTargetKind::ResourceId)
+                            .then_some(parsed)
                     })
-                } else if target.starts_with("http://") || target.starts_with("https://") {
-                    Some(crate::traits::RequestVerificationTarget {
-                        kind: crate::traits::RequestVerificationTargetKind::Url,
-                        value: target.to_string(),
-                    })
-                } else {
-                    None
-                }
-            });
+                    .collect::<Vec<_>>()
+            } else {
+                item.observation_targets.clone()
+            };
+            let required_target = declared_observation_targets
+                .first()
+                .map(|target| target.subject.clone());
             let (class, required_effect) = if has_effect {
                 (RunObligationClass::Achieve, item.mutation_effects)
-            } else if item.requires_observation || required_target.is_some() {
+            } else if item.requires_observation || !declared_observation_targets.is_empty() {
                 (RunObligationClass::Observe, ToolMutationEffects::NONE)
             } else {
                 // Free text without typed content is a note, not an obligation.
                 continue;
             };
+            let observation_targets = if class == RunObligationClass::Observe {
+                declared_observation_targets
+            } else {
+                Vec::new()
+            };
             declared_ids.insert(id.clone());
             let existing = self.obligations.get(&id);
+            // An index is stable presentation identity, not evidence identity.
+            // Preserve proof only when the complete typed obligation is the
+            // same; retargeting index 0 from goal A to goal B must reopen it.
+            let same_contract = existing.is_some_and(|obligation| {
+                obligation.class == class
+                    && obligation.required_effect == required_effect
+                    && obligation.required_target == required_target
+                    && obligation.observation_targets == observation_targets
+            });
             let existing_proof = existing
+                .filter(|_| same_contract)
                 .map(|o| o.satisfying_receipt_ids.clone())
                 .unwrap_or_default();
-            let existing_revision = existing.and_then(|o| o.satisfied_at_revision);
+            let existing_revision = existing
+                .filter(|_| same_contract)
+                .and_then(|o| o.satisfied_at_revision);
             let state = if abandoned {
                 RunObligationState::Abandoned
-            } else if existing.is_some_and(|o| o.state == RunObligationState::Satisfied) {
+            } else if same_contract
+                && existing.is_some_and(|o| o.state == RunObligationState::Satisfied)
+            {
                 RunObligationState::Satisfied
             } else {
                 RunObligationState::Pending
@@ -608,6 +660,7 @@ impl RunAggregate {
                 satisfying_receipt_ids: existing_proof,
                 summary: Some(executor_item_summary(item, class, required_effect)),
                 required_target,
+                observation_targets,
             });
         }
         for (id, obligation) in self.obligations.iter_mut() {
@@ -635,12 +688,14 @@ impl RunAggregate {
             mutation_effects: crate::traits::ToolMutationEffects,
             observes: bool,
             targets: Vec<ToolTargetHint>,
+            observations: Vec<ToolObservationEvidence>,
+            collection_observations: Vec<ToolCollectionObservation>,
             revision: u64,
         }
         let receipts: Vec<RecordedReceipt> = self
             .operations
             .values()
-            .filter(|operation| operation.result_id.is_some())
+            .filter(|operation| operation.has_terminal_receipt())
             .map(|operation| RecordedReceipt {
                 operation_id: operation.operation_id.clone(),
                 succeeded: matches!(operation.outcome, Some(ToolOutcomeStatus::Succeeded)),
@@ -655,6 +710,8 @@ impl RunAggregate {
                 mutation_effects: operation.mutation_effects,
                 observes: operation.observes,
                 targets: operation.targets.clone(),
+                observations: operation.observations.clone(),
+                collection_observations: operation.collection_observations.clone(),
                 revision: operation.result_revision.unwrap_or(self.effect_revision),
             })
             .collect();
@@ -669,10 +726,18 @@ impl RunAggregate {
                 continue;
             }
             for receipt in &receipts {
-                let target_compatible = obligation
-                    .required_target
-                    .as_ref()
-                    .is_none_or(|target| hints_touch_target(target, &receipt.targets));
+                let target_compatible = match obligation.class {
+                    RunObligationClass::Observe => observation_targets_supported(
+                        &obligation.observation_targets,
+                        &receipt.targets,
+                        &receipt.observations,
+                        &receipt.collection_observations,
+                    ),
+                    _ => obligation
+                        .required_target
+                        .as_ref()
+                        .is_none_or(|target| hints_touch_target(target, &receipt.targets)),
+                };
                 let proven = match obligation.class {
                     RunObligationClass::Achieve => {
                         !obligation.required_effect.is_empty()
@@ -701,10 +766,7 @@ impl RunAggregate {
                         later.succeeded
                             && !later.mutation_effects.is_empty()
                             && later.revision > receipt.revision
-                            && obligation
-                                .required_target
-                                .as_ref()
-                                .is_none_or(|target| hints_touch_target(target, &later.targets))
+                            && obligation_touched_by_targets(obligation, &later.targets)
                     });
                     if stale {
                         continue;
@@ -834,6 +896,8 @@ impl RunAggregate {
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
+                observations: Vec::new(),
+                collection_observations: Vec::new(),
                 mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 observes: false,
                 result_revision: None,
@@ -916,22 +980,26 @@ impl RunAggregate {
             .result_id
             .clone()
             .unwrap_or_else(|| format!("receipt:{}", result.tool_call_id));
-        if self
-            .operations
-            .get(&result.tool_call_id)
-            .and_then(|operation| operation.result_id.as_deref())
-            == Some(result_id.as_str())
-        {
-            return;
-        }
-        if self
-            .operations
-            .get(&result.tool_call_id)
-            .and_then(|operation| operation.result_id.as_ref())
-            .is_some()
-        {
-            self.record_invariant("operation_has_multiple_terminal_receipts");
-            return;
+        if let Some(operation) = self.operations.get(&result.tool_call_id) {
+            let same_result = operation.result_id.as_deref() == Some(result_id.as_str());
+            if operation.is_background_in_flight() {
+                if receipt.outcome_status == ToolOutcomeStatus::Backgrounded {
+                    // Replayed or refreshed handoff telemetry describes the
+                    // same nonterminal transition, regardless of whether an
+                    // older adapter assigned it a fresh provenance ID.
+                    return;
+                }
+                // The background receipt is provisional. Exactly one later
+                // terminal receipt advances this same invocation; it does not
+                // create a second operation or consume more cardinality. A
+                // legacy receipt may reuse the fallback result ID, so outcome
+                // state, not provenance inequality, authorizes the transition.
+            } else if same_result {
+                return;
+            } else if operation.result_id.is_some() {
+                self.record_invariant("operation_has_multiple_terminal_receipts");
+                return;
+            }
         }
         let operation = self
             .operations
@@ -950,6 +1018,8 @@ impl RunAggregate {
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
+                observations: Vec::new(),
+                collection_observations: Vec::new(),
                 mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 observes: false,
                 result_revision: None,
@@ -957,8 +1027,9 @@ impl RunAggregate {
                 operation_lineage: None,
             });
         operation.outcome = Some(receipt.outcome_status);
-        operation.dispatched = receipt.invocation_stage.reached_dispatch();
-        operation.policy_denied = !operation.dispatched && receipt.access_denial.is_some();
+        operation.dispatched = operation.dispatched || receipt.invocation_stage.reached_dispatch();
+        operation.policy_denied =
+            operation.policy_denied || (!operation.dispatched && receipt.access_denial.is_some());
         operation.mutating = operation.mutating || receipt.semantics.mutates_state();
         if operation.evidence_capabilities.is_empty() {
             operation.evidence_capabilities = receipt.semantics.evidence.clone();
@@ -971,6 +1042,8 @@ impl RunAggregate {
         if operation.targets.is_empty() {
             operation.targets = receipt_targets(receipt);
         }
+        operation.observations = receipt.observations.clone();
+        operation.collection_observations = receipt.collection_observations.clone();
         operation.mutation_effects = operation
             .mutation_effects
             .union(receipt.semantics.mutation_effects);
@@ -999,6 +1072,21 @@ impl RunAggregate {
             self.record_invariant("dispatched_operation_outside_allowed_tool_set");
         }
 
+        // `Backgrounded` means the adapter dispatched one invocation and
+        // handed its still-running lifecycle to a durable notifier. Retain the
+        // provisional receipt for replay/idempotence and cardinality, but do
+        // not credit completion evidence, advance effect revision, or exhaust
+        // the run while its terminal result is outstanding.
+        if receipt.outcome_status == ToolOutcomeStatus::Backgrounded {
+            self.reconcile_cardinality();
+            // The call proposal may have looked cardinality-exhausted before
+            // its first receipt arrived. The handoff reopens it as in-flight,
+            // so this operation is the current causal frontier regardless of
+            // that pre-receipt projection.
+            self.primary_causal_operation_id = Some(operation_id);
+            return;
+        }
+
         let completed_mutation = !is_durable_replay
             && result.succeeded()
             && receipt.invocation_stage.reached_dispatch()
@@ -1023,10 +1111,7 @@ impl RunAggregate {
                     && obligation
                         .satisfied_at_revision
                         .is_some_and(|revision| revision < self.effect_revision)
-                    && obligation
-                        .required_target
-                        .as_ref()
-                        .is_none_or(|target| hints_touch_target(target, &mutation_targets))
+                    && obligation_touched_by_targets(obligation, &mutation_targets)
                 {
                     obligation.state = RunObligationState::Invalidated;
                 }
@@ -1050,8 +1135,15 @@ impl RunAggregate {
                 .required_target
                 .as_ref()
                 .is_none_or(|target| receipt_touches_target(target, receipt));
+            let observation_selector_compatible = observation_targets_supported(
+                &obligation.observation_targets,
+                &receipt_targets(receipt),
+                &receipt.observations,
+                &receipt.collection_observations,
+            );
             let explicitly_proven = explicit_ids.contains(&obligation.id)
-                && (obligation.class != RunObligationClass::Observe || observation_compatible);
+                && (obligation.class != RunObligationClass::Observe
+                    || (observation_compatible && observation_selector_compatible));
             let claim_allows_proof = claimed_obligation_ids.is_empty()
                 || claimed_obligation_ids.contains(&obligation.id);
             let predicate_proven = claim_allows_proof
@@ -1073,7 +1165,7 @@ impl RunAggregate {
                 && receipt.invocation_stage.reached_dispatch()
                 && receipt.semantics.observes_state()
                 && observation_compatible
-                && target_compatible;
+                && observation_selector_compatible;
             // Receipt-bound obligations are replayed from their predicate,
             // never trusted from an upstream completion-ID annotation. This
             // keeps the reducer authoritative if an intermediate matcher is
@@ -1511,6 +1603,14 @@ impl RunAggregate {
             .count()
     }
 
+    /// A dispatched invocation has handed execution to durable background
+    /// tracking and has not emitted its terminal receipt yet.
+    pub(crate) fn has_background_in_flight(&self) -> bool {
+        self.operations
+            .values()
+            .any(RunOperation::is_background_in_flight)
+    }
+
     /// The run's only terminal receipts are typed policy denials: the model
     /// observed the request's authority boundary and nothing it can retry
     /// would cross it. Finalization treats the model's narration of that
@@ -1541,7 +1641,7 @@ impl RunAggregate {
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         self.operations.values().all(|operation| {
-            if operation.result_id.is_none() {
+            if !operation.has_terminal_receipt() {
                 return false;
             }
             let proof_id = match operation.operation_lineage.as_ref() {
@@ -1561,6 +1661,13 @@ impl RunAggregate {
         }
         if !self.invariant_violations.is_empty() {
             return RunTerminalDecision::Failed;
+        }
+        // A detached/background process has consumed one durable invocation,
+        // but it has not produced a terminal receipt yet. It is neither
+        // success nor exhausted failure, even if an older serialized
+        // projection credited its provisional handoff as evidence.
+        if self.has_background_in_flight() {
+            return RunTerminalDecision::Pending;
         }
         if self.is_fulfilled() {
             return RunTerminalDecision::Succeeded;
@@ -1934,7 +2041,14 @@ fn hints_touch_target(
     target: &crate::traits::RequestVerificationTarget,
     hints: &[ToolTargetHint],
 ) -> bool {
-    hints.iter().any(|hint| match (target.kind, hint.kind) {
+    hints.iter().any(|hint| hint_matches_target(target, hint))
+}
+
+fn hint_matches_target(
+    target: &crate::traits::RequestVerificationTarget,
+    hint: &ToolTargetHint,
+) -> bool {
+    match (target.kind, hint.kind) {
         (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => target.value == hint.value,
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
             let expected = crate::execution::normalize_active_path_lexically(&target.value);
@@ -1953,8 +2067,96 @@ fn hints_touch_target(
                 target == root || target.starts_with(&format!("{root}/"))
             })
         }
+        (RequestVerificationTargetKind::ResourceId, ToolTargetHintKind::ResourceId) => {
+            target.value == hint.value
+        }
         _ => false,
+    }
+}
+
+fn facets_cover(observed: &[ToolSemanticFacet], required: &[ToolSemanticFacet]) -> bool {
+    required.iter().all(|facet| observed.contains(facet))
+}
+
+fn direct_observation_supports(
+    target: &RequestObservationTarget,
+    observations: &[ToolObservationEvidence],
+) -> bool {
+    observations.iter().any(|observation| {
+        hint_matches_target(&target.subject, &observation.subject)
+            && facets_cover(&observation.facets, &target.facets)
     })
+}
+
+/// Verify one exact subject/facet selector against result assertions. Complete
+/// collection coverage can prove non-membership; partial coverage can only
+/// prove rows it actually returned, and those rows still need direct facets.
+fn observation_target_supported(
+    target: &RequestObservationTarget,
+    receipt_targets: &[ToolTargetHint],
+    observations: &[ToolObservationEvidence],
+    collections: &[ToolCollectionObservation],
+) -> bool {
+    if let Some(requirement) = target.collection_coverage.as_ref() {
+        let Some(collection) = collections.iter().find(|collection| {
+            hint_matches_target(&requirement.collection, &collection.collection)
+                && collection
+                    .completeness
+                    .satisfies(requirement.minimum_completeness)
+                && facets_cover(&collection.facets, &target.facets)
+        }) else {
+            return false;
+        };
+        // A selector may name the collection itself when the exact member
+        // subject is not known until discovery. This binds the obligation to
+        // complete typed coverage, never to an invented display-name alias.
+        if hint_matches_target(&target.subject, &collection.collection) {
+            return true;
+        }
+        let subject_is_member = collection
+            .members
+            .iter()
+            .any(|member| hint_matches_target(&target.subject, member));
+        if !subject_is_member {
+            return collection.completeness == crate::traits::ToolCollectionCompleteness::Complete;
+        }
+        return direct_observation_supports(target, observations);
+    }
+
+    if direct_observation_supports(target, observations) {
+        return true;
+    }
+    // Legacy path/URL/resource checklist declarations did not include facets.
+    // Preserve their exact-target behavior while refusing to infer any typed
+    // facet merely from proposed call semantics.
+    target.facets.is_empty() && hints_touch_target(&target.subject, receipt_targets)
+}
+
+fn observation_targets_supported(
+    targets: &[RequestObservationTarget],
+    receipt_targets: &[ToolTargetHint],
+    observations: &[ToolObservationEvidence],
+    collections: &[ToolCollectionObservation],
+) -> bool {
+    targets.iter().all(|target| {
+        observation_target_supported(target, receipt_targets, observations, collections)
+    })
+}
+
+fn obligation_touched_by_targets(obligation: &RunObligation, hints: &[ToolTargetHint]) -> bool {
+    if !obligation.observation_targets.is_empty() {
+        return obligation.observation_targets.iter().any(|target| {
+            hints_touch_target(&target.subject, hints)
+                || target
+                    .collection_coverage
+                    .as_ref()
+                    .is_some_and(|coverage| hints_touch_target(&coverage.collection, hints))
+        });
+    }
+    obligation
+        .required_target
+        .as_ref()
+        .is_none_or(|target| hints_touch_target(target, hints))
 }
 
 fn executor_item_summary(
@@ -2249,10 +2451,208 @@ mod tests {
                     completion_obligation_ids: Vec::new(),
                     continuation_obligation_ids: Vec::new(),
                     semantics,
+                    observations: Vec::new(),
+                    collection_observations: Vec::new(),
                     mandate_authority: None,
                 }),
             },
         )
+    }
+
+    fn with_result_id(mut event: Event, result_id: &str) -> Event {
+        event.data["receipt"]["result_provenance"]["result_id"] = json!(result_id);
+        event
+    }
+
+    fn background_result(id: &str, result_id: &str) -> Event {
+        let mut event = with_result_id(
+            result(
+                id,
+                "terminal",
+                ToolOutcomeStatus::Backgrounded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            result_id,
+        );
+        event.data["receipt"]["background_started"] = json!(true);
+        event.data["receipt"]["detached"] = json!(true);
+        event
+    }
+
+    #[test]
+    fn backgrounded_operation_transitions_to_succeeded_without_new_invocation() {
+        let obligation = "task:task-1/obligation:evidence:0";
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            claimed_call("run", "terminal", "operation:run", &[obligation]),
+            background_result("run", "result:run:background"),
+        ];
+        renumber(&mut events);
+
+        let in_flight = RunAggregate::replay("task-1", &events);
+        assert_eq!(in_flight.operations.len(), 1);
+        assert_eq!(in_flight.dispatched_operations(), 1);
+        assert_eq!(in_flight.cardinality_violations, 0);
+        assert_eq!(
+            in_flight.primary_causal_operation_id.as_deref(),
+            Some("run")
+        );
+        assert_eq!(
+            in_flight.obligations[obligation].state,
+            RunObligationState::Pending
+        );
+        assert_eq!(in_flight.terminal_decision(), RunTerminalDecision::Pending);
+        assert!(!in_flight.evidence_closed());
+
+        let terminal = with_result_id(
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            "result:run:terminal",
+        );
+        // No new projection field is needed: an aggregate persisted while the
+        // process is detached derives its in-flight state from the existing
+        // `outcome` and accepts the later terminal event after deserialization.
+        let mut completed: RunAggregate = serde_json::from_value(
+            serde_json::to_value(&in_flight).expect("serialize in-flight aggregate"),
+        )
+        .expect("deserialize in-flight aggregate");
+        completed.apply(&terminal);
+        assert_eq!(completed.operations.len(), 1);
+        assert_eq!(completed.dispatched_operations(), 1);
+        assert_eq!(completed.cardinality_violations, 0);
+        assert_eq!(
+            completed.operations["run"].outcome,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert_eq!(
+            completed.operations["run"].result_id.as_deref(),
+            Some("result:run:terminal")
+        );
+        assert_eq!(
+            completed.obligations[obligation].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            completed.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+        assert!(completed.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn backgrounded_operation_transitions_to_failed_without_duplicate_invariant() {
+        let obligation = "task:task-1/obligation:evidence:0";
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            claimed_call("run", "terminal", "operation:run", &[obligation]),
+            background_result("run", "result:run:background"),
+            with_result_id(
+                result(
+                    "run",
+                    "terminal",
+                    ToolOutcomeStatus::FailedPermanent,
+                    -1,
+                    ToolCallSemantics::observation(),
+                ),
+                "result:run:terminal",
+            ),
+        ];
+        renumber(&mut events);
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.operations.len(), 1);
+        assert_eq!(aggregate.cardinality_violations, 0);
+        assert_eq!(
+            aggregate.operations["run"].outcome,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
+        assert!(aggregate.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn duplicate_background_and_terminal_transition_receipts_are_idempotent() {
+        let obligation = "task:task-1/obligation:evidence:0";
+        let background = background_result("run", "result:run:background");
+        let refreshed_background = background_result("run", "result:run:background-refresh");
+        let terminal = with_result_id(
+            result(
+                "run",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            "result:run:terminal",
+        );
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            claimed_call("run", "terminal", "operation:run", &[obligation]),
+            background,
+            refreshed_background,
+            terminal.clone(),
+            terminal,
+        ];
+        renumber(&mut events);
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.operations.len(), 1);
+        assert_eq!(aggregate.dispatched_operations(), 1);
+        assert_eq!(aggregate.cardinality_violations, 0);
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+        assert!(aggregate.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn distinct_second_terminal_receipt_after_background_transition_is_rejected() {
+        let obligation = "task:task-1/obligation:evidence:0";
+        let mut events = vec![
+            contract(vec![requirement("terminal", 0)]),
+            claimed_call("run", "terminal", "operation:run", &[obligation]),
+            background_result("run", "result:run:background"),
+            with_result_id(
+                result(
+                    "run",
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    ToolCallSemantics::observation(),
+                ),
+                "result:run:terminal-1",
+            ),
+            with_result_id(
+                result(
+                    "run",
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    ToolCallSemantics::observation(),
+                ),
+                "result:run:terminal-2",
+            ),
+        ];
+        renumber(&mut events);
+
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.operations.len(), 1);
+        assert_eq!(
+            aggregate.operations["run"].result_id.as_deref(),
+            Some("result:run:terminal-1")
+        );
+        assert_eq!(
+            aggregate.invariant_violations,
+            ["operation_has_multiple_terminal_receipts"]
+        );
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Failed);
     }
 
     fn assistant_response(id: &str, content: &str) -> Event {
@@ -3634,8 +4034,55 @@ mod tests {
             requires_observation,
             mutation_effects: effects,
             targets: targets.iter().map(|t| t.to_string()).collect(),
+            observation_targets: Vec::new(),
             status: status.to_string(),
         }
+    }
+
+    fn objective_observation_target(
+        objective_id: &str,
+        facets: &[ToolSemanticFacet],
+        collection_id: Option<&str>,
+    ) -> RequestObservationTarget {
+        RequestObservationTarget {
+            subject: crate::traits::RequestVerificationTarget::new(
+                RequestVerificationTargetKind::ResourceId,
+                objective_id,
+            )
+            .unwrap(),
+            facets: facets.to_vec(),
+            collection_coverage: collection_id.map(|collection_id| {
+                crate::traits::RequestCollectionCoverageRequirement {
+                    collection: crate::traits::RequestVerificationTarget::new(
+                        RequestVerificationTargetKind::ResourceId,
+                        collection_id,
+                    )
+                    .unwrap(),
+                    minimum_completeness: crate::traits::ToolCollectionCompleteness::Complete,
+                }
+            }),
+        }
+    }
+
+    fn with_exact_observations(
+        mut event: Event,
+        observations: Vec<ToolObservationEvidence>,
+        collections: Vec<ToolCollectionObservation>,
+    ) -> Event {
+        event.data["receipt"]["observations"] = serde_json::to_value(observations).unwrap();
+        event.data["receipt"]["collection_observations"] =
+            serde_json::to_value(collections).unwrap();
+        event
+    }
+
+    fn objective_observation(
+        objective_id: &str,
+        facets: &[ToolSemanticFacet],
+    ) -> ToolObservationEvidence {
+        ToolObservationEvidence::new(
+            ToolTargetHint::new(ToolTargetHintKind::ResourceId, objective_id).unwrap(),
+            facets,
+        )
     }
 
     /// Mirrors the live shape: the runtime fills terminal receipts with
@@ -4055,6 +4502,307 @@ mod tests {
         assert_eq!(
             RunAggregate::replay("task-1", &events).open_executor_expectations(),
             0
+        );
+    }
+
+    #[test]
+    fn opaque_checklist_target_never_degrades_to_an_unrelated_observation() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &["scheduled_task_state:synthetic_blog"],
+                "pending",
+            )]),
+            result(
+                "read-other",
+                "manage_mandates",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        let obligation = &aggregate.obligations["task:task-1/obligation:checklist:0"];
+        assert_eq!(obligation.state, RunObligationState::Pending);
+        assert_eq!(
+            obligation.observation_targets[0].subject.kind,
+            RequestVerificationTargetKind::ResourceId
+        );
+    }
+
+    #[test]
+    fn legacy_executor_events_keep_their_pre_resource_id_replay_semantics() {
+        let mut declaration = executor_expectations(vec![checklist_item(
+            0,
+            ToolMutationEffects::NONE,
+            true,
+            &["legacy-display-label"],
+            "pending",
+        )]);
+        declaration.data["schema_version"] = serde_json::json!(1);
+        let mut events = vec![
+            declaration,
+            result(
+                "legacy-read",
+                "system_info",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied,
+            "schema-v1 history must not be reclassified by the additive exact-target protocol"
+        );
+    }
+
+    #[test]
+    fn exact_objective_subject_and_facets_prevent_cross_object_credit() {
+        let requested_facets = [
+            ToolSemanticFacet::Schedule,
+            ToolSemanticFacet::RunState,
+            ToolSemanticFacet::Recovery,
+        ];
+        let mut item = checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending");
+        item.observation_targets = vec![objective_observation_target(
+            "objective:goal-a",
+            &requested_facets,
+            None,
+        )];
+        let declaration = executor_expectations(vec![item]);
+        let wrong = with_exact_observations(
+            result(
+                "read-b",
+                "manage_mandates",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            vec![objective_observation("objective:goal-b", &requested_facets)],
+            Vec::new(),
+        );
+        let mut wrong_events = vec![declaration.clone(), wrong];
+        renumber(&mut wrong_events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &wrong_events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state,
+            RunObligationState::Pending
+        );
+
+        let right = with_exact_observations(
+            result(
+                "read-a",
+                "scheduled_goal_runs",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            vec![objective_observation("objective:goal-a", &requested_facets)],
+            Vec::new(),
+        );
+        let mut right_events = vec![declaration, right];
+        renumber(&mut right_events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &right_events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state,
+            RunObligationState::Satisfied
+        );
+    }
+
+    #[test]
+    fn complete_collection_coverage_proves_absence_but_partial_coverage_does_not() {
+        let collection_id = "objective_collection:scheduled_goals";
+        let facets = [ToolSemanticFacet::Schedule];
+        let mut item = checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending");
+        item.observation_targets = vec![objective_observation_target(
+            "objective:goal-missing",
+            &facets,
+            Some(collection_id),
+        )];
+        let declaration = executor_expectations(vec![item]);
+        let collection_hint =
+            ToolTargetHint::new(ToolTargetHintKind::ResourceId, collection_id).unwrap();
+        let partial = with_exact_observations(
+            result(
+                "partial",
+                "scheduled_goal_runs",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            Vec::new(),
+            vec![ToolCollectionObservation {
+                collection: collection_hint.clone(),
+                facets: facets.to_vec(),
+                completeness: crate::traits::ToolCollectionCompleteness::Partial,
+                returned_count: 1,
+                total_count: Some(2),
+                members: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ResourceId,
+                    "objective:goal-other",
+                )
+                .unwrap()],
+            }],
+        );
+        let mut partial_events = vec![declaration.clone(), partial];
+        renumber(&mut partial_events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &partial_events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state,
+            RunObligationState::Pending
+        );
+
+        let complete = with_exact_observations(
+            result(
+                "complete",
+                "scheduled_goal_runs",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            Vec::new(),
+            vec![ToolCollectionObservation::complete(
+                collection_hint,
+                &facets,
+                vec![
+                    ToolTargetHint::new(ToolTargetHintKind::ResourceId, "objective:goal-other")
+                        .unwrap(),
+                ],
+            )],
+        );
+        let mut complete_events = vec![declaration, complete];
+        renumber(&mut complete_events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &complete_events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state,
+            RunObligationState::Satisfied
+        );
+    }
+
+    #[test]
+    fn mutation_of_a_covered_collection_invalidates_prior_absence_proof() {
+        let collection_id = "objective_collection:scheduled_goals";
+        let facets = [ToolSemanticFacet::Schedule];
+        let mut item = checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending");
+        item.observation_targets = vec![objective_observation_target(
+            "objective:goal-missing",
+            &facets,
+            Some(collection_id),
+        )];
+        let collection_hint =
+            ToolTargetHint::new(ToolTargetHintKind::ResourceId, collection_id).unwrap();
+        let complete_absence = with_exact_observations(
+            result(
+                "complete",
+                "scheduled_goal_runs",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            Vec::new(),
+            vec![ToolCollectionObservation::complete(
+                collection_hint,
+                &facets,
+                Vec::new(),
+            )],
+        );
+        let collection_mutation = result(
+            "create-schedule",
+            "manage_goal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION)
+                .with_target_hint(ToolTargetHintKind::ResourceId, collection_id),
+        );
+        let mut events = vec![
+            executor_expectations(vec![item]),
+            complete_absence,
+            collection_mutation,
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Invalidated
+        );
+    }
+
+    #[test]
+    fn retargeting_a_checklist_index_does_not_inherit_the_old_subjects_proof() {
+        let facets = [ToolSemanticFacet::Control];
+        let mut item_a = checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending");
+        item_a.observation_targets = vec![objective_observation_target(
+            "objective:goal-a",
+            &facets,
+            None,
+        )];
+        let mut item_b = item_a.clone();
+        item_b.observation_targets = vec![objective_observation_target(
+            "objective:goal-b",
+            &facets,
+            None,
+        )];
+        let mut events = vec![
+            executor_expectations(vec![item_a]),
+            with_exact_observations(
+                result(
+                    "read-a",
+                    "manage_mandates",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    ToolCallSemantics::observation(),
+                ),
+                vec![objective_observation("objective:goal-a", &facets)],
+                Vec::new(),
+            ),
+            executor_expectations(vec![item_b]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        let obligation = &aggregate.obligations["task:task-1/obligation:checklist:0"];
+        assert_eq!(obligation.state, RunObligationState::Pending);
+        assert!(obligation.satisfying_receipt_ids.is_empty());
+    }
+
+    #[test]
+    fn upstream_completion_id_cannot_bypass_an_exact_observation_selector() {
+        let facets = [ToolSemanticFacet::Measurement];
+        let mut item = checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending");
+        item.observation_targets = vec![objective_observation_target(
+            "objective:goal-a",
+            &facets,
+            None,
+        )];
+        let mut wrong = with_exact_observations(
+            result(
+                "read-b",
+                "manage_mandates",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::observation(),
+            ),
+            vec![objective_observation("objective:goal-b", &facets)],
+            Vec::new(),
+        );
+        wrong.data["receipt"]["completion_obligation_ids"] =
+            serde_json::json!(["task:task-1/obligation:checklist:0"]);
+        let mut events = vec![executor_expectations(vec![item]), wrong];
+        renumber(&mut events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state,
+            RunObligationState::Pending
         );
     }
 

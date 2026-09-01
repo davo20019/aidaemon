@@ -1,14 +1,306 @@
-//! One authoritative lifecycle readout for a goal-backed objective.
+//! One authoritative lifecycle readout for goal-backed objectives.
 //!
 //! An objective's health lives in typed durable state (schedules, goal runs,
-//! recovery disposition), but it used to be visible only through
-//! `scheduled_goal_runs`. An owner audit that happened to consult a different
-//! surface (for example the mandate listing) honestly reported the objective
-//! as "unknown" even while the durable state said healthy. Every owner-facing
-//! surface that lists an objective must project THIS shared summary, so the
-//! answer does not depend on which tool the model consults.
+//! recovery disposition, and mandate control). The scheduled-goal and mandate
+//! collections are different universes, so a shared projection must preserve
+//! both the exact goal identity and which collection supplied each row. A
+//! complete collection may prove absence only inside that collection; a
+//! truncated or unqueried collection may not.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Durable collections that can contribute an objective row. These names are
+/// deliberately about source membership, not about what a row happens to say:
+/// a mandate-controller goal with no cron row is still a mandate controller,
+/// and does not prove that some unrelated scheduled objective is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ObjectiveCollection {
+    ScheduledGoals,
+    MandateControllers,
+}
+
+impl ObjectiveCollection {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScheduledGoals => "scheduled_goals",
+            Self::MandateControllers => "mandate_controllers",
+        }
+    }
+
+    pub(crate) const fn resource_id(self) -> &'static str {
+        match self {
+            Self::ScheduledGoals => "objective_collection:scheduled_goals",
+            Self::MandateControllers => "objective_collection:mandate_controllers",
+        }
+    }
+
+    fn target_hint(self) -> crate::traits::ToolTargetHint {
+        crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ResourceId,
+            self.resource_id(),
+        )
+        .expect("objective collection IDs are nonempty constants")
+    }
+}
+
+pub(crate) const OBJECTIVE_STATUS_FACETS: [crate::traits::ToolSemanticFacet; 6] = [
+    crate::traits::ToolSemanticFacet::Schedule,
+    crate::traits::ToolSemanticFacet::RunState,
+    crate::traits::ToolSemanticFacet::Recovery,
+    crate::traits::ToolSemanticFacet::Control,
+    crate::traits::ToolSemanticFacet::Measurement,
+    crate::traits::ToolSemanticFacet::Ownership,
+];
+
+pub(crate) fn objective_resource_id(goal_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // The checklist needs a stable exact identity, while owner-facing tool
+    // output must not expose internal database UUIDs. A full digest keeps the
+    // mapping deterministic without relying on display prose or row order.
+    format!("objective:sha256:{:x}", Sha256::digest(goal_id.as_bytes()))
+}
+
+/// Coverage for one collection enumeration. `complete` is derived rather than
+/// supplied so callers cannot accidentally label a limited result authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectiveCollectionCoverage {
+    pub collection: ObjectiveCollection,
+    pub total: usize,
+    pub returned: usize,
+}
+
+impl ObjectiveCollectionCoverage {
+    pub(crate) fn new(
+        collection: ObjectiveCollection,
+        total: usize,
+        returned: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            returned <= total,
+            "objective collection {} returned {returned} rows from a total of {total}",
+            collection.as_str()
+        );
+        Ok(Self {
+            collection,
+            total,
+            returned,
+        })
+    }
+
+    pub(crate) const fn is_complete(self) -> bool {
+        self.returned == self.total
+    }
+
+    pub(crate) fn as_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.collection.as_str(),
+            "resource_id": self.collection.resource_id(),
+            "complete": self.is_complete(),
+            "total": self.total,
+            "returned": self.returned,
+            "absence_semantics": if self.is_complete() {
+                "authoritative_within_collection"
+            } else {
+                "unknown_outside_returned_rows"
+            },
+        })
+    }
+}
+
+/// The only three defensible answers to collection membership. In particular,
+/// not seeing a subject in a limited collection is `Unknown`, never `Absent`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectiveCollectionMembership {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Subject-keyed row in the canonical objective portfolio. The stable goal ID
+/// is retained even when a public renderer elects not to display internal IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectivePortfolioRow {
+    pub goal_id: String,
+    pub source_membership: BTreeSet<ObjectiveCollection>,
+    pub status: ObjectiveStatus,
+}
+
+impl ObjectivePortfolioRow {
+    pub(crate) fn subject_hint(&self) -> crate::traits::ToolTargetHint {
+        crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ResourceId,
+            objective_resource_id(&self.goal_id),
+        )
+        .expect("validated objective goal IDs are nonempty")
+    }
+
+    pub(crate) fn source_membership_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.source_membership
+                .iter()
+                .map(|collection| serde_json::Value::String(collection.as_str().to_string()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn source_membership_label(&self) -> String {
+        self.source_membership
+            .iter()
+            .map(|collection| collection.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// A portfolio joins rows only by stable goal ID. It intentionally does not
+/// attempt to infer that similar objective prose, account configuration, row
+/// order, or one collection's first result refers to another collection's row.
+#[derive(Debug, Default)]
+pub(crate) struct ObjectivePortfolio {
+    subjects: BTreeMap<String, ObjectivePortfolioRow>,
+    coverage: BTreeMap<ObjectiveCollection, ObjectiveCollectionCoverage>,
+}
+
+impl ObjectivePortfolio {
+    pub(crate) fn record_collection(
+        &mut self,
+        coverage: ObjectiveCollectionCoverage,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.coverage.get(&coverage.collection) {
+            anyhow::ensure!(
+                existing == &coverage,
+                "objective collection {} was enumerated with conflicting coverage",
+                coverage.collection.as_str()
+            );
+            return Ok(());
+        }
+        self.coverage.insert(coverage.collection, coverage);
+        Ok(())
+    }
+
+    pub(crate) fn insert(&mut self, row: ObjectivePortfolioRow) -> anyhow::Result<()> {
+        match self.subjects.get_mut(&row.goal_id) {
+            Some(existing) => {
+                anyhow::ensure!(
+                    existing.status == row.status,
+                    "objective subject {} was projected with conflicting lifecycle state",
+                    row.goal_id
+                );
+                existing.source_membership.extend(row.source_membership);
+            }
+            None => {
+                self.subjects.insert(row.goal_id.clone(), row);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn subject(&self, goal_id: &str) -> Option<&ObjectivePortfolioRow> {
+        self.subjects.get(goal_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subjects(&self) -> impl Iterator<Item = &ObjectivePortfolioRow> {
+        self.subjects.values()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn membership(
+        &self,
+        goal_id: &str,
+        collection: ObjectiveCollection,
+    ) -> ObjectiveCollectionMembership {
+        if self
+            .subjects
+            .get(goal_id)
+            .is_some_and(|row| row.source_membership.contains(&collection))
+        {
+            return ObjectiveCollectionMembership::Present;
+        }
+        match self.coverage.get(&collection) {
+            Some(coverage) if coverage.is_complete() => ObjectiveCollectionMembership::Absent,
+            _ => ObjectiveCollectionMembership::Unknown,
+        }
+    }
+
+    pub(crate) fn collection_scope_json(
+        &self,
+        primary: ObjectiveCollection,
+    ) -> anyhow::Result<serde_json::Value> {
+        let coverage = self.coverage.get(&primary).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "objective collection {} has no coverage record",
+                primary.as_str()
+            )
+        })?;
+        let not_enumerated = [
+            ObjectiveCollection::ScheduledGoals,
+            ObjectiveCollection::MandateControllers,
+        ]
+        .into_iter()
+        .filter(|collection| !self.coverage.contains_key(collection))
+        .map(|collection| serde_json::Value::String(collection.as_str().to_string()))
+        .collect::<Vec<_>>();
+        let mut value = coverage.as_json();
+        value["not_enumerated"] = serde_json::Value::Array(not_enumerated);
+        Ok(value)
+    }
+
+    /// Convert the canonical subject-keyed snapshot into durable receipt
+    /// assertions. Renderers may reorder or truncate prose, but the adapter's
+    /// exact subject/facet and collection coverage remain stable evidence.
+    pub(crate) fn receipt_evidence(
+        &self,
+    ) -> (
+        Vec<crate::traits::ToolObservationEvidence>,
+        Vec<crate::traits::ToolCollectionObservation>,
+    ) {
+        let observations = self
+            .subjects
+            .values()
+            .map(|row| {
+                let mut observation = crate::traits::ToolObservationEvidence::new(
+                    row.subject_hint(),
+                    &OBJECTIVE_STATUS_FACETS,
+                );
+                for collection in &row.source_membership {
+                    observation = observation.with_source_collection(collection.target_hint());
+                }
+                observation
+            })
+            .collect::<Vec<_>>();
+        let collections = self
+            .coverage
+            .values()
+            .map(|coverage| {
+                let members = self
+                    .subjects
+                    .values()
+                    .filter(|row| row.source_membership.contains(&coverage.collection))
+                    .map(ObjectivePortfolioRow::subject_hint)
+                    .collect::<Vec<_>>();
+                crate::traits::ToolCollectionObservation {
+                    collection: coverage.collection.target_hint(),
+                    facets: OBJECTIVE_STATUS_FACETS.to_vec(),
+                    completeness: if coverage.is_complete() {
+                        crate::traits::ToolCollectionCompleteness::Complete
+                    } else {
+                        crate::traits::ToolCollectionCompleteness::Partial
+                    },
+                    returned_count: coverage.returned,
+                    total_count: Some(coverage.total),
+                    members,
+                }
+            })
+            .collect();
+        (observations, collections)
+    }
+}
 
 /// Typed lifecycle snapshot for one goal-backed objective.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectiveStatus {
     /// "active", "paused", or "missing".
     pub schedule_state: &'static str,
@@ -29,6 +321,7 @@ pub(crate) struct ObjectiveStatus {
 
 /// Typed delegation/control readout for one goal-backed objective, derived
 /// from the goal's mandate row and its recorded objective measurements.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectiveControlFacet {
     pub mandate_status: String,
     pub autonomy_mode: String,
@@ -90,16 +383,64 @@ pub(crate) fn objective_control_json(control: Option<&ObjectiveControlFacet>) ->
     }
 }
 
-/// Aggregate the typed rows into the snapshot. Pure so every surface —
-/// whatever store facade it holds — fetches its own rows and projects the
-/// identical summary.
-pub(crate) fn objective_status(
+/// Project one exact goal into a portfolio row. All typed inputs are checked
+/// against the requested subject before any field is aggregated. This is the
+/// central defense against projecting goal B's mandate or run state onto goal
+/// A merely because the rows were adjacent or fetched by the same audit.
+pub(crate) fn objective_portfolio_row(
+    goal_id: &str,
+    enumerated_from: ObjectiveCollection,
     schedules: &[crate::traits::GoalSchedule],
     runs: &[crate::traits::GoalRun],
     recovery: Option<&crate::traits::ScheduledRecoveryState>,
     mandate: Option<&crate::traits::Mandate>,
     measurement_count: usize,
-) -> ObjectiveStatus {
+) -> anyhow::Result<ObjectivePortfolioRow> {
+    anyhow::ensure!(!goal_id.trim().is_empty(), "objective subject is empty");
+    for schedule in schedules {
+        anyhow::ensure!(
+            schedule.goal_id == goal_id,
+            "schedule {} belongs to goal {}, not objective subject {goal_id}",
+            schedule.id,
+            schedule.goal_id
+        );
+    }
+    for run in runs {
+        anyhow::ensure!(
+            run.goal_id == goal_id,
+            "goal run {} belongs to goal {}, not objective subject {goal_id}",
+            run.id,
+            run.goal_id
+        );
+    }
+    if let Some(recovery) = recovery {
+        anyhow::ensure!(
+            recovery.goal_id == goal_id,
+            "recovery state belongs to goal {}, not objective subject {goal_id}",
+            recovery.goal_id
+        );
+    }
+    if let Some(mandate) = mandate {
+        anyhow::ensure!(
+            mandate.goal_id == goal_id,
+            "mandate {} belongs to goal {}, not objective subject {goal_id}",
+            mandate.id,
+            mandate.goal_id
+        );
+    } else {
+        anyhow::ensure!(
+            measurement_count == 0,
+            "objective subject {goal_id} has measurements without a mandate"
+        );
+    }
+
+    // Membership records which collection enumeration returned this subject,
+    // not which facet rows happened to be joined while projecting it. A
+    // scheduled audit may read a mandate facet without enumerating (or being
+    // authorized to enumerate) the mandate collection; that cannot become a
+    // collection-membership claim.
+    let source_membership = BTreeSet::from([enumerated_from]);
+
     let active_count = schedules
         .iter()
         .filter(|schedule| !schedule.is_paused)
@@ -137,15 +478,19 @@ pub(crate) fn objective_status(
             recovery.failure_budget,
         )
     });
-    ObjectiveStatus {
-        schedule_state,
-        next_run_at,
-        latest_run,
-        recovery,
-        runs_completed,
-        runs_failed,
-        control: objective_control_facet(mandate, measurement_count),
-    }
+    Ok(ObjectivePortfolioRow {
+        goal_id: goal_id.to_string(),
+        source_membership,
+        status: ObjectiveStatus {
+            schedule_state,
+            next_run_at,
+            latest_run,
+            recovery,
+            runs_completed,
+            runs_failed,
+            control: objective_control_facet(mandate, measurement_count),
+        },
+    })
 }
 
 /// Render the snapshot as a single plain-text line for list surfaces.
@@ -249,7 +594,17 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();
         let recovery = state.get_scheduled_recovery_state(&goal.id).await.unwrap();
-        let status = objective_status(&schedules, &runs, recovery.as_ref(), None, 0);
+        let status = objective_portfolio_row(
+            &goal.id,
+            ObjectiveCollection::ScheduledGoals,
+            &schedules,
+            &runs,
+            recovery.as_ref(),
+            None,
+            0,
+        )
+        .unwrap()
+        .status;
         assert_eq!(status.schedule_state, "active");
         assert_eq!(
             status.next_run_at.as_deref(),
@@ -314,7 +669,17 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         let runs = state.get_goal_runs(&goal.id).await.unwrap();
         let recovery = state.get_scheduled_recovery_state(&goal.id).await.unwrap();
-        let status = objective_status(&schedules, &runs, recovery.as_ref(), None, 0);
+        let status = objective_portfolio_row(
+            &goal.id,
+            ObjectiveCollection::ScheduledGoals,
+            &schedules,
+            &runs,
+            recovery.as_ref(),
+            None,
+            0,
+        )
+        .unwrap()
+        .status;
         assert_eq!(status.schedule_state, "paused");
         assert_eq!(status.next_run_at, None);
         let (disposition, failures, _) = status.recovery.unwrap();
@@ -379,7 +744,17 @@ mod tests {
             baseline_observed_at: chrono::Utc::now().to_rfc3339(),
         });
 
-        let status = objective_status(&[], &[], None, Some(&mandate), 3);
+        let status = objective_portfolio_row(
+            &goal.id,
+            ObjectiveCollection::MandateControllers,
+            &[],
+            &[],
+            None,
+            Some(&mandate),
+            3,
+        )
+        .unwrap()
+        .status;
         let control = status.control.as_ref().unwrap();
         assert_eq!(control.mandate_status, "active");
         assert_eq!(control.autonomy_mode, "bounded");
@@ -413,7 +788,17 @@ mod tests {
         // typed answer rather than an unknown.
         mandate.objective_control = None;
         mandate.authority.operation_scopes.clear();
-        let status = objective_status(&[], &[], None, Some(&mandate), 0);
+        let status = objective_portfolio_row(
+            &goal.id,
+            ObjectiveCollection::MandateControllers,
+            &[],
+            &[],
+            None,
+            Some(&mandate),
+            0,
+        )
+        .unwrap()
+        .status;
         let line = render_objective_status_line(&status);
         assert!(
             line.contains(
@@ -421,5 +806,147 @@ mod tests {
             ),
             "{line}"
         );
+    }
+
+    #[test]
+    fn portfolio_keeps_unrelated_collection_subjects_distinct_and_scopes_absence() {
+        let mut scheduled_goal =
+            Goal::new_continuous("Publish the Acme digest", "owner-session", None, None);
+        scheduled_goal.id = "goal-scheduled-a".to_string();
+        let mut controller_goal =
+            Goal::new_continuous("Review Acme engagement", "owner-session", None, None);
+        controller_goal.id = "goal-controller-b".to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: "schedule-a".to_string(),
+            goal_id: scheduled_goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: "2026-09-02T10:00:00+00:00".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let mandate = crate::traits::Mandate::new(
+            &controller_goal.id,
+            None,
+            "Review Acme engagement",
+            "owner-session",
+            crate::traits::MandateAuthority::default(),
+            3_600,
+            21_600,
+            10_800,
+        );
+
+        let scheduled_row = objective_portfolio_row(
+            &scheduled_goal.id,
+            ObjectiveCollection::ScheduledGoals,
+            std::slice::from_ref(&schedule),
+            &[],
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+        let controller_row = objective_portfolio_row(
+            &controller_goal.id,
+            ObjectiveCollection::MandateControllers,
+            &[],
+            &[],
+            None,
+            Some(&mandate),
+            1,
+        )
+        .unwrap();
+
+        // Insert in the reverse of the collection/subject order. Identity,
+        // never position, controls the merge.
+        let mut portfolio = ObjectivePortfolio::default();
+        portfolio
+            .record_collection(
+                ObjectiveCollectionCoverage::new(ObjectiveCollection::ScheduledGoals, 1, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        portfolio
+            .record_collection(
+                ObjectiveCollectionCoverage::new(ObjectiveCollection::MandateControllers, 1, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        portfolio.insert(controller_row.clone()).unwrap();
+        portfolio.insert(scheduled_row.clone()).unwrap();
+
+        assert_eq!(portfolio.subjects().count(), 2);
+        let scheduled = portfolio.subject(&scheduled_goal.id).unwrap();
+        assert_eq!(scheduled.status.schedule_state, "active");
+        assert!(scheduled.status.control.is_none());
+        let controller = portfolio.subject(&controller_goal.id).unwrap();
+        assert_eq!(controller.status.schedule_state, "missing");
+        assert_eq!(
+            controller
+                .status
+                .control
+                .as_ref()
+                .map(|control| control.measurement_count),
+            Some(1)
+        );
+        assert_eq!(
+            portfolio.membership(&scheduled_goal.id, ObjectiveCollection::ScheduledGoals),
+            ObjectiveCollectionMembership::Present
+        );
+        assert_eq!(
+            portfolio.membership(&scheduled_goal.id, ObjectiveCollection::MandateControllers),
+            ObjectiveCollectionMembership::Absent
+        );
+        assert_eq!(
+            portfolio.membership(&controller_goal.id, ObjectiveCollection::ScheduledGoals),
+            ObjectiveCollectionMembership::Absent
+        );
+        assert_eq!(
+            portfolio.membership(&controller_goal.id, ObjectiveCollection::MandateControllers),
+            ObjectiveCollectionMembership::Present
+        );
+
+        // A limit makes non-membership unknown, and never global absence.
+        let mut limited = ObjectivePortfolio::default();
+        limited
+            .record_collection(
+                ObjectiveCollectionCoverage::new(ObjectiveCollection::ScheduledGoals, 2, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        limited.insert(scheduled_row).unwrap();
+        assert_eq!(
+            limited.membership(&controller_goal.id, ObjectiveCollection::ScheduledGoals),
+            ObjectiveCollectionMembership::Unknown
+        );
+        let scope = limited
+            .collection_scope_json(ObjectiveCollection::ScheduledGoals)
+            .unwrap();
+        assert_eq!(scope["complete"], false);
+        assert_eq!(scope["absence_semantics"], "unknown_outside_returned_rows");
+        assert_eq!(
+            scope["not_enumerated"],
+            serde_json::json!(["mandate_controllers"])
+        );
+
+        // Passing one subject's durable row while naming another fails before
+        // any lifecycle or control field can be projected.
+        let error = objective_portfolio_row(
+            &controller_goal.id,
+            ObjectiveCollection::MandateControllers,
+            &[schedule],
+            &[],
+            None,
+            Some(&mandate),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not objective subject"));
     }
 }

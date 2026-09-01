@@ -392,7 +392,11 @@ impl ScheduledGoalRunsTool {
     /// inspection belong on the same capability surface: requiring callers to
     /// first guess an ID (or route through the memory tool) makes absence and
     /// cross-object audits impossible to establish reliably.
-    async fn overview(&self, limit: usize, include_diagnostics: bool) -> anyhow::Result<String> {
+    async fn overview_snapshot(
+        &self,
+        limit: usize,
+        include_diagnostics: bool,
+    ) -> anyhow::Result<(String, crate::tools::objective_status::ObjectivePortfolio)> {
         let mut goals = self.state.get_scheduled_goals().await?;
         goals.sort_by(|left, right| {
             let left_rank = usize::from(left.status != "active");
@@ -404,6 +408,14 @@ impl ScheduledGoalRunsTool {
 
         let total = goals.len();
         let limit = limit.clamp(1, 100);
+        let returned = total.min(limit);
+        let coverage = crate::tools::objective_status::ObjectiveCollectionCoverage::new(
+            crate::tools::objective_status::ObjectiveCollection::ScheduledGoals,
+            total,
+            returned,
+        )?;
+        let mut portfolio = crate::tools::objective_status::ObjectivePortfolio::default();
+        portfolio.record_collection(coverage)?;
         let mut records = Vec::new();
         for goal in goals.into_iter().take(limit) {
             let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
@@ -421,10 +433,6 @@ impl ScheduledGoalRunsTool {
                     .unwrap_or(&right.created_at);
                 right_time.cmp(left_time)
             });
-            let active_schedule_count = schedules
-                .iter()
-                .filter(|schedule| !schedule.is_paused)
-                .count();
             let latest_run = tasks.first().map(|task| {
                 let mut run = json!({
                     "status": task.status,
@@ -437,11 +445,6 @@ impl ScheduledGoalRunsTool {
                 }
                 run
             });
-            let next_run_at = schedules
-                .iter()
-                .filter(|schedule| !schedule.is_paused)
-                .map(|schedule| schedule.next_run_at.as_str())
-                .min();
             let last_run_at = schedules
                 .iter()
                 .filter_map(|schedule| schedule.last_run_at.as_deref())
@@ -456,15 +459,7 @@ impl ScheduledGoalRunsTool {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 });
-            // Terminal run history is the objective's measurement record:
-            // an audit asking "is progress measured?" reads these counts and
-            // the latest outcome directly instead of inferring from task rows.
             let runs = self.state.get_goal_runs(&goal.id).await?;
-            let runs_completed = runs.iter().filter(|run| run.status == "completed").count();
-            let runs_failed = runs
-                .iter()
-                .filter(|run| matches!(run.status.as_str(), "failed" | "blocked" | "cancelled"))
-                .count();
             let latest_run_outcome = runs.first().map(|run| {
                 json!({
                     "status": run.status,
@@ -475,33 +470,6 @@ impl ScheduledGoalRunsTool {
                         .map(|summary| Self::truncate(summary, 200)),
                 })
             });
-            let mut record = json!({
-                "objective": Self::truncate(&goal.description, 240),
-                "goal_status": goal.status,
-                "workspace_binding": workspace_binding,
-                "run_history": {
-                    "completed": runs_completed,
-                    "failed": runs_failed,
-                    "total": runs.len(),
-                },
-                "latest_run_outcome": latest_run_outcome,
-                "schedule_count": schedules.len(),
-                "active_schedule_count": active_schedule_count,
-                "schedule_state": if schedules.is_empty() {
-                    "missing"
-                } else if active_schedule_count > 0 {
-                    "active"
-                } else {
-                    "paused"
-                },
-                "next_run_at": next_run_at,
-                "last_run_at": last_run_at,
-                "latest_run": latest_run,
-            });
-            // The delegation/control answer is typed state with an explicit
-            // absent value: an audit asking "does anything control this
-            // objective, and is it measured?" reads this object instead of
-            // reporting the question unanswerable from this surface.
             let mandate = self.state.get_mandate_for_goal(&goal.id).await?;
             let measurement_count = match mandate.as_ref() {
                 Some(mandate) => self
@@ -511,21 +479,44 @@ impl ScheduledGoalRunsTool {
                     .len(),
                 None => 0,
             };
-            let control = crate::tools::objective_status::objective_control_facet(
+            let recovery = self.state.get_scheduled_recovery_state(&goal.id).await?;
+            let row = crate::tools::objective_status::objective_portfolio_row(
+                &goal.id,
+                crate::tools::objective_status::ObjectiveCollection::ScheduledGoals,
+                &schedules,
+                &runs,
+                recovery.as_ref(),
                 mandate.as_ref(),
                 measurement_count,
-            );
-            record["objective_control"] =
-                crate::tools::objective_status::objective_control_json(control.as_ref());
-            // The recorded-measurement count is a plain fact independent of
-            // whether a control loop exists (zero without a mandate), so it
-            // stays readable even when objective_control is the bare
-            // "absent" scalar.
-            record["objective_measurement_count"] = json!(measurement_count);
-            // The failure budget and recovery disposition are part of the
-            // objective's current state, not a diagnostic detail: a paused
-            // schedule with an escalated budget explains a missing next run.
-            if let Some(recovery) = self.state.get_scheduled_recovery_state(&goal.id).await? {
+            )?;
+            let status = &row.status;
+            let active_schedule_count = schedules
+                .iter()
+                .filter(|schedule| !schedule.is_paused)
+                .count();
+            let mut record = json!({
+                "objective_id": crate::tools::objective_status::objective_resource_id(&goal.id),
+                "objective": Self::truncate(&goal.description, 240),
+                "goal_status": goal.status,
+                "workspace_binding": workspace_binding,
+                "source_membership": row.source_membership_json(),
+                "run_history": {
+                    "completed": status.runs_completed,
+                    "failed": status.runs_failed,
+                    "total": runs.len(),
+                },
+                "latest_run_outcome": latest_run_outcome,
+                "schedule_count": schedules.len(),
+                "active_schedule_count": active_schedule_count,
+                "schedule_state": status.schedule_state,
+                "next_run_at": status.next_run_at,
+                "last_run_at": last_run_at,
+                "latest_run": latest_run,
+                "objective_control":
+                    crate::tools::objective_status::objective_control_json(status.control.as_ref()),
+                "objective_measurement_count": measurement_count,
+            });
+            if let Some(recovery) = recovery {
                 record["recovery"] = json!({
                     "disposition": recovery.disposition.as_str(),
                     "consecutive_failures": recovery.consecutive_failures,
@@ -545,16 +536,27 @@ impl ScheduledGoalRunsTool {
                         .collect(),
                 );
             }
+            portfolio.insert(row)?;
             records.push(record);
         }
 
-        Ok(serde_json::to_string_pretty(&json!({
+        let output = serde_json::to_string_pretty(&json!({
             "snapshot": "scheduled_objectives",
-            "complete": records.len() == total,
-            "total": total,
-            "returned": records.len(),
+            "complete": coverage.is_complete(),
+            "total": coverage.total,
+            "returned": coverage.returned,
+            "collection_scope": portfolio.collection_scope_json(
+                crate::tools::objective_status::ObjectiveCollection::ScheduledGoals,
+            )?,
             "objectives": records,
-        }))?)
+        }))?;
+        Ok((output, portfolio))
+    }
+
+    async fn overview(&self, limit: usize, include_diagnostics: bool) -> anyhow::Result<String> {
+        self.overview_snapshot(limit, include_diagnostics)
+            .await
+            .map(|(output, _)| output)
     }
 
     fn infer_hints(problem_text: &str, has_blocked: bool) -> Vec<&'static str> {
@@ -1368,7 +1370,17 @@ impl Tool for ScheduledGoalRunsTool {
         _status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
-        let output = self.call(arguments).await?;
+        let (output, objective_evidence) = if args.action == "overview" {
+            let (output, portfolio) = self
+                .overview_snapshot(
+                    args.limit.unwrap_or(50),
+                    args.include_diagnostics.unwrap_or(false),
+                )
+                .await?;
+            (output, Some(portfolio.receipt_evidence()))
+        } else {
+            (self.call(arguments).await?, None)
+        };
         let mut internal_identifiers = crate::tools::sanitize::extract_uuid_identifiers(&output);
         for candidate in [args.goal_id.as_deref(), args.schedule_id.as_deref()]
             .into_iter()
@@ -1390,14 +1402,18 @@ impl Tool for ScheduledGoalRunsTool {
         } else {
             None
         };
-        Ok(ToolCallOutcome {
+        let mut outcome = ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
                 presentation,
                 internal_identifiers,
                 ..ToolCallMetadata::default()
             },
-        })
+        };
+        if let Some((observations, collections)) = objective_evidence {
+            outcome = outcome.with_observation_evidence(observations, collections);
+        }
+        Ok(outcome)
     }
 }
 
@@ -1494,7 +1510,11 @@ mod tests {
         let task_id = task.id.clone();
         state.create_task(&task).await.unwrap();
 
-        let output = tool.call(r#"{"action":"overview"}"#).await.unwrap();
+        let outcome = tool
+            .call_with_status_outcome(r#"{"action":"overview"}"#, None)
+            .await
+            .unwrap();
+        let output = outcome.output;
         let snapshot: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(snapshot["snapshot"], "scheduled_objectives");
         assert_eq!(snapshot["complete"], true);
@@ -1505,6 +1525,38 @@ mod tests {
         // present (observed in R47), so absence must not have a shape.
         assert_eq!(snapshot["objectives"][0]["objective_control"], "absent");
         assert_eq!(snapshot["objectives"][0]["objective_measurement_count"], 0);
+        let objective_id = crate::tools::objective_status::objective_resource_id(&goal_id);
+        assert_eq!(snapshot["objectives"][0]["objective_id"], objective_id);
+        let observation = outcome
+            .metadata
+            .observations
+            .iter()
+            .find(|observation| observation.subject.value == objective_id)
+            .expect("exact objective receipt assertion");
+        assert!(observation
+            .facets
+            .contains(&crate::traits::ToolSemanticFacet::Schedule));
+        assert!(observation
+            .facets
+            .contains(&crate::traits::ToolSemanticFacet::Control));
+        let collection = outcome
+            .metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value
+                    == crate::tools::objective_status::ObjectiveCollection::ScheduledGoals
+                        .resource_id()
+            })
+            .expect("scheduled collection coverage");
+        assert_eq!(
+            collection.completeness,
+            crate::traits::ToolCollectionCompleteness::Complete
+        );
+        assert!(collection
+            .members
+            .iter()
+            .any(|member| member.value == objective_id));
         assert!(!output.contains(&goal_id));
         assert!(!output.contains(&schedule_id));
         assert!(!output.contains(&task_id));

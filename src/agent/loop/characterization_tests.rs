@@ -1990,6 +1990,25 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
                 })
             })
     }));
+    let task_end = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "background_ack_characterization",
+            &[crate::events::EventType::TaskEnd],
+            5,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("background parent task end");
+    assert_eq!(task_end.status, crate::events::TaskStatus::Completed);
+    assert_eq!(
+        task_end.effective_outcome(),
+        crate::events::TaskOutcome::Partial,
+        "an in-flight detached invocation is a partial handoff, not a terminal failure"
+    );
 }
 
 #[tokio::test]

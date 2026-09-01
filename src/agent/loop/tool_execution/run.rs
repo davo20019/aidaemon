@@ -4003,6 +4003,9 @@ fn executor_expectations_from_checklist_arguments(
                 }
             }
         }
+        let (targets, observation_targets) =
+            crate::tools::track_requirements::parse_expectation_targets(item.get("targets"))
+                .ok()?;
         items.push(crate::events::ExecutorExpectationItem {
             index,
             description,
@@ -4011,17 +4014,8 @@ fn executor_expectations_from_checklist_arguments(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             mutation_effects,
-            targets: item
-                .get("targets")
-                .and_then(Value::as_array)
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            targets,
+            observation_targets,
             status: item
                 .get("status")
                 .and_then(Value::as_str)
@@ -4062,7 +4056,7 @@ fn strip_untrusted_envelope(text: &str) -> &str {
 // rendered checklist out of a `track_requirements` tool result.
 #[cfg(test)]
 mod checklist_parse_tests {
-    use super::parse_checklist_from_result;
+    use super::{executor_expectations_from_checklist_arguments, parse_checklist_from_result};
 
     #[test]
     fn well_formed_result_splits_to_rendered_checklist() {
@@ -4104,5 +4098,51 @@ mod checklist_parse_tests {
         // the live surface with an empty checklist.
         let result = "Checklist updated (0/1 done):\n";
         assert_eq!(parse_checklist_from_result(result), None);
+    }
+
+    #[test]
+    fn structured_subject_facets_survive_into_the_durable_expectation_event() {
+        let declared = executor_expectations_from_checklist_arguments(
+            "task-synthetic",
+            r#"{
+                "items": [{
+                    "text": "Audit one objective",
+                    "requires_observation": true,
+                    "targets": [{
+                        "subject": {
+                            "kind": "resource_id",
+                            "value": "objective:sha256:synthetic"
+                        },
+                        "facets": ["schedule", "recovery"],
+                        "collection_coverage": {
+                            "collection": {
+                                "kind": "resource_id",
+                                "value": "objective_collection:scheduled_goals"
+                            },
+                            "minimum_completeness": "complete"
+                        }
+                    }],
+                    "status": "pending"
+                }]
+            }"#,
+        )
+        .expect("typed declaration");
+        let item = &declared.items[0];
+        assert_eq!(item.targets, ["objective:sha256:synthetic"]);
+        assert_eq!(item.observation_targets.len(), 1);
+        assert_eq!(
+            item.observation_targets[0].facets,
+            [
+                crate::traits::ToolSemanticFacet::Schedule,
+                crate::traits::ToolSemanticFacet::Recovery
+            ]
+        );
+        assert_eq!(
+            item.observation_targets[0]
+                .collection_coverage
+                .as_ref()
+                .map(|coverage| coverage.collection.value.as_str()),
+            Some("objective_collection:scheduled_goals")
+        );
     }
 }

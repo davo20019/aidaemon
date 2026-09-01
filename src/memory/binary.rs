@@ -35,8 +35,8 @@ pub fn decode_embedding_with_dim(blob: &[u8], expected_dim: usize) -> Result<Vec
     if expected_dim > 0 && blob.len() == expected_size {
         // Binary format: flat little-endian f32
         let mut vec = Vec::with_capacity(expected_dim);
-        for chunk in blob.chunks_exact(4) {
-            vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for chunk in blob.as_chunks::<4>().0 {
+            vec.push(f32::from_le_bytes(*chunk));
         }
         Ok(vec)
     } else if blob.first() == Some(&b'[') {

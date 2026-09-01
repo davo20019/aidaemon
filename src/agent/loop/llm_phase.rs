@@ -2395,6 +2395,7 @@ mod tests {
                 satisfied_at_revision: Some(0),
                 satisfying_receipt_ids: vec!["result-1".to_string()],
                 required_target: None,
+                observation_targets: Vec::new(),
                 summary: None,
             },
         );
@@ -2414,6 +2415,8 @@ mod tests {
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
+                observations: Vec::new(),
+                collection_observations: Vec::new(),
                 mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 observes: false,
                 result_revision: None,

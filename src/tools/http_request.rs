@@ -412,7 +412,7 @@ impl HttpRequestTool {
         format!("{kind}:{encoded}")
     }
 
-    fn auth_profile_resource_id(profile_name: &str) -> String {
+    pub(crate) fn auth_profile_resource_id(profile_name: &str) -> String {
         Self::scoped_resource_id("auth_profile", profile_name)
     }
 

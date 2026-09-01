@@ -25,11 +25,13 @@ pub use conversation::{
     message_content_is_structural_only, AttachmentProvenance, ConversationSummary, Message,
     MessageAnnotation, MessageAttachment, ToolCall,
 };
+#[allow(unused_imports)]
 pub use dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AdoptedEvidenceBinding, AssistantTurnKind,
     AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
-    QuestionKind, RequestCompletionContract, RequestDispatchStopRule, RequestEvidenceRequirement,
-    RequestForbiddenAction, RequestReceiptPredicate, RequestResponseContract, RequestTaskKind,
+    QuestionKind, RequestCollectionCoverageRequirement, RequestCompletionContract,
+    RequestDispatchStopRule, RequestEvidenceRequirement, RequestForbiddenAction,
+    RequestObservationTarget, RequestReceiptPredicate, RequestResponseContract, RequestTaskKind,
     RequestVerificationTarget, RequestVerificationTargetKind, RequestedOutcomeCondition,
     UserRequestBinding, UserTurnKind, UserTurnSummary,
 };
@@ -88,8 +90,9 @@ pub use tools::{
     ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation, SpecialistKind, Tool,
     ToolAccessDenial, ToolAccessEnforcement, ToolArgumentContractViolation, ToolCallAccessManifest,
     ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage,
-    ToolMutationEffects, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
+    ToolCapabilities, ToolCollectionCompleteness, ToolCollectionObservation,
+    ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,
+    ToolObservationEvidence, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
     ToolResultContentSource, ToolResultPresentation, ToolResultProvenance, ToolRole,
     ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
     ToolTargetHintKind, ToolVerificationMode, TruncationInfo,

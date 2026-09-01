@@ -407,6 +407,13 @@ pub struct ToolReceiptV1 {
     pub continuation_obligation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
+    /// Exact observations produced by a dispatched adapter result. These are
+    /// copied from result metadata only after dispatch; intended call
+    /// semantics are never promoted into observed evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<crate::traits::ToolObservationEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collection_observations: Vec<crate::traits::ToolCollectionObservation>,
     /// Exact owner-mandate grant checked for this call. This is an audit fact,
     /// not a reusable capability; replay still revalidates current policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,6 +421,9 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
+    // Exact-observation assertions are additive, serde-defaulted fields. Keep
+    // the existing version so durable v7 mutation and continuation receipts
+    // remain admissible across this upgrade.
     pub const SCHEMA_VERSION: u16 = 7;
 
     pub fn from_metadata(
@@ -422,6 +432,7 @@ impl ToolReceiptV1 {
         outcome_evidence: ToolOutcomeEvidenceSource,
         idempotency_key: Option<String>,
     ) -> Self {
+        let dispatched = metadata.invocation_stage.reached_dispatch();
         Self {
             schema_version: Self::SCHEMA_VERSION,
             outcome_status,
@@ -447,6 +458,16 @@ impl ToolReceiptV1 {
             completion_obligation_ids: Vec::new(),
             continuation_obligation_ids: Vec::new(),
             semantics: metadata.semantics.clone(),
+            observations: if dispatched {
+                metadata.observations.clone()
+            } else {
+                Vec::new()
+            },
+            collection_observations: if dispatched {
+                metadata.collection_observations.clone()
+            } else {
+                Vec::new()
+            },
             mandate_authority: None,
         }
     }
@@ -477,6 +498,8 @@ impl ToolReceiptV1 {
             }),
             authorization_preflight: self.authorization_preflight.clone(),
             semantics: self.semantics.clone(),
+            observations: self.observations.clone(),
+            collection_observations: self.collection_observations.clone(),
             ..ToolCallMetadata::default()
         }
     }
@@ -934,6 +957,10 @@ pub struct ExecutorExpectationItem {
     pub mutation_effects: crate::traits::ToolMutationEffects,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<String>,
+    /// Exact subject/facet evidence bindings. `targets` remains as the legacy
+    /// string protocol for persisted events; new declarations populate both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_targets: Vec<crate::traits::RequestObservationTarget>,
     /// The model's declared status (`pending`, `in_progress`, `completed`,
     /// `deferred`, ...). Receipts decide satisfaction; only an explicit
     /// `deferred`/`skipped` abandons an item.
@@ -952,7 +979,7 @@ pub struct ExecutorExpectationsDeclaredData {
 }
 
 impl ExecutorExpectationsDeclaredData {
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2258,6 +2285,71 @@ mod tests {
         assert!(!negative.failed());
         assert!(negative.completed_observation());
         assert!(!negative.compatibility_success());
+    }
+
+    #[test]
+    fn receipt_preserves_only_dispatched_exact_observation_evidence() {
+        let goal = crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ResourceId,
+            "goal:synthetic-goal-1",
+        )
+        .unwrap();
+        let collection = crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ResourceId,
+            "goal_collection:scheduled_goals",
+        )
+        .unwrap();
+        let observation = crate::traits::ToolObservationEvidence::new(
+            goal.clone(),
+            &[
+                crate::traits::ToolSemanticFacet::Schedule,
+                crate::traits::ToolSemanticFacet::Recovery,
+            ],
+        )
+        .with_source_collection(collection.clone());
+        let coverage = crate::traits::ToolCollectionObservation::complete(
+            collection,
+            &[crate::traits::ToolSemanticFacet::Schedule],
+            vec![goal],
+        );
+        let metadata = crate::traits::ToolCallMetadata {
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            observations: vec![observation],
+            collection_observations: vec![coverage],
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let receipt = ToolReceiptV1::from_metadata(
+            &metadata,
+            ToolOutcomeStatus::Succeeded,
+            ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        assert_eq!(receipt.observations, metadata.observations);
+        assert_eq!(
+            receipt.collection_observations,
+            metadata.collection_observations
+        );
+        let replay = receipt.to_metadata();
+        assert_eq!(replay.observations, metadata.observations);
+        assert_eq!(
+            replay.collection_observations,
+            metadata.collection_observations
+        );
+
+        let rejected = crate::traits::ToolCallMetadata {
+            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeIo,
+            observations: metadata.observations,
+            collection_observations: metadata.collection_observations,
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let rejected_receipt = ToolReceiptV1::from_metadata(
+            &rejected,
+            ToolOutcomeStatus::Blocked,
+            ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        assert!(rejected_receipt.observations.is_empty());
+        assert!(rejected_receipt.collection_observations.is_empty());
     }
 
     #[test]

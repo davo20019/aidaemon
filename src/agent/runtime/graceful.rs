@@ -1105,20 +1105,35 @@ impl Agent {
             .task_run_aggregate(emitter.session_id(), task_id)
             .await
             .unwrap_or_else(|_| crate::events::RunAggregate::new(task_id));
+        // A background launch receipt is a nonterminal transition owned by a
+        // durable notifier. A local finalizer/budget path may have proposed
+        // `Failed` after the inline loop stopped, but it cannot turn that
+        // in-flight invocation into a terminal failure. Persist the parent as
+        // a completed partial handoff; the later terminal receipt/continuation
+        // owns the eventual success or failure.
+        let background_in_flight = run_aggregate.has_background_in_flight();
+        let effective_status = if background_in_flight && status != TaskStatus::Cancelled {
+            TaskStatus::Completed
+        } else {
+            status
+        };
         // At task end there is no loop left to make progress: a `Pending`
         // ledger whose terminal receipts all succeeded or were credited is
         // closed by evidence (the still-open obligations are descriptions the
         // contract could not bind to the work that demonstrably happened).
         let terminal_decision = match run_aggregate.terminal_decision() {
             crate::events::RunTerminalDecision::Pending
-                if status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
+                if effective_status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
             {
                 crate::events::RunTerminalDecision::SucceededByEvidence
             }
             decision => decision,
         };
-        let effective_outcome = match (status, terminal_decision) {
+        let effective_outcome = match (effective_status, terminal_decision) {
             (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+            (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
+                crate::events::TaskOutcome::Partial
+            }
             (
                 _,
                 crate::events::RunTerminalDecision::Succeeded
@@ -1162,7 +1177,7 @@ impl Agent {
         // their token cost from policy telemetry.  Existing `Failed` paths
         // retain their legacy pre-boundary increment, so this branch covers
         // only the previously uncounted status projection.
-        if !effective_outcome.task_success() && status != TaskStatus::Failed {
+        if !effective_outcome.task_success() && effective_status != TaskStatus::Failed {
             let tokens = efficiency
                 .as_ref()
                 .map(|data| data.input_tokens.saturating_add(data.output_tokens))
@@ -1224,7 +1239,9 @@ impl Agent {
                 "condition": "task_finalization_reconciled",
                 "requested_outcome": outcome,
                 "effective_outcome": effective_outcome,
-                "status": status,
+                "requested_status": status,
+                "status": effective_status,
+                "background_in_flight": background_in_flight,
                 "run_aggregate_schema_version": run_aggregate.schema_version,
                 "run_contract_present": run_aggregate.contract_present,
                 "run_terminal_decision": format!("{:?}", terminal_decision).to_lowercase(),
@@ -1264,7 +1281,7 @@ impl Agent {
                 EventType::TaskEnd,
                 TaskEndData {
                     task_id: task_id.to_string(),
-                    status,
+                    status: effective_status,
                     outcome: Some(effective_outcome),
                     duration_secs: durable_duration_secs,
                     iterations: iteration as u32,
@@ -1292,7 +1309,7 @@ impl Agent {
             self,
             emitter.session_id(),
             task_id,
-            status,
+            effective_status,
             effective_outcome,
         )
         .await

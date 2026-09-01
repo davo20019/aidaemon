@@ -475,7 +475,130 @@ impl ToolEvidenceCapability {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSemanticFacet {
+    /// Legacy coarse goal-state capability. New exact observations should use
+    /// the narrow facet that was actually returned.
     GoalState,
+    Schedule,
+    RunState,
+    Recovery,
+    Control,
+    Measurement,
+    Authorization,
+    Ownership,
+}
+
+impl ToolSemanticFacet {
+    pub const PROTOCOL_NAMES: [&'static str; 8] = [
+        Self::GoalState.as_str(),
+        Self::Schedule.as_str(),
+        Self::RunState.as_str(),
+        Self::Recovery.as_str(),
+        Self::Control.as_str(),
+        Self::Measurement.as_str(),
+        Self::Authorization.as_str(),
+        Self::Ownership.as_str(),
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GoalState => "goal_state",
+            Self::Schedule => "schedule",
+            Self::RunState => "run_state",
+            Self::Recovery => "recovery",
+            Self::Control => "control",
+            Self::Measurement => "measurement",
+            Self::Authorization => "authorization",
+            Self::Ownership => "ownership",
+        }
+    }
+}
+
+/// Whether an adapter returned the whole requested collection. A truncated or
+/// otherwise partial list may prove facts about the subjects it contains, but
+/// it can never prove that another subject is absent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCollectionCompleteness {
+    #[default]
+    Unknown,
+    Partial,
+    Complete,
+}
+
+impl ToolCollectionCompleteness {
+    pub const fn satisfies(self, required: Self) -> bool {
+        matches!(required, Self::Unknown)
+            || matches!(required, Self::Partial) && matches!(self, Self::Partial | Self::Complete)
+            || matches!(required, Self::Complete) && matches!(self, Self::Complete)
+    }
+}
+
+/// One exact subject/facet tuple observed in a successful tool result. This is
+/// result evidence, not a capability prediction: adapters populate it only
+/// after domain I/O has returned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolObservationEvidence {
+    pub subject: ToolTargetHint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facets: Vec<ToolSemanticFacet>,
+    /// Collections from which this row was selected. Membership is lineage;
+    /// absence still requires a separate complete collection observation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_collections: Vec<ToolTargetHint>,
+}
+
+impl ToolObservationEvidence {
+    pub fn new(subject: ToolTargetHint, facets: &[ToolSemanticFacet]) -> Self {
+        Self {
+            subject,
+            facets: facets.to_vec(),
+            source_collections: Vec::new(),
+        }
+    }
+
+    pub fn with_source_collection(mut self, collection: ToolTargetHint) -> Self {
+        if !self.source_collections.contains(&collection) {
+            self.source_collections.push(collection);
+        }
+        self
+    }
+}
+
+/// Exact coverage of one collection returned by an adapter. `members` contains
+/// stable identities, never display labels. Only `Complete` coverage can prove
+/// non-membership; counts remain audit facts and are not interpreted as proof
+/// on their own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCollectionObservation {
+    pub collection: ToolTargetHint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facets: Vec<ToolSemanticFacet>,
+    #[serde(default)]
+    pub completeness: ToolCollectionCompleteness,
+    #[serde(default)]
+    pub returned_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ToolTargetHint>,
+}
+
+impl ToolCollectionObservation {
+    pub fn complete(
+        collection: ToolTargetHint,
+        facets: &[ToolSemanticFacet],
+        members: Vec<ToolTargetHint>,
+    ) -> Self {
+        let returned_count = members.len();
+        Self {
+            collection,
+            facets: facets.to_vec(),
+            completeness: ToolCollectionCompleteness::Complete,
+            returned_count,
+            total_count: Some(returned_count),
+            members,
+        }
+    }
 }
 
 /// Structured semantic affordances for matching tools to contextual requests.
@@ -1171,6 +1294,14 @@ pub struct ToolCallMetadata {
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
+    /// Exact subject/facet observations made by this dispatched result. These
+    /// are intentionally separate from `ToolCallSemantics`: proposed call
+    /// semantics must never become proof merely because dispatch was planned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ToolObservationEvidence>,
+    /// Collection membership and coverage observed by this dispatched result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collection_observations: Vec<ToolCollectionObservation>,
     /// Complete typed result for successful text-file reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_file: Option<ReadFileResultMetadata>,
@@ -1313,6 +1444,16 @@ impl ToolCallOutcome {
 
     pub fn with_semantics(mut self, semantics: ToolCallSemantics) -> Self {
         self.metadata.semantics = semantics;
+        self
+    }
+
+    pub fn with_observation_evidence(
+        mut self,
+        observations: Vec<ToolObservationEvidence>,
+        collection_observations: Vec<ToolCollectionObservation>,
+    ) -> Self {
+        self.metadata.observations = observations;
+        self.metadata.collection_observations = collection_observations;
         self
     }
 }
