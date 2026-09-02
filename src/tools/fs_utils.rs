@@ -1425,9 +1425,16 @@ mod tests {
                 .expect("anchored project scope");
         assert_eq!(scope, workspace);
 
+        // Negative control: without an anchor the process cwd is the base. Only
+        // the base is asserted — whether the reference is promoted to a project
+        // root depends on what exists under the cwd, which varies by checkout.
         let cwd = std::env::current_dir().unwrap();
         let unanchored = resolve_project_scope_reference("src/content/posts", &[])
             .expect("unanchored project scope resolves against the process cwd");
-        assert_eq!(unanchored, cwd);
+        assert!(
+            unanchored.starts_with(&cwd),
+            "{unanchored:?} should be rooted in {cwd:?}"
+        );
+        assert!(!unanchored.starts_with(&workspace));
     }
 }
