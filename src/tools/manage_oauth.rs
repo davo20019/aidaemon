@@ -535,29 +535,29 @@ impl ManageOAuthTool {
             ));
         }
         let mut result = String::from("Connected OAuth services:\n");
+        let now = chrono::Utc::now();
         for conn in &connections {
             let username = conn
                 .username
                 .as_deref()
                 .map(|u| format!(" ({})", u))
                 .unwrap_or_default();
-            let expires = conn
-                .token_expires_at
-                .as_deref()
-                .map(|e| format!(" [expires: {}]", e))
-                .unwrap_or_default();
+            // Typed readiness instead of a bare expiry: a short-lived bearer
+            // that lapsed since the last call is still usable when a refresh
+            // path exists, and an audit must not have to guess that.
+            let readiness = crate::oauth::CredentialReadiness::for_connection(conn, now).describe();
             let account = conn
                 .account_id
                 .as_deref()
                 .map(|id| format!(" [account_id: {}]", id))
                 .unwrap_or_else(|| " [account_id: unbound]".to_string());
             result.push_str(&format!(
-                "  - {}{} [{}]{}{} [resource_id: {}]\n",
+                "  - {}{} [{}]{} [readiness: {}] [resource_id: {}]\n",
                 conn.service,
                 username,
                 conn.auth_type,
                 account,
-                expires,
+                readiness,
                 HttpRequestTool::auth_profile_resource_id(&conn.service)
             ));
         }
@@ -1527,6 +1527,53 @@ mod tests {
             subject.resource_id.as_deref() == Some(ManageOAuthTool::OAUTH_CONNECTION_COLLECTION_ID)
                 && subject.binds(&resource_id)
         }));
+    }
+
+    #[tokio::test]
+    async fn list_projects_typed_credential_readiness_for_an_expired_but_refreshable_bearer() {
+        // An owner audit read a bare `[expires: <past>]` as a missing credential.
+        // The list must state the typed readiness instead, and must not
+        // exchange the refresh token to do so (no gateway restore here).
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=stale\nOAUTH_TWITTER_REFRESH_TOKEN=rt\nOAUTH_TWITTER_CLIENT_ID=id\nOAUTH_TWITTER_CLIENT_SECRET=secret\n",
+        )
+        .unwrap();
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let expired = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: Some("synthetic_handle".to_string()),
+                account_id: Some("1000000000000000001".to_string()),
+                scopes: r#"["tweet.write"]"#.to_string(),
+                token_expires_at: Some(expired.clone()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let output = tool.call(r#"{"action":"list"}"#).await.unwrap();
+        let expected = crate::oauth::CredentialReadiness::Refreshable {
+            expired_at: Some(expired.clone()),
+            path: crate::oauth::CredentialRefreshPath::RefreshToken,
+        }
+        .describe();
+        assert!(
+            output.contains(&format!("[readiness: {expected}]")),
+            "{output}"
+        );
+        assert!(!output.contains("[expires:"), "{output}");
+        // The refresh token was not spent: the stored secrets are unchanged.
+        let secrets = std::fs::read_to_string(isolation.env_file_path()).unwrap();
+        assert!(secrets.contains("OAUTH_TWITTER_ACCESS_TOKEN=stale"));
+        assert!(secrets.contains("OAUTH_TWITTER_REFRESH_TOKEN=rt"));
     }
 
     #[tokio::test]

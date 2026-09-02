@@ -840,31 +840,25 @@ impl ManageMandatesTool {
         // objective collections. They are deliberately tracked as separate
         // collection memberships: a mandate controller with no cron schedule
         // cannot stand in for an unrelated scheduled-only goal.
-        let mut scheduled_goals = self.state.get_scheduled_goals().await?;
-        // `manage_mandates` is owner-session scoped. Joining the portfolio must
-        // not widen that authority to another session's scheduled objectives.
-        scheduled_goals.retain(|goal| goal.session_id == session_id);
-        scheduled_goals.sort_by(|left, right| {
-            let left_rank = usize::from(left.status != "active");
-            let right_rank = usize::from(right.status != "active");
-            left_rank
-                .cmp(&right_rank)
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        const SCHEDULED_PORTFOLIO_LIMIT: usize = 100;
-        let scheduled_total = scheduled_goals.len();
-        scheduled_goals.truncate(SCHEDULED_PORTFOLIO_LIMIT);
+        //
+        // Mandates are session-scoped by typed authority (`list_mandates`,
+        // `resolve_owned_mandate`, the `transfer` action). Scheduled goals have
+        // no such authority model: `goal.session_id` only records which owner
+        // channel created the goal, and the owner reaches the daemon through
+        // several sessions. Enumerating that collection through the shared
+        // loader keeps its membership identical to `scheduled_goal_runs`, so a
+        // `complete` coverage here really does prove absence (R53).
+        let (scheduled_goals, scheduled_coverage) =
+            crate::tools::objective_status::load_scheduled_goal_collection(
+                self.state.as_ref(),
+                crate::tools::objective_status::SCHEDULED_COLLECTION_LIMIT,
+            )
+            .await?;
 
         let mandate_coverage = crate::tools::objective_status::ObjectiveCollectionCoverage::new(
             crate::tools::objective_status::ObjectiveCollection::MandateControllers,
             mandates.len(),
             mandates.len(),
-        )?;
-        let scheduled_coverage = crate::tools::objective_status::ObjectiveCollectionCoverage::new(
-            crate::tools::objective_status::ObjectiveCollection::ScheduledGoals,
-            scheduled_total,
-            scheduled_goals.len(),
         )?;
         let mut portfolio = crate::tools::objective_status::ObjectivePortfolio::default();
         portfolio.record_collection(mandate_coverage)?;
@@ -3288,19 +3282,21 @@ mod tests {
             .await
             .unwrap();
 
-        // A private owner audit must not widen to another session while
-        // joining the two collections.
-        let foreign = crate::traits::Goal::new_continuous(
-            "Foreign synthetic schedule",
-            "other-session",
+        // The owner reaches the daemon through several channel sessions. A
+        // scheduled objective created through a sibling owner session is part
+        // of the same daemon-wide collection; hiding it while labelling the
+        // coverage `complete` would prove a false absence (R53).
+        let sibling = crate::traits::Goal::new_continuous(
+            "Synthetic schedule created through the coding bot",
+            "owner-session-coding-bot",
             None,
             None,
         );
-        state.create_goal(&foreign).await.unwrap();
+        state.create_goal(&sibling).await.unwrap();
         state
             .create_goal_schedule(&crate::traits::GoalSchedule {
                 id: uuid::Uuid::new_v4().to_string(),
-                goal_id: foreign.id.clone(),
+                goal_id: sibling.id.clone(),
                 cron_expr: "0 7 * * *".to_string(),
                 tz: "local".to_string(),
                 original_schedule: Some("daily".to_string()),
@@ -3333,14 +3329,14 @@ mod tests {
 
         let scheduled_id = crate::tools::objective_status::objective_resource_id(&scheduled.id);
         let controller_id = crate::tools::objective_status::objective_resource_id(&controller.id);
-        let foreign_id = crate::tools::objective_status::objective_resource_id(&foreign.id);
+        let sibling_id = crate::tools::objective_status::objective_resource_id(&sibling.id);
         assert!(outcome.output.contains(&scheduled_id), "{}", outcome.output);
         assert!(
             outcome.output.contains(&controller_id),
             "{}",
             outcome.output
         );
-        assert!(!outcome.output.contains(&foreign_id), "{}", outcome.output);
+        assert!(outcome.output.contains(&sibling_id), "{}", outcome.output);
         let scheduled_position = outcome
             .output
             .find(&scheduled_id)
@@ -3358,9 +3354,9 @@ mod tests {
         assert!(observations
             .iter()
             .any(|observation| observation.subject.value == controller_id));
-        assert!(!observations
+        assert!(observations
             .iter()
-            .any(|observation| observation.subject.value == foreign_id));
+            .any(|observation| observation.subject.value == sibling_id));
         let scheduled_collection = outcome
             .metadata
             .collection_observations
@@ -3381,10 +3377,100 @@ mod tests {
                         .resource_id()
             })
             .unwrap();
-        assert_eq!(scheduled_collection.members.len(), 1);
-        assert_eq!(scheduled_collection.members[0].value, scheduled_id);
+        let mut scheduled_members = scheduled_collection
+            .members
+            .iter()
+            .map(|member| member.value.clone())
+            .collect::<Vec<_>>();
+        scheduled_members.sort();
+        let mut expected_scheduled = vec![scheduled_id.clone(), sibling_id.clone()];
+        expected_scheduled.sort();
+        assert_eq!(scheduled_members, expected_scheduled);
+        assert_eq!(scheduled_collection.total_count, Some(2));
+        assert_eq!(
+            scheduled_collection.completeness,
+            crate::traits::ToolCollectionCompleteness::Complete
+        );
+        // Mandate authority stays session-scoped: the collection join does
+        // not widen the mandate list itself.
         assert_eq!(mandate_collection.members.len(), 1);
         assert_eq!(mandate_collection.members[0].value, controller_id);
+    }
+
+    #[tokio::test]
+    async fn mandate_list_stays_session_scoped_while_scheduled_collection_is_daemon_wide() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+
+        let other_controller = crate::traits::Goal::new_continuous(
+            "Review synthetic inbox triage",
+            "owner-session-coding-bot",
+            None,
+            None,
+        );
+        let other_mandate = Mandate::new(
+            &other_controller.id,
+            None,
+            "Review synthetic inbox triage",
+            "owner-session-coding-bot",
+            MandateAuthority::default(),
+            3_600,
+            21_600,
+            10_800,
+        );
+        state
+            .create_mandate_controller(&other_controller, &other_mandate)
+            .await
+            .unwrap();
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "list",
+                    "_session_id": "owner-session",
+                    "_user_role": "owner",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !outcome.output.contains(&other_mandate.id),
+            "{}",
+            outcome.output
+        );
+        let mandate_collection = outcome
+            .metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value
+                    == crate::tools::objective_status::ObjectiveCollection::MandateControllers
+                        .resource_id()
+            })
+            .unwrap();
+        assert!(mandate_collection.members.is_empty());
+
+        // Non-owner and non-private callers still get nothing at all.
+        let refused = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "list",
+                    "_session_id": "owner-session",
+                    "_user_role": "member",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(refused.output.contains("only be listed by the owner"));
+        assert!(refused.metadata.collection_observations.is_empty());
     }
 
     #[test]

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-09-02
+
+### Fixed
+
+- **Every owner audit surface enumerates one scheduled-goal collection.** `manage_mandates list` filtered the scheduled-goal collection to goals whose `session_id` matched the calling channel session while still labelling its coverage `complete`, so an owner asking through one bot about a schedule created through a sibling bot (or a Slack DM) received an authoritative `0/0 returned (complete)` — a proven absence of an objective that exists and was firing on time. `scheduled_goal_runs overview` enumerated the same collection daemon-wide, so the answer depended on which tool the model happened to call. A goal's `session_id` records where it was created, not who may see it; mandate rows keep their typed session authority (`list_mandates`, `transfer`, `resolve_owned_mandate`) unchanged. Both surfaces now share `objective_status::load_scheduled_goal_collection`, whose `total` counts every scheduled goal so truncation is reported as `partial` rather than as absence, and the owner/private-channel gate on the tool is unchanged.
+- **Credential lists state typed readiness instead of a bare expiry.** `manage_oauth list` printed only `[expires: <timestamp>]` and `manage_http_auth list` printed nothing about readiness for OAuth-managed profiles, so an audit reading a lapsed two-hour X bearer reported the credential as `missing`/`unknown` even though the daemon refreshes it at startup and before every authenticated call. Both surfaces now render the same `CredentialReadiness` projection — `ready (bearer valid until …)`, `ready-via-refresh (bearer expired at …; refresh token stored; refreshed automatically before the next authenticated call)`, or `reauth-required (missing: …)` — computed from the stored connection row and secret-store presence alone. The projection never exchanges the refresh token, so an audit cannot rotate a provider credential by looking at it.
+
 ## [0.12.4] - 2026-09-02
 
 ### Fixed

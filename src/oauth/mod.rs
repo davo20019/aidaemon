@@ -39,6 +39,135 @@ fn access_token_needs_refresh(
         .unwrap_or(true)
 }
 
+/// How an expired or missing bearer gets replaced without owner involvement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRefreshPath {
+    /// A stored refresh token plus client credentials.
+    RefreshToken,
+    /// The client-credentials grant; no user token is involved.
+    ClientCredentials,
+}
+
+/// Durable readiness of an OAuth-managed credential, derived from the stored
+/// connection row plus secret-store presence.
+///
+/// This is a read-only projection. An owner audit must never exchange a
+/// refresh token to find out whether it works — providers such as X rotate
+/// the refresh token on every use — so the projection states what the next
+/// authenticated call (and daemon startup) will do instead of doing it.
+/// Without it, list surfaces printed only a raw `expires:` timestamp, and a
+/// two-hour bearer that had expired since the last call read as "missing"
+/// even though `refresh_access_token_if_needed` mints a fresh one before use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialReadiness {
+    /// A bearer is stored and stays valid past the refresh skew.
+    Ready { valid_until: Option<String> },
+    /// The bearer is expired or not stored, but a refresh path exists, so the
+    /// next call mints a fresh one automatically.
+    Refreshable {
+        expired_at: Option<String>,
+        path: CredentialRefreshPath,
+    },
+    /// No usable bearer and no refresh path: the owner must reconnect.
+    ReauthRequired { missing: Vec<&'static str> },
+}
+
+impl CredentialReadiness {
+    /// Compute readiness for a stored connection at `now` without touching
+    /// the network.
+    pub fn for_connection(
+        connection: &crate::traits::OAuthConnection,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let service = connection.service.as_str();
+        let stored = |suffix: &str| {
+            crate::config::resolve_from_keychain(&format!("oauth_{service}_{suffix}")).is_ok()
+        };
+        let has_access_token = stored("access_token");
+        let has_refresh_token = stored("refresh_token");
+        let has_client_id = stored("client_id");
+        let has_client_secret = stored("client_secret");
+        let client_credentials_grant = connection.auth_type == "oauth2_client_credentials";
+
+        if has_access_token && !access_token_needs_refresh(connection, now) {
+            return Self::Ready {
+                valid_until: connection.token_expires_at.clone(),
+            };
+        }
+
+        let expired_at = has_access_token
+            .then(|| connection.token_expires_at.clone())
+            .flatten();
+        if has_client_id && has_client_secret {
+            if client_credentials_grant {
+                return Self::Refreshable {
+                    expired_at,
+                    path: CredentialRefreshPath::ClientCredentials,
+                };
+            }
+            if has_refresh_token {
+                return Self::Refreshable {
+                    expired_at,
+                    path: CredentialRefreshPath::RefreshToken,
+                };
+            }
+        }
+
+        let mut missing = Vec::new();
+        if !has_access_token {
+            missing.push("access token");
+        }
+        if !client_credentials_grant && !has_refresh_token {
+            missing.push("refresh token");
+        }
+        if !has_client_id {
+            missing.push("client id");
+        }
+        if !has_client_secret {
+            missing.push("client secret");
+        }
+        Self::ReauthRequired { missing }
+    }
+
+    /// Stable machine-readable state name.
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::Refreshable { .. } => "ready-via-refresh",
+            Self::ReauthRequired { .. } => "reauth-required",
+        }
+    }
+
+    /// One-line readout shared by every credential list surface so an audit
+    /// reads the same typed answer wherever it looks: `<state> (<detail>)`.
+    pub fn describe(&self) -> String {
+        let detail = match self {
+            Self::Ready {
+                valid_until: Some(valid_until),
+            } => format!("bearer valid until {valid_until}"),
+            Self::Ready { valid_until: None } => "bearer stored, no expiry recorded".to_string(),
+            Self::Refreshable { expired_at, path } => {
+                let bearer = match expired_at {
+                    Some(expired_at) => format!("bearer expired at {expired_at}"),
+                    None => "no bearer stored".to_string(),
+                };
+                let path = match path {
+                    CredentialRefreshPath::RefreshToken => "refresh token stored",
+                    CredentialRefreshPath::ClientCredentials => "client-credentials grant",
+                };
+                format!(
+                    "{bearer}; {path}; refreshed automatically before the next authenticated call"
+                )
+            }
+            Self::ReauthRequired { missing } if missing.is_empty() => {
+                "stored bearer is expired and no refresh path exists".to_string()
+            }
+            Self::ReauthRequired { missing } => format!("missing: {}", missing.join(", ")),
+        };
+        format!("{} ({detail})", self.state())
+    }
+}
+
 /// OAuth type enum.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OAuthType {
@@ -1672,5 +1801,144 @@ mod tests {
             .expect("twitter profile should be restored via refresh");
         assert_eq!(profile.token.as_deref(), Some("restored-via-refresh"));
         assert_eq!(profile.user_id.as_deref(), Some("stable-account-456"));
+    }
+
+    fn synthetic_connection(
+        auth_type: &str,
+        expires_at: Option<&str>,
+    ) -> crate::traits::OAuthConnection {
+        crate::traits::OAuthConnection {
+            id: 0,
+            service: "twitter".to_string(),
+            auth_type: auth_type.to_string(),
+            username: None,
+            account_id: Some("1000000000000000001".to_string()),
+            scopes: r#"["tweet.read"]"#.to_string(),
+            token_expires_at: expires_at.map(str::to_string),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn credential_readiness_treats_an_expired_bearer_with_a_refresh_path_as_ready() {
+        // Residual from R50–R53: the X bearer lives two hours, so by audit
+        // time it has usually lapsed. The projection must say the next call
+        // refreshes it, not that the credential is missing.
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=stale\nOAUTH_TWITTER_REFRESH_TOKEN=rt\nOAUTH_TWITTER_CLIENT_ID=id\nOAUTH_TWITTER_CLIENT_SECRET=secret\n",
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let expired = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let connection = synthetic_connection("oauth2_pkce", Some(&expired));
+
+        let readiness = CredentialReadiness::for_connection(&connection, now);
+        assert_eq!(
+            readiness,
+            CredentialReadiness::Refreshable {
+                expired_at: Some(expired.clone()),
+                path: CredentialRefreshPath::RefreshToken,
+            }
+        );
+        assert_eq!(readiness.state(), "ready-via-refresh");
+        let text = readiness.describe();
+        assert!(text.starts_with("ready-via-refresh ("), "{text}");
+        assert!(text.contains(&expired), "{text}");
+        assert!(text.contains("refresh token stored"), "{text}");
+    }
+
+    #[test]
+    fn credential_readiness_reports_a_live_bearer_as_ready() {
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=live\n",
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let valid_until = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let connection = synthetic_connection("oauth2_pkce", Some(&valid_until));
+
+        let readiness = CredentialReadiness::for_connection(&connection, now);
+        assert_eq!(
+            readiness,
+            CredentialReadiness::Ready {
+                valid_until: Some(valid_until.clone()),
+            }
+        );
+        assert_eq!(readiness.state(), "ready");
+        assert!(readiness.describe().contains(&valid_until));
+    }
+
+    #[test]
+    fn credential_readiness_inside_the_refresh_skew_is_not_ready_without_a_refresh_path() {
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=nearly-stale\nOAUTH_TWITTER_CLIENT_ID=id\nOAUTH_TWITTER_CLIENT_SECRET=secret\n",
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let almost =
+            (now + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_SKEW_SECS / 2)).to_rfc3339();
+        let connection = synthetic_connection("oauth2_pkce", Some(&almost));
+
+        let readiness = CredentialReadiness::for_connection(&connection, now);
+        assert_eq!(
+            readiness,
+            CredentialReadiness::ReauthRequired {
+                missing: vec!["refresh token"],
+            }
+        );
+        assert_eq!(readiness.state(), "reauth-required");
+        assert!(readiness
+            .describe()
+            .contains("reauth-required (missing: refresh token)"));
+    }
+
+    #[test]
+    fn credential_readiness_uses_the_client_credentials_grant_when_no_bearer_is_stored() {
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_CLIENT_ID=id\nOAUTH_TWITTER_CLIENT_SECRET=secret\n",
+        )
+        .unwrap();
+        let connection = synthetic_connection("oauth2_client_credentials", None);
+
+        let readiness = CredentialReadiness::for_connection(&connection, chrono::Utc::now());
+        assert_eq!(
+            readiness,
+            CredentialReadiness::Refreshable {
+                expired_at: None,
+                path: CredentialRefreshPath::ClientCredentials,
+            }
+        );
+        let text = readiness.describe();
+        assert!(text.contains("no bearer stored"), "{text}");
+        assert!(text.contains("client-credentials grant"), "{text}");
+    }
+
+    #[test]
+    fn credential_readiness_lists_every_missing_secret_when_nothing_is_stored() {
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(isolation.env_file_path(), "").unwrap();
+        let connection = synthetic_connection("oauth2_pkce", None);
+
+        let readiness = CredentialReadiness::for_connection(&connection, chrono::Utc::now());
+        assert_eq!(
+            readiness,
+            CredentialReadiness::ReauthRequired {
+                missing: vec![
+                    "access token",
+                    "refresh token",
+                    "client id",
+                    "client secret"
+                ],
+            }
+        );
     }
 }

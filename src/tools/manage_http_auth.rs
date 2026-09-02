@@ -512,12 +512,17 @@ impl ManageHttpAuthTool {
                 lines.push(String::new());
             }
             lines.push("OAuth-managed profiles:".to_string());
+            let now = chrono::Utc::now();
             for connection in oauth_connections {
                 let resource_id = HttpRequestTool::auth_profile_resource_id(&connection.service);
                 resource_ids.insert(resource_id.clone());
+                // Same typed readiness as `manage_oauth list`, so whichever
+                // surface an audit consults, it gets the same answer.
+                let readiness =
+                    crate::oauth::CredentialReadiness::for_connection(&connection, now).describe();
                 lines.push(format!(
-                    "- {} [resource_id: {}] [{}] manage with OAuth flow tools",
-                    connection.service, resource_id, connection.auth_type
+                    "- {} [resource_id: {}] [{}] readiness: {}; manage with OAuth flow tools",
+                    connection.service, resource_id, connection.auth_type, readiness
                 ));
             }
         }
@@ -1254,6 +1259,17 @@ mod tests {
         config_path: PathBuf,
         profiles: SharedHttpProfiles,
     ) -> anyhow::Result<ManageHttpAuthTool> {
+        test_tool_with_db(config_path, profiles)
+            .await
+            .map(|(tool, _db)| tool)
+    }
+
+    /// Keeps the SQLite file alive for tests that write to the store; a
+    /// dropped `NamedTempFile` leaves the open database read-only.
+    async fn test_tool_with_db(
+        config_path: PathBuf,
+        profiles: SharedHttpProfiles,
+    ) -> anyhow::Result<(ManageHttpAuthTool, NamedTempFile)> {
         let db_file = NamedTempFile::new()?;
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new()?);
@@ -1265,11 +1281,14 @@ mod tests {
                 let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
             }
         });
-        Ok(ManageHttpAuthTool::new(
-            config_path,
-            profiles,
-            approval_tx,
-            state as Arc<dyn OAuthStore>,
+        Ok((
+            ManageHttpAuthTool::new(
+                config_path,
+                profiles,
+                approval_tx,
+                state as Arc<dyn OAuthStore>,
+            ),
+            db_file,
         ))
     }
 
@@ -1401,6 +1420,51 @@ allowed_domains = ["api.example.test"]
         );
         assert_eq!(collection.members.len(), 1);
         assert_eq!(collection.members[0].value, resource_id);
+    }
+
+    #[tokio::test]
+    async fn list_projects_the_same_typed_readiness_for_oauth_managed_profiles() {
+        // R53 read `credential_readiness=unknown` from this surface because
+        // the OAuth-managed row carried no readiness at all. It must render
+        // the same typed projection as `manage_oauth list`.
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path(), "");
+        let isolation = KeychainIsolation::acquire();
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=stale\nOAUTH_TWITTER_REFRESH_TOKEN=rt\nOAUTH_TWITTER_CLIENT_ID=id\nOAUTH_TWITTER_CLIENT_SECRET=secret\n",
+        )
+        .unwrap();
+        let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tool, _db) = test_tool_with_db(config_file.path().to_path_buf(), profiles)
+            .await
+            .unwrap();
+        let expired = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                account_id: Some("1000000000000000001".to_string()),
+                scopes: r#"["tweet.write"]"#.to_string(),
+                token_expires_at: Some(expired.clone()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let output = tool.call(r#"{"action":"list"}"#).await.unwrap();
+        let expected = crate::oauth::CredentialReadiness::Refreshable {
+            expired_at: Some(expired),
+            path: crate::oauth::CredentialRefreshPath::RefreshToken,
+        }
+        .describe();
+        assert!(
+            output.contains(&format!("readiness: {expected};")),
+            "{output}"
+        );
     }
 
     #[test]

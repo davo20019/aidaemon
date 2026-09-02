@@ -397,27 +397,17 @@ impl ScheduledGoalRunsTool {
         limit: usize,
         include_diagnostics: bool,
     ) -> anyhow::Result<(String, crate::tools::objective_status::ObjectivePortfolio)> {
-        let mut goals = self.state.get_scheduled_goals().await?;
-        goals.sort_by(|left, right| {
-            let left_rank = usize::from(left.status != "active");
-            let right_rank = usize::from(right.status != "active");
-            left_rank
-                .cmp(&right_rank)
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
-
-        let total = goals.len();
-        let limit = limit.clamp(1, 100);
-        let returned = total.min(limit);
-        let coverage = crate::tools::objective_status::ObjectiveCollectionCoverage::new(
-            crate::tools::objective_status::ObjectiveCollection::ScheduledGoals,
-            total,
-            returned,
-        )?;
+        // Shared with `manage_mandates list`: both owner audit surfaces must
+        // report one membership for `objective_collection:scheduled_goals`.
+        let (goals, coverage) = crate::tools::objective_status::load_scheduled_goal_collection(
+            self.state.as_ref(),
+            limit,
+        )
+        .await?;
         let mut portfolio = crate::tools::objective_status::ObjectivePortfolio::default();
         portfolio.record_collection(coverage)?;
         let mut records = Vec::new();
-        for goal in goals.into_iter().take(limit) {
+        for goal in goals {
             let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
             let mut tasks = self.state.get_tasks_for_goal(&goal.id).await?;
             tasks.sort_by(|left, right| {

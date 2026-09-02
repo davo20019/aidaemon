@@ -128,6 +128,40 @@ impl ObjectiveCollectionCoverage {
     }
 }
 
+/// Upper bound on scheduled rows any surface returns in one enumeration.
+pub(crate) const SCHEDULED_COLLECTION_LIMIT: usize = 100;
+
+/// Enumerate the scheduled-goal collection the same way on every owner
+/// surface. The collection is daemon-wide: a goal's `session_id` records the
+/// channel session that created it, not an authority boundary, and one owner
+/// routinely reaches the daemon through several sessions (two Telegram bots,
+/// a Slack DM). A surface that filters this collection by session while still
+/// labeling its coverage `complete` turns a goal created through a sibling
+/// owner session into an authoritative "absent" (R53). `total` therefore
+/// counts every scheduled goal, so truncation stays honest as `partial`.
+pub(crate) async fn load_scheduled_goal_collection<S>(
+    state: &S,
+    limit: usize,
+) -> anyhow::Result<(Vec<crate::traits::Goal>, ObjectiveCollectionCoverage)>
+where
+    S: crate::traits::GoalScheduleStore + ?Sized,
+{
+    let mut goals = state.get_scheduled_goals().await?;
+    goals.sort_by(|left, right| {
+        let left_rank = usize::from(left.status != "active");
+        let right_rank = usize::from(right.status != "active");
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total = goals.len();
+    goals.truncate(limit.clamp(1, SCHEDULED_COLLECTION_LIMIT));
+    let coverage =
+        ObjectiveCollectionCoverage::new(ObjectiveCollection::ScheduledGoals, total, goals.len())?;
+    Ok((goals, coverage))
+}
+
 /// The only three defensible answers to collection membership. In particular,
 /// not seeing a subject in a limited collection is `Unknown`, never `Absent`.
 #[cfg(test)]
@@ -968,5 +1002,165 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("not objective subject"));
+    }
+
+    fn scheduled_collection_of(
+        metadata: &crate::traits::ToolCallMetadata,
+    ) -> crate::traits::ToolCollectionObservation {
+        metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value == ObjectiveCollection::ScheduledGoals.resource_id()
+            })
+            .cloned()
+            .expect("scheduled-goal collection coverage")
+    }
+
+    #[tokio::test]
+    async fn every_owner_surface_enumerates_the_same_scheduled_goal_collection() {
+        // R53: an owner audit consulted only `manage_mandates list`, which
+        // reported the scheduled-goal collection as `0/0 (complete)` because
+        // the one scheduled objective had been created through a sibling
+        // channel session of the same owner. `scheduled_goal_runs overview`
+        // saw it. One collection ID must have one membership everywhere.
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut created = Vec::new();
+        for (description, session) in [
+            ("Publish the synthetic daily digest", "owner-bot-a:1001"),
+            ("Refresh the synthetic status page", "owner-bot-b:1001"),
+            ("Roll the synthetic weekly summary", "owner-slack-dm:1001"),
+        ] {
+            let goal = Goal::new_continuous(description, session, None, None);
+            state.create_goal(&goal).await.unwrap();
+            state
+                .create_goal_schedule(&GoalSchedule {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: goal.id.clone(),
+                    cron_expr: "0 6 * * *".to_string(),
+                    tz: "local".to_string(),
+                    original_schedule: Some("daily".to_string()),
+                    fire_policy: "coalesce".to_string(),
+                    is_one_shot: false,
+                    is_paused: false,
+                    last_run_at: None,
+                    next_run_at: "2026-09-03T10:00:00+00:00".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .await
+                .unwrap();
+            created.push(objective_resource_id(&goal.id));
+        }
+
+        use crate::traits::Tool as _;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let mandates = crate::tools::manage_mandates::ManageMandatesTool::new(
+            state.clone(),
+            crate::tools::ApprovalBroker::new(approval_tx),
+        );
+        let runs = crate::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(state.clone());
+
+        let mandate_view = mandates
+            .call_with_status_outcome(
+                &serde_json::json!({
+                    "action": "list",
+                    "_session_id": "owner-bot-a:1001",
+                    "_user_role": "owner",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let runs_view = runs
+            .call_with_status_outcome(r#"{"action":"overview"}"#, None)
+            .await
+            .unwrap();
+
+        let from_mandates = scheduled_collection_of(&mandate_view.metadata);
+        let from_runs = scheduled_collection_of(&runs_view.metadata);
+        assert_eq!(from_mandates.total_count, Some(3));
+        assert_eq!(from_mandates.returned_count, 3);
+        assert_eq!(
+            from_mandates.completeness,
+            crate::traits::ToolCollectionCompleteness::Complete
+        );
+        let mut mandate_members = from_mandates
+            .members
+            .iter()
+            .map(|member| member.value.clone())
+            .collect::<Vec<_>>();
+        let mut runs_members = from_runs
+            .members
+            .iter()
+            .map(|member| member.value.clone())
+            .collect::<Vec<_>>();
+        mandate_members.sort();
+        runs_members.sort();
+        created.sort();
+        assert_eq!(mandate_members, created);
+        assert_eq!(runs_members, created);
+        assert_eq!(from_runs.total_count, from_mandates.total_count);
+        assert_eq!(from_runs.completeness, from_mandates.completeness);
+
+        // The rendered audit text names every objective, not just the ones
+        // created through the calling session.
+        for member in &created {
+            assert!(
+                mandate_view.output.contains(member),
+                "{}",
+                mandate_view.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_goal_collection_reports_truncation_as_partial_coverage() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        for index in 0..3 {
+            let goal = Goal::new_continuous(
+                &format!("Synthetic scheduled objective {index}"),
+                "owner-bot-a:1001",
+                None,
+                None,
+            );
+            state.create_goal(&goal).await.unwrap();
+            state
+                .create_goal_schedule(&GoalSchedule {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: goal.id.clone(),
+                    cron_expr: "0 6 * * *".to_string(),
+                    tz: "local".to_string(),
+                    original_schedule: Some("daily".to_string()),
+                    fire_policy: "coalesce".to_string(),
+                    is_one_shot: false,
+                    is_paused: false,
+                    last_run_at: None,
+                    next_run_at: "2026-09-03T10:00:00+00:00".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let (goals, coverage) = load_scheduled_goal_collection(state.as_ref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(goals.len(), 2);
+        assert_eq!(coverage.total, 3);
+        assert_eq!(coverage.returned, 2);
+        assert!(!coverage.is_complete());
+        let (goals, coverage) = load_scheduled_goal_collection(state.as_ref(), 50)
+            .await
+            .unwrap();
+        assert_eq!(goals.len(), 3);
+        assert!(coverage.is_complete());
     }
 }
