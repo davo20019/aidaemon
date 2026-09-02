@@ -962,14 +962,21 @@ pub(super) fn retain_structural_completion_contract(
     };
 }
 
-/// Construct the bootstrap contract from concrete resource identities only.
-/// Semantic obligations are installed later by task assessment.
-pub(super) fn infer_structural_completion_contract(
+/// Construct the bootstrap contract from concrete resource identities only,
+/// with relative filesystem targets anchored to the turn's typed workspace
+/// (or the daemon cwd when the turn has none). Semantic obligations are
+/// installed later by task assessment.
+pub(super) fn infer_structural_completion_contract_anchored(
     text: &str,
     alias_roots: &[String],
+    workspace_anchor: Option<&std::path::Path>,
 ) -> CompletionContract {
     let mut contract = CompletionContract {
-        verification_targets: extract_verification_targets(text, alias_roots),
+        verification_targets: extract_verification_targets_anchored(
+            text,
+            alias_roots,
+            workspace_anchor,
+        ),
         ..CompletionContract::default()
     };
     retain_structural_completion_contract(&mut contract, false);
@@ -1920,10 +1927,13 @@ fn extract_verification_filesystem_targets(
     targets: &mut Vec<VerificationTarget>,
     max_targets: usize,
     alias_roots: &[String],
+    workspace_anchor: Option<&std::path::Path>,
 ) {
-    for value in
-        super::project_scope::extract_exact_filesystem_resources_from_text(text, alias_roots)
-    {
+    for value in super::project_scope::extract_exact_filesystem_resources_from_text_anchored(
+        text,
+        alias_roots,
+        workspace_anchor,
+    ) {
         if targets.len() >= max_targets {
             break;
         }
@@ -1939,7 +1949,16 @@ fn extract_verification_filesystem_targets(
     }
 }
 
+#[cfg(test)]
 fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<VerificationTarget> {
+    extract_verification_targets_anchored(text, alias_roots, None)
+}
+
+fn extract_verification_targets_anchored(
+    text: &str,
+    alias_roots: &[String],
+    workspace_anchor: Option<&std::path::Path>,
+) -> Vec<VerificationTarget> {
     let mut targets = Vec::new();
 
     for capture in HTTP_URL_RE.captures_iter(text) {
@@ -1962,7 +1981,7 @@ fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<Verif
         });
     }
 
-    extract_verification_filesystem_targets(text, &mut targets, 4, alias_roots);
+    extract_verification_filesystem_targets(text, &mut targets, 4, alias_roots, workspace_anchor);
 
     targets
 }

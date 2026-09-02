@@ -7,7 +7,7 @@
 //! sibling [`project_scope`](super::project_scope) module.
 
 use super::completion_contract::{
-    completion_contract_from_persisted, infer_structural_completion_contract,
+    completion_contract_from_persisted, infer_structural_completion_contract_anchored,
     inherit_unfinished_request_contract, scope_contract_for_delegated_executor,
 };
 use super::followup::{
@@ -15,8 +15,9 @@ use super::followup::{
     FollowupMode, TurnContextReason,
 };
 use super::project_scope::{
-    choose_primary_project_scope, extract_explicit_path_scopes_from_text,
-    extract_project_scopes_from_history, resolve_primary_project_scope, unify_current_turn_scopes,
+    choose_primary_project_scope, extract_explicit_path_scopes_from_text_anchored,
+    extract_project_scopes_from_history_anchored, resolve_primary_project_scope,
+    unify_current_turn_scopes,
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
@@ -36,6 +37,13 @@ pub(super) struct TurnContext {
     /// one persisted antecedent instead of treating the whole recent tail as
     /// interchangeable proof.
     pub visible_antecedent_user_message_id: Option<String>,
+    /// Typed durable workspace binding for this turn: the goal's bound project
+    /// scope, or the workspace a parent handed to a spawned worker (including
+    /// an executor's provisioned attempt workspace). Both are runtime state,
+    /// not request prose. When present it anchors every relative path
+    /// reference in the request and is the filesystem authority boundary the
+    /// compiled access manifest may attenuate within but never relocate.
+    pub bound_workspace: Option<String>,
     pub primary_project_scope: Option<String>,
     /// Exact path authorities named by the current request (or inherited from
     /// its structurally-linked open request). Unlike `primary_project_scope`,
@@ -422,51 +430,21 @@ impl Agent {
             }
         }
 
-        // For the current user message, only extract explicit filesystem paths
-        // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
-        // common English words like "modern" (in "modern website") from resolving
-        // to existing project directories like modern-plants-site.
-        let intent_scope_text = continuation_request_anchor.unwrap_or(&authored_current);
-        let mut current_project_scopes = Vec::new();
-        extract_explicit_path_scopes_from_text(
-            intent_scope_text,
-            &mut current_project_scopes,
-            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
-            &self.path_aliases.projects,
-        );
-        // Scope carryover follows the persisted dialogue relationship, not an
-        // acknowledgement/command phrase list. New requests must name their
-        // scope structurally or receive a grounded semantic project reference.
-        let allow_scope_carryover = internal_continuation || followup_mode != FollowupMode::NewTask;
-        let project_scopes = extract_project_scopes_from_history(
-            &history,
-            intent_scope_text,
-            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
-            allow_scope_carryover,
-            &self.path_aliases.projects,
-        );
-        let allow_multi_project_scope = current_project_scopes.len() > 1;
-        // For current-turn scopes, unify all explicitly mentioned paths into a
-        // single scope that encompasses them all.  When the user mentions paths
-        // in different subdirectories (e.g. ~/projects/blog/posts/file.md and
-        // ~/projects/blog/tweets.md), the unified scope is their common ancestor
-        // (~/projects/blog/) so writes to sibling directories aren't blocked.
+        // A typed durable workspace binding outranks anything inferred from
+        // request text. Two sources exist, both runtime state rather than
+        // prose:
         //
-        // Falls back to `.first()` for single-scope messages, preserving the
-        // text-order priority that's critical for new-project creation (the
-        // user's explicit path may not exist yet on disk).
-        // The project-root preference is only appropriate for history scopes
-        // where we want to pick the most likely intended project among stale
-        // references.
-        // A typed durable workspace binding on this agent's own goal
-        // (`scheduled_goal_runs bind_workspace` → goal.context.project_scope)
-        // is the authoritative scope for that goal's workers. Mission text
-        // routinely names other repositories, hostnames containing a sibling
-        // project's name, or instruction-relative paths like
-        // `src/content/posts`; extracted scopes from such text must not steal
-        // a scheduled objective's workspace. Executors keep their provisioned
-        // attempt workspace. The binding is re-read from the store each turn,
-        // so a bind issued mid-run takes effect on the following turn.
+        // * this agent's own goal binding (`scheduled_goal_runs bind_workspace`
+        //   → goal.context.project_scope), re-read from the store each turn so
+        //   a bind issued mid-run takes effect on the following turn;
+        // * the workspace a parent handed to this spawned worker — for an
+        //   executor, its provisioned attempt workspace (`task_workspaces`).
+        //
+        // Mission and handoff text routinely name other repositories,
+        // hostnames containing a sibling project's name, or
+        // instruction-relative paths like `src/content/posts`. Such paths are
+        // resolved *inside* the binding; they must never relocate the worker
+        // to whichever repository the daemon process happens to run from.
         let bound_goal_scope = if self.role() == crate::traits::AgentRole::Executor {
             None
         } else if let Some(goal_id) = self.goal_id.as_deref() {
@@ -481,7 +459,51 @@ impl Agent {
         } else {
             None
         };
-        let primary_project_scope = bound_goal_scope.clone().or_else(|| {
+        let bound_workspace = bound_goal_scope.or_else(|| {
+            super::project_scope::typed_workspace_binding(self.inherited_project_scope.as_deref())
+        });
+        let workspace_anchor = bound_workspace.as_deref().map(std::path::Path::new);
+
+        // For the current user message, only extract explicit filesystem paths
+        // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
+        // common English words like "modern" (in "modern website") from resolving
+        // to existing project directories like modern-plants-site.
+        let intent_scope_text = continuation_request_anchor.unwrap_or(&authored_current);
+        let mut current_project_scopes = Vec::new();
+        extract_explicit_path_scopes_from_text_anchored(
+            intent_scope_text,
+            &mut current_project_scopes,
+            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+            &self.path_aliases.projects,
+            workspace_anchor,
+        );
+        // Scope carryover follows the persisted dialogue relationship, not an
+        // acknowledgement/command phrase list. New requests must name their
+        // scope structurally or receive a grounded semantic project reference.
+        let allow_scope_carryover = internal_continuation || followup_mode != FollowupMode::NewTask;
+        let project_scopes = extract_project_scopes_from_history_anchored(
+            &history,
+            intent_scope_text,
+            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+            allow_scope_carryover,
+            &self.path_aliases.projects,
+            workspace_anchor,
+        );
+        let allow_multi_project_scope = current_project_scopes.len() > 1;
+        // For current-turn scopes, unify all explicitly mentioned paths into a
+        // single scope that encompasses them all.  When the user mentions paths
+        // in different subdirectories (e.g. ~/projects/blog/posts/file.md and
+        // ~/projects/blog/tweets.md), the unified scope is their common ancestor
+        // (~/projects/blog/) so writes to sibling directories aren't blocked.
+        //
+        // Falls back to `.first()` for single-scope messages, preserving the
+        // text-order priority that's critical for new-project creation (the
+        // user's explicit path may not exist yet on disk).
+        // The project-root preference is only appropriate for history scopes
+        // where we want to pick the most likely intended project among stale
+        // references.
+        // Under a binding the workspace is the primary scope outright.
+        let primary_project_scope = bound_workspace.clone().or_else(|| {
             resolve_primary_project_scope(
                 unify_current_turn_scopes(&current_project_scopes)
                     .or_else(|| choose_primary_project_scope(&project_scopes)),
@@ -494,14 +516,17 @@ impl Agent {
         // are not authorized: the binding is the objective's authority
         // boundary.
         let authorized_project_scopes =
-            if bound_goal_scope.is_some() || current_project_scopes.is_empty() {
+            if bound_workspace.is_some() || current_project_scopes.is_empty() {
                 primary_project_scope.iter().cloned().collect()
             } else {
                 current_project_scopes.clone()
             };
         let contract_text = continuation_request_anchor.unwrap_or(&goal_user_text);
-        let mut completion_contract =
-            infer_structural_completion_contract(contract_text, &self.path_aliases.projects);
+        let mut completion_contract = infer_structural_completion_contract_anchored(
+            contract_text,
+            &self.path_aliases.projects,
+            workspace_anchor,
+        );
         let mut inherited_completion_contract = false;
         let mut inherited_outstanding_obligations = false;
         if followup_mode != FollowupMode::NewTask {
@@ -511,9 +536,10 @@ impl Agent {
                     .as_ref()
                     .map(completion_contract_from_persisted)
                     .unwrap_or_else(|| {
-                        infer_structural_completion_contract(
+                        infer_structural_completion_contract_anchored(
                             &request.text,
                             &self.path_aliases.projects,
+                            workspace_anchor,
                         )
                     });
                 // Legacy persisted contracts predate container-level lineage.
@@ -556,6 +582,7 @@ impl Agent {
                 GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
             ),
             visible_antecedent_user_message_id: None,
+            bound_workspace,
             primary_project_scope,
             authorized_project_scopes,
             filesystem_access: None,
@@ -1470,6 +1497,152 @@ mod tests {
         assert_eq!(
             unbound.primary_project_scope.as_deref(),
             Some("/tmp/synthetic-alice/projects/acme-daemon/src/content/posts"),
+        );
+    }
+
+    /// Lay out a synthetic bound workspace shaped like a static-site checkout.
+    /// The daemon cwd (this repository) also has `src/`, so an un-anchored
+    /// `src/content/posts` would silently resolve there — the regression.
+    fn synthetic_site_workspace() -> (tempfile::TempDir, String) {
+        let workspace = tempfile::tempdir().expect("bound workspace");
+        std::fs::create_dir_all(workspace.path().join(".git")).expect("workspace marker");
+        std::fs::create_dir_all(workspace.path().join("src/content/posts")).expect("posts dir");
+        let path = workspace.path().to_string_lossy().to_string();
+        (workspace, path)
+    }
+
+    #[tokio::test]
+    async fn relative_paths_in_mission_text_anchor_to_the_bound_goal_workspace() {
+        use crate::testing::{setup_test_agent_root, MockProvider};
+        use crate::traits::store_prelude::*;
+
+        let mut harness = setup_test_agent_root(MockProvider::new())
+            .await
+            .expect("test harness");
+        let (_workspace, workspace_path) = synthetic_site_workspace();
+        let mut goal = crate::traits::Goal::new_finite("Manage the blog daily", "test-session");
+        goal.context = Some(
+            serde_json::json!({
+                "project_scope": workspace_path,
+                "project_scope_bound_at": "2026-08-27T00:00:00Z",
+            })
+            .to_string(),
+        );
+        harness.state.create_goal(&goal).await.expect("create goal");
+        harness.agent.set_test_goal_id(Some(goal.id.clone()));
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(
+            cwd.join("src").is_dir(),
+            "precondition: cwd has a competing src/"
+        );
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                "Write today's post as a new markdown file in src/content/posts, then build.",
+            )
+            .await;
+
+        assert_eq!(
+            turn_context.bound_workspace.as_deref(),
+            Some(workspace_path.as_str())
+        );
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(workspace_path.as_str())
+        );
+        assert_eq!(
+            turn_context.authorized_project_scopes,
+            vec![workspace_path.clone()]
+        );
+        let path_targets = turn_context
+            .completion_contract
+            .verification_targets
+            .iter()
+            .filter(|target| {
+                target.kind == super::completion_contract::VerificationTargetKind::Path
+            })
+            .map(|target| target.value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            path_targets,
+            vec![format!("{workspace_path}/src/content/posts")],
+            "verification target anchored to the bound workspace, not the daemon cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_inherited_workspace_anchors_relative_handoff_paths() {
+        use crate::testing::{setup_test_agent, MockProvider};
+
+        // `setup_test_agent` builds an executor-role agent: the workspace a
+        // parent hands to it is its typed binding.
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let (_workspace, workspace_path) = synthetic_site_workspace();
+        harness.agent.inherited_project_scope = Some(workspace_path.clone());
+
+        for handoff in [
+            "Create the post file in src/content/posts and run the build.",
+            "target_dir=src/content/posts action=create_post then verify the build output",
+        ] {
+            let turn_context = harness
+                .agent
+                .build_turn_context_from_recent_history("test-session", handoff)
+                .await;
+            assert_eq!(
+                turn_context.bound_workspace.as_deref(),
+                Some(workspace_path.as_str()),
+                "{handoff}"
+            );
+            assert_eq!(
+                turn_context.primary_project_scope.as_deref(),
+                Some(workspace_path.as_str()),
+                "{handoff}"
+            );
+            assert_eq!(
+                turn_context.authorized_project_scopes,
+                vec![workspace_path.clone()],
+                "{handoff}"
+            );
+        }
+
+        // Negative control: a handoff naming another repository cannot move the
+        // executor out of its provisioned workspace.
+        let (_elsewhere, elsewhere_path) = synthetic_site_workspace();
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                &format!("Create the post in {elsewhere_path}/src/content/posts."),
+            )
+            .await;
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(workspace_path.as_str())
+        );
+        assert_eq!(
+            turn_context.authorized_project_scopes,
+            vec![workspace_path.clone()]
+        );
+
+        // Without an inherited workspace there is no binding and the explicit
+        // path in the handoff scopes the turn as before.
+        harness.agent.inherited_project_scope = None;
+        let unbound = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                &format!("Create the post in {elsewhere_path}/src/content/posts."),
+            )
+            .await;
+        assert_eq!(unbound.bound_workspace, None);
+        assert_eq!(
+            unbound.primary_project_scope.as_deref(),
+            Some(elsewhere_path.as_str()),
+            "existing path promotes to its own project root"
         );
     }
 

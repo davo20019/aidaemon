@@ -4,6 +4,12 @@
 //! unchanged. These helpers resolve filesystem paths and named project
 //! nicknames into normalized project scopes, and choose a primary scope for a
 //! turn.
+//!
+//! Relative path references are anchored to the turn's typed workspace when
+//! one exists (see [`TurnContext::bound_workspace`]); only workspace-less turns
+//! fall back to the daemon process cwd.
+
+use std::path::Path;
 
 use super::*;
 
@@ -65,8 +71,17 @@ pub(in crate::agent) fn token_looks_like_filesystem_path(token: &str) -> bool {
     crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some()
 }
 
-fn token_looks_like_project_scope_path(token: &str, alias_roots: &[String]) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots).is_some()
+fn token_looks_like_project_scope_path(
+    token: &str,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
+) -> bool {
+    crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        token,
+        alias_roots,
+        workspace_anchor,
+    )
+    .is_some()
 }
 
 #[cfg(test)]
@@ -259,12 +274,25 @@ pub(super) fn extract_project_hints_from_history(
     hints
 }
 
+#[cfg(test)]
 pub(super) fn normalize_project_scope_path_with_aliases(
     raw_path: &str,
     alias_roots: &[String],
 ) -> Option<String> {
-    crate::tools::fs_utils::resolve_project_scope_reference(raw_path, alias_roots)
-        .map(|path| path.to_string_lossy().to_string())
+    normalize_project_scope_path_anchored(raw_path, alias_roots, None)
+}
+
+fn normalize_project_scope_path_anchored(
+    raw_path: &str,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
+) -> Option<String> {
+    crate::tools::fs_utils::resolve_project_scope_reference_from(
+        raw_path,
+        alias_roots,
+        workspace_anchor,
+    )
+    .map(|path| path.to_string_lossy().to_string())
 }
 
 pub(super) fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
@@ -280,7 +308,7 @@ pub(super) fn extract_project_scopes_from_text(
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots);
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, None);
 }
 
 /// Extract only explicit filesystem paths (tokens with `~/`, `/`, `./`, etc.)
@@ -293,21 +321,46 @@ pub(super) fn extract_explicit_path_scopes_from_text(
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots);
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, None);
+}
+
+/// [`extract_explicit_path_scopes_from_text`] with relative paths anchored to
+/// the turn's typed workspace instead of the daemon cwd.
+pub(super) fn extract_explicit_path_scopes_from_text_anchored(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
+) {
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, workspace_anchor);
+}
+
+#[cfg(test)]
+pub(super) fn extract_exact_filesystem_resources_from_text(
+    text: &str,
+    alias_roots: &[String],
+) -> Vec<String> {
+    extract_exact_filesystem_resources_from_text_anchored(text, alias_roots, None)
 }
 
 /// Extract exact filesystem resource identities without promoting a file or
 /// subdirectory to its repository root. Project selection may deliberately
 /// broaden a resource to its workspace; permission grounding must not.
-pub(super) fn extract_exact_filesystem_resources_from_text(
+/// Relative references are anchored to the turn's typed workspace (or the
+/// daemon cwd when the turn has none).
+pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
     text: &str,
     alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
 ) -> Vec<String> {
     let mut resources = Vec::new();
     for token in structural_filesystem_reference_tokens(text) {
-        let Some(path) =
-            crate::tools::fs_utils::resolve_structural_filesystem_reference(&token, alias_roots)
-        else {
+        let Some(path) = crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+            &token,
+            alias_roots,
+            workspace_anchor,
+        ) else {
             continue;
         };
         let path = path.to_string_lossy().to_string();
@@ -367,6 +420,7 @@ fn extract_project_scopes_from_text_inner(
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
 ) {
     for token in structural_filesystem_reference_tokens(text) {
         if scopes.len() >= max_scopes {
@@ -375,8 +429,8 @@ fn extract_project_scopes_from_text_inner(
         if token.is_empty() || token.contains("://") {
             continue;
         }
-        let scope = if token_looks_like_project_scope_path(&token, alias_roots) {
-            normalize_project_scope_path_with_aliases(&token, alias_roots)
+        let scope = if token_looks_like_project_scope_path(&token, alias_roots, workspace_anchor) {
+            normalize_project_scope_path_anchored(&token, alias_roots, workspace_anchor)
         } else {
             None
         };
@@ -473,8 +527,15 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
 /// binding outranks anything inferred from mission or request text.
 pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
-    let scope = value.get("project_scope")?.as_str()?.trim();
-    let path = std::path::Path::new(scope);
+    typed_workspace_binding(value.get("project_scope")?.as_str())
+}
+
+/// Accept a runtime-supplied scope as a typed workspace binding only when it
+/// is an existing absolute directory. Anything else (a stale or relative
+/// spelling, a file) is not a binding and must not anchor or confine a turn.
+pub(crate) fn typed_workspace_binding(scope: Option<&str>) -> Option<String> {
+    let scope = scope?.trim();
+    let path = Path::new(scope);
     (path.is_absolute() && path.is_dir()).then(|| scope.to_string())
 }
 
@@ -501,6 +562,7 @@ pub(super) fn resolve_primary_project_scope(
     }
 }
 
+#[cfg(test)]
 pub(super) fn extract_project_scopes_from_history(
     history: &[Message],
     current_user_text: &str,
@@ -508,8 +570,35 @@ pub(super) fn extract_project_scopes_from_history(
     include_history_scopes: bool,
     alias_roots: &[String],
 ) -> Vec<String> {
+    extract_project_scopes_from_history_anchored(
+        history,
+        current_user_text,
+        max_scopes,
+        include_history_scopes,
+        alias_roots,
+        None,
+    )
+}
+
+/// Collect project scopes from the current request and (optionally) prior
+/// user turns, with relative paths anchored to the turn's typed workspace (or
+/// the daemon cwd when the turn has none).
+pub(super) fn extract_project_scopes_from_history_anchored(
+    history: &[Message],
+    current_user_text: &str,
+    max_scopes: usize,
+    include_history_scopes: bool,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
+) -> Vec<String> {
     let mut scopes = Vec::new();
-    extract_project_scopes_from_text(current_user_text, &mut scopes, max_scopes, alias_roots);
+    extract_project_scopes_from_text_inner(
+        current_user_text,
+        &mut scopes,
+        max_scopes,
+        alias_roots,
+        workspace_anchor,
+    );
 
     if !include_history_scopes {
         return scopes;
@@ -525,7 +614,13 @@ pub(super) fn extract_project_scopes_from_history(
         let Some(content) = msg.content.as_deref() else {
             continue;
         };
-        extract_project_scopes_from_text(content, &mut scopes, max_scopes, alias_roots);
+        extract_project_scopes_from_text_inner(
+            content,
+            &mut scopes,
+            max_scopes,
+            alias_roots,
+            workspace_anchor,
+        );
     }
 
     scopes

@@ -258,6 +258,40 @@ pub fn token_is_absolute_like(token: &str) -> bool {
         || looks_windows_abs
 }
 
+/// Join a possibly-relative token onto `base` and normalize `.` / `..`
+/// lexically. Returns `None` when `..` would climb past the filesystem root.
+fn join_normalized(base: &Path, token: &str) -> Option<PathBuf> {
+    let expanded = shellexpand::tilde(token).to_string();
+    let path = PathBuf::from(expanded);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            value => normalized.push(value.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+/// The directory a relative path reference is resolved against: the caller's
+/// typed workspace when it has one, otherwise the daemon process cwd.
+fn relative_reference_base(workspace_anchor: Option<&Path>) -> Option<PathBuf> {
+    match workspace_anchor {
+        Some(anchor) => Some(anchor.to_path_buf()),
+        None => std::env::current_dir().ok(),
+    }
+}
+
 /// Resolve a token as a filesystem reference only when its shape or the live
 /// filesystem provides structural evidence that it is a path.
 ///
@@ -267,9 +301,31 @@ pub fn token_is_absolute_like(token: &str) -> bool {
 /// working directory or an explicitly configured project root. This prevents
 /// natural-language compounds such as `pros/cons` from becoming invented local
 /// targets without maintaining a vocabulary of prose exceptions.
+///
+/// Relative references resolve against the daemon process cwd. Callers acting
+/// for a task with a typed workspace must use
+/// [`resolve_structural_filesystem_reference_from`] so the reference is anchored
+/// to that workspace instead.
 pub fn resolve_structural_filesystem_reference(
     raw: &str,
     alias_roots: &[String],
+) -> Option<PathBuf> {
+    resolve_structural_filesystem_reference_from(raw, alias_roots, None)
+}
+
+/// [`resolve_structural_filesystem_reference`] with an explicit anchor for
+/// relative references.
+///
+/// `workspace_anchor` is the task's typed workspace (a goal's bound project
+/// scope or a provisioned attempt workspace). When present, `src/content/posts`
+/// means that directory *inside the workspace*; the daemon process cwd is an
+/// unrelated deployment detail and is never consulted, and no other configured
+/// project root may claim the reference either. Without an anchor the cwd and
+/// alias-root fallbacks apply as before.
+pub fn resolve_structural_filesystem_reference_from(
+    raw: &str,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
 ) -> Option<PathBuf> {
     let token = raw.trim();
     if token.is_empty() || token.contains("://") || token.contains('?') || token.contains('*') {
@@ -288,30 +344,8 @@ pub fn resolve_structural_filesystem_reference(
         return resolve_projects_folder_alias(token, alias_roots);
     }
 
-    let direct = if explicit {
-        let expanded = shellexpand::tilde(token).to_string();
-        let path = PathBuf::from(expanded);
-        let joined = if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir().ok()?.join(path)
-        };
-        let mut normalized = PathBuf::new();
-        for component in joined.components() {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    if !normalized.pop() {
-                        return None;
-                    }
-                }
-                value => normalized.push(value.as_os_str()),
-            }
-        }
-        normalized
-    } else {
-        validate_path(token).ok()?
-    };
+    let base = relative_reference_base(workspace_anchor)?;
+    let direct = join_normalized(&base, token)?;
     // A bare existing directory name is still ordinary language ("tests",
     // "docs", "memory") often enough that it cannot establish a hard path
     // obligation. Exact bare files remain structural; directories require an
@@ -333,9 +367,14 @@ pub fn resolve_structural_filesystem_reference(
             std::path::Component::Normal(value) => Some(value),
             _ => None,
         })?;
-    let cwd = std::env::current_dir().ok()?;
-    if cwd.join(first_component).exists() {
+    if base.join(first_component).exists() {
         return Some(direct);
+    }
+    // Under a typed workspace the reference is either inside that workspace or
+    // it is not a filesystem reference for this task. Guessing another project
+    // root would relocate the task's authority.
+    if workspace_anchor.is_some() {
+        return None;
     }
 
     for raw_root in alias_roots {
@@ -647,7 +686,27 @@ pub fn resolve_contextual_project_nickname_in_explicit_roots(
     resolve_contextual_project_nickname_across_roots(raw_name, explicit_roots)
 }
 
+/// Resolve a project-scope reference (path-like token or project nickname) to
+/// a project root, with relative path tokens resolved against the daemon
+/// process cwd. Task-bound callers use [`resolve_project_scope_reference_from`].
+#[cfg(test)]
 pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Option<PathBuf> {
+    resolve_project_scope_reference_from(raw, alias_roots, None)
+}
+
+/// Resolve a project-scope reference (path-like token or project nickname) to
+/// a project root.
+///
+/// With `workspace_anchor`, a relative path token is joined onto the workspace
+/// (never the daemon cwd) and promoted to the nearest project root from there,
+/// so `src/content/posts` inside a bound blog checkout scopes to that checkout
+/// rather than to whichever repository the daemon happens to run from. Without
+/// an anchor the daemon cwd is the base.
+pub fn resolve_project_scope_reference_from(
+    raw: &str,
+    alias_roots: &[String],
+    workspace_anchor: Option<&Path>,
+) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -662,8 +721,9 @@ pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Opt
         let path_for_resolution = if token_is_absolute_like(trimmed) {
             trimmed.to_string()
         } else {
-            let cwd_relative = validate_path(trimmed).ok();
-            if let Some(candidate) = cwd_relative {
+            let base = relative_reference_base(workspace_anchor);
+            let base_relative = base.and_then(|base| join_normalized(&base, trimmed));
+            if let Some(candidate) = base_relative {
                 if candidate.exists() {
                     candidate.to_string_lossy().to_string()
                 } else if let Some(alias_candidate) =
@@ -1283,5 +1343,91 @@ mod tests {
         assert!(contains_shell_operator("echo $(cmd)"));
         assert!(!contains_shell_operator("cargo build --release"));
         assert!(!contains_shell_operator("ls -la /tmp"));
+    }
+
+    /// A bound workspace anchors bare relative references even when the daemon
+    /// cwd (this repository, which also has `src/`) could claim them.
+    #[test]
+    fn anchored_relative_reference_resolves_inside_workspace_not_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("blog-site");
+        std::fs::create_dir_all(workspace.join("src").join("content").join("posts")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            cwd.join("src").is_dir(),
+            "test precondition: the daemon cwd has a competing src/ directory"
+        );
+
+        let resolved = resolve_structural_filesystem_reference_from(
+            "src/content/posts",
+            &[],
+            Some(&workspace),
+        )
+        .expect("workspace-anchored reference");
+        assert_eq!(resolved, workspace.join("src/content/posts"));
+        assert!(!resolved.starts_with(&cwd));
+
+        let unanchored = resolve_structural_filesystem_reference("src/content/posts", &[])
+            .expect("cwd-anchored reference resolves against the process cwd");
+        assert!(unanchored.starts_with(&cwd));
+    }
+
+    /// Under an anchor, a reference the workspace cannot ground must not be
+    /// relocated to another configured project root; that would move the task's
+    /// authority to a repository the goal never named.
+    #[test]
+    fn anchored_reference_never_relocates_to_alias_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        std::fs::create_dir_all(alias_root.join("other-project").join("src")).unwrap();
+        let workspace = dir.path().join("workspace-without-src");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        assert_eq!(
+            resolve_structural_filesystem_reference_from(
+                "src/content/posts",
+                &alias_roots,
+                Some(&workspace)
+            ),
+            None
+        );
+
+        // Explicit forms still resolve inside the anchor, and a not-yet-created
+        // target is allowed there.
+        assert_eq!(
+            resolve_structural_filesystem_reference_from(
+                "./src/content/posts",
+                &alias_roots,
+                Some(&workspace)
+            ),
+            Some(workspace.join("src/content/posts"))
+        );
+        assert_eq!(
+            resolve_structural_filesystem_reference_from(
+                "../escape",
+                &alias_roots,
+                Some(&workspace)
+            ),
+            Some(dir.path().join("escape"))
+        );
+    }
+
+    #[test]
+    fn anchored_project_scope_reference_promotes_to_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("blog-site");
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(workspace.join("src").join("content").join("posts")).unwrap();
+
+        let scope =
+            resolve_project_scope_reference_from("src/content/posts", &[], Some(&workspace))
+                .expect("anchored project scope");
+        assert_eq!(scope, workspace);
+
+        let cwd = std::env::current_dir().unwrap();
+        let unanchored = resolve_project_scope_reference("src/content/posts", &[])
+            .expect("unanchored project scope resolves against the process cwd");
+        assert_eq!(unanchored, cwd);
     }
 }

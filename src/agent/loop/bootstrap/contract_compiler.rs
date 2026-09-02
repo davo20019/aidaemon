@@ -87,6 +87,12 @@ pub(crate) struct ContractCompilerInput<'a> {
     pub structural_filesystem_resources: &'a [String],
     pub structural_project_scopes: &'a [String],
     pub project_alias_roots: &'a [String],
+    /// Typed durable workspace binding for the turn (`TurnContext::bound_workspace`).
+    /// When present it anchors relative filesystem references and is the
+    /// authority boundary the compiled manifest may attenuate within but never
+    /// relocate: the workspace is granted, out-of-workspace write targets are
+    /// dropped, and a resolved project scope outside it is rejected.
+    pub bound_workspace: Option<&'a str>,
     /// Current user turn used only to bind an assessor-produced response
     /// contract to its request identity. Rust never classifies its wording.
     pub current_user_text: &'a str,
@@ -867,10 +873,91 @@ fn resolve_structural_path(
     raw: &str,
     structural_resources: &[String],
     alias_roots: &[String],
+    workspace_anchor: Option<&std::path::Path>,
 ) -> Option<String> {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(raw, alias_roots)
-        .map(|path| path.to_string_lossy().to_string())
-        .filter(|path| structural_resources.contains(path))
+    crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        raw,
+        alias_roots,
+        workspace_anchor,
+    )
+    .map(|path| path.to_string_lossy().to_string())
+    .filter(|path| structural_resources.contains(path))
+}
+
+fn path_within_workspace(path: &str, workspace: &str) -> bool {
+    std::path::Path::new(path).starts_with(std::path::Path::new(workspace))
+}
+
+/// Confine a compiled manifest to the turn's typed workspace binding.
+///
+/// The binding is the authority boundary the semantic contract may attenuate
+/// within but never relocate: the workspace itself is granted for read and
+/// write, write targets and an execution cwd outside it are dropped. Exact
+/// read targets outside the workspace are retained — they are grounded in
+/// resources the request named, and reading reference material from a
+/// sibling project does not move where the work happens. Without a binding
+/// the manifest is returned unchanged and no decision is recorded.
+fn confine_manifest_to_bound_workspace(
+    manifest: Option<ToolCallAccessManifest>,
+    bound_workspace: Option<&str>,
+) -> (Option<ToolCallAccessManifest>, Option<ContractLaneDecision>) {
+    let Some(workspace) = bound_workspace.map(str::trim).filter(|w| !w.is_empty()) else {
+        return (manifest, None);
+    };
+    let Some(workspace_grant) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, workspace)
+    else {
+        return (manifest, None);
+    };
+    let mut manifest = manifest.unwrap_or_default();
+    let candidate_count = usize::from(manifest.execution_cwd.is_some())
+        + manifest.read_targets.len()
+        + manifest.write_targets.len();
+
+    let relocates = |target: &ToolTargetHint| {
+        matches!(
+            target.kind,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+        ) && !path_within_workspace(&target.value, workspace)
+    };
+    let dropped_writes = manifest
+        .write_targets
+        .iter()
+        .filter(|t| relocates(t))
+        .count();
+    manifest.write_targets.retain(|target| !relocates(target));
+    let dropped_cwd = manifest
+        .execution_cwd
+        .as_deref()
+        .is_some_and(|cwd| !path_within_workspace(cwd, workspace));
+    if dropped_cwd {
+        manifest.execution_cwd = None;
+    }
+    for targets in [&mut manifest.read_targets, &mut manifest.write_targets] {
+        if !targets.contains(&workspace_grant) {
+            targets.push(workspace_grant.clone());
+        }
+        targets.sort_by(|left, right| left.value.cmp(&right.value));
+        targets.dedup();
+    }
+
+    let dropped = dropped_writes + usize::from(dropped_cwd);
+    let installed_count = usize::from(manifest.execution_cwd.is_some())
+        + manifest.read_targets.len()
+        + manifest.write_targets.len();
+    (
+        Some(manifest),
+        Some(decision(
+            "bound_workspace_authority",
+            true,
+            if dropped > 0 {
+                "relocated_targets_dropped"
+            } else {
+                "workspace_grant_installed"
+            },
+            candidate_count,
+            installed_count,
+        )),
+    )
 }
 
 fn compile_filesystem_access(
@@ -879,29 +966,28 @@ fn compile_filesystem_access(
     alias_roots: &[String],
     project_reference: Option<&str>,
     required_mutation_effects: ToolMutationEffects,
+    workspace_anchor: Option<&std::path::Path>,
 ) -> (Option<ToolCallAccessManifest>, ContractLaneDecision) {
     let candidate = candidate.cloned().unwrap_or_default();
-    let resolved_project_scope = project_reference.and_then(|reference| {
-        resolve_structural_path(reference, structural_resources, alias_roots)
-    });
+    let resolve = |raw: &str| {
+        resolve_structural_path(raw, structural_resources, alias_roots, workspace_anchor)
+    };
+    let resolved_project_scope = project_reference.and_then(resolve);
     let candidate_count = usize::from(candidate.execution_cwd.is_some())
         + candidate.read_paths.len()
         + candidate.write_paths.len()
         + candidate.read_roots.len()
         + candidate.write_roots.len();
-    let execution_cwd = candidate
-        .execution_cwd
-        .as_deref()
-        .and_then(|path| resolve_structural_path(path, structural_resources, alias_roots));
+    let execution_cwd = candidate.execution_cwd.as_deref().and_then(resolve);
     let resolved_read_roots = candidate
         .read_roots
         .iter()
-        .filter_map(|path| resolve_structural_path(path, structural_resources, alias_roots))
+        .filter_map(|path| resolve(path))
         .collect::<Vec<_>>();
     let resolved_write_roots = candidate
         .write_roots
         .iter()
-        .filter_map(|path| resolve_structural_path(path, structural_resources, alias_roots))
+        .filter_map(|path| resolve(path))
         .collect::<Vec<_>>();
 
     // A contract may name both a disposable directory and one of its future
@@ -914,7 +1000,7 @@ fn compile_filesystem_access(
     // or an execution cwd (cwd is traversal context, not data authority).
     let resolved_structural_resources = structural_resources
         .iter()
-        .filter_map(|path| resolve_structural_path(path, structural_resources, alias_roots))
+        .filter_map(|path| resolve(path))
         .collect::<Vec<_>>();
     let structural_ancestors_for = |path: &str| {
         let candidate_path = std::path::Path::new(path);
@@ -948,7 +1034,7 @@ fn compile_filesystem_access(
     let mut read_targets = candidate
         .read_paths
         .iter()
-        .filter_map(|path| resolve_structural_path(path, structural_resources, alias_roots))
+        .filter_map(|path| resolve(path))
         .filter_map(|path| {
             let kind = if is_directory_capability(&path, &resolved_read_roots) {
                 ToolTargetHintKind::ProjectScope
@@ -961,7 +1047,7 @@ fn compile_filesystem_access(
     let mut write_targets = candidate
         .write_paths
         .iter()
-        .filter_map(|path| resolve_structural_path(path, structural_resources, alias_roots))
+        .filter_map(|path| resolve(path))
         .filter_map(|path| {
             let kind = if is_directory_capability(&path, &resolved_write_roots) {
                 ToolTargetHintKind::ProjectScope
@@ -1084,6 +1170,7 @@ fn compile_project_scope(
     project_reference: Option<&str>,
     structural_project_scopes: &[String],
     alias_roots: &[String],
+    bound_workspace: Option<&str>,
 ) -> (Option<String>, ContractLaneDecision) {
     let Some(reference) = project_reference
         .map(str::trim)
@@ -1091,9 +1178,25 @@ fn compile_project_scope(
     else {
         return (None, decision("project_scope", true, "empty", 0, 0));
     };
-    let resolved = crate::tools::fs_utils::resolve_project_scope_reference(reference, alias_roots)
-        .map(|path| path.to_string_lossy().to_string())
-        .filter(|path| structural_project_scopes.contains(path));
+    let workspace_anchor = bound_workspace.map(std::path::Path::new);
+    let resolved = crate::tools::fs_utils::resolve_project_scope_reference_from(
+        reference,
+        alias_roots,
+        workspace_anchor,
+    )
+    .map(|path| path.to_string_lossy().to_string())
+    .filter(|path| structural_project_scopes.contains(path));
+    // A semantic project reference cannot move a bound turn to another
+    // repository; the binding is typed authority, the reference is a hint.
+    let outside_bound_workspace = match (resolved.as_deref(), bound_workspace) {
+        (Some(path), Some(workspace)) => !path_within_workspace(path, workspace),
+        _ => false,
+    };
+    let resolved = if outside_bound_workspace {
+        None
+    } else {
+        resolved
+    };
     let accepted = resolved.is_some();
     (
         resolved,
@@ -1102,6 +1205,8 @@ fn compile_project_scope(
             accepted,
             if accepted {
                 "accepted"
+            } else if outside_bound_workspace {
+                "outside_bound_workspace"
             } else {
                 "no_structural_resource_identity"
             },
@@ -1268,14 +1373,19 @@ pub(crate) fn compile_task_contract(input: ContractCompilerInput<'_>) -> Compile
             .as_ref()
             .map(|core| core.required_mutation_effects)
             .unwrap_or(ToolMutationEffects::NONE),
+        input.bound_workspace.map(std::path::Path::new),
     );
-    compiled.filesystem_access = filesystem_access;
     compiled.decisions.push(filesystem_decision);
+    let (filesystem_access, workspace_decision) =
+        confine_manifest_to_bound_workspace(filesystem_access, input.bound_workspace);
+    compiled.filesystem_access = filesystem_access;
+    compiled.decisions.extend(workspace_decision);
 
     let (project_scope, project_decision) = compile_project_scope(
         input.signals.project_reference.as_deref(),
         input.structural_project_scopes,
         input.project_alias_roots,
+        input.bound_workspace,
     );
     compiled.project_scope = project_scope;
     compiled.decisions.push(project_decision);
@@ -1350,6 +1460,7 @@ mod tests {
             structural_filesystem_resources: &[],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         })
     }
@@ -1900,6 +2011,7 @@ mod tests {
             structural_filesystem_resources: &resources,
             structural_project_scopes: &resources,
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
 
@@ -1945,6 +2057,7 @@ mod tests {
             structural_filesystem_resources: &[file.clone(), directory.clone()],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -1952,6 +2065,281 @@ mod tests {
         assert_eq!(
             access.write_targets[0].kind,
             ToolTargetHintKind::ProjectScope
+        );
+    }
+
+    /// A synthetic bound workspace laid out like a static-site checkout, plus a
+    /// sibling project the workspace must never be relocated to.
+    struct BoundWorkspaceFixture {
+        _dir: tempfile::TempDir,
+        workspace: String,
+        posts: String,
+        sibling: String,
+        sibling_file: String,
+    }
+
+    fn bound_workspace_fixture() -> BoundWorkspaceFixture {
+        let dir = tempfile::tempdir().expect("directory");
+        let workspace = dir.path().join("blog-site");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace marker");
+        let posts = workspace.join("src").join("content").join("posts");
+        std::fs::create_dir_all(&posts).expect("posts directory");
+        let sibling = dir.path().join("sibling-project");
+        std::fs::create_dir_all(sibling.join(".git")).expect("sibling marker");
+        let sibling_file = sibling.join("NOTES.md");
+        std::fs::write(&sibling_file, "synthetic").expect("sibling file");
+        BoundWorkspaceFixture {
+            workspace: workspace.to_string_lossy().to_string(),
+            posts: posts.to_string_lossy().to_string(),
+            sibling: sibling.to_string_lossy().to_string(),
+            sibling_file: sibling_file.to_string_lossy().to_string(),
+            _dir: dir,
+        }
+    }
+
+    fn local_write_signals(filesystem_access: PlannedFilesystemAccess) -> PlannedContractSignals {
+        let mut signals = base_signals();
+        signals.task_kind = Some("change".to_string());
+        signals.expects_mutation = Some(true);
+        signals.requires_observation = Some(false);
+        signals.required_effects = Some(vec!["local_source_write".to_string()]);
+        signals.filesystem_access = Some(filesystem_access);
+        signals
+    }
+
+    fn compile_bound(
+        signals: &PlannedContractSignals,
+        request_text: &str,
+        structural_project_scopes: &[String],
+        bound_workspace: Option<&str>,
+    ) -> CompiledTaskContract {
+        let structural_resources =
+            crate::agent::project_scope::extract_exact_filesystem_resources_from_text_anchored(
+                request_text,
+                &[],
+                bound_workspace.map(std::path::Path::new),
+            );
+        compile_task_contract(ContractCompilerInput {
+            signals,
+            task_shape: None,
+            available_tool_names: &["terminal".to_string()],
+            available_tool_receipt_kinds: &[(
+                "terminal".to_string(),
+                crate::traits::ToolReceiptKind::Process,
+            )],
+            structural_filesystem_resources: &structural_resources,
+            structural_project_scopes,
+            project_alias_roots: &[],
+            bound_workspace,
+            current_user_text: request_text,
+        })
+    }
+
+    fn lane<'a>(
+        compiled: &'a CompiledTaskContract,
+        lane: &str,
+    ) -> Option<&'a ContractLaneDecision> {
+        compiled
+            .decisions
+            .iter()
+            .find(|decision| decision.lane == lane)
+    }
+
+    fn target_values(targets: &[ToolTargetHint], kind: ToolTargetHintKind) -> Vec<&str> {
+        targets
+            .iter()
+            .filter(|target| target.kind == kind)
+            .map(|target| target.value.as_str())
+            .collect()
+    }
+
+    /// The regression: a relative path in goal/handoff text (`src/content/posts`)
+    /// must ground inside the typed bound workspace, not the daemon cwd (this
+    /// repository, which also has a `src/` directory).
+    #[test]
+    fn relative_resources_ground_inside_the_bound_workspace() {
+        let fixture = bound_workspace_fixture();
+        let request = "Publish the next post under src/content/posts and rebuild the site.";
+        let signals = local_write_signals(PlannedFilesystemAccess {
+            write_paths: vec!["src/content/posts".to_string()],
+            ..PlannedFilesystemAccess::default()
+        });
+
+        let compiled = compile_bound(&signals, request, &[], Some(&fixture.workspace));
+
+        let access = compiled
+            .filesystem_access
+            .as_ref()
+            .expect("filesystem authority");
+        let writes = target_values(&access.write_targets, ToolTargetHintKind::ProjectScope);
+        assert_eq!(
+            writes,
+            vec![fixture.workspace.as_str(), fixture.posts.as_str()],
+            "posts directory anchored to the workspace and workspace grant installed"
+        );
+        let cwd = std::env::current_dir().expect("cwd");
+        for target in access
+            .read_targets
+            .iter()
+            .chain(access.write_targets.iter())
+        {
+            assert!(
+                !std::path::Path::new(&target.value).starts_with(&cwd),
+                "compiled target relocated to the daemon cwd: {}",
+                target.value
+            );
+        }
+        let workspace_decision =
+            lane(&compiled, "bound_workspace_authority").expect("workspace lane decision");
+        assert!(workspace_decision.accepted);
+        assert_eq!(workspace_decision.reason_code, "workspace_grant_installed");
+    }
+
+    /// Differently phrased handoff text (`key=value` notation instead of prose)
+    /// reaches the same typed grant; the anchor, not the wording, decides.
+    #[test]
+    fn handoff_notation_resources_ground_inside_the_bound_workspace() {
+        let fixture = bound_workspace_fixture();
+        let request = "target_dir=src/content/posts action=create_post";
+        let signals = local_write_signals(PlannedFilesystemAccess {
+            write_paths: vec!["src/content/posts".to_string()],
+            ..PlannedFilesystemAccess::default()
+        });
+
+        let compiled = compile_bound(&signals, request, &[], Some(&fixture.workspace));
+
+        let access = compiled.filesystem_access.expect("filesystem authority");
+        assert!(access
+            .write_targets
+            .iter()
+            .any(|target| target.value == fixture.posts));
+    }
+
+    /// A write target or cwd in another repository cannot relocate a bound
+    /// turn; an exact read of a named sibling file is retained because reading
+    /// reference material does not move where the work happens.
+    #[test]
+    fn compiled_targets_outside_the_bound_workspace_are_dropped_for_writes_only() {
+        let fixture = bound_workspace_fixture();
+        let request = format!(
+            "Read {} for tone, then write the post into {} (cwd {}).",
+            fixture.sibling_file, fixture.sibling, fixture.sibling
+        );
+        let signals = local_write_signals(PlannedFilesystemAccess {
+            read_paths: vec![fixture.sibling_file.clone()],
+            write_paths: vec![fixture.sibling.clone()],
+            execution_cwd: Some(fixture.sibling.clone()),
+            ..PlannedFilesystemAccess::default()
+        });
+
+        let compiled = compile_bound(&signals, &request, &[], Some(&fixture.workspace));
+
+        let access = compiled
+            .filesystem_access
+            .as_ref()
+            .expect("filesystem authority");
+        assert_eq!(access.execution_cwd, None, "foreign cwd dropped");
+        assert_eq!(
+            target_values(&access.write_targets, ToolTargetHintKind::ProjectScope),
+            vec![fixture.workspace.as_str()],
+            "foreign write root dropped, workspace grant installed"
+        );
+        assert!(
+            access
+                .write_targets
+                .iter()
+                .all(|target| target.value != fixture.sibling),
+            "{:?}",
+            access.write_targets
+        );
+        assert_eq!(
+            target_values(&access.read_targets, ToolTargetHintKind::Path),
+            vec![fixture.sibling_file.as_str()],
+            "exact sibling read retained"
+        );
+        assert!(access
+            .read_targets
+            .iter()
+            .any(|target| target.value == fixture.workspace));
+        let workspace_decision =
+            lane(&compiled, "bound_workspace_authority").expect("workspace lane decision");
+        assert_eq!(workspace_decision.reason_code, "relocated_targets_dropped");
+    }
+
+    /// A semantic project reference that resolves to another repository is a
+    /// hint the binding overrides, not authority.
+    #[test]
+    fn project_reference_outside_the_bound_workspace_is_rejected() {
+        let fixture = bound_workspace_fixture();
+        let request = format!("Deploy the site in {}", fixture.sibling);
+        let mut signals = local_write_signals(PlannedFilesystemAccess::default());
+        signals.project_reference = Some(fixture.sibling.clone());
+
+        let compiled = compile_bound(
+            &signals,
+            &request,
+            std::slice::from_ref(&fixture.sibling),
+            Some(&fixture.workspace),
+        );
+
+        assert_eq!(compiled.project_scope, None);
+        let project_decision = lane(&compiled, "project_scope").expect("project lane decision");
+        assert!(!project_decision.accepted);
+        assert_eq!(project_decision.reason_code, "outside_bound_workspace");
+
+        // The same reference inside the binding is accepted, and a relative
+        // reference promotes to the bound workspace root rather than the cwd.
+        for reference in ["src/content/posts", fixture.workspace.as_str()] {
+            let mut signals = local_write_signals(PlannedFilesystemAccess::default());
+            signals.project_reference = Some(reference.to_string());
+            let compiled = compile_bound(
+                &signals,
+                &request,
+                std::slice::from_ref(&fixture.workspace),
+                Some(&fixture.workspace),
+            );
+            assert_eq!(
+                compiled.project_scope.as_deref(),
+                Some(fixture.workspace.as_str()),
+                "reference {reference}"
+            );
+        }
+    }
+
+    /// Negative control: without a binding the compiler behaves as before — no
+    /// workspace lane decision, no synthetic grant, and a sibling repository
+    /// reference is honored.
+    #[test]
+    fn unbound_turns_record_no_workspace_authority_decision() {
+        let fixture = bound_workspace_fixture();
+        let request = format!("Write the post into {}", fixture.sibling);
+        let mut signals = local_write_signals(PlannedFilesystemAccess {
+            write_paths: vec![fixture.sibling.clone()],
+            ..PlannedFilesystemAccess::default()
+        });
+        signals.project_reference = Some(fixture.sibling.clone());
+
+        let compiled = compile_bound(
+            &signals,
+            &request,
+            std::slice::from_ref(&fixture.sibling),
+            None,
+        );
+
+        assert!(lane(&compiled, "bound_workspace_authority").is_none());
+        let access = compiled.filesystem_access.expect("filesystem authority");
+        assert_eq!(
+            target_values(&access.write_targets, ToolTargetHintKind::ProjectScope),
+            vec![fixture.sibling.as_str()]
+        );
+        assert!(access
+            .read_targets
+            .iter()
+            .chain(access.write_targets.iter())
+            .all(|target| target.value != fixture.workspace));
+        assert_eq!(
+            compiled.project_scope.as_deref(),
+            Some(fixture.sibling.as_str())
         );
     }
 
@@ -1976,6 +2364,7 @@ mod tests {
             structural_filesystem_resources: &[],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let authority = compiled.authority;
@@ -2015,6 +2404,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string()],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -2052,6 +2442,7 @@ mod tests {
             structural_filesystem_resources: &[file.clone()],
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -2093,6 +2484,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string()],
             structural_project_scopes: &[root.to_string()],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -2134,6 +2526,7 @@ mod tests {
             structural_filesystem_resources: &[root.to_string(), child.clone()],
             structural_project_scopes: &[root.to_string()],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");
@@ -2171,6 +2564,7 @@ mod tests {
             structural_filesystem_resources: &resources,
             structural_project_scopes: &[],
             project_alias_roots: &[],
+            bound_workspace: None,
             current_user_text: "synthetic request",
         });
         let access = compiled.filesystem_access.expect("filesystem authority");

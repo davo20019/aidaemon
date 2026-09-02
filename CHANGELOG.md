@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-09-02
+
+### Fixed
+
+- **Relative paths in goal and handoff text resolve inside the bound workspace, not the daemon's cwd.** A scheduled goal bound to a static-site checkout failed every task as `blocked` because instruction-relative references such as `src/content/posts` were anchored to the directory the daemon process happens to run from (which also has a `src/`), so the compiled access manifest granted the wrong repository and the scope lock then denied reads of the real one. The turn now carries a typed `bound_workspace` — the goal's durable `project_scope` binding for the task lead, or the provisioned attempt workspace a parent handed to an executor — and every structural path resolver (scope extraction, completion-contract verification targets, the contract compiler's filesystem and project-scope lanes) anchors relative references to it; under a binding no other configured project root may claim a reference. The compiled manifest is confined to the binding as an authority boundary: the workspace is granted for read and write, write targets and an execution cwd outside it are dropped (recorded as a `bound_workspace_authority` lane decision), a semantic project reference resolving outside it is rejected (`outside_bound_workspace`), and exact read targets the request named elsewhere are retained. Unbound turns behave exactly as before.
+
 ## [0.12.3] - 2026-09-02
 
 ### Changed

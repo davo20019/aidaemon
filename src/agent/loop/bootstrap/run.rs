@@ -259,11 +259,14 @@ async fn finalize_turn_assessment(
         // invent filesystem authority. Ground every proposed path against an
         // exact path-shaped resource identity authored in the current request.
         // This parser recognizes filesystem grammar only; it does not infer
-        // intent from words or phrases.
+        // intent from words or phrases. Relative references are anchored to
+        // the turn's typed workspace binding, never to the daemon's own cwd.
+        let bound_workspace = turn_context.bound_workspace.as_deref();
         let structural_filesystem_resources =
-            crate::agent::project_scope::extract_exact_filesystem_resources_from_text(
+            crate::agent::project_scope::extract_exact_filesystem_resources_from_text_anchored(
                 user_text,
                 &agent.path_aliases.projects,
+                bound_workspace.map(std::path::Path::new),
             );
         let structural_project_scopes = structural_filesystem_resources.clone();
         let compiled = super::contract_compiler::compile_task_contract(
@@ -275,6 +278,7 @@ async fn finalize_turn_assessment(
                 structural_filesystem_resources: &structural_filesystem_resources,
                 structural_project_scopes: &structural_project_scopes,
                 project_alias_roots: &agent.path_aliases.projects,
+                bound_workspace,
                 current_user_text: user_text,
             },
         );
@@ -360,8 +364,12 @@ async fn finalize_turn_assessment(
             },
         );
     }
+    // A typed workspace binding is the primary scope for the whole turn; the
+    // semantic project reference may only steer unbound turns.
     if let Some(project_scope) = compiled_project_scope {
-        turn_context.primary_project_scope = Some(project_scope);
+        if turn_context.bound_workspace.is_none() {
+            turn_context.primary_project_scope = Some(project_scope);
+        }
     }
     turn_context.filesystem_access = compiled_filesystem_access.filter(|access| {
         access.execution_cwd.is_some()
