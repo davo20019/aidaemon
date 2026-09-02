@@ -961,6 +961,11 @@ pub struct ExecutorExpectationItem {
     /// string protocol for persisted events; new declarations populate both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observation_targets: Vec<crate::traits::RequestObservationTarget>,
+    /// Resource IDs the model named that no registered tool advertises. They
+    /// were removed from `targets` before compilation because no receipt can
+    /// ever carry them; recorded so the drop stays auditable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unbound_targets: Vec<String>,
     /// The model's declared status (`pending`, `in_progress`, `completed`,
     /// `deferred`, ...). Receipts decide satisfaction; only an explicit
     /// `deferred`/`skipped` abandons an item.

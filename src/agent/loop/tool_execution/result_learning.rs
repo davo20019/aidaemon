@@ -728,6 +728,8 @@ pub(super) async fn apply_result_learning(
         }
     }
 
+    credit_recovery_after_success(state.learning_ctx, env.tool_summary);
+
     if global_learning_allowed && !state.learning_ctx.errors.is_empty() {
         // Credit any injected diagnostic hints if we recovered after they were shown.
         if let Some(solution_id) = state.pending_error_solution_ids.first().copied() {
@@ -799,16 +801,6 @@ pub(super) async fn apply_result_learning(
                     "In-session error solution learned"
                 );
             }
-        }
-
-        // Successful action after an error - this is recovery
-        state
-            .learning_ctx
-            .recovery_actions
-            .push(env.tool_summary.to_string());
-        // Mark the last error as recovered
-        if let Some((_, recovered)) = state.learning_ctx.errors.last_mut() {
-            *recovered = true;
         }
     }
 
@@ -910,6 +902,26 @@ fn global_learning_is_allowed(
     !mandate_execution_active && memory_persistence_allowed
 }
 
+/// A successful action after an earlier error is recovery. This is run-state
+/// bookkeeping, not a memory write: the task-end outcome label reads it, so a
+/// memory-suppressed or mandate turn must record it exactly like any other.
+/// Only persisted learning (solutions, patterns) stays behind the memory
+/// capability. Returns whether an outstanding error was marked recovered.
+fn credit_recovery_after_success(learning_ctx: &mut LearningContext, tool_summary: &str) -> bool {
+    if learning_ctx.errors.is_empty() {
+        return false;
+    }
+    learning_ctx.recovery_actions.push(tool_summary.to_string());
+    match learning_ctx.errors.last_mut() {
+        Some((_, recovered)) => {
+            let newly = !*recovered;
+            *recovered = true;
+            newly
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +932,55 @@ mod tests {
         assert!(!global_learning_is_allowed(false, false));
         assert!(!global_learning_is_allowed(true, true));
         assert!(!global_learning_is_allowed(true, false));
+    }
+
+    fn learning_ctx_with_errors(
+        memory_persistence_allowed: bool,
+        errors: Vec<(&str, bool)>,
+    ) -> LearningContext {
+        LearningContext {
+            user_text: "run the check".to_string(),
+            memory_persistence_allowed,
+            intent_domains: Vec::new(),
+            tool_calls: Vec::new(),
+            errors: errors
+                .into_iter()
+                .map(|(error, recovered)| (error.to_string(), recovered))
+                .collect(),
+            first_error: None,
+            recovery_actions: Vec::new(),
+            start_time: chrono::Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+            task_outcome: None,
+            replay_notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_bookkeeping_is_independent_of_the_memory_capability() {
+        // The R51 regression: a memory-suppressed turn whose provider call
+        // timed out once, then succeeded through a tool, was labelled failed
+        // because recovery was only recorded when learning was allowed.
+        let mut suppressed =
+            learning_ctx_with_errors(false, vec![("LLM call timed out after 90s", false)]);
+        assert!(suppressed.has_unrecovered_model_error());
+        assert!(credit_recovery_after_success(
+            &mut suppressed,
+            "terminal(check pid)"
+        ));
+        assert!(!suppressed.has_unrecovered_model_error());
+        assert_eq!(suppressed.recovery_actions, vec!["terminal(check pid)"]);
+
+        let mut allowed = learning_ctx_with_errors(true, vec![("Error: not found", false)]);
+        assert!(credit_recovery_after_success(&mut allowed, "read_file(x)"));
+        assert!(allowed.errors[0].1);
+
+        // No error means nothing to recover and no phantom recovery action.
+        let mut clean = learning_ctx_with_errors(false, Vec::new());
+        assert!(!credit_recovery_after_success(&mut clean, "read_file(x)"));
+        assert!(clean.recovery_actions.is_empty());
     }
 
     #[test]

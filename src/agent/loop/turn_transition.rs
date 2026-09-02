@@ -6,7 +6,13 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TurnRestartReason {
     StoppingPhaseControl,
-    ApproachPivot { failure_record: String },
+    ApproachPivot {
+        failure_record: String,
+    },
+    /// A stall after clean progress hands the model one tool-less closeout
+    /// pass; the stall evidence belonged to the tool-calling approach that
+    /// this pass ends.
+    StallForceTextCloseout,
     LlmPhaseRecovery,
     ResponsePhaseRecovery,
     ToolPreludeRecovery,

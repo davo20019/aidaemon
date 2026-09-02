@@ -1090,6 +1090,15 @@ impl Tool for ManageHttpAuthTool {
         manage_http_auth_schema()
     }
 
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::traits::StableObservationSubject::collection(
+            Self::AUTH_PROFILE_COLLECTION_ID,
+            &[ToolSemanticFacet::Authorization],
+            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
+            "every configured API auth profile, manual or OAuth-backed",
+        )]
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let mut semantics = semantics_for_exact_read_actions(
             arguments,
@@ -1233,27 +1242,13 @@ impl Tool for ManageHttpAuthTool {
 }
 
 #[cfg(test)]
-// These tests serialize global env-var mutation via a shared lock; the guard
-// must intentionally span `.await` points to keep parallel tests isolated, so
-// `clippy::await_holding_lock` is a false positive for this pattern.
-#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use tempfile::{NamedTempFile, TempDir};
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-
-    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-
-    fn restore_env_var(name: &str, old_value: Option<String>) {
-        if let Some(value) = old_value {
-            std::env::set_var(name, value);
-        } else {
-            std::env::remove_var(name);
-        }
-    }
+    use crate::testing::KeychainIsolation;
 
     async fn test_tool(
         config_path: PathBuf,
@@ -1330,10 +1325,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_binds_detected_env_secret_and_refreshes_runtime_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
-        let env_path = temp_dir.path().join(".env");
         write_minimal_config(
             &config_path,
             r#"
@@ -1342,15 +1336,11 @@ auth_type = "bearer"
 allowed_domains = ["api.example.com"]
 "#,
         );
-        std::fs::write(&env_path, "HTTP_AUTH_DEMO_TOKEN=secret-demo-token\n").unwrap();
-
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_path.to_string_lossy().to_string(),
-        );
+        std::fs::write(
+            isolation.env_file_path(),
+            "HTTP_AUTH_DEMO_TOKEN=secret-demo-token\n",
+        )
+        .unwrap();
 
         let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let tool = test_tool(config_path.clone(), profiles.clone())
@@ -1360,9 +1350,6 @@ allowed_domains = ["api.example.com"]
             .call(r#"{"action":"verify","profile":"demo"}"#)
             .await
             .unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert!(result.contains("Profile 'demo' is ready."));
         let saved = std::fs::read_to_string(&config_path).unwrap();

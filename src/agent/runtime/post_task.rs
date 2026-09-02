@@ -64,12 +64,30 @@ pub(super) struct LearningContext {
 }
 
 impl LearningContext {
+    fn is_model_call_error(error: &str) -> bool {
+        error.starts_with("LLM call ") || error.starts_with("All model attempts failed")
+    }
+
     pub(super) fn has_unrecovered_model_error(&self) -> bool {
-        self.errors.iter().any(|(error, recovered)| {
-            !*recovered
-                && (error.starts_with("LLM call ")
-                    || error.starts_with("All model attempts failed"))
-        })
+        self.errors
+            .iter()
+            .any(|(error, recovered)| !*recovered && Self::is_model_call_error(error))
+    }
+
+    /// A completed provider response is the typed recovery for every earlier
+    /// provider failure in this run (timeout, transport error, exhausted
+    /// fallbacks): the loop regained the model and kept working. Without this
+    /// the task-end label reports `failed` for a turn whose only defect was a
+    /// stalled attempt before the one that succeeded.
+    pub(super) fn mark_model_call_errors_recovered(&mut self) -> usize {
+        let mut marked = 0;
+        for (error, recovered) in &mut self.errors {
+            if !*recovered && Self::is_model_call_error(error) {
+                *recovered = true;
+                marked += 1;
+            }
+        }
+        marked
     }
 
     pub(super) fn record_replay_note(
@@ -1539,6 +1557,28 @@ mod tests {
         assert!(model_error.has_unrecovered_model_error());
         model_error.errors[0].1 = true;
         assert!(!model_error.has_unrecovered_model_error());
+    }
+
+    #[test]
+    fn a_later_provider_response_recovers_only_model_call_errors() {
+        let mut ctx = ctx_with_single_error("LLM call timed out after 90s");
+        ctx.errors.push((
+            "All model attempts failed: gpt-5.6-terra, gpt-5.6-sol".to_string(),
+            false,
+        ));
+        ctx.errors
+            .push(("Error: selector did not match".to_string(), false));
+        assert!(ctx.has_unrecovered_model_error());
+
+        assert_eq!(ctx.mark_model_call_errors_recovered(), 2);
+        assert!(!ctx.has_unrecovered_model_error());
+        // Tool failures keep their own recovery bookkeeping.
+        assert_eq!(
+            ctx.errors[2],
+            ("Error: selector did not match".to_string(), false)
+        );
+        // Idempotent: nothing left to mark.
+        assert_eq!(ctx.mark_model_call_errors_recovered(), 0);
     }
 
     #[test]

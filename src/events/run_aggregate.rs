@@ -303,6 +303,12 @@ pub(crate) struct RunAggregate {
     pub prepared_response_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivery_states: BTreeMap<String, ResponseDeliveryState>,
+    /// Source obligation id (from a task this contract adopted) -> the
+    /// obligation id this run compiled for the same requirement. An adopted
+    /// durable replay of the source receipt claims and completes the source
+    /// id; this alias is the typed bridge that lets it prove ours.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub adopted_obligation_aliases: BTreeMap<String, String>,
 }
 
 impl RunAggregate {
@@ -331,6 +337,7 @@ impl RunAggregate {
             recorded_task_outcome: None,
             prepared_response_id: None,
             delivery_states: BTreeMap::new(),
+            adopted_obligation_aliases: BTreeMap::new(),
         }
     }
 
@@ -483,6 +490,22 @@ impl RunAggregate {
                 observation_targets: Vec::new(),
                 summary: None,
             });
+        }
+
+        self.adopted_obligation_aliases.clear();
+        for binding in &compiled.contract.adopted_evidence_bindings {
+            let Some(index) = compiled
+                .contract
+                .evidence_requirements
+                .iter()
+                .position(|requirement| requirement == &binding.requirement)
+            else {
+                continue;
+            };
+            self.adopted_obligation_aliases.insert(
+                binding.source_obligation_id.clone(),
+                format!("task:{}/obligation:evidence:{index}", self.task_id),
+            );
         }
 
         // Older compiled rows can carry invocation predicates separately from
@@ -879,6 +902,12 @@ impl RunAggregate {
             }
             return;
         }
+        if matches!(
+            call.operation_lineage,
+            Some(super::ToolOperationLineage::DurableReplay { .. })
+        ) {
+            call.obligation_ids = self.resolve_adopted_obligation_ids(&call.obligation_ids);
+        }
         call.obligation_ids = self.effective_obligation_ids(&call.obligation_ids);
         self.operations.insert(
             call.tool_call_id.clone(),
@@ -958,6 +987,25 @@ impl RunAggregate {
         } else {
             open
         }
+    }
+
+    /// Map obligation ids named by an adopted durable replay onto this run's
+    /// own obligations. Only ids bound by the compiled contract translate;
+    /// anything else is kept verbatim so an unrelated claim still cannot
+    /// prove a local obligation.
+    fn resolve_adopted_obligation_ids(&self, ids: &[String]) -> Vec<String> {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            let local = self
+                .adopted_obligation_aliases
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            if !resolved.contains(&local) {
+                resolved.push(local);
+            }
+        }
+        resolved
     }
 
     fn record_result(&mut self, result: ToolResultData) {
@@ -1118,11 +1166,13 @@ impl RunAggregate {
             }
         }
 
-        let explicit_ids = receipt
-            .completion_obligation_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let explicit_ids = if is_durable_replay {
+            self.resolve_adopted_obligation_ids(&receipt.completion_obligation_ids)
+        } else {
+            receipt.completion_obligation_ids.clone()
+        }
+        .into_iter()
+        .collect::<BTreeSet<_>>();
         for obligation in self.obligations.values_mut() {
             if obligation.state == RunObligationState::Unverifiable {
                 continue;
@@ -3828,6 +3878,80 @@ mod tests {
     }
 
     #[test]
+    fn adopted_parent_receipt_credits_the_bound_child_obligation() {
+        // A background continuation child inherits the parent's invocation
+        // requirement. The adopted durable replay of the parent's terminal
+        // receipt still names the *parent's* obligation id, both in the call
+        // claim and in the receipt's completion ids; the child contract's
+        // adopted binding is the typed bridge to the child's own obligation.
+        let parent_obligation = "task:parent-1/obligation:evidence:0";
+        let child_obligation = "task:task-1/obligation:evidence:0";
+        let inherited = requirement("terminal", 0);
+        let mut contract = contract(vec![inherited.clone()]);
+        contract.data["contract"]["adopted_from_task_ids"] = json!(["parent-1"]);
+        contract.data["contract"]["adopted_evidence_bindings"] = json!([{
+            "source_obligation_id": parent_obligation,
+            "requirement": inherited,
+        }]);
+        contract.data["contract"]["expects_mutation"] = json!(true);
+        contract.data["contract"]["required_mutation_effects"] =
+            json!(ToolMutationEffects::PROCESS_STATE.bits());
+
+        let lineage = crate::events::ToolOperationLineage::DurableReplay {
+            source_operation_id: "run".to_string(),
+            source_result_id: "result:run".to_string(),
+        };
+        let adopted_call = event(
+            EventType::ToolCall,
+            ToolCallData::from_tool_call("run", "terminal", json!({}), Some("task-1".to_string()))
+                .with_policy_metadata(Some("operation:run".to_string()), None, None)
+                .with_kernel_claim("operation:run", vec![parent_obligation.to_string()], 1, 1)
+                .with_operation_lineage(Some(lineage)),
+        );
+        // The terminal receipt of a backgrounded process carries the
+        // process-state mutation the launch declared.
+        let mut adopted_result = result(
+            "run",
+            "terminal",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::PROCESS_STATE),
+        );
+        adopted_result.data["receipt"]["completion_obligation_ids"] = json!([parent_obligation]);
+        adopted_result.data["receipt"]["result_provenance"]["result_id"] = json!("result:run");
+
+        let mut events = vec![contract, adopted_call, adopted_result];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.id = index as i64 + 1;
+        }
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.invariant_violations.is_empty());
+        assert_eq!(
+            aggregate.obligations[child_obligation].state,
+            RunObligationState::Satisfied,
+            "adopted receipt must close the child's bound invocation obligation"
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:mutation:process_state"].state,
+            RunObligationState::Satisfied,
+            "the completed background process proves the inherited process-state mutation"
+        );
+        assert_eq!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+        assert_eq!(
+            aggregate.closeout(|_| true),
+            CloseoutDecision::Closed {
+                proof_basis: "contract"
+            }
+        );
+        // The replay stays idempotent and never advances the child's effect
+        // revision: the mutation happened in the parent's lifecycle.
+        assert_eq!(aggregate.effect_revision, 0);
+    }
+
+    #[test]
     fn later_mutation_invalidates_current_observation_not_historical_accomplishment() {
         let current = RequestEvidenceRequirement {
             summary: "synthetic current state".to_string(),
@@ -4035,6 +4159,7 @@ mod tests {
             mutation_effects: effects,
             targets: targets.iter().map(|t| t.to_string()).collect(),
             observation_targets: Vec::new(),
+            unbound_targets: Vec::new(),
             status: status.to_string(),
         }
     }
@@ -4687,6 +4812,226 @@ mod tests {
                 .state,
             RunObligationState::Satisfied
         );
+    }
+
+    /// Regression for the 2026-09-01 audit runs: every receipt succeeded, but
+    /// the model bound one checklist item to an invented credential-state ID
+    /// no adapter reports. That obligation stayed pending and reachable, so
+    /// the run closed `partial`. Binding checklist targets against the stable
+    /// subjects tools actually advertise turns the invented ID into a
+    /// recorded, untargeted observation that the credential read satisfies.
+    #[test]
+    fn unbound_checklist_target_no_longer_leaves_an_all_success_audit_partial() {
+        use crate::tools::track_requirements::{
+            bind_checklist_targets, executor_expectations_from_checklist_arguments,
+            StableSubjectVocabulary,
+        };
+        use crate::traits::StableObservationSubject;
+
+        let objective_facets = [
+            ToolSemanticFacet::Schedule,
+            ToolSemanticFacet::RunState,
+            ToolSemanticFacet::Recovery,
+            ToolSemanticFacet::Control,
+            ToolSemanticFacet::Measurement,
+            ToolSemanticFacet::Ownership,
+        ];
+        let vocabulary = StableSubjectVocabulary::from_subjects(vec![
+            StableObservationSubject::collection(
+                "objective_collection:scheduled_goals",
+                &objective_facets,
+                "objective:",
+                "every scheduled goal",
+            ),
+            StableObservationSubject::collection(
+                "objective_collection:mandate_controllers",
+                &objective_facets,
+                "objective:",
+                "every mandate controller",
+            ),
+            StableObservationSubject::collection(
+                "auth_profile_collection:configured",
+                &[ToolSemanticFacet::Authorization],
+                "auth_profile:",
+                "every configured auth profile",
+            ),
+        ]);
+        let raw_arguments = serde_json::json!({
+            "items": [
+                {
+                    "text": "Audit the schedule state and latest run outcome.",
+                    "status": "completed",
+                    "requires_observation": true,
+                    "targets": [{
+                        "subject": {"kind": "resource_id", "value": "objective_collection:scheduled_goals"},
+                        "facets": ["schedule", "run_state"],
+                        "collection_coverage": {
+                            "collection": {"kind": "resource_id", "value": "objective_collection:scheduled_goals"},
+                            "minimum_completeness": "complete"
+                        }
+                    }]
+                },
+                {
+                    "text": "Audit objective-control presence.",
+                    "status": "completed",
+                    "requires_observation": true,
+                    "targets": [{
+                        "subject": {"kind": "resource_id", "value": "objective_collection:mandate_controllers"},
+                        "facets": ["control"],
+                        "collection_coverage": {
+                            "collection": {"kind": "resource_id", "value": "objective_collection:mandate_controllers"},
+                            "minimum_completeness": "complete"
+                        }
+                    }]
+                },
+                {
+                    "text": "Audit owner configuration and credential readiness.",
+                    "status": "completed",
+                    "requires_observation": true,
+                    "targets": ["x_owner_credential_state"]
+                }
+            ]
+        })
+        .to_string();
+
+        let goals_hint = ToolTargetHint::new(
+            ToolTargetHintKind::ResourceId,
+            "objective_collection:scheduled_goals",
+        )
+        .unwrap();
+        let mandates_hint = ToolTargetHint::new(
+            ToolTargetHintKind::ResourceId,
+            "objective_collection:mandate_controllers",
+        )
+        .unwrap();
+        let profile_collection_hint = ToolTargetHint::new(
+            ToolTargetHintKind::ResourceId,
+            "auth_profile_collection:configured",
+        )
+        .unwrap();
+        let profile_hint =
+            ToolTargetHint::new(ToolTargetHintKind::ResourceId, "auth_profile:twitter").unwrap();
+        let goal_member =
+            ToolTargetHint::new(ToolTargetHintKind::ResourceId, "objective:sha256:synthetic")
+                .unwrap();
+        let receipts = || {
+            vec![
+                call("goal-runs", "scheduled_goal_runs"),
+                with_exact_observations(
+                    result(
+                        "goal-runs",
+                        "scheduled_goal_runs",
+                        ToolOutcomeStatus::Succeeded,
+                        0,
+                        ToolCallSemantics::observation(),
+                    ),
+                    vec![objective_observation(
+                        "objective:sha256:synthetic",
+                        &objective_facets,
+                    )],
+                    vec![ToolCollectionObservation::complete(
+                        goals_hint.clone(),
+                        &objective_facets,
+                        vec![goal_member.clone()],
+                    )],
+                ),
+                call("mandates", "manage_mandates"),
+                with_exact_observations(
+                    result(
+                        "mandates",
+                        "manage_mandates",
+                        ToolOutcomeStatus::Succeeded,
+                        0,
+                        ToolCallSemantics::observation(),
+                    ),
+                    Vec::new(),
+                    vec![
+                        ToolCollectionObservation::complete(
+                            goals_hint.clone(),
+                            &objective_facets,
+                            vec![goal_member.clone()],
+                        ),
+                        ToolCollectionObservation::complete(
+                            mandates_hint.clone(),
+                            &objective_facets,
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+                call("auth", "manage_http_auth"),
+                with_exact_observations(
+                    result(
+                        "auth",
+                        "manage_http_auth",
+                        ToolOutcomeStatus::Succeeded,
+                        0,
+                        ToolCallSemantics::observation(),
+                    ),
+                    vec![ToolObservationEvidence::new(
+                        profile_hint.clone(),
+                        &[ToolSemanticFacet::Authorization],
+                    )],
+                    vec![ToolCollectionObservation::complete(
+                        profile_collection_hint.clone(),
+                        &[ToolSemanticFacet::Authorization],
+                        vec![profile_hint.clone()],
+                    )],
+                ),
+            ]
+        };
+
+        // Negative control: the pre-fix declaration keeps the invented ID as an
+        // exact obligation, which no receipt can ever credit.
+        let unbound_declaration =
+            executor_expectations_from_checklist_arguments("task-1", &raw_arguments).unwrap();
+        assert_eq!(
+            unbound_declaration.items[2].targets,
+            ["x_owner_credential_state"]
+        );
+        let mut control_events = vec![event(
+            EventType::ExecutorExpectationsDeclared,
+            unbound_declaration,
+        )];
+        control_events.extend(receipts());
+        renumber(&mut control_events);
+        let control = RunAggregate::replay("task-1", &control_events);
+        assert_eq!(
+            control.obligations["task:task-1/obligation:checklist:2"].state,
+            RunObligationState::Pending
+        );
+        assert_eq!(control.open_executor_expectations(), 1);
+        assert!(!control.evidence_closed());
+
+        // Bound declaration: the invented ID is recorded as unbound and the
+        // item becomes an untargeted observation expectation.
+        let bound_arguments = bind_checklist_targets(&raw_arguments, &vocabulary).unwrap();
+        let bound_declaration =
+            executor_expectations_from_checklist_arguments("task-1", &bound_arguments).unwrap();
+        assert!(bound_declaration.items[2].targets.is_empty());
+        assert!(bound_declaration.items[2].observation_targets.is_empty());
+        assert_eq!(
+            bound_declaration.items[2].unbound_targets,
+            ["x_owner_credential_state"]
+        );
+        assert_eq!(bound_declaration.items[0].observation_targets.len(), 1);
+        assert_eq!(bound_declaration.items[1].observation_targets.len(), 1);
+
+        let mut events = vec![event(
+            EventType::ExecutorExpectationsDeclared,
+            bound_declaration,
+        )];
+        events.extend(receipts());
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        for index in 0..3 {
+            assert_eq!(
+                aggregate.obligations[&format!("task:task-1/obligation:checklist:{index}")].state,
+                RunObligationState::Satisfied,
+                "checklist item {index} must be credited by the typed receipts"
+            );
+        }
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+        assert!(aggregate.evidence_closed());
     }
 
     #[test]

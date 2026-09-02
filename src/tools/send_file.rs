@@ -160,6 +160,13 @@ impl Tool for SendFileTool {
         }
     }
 
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::traits::StableObservationSubject::namespace(
+            crate::channels::attachments::RESOURCE_ID_PREFIX,
+            "session resource handles returned by tools",
+        )]
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args = serde_json::from_str::<Value>(arguments).ok();
         let resource_id = args

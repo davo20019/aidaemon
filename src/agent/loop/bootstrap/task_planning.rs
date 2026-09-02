@@ -1229,6 +1229,75 @@ fn observed_assessment_budget(observed_latency_ms: Option<u64>) -> Duration {
         .min(TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT)
 }
 
+/// How long a configured candidate keeps the assessment lane to itself before
+/// the next configured candidate is started alongside it.  A candidate is
+/// statistically late once it exceeds its own observed p95, so hedging there
+/// adds at most ~5% duplicate load; the default attempt budget caps the
+/// exclusive window so a slow model's extended budget (up to
+/// [`TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT`]) protects its in-flight call without
+/// delaying failover by that whole extension.  With no observed latency the
+/// hedge point equals the default budget, which is plain serial failover.
+fn assessment_hedge_delay(observed_latency_ms: Option<u64>, attempt_budget: Duration) -> Duration {
+    observed_latency_ms
+        .map(Duration::from_millis)
+        .unwrap_or(TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT)
+        .min(TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT)
+        .min(attempt_budget)
+}
+
+/// One bounded physical assessment call.  Hedged candidates run as separate
+/// instances of this future so each keeps its own deadline and telemetry.
+async fn run_assessment_attempt(
+    provider: Arc<dyn ModelProvider>,
+    model: String,
+    messages: Vec<Value>,
+    options: crate::traits::ChatOptions,
+    attempt_timeout: Duration,
+    attempt_number: u32,
+    est_input_tokens: Option<u32>,
+) -> (u32, Option<u32>, TaskAssessmentAttempt) {
+    let call_start = tokio::time::Instant::now();
+    let attempt = match tokio::time::timeout(
+        attempt_timeout,
+        provider.chat_with_options(&model, &messages, &[], &options),
+    )
+    .await
+    {
+        Ok(Ok(response)) => TaskAssessmentAttempt::Response {
+            model,
+            response,
+            latency_ms: call_start.elapsed().as_millis() as u64,
+        },
+        Ok(Err(error)) => {
+            let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
+            TaskAssessmentAttempt::ProviderError {
+                model,
+                latency_ms: call_start.elapsed().as_millis() as u64,
+                prevents_model_fallback: provider_error
+                    .is_some_and(crate::providers::ProviderError::prevents_model_fallback),
+                provider_error_kind: provider_error.map(|error| error.kind),
+                provider_status: provider_error.and_then(|error| error.status),
+                error: error.to_string(),
+            }
+        }
+        Err(_) => TaskAssessmentAttempt::Timeout {
+            model,
+            latency_ms: call_start.elapsed().as_millis() as u64,
+        },
+    };
+    (attempt_number, est_input_tokens, attempt)
+}
+
+/// One planned physical attempt in the assessment lane.  Multiple configured
+/// candidates are hedged against each other; a lone candidate instead reserves
+/// one protocol-repair attempt that only a validation failure may start.
+struct AssessmentAttemptSpec {
+    model: String,
+    budget: Duration,
+    hedge_delay: Option<Duration>,
+    repair: bool,
+}
+
 #[cfg(test)]
 fn bounded_attempt_timeout(remaining: Duration, requested: Duration) -> Option<Duration> {
     (!remaining.is_zero() && !requested.is_zero()).then(|| remaining.min(requested))
@@ -1702,30 +1771,33 @@ pub(crate) async fn generate_task_plan(
         single_attempt_fail_closed: true,
         ..crate::traits::ChatOptions::default()
     };
-    // Semantic assessment is one logical producer, not a quorum. Hedge the
-    // configured candidates concurrently under one bounded envelope, then
-    // choose the highest-priority valid result. Serial failover makes three
-    // ordinary provider latencies add together and can time out every
-    // candidate even when one would have completed inside the envelope. Each
-    // physical attempt still has its own observed-latency deadline and is
-    // recorded, so concurrency changes availability without hiding failures or
-    // allowing an unbounded provider fan-out.
-    let attempt_budgets = {
-        let mut budgets = Vec::with_capacity(model_candidates.len());
-        for model in model_candidates {
-            let observed = match telemetry.as_ref() {
-                Some(telemetry) => telemetry
-                    .event_store
-                    .recent_model_latency_ms(model, "task_assessment")
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
-            };
-            budgets.push(observed_assessment_budget(observed));
-        }
-        budgets
-    };
+    // Semantic assessment is one logical producer, not a quorum. Candidates
+    // are alternatives attempted in configured priority order under one
+    // bounded envelope, and the first complete typed contract wins. Each
+    // candidate owns the lane for its expected latency; once it runs late the
+    // next configured candidate is started alongside it (a hedged failover)
+    // instead of only after the slow candidate's full timeout, so a stalled
+    // primary no longer adds its whole budget to the fallback's latency. A
+    // candidate that finishes inside its window is never hedged, so a healthy
+    // primary does not pay for speculative fallbacks. Every physical attempt
+    // keeps its own observed-latency deadline and telemetry row, so hedging
+    // changes availability without hiding failures or fanning out unboundedly.
+    let mut attempt_budgets = Vec::with_capacity(model_candidates.len());
+    let mut hedge_delays = Vec::with_capacity(model_candidates.len());
+    for model in model_candidates {
+        let observed = match telemetry.as_ref() {
+            Some(telemetry) => telemetry
+                .event_store
+                .recent_model_latency_ms(model, "task_assessment")
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let budget = observed_assessment_budget(observed);
+        hedge_delays.push(assessment_hedge_delay(observed, budget));
+        attempt_budgets.push(budget);
+    }
     let candidate_timeout = attempt_budgets
         .iter()
         .copied()
@@ -1734,7 +1806,8 @@ pub(crate) async fn generate_task_plan(
     // protocol-repair attempt for malformed or internally incoherent output;
     // provider failures and timeouts are not blindly retried. With multiple
     // configured producers, the next producer is the repair path.
-    let validation_repair_timeout = if model_candidates.len() == 1 {
+    let repair_lane = model_candidates.len() == 1;
+    let validation_repair_timeout = if repair_lane {
         attempt_budgets.first().copied().unwrap_or_default()
     } else {
         Duration::ZERO
@@ -1745,28 +1818,89 @@ pub(crate) async fn generate_task_plan(
     if aggregate_timeout.is_zero() {
         return None;
     }
-    // Candidates are alternatives, not a fan-out ensemble. Attempt them in
-    // configured priority order under one deadline and stop after the first
-    // valid typed product. This prevents a successful primary from still
-    // paying for every speculative fallback and makes each failed transition
-    // individually attributable in telemetry.
-    let deadline = Instant::now() + aggregate_timeout;
+    let specs: Vec<AssessmentAttemptSpec> = if repair_lane {
+        let model = model_candidates[0].clone();
+        let budget = attempt_budgets[0];
+        vec![
+            AssessmentAttemptSpec {
+                model: model.clone(),
+                budget,
+                hedge_delay: None,
+                repair: false,
+            },
+            AssessmentAttemptSpec {
+                model,
+                budget,
+                hedge_delay: None,
+                repair: true,
+            },
+        ]
+    } else {
+        model_candidates
+            .iter()
+            .zip(attempt_budgets.iter().zip(hedge_delays.iter()))
+            .map(|(model, (budget, hedge_delay))| AssessmentAttemptSpec {
+                model: model.clone(),
+                budget: *budget,
+                hedge_delay: Some(*hedge_delay),
+                repair: false,
+            })
+            .collect()
+    };
+    run_assessment_lane(
+        provider,
+        specs,
+        aggregate_timeout,
+        messages,
+        options,
+        mode,
+        telemetry,
+    )
+    .await
+}
+
+/// Drive the planned attempts under one deadline and return the first
+/// complete typed contract, or the best incomplete one.  Separated from
+/// budget derivation so the hedging contract is testable with explicit
+/// budgets rather than a seeded latency ledger.
+#[allow(clippy::too_many_arguments)]
+async fn run_assessment_lane(
+    provider: Arc<dyn ModelProvider>,
+    specs: Vec<AssessmentAttemptSpec>,
+    aggregate_timeout: Duration,
+    messages: Vec<Value>,
+    options: crate::traits::ChatOptions,
+    mode: TaskAssessmentMode,
+    telemetry: Option<PlannerTelemetryCtx<'_>>,
+) -> Option<TaskPlan> {
+    use futures::StreamExt as _;
+    // A lone candidate runs its reserved repair attempt only after a
+    // validation-class failure; provider failures and timeouts are terminal.
+    let repair_lane = specs.iter().any(|spec| spec.repair);
+    let deadline = tokio::time::Instant::now() + aggregate_timeout;
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    let mut next_spec = 0_usize;
     let mut physical_attempt = 0_u32;
     let mut partial_plan = None;
     let mut stop_fallback = false;
-    for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let Some(configured_timeout) = attempt_budgets.get(candidate_index).copied() else {
-            continue;
-        };
-        let max_attempts = if model_candidates.len() == 1 { 2 } else { 1 };
-        for validation_attempt in 0..max_attempts {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+    // The first attempt starts immediately; later ones start when the prior
+    // attempt ends without a contract or when its hedge window elapses.
+    let mut launch_next_now = true;
+    let mut hedge_due: Option<tokio::time::Instant> = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        let hedge_fired = hedge_due.is_some_and(|due| now >= due);
+        if !stop_fallback && next_spec < specs.len() && (launch_next_now || hedge_fired) {
+            let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
-                break;
+                next_spec = specs.len();
+                continue;
             }
-            let attempt_timeout = configured_timeout.min(remaining);
+            let spec = &specs[next_spec];
+            next_spec += 1;
+            launch_next_now = false;
             let mut attempt_messages = messages.clone();
-            if validation_attempt > 0 {
+            if spec.repair {
                 attempt_messages.push(json!({
                     "role": "user",
                     "content": "The prior object was rejected by the typed lifecycle validator. Return a complete replacement object for the original request. The completion contract must be internally coherent: requires_observation must agree with nonempty typed evidence_requirements or required_invocations, and every required contract field must be present. Return only the replacement JSON object."
@@ -1777,149 +1911,166 @@ pub(crate) async fn generate_task_plan(
                 crate::memory::context_window::estimate_multimodal_message_tokens(&attempt_messages)
                     .min(u32::MAX as usize) as u32,
             );
-            let call_start = Instant::now();
-            let attempt = match tokio::time::timeout(
-                attempt_timeout,
-                provider.chat_with_options(model, &attempt_messages, &[], &options),
-            )
-            .await
-            {
-                Ok(Ok(response)) => TaskAssessmentAttempt::Response {
-                    model: model.clone(),
-                    response,
-                    latency_ms: call_start.elapsed().as_millis() as u64,
-                },
-                Ok(Err(error)) => {
-                    let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
-                    TaskAssessmentAttempt::ProviderError {
-                        model: model.clone(),
-                        latency_ms: call_start.elapsed().as_millis() as u64,
-                        prevents_model_fallback: provider_error
-                            .is_some_and(crate::providers::ProviderError::prevents_model_fallback),
-                        provider_error_kind: provider_error.map(|error| error.kind),
-                        provider_status: provider_error.and_then(|error| error.status),
-                        error: error.to_string(),
-                    }
-                }
-                Err(_) => TaskAssessmentAttempt::Timeout {
-                    model: model.clone(),
-                    latency_ms: call_start.elapsed().as_millis() as u64,
-                },
-            };
-            match attempt {
-                TaskAssessmentAttempt::Response {
-                    model,
-                    response,
-                    latency_ms,
-                    ..
-                } => match decode_task_plan_result(&response, mode) {
-                    Ok(plan) => {
-                        let validation_error = (!plan.contract_complete).then(|| {
-                            format!(
-                                "incomplete_completion_contract:{}",
-                                plan.incoherence.unwrap_or("unknown")
-                            )
-                        });
-                        record_auxiliary_model_call(
-                            telemetry,
-                            "task_assessment",
-                            &model,
-                            &response,
-                            latency_ms,
-                            AuxiliaryAttemptTelemetry {
-                                attempt: physical_attempt,
-                                fell_back: physical_attempt > 1,
-                                validation_error: validation_error.clone(),
-                            },
+            if hedge_fired && !in_flight.is_empty() {
+                info!(
+                    model = %spec.model,
+                    attempt = physical_attempt,
+                    hedge_after_ms = specs
+                        .get(next_spec.saturating_sub(2))
+                        .and_then(|prior| prior.hedge_delay)
+                        .map(|delay| delay.as_millis() as u64),
+                    "Task assessment hedged with the next configured candidate"
+                );
+            }
+            hedge_due = spec.hedge_delay.map(|delay| now + delay);
+            in_flight.push(run_assessment_attempt(
+                provider.clone(),
+                spec.model.clone(),
+                attempt_messages,
+                options.clone(),
+                spec.budget.min(remaining),
+                physical_attempt,
+                est_input_tokens,
+            ));
+            continue;
+        }
+        if in_flight.is_empty() {
+            break;
+        }
+        let may_hedge = !stop_fallback && next_spec < specs.len();
+        let hedge_timer = async {
+            match hedge_due {
+                Some(due) if may_hedge => tokio::time::sleep_until(due).await,
+                _ => std::future::pending::<()>().await,
+            }
+        };
+        let completed = tokio::select! {
+            Some(completed) = in_flight.next() => Some(completed),
+            _ = hedge_timer => None,
+        };
+        let Some((attempt_number, est_input_tokens, attempt)) = completed else {
+            continue;
+        };
+        match attempt {
+            TaskAssessmentAttempt::Response {
+                model,
+                response,
+                latency_ms,
+                ..
+            } => match decode_task_plan_result(&response, mode) {
+                Ok(plan) => {
+                    let validation_error = (!plan.contract_complete).then(|| {
+                        format!(
+                            "incomplete_completion_contract:{}",
+                            plan.incoherence.unwrap_or("unknown")
                         )
-                        .await;
-                        if plan.contract_complete {
-                            let plan = strengthen_plan_from_partial(plan, partial_plan.as_ref());
-                            info!(
-                                goal = %plan.goal,
-                                step_count = plan.steps.len(),
-                                assessment_mode = mode.as_str(),
-                                %model,
-                                fallback = physical_attempt > 1,
-                                repairs = ?plan.contract_repairs,
-                                "Task assessment selected by configured model priority"
-                            );
-                            return Some(plan);
-                        }
-                        warn!(
+                    });
+                    record_auxiliary_model_call(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        &response,
+                        latency_ms,
+                        AuxiliaryAttemptTelemetry {
+                            attempt: attempt_number,
+                            fell_back: attempt_number > 1,
+                            validation_error: validation_error.clone(),
+                        },
+                    )
+                    .await;
+                    if plan.contract_complete {
+                        let plan = strengthen_plan_from_partial(plan, partial_plan.as_ref());
+                        info!(
+                            goal = %plan.goal,
+                            step_count = plan.steps.len(),
+                            assessment_mode = mode.as_str(),
                             %model,
-                            lane = plan.incoherence.unwrap_or("unknown"),
+                            fallback = attempt_number > 1,
+                            // Another candidate was still running; dropping
+                            // the lane cancels it.
+                            hedged = !in_flight.is_empty(),
                             repairs = ?plan.contract_repairs,
-                            "Task assessment returned an incomplete lifecycle contract"
+                            "Task assessment selected by configured model priority"
                         );
-                        partial_plan.get_or_insert(plan);
+                        return Some(plan);
                     }
-                    Err(error) => {
-                        record_auxiliary_model_call(
-                            telemetry,
-                            "task_assessment",
-                            &model,
-                            &response,
-                            latency_ms,
-                            AuxiliaryAttemptTelemetry {
-                                attempt: physical_attempt,
-                                fell_back: physical_attempt > 1,
-                                validation_error: Some(error.clone()),
-                            },
-                        )
-                        .await;
-                        warn!(%model, %error, "Task assessment response rejected");
-                    }
-                },
-                TaskAssessmentAttempt::ProviderError {
-                    model,
+                    warn!(
+                        %model,
+                        lane = plan.incoherence.unwrap_or("unknown"),
+                        repairs = ?plan.contract_repairs,
+                        "Task assessment returned an incomplete lifecycle contract"
+                    );
+                    partial_plan.get_or_insert(plan);
+                    launch_next_now = true;
+                }
+                Err(error) => {
+                    record_auxiliary_model_call(
+                        telemetry,
+                        "task_assessment",
+                        &model,
+                        &response,
+                        latency_ms,
+                        AuxiliaryAttemptTelemetry {
+                            attempt: attempt_number,
+                            fell_back: attempt_number > 1,
+                            validation_error: Some(error.clone()),
+                        },
+                    )
+                    .await;
+                    warn!(%model, %error, "Task assessment response rejected");
+                    launch_next_now = true;
+                }
+            },
+            TaskAssessmentAttempt::ProviderError {
+                model,
+                latency_ms,
+                error,
+                prevents_model_fallback,
+                provider_error_kind,
+                provider_status,
+                ..
+            } => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_assessment",
+                    &model,
                     latency_ms,
-                    error,
-                    prevents_model_fallback,
+                    attempt_number,
+                    attempt_number > 1,
+                    est_input_tokens,
                     provider_error_kind,
                     provider_status,
-                    ..
-                } => {
-                    record_auxiliary_model_failure(
-                        telemetry,
-                        "task_assessment",
-                        &model,
-                        latency_ms,
-                        physical_attempt,
-                        physical_attempt > 1,
-                        est_input_tokens,
-                        provider_error_kind,
-                        provider_status,
-                        format!("provider_error: {error}"),
-                    )
-                    .await;
-                    warn!(%error, %model, "Task assessment attempt failed");
-                    stop_fallback = prevents_model_fallback;
-                    break;
-                }
-                TaskAssessmentAttempt::Timeout {
-                    model, latency_ms, ..
-                } => {
-                    record_auxiliary_model_failure(
-                        telemetry,
-                        "task_assessment",
-                        &model,
-                        latency_ms,
-                        physical_attempt,
-                        physical_attempt > 1,
-                        est_input_tokens,
-                        None,
-                        None,
-                        "timeout",
-                    )
-                    .await;
-                    warn!(%model, "Task assessment attempt timed out");
-                    break;
+                    format!("provider_error: {error}"),
+                )
+                .await;
+                warn!(%error, %model, "Task assessment attempt failed");
+                if prevents_model_fallback {
+                    stop_fallback = true;
+                } else if !repair_lane {
+                    launch_next_now = true;
                 }
             }
-        }
-        if stop_fallback {
-            break;
+            TaskAssessmentAttempt::Timeout {
+                model, latency_ms, ..
+            } => {
+                record_auxiliary_model_failure(
+                    telemetry,
+                    "task_assessment",
+                    &model,
+                    latency_ms,
+                    attempt_number,
+                    attempt_number > 1,
+                    est_input_tokens,
+                    None,
+                    None,
+                    "timeout",
+                )
+                .await;
+                warn!(%model, "Task assessment attempt timed out");
+                if !repair_lane {
+                    launch_next_now = true;
+                }
+            }
         }
     }
     partial_plan
@@ -3321,6 +3472,307 @@ mod tests {
         assert_eq!(assessment.goal, "primary contract");
         let calls = provider.calls.lock().expect("call ledger");
         assert_eq!(calls.as_slice(), ["configured-primary"]);
+    }
+
+    /// Complete typed contract whose goal names the producing model, so tests
+    /// can see which hedged candidate was selected.
+    fn synthetic_contract_for(model: &str) -> ProviderResponse {
+        crate::testing::MockProvider::text_response(
+            &json!({
+                "schema_version": 11,
+                "goal": format!("{model} contract"),
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "answer",
+                    "expects_mutation": false,
+                    "requires_observation": false,
+                    "required_effects": [],
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": [],
+                    "tool_scope": "allowed",
+                    "allowed_tool_names": [],
+                    "forbidden_tool_scopes": [],
+                    "minimum_sources": 0,
+                    "requires_primary_sources": false,
+                    "requires_exact_history": false,
+                    "evidence_requirements": [],
+                    "required_invocations": [],
+                    "filesystem_access": {
+                        "execution_cwd": null,
+                        "read_paths": [],
+                        "write_paths": []
+                    },
+                    "project_reference": null
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false,
+                    "continue_inline_after_background_start": false,
+                    "request_relationship": "new_request",
+                    "antecedent_user_message_id": null,
+                    "semantic_scope": "general"
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    /// Provider whose per-model latency is scripted on the paused tokio
+    /// clock, recording when each candidate was started.
+    struct ScriptedLatencyProvider {
+        latencies: std::collections::HashMap<&'static str, std::time::Duration>,
+        started: std::sync::Mutex<Vec<(String, tokio::time::Instant)>>,
+    }
+
+    impl ScriptedLatencyProvider {
+        fn new(latencies: &[(&'static str, std::time::Duration)]) -> Self {
+            Self {
+                latencies: latencies.iter().copied().collect(),
+                started: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn started_models(&self) -> Vec<String> {
+            self.started
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(model, _)| model.clone())
+                .collect()
+        }
+
+        fn start_offset(&self, model: &str, origin: tokio::time::Instant) -> std::time::Duration {
+            self.started
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(started, _)| started == model)
+                .map(|(_, at)| at.saturating_duration_since(origin))
+                .expect("candidate was started")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedLatencyProvider {
+        async fn chat(
+            &self,
+            model: &str,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<ProviderResponse> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((model.to_string(), tokio::time::Instant::now()));
+            let latency = self
+                .latencies
+                .get(model)
+                .copied()
+                .unwrap_or(std::time::Duration::from_millis(1));
+            tokio::time::sleep(latency).await;
+            Ok(synthetic_contract_for(model))
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn assessment_hedge_delay_is_the_observed_p95_capped_by_the_default_budget() {
+        let default = std::time::Duration::from_secs(20);
+        assert_eq!(
+            assessment_hedge_delay(None, default),
+            default,
+            "no observed latency hedges at the default budget, i.e. plain serial failover"
+        );
+        assert_eq!(
+            assessment_hedge_delay(Some(5_000), default),
+            std::time::Duration::from_secs(5),
+            "a fast candidate is hedged once it is statistically late"
+        );
+        assert_eq!(
+            assessment_hedge_delay(Some(37_000), std::time::Duration::from_secs(45)),
+            default,
+            "a slow candidate keeps its extended budget but not an extended exclusive window"
+        );
+        assert!(
+            assessment_hedge_delay(Some(60_000), std::time::Duration::from_secs(12))
+                <= std::time::Duration::from_secs(12),
+            "the hedge point never exceeds the attempt budget"
+        );
+    }
+
+    /// Explicit lane specs for the hedging contract: a slow candidate keeps a
+    /// 45s attempt budget but only a 20s exclusive window, exactly what the
+    /// telemetry-derived budgets produce for a model whose observed p95 is
+    /// above the default attempt budget.
+    fn hedged_specs(models: &[&str]) -> Vec<AssessmentAttemptSpec> {
+        models
+            .iter()
+            .map(|model| AssessmentAttemptSpec {
+                model: model.to_string(),
+                budget: TASK_ASSESSMENT_MAX_ATTEMPT_TIMEOUT,
+                hedge_delay: Some(TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT),
+                repair: false,
+            })
+            .collect()
+    }
+
+    async fn run_lane(
+        provider: Arc<ScriptedLatencyProvider>,
+        specs: Vec<AssessmentAttemptSpec>,
+    ) -> Option<TaskPlan> {
+        run_assessment_lane(
+            provider,
+            specs,
+            TASK_ASSESSMENT_MAX_TOTAL_TIMEOUT,
+            vec![json!({ "role": "user", "content": "Give a synthetic answer." })],
+            crate::traits::ChatOptions::default(),
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_primary_is_hedged_and_the_first_complete_contract_wins() {
+        let provider = Arc::new(ScriptedLatencyProvider::new(&[
+            ("slow-primary", std::time::Duration::from_secs(44)),
+            ("steady-fallback", std::time::Duration::from_secs(15)),
+        ]));
+        let origin = tokio::time::Instant::now();
+
+        let assessment = run_lane(
+            provider.clone(),
+            hedged_specs(&["slow-primary", "steady-fallback"]),
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(assessment.goal, "steady-fallback contract");
+        assert_eq!(
+            provider.started_models(),
+            ["slow-primary", "steady-fallback"],
+            "the fallback starts while the primary is still inside its 45s budget"
+        );
+        assert_eq!(
+            provider.start_offset("steady-fallback", origin),
+            TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT,
+            "the hedge fires at the end of the primary's exclusive window"
+        );
+        assert_eq!(
+            origin.elapsed(),
+            std::time::Duration::from_secs(35),
+            "hedge point plus fallback latency, not primary budget plus fallback latency"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedged_primary_that_finishes_first_still_wins() {
+        let provider = Arc::new(ScriptedLatencyProvider::new(&[
+            ("late-primary", std::time::Duration::from_secs(28)),
+            ("slower-fallback", std::time::Duration::from_secs(15)),
+        ]));
+        let origin = tokio::time::Instant::now();
+
+        let assessment = run_lane(
+            provider.clone(),
+            hedged_specs(&["late-primary", "slower-fallback"]),
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(
+            assessment.goal, "late-primary contract",
+            "hedging never discards the primary's in-flight work"
+        );
+        assert_eq!(
+            provider.started_models(),
+            ["late-primary", "slower-fallback"],
+            "the hedge was launched at 20s and then cancelled by the primary's contract"
+        );
+        assert_eq!(origin.elapsed(), std::time::Duration::from_secs(28));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_inside_its_window_is_never_hedged() {
+        let provider = Arc::new(ScriptedLatencyProvider::new(&[(
+            "healthy-primary",
+            std::time::Duration::from_secs(19),
+        )]));
+
+        let assessment = run_lane(
+            provider.clone(),
+            hedged_specs(&["healthy-primary", "idle-fallback"]),
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(assessment.goal, "healthy-primary contract");
+        assert_eq!(
+            provider.started_models(),
+            ["healthy-primary"],
+            "a candidate that finishes inside its exclusive window pays for no speculative fallback"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_free_budgets_keep_plain_serial_failover() {
+        // With no observed latency, budget and hedge point coincide at the
+        // default attempt timeout: the fallback starts exactly when the
+        // primary times out, never earlier.
+        let models = vec!["slow-primary".to_string(), "steady-fallback".to_string()];
+        let provider = Arc::new(ScriptedLatencyProvider::new(&[
+            ("slow-primary", std::time::Duration::from_secs(44)),
+            ("steady-fallback", std::time::Duration::from_secs(15)),
+        ]));
+        let origin = tokio::time::Instant::now();
+
+        let assessment = generate_task_plan(
+            provider.clone(),
+            &models,
+            "Give a synthetic answer.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(assessment.goal, "steady-fallback contract");
+        assert_eq!(
+            provider.start_offset("steady-fallback", origin),
+            TASK_ASSESSMENT_DEFAULT_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(origin.elapsed(), std::time::Duration::from_secs(35));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_candidate_is_not_hedged_against_itself() {
+        let models = vec!["only-candidate".to_string()];
+        let provider = Arc::new(ScriptedLatencyProvider::new(&[(
+            "only-candidate",
+            std::time::Duration::from_secs(30),
+        )]));
+
+        let assessment = generate_task_plan(
+            provider.clone(),
+            &models,
+            "Give a synthetic answer.",
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await;
+
+        assert!(
+            assessment.is_none(),
+            "a timed-out lone candidate is not blindly retried"
+        );
+        assert_eq!(provider.started_models(), ["only-candidate"]);
     }
 
     #[tokio::test]

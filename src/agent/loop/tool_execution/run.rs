@@ -3060,7 +3060,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 // items become obligations closed by receipts and demanded
                 // while reachable — the model is held to its own plan.
                 if let Some(declared) =
-                    executor_expectations_from_checklist_arguments(task_id, &effective_arguments)
+                    crate::tools::track_requirements::executor_expectations_from_checklist_arguments(
+                        task_id,
+                        &effective_arguments,
+                    )
                 {
                     if let Err(error) = emitter
                         .emit(crate::events::EventType::ExecutorExpectationsDeclared, declared)
@@ -3980,58 +3983,14 @@ mod correction_gate_tests {
 /// point wrapped in an `[UNTRUSTED EXTERNAL DATA …]` envelope (see
 /// `sanitize::wrap_untrusted_output`), so the envelope is stripped first —
 /// otherwise the rendered checklist would carry the wrapper's trailing
-/// `[END UNTRUSTED EXTERNAL DATA]` marker. Returns None for degraded/error
-/// returns that carry no rendered list, in which case no Checklist is emitted.
-/// Project a `track_requirements` call into the executor's typed expectation
-/// declaration. Only typed content survives: effects, the observation flag,
-/// exact targets, and the declared status.
-fn executor_expectations_from_checklist_arguments(
-    task_id: &str,
-    arguments: &str,
-) -> Option<crate::events::ExecutorExpectationsDeclaredData> {
-    let value: Value = serde_json::from_str(arguments).ok()?;
-    let raw_items = value.get("items")?.as_array()?;
-    let mut items = Vec::with_capacity(raw_items.len());
-    for (index, item) in raw_items.iter().enumerate() {
-        let description = item.get("text")?.as_str()?.to_string();
-        let mut mutation_effects = crate::traits::ToolMutationEffects::NONE;
-        if let Some(effects) = item.get("mutation_effects").and_then(Value::as_array) {
-            for effect in effects.iter().filter_map(Value::as_str) {
-                if let Some(effect) = crate::traits::ToolMutationEffects::from_protocol_name(effect)
-                {
-                    mutation_effects = mutation_effects.union(effect);
-                }
-            }
-        }
-        let (targets, observation_targets) =
-            crate::tools::track_requirements::parse_expectation_targets(item.get("targets"))
-                .ok()?;
-        items.push(crate::events::ExecutorExpectationItem {
-            index,
-            description,
-            requires_observation: item
-                .get("requires_observation")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            mutation_effects,
-            targets,
-            observation_targets,
-            status: item
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending")
-                .to_string(),
-        });
-    }
-    (!items.is_empty()).then(|| crate::events::ExecutorExpectationsDeclaredData {
-        schema_version: crate::events::ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
-        task_id: task_id.to_string(),
-        items,
-    })
-}
-
+/// `[END UNTRUSTED EXTERNAL DATA]` marker. The tool may prepend a model-only
+/// notice before the header, so parsing anchors on the header rather than the
+/// first line. Returns None for degraded/error returns that carry no rendered
+/// list, in which case no Checklist is emitted.
 pub(crate) fn parse_checklist_from_result(result_text: &str) -> Option<String> {
-    strip_untrusted_envelope(result_text)
+    let body = strip_untrusted_envelope(result_text);
+    let header = body.find(crate::tools::track_requirements::CHECKLIST_HEADER)?;
+    body[header..]
         .split_once(":\n")
         .map(|(_, checklist)| checklist.trim().to_string())
         .filter(|checklist| !checklist.is_empty())
@@ -4056,7 +4015,7 @@ fn strip_untrusted_envelope(text: &str) -> &str {
 // rendered checklist out of a `track_requirements` tool result.
 #[cfg(test)]
 mod checklist_parse_tests {
-    use super::{executor_expectations_from_checklist_arguments, parse_checklist_from_result};
+    use super::parse_checklist_from_result;
 
     #[test]
     fn well_formed_result_splits_to_rendered_checklist() {
@@ -4101,48 +4060,15 @@ mod checklist_parse_tests {
     }
 
     #[test]
-    fn structured_subject_facets_survive_into_the_durable_expectation_event() {
-        let declared = executor_expectations_from_checklist_arguments(
-            "task-synthetic",
-            r#"{
-                "items": [{
-                    "text": "Audit one objective",
-                    "requires_observation": true,
-                    "targets": [{
-                        "subject": {
-                            "kind": "resource_id",
-                            "value": "objective:sha256:synthetic"
-                        },
-                        "facets": ["schedule", "recovery"],
-                        "collection_coverage": {
-                            "collection": {
-                                "kind": "resource_id",
-                                "value": "objective_collection:scheduled_goals"
-                            },
-                            "minimum_completeness": "complete"
-                        }
-                    }],
-                    "status": "pending"
-                }]
-            }"#,
-        )
-        .expect("typed declaration");
-        let item = &declared.items[0];
-        assert_eq!(item.targets, ["objective:sha256:synthetic"]);
-        assert_eq!(item.observation_targets.len(), 1);
+    fn model_only_notice_before_the_header_never_reaches_the_live_surface() {
+        // The tool prepends binding notices for the model; the user-facing
+        // render starts at the header.
+        let result = "Item 2: no tool reports `x_owner_credential_state`; kept as an untargeted \
+             observation.\nBindable collection subjects are auth_profile_collection:configured.\n\n\
+             Checklist updated (0/1 done):\n📋 Plan\n☐ Step 1";
         assert_eq!(
-            item.observation_targets[0].facets,
-            [
-                crate::traits::ToolSemanticFacet::Schedule,
-                crate::traits::ToolSemanticFacet::Recovery
-            ]
-        );
-        assert_eq!(
-            item.observation_targets[0]
-                .collection_coverage
-                .as_ref()
-                .map(|coverage| coverage.collection.value.as_str()),
-            Some("objective_collection:scheduled_goals")
+            parse_checklist_from_result(result),
+            Some("📋 Plan\n☐ Step 1".to_string())
         );
     }
 }

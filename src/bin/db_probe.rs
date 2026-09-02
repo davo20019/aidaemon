@@ -222,6 +222,90 @@ fn token_only_breakdown(
     }
 }
 
+/// One `llm_call` event's usage provenance, as persisted.
+struct UsageEvidenceRow {
+    failed: bool,
+    token_usage_present: bool,
+    evidence: Option<String>,
+    est_input_tokens: u64,
+}
+
+/// Classify unmeasured usage by whether the call could have reported it.
+/// A failed or timed-out attempt structurally has no provider usage; its
+/// estimate-only accounting is the intended record, not a telemetry gap. Only
+/// completed calls without provider-measured usage are gaps.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UsageEvidenceAudit {
+    provider_measured: u64,
+    failed_estimate_only: u64,
+    failed_unavailable: u64,
+    completed_estimate_only: u64,
+    completed_unavailable: u64,
+    estimated_input_tokens: u64,
+}
+
+impl UsageEvidenceAudit {
+    fn from_rows<I: IntoIterator<Item = UsageEvidenceRow>>(rows: I) -> Self {
+        let mut audit = Self::default();
+        for row in rows {
+            if row.token_usage_present {
+                audit.provider_measured += 1;
+                continue;
+            }
+            let estimate_only = row.evidence.as_deref() == Some("estimated_input_only");
+            if estimate_only {
+                audit.estimated_input_tokens = audit
+                    .estimated_input_tokens
+                    .saturating_add(row.est_input_tokens);
+            }
+            match (row.failed, estimate_only) {
+                (true, true) => audit.failed_estimate_only += 1,
+                (true, false) => audit.failed_unavailable += 1,
+                (false, true) => audit.completed_estimate_only += 1,
+                (false, false) => audit.completed_unavailable += 1,
+            }
+        }
+        audit
+    }
+
+    /// Unmeasured calls that are expected: the attempt failed before the
+    /// provider could report usage.
+    fn expected_unmeasured(&self) -> u64 {
+        self.failed_estimate_only + self.failed_unavailable
+    }
+
+    /// Completed calls that should have carried provider usage but did not.
+    fn gap_count(&self) -> u64 {
+        self.completed_estimate_only + self.completed_unavailable
+    }
+}
+
+/// Single-line verdict so a reader does not have to infer from raw counts
+/// whether unmeasured or uncorrelated rows are anomalies.
+fn telemetry_verdict(
+    usage: &UsageEvidenceAudit,
+    reconciliation: &TelemetryReconciliationCounts,
+) -> String {
+    let uncorrelated = reconciliation.token_only + reconciliation.event_only;
+    let gaps = usage.gap_count() + uncorrelated as u64;
+    if gaps == 0 {
+        if usage.expected_unmeasured() == 0 {
+            return "- verdict: no telemetry gaps; every call has provider-measured, correlated usage"
+                .to_string();
+        }
+        return format!(
+            "- verdict: no telemetry gaps; the {} unmeasured call(s) are failed/timed-out attempts whose estimate-only accounting is by design",
+            usage.expected_unmeasured()
+        );
+    }
+    format!(
+        "- verdict: {gaps} telemetry gap(s): completed_calls_without_provider_usage={} uncorrelated_rows={} (failed/timed-out attempts excluded: {})",
+        usage.gap_count(),
+        uncorrelated,
+        usage.expected_unmeasured()
+    )
+}
+
 fn handholding_detail_label(reason: Option<&str>, error: Option<&str>) -> String {
     if let Some(reason) = reason.filter(|value| !value.is_empty()) {
         return format!("reason={reason}");
@@ -290,6 +374,85 @@ mod tests {
         );
         assert_eq!(breakdown.event_missing, 2);
         assert_eq!(breakdown.event_usage_flag_false, 1);
+    }
+
+    fn usage_row(failed: bool, present: bool, evidence: &str, est: u64) -> UsageEvidenceRow {
+        UsageEvidenceRow {
+            failed,
+            token_usage_present: present,
+            evidence: Some(evidence.to_string()),
+            est_input_tokens: est,
+        }
+    }
+
+    #[test]
+    fn failed_attempts_without_provider_usage_are_expected_not_gaps() {
+        // A timed-out assessor attempt: one event, no provider usage, an
+        // input estimate. Previously reported as both "an event without a
+        // token row" and "an estimate-only record", reading as two anomalies.
+        let audit = UsageEvidenceAudit::from_rows([
+            usage_row(false, true, "provider_measured", 0),
+            usage_row(false, true, "provider_measured", 0),
+            usage_row(true, false, "estimated_input_only", 2_500),
+        ]);
+        assert_eq!(
+            audit,
+            UsageEvidenceAudit {
+                provider_measured: 2,
+                failed_estimate_only: 1,
+                estimated_input_tokens: 2_500,
+                ..UsageEvidenceAudit::default()
+            }
+        );
+        assert_eq!(audit.gap_count(), 0);
+        assert_eq!(audit.expected_unmeasured(), 1);
+        let verdict = telemetry_verdict(&audit, &TelemetryReconciliationCounts::default());
+        assert!(
+            verdict.starts_with("- verdict: no telemetry gaps"),
+            "{verdict}"
+        );
+        assert!(
+            verdict.contains("1 unmeasured call(s) are failed/timed-out attempts"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn completed_calls_without_provider_usage_are_reported_as_gaps() {
+        let audit = UsageEvidenceAudit::from_rows([
+            usage_row(false, true, "provider_measured", 0),
+            usage_row(false, false, "estimated_input_only", 900),
+            usage_row(false, false, "unavailable", 0),
+            usage_row(true, false, "unavailable", 0),
+        ]);
+        assert_eq!(audit.completed_estimate_only, 1);
+        assert_eq!(audit.completed_unavailable, 1);
+        assert_eq!(audit.failed_unavailable, 1);
+        assert_eq!(audit.gap_count(), 2);
+        let reconciliation = TelemetryReconciliationCounts {
+            event_only: 1,
+            ..TelemetryReconciliationCounts::default()
+        };
+        let verdict = telemetry_verdict(&audit, &reconciliation);
+        assert!(
+            verdict.starts_with(
+                "- verdict: 3 telemetry gap(s): completed_calls_without_provider_usage=2 uncorrelated_rows=1"
+            ),
+            "{verdict}"
+        );
+        assert!(
+            verdict.ends_with("(failed/timed-out attempts excluded: 1)"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn fully_measured_window_has_a_clean_verdict() {
+        let audit = UsageEvidenceAudit::from_rows([usage_row(false, true, "provider_measured", 0)]);
+        assert_eq!(
+            telemetry_verdict(&audit, &TelemetryReconciliationCounts::default()),
+            "- verdict: no telemetry gaps; every call has provider-measured, correlated usage"
+        );
     }
 
     #[test]
@@ -1760,39 +1923,29 @@ async fn main() -> anyhow::Result<()> {
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
-    let mut events_with_usage = 0i64;
-    let mut estimate_only_calls = 0u64;
-    let mut estimate_only_input_tokens = 0u64;
-    let mut failed_calls_without_provider_usage = 0u64;
     let mut event_rows = Vec::with_capacity(llm_rows.len());
+    let mut usage_rows = Vec::with_capacity(llm_rows.len());
     for row in &llm_rows {
         let call_id = row.try_get::<Option<String>, _>("call_id").unwrap_or(None);
         let token_usage_present = row
             .try_get::<Option<i64>, _>("token_usage_present")
             .unwrap_or(None)
             == Some(1);
-        if token_usage_present {
-            events_with_usage += 1;
-        }
-        let evidence = row
-            .try_get::<Option<String>, _>("token_usage_evidence")
-            .unwrap_or(None);
-        if evidence.as_deref() == Some("estimated_input_only") {
-            estimate_only_calls = estimate_only_calls.saturating_add(1);
-            estimate_only_input_tokens = estimate_only_input_tokens.saturating_add(
-                row.try_get::<Option<i64>, _>("est_input_tokens")
-                    .unwrap_or(None)
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or_default(),
-            );
-        }
-        let failed = row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1);
-        if failed && !token_usage_present {
-            failed_calls_without_provider_usage =
-                failed_calls_without_provider_usage.saturating_add(1);
-        }
+        usage_rows.push(UsageEvidenceRow {
+            failed: row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1),
+            token_usage_present,
+            evidence: row
+                .try_get::<Option<String>, _>("token_usage_evidence")
+                .unwrap_or(None),
+            est_input_tokens: row
+                .try_get::<Option<i64>, _>("est_input_tokens")
+                .unwrap_or(None)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or_default(),
+        });
         event_rows.push((call_id, token_usage_present));
     }
+    let usage_audit = UsageEvidenceAudit::from_rows(usage_rows);
     // Counterpart presence is resolved over the complete durable index. The
     // requested time window selects the reported cohort only; it cannot change
     // a call's matched/unmatched category.
@@ -1826,14 +1979,21 @@ async fn main() -> anyhow::Result<()> {
         &all_event_rows,
     );
     println!(
-        "- provider_usage_unavailable_failed_calls={} estimate_only_calls={} estimated_input_tokens={} (estimate; not provider-measured billing)",
-        failed_calls_without_provider_usage, estimate_only_calls, estimate_only_input_tokens
+        "- usage evidence: provider_measured={} failed_attempts_unmeasured={} (estimate_only={} unavailable={}; expected, no provider usage exists for a failed/timed-out call) completed_calls_without_provider_usage={} (estimate_only={} unavailable={}; gaps) estimated_input_tokens={} (estimate; not provider-measured billing)",
+        usage_audit.provider_measured,
+        usage_audit.expected_unmeasured(),
+        usage_audit.failed_estimate_only,
+        usage_audit.failed_unavailable,
+        usage_audit.gap_count(),
+        usage_audit.completed_estimate_only,
+        usage_audit.completed_unavailable,
+        usage_audit.estimated_input_tokens,
     );
     println!(
         "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} unattributed_legacy_token_rows={} unattributed_legacy_event_rows={}",
         token_call_ids.len(),
         llm_rows.len(),
-        events_with_usage,
+        usage_audit.provider_measured,
         reconciliation.correlated,
         reconciliation.token_only,
         reconciliation.event_only,
@@ -1856,6 +2016,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  - (+{} more sessions)", breakdown.by_session.len() - 10);
         }
     }
+    println!("{}", telemetry_verdict(&usage_audit, &reconciliation));
 
     println!("\n== Task Outcomes (Last {} Hours) ==", token_hours);
     let task_end_rows = sqlx::query(

@@ -1245,6 +1245,10 @@ impl Tool for ScheduledGoalRunsTool {
         .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
     }
 
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::tools::objective_status::ObjectiveCollection::ScheduledGoals.stable_subject()]
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,

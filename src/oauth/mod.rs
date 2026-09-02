@@ -1046,10 +1046,6 @@ fn urlencoded(s: &str) -> String {
 }
 
 #[cfg(test)]
-// These tests serialize global env-var mutation via `ENV_LOCK`; the guard must
-// intentionally span `.await` points to keep parallel tests isolated, so
-// `clippy::await_holding_lock` is a false positive for this pattern.
-#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1057,23 +1053,13 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{extract::Form, routing::post, Json, Router};
-    use once_cell::sync::Lazy;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::KeychainIsolation;
     use crate::traits::OAuthGatewayStore;
-
-    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-
-    fn restore_env_var(name: &str, old_value: Option<String>) {
-        if let Some(value) = old_value {
-            std::env::set_var(name, value);
-        } else {
-            std::env::remove_var(name);
-        }
-    }
 
     fn state_from_authorize_url(authorize_url: &str) -> String {
         reqwest::Url::parse(authorize_url)
@@ -1239,7 +1225,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_code_flow_omits_pkce_challenge() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
         let gateway = test_gateway().await.unwrap();
         gateway
             .register_provider(OAuthProvider {
@@ -1253,24 +1239,12 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         let (authorize_url, _) = gateway.start_oauth2_flow("linear", "test").await.unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert!(authorize_url.contains("response_type=code"));
         assert!(!authorize_url.contains("code_challenge="));
@@ -1278,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_credentials_flow_stores_connection_and_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1313,24 +1287,12 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_SERVICE_CLIENT_ID=abc\nOAUTH_SERVICE_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         let result = gateway.connect_client_credentials("service").await.unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert!(result.contains("Connected to Service"));
         let conn = gateway
@@ -1347,7 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_survives_restart_using_persisted_pending_flow() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1385,20 +1347,11 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         let (authorize_url, _result_rx) =
             gateway.start_oauth2_flow("linear", "test").await.unwrap();
         let state = state_from_authorize_url(&authorize_url);
@@ -1411,9 +1364,6 @@ mod tests {
             .handle_callback(&state, Some("auth-code"), None)
             .await
             .unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert!(result.contains("Connected to Linear"));
         assert!(gateway
@@ -1432,7 +1382,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_refresh_reuses_recent_result_message() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         let gateway = test_gateway().await.unwrap();
         gateway
@@ -1447,20 +1397,11 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         let (authorize_url, _result_rx) =
             gateway.start_oauth2_flow("linear", "test").await.unwrap();
         let state = state_from_authorize_url(&authorize_url);
@@ -1469,9 +1410,6 @@ mod tests {
             .await
             .unwrap();
         let second = gateway.handle_callback(&state, None, None).await.unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert_eq!(first, "OAuth authorization denied: access_denied");
         assert_eq!(second, first);
@@ -1511,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_token_rebuilds_missing_http_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1550,20 +1488,11 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         gateway
             .state_store
             .save_oauth_connection(&crate::traits::OAuthConnection {
@@ -1582,9 +1511,6 @@ mod tests {
 
         let result = gateway.refresh_token("twitter").await.unwrap();
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
-
         assert_eq!(result, "Token refreshed for twitter");
         let profiles = gateway.http_profiles.read().await;
         let profile = profiles.get("twitter").expect("twitter profile rebuilt");
@@ -1598,7 +1524,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_token_preflight_is_serialized_and_preserves_account_binding() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1633,20 +1559,11 @@ mod tests {
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         gateway
             .state_store
             .save_oauth_connection(&crate::traits::OAuthConnection {
@@ -1670,9 +1587,6 @@ mod tests {
             gateway.refresh_access_token_if_needed("twitter")
         );
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
-
         let refresh_results = [first.unwrap(), second.unwrap()];
         assert_eq!(
             refresh_results
@@ -1690,7 +1604,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_connections_refreshes_when_access_token_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1727,20 +1641,11 @@ mod tests {
 
         // Reproduce the real failure: NO_KEYCHAIN mode reading a .env that has
         // the refresh token + client creds but NOT the access token.
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
-
         gateway
             .state_store
             .save_oauth_connection(&crate::traits::OAuthConnection {
@@ -1760,9 +1665,6 @@ mod tests {
         // Startup restore must mint a bearer via refresh when the access token
         // is absent, instead of leaving the profile unloaded.
         gateway.restore_connections().await;
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         let profiles = gateway.http_profiles.read().await;
         let profile = profiles

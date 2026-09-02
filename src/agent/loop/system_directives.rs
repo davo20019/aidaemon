@@ -24,6 +24,11 @@ pub(in crate::agent) enum SystemDirective {
         truncated_tail: String,
     },
     ToolModeDisabledPlainText,
+    /// The loop stalled after clean progress: every completed operation
+    /// succeeded, yet the model kept re-invoking tools instead of answering.
+    /// Tool calling is disabled for the closeout pass; the model answers from
+    /// the receipts it already holds.
+    StallSummarizeCollectedResults,
     ApproachPivotRequired {
         attempt: usize,
         failure_record: String,
@@ -294,6 +299,7 @@ impl SystemDirective {
                 truncated_tail
             ),
             Self::ToolModeDisabledPlainText => "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. Do NOT emit tool calls.".to_string(),
+            Self::StallSummarizeCollectedResults => "[SYSTEM] Repeated tool calls are no longer producing new results, and tool mode is disabled for this turn. Answer the user's request now in plain text from the tool results you already have. Report only what those results actually show; state plainly anything that remains unverified. Do NOT emit tool calls.".to_string(),
             Self::ApproachPivotRequired {
                 attempt,
                 failure_record,

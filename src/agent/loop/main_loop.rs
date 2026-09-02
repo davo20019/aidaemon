@@ -464,8 +464,23 @@ fn prepare_turn_restart(
     approach_pivots_used: &mut usize,
     model: &str,
 ) {
-    let TurnRestartReason::ApproachPivot { failure_record } = reason else {
-        return;
+    let failure_record = match reason {
+        TurnRestartReason::ApproachPivot { failure_record } => failure_record,
+        TurnRestartReason::StallForceTextCloseout => {
+            // The stopping phase already switched the turn to force-text mode
+            // and queued the closeout directive; the stall count it measured
+            // belonged to the tool-calling approach that mode ends. The
+            // force-text safety net bounds the pass from here.
+            turn_state.stall.reset_for_force_text_closeout();
+            crate::agent::heuristic_telemetry::global().record(
+                "stall_force_text_closeout",
+                model,
+                agent.trust_tier_for_model(model),
+                crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
+            );
+            return;
+        }
+        _ => return,
     };
 
     *approach_pivots_used += 1;

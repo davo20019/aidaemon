@@ -412,6 +412,9 @@ impl HttpRequestTool {
         format!("{kind}:{encoded}")
     }
 
+    pub(crate) const AUTH_PROFILE_NAMESPACE: &'static str = "auth_profile:";
+    pub(crate) const ACCOUNT_NAMESPACE: &'static str = "account:";
+
     pub(crate) fn auth_profile_resource_id(profile_name: &str) -> String {
         Self::scoped_resource_id("auth_profile", profile_name)
     }
@@ -2252,6 +2255,19 @@ impl Tool for HttpRequestTool {
             idempotent: false,
             high_impact_write: false,
         }
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![
+            crate::traits::StableObservationSubject::namespace(
+                Self::AUTH_PROFILE_NAMESPACE,
+                "auth profile a request used",
+            ),
+            crate::traits::StableObservationSubject::namespace(
+                Self::ACCOUNT_NAMESPACE,
+                "account a request was bound to",
+            ),
+        ]
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {

@@ -4199,6 +4199,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::KeychainIsolation;
     use once_cell::sync::Lazy;
 
     #[test]
@@ -4273,16 +4274,6 @@ mod tests {
         Lazy::new(|| std::sync::Mutex::new(()));
     static TERMINAL_STATIC_FALLBACK_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
         Lazy::new(|| std::sync::Mutex::new(()));
-    static KEYCHAIN_ENV_FILE_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
-
-    fn restore_env_var(name: &str, old_value: Option<String>) {
-        if let Some(old) = old_value {
-            std::env::set_var(name, old);
-        } else {
-            std::env::remove_var(name);
-        }
-    }
 
     #[test]
     fn cli_agents_config_defaults_to_disabled() {
@@ -4415,15 +4406,12 @@ mod tests {
     #[test]
     #[serial_test::serial(env_vars)]
     fn store_in_keychain_writes_env_file_when_keychain_disabled() {
-        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let mut isolation = KeychainIsolation::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let env_path = tmp.path().join(".env.test");
         std::fs::write(&env_path, "EXISTING=1\n").unwrap();
-
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+        isolation.unset(crate::RUNTIME_ENV_FILE_ENV_KEY);
+        isolation.set("AIDAEMON_ENV_FILE", &env_path.to_string_lossy());
 
         store_in_keychain("oauth_twitter_access_token", "new token$1")
             .expect("write oauth token to env");
@@ -4431,15 +4419,12 @@ mod tests {
         let content = std::fs::read_to_string(&env_path).expect("read env file");
         assert!(content.contains("EXISTING=1"));
         assert!(content.contains("OAUTH_TWITTER_ACCESS_TOKEN=\"new token\\$1\""));
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn delete_from_keychain_removes_env_file_key_when_keychain_disabled() {
-        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let mut isolation = KeychainIsolation::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let env_path = tmp.path().join(".env.test");
         std::fs::write(
@@ -4447,11 +4432,8 @@ mod tests {
             "KEEP=1\nOAUTH_TWITTER_ACCESS_TOKEN=oldtoken\nANOTHER=2\n",
         )
         .unwrap();
-
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+        isolation.unset(crate::RUNTIME_ENV_FILE_ENV_KEY);
+        isolation.set("AIDAEMON_ENV_FILE", &env_path.to_string_lossy());
 
         delete_from_keychain("oauth_twitter_access_token").expect("delete oauth token from env");
 
@@ -4459,38 +4441,27 @@ mod tests {
         assert!(content.contains("KEEP=1"));
         assert!(content.contains("ANOTHER=2"));
         assert!(!content.contains("OAUTH_TWITTER_ACCESS_TOKEN"));
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn resolve_from_keychain_reads_env_file_when_keychain_disabled() {
-        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let mut isolation = KeychainIsolation::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let env_path = tmp.path().join(".env.test");
         std::fs::write(&env_path, "OAUTH_TWITTER_CLIENT_ID=client123\n").unwrap();
-
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
-        let old_client_id = std::env::var("OAUTH_TWITTER_CLIENT_ID").ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
-        std::env::remove_var("OAUTH_TWITTER_CLIENT_ID");
+        isolation.unset(crate::RUNTIME_ENV_FILE_ENV_KEY);
+        isolation.set("AIDAEMON_ENV_FILE", &env_path.to_string_lossy());
+        isolation.unset("OAUTH_TWITTER_CLIENT_ID");
 
         let value = resolve_from_keychain("oauth_twitter_client_id").expect("resolve client id");
         assert_eq!(value, "client123");
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
-        restore_env_var("OAUTH_TWITTER_CLIENT_ID", old_client_id);
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn resolve_from_keychain_tolerates_malformed_env_lines() {
-        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let mut isolation = KeychainIsolation::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let env_path = tmp.path().join(".env.test");
         std::fs::write(
@@ -4498,37 +4469,26 @@ mod tests {
             "BROKEN=\"unterminated\nOAUTH_TWITTER_CLIENT_ID=client123\n",
         )
         .unwrap();
-
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
-        let old_client_id = std::env::var("OAUTH_TWITTER_CLIENT_ID").ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
-        std::env::remove_var("OAUTH_TWITTER_CLIENT_ID");
+        isolation.unset(crate::RUNTIME_ENV_FILE_ENV_KEY);
+        isolation.set("AIDAEMON_ENV_FILE", &env_path.to_string_lossy());
+        isolation.unset("OAUTH_TWITTER_CLIENT_ID");
 
         let value = resolve_from_keychain("oauth_twitter_client_id")
             .expect("resolve client id despite malformed env line");
         assert_eq!(value, "client123");
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
-        restore_env_var("OAUTH_TWITTER_CLIENT_ID", old_client_id);
     }
 
     #[test]
     #[serial_test::serial(env_vars)]
     fn resolve_env_file_path_prefers_runtime_resolved_path() {
-        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
-        let old_runtime_env_file = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
-
-        std::env::set_var(crate::RUNTIME_ENV_FILE_ENV_KEY, "/daemon/root/.env");
-        std::env::set_var("AIDAEMON_ENV_FILE", "/some/other/.env");
+        // The runtime env-file key is owned by the keychain isolation guard;
+        // override it through the guard so parallel secret-store tests keep
+        // their redirect.
+        let mut isolation = KeychainIsolation::acquire();
+        isolation.set(crate::RUNTIME_ENV_FILE_ENV_KEY, "/daemon/root/.env");
+        isolation.set("AIDAEMON_ENV_FILE", "/some/other/.env");
 
         assert_eq!(resolve_env_file_path(), PathBuf::from("/daemon/root/.env"));
-
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env_file);
-        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
     }
 
     #[test]

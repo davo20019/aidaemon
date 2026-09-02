@@ -71,6 +71,15 @@ impl StallTracker {
         self.last_escalation_iteration = None;
     }
 
+    /// Fresh runway for a force-text closeout: the stall count measured the
+    /// tool-calling approach that the closeout ends. Tool-pattern windows stay
+    /// intact because the force-text mode may be clamped off again by the
+    /// completion contract, at which point they are evidence once more.
+    pub(in crate::agent) fn reset_for_force_text_closeout(&mut self) {
+        self.stall_count = 0;
+        self.consecutive_clean_iterations = 0;
+    }
+
     pub(in crate::agent) fn for_llm_phase(&mut self) -> LlmStallState<'_> {
         LlmStallState {
             stall_count: &mut self.stall_count,
@@ -232,6 +241,22 @@ mod tests {
         assert_eq!(tracker.consecutive_same_tool_arg_hash_count(), 1);
         assert_eq!(tracker.recent_tool_call_count(), 3);
         assert_eq!(tracker.recent_tool_name_count(), 3);
+    }
+
+    #[test]
+    fn force_text_closeout_reset_keeps_tool_pattern_windows() {
+        let mut tracker = StallTracker::default();
+        tracker.record_tool_call("system_info", 11);
+        tracker.record_tool_call("system_info", 11);
+        tracker.increment_stall();
+        tracker.increment_stall();
+
+        tracker.reset_for_force_text_closeout();
+
+        assert_eq!(tracker.stall_count(), 0);
+        assert_eq!(tracker.consecutive_clean_iterations(), 0);
+        assert_eq!(tracker.consecutive_same_tool(), ("system_info", 2));
+        assert_eq!(tracker.recent_tool_call_count(), 2);
     }
 
     #[test]

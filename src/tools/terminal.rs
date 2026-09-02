@@ -5526,7 +5526,13 @@ impl TerminalTool {
                 let owner_task_id_for_notify = owner_task_id.clone();
                 let tool_call_id_for_notify = tool_call_id.map(str::to_string);
                 let event_store_for_notify = self.event_store.clone();
-                let command_semantics_for_notify = command_semantics.clone();
+                // The completion receipt terminates the same invocation whose
+                // launch receipt declared the process-state change. The
+                // launch receipt is provisional and proves nothing on its
+                // own, so the terminal receipt must carry that declared
+                // effect or the mutation is never credited anywhere.
+                let completion_semantics_for_notify =
+                    background_process_semantics(&command_semantics);
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -5654,7 +5660,7 @@ impl TerminalTool {
                                                 crate::traits::ToolReceiptKind::Process;
                                             metadata.effective_tool_name = Some("terminal".to_string());
                                             metadata.truncation = truncation.clone();
-                                            metadata.semantics = command_semantics_for_notify.clone();
+                                            metadata.semantics = completion_semantics_for_notify.clone();
                                             metadata.access_denial =
                                                 sandbox_access_denial(&stderr, exit_code);
                                             let provenance =
@@ -6520,15 +6526,7 @@ impl TerminalTool {
                 if !partial_stdout.is_empty() {
                     msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
                 }
-                // A process now running independently of this call is a
-                // typed process-state change on top of whatever the command
-                // was declared to observe or write.
-                let background_semantics = ToolCallSemantics::observation_and_mutation_with(
-                    command_semantics
-                        .mutation_effects
-                        .union(ToolMutationEffects::PROCESS_STATE),
-                )
-                .with_verification_mode(ToolVerificationMode::ResultContent);
+                let background_semantics = background_process_semantics(&command_semantics);
                 Ok(ToolCallOutcome {
                     metadata: ToolCallMetadata {
                         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
@@ -7454,6 +7452,20 @@ fn sandbox_access_denial(
     })
 }
 
+/// Semantics of an invocation whose process runs independently of the call:
+/// a typed process-state change on top of whatever the command was declared
+/// to observe or write. Shared by the provisional launch receipt and the
+/// terminal completion receipt of the same invocation so the effect the
+/// launch declared is exactly the effect the completion proves.
+fn background_process_semantics(command_semantics: &ToolCallSemantics) -> ToolCallSemantics {
+    ToolCallSemantics::observation_and_mutation_with(
+        command_semantics
+            .mutation_effects
+            .union(ToolMutationEffects::PROCESS_STATE),
+    )
+    .with_verification_mode(ToolVerificationMode::ResultContent)
+}
+
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     let enforcement = confined_process_access_enforcement();
     ToolCallMetadata {
@@ -8042,6 +8054,30 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             "mock-semantic-risk".to_string(),
         )
+    }
+
+    #[test]
+    fn background_completion_semantics_prove_what_the_launch_declared() {
+        // The launch receipt is `Backgrounded` and provisional; only the
+        // terminal receipt of the same invocation can credit the
+        // process-state mutation, so both must derive the same effect set.
+        let observed_only = ToolCallSemantics::observation();
+        let completion = background_process_semantics(&observed_only);
+        assert!(completion.mutates_state());
+        assert!(completion.observes_state());
+        assert!(completion
+            .mutation_effects
+            .satisfies(ToolMutationEffects::PROCESS_STATE));
+
+        let writes = ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE);
+        let completion = background_process_semantics(&writes);
+        assert!(completion
+            .mutation_effects
+            .satisfies(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(completion
+            .mutation_effects
+            .satisfies(ToolMutationEffects::PROCESS_STATE));
+        assert_eq!(completion, background_process_semantics(&writes));
     }
 
     #[test]

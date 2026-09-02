@@ -1255,3 +1255,110 @@ pub fn test_policy_config() -> crate::config::PolicyConfig {
         ..crate::config::PolicyConfig::default()
     }
 }
+
+/// Redirects secret storage away from the OS keychain for one test.
+///
+/// `AIDAEMON_NO_KEYCHAIN` and the runtime env-file path are process-global,
+/// and libtest runs every module's tests concurrently in one process. A
+/// module-local mutex only orders the tests inside that module; a test in
+/// another module that restores (unsets) the variable mid-flight sends the
+/// lock holder through the real keychain, where an unsigned test binary
+/// either blocks the whole suite behind a macOS Keychain prompt or writes
+/// into the developer's keychain. Every test that needs the redirect must go
+/// through this one guard so the ordering is crate-wide.
+///
+/// The guard restores each variable it touched when dropped, so a panicking
+/// test cannot leak its redirect into the next one, and a poisoned lock is
+/// recovered instead of cascading one failure into every later holder.
+pub struct KeychainIsolation {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Vec<(String, Option<String>)>,
+    env_file: tempfile::NamedTempFile,
+}
+
+impl KeychainIsolation {
+    /// Serialize on the crate-wide lock, disable the keychain, and point the
+    /// runtime env-file path at a fresh empty temp file.
+    pub fn acquire() -> Self {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env_file = tempfile::NamedTempFile::new().expect("create isolated env file");
+        let mut isolation = Self {
+            _lock: lock,
+            previous: Vec::new(),
+            env_file,
+        };
+        isolation.set("AIDAEMON_NO_KEYCHAIN", "1");
+        let env_path = isolation.env_file.path().to_string_lossy().to_string();
+        isolation.set(crate::RUNTIME_ENV_FILE_ENV_KEY, &env_path);
+        isolation
+    }
+
+    /// The temp env file that now backs secret storage.
+    pub fn env_file_path(&self) -> &std::path::Path {
+        self.env_file.path()
+    }
+
+    /// Override another process-global variable for the guard's lifetime.
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.remember(name);
+        std::env::set_var(name, value);
+    }
+
+    /// Clear another process-global variable for the guard's lifetime.
+    pub fn unset(&mut self, name: &str) {
+        self.remember(name);
+        std::env::remove_var(name);
+    }
+
+    fn remember(&mut self, name: &str) {
+        self.previous
+            .push((name.to_string(), std::env::var(name).ok()));
+    }
+}
+
+impl Drop for KeychainIsolation {
+    fn drop(&mut self) {
+        // Reverse order so a variable set twice lands on its original value.
+        for (name, previous) in self.previous.drain(..).rev() {
+            match previous {
+                Some(value) => std::env::set_var(&name, value),
+                None => std::env::remove_var(&name),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keychain_isolation_tests {
+    use super::KeychainIsolation;
+
+    #[test]
+    fn acquire_redirects_and_drop_restores_original_values() {
+        // Only the private marker is asserted after the drop: the shared
+        // variables belong to whichever test acquires the lock next.
+        let marker = "AIDAEMON_TEST_ISOLATION_MARKER";
+        std::env::set_var(marker, "before");
+
+        {
+            let mut isolation = KeychainIsolation::acquire();
+            assert_eq!(std::env::var("AIDAEMON_NO_KEYCHAIN").as_deref(), Ok("1"));
+            assert_eq!(
+                std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY)
+                    .ok()
+                    .as_deref(),
+                Some(isolation.env_file_path().to_string_lossy().as_ref())
+            );
+            isolation.set(marker, "during");
+            isolation.unset(marker);
+            isolation.set(marker, "again");
+            assert_eq!(std::env::var(marker).as_deref(), Ok("again"));
+        }
+
+        assert_eq!(std::env::var(marker).as_deref(), Ok("before"));
+        std::env::remove_var(marker);
+    }
+}

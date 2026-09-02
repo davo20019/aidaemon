@@ -41,7 +41,24 @@ impl ObjectiveCollection {
         )
         .expect("objective collection IDs are nonempty constants")
     }
+
+    /// What an adapter enumerating this collection advertises to the
+    /// checklist: the collection ID, every objective facet, and the
+    /// `objective:` member namespace `objective_resource_id` mints.
+    pub(crate) fn stable_subject(self) -> crate::traits::StableObservationSubject {
+        crate::traits::StableObservationSubject::collection(
+            self.resource_id(),
+            &OBJECTIVE_STATUS_FACETS,
+            OBJECTIVE_MEMBER_NAMESPACE,
+            match self {
+                Self::ScheduledGoals => "every scheduled goal",
+                Self::MandateControllers => "every mandate-controlled goal",
+            },
+        )
+    }
 }
+
+pub(crate) const OBJECTIVE_MEMBER_NAMESPACE: &str = "objective:";
 
 pub(crate) const OBJECTIVE_STATUS_FACETS: [crate::traits::ToolSemanticFacet; 6] = [
     crate::traits::ToolSemanticFacet::Schedule,
@@ -58,7 +75,10 @@ pub(crate) fn objective_resource_id(goal_id: &str) -> String {
     // The checklist needs a stable exact identity, while owner-facing tool
     // output must not expose internal database UUIDs. A full digest keeps the
     // mapping deterministic without relying on display prose or row order.
-    format!("objective:sha256:{:x}", Sha256::digest(goal_id.as_bytes()))
+    format!(
+        "{OBJECTIVE_MEMBER_NAMESPACE}sha256:{:x}",
+        Sha256::digest(goal_id.as_bytes())
+    )
 }
 
 /// Coverage for one collection enumeration. `complete` is derived rather than

@@ -601,6 +601,64 @@ impl ToolCollectionObservation {
     }
 }
 
+/// A receipt subject an adapter reports verbatim, published ahead of any call
+/// so the executor's checklist can bind to identities that receipts will
+/// actually carry. A checklist target outside every advertised subject and
+/// member namespace can never be credited, so the checklist tool refuses to
+/// compile it into an exact obligation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StableObservationSubject {
+    /// Exact `ResourceId` the adapter reports for a fixed collection or
+    /// singleton subject, when that identity is known before the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    /// Facets a receipt for this subject or its members can carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facets: Vec<ToolSemanticFacet>,
+    /// `ResourceId` prefixes of exact member identities the adapter or the
+    /// runtime mints (for example `auth_profile:`). A value under a prefix is
+    /// exact and is credited only by a receipt naming it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_namespaces: Vec<String>,
+    /// Short model-facing meaning of the subject.
+    pub summary: String,
+}
+
+impl StableObservationSubject {
+    pub fn collection(
+        resource_id: impl Into<String>,
+        facets: &[ToolSemanticFacet],
+        member_namespace: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            resource_id: Some(resource_id.into()),
+            facets: facets.to_vec(),
+            member_namespaces: vec![member_namespace.into()],
+            summary: summary.into(),
+        }
+    }
+
+    pub fn namespace(prefix: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            resource_id: None,
+            facets: Vec::new(),
+            member_namespaces: vec![prefix.into()],
+            summary: summary.into(),
+        }
+    }
+
+    /// Whether `value` is this subject itself or an exact member under one of
+    /// its namespaces. A bare prefix with nothing after it is not a member.
+    pub fn binds(&self, value: &str) -> bool {
+        self.resource_id.as_deref() == Some(value)
+            || self
+                .member_namespaces
+                .iter()
+                .any(|prefix| value.len() > prefix.len() && value.starts_with(prefix.as_str()))
+    }
+}
+
 /// Structured semantic affordances for matching tools to contextual requests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1902,6 +1960,14 @@ pub trait Tool: Send + Sync {
     #[allow(dead_code)]
     fn semantic_affordances(&self) -> Option<ToolSemanticAffordances> {
         None
+    }
+
+    /// Exact receipt subjects this adapter reports verbatim: fixed collection
+    /// IDs and the namespaces of member identities it mints. The checklist
+    /// tool publishes the union so declared targets bind only to identities a
+    /// receipt can carry. The default advertises nothing.
+    fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
+        Vec::new()
     }
 
     /// Whether this tool is currently operational.

@@ -166,8 +166,12 @@ pub fn message_attachment(
     }
 }
 
+/// Prefix of every session resource handle minted here and consumed by
+/// `send_file`/`image_generation`; the checklist binds `res_*` targets to it.
+pub const RESOURCE_ID_PREFIX: &str = "res_";
+
 pub fn new_resource_id() -> String {
-    format!("res_{}", uuid::Uuid::new_v4().simple())
+    format!("{RESOURCE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple())
 }
 
 pub fn sha256_file(path: &Path) -> Option<String> {

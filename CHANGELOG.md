@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-09-02
+
+### Changed
+
+- **Checklist targets bind only to identities a receipt can carry.** Every tool adapter advertises the stable receipt subjects it reports (`Tool::stable_observation_subjects`: fixed collection IDs such as `objective_collection:scheduled_goals` and member namespaces such as `auth_profile:`), and `track_requirements` publishes the union in its schema and binds each checklist `resource_id` target against it. A target no adapter reports is recorded as `_unbound_targets` on the item and compiled as an untargeted observation instead of an exact obligation that nothing could ever credit; paths, URLs, and structurally invalid targets pass through unchanged. `manage_oauth list` now emits the exact `auth_profile:<service>` connection identities and complete-collection evidence (an empty list proves absence), sharing one credential identity with `manage_http_auth` and `http_request`; `send_file`/`image_generation` session handles bind under `res_*`.
+- **Task assessment hedges a late primary candidate.** Assessment candidates are attempted in configured order under one bounded envelope, and each keeps the lane for its observed-p95 window (capped by the default attempt budget). Once a candidate runs late the next configured candidate starts alongside it and the first complete typed contract wins; a candidate that finishes inside its window is never hedged, no observed latency means plain serial failover, and a lone candidate is never hedged against itself. A stalled primary assessor no longer adds its whole timeout to the fallback's latency.
+- **A stall after clean progress gets one tool-less closeout pass.** When every completed operation succeeded but the model keeps re-invoking tools instead of answering, the loop grants a single force-text pass in which the model must answer from the receipts it already holds, before any deterministic exit ships a canned reply. The pass is gated by the completion contract (unfulfilled Change/Deliver work keeps execution capability) and shares its one-shot marker with the budget closeout grace.
+- **`db_probe --token-hours` classifies unmeasured usage and prints a verdict.** A failed or timed-out attempt structurally has no provider usage, so its estimate-only row is expected rather than a gap; only completed calls without provider-measured usage are reported as gaps. One such row was previously printed as both "an event without a token row" and "an estimate-only record".
+
+### Fixed
+
+- **A background continuation credits the parent receipt it adopted.** The child task's contract adopts the parent's invocation requirement, but the durable replay of the parent's terminal receipt named the parent's obligation ID, so the child could not close it, demanded another pass, and delivered the detached result only after that pass (about two minutes in live runs when it hit a provider stall). The ledger now translates adopted obligation IDs onto the run's own compiled obligations, and the provisional launch receipt and terminal completion receipt of one backgrounded invocation derive a single shared effect set so the process-state mutation the launch declared is exactly what the completion proves. Replays stay idempotent and never advance the child's effect revision.
+- **Recovering from a provider failure is run state, not a memory write.** A turn whose provider call timed out once and then succeeded through a tool was labelled `failed` (and counted as an `llm_error`) when memory learning was suppressed, because recovery was recorded only alongside persisted learning. Recovery bookkeeping is now independent of the memory capability, and a completed provider response marks every earlier model-call failure in the run recovered by typed signal rather than by what the model says next.
+- **Secret-store tests share one crate-wide isolation guard.** Tests that redirect secret storage away from the OS keychain toggled process-global environment variables under four module-local mutexes; one unguarded test raced the others, poisoned a mutex, and could send a test into the real macOS keychain. All such tests now hold a single `KeychainIsolation` guard with restore-on-drop and poison recovery.
+
 ## [0.12.2] - 2026-09-01
 
 ### Changed

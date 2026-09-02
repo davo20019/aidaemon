@@ -1070,6 +1070,81 @@ async fn policy_blocked_calls_are_no_progress_without_false_failed_task_tokens()
     );
 }
 
+#[tokio::test]
+async fn stall_after_clean_progress_gets_a_force_text_closeout_not_a_canned_partial() {
+    // Two `system_info` calls succeed; the model then keeps re-issuing the
+    // same call until the repetition guard blocks it and the stall limit
+    // trips. Nothing ever errored, so this is a summarization stall: the
+    // loop must hand the model one tool-less pass and ship *its* answer,
+    // rather than a deterministic "typed result but no verified answer".
+    let mut responses: Vec<crate::traits::ProviderResponse> = (0..7)
+        .map(|_| MockProvider::tool_call_response("system_info", "{}"))
+        .collect();
+    responses.push(MockProvider::text_response(
+        "The host reports a local execution target and its system details are above.",
+    ));
+    let provider = MockProvider::with_responses(responses);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "stall_clean_progress_closeout",
+            "Run system checks repeatedly",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        reply.contains("local execution target"),
+        "the model's force-text answer must be the reply, got: {reply}"
+    );
+    assert!(
+        !reply.contains("did not produce a verified user-facing answer"),
+        "a clean-progress stall must not ship the canned partial: {reply}"
+    );
+
+    let closeout_grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events
+         WHERE session_id = 'stall_clean_progress_closeout'
+           AND event_type = 'decision_point'
+           AND data LIKE '%stall_force_text_closeout%'",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .expect("decision points");
+    assert_eq!(
+        closeout_grants, 1,
+        "exactly one force-text closeout grace is issued per task"
+    );
+
+    let task_end_json: String = sqlx::query_scalar(
+        "SELECT data FROM events
+         WHERE session_id = 'stall_clean_progress_closeout' AND event_type = 'task_end'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .expect("task-local end event");
+    let task_end: crate::events::TaskEndData =
+        serde_json::from_str(&task_end_json).expect("task end payload");
+    assert_eq!(
+        task_end.outcome,
+        Some(crate::events::TaskOutcome::Succeeded)
+    );
+    assert!(
+        !task_end
+            .harness_eval
+            .expect("task-local harness evaluation")
+            .cost
+            .tokens_failed_waste
+    );
+}
+
 struct RecordingSearchFilesTool {
     calls: Arc<Mutex<Vec<String>>>,
 }

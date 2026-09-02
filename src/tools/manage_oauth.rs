@@ -11,8 +11,10 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
+    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
+    ToolTargetHintKind,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -48,6 +50,13 @@ pub struct ManageOAuthTool {
 }
 
 impl ManageOAuthTool {
+    /// Stable collection subject for every connected OAuth service, complete
+    /// on each `list`. Members are the same `auth_profile:<service>` IDs that
+    /// `manage_http_auth` and `http_request` report, so one credential
+    /// identity is shared across all three adapters.
+    pub const OAUTH_CONNECTION_COLLECTION_ID: &'static str =
+        "oauth_connection_collection:connected";
+
     pub fn new(
         gateway: OAuthGateway,
         state_store: Arc<dyn OAuthStore>,
@@ -60,6 +69,14 @@ impl ManageOAuthTool {
             config_path,
             approval_tx,
         }
+    }
+
+    fn connection_collection_hint() -> ToolTargetHint {
+        ToolTargetHint::new(
+            ToolTargetHintKind::ResourceId,
+            Self::OAUTH_CONNECTION_COLLECTION_ID,
+        )
+        .expect("oauth connection collection ID is nonempty")
     }
 
     fn validate_service_name(raw: &str) -> anyhow::Result<String> {
@@ -495,9 +512,27 @@ impl ManageOAuthTool {
     }
 
     async fn handle_list(&self) -> anyhow::Result<String> {
+        Ok(self.handle_list_snapshot().await?.0)
+    }
+
+    /// Render the connection list and return the exact member identities the
+    /// receipt reports, so `list` proves both readiness and absence.
+    async fn handle_list_snapshot(&self) -> anyhow::Result<(String, Vec<ToolTargetHint>)> {
         let connections = self.state_store.list_oauth_connections().await?;
+        let members = connections
+            .iter()
+            .filter_map(|conn| {
+                ToolTargetHint::new(
+                    ToolTargetHintKind::ResourceId,
+                    HttpRequestTool::auth_profile_resource_id(&conn.service),
+                )
+            })
+            .collect();
         if connections.is_empty() {
-            return Ok("No OAuth connections. Use 'connect' to link a service.".to_string());
+            return Ok((
+                "No OAuth connections. Use 'connect' to link a service.".to_string(),
+                members,
+            ));
         }
         let mut result = String::from("Connected OAuth services:\n");
         for conn in &connections {
@@ -517,11 +552,16 @@ impl ManageOAuthTool {
                 .map(|id| format!(" [account_id: {}]", id))
                 .unwrap_or_else(|| " [account_id: unbound]".to_string());
             result.push_str(&format!(
-                "  - {}{} [{}]{}{}\n",
-                conn.service, username, conn.auth_type, account, expires
+                "  - {}{} [{}]{}{} [resource_id: {}]\n",
+                conn.service,
+                username,
+                conn.auth_type,
+                account,
+                expires,
+                HttpRequestTool::auth_profile_resource_id(&conn.service)
             ));
         }
-        Ok(result)
+        Ok((result, members))
     }
 
     async fn identity_response(
@@ -1126,11 +1166,37 @@ impl Tool for ManageOAuthTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
+        let mut semantics = semantics_for_exact_read_actions(
             arguments,
             &["list", "providers", "describe_provider"],
             ToolMutationEffects::CONFIGURATION,
-        )
+        );
+        if let Ok(args) = serde_json::from_str::<ManageOAuthArgs>(arguments) {
+            if args.action == "list" {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    Self::OAUTH_CONNECTION_COLLECTION_ID,
+                );
+            }
+            if let Some(service) = args.service.as_deref() {
+                if let Ok(service) = Self::validate_service_name(service) {
+                    semantics = semantics.with_target_hint(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&service),
+                    );
+                }
+            }
+        }
+        semantics
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
+        vec![StableObservationSubject::collection(
+            Self::OAUTH_CONNECTION_COLLECTION_ID,
+            &[ToolSemanticFacet::Authorization],
+            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
+            "every connected OAuth service",
+        )]
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1279,6 +1345,28 @@ impl Tool for ManageOAuthTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        if args.action == "list" {
+            let (output, members) = self.handle_list_snapshot().await?;
+            let observations = members
+                .iter()
+                .cloned()
+                .map(|subject| {
+                    ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
+                })
+                .collect();
+            return Ok(ToolCallOutcome {
+                output,
+                metadata: ToolCallMetadata {
+                    observations,
+                    collection_observations: vec![ToolCollectionObservation::complete(
+                        Self::connection_collection_hint(),
+                        &[ToolSemanticFacet::Authorization],
+                        members,
+                    )],
+                    ..ToolCallMetadata::default()
+                },
+            });
+        }
         let output = self.call_with_status(arguments, status_tx).await?;
         let mut outcome = ToolCallOutcome::from_output(output.clone());
         if args.action == "connect" {
@@ -1292,10 +1380,6 @@ impl Tool for ManageOAuthTool {
 }
 
 #[cfg(test)]
-// These tests serialize global env-var mutation via a shared lock; the guard
-// must intentionally span `.await` points to keep parallel tests isolated, so
-// `clippy::await_holding_lock` is a false positive for this pattern.
-#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1308,13 +1392,14 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
-    use once_cell::sync::Lazy;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::oauth::{OAuthProvider, SharedHttpProfiles};
     use crate::state::SqliteStateStore;
+    use crate::testing::KeychainIsolation;
+    use crate::traits::ToolCollectionCompleteness;
 
     #[test]
     fn schema_fits_payload_budget() {
@@ -1333,16 +1418,6 @@ mod tests {
             bytes <= 1100,
             "manage_oauth schema is {bytes} bytes, budget is 1100"
         );
-    }
-
-    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-
-    fn restore_env_var(name: &str, old_value: Option<String>) {
-        if let Some(value) = old_value {
-            std::env::set_var(name, value);
-        } else {
-            std::env::remove_var(name);
-        }
     }
 
     async fn test_tool(
@@ -1380,6 +1455,103 @@ mod tests {
 
     fn write_minimal_config(path: &Path) {
         std::fs::write(path, "[provider]\napi_key = \"test-key\"\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_emits_exact_connection_readiness_and_complete_collection_evidence() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        // `restore_connections` resolves the stored connection's access token
+        // through the secret store; a developer machine may hold a real
+        // `oauth_twitter_access_token` keychain item.
+        let _isolation = KeychainIsolation::acquire();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: Some("synthetic_handle".to_string()),
+                account_id: Some("1000000000000000001".to_string()),
+                scopes: r#"["users.read"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        gateway.restore_connections().await;
+
+        let semantics = tool.call_semantics(r#"{"action":"list"}"#);
+        assert!(semantics.target_hints.iter().any(|hint| {
+            hint.kind == ToolTargetHintKind::ResourceId
+                && hint.value == ManageOAuthTool::OAUTH_CONNECTION_COLLECTION_ID
+        }));
+        let service_semantics = tool.call_semantics(r#"{"action":"refresh","service":"twitter"}"#);
+        let resource_id = HttpRequestTool::auth_profile_resource_id("twitter");
+        assert!(service_semantics
+            .target_hints
+            .iter()
+            .any(|hint| hint.kind == ToolTargetHintKind::ResourceId && hint.value == resource_id));
+
+        let outcome = tool
+            .call_with_status_outcome(r#"{"action":"list"}"#, None)
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("twitter"));
+        assert!(outcome.metadata.direct_response.is_none());
+        assert!(outcome.metadata.observations.iter().any(|observation| {
+            observation.subject.kind == ToolTargetHintKind::ResourceId
+                && observation.subject.value == resource_id
+                && observation
+                    .facets
+                    .contains(&ToolSemanticFacet::Authorization)
+        }));
+        let collection = outcome
+            .metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value == ManageOAuthTool::OAUTH_CONNECTION_COLLECTION_ID
+            })
+            .expect("oauth connection collection coverage");
+        assert_eq!(
+            collection.completeness,
+            ToolCollectionCompleteness::Complete
+        );
+        assert_eq!(collection.members.len(), 1);
+        assert_eq!(collection.members[0].value, resource_id);
+
+        let advertised = tool.stable_observation_subjects();
+        assert!(advertised.iter().any(|subject| {
+            subject.resource_id.as_deref() == Some(ManageOAuthTool::OAUTH_CONNECTION_COLLECTION_ID)
+                && subject.binds(&resource_id)
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_list_still_proves_complete_absence() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let outcome = tool
+            .call_with_status_outcome(r#"{"action":"list"}"#, None)
+            .await
+            .unwrap();
+        assert!(outcome.metadata.observations.is_empty());
+        let collection = outcome
+            .metadata
+            .collection_observations
+            .iter()
+            .find(|collection| {
+                collection.collection.value == ManageOAuthTool::OAUTH_CONNECTION_COLLECTION_ID
+            })
+            .expect("absence is evidence too");
+        assert_eq!(
+            collection.completeness,
+            ToolCollectionCompleteness::Complete
+        );
+        assert!(collection.members.is_empty());
     }
 
     #[tokio::test]
@@ -1455,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_provider_deletes_custom_provider_and_client_credentials() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
         let config_file = NamedTempFile::new().unwrap();
         std::fs::write(
             config_file.path(),
@@ -1476,19 +1648,11 @@ allowed_domains = ["api.linear.app"]
         )
         .unwrap();
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
 
         let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         let config_provider = OAuthProviderConfig {
@@ -1508,14 +1672,11 @@ allowed_domains = ["api.linear.app"]
             .await
             .unwrap();
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
-
         assert!(result.contains("Removed custom OAuth provider 'linear'"));
         let saved = std::fs::read_to_string(config_file.path()).unwrap();
         assert!(!saved.contains("[oauth.providers.linear]"));
         assert!(gateway.get_provider("linear").await.is_none());
-        let env_content = std::fs::read_to_string(env_file.path()).unwrap();
+        let env_content = std::fs::read_to_string(isolation.env_file_path()).unwrap();
         assert!(!env_content.contains("OAUTH_LINEAR_CLIENT_ID"));
         assert!(!env_content.contains("OAUTH_LINEAR_CLIENT_SECRET"));
     }
@@ -1540,9 +1701,7 @@ allowed_domains = ["api.linear.app"]
 
     #[tokio::test]
     async fn describe_provider_surfaces_localhost_callback_warning() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        let _isolation = KeychainIsolation::acquire();
 
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
@@ -1556,15 +1715,13 @@ allowed_domains = ["api.linear.app"]
             .await
             .unwrap();
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-
         assert!(result.contains("callback_url: http://localhost:8080/oauth/callback"));
         assert!(result.contains("same machine running aidaemon"));
     }
 
     #[tokio::test]
     async fn connect_reports_browser_completion_via_status_updates() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn token_handler(
             Form(form): Form<HashMap<String, String>>,
@@ -1602,19 +1759,11 @@ allowed_domains = ["api.linear.app"]
             })
             .await;
 
-        let env_file = NamedTempFile::new().unwrap();
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
 
         let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(8);
         let tool = Arc::new(tool);
@@ -1670,9 +1819,6 @@ allowed_domains = ["api.linear.app"]
 
         let tool_outcome = tool_task.await.unwrap().unwrap();
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
-
         assert!(tool_outcome.output.contains("Connected to Linear"));
         assert_eq!(
             tool_outcome.metadata.direct_response,
@@ -1682,7 +1828,7 @@ allowed_domains = ["api.linear.app"]
 
     #[tokio::test]
     async fn bind_account_proves_remote_identity_before_persisting_it() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let isolation = KeychainIsolation::acquire();
 
         async fn identity_handler(headers: HeaderMap) -> Json<serde_json::Value> {
             assert_eq!(
@@ -1707,20 +1853,12 @@ allowed_domains = ["api.linear.app"]
         });
 
         let config_file = NamedTempFile::new().unwrap();
-        let env_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
         std::fs::write(
-            env_file.path(),
+            isolation.env_file_path(),
             "OAUTH_TWITTER_ACCESS_TOKEN=synthetic-access-token\n",
         )
         .unwrap();
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
 
         let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         gateway
@@ -1801,24 +1939,13 @@ allowed_domains = ["api.linear.app"]
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.account_id.as_deref(), Some("2018008573557551105"));
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
     }
 
     #[tokio::test]
     async fn remove_requires_explicit_confirmation() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _isolation = KeychainIsolation::acquire();
         let config_file = NamedTempFile::new().unwrap();
-        let env_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
         let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         tool.state_store
@@ -1841,9 +1968,6 @@ allowed_domains = ["api.linear.app"]
             .await
             .unwrap();
 
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
-
         assert!(result.contains("confirm_disconnect=true"));
         assert!(tool
             .state_store
@@ -1855,17 +1979,9 @@ allowed_domains = ["api.linear.app"]
 
     #[tokio::test]
     async fn remove_with_explicit_confirmation_disconnects_service() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _isolation = KeychainIsolation::acquire();
         let config_file = NamedTempFile::new().unwrap();
-        let env_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
-        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
-        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
-        std::env::set_var(
-            crate::RUNTIME_ENV_FILE_ENV_KEY,
-            env_file.path().to_string_lossy().to_string(),
-        );
         let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         tool.state_store
@@ -1889,9 +2005,6 @@ allowed_domains = ["api.linear.app"]
             )
             .await
             .unwrap();
-
-        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
-        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
 
         assert!(result.contains("Disconnected from twitter"));
         assert!(tool

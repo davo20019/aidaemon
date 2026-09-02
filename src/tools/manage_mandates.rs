@@ -2500,6 +2500,14 @@ impl Tool for ManageMandatesTool {
         ToolRole::Management
     }
 
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![
+            crate::tools::objective_status::ObjectiveCollection::MandateControllers
+                .stable_subject(),
+            crate::tools::objective_status::ObjectiveCollection::ScheduledGoals.stable_subject(),
+        ]
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let action = serde_json::from_str::<Value>(arguments)
             .ok()

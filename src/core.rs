@@ -112,9 +112,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // checklist (backed by plan_store). It only persists checklist state; the
     // rendered checklist is surfaced to the user by the agent loop via
     // StatusUpdate::Checklist, so it no longer needs ChannelHub wiring.
+    // Checklist resource-ID targets bind against the subjects the registered
+    // adapters advertise, so `tools` must be complete before this point.
     let mut tools = tools;
-    let track_requirements_tool =
-        Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone()));
+    let stable_subjects =
+        crate::tools::track_requirements::StableSubjectVocabulary::from_tools(&tools);
+    let track_requirements_tool = Arc::new(
+        crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone())
+            .with_stable_subjects(stable_subjects),
+    );
     tools.push(track_requirements_tool.clone());
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)

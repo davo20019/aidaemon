@@ -19,6 +19,9 @@ pub(super) enum StoppingPhaseOutcome {
     PivotApproach {
         failure_record: String,
     },
+    /// Stall after clean progress: continue the loop in force-text mode so
+    /// the model answers from the receipts it already holds.
+    ForceTextCloseout,
 }
 
 impl StoppingPhaseOutcome {
@@ -29,6 +32,9 @@ impl StoppingPhaseOutcome {
             Self::Proceed => TurnTransition::Advance(()),
             Self::PivotApproach { failure_record } => {
                 TurnTransition::Restart(TurnRestartReason::ApproachPivot { failure_record })
+            }
+            Self::ForceTextCloseout => {
+                TurnTransition::Restart(TurnRestartReason::StallForceTextCloseout)
             }
         }
     }
@@ -1688,6 +1694,55 @@ pub(super) async fn run_stopping_phase(
             }
         }
 
+        // A stall after clean progress is a summarization problem, not an
+        // approach problem: every completed operation succeeded, yet the model
+        // keeps re-invoking tools instead of answering. Before any
+        // deterministic exit ships a canned reply, hand the model one pass in
+        // which it cannot call tools and must answer from the receipts it
+        // already holds. The pass is bounded by the force-text safety net,
+        // gated by the completion contract (an unfulfilled Change/Deliver
+        // contract keeps execution capability), and shares its one-shot marker
+        // with the budget closeout grace so a task receives it once.
+        let stall_closeout_grace_available = stall_closeout_grace_is_available(
+            total_successful_tool_calls,
+            unrecovered_errors,
+            force_text_response,
+            &validation_state,
+        ) && completion_contract_allows_force_text(
+            &turn_context.completion_contract,
+            completion_progress,
+        );
+        if stall_closeout_grace_available {
+            validation_state.record_failure(ValidationFailure::BudgetExhausted);
+            force_text_response = true;
+            pending_system_messages.push(SystemDirective::StallSummarizeCollectedResults);
+            warn!(
+                session_id,
+                iteration,
+                stall_count = detected_stall_count,
+                total_successful_tool_calls,
+                "Stall after clean progress: granting one force-text closeout pass"
+            );
+            agent
+                .emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Stall after clean progress: continuing in force-text mode so the model answers from collected results"
+                        .to_string(),
+                    json!({
+                        "condition": "stall_force_text_closeout",
+                        "stall_count": detected_stall_count,
+                        "max_stall_iterations": stall_limit,
+                        "stall_mode": stall_mode,
+                        "total_successful_tool_calls": total_successful_tool_calls,
+                    }),
+                )
+                .await;
+            return Ok(StoppingPhaseOutcome::ForceTextCloseout);
+        }
+
         let meaningful_progress = (total_successful_tool_calls >= 5 || evidence_gain_count >= 3)
             && total_successful_tool_calls > unrecovered_errors;
         if meaningful_progress {
@@ -2181,6 +2236,25 @@ pub(super) async fn run_stopping_phase(
 /// payload is evidence, not a user-facing answer, so the fallback reports the
 /// missing finalization honestly without claiming the task's subject data was
 /// gathered or asking the user to stimulate another turn.
+/// Whether a stall may be answered by one tool-less closeout pass instead of a
+/// deterministic exit. Requires clean progress (typed successes, no unrecovered
+/// error), no force-text pass already in flight, and an unused closeout grace;
+/// the contract check that keeps execution capability for unfulfilled
+/// Change/Deliver work is applied by the caller.
+fn stall_closeout_grace_is_available(
+    total_successful_tool_calls: usize,
+    unrecovered_errors: usize,
+    force_text_response: bool,
+    validation_state: &ValidationState,
+) -> bool {
+    total_successful_tool_calls > 0
+        && unrecovered_errors == 0
+        && !force_text_response
+        && !validation_state
+            .failed_checks
+            .contains(&ValidationFailure::BudgetExhausted)
+}
+
 pub(super) fn last_resort_tool_output_reply(tool_output: &str) -> (String, bool) {
     let presentable = crate::agent::response_analysis::is_short_prose_excerpt(tool_output)
         && !crate::agent::response_analysis::reply_is_pasted_file_page(tool_output);
@@ -2195,6 +2269,40 @@ pub(super) fn last_resort_tool_output_reply(tool_output: &str) -> (String, bool)
                 .to_string(),
             false,
         )
+    }
+}
+
+#[cfg(test)]
+mod stall_closeout_grace_tests {
+    use super::stall_closeout_grace_is_available;
+    use crate::agent::validation_state::{ValidationFailure, ValidationState};
+
+    #[test]
+    fn clean_progress_earns_one_force_text_closeout() {
+        let state = ValidationState::default();
+        assert!(stall_closeout_grace_is_available(2, 0, false, &state));
+    }
+
+    #[test]
+    fn failing_or_empty_approaches_keep_the_deterministic_exits() {
+        let state = ValidationState::default();
+        // Unrecovered errors belong to the approach-pivot lane.
+        assert!(!stall_closeout_grace_is_available(2, 1, false, &state));
+        // Nothing succeeded: there is no evidence to summarize.
+        assert!(!stall_closeout_grace_is_available(0, 0, false, &state));
+    }
+
+    #[test]
+    fn a_force_text_pass_in_flight_is_not_granted_again() {
+        let state = ValidationState::default();
+        assert!(!stall_closeout_grace_is_available(2, 0, true, &state));
+    }
+
+    #[test]
+    fn the_closeout_grace_is_shared_with_budget_exhaustion_and_one_shot() {
+        let mut state = ValidationState::default();
+        state.record_failure(ValidationFailure::BudgetExhausted);
+        assert!(!stall_closeout_grace_is_available(2, 0, false, &state));
     }
 }
 

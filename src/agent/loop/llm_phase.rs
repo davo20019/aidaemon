@@ -1449,6 +1449,20 @@ pub(super) async fn run_llm_phase(
     drop(_llm_heartbeat_keeper);
     touch_heartbeat(heartbeat);
 
+    // The provider answered: earlier stalled or failed attempts in this run
+    // are recovered by this typed signal, not by whatever the model says next.
+    // Outcome labelling reads the same bookkeeping, so a turn that regained
+    // the model and finished its work is not reported as failed.
+    let recovered_model_errors = learning_ctx.mark_model_call_errors_recovered();
+    if recovered_model_errors > 0 {
+        info!(
+            session_id,
+            iteration,
+            recovered_model_errors,
+            "Provider response recovered earlier model-call failures in this run"
+        );
+    }
+
     // Settle the serialized mandate call before doing any fallible telemetry
     // work or exposing tool calls. Missing provider usage is unknowable spend,
     // so consume the remaining balance and fail closed for subsequent calls.
