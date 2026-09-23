@@ -17,7 +17,7 @@ mod duration_format;
 #[allow(dead_code)]
 mod events;
 pub use events::{
-    CompletionProofReference, EventType, TaskCompletionProofData, TaskEndData, ToolCallData,
+    CompletionProofReference, Event, EventType, TaskCompletionProofData, TaskEndData, ToolCallData,
     UserMessageData,
 };
 pub(crate) mod execution;

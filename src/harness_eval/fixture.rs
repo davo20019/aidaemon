@@ -14,7 +14,10 @@ fn empty_json() -> String {
     "{}".to_string()
 }
 
+// Fixture structs reject unknown keys: a typo such as `tool_calls_mx` would
+// otherwise deserialize to "no assertion" and the fixture would pass vacuously.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessEvalFixture {
     pub name: String,
     #[serde(default)]
@@ -42,12 +45,14 @@ pub struct HarnessEvalFixture {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FixtureSeed {
     #[serde(default)]
     pub goals: Vec<SeedGoal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeedGoal {
     pub description: String,
     #[serde(default = "default_active_status")]
@@ -59,6 +64,7 @@ fn default_active_status() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectBlock {
     #[serde(default)]
     pub orchestration_route: Option<String>,
@@ -76,6 +82,12 @@ pub struct ExpectBlock {
     /// e.g. `{twitter_post: 1}`. Tools omitted here are unconstrained.
     #[serde(default)]
     pub tool_call_counts: BTreeMap<String, u32>,
+    /// Exact count of receipts proving the adapter was actually dispatched.
+    /// Unlike `tool_call_counts` (model proposals), this ignores calls that
+    /// were replayed, suppressed as duplicates, or rejected before dispatch,
+    /// so it measures real side effects.
+    #[serde(default)]
+    pub tool_dispatch_counts: BTreeMap<String, u32>,
     #[serde(default)]
     pub outcome: Option<String>,
     #[serde(default)]
@@ -84,6 +96,13 @@ pub struct ExpectBlock {
     pub llm_calls_min: Option<u32>,
     #[serde(default)]
     pub llm_calls_max: Option<u32>,
+    /// Bounds on main-loop calls only. `llm_calls_*` also counts auxiliary
+    /// calls (task assessment, etc.), which can satisfy a minimum even when
+    /// the execution loop ran a single iteration.
+    #[serde(default)]
+    pub execution_llm_calls_min: Option<u32>,
+    #[serde(default)]
+    pub execution_llm_calls_max: Option<u32>,
     #[serde(default)]
     pub tool_calls_min: Option<u32>,
     #[serde(default)]
@@ -92,6 +111,8 @@ pub struct ExpectBlock {
     pub weighted_tokens_max: Option<u64>,
     #[serde(default)]
     pub forbidden_mutation_attempts_max: Option<u32>,
+    #[serde(default)]
+    pub forbids_mutation: Option<bool>,
     #[serde(default)]
     pub plan_steps_completed_min: Option<u32>,
     #[serde(default)]
@@ -124,6 +145,7 @@ pub enum MockResponseSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCallSpec {
     pub name: String,
     #[serde(default = "empty_json")]
@@ -136,7 +158,11 @@ pub struct HarnessEvalRunResult {
     pub task_end: TaskEndData,
     pub harness_eval: HarnessEvalSnapshot,
     pub llm_calls: u32,
+    /// LLM calls without an auxiliary `call_purpose`, i.e. execution-loop turns.
+    pub execution_llm_calls: u32,
     pub tool_names: Vec<String>,
+    /// Tools whose result receipt reports `ToolInvocationStage::Dispatched`.
+    pub dispatched_tool_names: Vec<String>,
     pub decision_types: Vec<String>,
 }
 
@@ -193,37 +219,51 @@ pub fn collect_run_result(
         .context("TaskEnd missing harness_eval snapshot")?;
     let task_id = &task_end.task_id;
 
-    let llm_calls = events
-        .iter()
-        .filter(|event| {
-            event.event_type == EventType::LlmCall && event.task_id.as_deref() == Some(task_id)
+    // Unparseable trace events are errors, not skips: dropping one would
+    // silently undercount calls and let count/absence assertions pass.
+    let task_events = |event_type: EventType| {
+        events.iter().filter(move |event| {
+            event.event_type == event_type && event.task_id.as_deref() == Some(task_id.as_str())
         })
-        .count() as u32;
+    };
+    let mut llm_calls = 0u32;
+    let mut execution_llm_calls = 0u32;
+    for event in task_events(EventType::LlmCall) {
+        let data = event
+            .parse_data::<crate::events::LlmCallData>()
+            .with_context(|| format!("parse LlmCall event {}", event.id))?;
+        llm_calls += 1;
+        if data.call_purpose.is_none() {
+            execution_llm_calls += 1;
+        }
+    }
 
     let mut tool_names = Vec::new();
-    for event in events
-        .iter()
-        .filter(|event| event.event_type == EventType::ToolCall)
-    {
-        if event.task_id.as_deref() != Some(task_id.as_str()) {
-            continue;
-        }
-        if let Ok(data) = event.parse_data::<crate::events::ToolCallData>() {
-            tool_names.push(data.name);
+    for event in task_events(EventType::ToolCall) {
+        let data = event
+            .parse_data::<crate::events::ToolCallData>()
+            .with_context(|| format!("parse ToolCall event {}", event.id))?;
+        tool_names.push(data.name);
+    }
+
+    let mut dispatched_tool_names = Vec::new();
+    for event in task_events(EventType::ToolResult) {
+        let data = event
+            .parse_data::<crate::events::ToolResultData>()
+            .with_context(|| format!("parse ToolResult event {}", event.id))?;
+        if data.receipt.as_ref().is_some_and(|receipt| {
+            receipt.invocation_stage == crate::traits::ToolInvocationStage::Dispatched
+        }) {
+            dispatched_tool_names.push(data.name);
         }
     }
 
     let mut decision_types = Vec::new();
-    for event in events
-        .iter()
-        .filter(|event| event.event_type == EventType::DecisionPoint)
-    {
-        if event.task_id.as_deref() != Some(task_id.as_str()) {
-            continue;
-        }
-        if let Ok(data) = event.parse_data::<DecisionPointData>() {
-            decision_types.push(format!("{:?}", data.decision_type));
-        }
+    for event in task_events(EventType::DecisionPoint) {
+        let data = event
+            .parse_data::<DecisionPointData>()
+            .with_context(|| format!("parse DecisionPoint event {}", event.id))?;
+        decision_types.push(format!("{:?}", data.decision_type));
     }
 
     Ok(HarnessEvalRunResult {
@@ -231,7 +271,9 @@ pub fn collect_run_result(
         task_end,
         harness_eval,
         llm_calls,
+        execution_llm_calls,
         tool_names,
+        dispatched_tool_names,
         decision_types,
     })
 }
@@ -284,7 +326,20 @@ pub fn assert_expectations(
         assert_tool_order(&fixture.name, &expect.tools_in_order, &result.tool_names)?;
     }
     if !expect.tool_call_counts.is_empty() {
-        assert_tool_counts(&fixture.name, &expect.tool_call_counts, &result.tool_names)?;
+        assert_tool_counts(
+            &fixture.name,
+            "tool_call_counts",
+            &expect.tool_call_counts,
+            &result.tool_names,
+        )?;
+    }
+    if !expect.tool_dispatch_counts.is_empty() {
+        assert_tool_counts(
+            &fixture.name,
+            "tool_dispatch_counts",
+            &expect.tool_dispatch_counts,
+            &result.dispatched_tool_names,
+        )?;
     }
 
     if let Some(expected) = &expect.outcome {
@@ -313,6 +368,23 @@ pub fn assert_expectations(
         );
     }
 
+    if let Some(min) = expect.execution_llm_calls_min {
+        anyhow::ensure!(
+            result.execution_llm_calls >= min,
+            "[{}] execution_llm_calls_min: expected >= {min}, got {}",
+            fixture.name,
+            result.execution_llm_calls
+        );
+    }
+    if let Some(max) = expect.execution_llm_calls_max {
+        anyhow::ensure!(
+            result.execution_llm_calls <= max,
+            "[{}] execution_llm_calls_max: expected <= {max}, got {}",
+            fixture.name,
+            result.execution_llm_calls
+        );
+    }
+
     let tool_calls = result.task_end.tool_calls_count;
     if let Some(min) = expect.tool_calls_min {
         anyhow::ensure!(
@@ -334,6 +406,14 @@ pub fn assert_expectations(
             "[{}] weighted_tokens_max: expected <= {max}, got {}",
             fixture.name,
             eval.cost.weighted_tokens
+        );
+    }
+    if let Some(expected) = expect.forbids_mutation {
+        anyhow::ensure!(
+            eval.quality.contract.forbids_mutation == expected,
+            "[{}] forbids_mutation: expected {expected}, got {}",
+            fixture.name,
+            eval.quality.contract.forbids_mutation
         );
     }
     if let Some(max) = expect.forbidden_mutation_attempts_max {
@@ -402,11 +482,12 @@ pub fn assert_expectations(
         );
     }
 
-    if expect.response_fallthrough == Some(true) {
+    if let Some(expected) = expect.response_fallthrough {
         anyhow::ensure!(
-            eval.routing.response_fallthrough,
-            "[{}] expected response_fallthrough=true",
-            fixture.name
+            eval.routing.response_fallthrough == expected,
+            "[{}] response_fallthrough: expected {expected}, got {}",
+            fixture.name,
+            eval.routing.response_fallthrough
         );
     }
 
@@ -433,7 +514,7 @@ pub fn assert_expectations(
             result
                 .decision_types
                 .iter()
-                .any(|seen| seen.contains(decision_type)),
+                .any(|seen| seen == decision_type),
             "[{}] decision_types_seen: expected {decision_type}, got {:?}",
             fixture.name,
             result.decision_types
@@ -477,6 +558,7 @@ fn assert_tool_order(
 /// Tools absent from `expected` are unconstrained.
 fn assert_tool_counts(
     fixture_name: &str,
+    label: &str,
     expected: &BTreeMap<String, u32>,
     actual: &[String],
 ) -> anyhow::Result<()> {
@@ -487,8 +569,7 @@ fn assert_tool_counts(
             .count() as u32;
         anyhow::ensure!(
             got == *want,
-            "[{fixture_name}] tool_call_counts: expected {tool} called {want} time(s), \
-             got {got}; all calls: {actual:?}"
+            "[{fixture_name}] {label}: expected {tool} {want} time(s), got {got}; all: {actual:?}"
         );
     }
     Ok(())
@@ -509,60 +590,157 @@ fn assert_score_min(
     Ok(())
 }
 
-/// Build a fixture YAML from a completed task (structural expect block only).
-pub fn build_recorded_fixture(
-    name: &str,
+/// Where recorded drafts are written by default. Deliberately outside
+/// [`fixtures_dir`], which the suite auto-loads: a draft is not replayable
+/// until a human scripts its task assessment (see [`record_fixture_from_events`]).
+pub fn recorded_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/harness_eval/recorded")
+}
+
+/// Leading comment for recorded drafts, explaining what must be added before
+/// the draft is promoted into the suite.
+pub const RECORDED_FIXTURE_HEADER: &str = "\
+# DRAFT recorded from a production trace. Not auto-loaded by the suite.
+# 1. The task assessment is not persisted, so replay runs without the
+#    production contract until `task_assessments` is scripted.
+# 2. `mock_responses` is rebuilt from the responses the daemon SHIPPED, not
+#    the raw model output: replies bounced by gates and calls blocked by guards
+#    are missing, and daemon-synthesized replies appear as model text.
+#    Check the script against the trace (db_probe --task <id>).
+# Run the fixture until it passes, then move it into tests/harness_eval/fixtures/.
+";
+
+/// Build a draft fixture from one task's canonical trace.
+///
+/// `events` must be in append (`id`) order and may span the whole session;
+/// only the selected task's events feed the script and expectations. The task
+/// is `task_id` when given, else the last task that recorded a harness-eval
+/// snapshot. The execution-model script is rebuilt from `AssistantResponse`
+/// events, which are the post-gate projection of the run: they only equal
+/// the model's raw script when no gate bounced, blocked, or synthesized a
+/// reply. `LlmCall` events do not carry the response, so nothing better is
+/// available from the trace today. Expectations are structural and receipt-backed, and score minimums
+/// are floored so a replay of the same behavior cannot fail on rounding.
+pub fn record_fixture_from_events(
     session_id: &str,
-    user_text: &str,
-    eval: &HarnessEvalSnapshot,
-    task_end: &TaskEndData,
-    tool_names: &[String],
-) -> HarnessEvalFixture {
-    HarnessEvalFixture {
-        name: name.to_string(),
-        description: "Recorded from production run (structural expect only)".to_string(),
+    events: &[Event],
+    task_id: Option<&str>,
+) -> anyhow::Result<HarnessEvalFixture> {
+    let (end_index, task_end) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, event)| event.event_type == EventType::TaskEnd)
+        .filter(|(_, event)| task_id.is_none_or(|id| event.task_id.as_deref() == Some(id)))
+        .find_map(|(index, event)| {
+            let end = event.parse_data::<TaskEndData>().ok()?;
+            end.harness_eval.is_some().then_some((index, end))
+        })
+        .context("no TaskEnd with a harness_eval snapshot for this session/task")?;
+    let eval = task_end
+        .harness_eval
+        .clone()
+        .context("TaskEnd missing harness_eval snapshot")?;
+    let task_id = task_end.task_id.as_str();
+    let in_task = |event: &&Event| event.task_id.as_deref() == Some(task_id);
+    let first_task_index = events
+        .iter()
+        .position(|event| in_task(&event))
+        .unwrap_or(end_index);
+
+    // The opening user message may be written before the task identity
+    // exists; fall back to the latest one preceding the task's first event.
+    let user_text = events
+        .iter()
+        .filter(in_task)
+        .chain(events[..first_task_index].iter().rev())
+        .find(|event| event.event_type == EventType::UserMessage)
+        .and_then(|event| event.parse_data::<crate::events::UserMessageData>().ok())
+        .map(|message| message.content)
+        .or_else(|| task_end.summary.clone())
+        .context("could not resolve the task's user message")?;
+
+    let mut mock_responses = Vec::new();
+    for event in events
+        .iter()
+        .filter(in_task)
+        .filter(|event| event.event_type == EventType::AssistantResponse)
+    {
+        let data = event
+            .parse_data::<crate::events::AssistantResponseData>()
+            .with_context(|| format!("parse AssistantResponse event {}", event.id))?;
+        let tool_calls = data.tool_calls.unwrap_or_default();
+        if tool_calls.is_empty() {
+            if let Some(text) = data.content.filter(|text| !text.trim().is_empty()) {
+                mock_responses.push(MockResponseSpec::Text { text });
+            }
+        }
+        // The mock serves one tool call per response, so a parallel batch
+        // becomes consecutive turns. Order is kept; batching is not.
+        for call in tool_calls {
+            mock_responses.push(MockResponseSpec::ToolCall {
+                tool_call: ToolCallSpec {
+                    name: call.name,
+                    arguments: call.arguments.to_string(),
+                },
+            });
+        }
+    }
+
+    let run = collect_run_result(
+        &events
+            .iter()
+            .filter(|event| in_task(event))
+            .cloned()
+            .collect::<Vec<_>>(),
+        "",
+    )?;
+    let mut tool_dispatch_counts = BTreeMap::new();
+    for name in &run.dispatched_tool_names {
+        *tool_dispatch_counts.entry(name.clone()).or_insert(0) += 1;
+    }
+
+    Ok(HarnessEvalFixture {
+        name: task_id.chars().take(32).collect(),
+        description: "Recorded from production run (draft; structural expect only)".to_string(),
         session_id: session_id.to_string(),
-        user_text: user_text.to_string(),
+        user_text,
         user_role: "owner".to_string(),
         orchestrator: false,
         routing_models: false,
-        mock_responses: Vec::new(),
+        mock_responses,
         task_assessments: Vec::new(),
         seed: FixtureSeed::default(),
         expect: ExpectBlock {
             orchestration_route: Some(eval.orchestration_route.clone()),
             tools_required_predicted: Some(eval.routing.tools_required_predicted),
-            tools_used: tool_names.to_vec(),
-            tools_not_used: Vec::new(),
-            tools_in_order: Vec::new(),
-            tool_call_counts: BTreeMap::new(),
+            tools_in_order: run.tool_names.clone(),
+            tool_dispatch_counts,
             outcome: Some(task_end.effective_outcome().as_str().to_string()),
             stop_reason: Some(eval.quality.stop_reason.clone()),
-            llm_calls_min: None,
-            llm_calls_max: Some(eval.cost.llm_calls),
-            tool_calls_min: None,
+            execution_llm_calls_max: Some(run.execution_llm_calls),
             tool_calls_max: Some(task_end.tool_calls_count),
-            weighted_tokens_max: Some(eval.cost.weighted_tokens),
+            forbids_mutation: Some(eval.quality.contract.forbids_mutation),
             forbidden_mutation_attempts_max: Some(
                 eval.quality.contract.forbidden_mutation_attempts,
             ),
             plan_steps_completed_min: eval.progress.plan_steps_completed,
-            routing_accuracy_min: Some(round_score(eval.scores.routing_accuracy)),
-            progress_yield_min: Some(round_score(eval.scores.progress_yield)),
-            contract_fulfillment_min: Some(round_score(eval.scores.contract_fulfillment)),
-            cost_efficiency_min: Some(round_score(eval.scores.cost_efficiency)),
-            overall_min: Some(round_score(eval.scores.overall)),
+            routing_accuracy_min: Some(floor_score(eval.scores.routing_accuracy)),
+            progress_yield_min: Some(floor_score(eval.scores.progress_yield)),
+            contract_fulfillment_min: Some(floor_score(eval.scores.contract_fulfillment)),
+            cost_efficiency_min: Some(floor_score(eval.scores.cost_efficiency)),
+            overall_min: Some(floor_score(eval.scores.overall)),
             direct_return: Some(eval.routing.direct_return_attempted),
             response_fallthrough: Some(eval.routing.response_fallthrough),
-            guard_fired: Vec::new(),
-            decision_types_seen: Vec::new(),
-            response_contains: Vec::new(),
+            ..ExpectBlock::default()
         },
-    }
+    })
 }
 
-fn round_score(value: f32) -> f32 {
-    (value * 100.0).round() / 100.0
+/// Round down to two decimals. Rounding to nearest could record a minimum
+/// above the observed score (0.845 -> 0.85) and fail the identical replay.
+fn floor_score(value: f32) -> f32 {
+    (value * 100.0).floor() / 100.0
 }
 
 #[cfg(test)]
@@ -633,6 +811,7 @@ mod tests {
     fn tool_call_counts_rejects_duplicate_side_effect() {
         let err = assert_tool_counts(
             "fx",
+            "tool_call_counts",
             &counts(&[("twitter_post", 1)]),
             &names(&["twitter_post", "twitter_post"]),
         )
@@ -647,6 +826,7 @@ mod tests {
     fn tool_call_counts_accepts_exact_match() {
         assert_tool_counts(
             "fx",
+            "tool_call_counts",
             &counts(&[("twitter_post", 1), ("read_file", 2)]),
             &names(&["read_file", "twitter_post", "read_file"]),
         )
@@ -657,6 +837,7 @@ mod tests {
     fn tool_call_counts_zero_requires_absence() {
         let err = assert_tool_counts(
             "fx",
+            "tool_call_counts",
             &counts(&[("twitter_post", 0)]),
             &names(&["twitter_post"]),
         )
@@ -671,6 +852,7 @@ mod tests {
     fn tool_call_counts_ignores_unlisted_tools() {
         assert_tool_counts(
             "fx",
+            "tool_call_counts",
             &counts(&[("read_file", 1)]),
             &names(&["read_file", "system_info"]),
         )
@@ -697,6 +879,35 @@ expect:
             fixture.expect.tool_call_counts.get("twitter_post"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn parse_fixture_yaml_rejects_misspelled_expectation() {
+        let yaml = r#"
+name: typo
+session_id: s1
+user_text: Hello
+expect:
+  tool_calls_mx: 0
+"#;
+        let err = parse_fixture_yaml(yaml).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tool_calls_mx"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_fixture_yaml_rejects_unknown_top_level_key() {
+        let yaml = r#"
+name: typo
+session_id: s1
+user_text: Hello
+mock_response:
+  - text: Hi
+expect: {}
+"#;
+        assert!(parse_fixture_yaml(yaml).is_err());
     }
 
     #[test]

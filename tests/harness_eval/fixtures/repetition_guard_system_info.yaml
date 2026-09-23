@@ -30,6 +30,7 @@ mock_responses:
   - tool_call:
       name: system_info
       arguments: "{}"
+  - text: "The repeated checks returned the same system information; further identical calls were blocked."
 expect:
   guard_fired:
     - RepetitiveCallDetection

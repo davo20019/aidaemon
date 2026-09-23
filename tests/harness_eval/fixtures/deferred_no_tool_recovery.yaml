@@ -9,9 +9,16 @@ description: Deferred and false-in-progress texts are bounced until execution oc
 # retrying until substantive content arrives.
 # The finalized execution requirement now remains authoritative through
 # recovery, so the scripted observation call executes before completion.
+# (2026-09-22) That requirement comes from the task assessment. Without a
+# scripted one the mock returns an empty assessment, the run has no contract,
+# and the first promise shipped as Succeeded after one execution call, while
+# `llm_calls_min: 3` still passed on the two auxiliary assessment calls. The
+# assessment is scripted now, and the bounds count execution turns only.
 session_id: eval_deferred_01
 user_text: Find all Rust files that contain async fn and give me the top 3 files.
 routing_models: true
+task_assessments:
+  - text: '{"schema_version":9,"goal":"Find Rust files containing async fn and report the top 3","steps":[],"success_criteria":[],"contract":{"confidence":"high","task_kind":"check","expects_mutation":false,"requires_observation":true,"required_effects":[],"mutation_scope":"read_only","forbidden_actions":[],"constraint_evidence":[],"tool_scope":"allowed","tool_constraint_evidence":[],"required_response_fields":[],"minimum_sources":0,"requires_primary_sources":false,"requires_exact_history":false,"evidence_requirements":[{"summary":"Search local Rust files for async fn","acceptable_scopes":["host_local"],"purpose":"content","minimum_authority":"direct","temporal_scope":"current"}],"required_invocations":[],"filesystem_access":{"execution_cwd":null,"read_paths":[],"write_paths":[]},"project_reference":null},"task_shape":{"execution_mode":"inline","confidence":"high","independent_workstreams":1,"requires_background_continuation":false,"request_relationship":"new_request","semantic_scope":"host_local"}}'
 mock_responses:
   - text: I'll search for all Rust files with async fn first.
   - text: I'm going to run the search now.
@@ -20,5 +27,11 @@ mock_responses:
       arguments: "{}"
   - text: Found the files and compiled the async summary.
 expect:
-  llm_calls_min: 3
+  # Both promissory texts are bounced, then the observation runs.
+  execution_llm_calls_min: 4
+  execution_llm_calls_max: 4
+  tool_dispatch_counts:
+    system_info: 1
+  response_contains:
+    - Found the files
   outcome: succeeded

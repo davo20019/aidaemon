@@ -51,6 +51,8 @@ pub struct MockProvider {
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
+    strict_responses: bool,
+    exhausted_response_calls: Mutex<u32>,
     /// When true (default), assessment/re-planner LLM calls are silently
     /// intercepted with an empty response (causing generate_task_plan()
     /// to return None). Preserves existing test behavior — no plan
@@ -68,6 +70,8 @@ impl MockProvider {
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            strict_responses: false,
+            exhausted_response_calls: Mutex::new(0),
             skip_planning_calls: true,
         }
     }
@@ -81,6 +85,8 @@ impl MockProvider {
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            strict_responses: false,
+            exhausted_response_calls: Mutex::new(0),
             skip_planning_calls: true,
         }
     }
@@ -97,8 +103,42 @@ impl MockProvider {
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            strict_responses: false,
+            exhausted_response_calls: Mutex::new(0),
             skip_planning_calls: true,
         }
+    }
+
+    /// Reject unexpected execution-model calls instead of inventing a reply.
+    /// Assessment lanes remain independently scripted via with_task_assessments.
+    pub fn with_strict_responses(mut self) -> Self {
+        self.strict_responses = true;
+        self
+    }
+
+    /// Check after a run as provider errors may be recovered by the agent loop.
+    pub async fn assert_response_script_not_exhausted(&self) -> anyhow::Result<()> {
+        let unexpected = *self.exhausted_response_calls.lock().await;
+        anyhow::ensure!(
+            unexpected == 0,
+            "mock response script exhausted: {unexpected} unexpected execution-model call(s)"
+        );
+        Ok(())
+    }
+
+    /// Fail when scripted replies were never requested. A run that stops
+    /// early (e.g. a new terminal gate) otherwise passes against a longer
+    /// script, hiding the regression.
+    pub async fn assert_response_script_consumed(&self) -> anyhow::Result<()> {
+        let responses = self.responses.lock().await.len();
+        let assessments = self.task_assessment_responses.lock().await.len();
+        let relationships = self.relationship_assessment_responses.lock().await.len();
+        anyhow::ensure!(
+            responses == 0 && assessments == 0 && relationships == 0,
+            "mock script not fully consumed: {responses} execution, {assessments} task-assessment, \
+             {relationships} relationship response(s) left unused"
+        );
+        Ok(())
     }
 
     /// Simulate a provider/model that rejects advanced per-call options.
@@ -386,6 +426,11 @@ impl ModelProvider for MockProvider {
         // Return next scripted response, or a default
         let mut responses = self.responses.lock().await;
         if responses.is_empty() {
+            if self.strict_responses {
+                let mut unexpected = self.exhausted_response_calls.lock().await;
+                *unexpected = unexpected.saturating_add(1);
+                anyhow::bail!("mock response script exhausted");
+            }
             Ok(MockProvider::text_response("Mock response"))
         } else {
             Ok(responses.remove(0))

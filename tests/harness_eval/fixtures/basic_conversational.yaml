@@ -2,6 +2,8 @@ name: basic_conversational
 description: Simple conversational turn completes with harness eval snapshot
 session_id: eval_basic_01
 user_text: Hello there
+mock_responses:
+  - text: Hello there.
 expect:
   outcome: succeeded
   llm_calls_min: 1

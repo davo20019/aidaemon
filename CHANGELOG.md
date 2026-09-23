@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-09-22
+
+### Changed
+
+- **Harness eval fixtures fail loudly instead of passing vacuously.** Fixture YAML rejects unknown keys (a typo such as `tool_calls_mx` previously meant "no assertion"), an unknown `user_role` is an error rather than a silent run as Owner, and trace events that fail to parse are errors rather than skipped. The mock execution script is strict in both directions: a run that asks for more replies than scripted fails, and so does a run that stops before consuming its script. `decision_types_seen` matches exactly.
+- **Harness eval separates proposals, dispatches, and execution turns.** `tool_dispatch_counts` counts only result receipts whose invocation stage is `dispatched`, so duplicate calls suppressed by the idempotency gate no longer count as side effects (`tool_call_counts` keeps counting model proposals). `execution_llm_calls_min/max` bound main-loop calls only; `llm_calls_*` also counts auxiliary task-assessment calls, which is how `deferred_no_tool_recovery` kept passing after it silently fell onto a contract-less path and shipped its first promissory reply as a success. That fixture now scripts its task assessment and pins the bounced-promise behaviour; results are collected from the terminal task's full trace rather than a recent-event window.
+- **`db_probe --record-fixture` writes task-scoped drafts outside the suite.** Recording is a shared, tested `record_fixture_from_events`: it scopes tool calls, user text, and the rebuilt execution script to one task in append order, derives receipt-backed dispatch counts, and floors score minimums so a replay of the same run cannot fail on rounding. Drafts go to `tests/harness_eval/recorded/` (not auto-loaded) with a header noting that the task assessment is not persisted and that `AssistantResponse` events are the post-gate projection, so bounced or synthesized replies must be checked against the trace before promotion. The probe reads events with a plain SELECT and never runs migrations against a live database.
+
 ## [0.12.5] - 2026-09-02
 
 ### Fixed

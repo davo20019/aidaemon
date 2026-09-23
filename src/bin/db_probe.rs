@@ -1054,93 +1054,65 @@ async fn record_fixture_from_session(
     output: Option<&str>,
     include_text: bool,
 ) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::fixture::{build_recorded_fixture, fixtures_dir};
-    use aidaemon::{EventType, TaskEndData, ToolCallData, UserMessageData};
-
-    let rows = if let Some(task_id) = task_id {
-        sqlx::query(
-            r#"
-            SELECT event_type, task_id, tool_name, data, created_at
-            FROM events
-            WHERE session_id = ? AND task_id = ?
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(session_id)
-        .bind(task_id)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT event_type, task_id, tool_name, data, created_at
-            FROM events
-            WHERE session_id = ?
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(session_id)
-        .fetch_all(pool)
-        .await?
+    use aidaemon::harness_eval::fixture::{
+        record_fixture_from_events, recorded_fixtures_dir, RECORDED_FIXTURE_HEADER,
     };
 
-    let mut task_end: Option<TaskEndData> = None;
-    let mut resolved_task_id = task_id.map(str::to_string);
-    let mut user_text = String::new();
-    let mut tool_names = Vec::new();
-
-    for row in &rows {
+    // Plain SELECT (no EventStore::new, which would run migrations against a
+    // live database). Append order, not wall time: `created_at` can tie or
+    // go backwards across writers.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, session_id, event_type, data, created_at, task_id, tool_name, turn_id
+        FROM events
+        WHERE session_id = ?
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
         let event_type: String = row.get("event_type");
-        let data_json: String = row.get("data");
-        if event_type == EventType::TaskEnd.as_str() {
-            if let Ok(end) = serde_json::from_str::<TaskEndData>(&data_json) {
-                if end.harness_eval.is_some() {
-                    resolved_task_id = Some(end.task_id.clone());
-                    task_end = Some(end);
-                }
-            }
-        } else if event_type == EventType::UserMessage.as_str() && user_text.is_empty() {
-            if let Ok(msg) = serde_json::from_str::<UserMessageData>(&data_json) {
-                user_text = msg.content;
-            }
-        } else if event_type == EventType::ToolCall.as_str() {
-            if let Ok(data) = serde_json::from_str::<ToolCallData>(&data_json) {
-                tool_names.push(data.name);
-            }
-        }
+        let Some(event_type) = aidaemon::EventType::from_str(&event_type) else {
+            continue;
+        };
+        let created_at: String = row.get("created_at");
+        events.push(aidaemon::Event {
+            id: row.get("id"),
+            session_id: row.get("session_id"),
+            event_type,
+            data: serde_json::from_str(&row.get::<String, _>("data"))?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            consolidated_at: None,
+            task_id: row.get("task_id"),
+            tool_name: row.get("tool_name"),
+            turn_id: row.get("turn_id"),
+        });
     }
 
-    let task_end = task_end.context("no TaskEnd with harness_eval found for session/task")?;
-    let eval = task_end
-        .harness_eval
-        .as_ref()
-        .context("TaskEnd missing harness_eval")?;
-    let task_id = resolved_task_id.context("could not resolve task_id")?;
-    if user_text.is_empty() {
-        user_text = task_end
-            .summary
-            .clone()
-            .unwrap_or_else(|| "(unknown user text)".to_string());
-    }
-
-    let name = task_id.chars().take(32).collect::<String>();
-    let mut fixture =
-        build_recorded_fixture(&name, session_id, &user_text, eval, &task_end, &tool_names);
+    let mut fixture = record_fixture_from_events(session_id, &events, task_id)?;
     if include_text {
-        if let Some(summary) = task_end.summary.as_ref() {
-            fixture.expect.response_contains = vec![summary.chars().take(40).collect()];
+        if let Some(aidaemon::harness_eval::MockResponseSpec::Text { text }) =
+            fixture.mock_responses.last()
+        {
+            fixture.expect.response_contains = vec![text.chars().take(40).collect()];
         }
     }
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| fixtures_dir().join(format!("{name}.yaml")));
+        .unwrap_or_else(|| recorded_fixtures_dir().join(format!("{}.yaml", fixture.name)));
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let yaml = serde_yaml::to_string(&fixture)?;
-    std::fs::write(&output_path, yaml)?;
-    println!("Recorded fixture -> {}", output_path.display());
+    std::fs::write(&output_path, format!("{RECORDED_FIXTURE_HEADER}{yaml}"))?;
+    println!("Recorded draft fixture -> {}", output_path.display());
+    println!("Script its task_assessments before moving it into the suite.");
     Ok(())
 }
 

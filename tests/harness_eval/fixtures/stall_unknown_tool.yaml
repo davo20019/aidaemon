@@ -2,6 +2,9 @@ name: stall_unknown_tool
 description: Repeated unknown tool calls stop before scripted final text
 session_id: eval_stall_01
 user_text: Use the unavailable stall tool
+# The script is exactly what the budget guard admits: strict mode fails the
+# fixture if the loop asks for a sixth reply, and the consumption check fails
+# it if the loop stops earlier.
 mock_responses:
   - tool_call:
       name: unknown_stall_tool
@@ -18,13 +21,6 @@ mock_responses:
   - tool_call:
       name: unknown_stall_tool
       arguments: "{}"
-  - tool_call:
-      name: unknown_stall_tool
-      arguments: "{}"
-  - tool_call:
-      name: unknown_stall_tool
-      arguments: "{}"
-  - text: This should not be reached.
 expect:
   outcome: failed
   stop_reason: error

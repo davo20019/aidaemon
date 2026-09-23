@@ -3,6 +3,8 @@ description: Explicit no-write request observes current state and never reaches 
 session_id: eval_read_only_contract_01
 user_text: What operating system is this running? Read only; don't modify.
 orchestrator: true
+task_assessments:
+  - text: '{"schema_version":9,"goal":"Inspect operating system without modification","steps":[],"success_criteria":[],"contract":{"confidence":"high","task_kind":"check","expects_mutation":false,"requires_observation":true,"required_effects":[],"mutation_scope":"read_only","forbidden_actions":[],"constraint_evidence":[],"tool_scope":"allowed","tool_constraint_evidence":[],"required_response_fields":[],"minimum_sources":0,"requires_primary_sources":false,"requires_exact_history":false,"evidence_requirements":[{"summary":"Inspect current operating system","acceptable_scopes":["host_local"],"purpose":"current_state","minimum_authority":"direct","temporal_scope":"current"}],"required_invocations":[],"filesystem_access":{"execution_cwd":null,"read_paths":[],"write_paths":[]},"project_reference":null},"task_shape":{"execution_mode":"inline","confidence":"high","independent_workstreams":1,"requires_background_continuation":false,"request_relationship":"new_request","semantic_scope":"host_local"}}'
 mock_responses:
   - tool_call:
       name: system_info
@@ -10,6 +12,7 @@ mock_responses:
   - text: The current operating system details are in the observed system information. I did not modify anything.
 expect:
   tools_required_predicted: false
+  forbids_mutation: true
   tools_in_order:
     - system_info
   tools_not_used:
