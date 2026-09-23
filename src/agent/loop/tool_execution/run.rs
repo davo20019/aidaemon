@@ -2219,8 +2219,15 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
                 MandateGateDecision::Deny { reason } => {
                     *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                    let next_step = if reason == "mandate_role_forbidden" {
+                        // Only the executor role hits this: it may perform the
+                        // committed mutation or report a blocker, nothing else.
+                        "Executors cannot observe or orchestrate; the task lead already gathered the evidence. Perform the one committed mutation from your assigned work now, or call report_blocker only if the assigned work itself is invalid."
+                    } else {
+                        "Record a current ACT, choose a permitted action, WAIT, or ASK the owner."
+                    };
                     let result_text = format!(
-                        "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). Record a current ACT, choose a permitted action, WAIT, or ASK the owner.",
+                        "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). {next_step}",
                         tc.name
                     );
                     // This branch exits before the common activity logger. Keep

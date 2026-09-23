@@ -398,6 +398,8 @@ pub struct MandateObjectiveControl {
 
 impl MandateObjectiveControl {
     pub const SCHEMA_VERSION: u16 = 1;
+    /// Smallest meaningful effect: one thousandth of a unit.
+    pub const MIN_EFFECT_MICROS: i64 = 1_000;
 
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != Self::SCHEMA_VERSION
@@ -416,6 +418,19 @@ impl MandateObjectiveControl {
                 "objective control target must advance from baseline in its declared direction and minimum_effect_micros must be positive"
                     .to_string(),
             );
+        }
+        // `*_micros` are millionths of one unit. A sub-milli-unit effect or a
+        // target closer to baseline than the minimum effect is a unit slip
+        // ("1 engagement" written as 1 micro), and it makes any single
+        // observation satisfy the objective and terminate the mandate.
+        if self.minimum_effect_micros < Self::MIN_EFFECT_MICROS
+            || self.target_micros.abs_diff(self.baseline_micros)
+                < self.minimum_effect_micros.unsigned_abs()
+        {
+            return Err(format!(
+                "objective control values are micro-units (1 unit = 1000000): minimum_effect_micros must be at least {} and the target must differ from baseline by at least minimum_effect_micros",
+                Self::MIN_EFFECT_MICROS
+            ));
         }
         let source_valid = reqwest::Url::parse(&self.measurement_source)
             .ok()
@@ -2337,6 +2352,34 @@ pub struct MandateRunNotification {
     pub kind: MandateRunNotificationKind,
     pub counts: MandateRunProofCounts,
     pub created_at: String,
+    /// The deliberator's ASK question, shown to the owner so they can
+    /// answer from chat. Rendered through [`owner_question_excerpt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_question: Option<String>,
+}
+
+/// Bounded, single-line rendering of a model-generated owner question. The
+/// question is derived from untrusted observations, so it is flattened,
+/// stripped of control characters, capped, and always presented quoted and
+/// attributed rather than as the assistant's own words.
+pub fn owner_question_excerpt(question: &str) -> Option<String> {
+    const MAX_CHARS: usize = 500;
+    let flattened = question
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    if flattened.is_empty() {
+        return None;
+    }
+    let mut excerpt = flattened.chars().take(MAX_CHARS).collect::<String>();
+    if flattened.chars().count() > MAX_CHARS {
+        excerpt.push('…');
+    }
+    Some(excerpt)
 }
 
 impl MandateRunNotification {
@@ -2360,7 +2403,13 @@ impl MandateRunNotification {
             kind,
             counts,
             created_at: created_at.to_string(),
+            owner_question: None,
         }
+    }
+
+    pub fn with_owner_question(mut self, question: Option<&str>) -> Self {
+        self.owner_question = question.and_then(owner_question_excerpt);
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -2407,10 +2456,16 @@ impl MandateRunNotification {
                 self.counts.succeeded_mutations,
                 self.counts.mutation_reservations,
             ),
-            MandateRunNotificationKind::Ask => format!(
-                "Mandate {mandate_ref} is awaiting owner input after review {run_ref} under policy version {}. Its generated question is stored as untrusted mandate-local data and is intentionally not copied into assistant history. {inspect}",
-                self.mandate_version,
-            ),
+            MandateRunNotificationKind::Ask => match self.owner_question.as_deref() {
+                Some(question) => format!(
+                    "Mandate {mandate_ref} is waiting for your answer after review {run_ref} (policy version {}). The mandate reviewer asked (generated text, verify before acting): \"{question}\" Reply with your answer; an answer is guidance only and never widens authority. If you do not answer, the mandate resumes within its current authority at its next review. {inspect}",
+                    self.mandate_version,
+                ),
+                None => format!(
+                    "Mandate {mandate_ref} is awaiting owner input after review {run_ref} under policy version {}. If you do not answer, the mandate resumes within its current authority at its next review. {inspect}",
+                    self.mandate_version,
+                ),
+            },
             MandateRunNotificationKind::Stopped => format!(
                 "Mandate {mandate_ref} stopped after review {run_ref} under policy version {}. Its generated rationale remains untrusted mandate-local data and is intentionally not copied into assistant history. {inspect}",
                 self.mandate_version,
@@ -2952,6 +3007,17 @@ mod tests {
 
         control.target_micros = control.baseline_micros;
         assert!(control.validate().is_err());
+        // "Reach 1 engagement" written as one micro-unit: a single signal
+        // would satisfy the objective and end the mandate.
+        let mut unit_slip = control.clone();
+        unit_slip.baseline_micros = 0;
+        unit_slip.target_micros = 1;
+        unit_slip.minimum_effect_micros = 1;
+        assert!(unit_slip.validate().is_err());
+        // A target inside the minimum effect is not a reachable improvement.
+        let mut too_close = control.clone();
+        too_close.target_micros = too_close.baseline_micros + 400_000;
+        assert!(too_close.validate().is_err());
         control.target_micros = 8_000_000;
         control.experiment_window_secs = control.measurement_cadence_secs - 1;
         assert!(control.validate().is_err());

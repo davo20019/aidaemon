@@ -257,7 +257,7 @@ pub(crate) fn goal_completion_summary_indicates_not_finished(summary: &str) -> b
     .any(|phrase| lower.contains(phrase))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ManageGoalTasksArgs {
     action: String,
     #[serde(default)]
@@ -550,17 +550,24 @@ impl ManageGoalTasksTool {
                     "mandate task creation policy binding is stale"
                 );
             }
-            anyhow::ensure!(
-                args.workspace_policy.is_none(),
-                "workspace_policy is unavailable for mandate tasks"
-            );
-            anyhow::ensure!(
-                args.worker_profile.is_none(),
-                "worker_profile assignment is unavailable for mandate tasks"
-            );
             Some((mandate_id, mandate_version, goal_run_id, task_attempt_id))
         } else {
             None
+        };
+        // Mandate work placement is runtime-owned: the fenced dispatcher picks
+        // the worker and workspace. The schema still offers these hints, so a
+        // task lead that fills them in must not have its committed ACT
+        // rejected; the hints are dropped instead of honored.
+        let without_hints;
+        let args = if mandate_fence.is_some() {
+            without_hints = ManageGoalTasksArgs {
+                workspace_policy: None,
+                worker_profile: None,
+                ..args.clone()
+            };
+            &without_hints
+        } else {
+            args
         };
 
         let description = args
@@ -965,10 +972,8 @@ impl ManageGoalTasksTool {
                 self.goal_run_id.as_deref() == Some(goal_run_id),
                 "mandate task claim run does not match the task-lead binding"
             );
-            anyhow::ensure!(
-                args.worker_profile.is_none(),
-                "worker_profile assignment is unavailable for mandate tasks"
-            );
+            // worker_profile is a runtime-owned placement hint here; the
+            // claim below never binds one, so a supplied value is ignored.
             return match self
                 .state
                 .claim_mandate_task_from_attempt(
@@ -2989,5 +2994,107 @@ mod tests {
         for entry in entries.iter().skip(5) {
             assert!(entry.is_object(), "Recent entries should remain as objects");
         }
+    }
+
+    #[tokio::test]
+    async fn mandate_create_task_ignores_runtime_owned_placement_hints() {
+        use crate::traits::{
+            Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
+        };
+        let (state, _) = setup_test_state().await;
+        let goal = Goal::new_continuous("Synthetic mandate", "owner-session", None, None);
+        let authority = MandateAuthority {
+            allow_observations: true,
+            allowed_tools: vec!["http_request".to_string()],
+            allowed_mutation_effects: vec!["remote_mutation".to_string()],
+            allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
+            operation_scopes: Vec::new(),
+            max_mutating_actions_per_cycle: 1,
+            max_mutating_actions_per_rolling_24h: 8,
+            min_seconds_between_mutations: 900,
+        };
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Publish one synthetic post",
+            "owner-session",
+            authority,
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .claim_due_mandates(1, "test-heartbeat", 300)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let root = test_task(
+            &goal.id,
+            &uuid::Uuid::new_v4().to_string(),
+            "Run one bounded mandate cycle",
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        let run = state
+            .start_goal_run(&goal.id, "mandate", None, Some(&root.id))
+            .await
+            .unwrap();
+        state.create_task(&root).await.unwrap();
+        let root_attempt = state
+            .claim_task_with_lease(&root.id, "task-lead", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("mandate root should be claimable");
+        let decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "Publish the synthetic post",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &decision.id,
+            &run.id,
+            "Publish one synthetic post",
+            "It keeps the requested cadence",
+        );
+        state
+            .record_mandate_decision(&decision, Some(&intention), None)
+            .await
+            .unwrap();
+
+        let tool = ManageGoalTasksTool::new(goal.id.clone(), state.clone())
+            .with_goal_run_id(Some(run.id.clone()));
+        // The schema offers placement hints; a mandate task lead that fills
+        // them in must still be able to create its committed work task.
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_task",
+                    "description": "Publish exactly one synthetic post",
+                    "worker_profile": "executor",
+                    "workspace_policy": "isolated",
+                    "_mandate_id": mandate.id,
+                    "_mandate_version": mandate.version,
+                    "_goal_run_id": run.id,
+                    "_task_attempt_id": root_attempt.id,
+                })
+                .to_string(),
+            )
+            .await
+            .expect("placement hints must not block a committed ACT");
+        assert!(!result.contains("Cannot create task"), "{result}");
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert!(tasks
+            .iter()
+            .any(|task| task.description == "Publish exactly one synthetic post"));
     }
 }

@@ -1071,6 +1071,19 @@ pub trait MandateStore: Send + Sync {
         Ok(false)
     }
 
+    /// Record a late owner answer on an active mandate by replacing its
+    /// controller context, fenced on the mandate still being active at the
+    /// expected version for this owner. Authority is never touched.
+    async fn record_active_mandate_owner_guidance(
+        &self,
+        _mandate_id: &str,
+        _expected_version: i64,
+        _owner_session: &str,
+        _controller_context: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Atomically create one mandate review run and its root task under the
     /// caller's current review lease. A failed root insert must
     /// leave no open run behind.

@@ -654,6 +654,59 @@ pub(crate) fn mandate_accepts_wake_signal(mandate: &Mandate, signal: &MandateWak
     })
 }
 
+/// A controlled mandate must be able to read its own metric. An HTTPS
+/// `measurement_source` (including any query it needs, such as a field
+/// selector) has to be an exact GET observation the confirmed authority
+/// already allows; otherwise every review records an unreadable measurement
+/// and the control loop can never close. `metric_source:` identities are
+/// opaque resource names and are checked by the adapter that reads them.
+pub(crate) fn validate_objective_measurement_source(mandate: &Mandate) -> Result<(), String> {
+    match mandate.objective_control.as_ref() {
+        Some(control) => measurement_source_is_authorized(&mandate.authority, control),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn measurement_source_is_authorized(
+    authority: &crate::traits::MandateAuthority,
+    control: &crate::traits::MandateObjectiveControl,
+) -> Result<(), String> {
+    if control.measurement_source.starts_with("metric_source:") {
+        return Ok(());
+    }
+    let target = CanonicalTarget {
+        kind: "url",
+        value: control.measurement_source.clone(),
+    };
+    let authorized = authority.allow_observations
+        && if authority.operation_scopes.is_empty() {
+            authority
+                .allowed_target_prefixes
+                .iter()
+                .any(|prefix| url_is_within_scope(&target.value, prefix))
+        } else {
+            authority.operation_scopes.iter().any(|scope| {
+                scope.kind == MandateOperationKind::Observation
+                    && scope.operation == crate::traits::ToolCallOperation::Get
+                    && scope.target_prefixes.iter().any(|prefix| {
+                        target_is_within_operation_scope(
+                            &target,
+                            prefix,
+                            &scope.allowed_query_params,
+                        )
+                    })
+            })
+        };
+    if authorized {
+        Ok(())
+    } else {
+        Err(format!(
+            "objective control measurement_source {} is not an authorized GET observation; add an observation scope that covers this exact URL and its query parameters, or measure from a URL the mandate may already read",
+            control.measurement_source
+        ))
+    }
+}
+
 /// Derive the content-safe audit fields persisted with a mutation reservation.
 /// This runs only after the exact semantics passed authority evaluation. URL
 /// query strings and unrecognized resource identifiers are never persisted.
@@ -2382,5 +2435,63 @@ mod tests {
             MandateAuthorityDenial::OperationNotAllowed.as_str(),
             "operation_not_allowed"
         );
+    }
+
+    #[test]
+    fn measurement_source_must_be_an_authorized_get_observation() {
+        let observation = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec![
+                "https://api.x.com/2/users/12345/tweets".to_string(),
+                "auth_profile:twitter".to_string(),
+                "account:12345".to_string(),
+            ],
+            allowed_query_params: Vec::new(),
+            mutation_effects: Vec::new(),
+        };
+        let mut mandate = mandate();
+        mandate.authority =
+            MandateAuthority::from_operation_scopes(true, vec![observation.clone()], 1, 1, 900);
+        let mut control = crate::traits::MandateObjectiveControl {
+            schema_version: crate::traits::MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "weekly engagements".to_string(),
+            unit: "engagements".to_string(),
+            baseline_micros: 0,
+            target_micros: 50_000_000,
+            direction: crate::traits::ObjectiveMetricDirection::AtLeast,
+            measurement_source: "https://api.x.com/2/users/12345/tweets".to_string(),
+            measurement_cadence_secs: 86_400,
+            experiment_cohort: "synthetic-cohort".to_string(),
+            experiment_window_secs: 604_800,
+            minimum_effect_micros: 1_000_000,
+            max_stagnant_measurements: 3,
+            run_failure_budget: 3,
+            baseline_observed_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        mandate.objective_control = Some(control.clone());
+        assert_eq!(validate_objective_measurement_source(&mandate), Ok(()));
+
+        // The metric needs a field selector the scope does not allow: the
+        // loop could never read it, so confirmation must fail closed.
+        control.measurement_source =
+            "https://api.x.com/2/users/12345/tweets?tweet.fields=public_metrics".to_string();
+        mandate.objective_control = Some(control.clone());
+        assert!(validate_objective_measurement_source(&mandate).is_err());
+
+        let mut with_fields = observation.clone();
+        with_fields.allowed_query_params = vec!["tweet.fields".to_string()];
+        mandate.authority =
+            MandateAuthority::from_operation_scopes(true, vec![with_fields], 1, 1, 900);
+        assert_eq!(validate_objective_measurement_source(&mandate), Ok(()));
+
+        control.measurement_source = "https://analytics.example.com/api".to_string();
+        mandate.objective_control = Some(control.clone());
+        assert!(validate_objective_measurement_source(&mandate).is_err());
+
+        control.measurement_source = "metric_source:synthetic-analytics".to_string();
+        mandate.objective_control = Some(control);
+        assert_eq!(validate_objective_measurement_source(&mandate), Ok(()));
     }
 }

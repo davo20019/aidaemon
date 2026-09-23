@@ -492,10 +492,12 @@ impl ManageMandatesTool {
         if autonomy_mode.is_autopilot() && args.objective_control.is_none() {
             missing.push("objective_control");
         }
-        let control_validation = args
-            .objective_control
-            .as_ref()
-            .and_then(|control| control.validate().err());
+        let control_validation = args.objective_control.as_ref().and_then(|control| {
+            control.validate().err().or_else(|| {
+                crate::mandates::authority::measurement_source_is_authorized(&authority, control)
+                    .err()
+            })
+        });
         let validation_error = authority.validate().err();
         let ready_to_confirm =
             missing.is_empty() && validation_error.is_none() && control_validation.is_none();
@@ -1283,6 +1285,38 @@ impl ManageMandatesTool {
             })
             .transpose()?;
 
+        // An unanswered ASK resumes on its own at its reconsider time. A late
+        // answer still lands as bounded owner guidance on the active mandate.
+        if action == "answer_question" && mandate.status == MandateStatus::Active {
+            let context = resumed_context
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("guidance is required for answer_question"))?;
+            let asked = self
+                .state
+                .list_mandate_decisions(&mandate.id, 50)
+                .await?
+                .iter()
+                .any(|decision| decision.outcome == MandateDecisionOutcome::Ask);
+            anyhow::ensure!(
+                asked,
+                "this mandate has no open question; use update to change its policy"
+            );
+            anyhow::ensure!(
+                self.state
+                    .record_active_mandate_owner_guidance(
+                        &mandate.id,
+                        mandate.version,
+                        owner,
+                        context,
+                    )
+                    .await?,
+                "mandate changed before the answer could be recorded"
+            );
+            return Ok(format!(
+                "Mandate {} recorded your late answer as bounded owner guidance for its next review. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change.",
+                mandate.id
+            ));
+        }
         if action == "answer_question"
             || action == "resolve_reconciliation"
             || (action == "resume" && mandate.status == MandateStatus::AwaitingInput)
@@ -2330,7 +2364,7 @@ const PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
 const REVIEW_EFFORTS: &[&str] = &["efficient", "balanced", "thorough"];
 const GET_SECTIONS: &[&str] = &["summary", "policy", "history"];
 const OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION: &str =
-    "Autopilot control loop; integers use the declared micro-unit.";
+    "Autopilot control loop. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.";
 const FIXED_DEADLINE_DESCRIPTION: &str =
     "RFC3339 fixed deadline. Supported by both create and update.";
 const STOP_ONLY_DESCRIPTION: &str = "STOP only; omit for ACT, WAIT, and ASK.";
@@ -2414,7 +2448,7 @@ impl Tool for ManageMandatesTool {
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
                     "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
                     "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "question": bounded_text(MAX_QUESTION_TEXT),
-                    "measurement_value_micros": { "type": "integer" }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
+                    "measurement_value_micros": { "type": "integer", "description": "Millionths of one unit (25 engagements = 25000000)." }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
                     "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
                     "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
                     "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "strategy_key": bounded_text(64),
@@ -4787,6 +4821,30 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Prefer thoughtful replies"));
+
+        // An unanswered ASK resumes on its own, so an answer can arrive while
+        // the mandate is already active. It still lands as bounded guidance.
+        let late = tool
+            .call(&format!(
+                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Keep posts under two sentences.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await
+            .unwrap();
+        assert!(late.contains("late answer"), "{late}");
+        assert!(late.contains("Immutable authority is unchanged"));
+        let after_late = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(after_late.status, MandateStatus::Active);
+        assert_eq!(after_late.authority, mandate.authority);
+        let context = state
+            .get_goal(&goal.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context
+            .unwrap();
+        assert!(context.contains("Prefer thoughtful replies"));
+        assert!(context.contains("Keep posts under two sentences"));
     }
 
     #[tokio::test]

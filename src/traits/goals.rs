@@ -782,6 +782,7 @@ impl NotificationEntry {
             | "token_alert"
             | "mandate_action"
             | "mandate_ask"
+            | "mandate_ask_timeout"
             | "mandate_stopped"
             | "mandate_review_failed"
             | "mandate_reconciliation"

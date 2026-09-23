@@ -69,7 +69,9 @@ pub(crate) fn present_notification(notification_type: &str, message: &str) -> St
         "token_alert" => "⚠️ **Budget alert**",
         "evergreen_alert" => "⚠️ **Schedule needs attention**",
         "mandate_paused" | "mandate_stopped" => "⏸️ **Automation paused**",
-        "mandate_review_failed" | "mandate_reconciliation" => "⚠️ **Automation update**",
+        "mandate_review_failed" | "mandate_reconciliation" | "mandate_ask_timeout" => {
+            "⚠️ **Automation update**"
+        }
         "mandate_action" => "✅ **Automation update**",
         "node_monitor_alert" => "🚨 **Node alert**",
         "node_monitor_recovery" => "✅ **Node recovered**",

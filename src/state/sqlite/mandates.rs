@@ -270,6 +270,8 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
     mandate
         .validate_content_bounds()
         .map_err(anyhow::Error::msg)?;
+    crate::mandates::authority::validate_objective_measurement_source(mandate)
+        .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         !mandate.created_by_session.trim().is_empty(),
         "mandate owner session is required"
@@ -1022,6 +1024,7 @@ async fn mandate_run_proof_counts_on_connection(
 #[allow(clippy::too_many_arguments)]
 async fn retry_orphaned_mandate_review_without_dispatch(
     connection: &mut sqlx::SqliteConnection,
+    reason: MandateFinalizationRejectReason,
     mandate_id: &str,
     goal_id: &str,
     mandate_version: i64,
@@ -1032,7 +1035,20 @@ async fn retry_orphaned_mandate_review_without_dispatch(
     review_failures: i32,
     now: &str,
 ) -> anyhow::Result<()> {
-    let reason = MandateFinalizationRejectReason::DecisionMissing;
+    let (intention_from, intention_to) =
+        intention_transition(IntentionStatus::Committed, IntentionStatus::Suspended)?;
+    sqlx::query(
+        "UPDATE intentions
+         SET status = ?, completed_at = COALESCE(completed_at, ?), updated_at = ?
+         WHERE goal_run_id = ? AND status = ?",
+    )
+    .bind(intention_to)
+    .bind(now)
+    .bind(now)
+    .bind(goal_run_id)
+    .bind(intention_from)
+    .execute(&mut *connection)
+    .await?;
     sqlx::query(
         "UPDATE task_attempts
          SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
@@ -1127,9 +1143,9 @@ async fn reconcile_orphaned_mandate_runs(
                 g.dispatch_failures AS review_failures,
                 m.min_review_secs, m.max_review_secs,
                 gr.id AS goal_run_id, gr.root_task_id,
-                (SELECT COUNT(*) FROM mandate_decision_cycles dc
+                (SELECT dc.outcome FROM mandate_decision_cycles dc
                  WHERE dc.mandate_id = m.id AND dc.goal_run_id = gr.id)
-                    AS decision_count,
+                    AS decision_outcome,
                 (SELECT COUNT(*) FROM mandate_mutation_attempts ma
                  WHERE ma.mandate_id = m.id AND ma.goal_run_id = gr.id)
                     AS mutation_reservation_count,
@@ -1176,18 +1192,32 @@ async fn reconcile_orphaned_mandate_runs(
         let max_review_secs: i64 = row.get("max_review_secs");
         let goal_run_id: String = row.get("goal_run_id");
         let root_task_id: Option<String> = row.get("root_task_id");
-        let decision_count: i64 = row.get("decision_count");
+        let decision_outcome: Option<String> = row.get("decision_outcome");
         let mutation_reservation_count: i64 = row.get("mutation_reservation_count");
         let dispatch_claim_count: i64 = row.get("dispatch_claim_count");
 
         // A mandate mutation can only cross the external I/O boundary after
-        // both a durable decision and a one-use dispatch claim exist. If the
-        // worker died before any of those proofs were written, there is no
-        // external effect to reconcile and pausing the mandate would turn a
-        // recoverable review interruption into a false safety incident.
-        if decision_count == 0 && mutation_reservation_count == 0 && dispatch_claim_count == 0 {
+        // a mutation reservation and a one-use dispatch claim exist. Without
+        // either, there is no external effect to reconcile even if an ACT
+        // was recorded (e.g. its executor blocked before reserving), and
+        // pausing the mandate would turn a recoverable review interruption
+        // into a false safety incident. The committed intention is suspended
+        // and the next review decides afresh. A recorded ASK or STOP is an
+        // owner-facing outcome, so it still goes to reconciliation rather
+        // than being silently re-deliberated.
+        let retry_reason = match decision_outcome.as_deref() {
+            None => Some(MandateFinalizationRejectReason::DecisionMissing),
+            Some("act") => Some(MandateFinalizationRejectReason::DeliberatorFailed),
+            Some(_) => None,
+        };
+        if let (Some(reason), 0, 0) = (
+            retry_reason,
+            mutation_reservation_count,
+            dispatch_claim_count,
+        ) {
             retry_orphaned_mandate_review_without_dispatch(
                 connection,
+                reason,
                 &mandate_id,
                 &goal_id,
                 version,
@@ -1250,6 +1280,83 @@ async fn reconcile_orphaned_mandate_runs(
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+async fn resume_unanswered_agent_questions(
+    connection: &mut sqlx::SqliteConnection,
+    now: &str,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT m.id, m.goal_id, m.version, m.created_by_session, d.id AS decision_id, d.question
+         FROM mandates m
+         LEFT JOIN mandate_decision_cycles d
+           ON d.id = json_extract(m.suspension_json, '$.decision_cycle_id')
+         WHERE m.status = 'awaiting_input'
+           AND m.confirmed_at IS NOT NULL
+           AND json_extract(m.suspension_json, '$.kind') = 'awaiting_answer'
+           AND julianday(m.next_review_at) <= julianday(?)
+           AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday(?))",
+    )
+    .bind(now)
+    .bind(now)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    for row in rows {
+        let mandate_id: String = row.get("id");
+        let goal_id: String = row.get("goal_id");
+        let version: i64 = row.get("version");
+        let owner_session: String = row.get("created_by_session");
+        let decision_id: Option<String> = row.get("decision_id");
+        let question: Option<String> = row.get("question");
+        // Authority is unchanged, so the policy version is kept: a late
+        // owner answer still applies to the same policy.
+        let resumed = sqlx::query(
+            "UPDATE mandates
+             SET status = 'active', suspension_json = NULL,
+                 review_lease_token = NULL, review_lease_expires_at = NULL, updated_at = ?
+             WHERE id = ? AND version = ? AND status = 'awaiting_input'
+               AND json_extract(suspension_json, '$.kind') = 'awaiting_answer'",
+        )
+        .bind(now)
+        .bind(&mandate_id)
+        .bind(version)
+        .execute(&mut *connection)
+        .await?;
+        if resumed.rows_affected() != 1 {
+            continue;
+        }
+        update_controller_status(connection, &goal_id, MandateStatus::Active, now).await?;
+        let mandate_ref = mandate_id.chars().take(8).collect::<String>();
+        let message = match question
+            .as_deref()
+            .and_then(crate::traits::owner_question_excerpt)
+        {
+            Some(question) => format!(
+                "Mandate {mandate_ref} resumed within its current authority because its question was not answered in time. The open question was (generated text): \"{question}\" You can still answer it; nothing was granted in the meantime."
+            ),
+            None => format!(
+                "Mandate {mandate_ref} resumed within its current authority because its question was not answered in time. Nothing was granted in the meantime."
+            ),
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO notification_queue
+                (id, goal_id, session_id, notification_type, priority, message,
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
+             VALUES (?, ?, ?, 'mandate_ask_timeout', 'critical', ?, ?, NULL, 0, NULL, NULL, NULL)",
+        )
+        .bind(format!(
+            "mandate-ask-timeout:{}",
+            decision_id.unwrap_or_else(|| format!("{mandate_id}:{version}"))
+        ))
+        .bind(&goal_id)
+        .bind(&owner_session)
+        .bind(message)
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
     }
     Ok(())
 }
@@ -2097,6 +2204,38 @@ impl MandateStore for SqliteStateStore {
         Ok(true)
     }
 
+    async fn record_active_mandate_owner_guidance(
+        &self,
+        mandate_id: &str,
+        expected_version: i64,
+        owner_session: &str,
+        controller_context: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            controller_context.chars().count() <= 64_000,
+            "mandate controller context is too large"
+        );
+        serde_json::from_str::<serde_json::Value>(controller_context)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE goals SET context = ?, updated_at = ?
+             WHERE id = (
+                 SELECT goal_id FROM mandates
+                 WHERE id = ? AND version = ? AND status = 'active'
+                   AND confirmed_at IS NOT NULL AND created_by_session = ?
+             )
+               AND domain = 'orchestration' AND goal_type = 'continuous'",
+        )
+        .bind(controller_context)
+        .bind(&now)
+        .bind(mandate_id)
+        .bind(expected_version)
+        .bind(owner_session)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn create_mandate_review_run(
         &self,
         mandate_id: &str,
@@ -2346,6 +2485,12 @@ impl MandateStore for SqliteStateStore {
         // boundary so a restart cannot silently keep an unmeasurable autopilot
         // objective active.
         quarantine_uncontrolled_autopilot_mandates(&mut tx, &now_string).await?;
+
+        // An agent question is a request for owner judgment, not a safety
+        // fence. Once its bounded reconsider time passes without an answer,
+        // the mandate continues within its unchanged authority instead of
+        // parking forever; the question stays visible in decision history.
+        resume_unanswered_agent_questions(&mut tx, &now_string).await?;
 
         // Expiry is a hard authority boundary, not merely a query filter. Keep
         // the visible lifecycle coherent so an expired mandate cannot remain
@@ -2992,8 +3137,8 @@ impl MandateStore for SqliteStateStore {
                     | MandateDecisionOutcome::Wait
                     | MandateDecisionOutcome::Stop
             ) {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT value_micros FROM mandate_objective_measurements
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT value_micros, confidence_bps FROM mandate_objective_measurements
                  WHERE mandate_id = ? AND mandate_version = ? AND goal_run_id = ?
                  ORDER BY julianday(observed_at) DESC, id DESC LIMIT 1",
             )
@@ -3020,6 +3165,11 @@ impl MandateStore for SqliteStateStore {
         if decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
             if let Some(control) = mandate.objective_control.as_ref() {
                 let limit = i64::from(control.max_stagnant_measurements) + 1;
+                // Only credible readings form the no-progress window. A
+                // zero-confidence reading means the metric could not be read
+                // (e.g. the source omitted the field), which is a measurement
+                // outage, not evidence that the objective stalled; counting
+                // it would force a healthy mandate out of WAIT into ASK/STOP.
                 let values = sqlx::query_scalar::<_, i64>(
                     "SELECT value_micros FROM (
                          SELECT value_micros, observed_at, id,
@@ -3028,7 +3178,7 @@ impl MandateStore for SqliteStateStore {
                                     ORDER BY julianday(observed_at) DESC, id DESC
                                 ) AS run_rank
                          FROM mandate_objective_measurements
-                         WHERE mandate_id = ?
+                         WHERE mandate_id = ? AND confidence_bps > 0
                      )
                      WHERE run_rank = 1
                      ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?",
@@ -3063,9 +3213,10 @@ impl MandateStore for SqliteStateStore {
                 MandateTerminationKind::SuccessCriteriaSatisfied => {
                     if let Some(control) = mandate.objective_control.as_ref() {
                         anyhow::ensure!(
-                            current_measurement
-                                .is_some_and(|value| control.target_reached(value)),
-                            "success termination requires the current receipt-backed metric to reach the owner-confirmed target"
+                            current_measurement.is_some_and(|(value, confidence)| {
+                                confidence > 0 && control.target_reached(value)
+                            }),
+                            "success termination requires a credible (confidence > 0) current receipt-backed metric that reaches the owner-confirmed target"
                         );
                     }
                     let matched = decision.termination_match.as_deref().ok_or_else(|| {
@@ -4811,6 +4962,17 @@ impl MandateStore for SqliteStateStore {
                     }
                     MandateDecisionOutcome::Act => unreachable!(),
                 } {
+                    let question = if decision_outcome == MandateDecisionOutcome::Ask {
+                        sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT question FROM mandate_decision_cycles WHERE id = ?",
+                        )
+                        .bind(&decision_cycle_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten()
+                    } else {
+                        None
+                    };
                     let notice = crate::traits::MandateRunNotification::new(
                         &request.mandate_id,
                         request.expected_mandate_version,
@@ -4820,7 +4982,8 @@ impl MandateStore for SqliteStateStore {
                         kind,
                         counts.clone(),
                         &request.finalized_at,
-                    );
+                    )
+                    .with_owner_question(question.as_deref());
                     super::notifications::enqueue_mandate_run_notification_on_connection(
                         &mut tx, &notice,
                     )
@@ -5903,7 +6066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_root_crash_reconciles_after_grace_and_cancels_pending_child() {
+    async fn completed_root_crash_without_dispatch_retries_after_grace_and_cancels_pending_child() {
         let (store, _database) = test_store().await;
         let (goal, mandate) = controller("owner-session", 1);
         let run = claim_and_start_run(&store, &goal, &mandate).await;
@@ -5997,6 +6160,8 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        // The child never reserved a mutation, so nothing external can have
+        // happened: the run fails and the mandate retries, unsuspended.
         assert_eq!(
             store
                 .get_mandate(&mandate.id)
@@ -6004,11 +6169,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            MandateStatus::AwaitingInput
+            MandateStatus::Active
         );
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
-            "paused"
+            "active"
         );
         assert_eq!(
             store.get_task(&child_id).await.unwrap().unwrap().status,
@@ -6016,11 +6181,11 @@ mod tests {
         );
         assert_eq!(
             store.get_goal_runs(&goal.id).await.unwrap()[0].status,
-            "cancelled"
+            "failed"
         );
         let notification_message: String = sqlx::query_scalar(
             "SELECT message FROM notification_queue
-             WHERE goal_id = ? AND notification_type = 'mandate_reconciliation_required'
+             WHERE goal_id = ? AND notification_type = 'mandate_review_failed'
                AND priority = 'critical' AND expires_at IS NULL
              LIMIT 1",
         )
@@ -6028,8 +6193,14 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert!(notification_message.contains("work_tasks=1"));
-        assert!(notification_message.contains("mutation_reservations=0"));
+        assert!(notification_message.contains("will retry automatically"));
+        let intention_status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
+                .bind(&intention.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(intention_status, "suspended");
     }
 
     #[tokio::test]
@@ -8046,5 +8217,323 @@ mod tests {
         assert_eq!(loaded.goal_id, goal.id);
         assert_eq!(loaded.version, mandate.version);
         assert_eq!(loaded.next_review_at, mandate.next_review_at);
+    }
+
+    /// Seed one objective reading on a closed prior review run, as the
+    /// history of an earlier cycle would leave it.
+    async fn seed_prior_measurement(
+        store: &SqliteStateStore,
+        mandate: &Mandate,
+        current_run: &GoalRun,
+        value_micros: i64,
+        confidence_bps: i64,
+        hours_ago: i64,
+    ) {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO goal_runs (id, project_id, goal_id, trigger_type, status)
+             SELECT ?, project_id, goal_id, 'mandate', 'completed' FROM goal_runs WHERE id = ?",
+        )
+        .bind(&run_id)
+        .bind(&current_run.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        seed_measurement_on_run(
+            store,
+            mandate,
+            &run_id,
+            value_micros,
+            confidence_bps,
+            hours_ago,
+        )
+        .await;
+    }
+
+    async fn seed_measurement_on_run(
+        store: &SqliteStateStore,
+        mandate: &Mandate,
+        run_id: &str,
+        value_micros: i64,
+        confidence_bps: i64,
+        hours_ago: i64,
+    ) {
+        let observed_at = (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO mandate_objective_measurements
+                (id, mandate_id, mandate_version, goal_run_id, value_micros, confidence_bps,
+                 evidence_receipt_ids_json, attributed_intention_ids_json, observed_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, '[\"call_synthetic_seed\"]', '[]', ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&mandate.id)
+        .bind(mandate.version)
+        .bind(run_id)
+        .bind(value_micros)
+        .bind(confidence_bps)
+        .bind(&observed_at)
+        .bind(&observed_at)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_measurements_do_not_count_toward_stagnation() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        // Every prior review could not read the metric (confidence 0), which
+        // is a measurement outage, not evidence that the objective stalled.
+        for hours_ago in 2..=5 {
+            seed_prior_measurement(&store, &mandate, &run, 0, 0, hours_ago).await;
+        }
+        seed_measurement_on_run(&store, &mandate, &run.id, 0, 0, 0).await;
+
+        let wait = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "metric unavailable; observe again next cycle",
+            mandate.version,
+        );
+        store
+            .record_mandate_decision(&wait, None, None)
+            .await
+            .expect("an unreadable metric must not force the mandate out of WAIT");
+    }
+
+    #[tokio::test]
+    async fn credible_flat_measurements_still_reject_wait_as_stagnant() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        for hours_ago in 2..=4 {
+            seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
+        }
+        // An unreadable reading in between must neither reset nor extend the window.
+        seed_prior_measurement(&store, &mandate, &run, 0, 0, 1).await;
+        seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
+
+        let wait = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "no change observed",
+            mandate.version,
+        );
+        let error = store
+            .record_mandate_decision(&wait, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("objective_control_stagnant"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_stop_requires_a_credible_current_measurement() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        let control = objective_control();
+        let target = control.target_micros;
+        mandate.objective_control = Some(control);
+        mandate.success_criteria = vec!["Synthetic interactions reach the target".to_string()];
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        seed_measurement_on_run(&store, &mandate, &run.id, target, 0, 0).await;
+
+        let mut stop = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Stop,
+            "target reached",
+            mandate.version,
+        );
+        stop.termination_kind = Some(MandateTerminationKind::SuccessCriteriaSatisfied);
+        stop.termination_match = Some("Synthetic interactions reach the target".to_string());
+        stop.evidence_receipt_ids = vec![];
+        let error = store
+            .record_mandate_decision(&stop, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("credible"), "{error}");
+    }
+
+    /// Drive one review to a finalized ASK exactly as the task lead would,
+    /// leaving the mandate parked in `awaiting_input` with its question.
+    async fn park_mandate_on_ask(
+        store: &SqliteStateStore,
+        goal: &Goal,
+        mandate: &Mandate,
+        question: &str,
+    ) -> GoalRun {
+        let run = claim_and_start_run(store, goal, mandate).await;
+        let root_attempt = store
+            .claim_task_with_lease(
+                run.root_task_id.as_deref().unwrap(),
+                "ask-root",
+                Some("profile-task-lead"),
+                7_200,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Ask,
+            "owner judgment requested",
+            mandate.version,
+        );
+        decision.question = Some(question.to_string());
+        store
+            .record_mandate_decision(&decision, None, Some(&root_attempt.id))
+            .await
+            .unwrap();
+        assert!(store
+            .patch_task_from_attempt(
+                &root_attempt.id,
+                &root_attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("ASK recorded".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        store
+            .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                mandate_id: mandate.id.clone(),
+                expected_mandate_version: mandate.version,
+                goal_run_id: run.id.clone(),
+                finalized_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        let parked = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(parked.status, MandateStatus::AwaitingInput);
+        run
+    }
+
+    async fn make_review_due(store: &SqliteStateStore, mandate: &Mandate) {
+        sqlx::query("UPDATE mandates SET next_review_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+            .bind(&mandate.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_notice_carries_the_generated_question_for_the_owner() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        park_mandate_on_ask(&store, &goal, &mandate, "May I also read reply counts?").await;
+        let message = sqlx::query_scalar::<_, String>(
+            "SELECT message FROM notification_queue
+             WHERE goal_id = ? AND notification_type = 'mandate_ask'",
+        )
+        .bind(&goal.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(
+            message.contains("May I also read reply counts?"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_ask_resumes_within_existing_authority_at_its_reconsider_time() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        park_mandate_on_ask(&store, &goal, &mandate, "May I also read reply counts?").await;
+
+        // Not yet due: the owner still has the full reconsider window.
+        assert!(store
+            .claim_due_mandates(10, "synthetic-heartbeat", 300)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MandateStatus::AwaitingInput
+        );
+
+        make_review_due(&store, &mandate).await;
+        let claimed = store
+            .claim_due_mandates(10, "synthetic-heartbeat", 300)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "an unanswered ASK must not park forever");
+        let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, MandateStatus::Active);
+        assert!(resumed.suspension.is_none());
+        assert_eq!(
+            resumed.authority, mandate.authority,
+            "resuming without an answer must not change authority"
+        );
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        let notice = sqlx::query_scalar::<_, String>(
+            "SELECT message FROM notification_queue
+             WHERE goal_id = ? AND notification_type = 'mandate_ask_timeout'",
+        )
+        .bind(&goal.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(notice.contains("May I also read reply counts?"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn safety_suspensions_never_auto_resume() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let suspension = MandateSuspension::new(
+            MandateSuspensionKind::ReconciliationRequired,
+            Some("synthetic".to_string()),
+        );
+        sqlx::query(
+            "UPDATE mandates SET status = 'awaiting_input', suspension_json = ?,
+                 confirmed_at = COALESCE(confirmed_at, ?)
+             WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&suspension).unwrap())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&mandate.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        make_review_due(&store, &mandate).await;
+        assert!(store
+            .claim_due_mandates(10, "synthetic-heartbeat", 300)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MandateStatus::AwaitingInput
+        );
     }
 }

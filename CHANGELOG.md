@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.7] - 2026-09-23
+
+### Fixed
+
+- **Controlled mandates no longer treat an unreadable metric as stagnation.** The no-progress window that rejects WAIT counted zero-confidence readings (a measurement source that omitted the field, or a failed read) as "no improvement", so a mandate whose metric could not be read was forced out of WAIT into ASK or STOP. Only credible readings (`confidence_bps > 0`) now form the window, and a success STOP requires a credible current reading.
+- **Objective controls are validated against the mandate's own authority.** An HTTPS `measurement_source` — which may now carry the query the metric needs, such as a field selector — must be an authorized GET observation under the confirmed operation scopes, checked at persistence and in the draft readiness report. `*_micros` values are documented as millionths of one unit; `minimum_effect_micros` must be at least 1000 and the target must differ from baseline by at least the minimum effect, so "1 engagement" written as one micro can no longer make a single observation satisfy and terminate a long-running mandate.
+- **An unanswered agent question no longer parks a mandate forever.** A mandate suspended with `awaiting_answer` resumes within its unchanged authority once its bounded reconsider time passes, and the owner receives a `mandate_ask_timeout` notice. Safety suspensions (reconciliation, lost execution lease, revoked authority) never auto-resume. `answer_question` on a resumed, active mandate records the late answer as bounded owner guidance through a version- and owner-fenced controller update.
+- **ASK notices show the question.** The owner notice quotes the deliberator's question as flattened, bounded, attributed generated text instead of pointing at an inspection command, so it can be answered from chat. Rationale and task prose are still never included.
+- **Mandate executors receive the work they were claimed for.** The executor prompt carried only the worker task ID, and executors cannot read tasks, so a task lead that wrote "publish the exact text specified by the task" produced an executor that could only report a blocker. The claimed task's description and the committed intention now travel with the execution fence as labelled, non-authoritative plan data. The executor protocol states that the role cannot observe or preflight and that the committed mutation is its first call, and a role denial now tells an executor exactly that rather than lead-oriented advice.
+- **Mandate task creation ignores runtime-owned placement hints.** `manage_goal_tasks` offers `workspace_policy` and `worker_profile`, then rejected them in mandate context, so a committed ACT could never create its work task. The hints are now dropped for mandate tasks, whose placement stays runtime-owned.
+- **An orphaned ACT that never reserved a mutation retries instead of suspending.** A review whose ACT executor blocked before any mutation reservation or dispatch claim was reconciled as `execution_lease_lost`, parking the mandate for owner reconciliation although no external effect was possible. Such runs now fail, suspend their committed intention, and retry with backoff; recorded ASK and STOP outcomes still go to reconciliation.
+
+### Changed
+
+- **Mandate deliberation guidance.** An unreadable metric is recorded with `confidence_bps` 0 and treated as a measurement outage rather than a reason to ASK or STOP; an owner-requested cadence counts as a sufficient expected benefit when quota is free and constraints allow; and an unanswered ASK is not repeated after the mandate resumes.
+
 ## [0.12.6] - 2026-09-22
 
 ### Changed

@@ -963,7 +963,18 @@ async fn finalize_mandate_review(
                 keep_mandate_controller_open(state, &mandate, goal).await;
                 None
             }
-            MandateDecisionOutcome::Ask => Some(notice(MandateRunNotificationKind::Ask, counts)),
+            MandateDecisionOutcome::Ask => {
+                let question = state
+                    .get_mandate_decision_for_run(goal_run_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|decision| decision.question);
+                Some(
+                    notice(MandateRunNotificationKind::Ask, counts)
+                        .with_owner_question(question.as_deref()),
+                )
+            }
             MandateDecisionOutcome::Stop => {
                 Some(notice(MandateRunNotificationKind::Stopped, counts))
             }
@@ -3520,11 +3531,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mandate_notifications_never_promote_generated_question_or_task_prose() {
+    async fn mandate_ask_notice_quotes_the_question_but_never_promotes_rationale_or_task_prose() {
         let (state, _database) = mandate_test_state().await;
         let (goal, mandate) = due_mandate_controller("owner-session");
         let run = claimed_mandate_run(&state, &goal, &mandate).await;
-        let sentinel = "UNTRUSTED_QUESTION_DO_NOT_PROMOTE";
+        let sentinel = "UNTRUSTED_RATIONALE_DO_NOT_PROMOTE";
         let mut decision = MandateDecisionCycle::new(
             &mandate.id,
             &run.id,
@@ -3532,7 +3543,9 @@ mod tests {
             &format!("generated rationale {sentinel}"),
             mandate.version,
         );
-        decision.question = Some(format!("generated question {sentinel}"));
+        // The owner must see what is being asked, but only as quoted,
+        // attributed, single-line generated text.
+        decision.question = Some("May I read\n\"reply\" counts?\u{7}".to_string());
         state
             .record_mandate_decision(&decision, None, None)
             .await
@@ -3548,9 +3561,15 @@ mod tests {
         assert_eq!(entry.priority, "critical");
         assert!(entry.expires_at.is_none());
         assert!(!entry.message.contains(sentinel));
-        assert!(entry
-            .message
-            .contains("stored as untrusted mandate-local data"));
+        assert!(
+            entry
+                .message
+                .contains("(generated text, verify before acting): \"May I read 'reply' counts?\""),
+            "{}",
+            entry.message
+        );
+        assert!(!entry.message.contains('\u{7}'));
+        assert!(entry.message.contains("never widens authority"));
         assert!(entry.message.contains("manage_mandates(action=\"get\""));
         let pending = state.get_pending_notifications(10).await.unwrap();
         assert_eq!(pending.len(), 1);
