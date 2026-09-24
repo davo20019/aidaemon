@@ -12,6 +12,20 @@ pub(super) async fn enqueue_mandate_run_notification_on_connection(
     notice: &crate::traits::MandateRunNotification,
 ) -> anyhow::Result<bool> {
     notice.validate().map_err(|error| anyhow::anyhow!(error))?;
+    // Name the automation by its owner-confirmed objective. Every queued
+    // mandate notice passes through here, so no call site can forget it.
+    let named;
+    let notice = if notice.objective.is_some() {
+        notice
+    } else {
+        let objective =
+            sqlx::query_scalar::<_, String>("SELECT objective FROM mandates WHERE id = ?")
+                .bind(&notice.mandate_id)
+                .fetch_optional(&mut *connection)
+                .await?;
+        named = notice.clone().with_objective(objective.as_deref());
+        &named
+    };
     let entry = notice.to_notification_entry();
     if entry.priority != "critical" || entry.expires_at.is_some() {
         anyhow::bail!("mandate owner notifications must be critical and non-expiring");
@@ -60,7 +74,8 @@ pub(super) async fn enqueue_mandate_run_notification_on_connection(
         && existing.get::<String, _>("session_id") == entry.session_id
         && existing.get::<String, _>("notification_type") == entry.notification_type
         && existing.get::<String, _>("priority") == entry.priority
-        && existing.get::<String, _>("message") == entry.message
+        // Message text is excluded: it is rendered from these fields, and a
+        // retry across an upgrade may word the same outcome differently.
         && existing.get::<String, _>("created_at") == entry.created_at
         && existing.get::<Option<String>, _>("expires_at") == entry.expires_at
         && existing.get::<Option<String>, _>("task_id") == entry.task_id

@@ -53,20 +53,20 @@ pub use history::{
 };
 #[allow(unused_imports)]
 pub use mandates::{
-    is_runtime_fallback_rationale, owner_question_excerpt, Intention, IntentionStatus, Mandate,
-    MandateActivityLevel, MandateAuthority, MandateAuthorityGrant, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOutcome, MandateFinalizationRejectReason,
-    MandateFinalizationStaleReason, MandateLearningNote, MandateMutationAttempt,
-    MandateMutationAttemptStatus, MandateMutationDispatchClaim, MandateMutationEvidence,
-    MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
-    MandateMutationReservation, MandateMutationTarget, MandateObjectiveControl,
-    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationKind,
-    MandateOperationScope, MandateReconciliationReason, MandateReconciliationResolution,
-    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategyRevision,
-    MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind,
-    MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
-    SAFE_FALLBACK_WAIT_RATIONALE,
+    is_runtime_fallback_rationale, mandate_owner_label, owner_question_excerpt, Intention,
+    IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority, MandateAuthorityGrant,
+    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
+    MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
+    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
+    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
+    MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
+    MandateObjectiveControl, MandateObjectiveMeasurement, MandateOperatingUpdates,
+    MandateOperationKind, MandateOperationScope, MandateReconciliationReason,
+    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
+    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
+    MandateStrategyRevision, MandateStrategyRevisionKind, MandateStrategySnapshot,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
+    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[allow(unused_imports)]
 pub use memory::{

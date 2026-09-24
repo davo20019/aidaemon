@@ -322,6 +322,60 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn gate_outcomes_label_each_intervened_task_once_by_terminal_status() {
+        let interventions = vec![
+            (
+                "objective_control_stagnant".to_string(),
+                "task-a".to_string(),
+            ),
+            (
+                "objective_control_stagnant".to_string(),
+                "task-a".to_string(),
+            ),
+            (
+                "objective_control_stagnant".to_string(),
+                "task-b".to_string(),
+            ),
+            ("verification_pending".to_string(), "task-c".to_string()),
+        ];
+        let outcomes = std::collections::HashMap::from([
+            ("task-a".to_string(), "completed".to_string()),
+            ("task-b".to_string(), "failed".to_string()),
+        ]);
+        let rows = aggregate_gate_outcomes(&interventions, &outcomes);
+        assert_eq!(
+            rows[0],
+            GateOutcomeRow {
+                gate: "objective_control_stagnant".to_string(),
+                interventions: 3,
+                tasks: 2,
+                completed: 1,
+                failed: 1,
+                unfinished: 0,
+            }
+        );
+        assert_eq!(rows[1].unfinished, 1);
+    }
+
+    #[test]
+    fn refusal_labels_prefer_a_typed_code_over_prose() {
+        assert_eq!(
+            refusal_gate_label(
+                "manage_mandates",
+                "Error: objective_control_stagnant: WAIT is not permitted"
+            ),
+            "manage_mandates: objective_control_stagnant"
+        );
+        assert_eq!(
+            refusal_gate_label(
+                "manage_goal_tasks",
+                "Error: scheduled run cannot complete while 1 task obligation(s) remain"
+            ),
+            "manage_goal_tasks: scheduled run cannot complete while 1 task"
+        );
+    }
+
+    #[test]
     fn canonical_task_outcome_rejects_unrecognized_values() {
         assert_eq!(
             canonical_task_outcome(&json!({"status": "completed", "outcome": "mostly_done"})),
@@ -878,6 +932,194 @@ fn completion_claim_has_closed_proof(
 /// and task-end records. Any task whose typed contract or actual receipt
 /// accounting is material must carry a closed response-to-receipt proof edge.
 /// No response wording classifier participates.
+/// Decision-point codes where a gate refused, redirected, or demanded more
+/// work from the model. Routine snapshots are excluded.
+const GATE_INTERVENTION_CODES: &[&str] = &[
+    "ledger_expectations_required",
+    "target_scope_violation",
+    "mandate_action_blocked",
+    "tool_budget_block",
+    "policy_denial_terminal_observation",
+    "negative_completion_contract",
+    "verification_pending",
+    "scheduled_run_budget_pressure",
+];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GateOutcomeRow {
+    gate: String,
+    interventions: usize,
+    tasks: usize,
+    completed: usize,
+    failed: usize,
+    unfinished: usize,
+}
+
+/// Group gate interventions by gate and label each intervened task with how
+/// it ended. A gate whose interventions mostly end in failure or never finish
+/// is costing more than it protects; one whose tasks complete is redirecting.
+fn aggregate_gate_outcomes(
+    interventions: &[(String, String)],
+    task_outcomes: &std::collections::HashMap<String, String>,
+) -> Vec<GateOutcomeRow> {
+    let mut by_gate: std::collections::BTreeMap<&str, (usize, std::collections::BTreeSet<&str>)> =
+        std::collections::BTreeMap::new();
+    for (gate, task_id) in interventions {
+        let entry = by_gate.entry(gate.as_str()).or_default();
+        entry.0 += 1;
+        entry.1.insert(task_id.as_str());
+    }
+    let mut rows = by_gate
+        .into_iter()
+        .map(|(gate, (interventions, tasks))| {
+            let mut row = GateOutcomeRow {
+                gate: gate.to_string(),
+                interventions,
+                tasks: tasks.len(),
+                ..GateOutcomeRow::default()
+            };
+            for task_id in tasks {
+                match task_outcomes.get(task_id).map(String::as_str) {
+                    Some("completed") => row.completed += 1,
+                    Some(_) => row.failed += 1,
+                    None => row.unfinished += 1,
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.interventions));
+    rows
+}
+
+/// Normalize a refusal message into a stable gate label: a leading
+/// `snake_case:` code when the tool emits one, otherwise its first words.
+fn refusal_gate_label(tool: &str, message: &str) -> String {
+    let body = message
+        .trim()
+        .trim_start_matches("Error:")
+        .trim_start_matches("Blocked:")
+        .trim();
+    let code = body
+        .split_once(':')
+        .map(|(head, _)| head.trim())
+        .filter(|head| {
+            !head.is_empty()
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+    let label = code.map(str::to_string).unwrap_or_else(|| {
+        body.split_whitespace()
+            .take(7)
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    format!("{tool}: {label}")
+}
+
+async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Gate Outcomes (Last {} Hours) ==", hours);
+    println!("(each intervened task labelled by its goal-run status, else its task_end status)\n");
+
+    let placeholders = GATE_INTERVENTION_CODES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let decision_sql = format!(
+        "SELECT json_extract(data, '$.code') AS gate, task_id FROM events
+         WHERE event_type = 'decision_point' AND created_at >= ? AND task_id IS NOT NULL
+           AND json_extract(data, '$.code') IN ({placeholders})"
+    );
+    let mut query = sqlx::query(&decision_sql).bind(&cutoff);
+    for code in GATE_INTERVENTION_CODES {
+        query = query.bind(*code);
+    }
+    let mut interventions = query
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("gate"),
+                row.get::<String, _>("task_id"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let refusals = sqlx::query(
+        "SELECT task_id,
+                COALESCE(json_extract(data, '$.tool_name'), tool_name, 'tool') AS tool,
+                COALESCE(json_extract(data, '$.message'), json_extract(data, '$.result'), '') AS message
+         FROM events
+         WHERE created_at >= ? AND task_id IS NOT NULL
+           AND (event_type = 'error'
+                OR (event_type = 'tool_result'
+                    AND ltrim(COALESCE(json_extract(data, '$.result'), '')) LIKE 'Blocked:%'))",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    for row in refusals {
+        let tool: String = row.get("tool");
+        let message: String = row.get("message");
+        interventions.push((refusal_gate_label(&tool, &message), row.get("task_id")));
+    }
+
+    // A clean task_end only means the agent loop stopped normally. When the
+    // task ran as a goal-run worker, the run's terminal status is the real
+    // outcome (a lead can end "completed" while its run failed).
+    let mut task_outcomes = sqlx::query(
+        "SELECT task_id, COALESCE(json_extract(data, '$.status'), 'unknown') AS status
+         FROM events WHERE event_type = 'task_end' AND created_at >= ? AND task_id IS NOT NULL",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("task_id"),
+            row.get::<String, _>("status"),
+        )
+    })
+    .collect::<std::collections::HashMap<_, _>>();
+    let run_outcomes = sqlx::query(
+        "SELECT DISTINCT e.task_id, gr.status
+         FROM events e
+         JOIN task_attempts ta ON ta.worker_instance_id = e.session_id
+         JOIN goal_runs gr ON gr.id = ta.goal_run_id
+         WHERE e.created_at >= ? AND e.task_id IS NOT NULL
+           AND gr.status IN ('completed', 'failed', 'cancelled', 'blocked')",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    for row in run_outcomes {
+        task_outcomes.insert(row.get("task_id"), row.get("status"));
+    }
+
+    let rows = aggregate_gate_outcomes(&interventions, &task_outcomes);
+    if rows.is_empty() {
+        println!("No gate interventions recorded.");
+        return Ok(());
+    }
+    println!(
+        "{:<72} {:>6} {:>6} {:>10} {:>7} {:>11}",
+        "gate", "hits", "tasks", "completed", "failed", "unfinished"
+    );
+    for row in rows {
+        let gate: String = row.gate.chars().take(72).collect();
+        println!(
+            "{:<72} {:>6} {:>6} {:>10} {:>7} {:>11}",
+            gate, row.interventions, row.tasks, row.completed, row.failed, row.unfinished
+        );
+    }
+    Ok(())
+}
+
 async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
     let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
     println!("== Fabrication Audit (Last {} Hours) ==", hours);
@@ -1173,6 +1415,7 @@ async fn main() -> anyhow::Result<()> {
     let eval_summary = args.iter().any(|arg| arg == "--eval-summary");
     let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
     let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
+    let gate_outcomes = args.iter().any(|arg| arg == "--gate-outcomes");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -1452,6 +1695,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if fabrication_audit {
         print_fabrication_audit(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if gate_outcomes {
+        print_gate_outcomes(&pool, eval_hours).await?;
         return Ok(());
     }
     if let Some(session_id) = record_fixture_session.as_deref() {

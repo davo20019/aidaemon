@@ -952,6 +952,7 @@ async fn finalize_mandate_review(
             counts,
             &finalized_at,
         )
+        .with_objective(Some(&mandate.objective))
     };
     match proof {
         MandateRunFinalizationResult::ActSatisfied { counts } => {
@@ -3564,13 +3565,16 @@ mod tests {
         assert!(
             entry
                 .message
-                .contains("(generated text, verify before acting): \"May I read 'reply' counts?\""),
+                .contains("It asked: \"May I read 'reply' counts?\""),
             "{}",
             entry.message
         );
         assert!(!entry.message.contains('\u{7}'));
-        assert!(entry.message.contains("never widens authority"));
-        assert!(entry.message.contains("manage_mandates(action=\"get\""));
+        assert!(entry.message.contains("never gives it new permissions"));
+        assert!(entry
+            .message
+            .starts_with("Your automation \"Maintain a useful account presence\""));
+        assert!(!entry.message.contains("manage_mandates("));
         let pending = state.get_pending_notifications(10).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, entry.id);

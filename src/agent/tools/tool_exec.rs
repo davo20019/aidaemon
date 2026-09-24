@@ -958,13 +958,36 @@ impl Agent {
                 available.extend(info.tool_names);
             }
         }
-        anyhow::bail!(
+        Err(UnknownToolError {
+            name: name.to_string(),
+            available,
+        }
+        .into())
+    }
+}
+
+/// No adapter (native or MCP) is registered under the requested name, so the
+/// call was refused before dispatch. Typed so the receipt boundary can record
+/// `RejectedBeforeDispatch` instead of the `Dispatched` stamp it gives legacy
+/// adapter errors.
+#[derive(Debug)]
+pub(crate) struct UnknownToolError {
+    name: String,
+    available: Vec<String>,
+}
+
+impl std::fmt::Display for UnknownToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "Unknown tool '{}'. Available tools: [{}]. Use one of these or respond with text only.",
-            name,
-            available.join(", ")
+            self.name,
+            self.available.join(", ")
         )
     }
 }
+
+impl std::error::Error for UnknownToolError {}
 
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]

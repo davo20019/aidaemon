@@ -457,14 +457,25 @@ impl WorkCoordinationStore for SqliteStateStore {
         let has_schedule = run.get::<i64, _>("has_schedule") != 0;
         let recovery_for_run: Option<String> = run.get("recovery_for_run");
         if trigger_type == "scheduled" && status == "completed" {
+            // The run's root task is the lead itself. While it is still
+            // active it is the caller completing the run, not an unresolved
+            // obligation; counting it made every lead-driven complete_goal
+            // fail. A root that ended failed or blocked still counts.
+            let root_task_id: Option<String> = run.get("root_task_id");
             let incomplete_task_count = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM tasks
                  WHERE goal_run_id = ?
-                   AND (status NOT IN ('completed', 'skipped', 'superseded')
+                   AND NOT (id IS ? AND status IN ('pending', 'claimed', 'running'))
+                   -- Mirrors Task::satisfies_run_completion: skipped and
+                   -- superseded work is resolved whatever note it carries;
+                   -- a completed task must be clean.
+                   AND status NOT IN ('skipped', 'superseded')
+                   AND (status != 'completed'
                         OR length(trim(COALESCE(error, ''))) > 0
                         OR length(trim(COALESCE(blocker, ''))) > 0)",
             )
             .bind(run_id)
+            .bind(root_task_id)
             .fetch_one(&mut *tx)
             .await?;
             anyhow::ensure!(
@@ -2267,6 +2278,78 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("Parent scheduled occurrence")));
+    }
+
+    #[tokio::test]
+    async fn active_root_lead_can_complete_its_own_scheduled_run() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("synthetic daily publication", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let root = task(&goal.id, "scheduled lead", None);
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, Some(&root.id))
+            .await
+            .unwrap();
+        store.create_task(&root).await.unwrap();
+        store
+            .claim_task_with_lease(&root.id, "lead", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("lead claims its root");
+        let mut child = task(&goal.id, "publish one post", None);
+        child.status = "completed".to_string();
+        child.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        store.create_task(&child).await.unwrap();
+
+        // The lead is still running inside its root task when it completes
+        // the run; its own root is the caller, not an open obligation.
+        assert!(store
+            .finish_goal_run(&run.id, "completed", Some("published"))
+            .await
+            .expect("an active root lead must be able to complete its run"));
+    }
+
+    #[tokio::test]
+    async fn superseded_task_with_note_does_not_block_scheduled_completion() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("synthetic daily publication", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let mut replaced = task(&goal.id, "specialist review", None);
+        replaced.status = "superseded".to_string();
+        replaced.error = Some("timed out; the lead reviewed directly".to_string());
+        store.create_task(&replaced).await.unwrap();
+        let mut done = task(&goal.id, "publish one post", None);
+        done.status = "completed".to_string();
+        store.create_task(&done).await.unwrap();
+
+        assert!(store
+            .finish_goal_run(&run.id, "completed", Some("published"))
+            .await
+            .expect("superseded work is resolved, as Task::satisfies_run_completion says"));
+    }
+
+    #[tokio::test]
+    async fn failed_root_still_blocks_scheduled_run_completion() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("synthetic daily publication", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let mut root = task(&goal.id, "scheduled lead", None);
+        root.status = "failed".to_string();
+        root.error = Some("lead crashed".to_string());
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, Some(&root.id))
+            .await
+            .unwrap();
+        store.create_task(&root).await.unwrap();
+
+        assert!(store
+            .finish_goal_run(&run.id, "completed", Some("premature"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

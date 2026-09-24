@@ -40,8 +40,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// `/models` listing, so this is a static catalog; unknown ids still pass
 /// through to the API, which is the authority on what an account can use.
 ///
-/// Tiers: `sol` is the flagship, `terra` balanced, `luna` fast/low-cost.
+/// GPT-6 tiers: `astra` is the flagship, `sol` the workhorse, `luna`
+/// fast/low-cost. GPT-5.6 tiers: `sol` flagship, `terra` balanced, `luna`
+/// fast/low-cost.
 const KNOWN_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

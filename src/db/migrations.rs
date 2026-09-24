@@ -63,6 +63,15 @@ pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Canonical recent-event queries order by append identity, not wall time.
+    // Keep LIMIT queries bounded even for sessions with long event histories.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_session_id
+         ON events(session_id, id)",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
         .execute(pool)
         .await?;

@@ -172,11 +172,19 @@ pub(in crate::agent) async fn task_has_scheduled_provenance(
 ) -> bool {
     if let Some(tid) = task_id {
         if let Ok(Some(run)) = state.get_goal_run_for_task(tid).await {
-            return run.trigger_type == "scheduled";
+            return is_scheduled_cycle_trigger(&run.trigger_type);
         }
     }
 
     false
+}
+
+/// A recovery run re-attempts a failed scheduled occurrence, so it is an
+/// autonomous cycle of the scheduled goal in its own right. Treating it as
+/// non-root made it inherit the failed run's persisted token spend and start
+/// already over budget.
+fn is_scheduled_cycle_trigger(trigger_type: &str) -> bool {
+    matches!(trigger_type, "scheduled" | "recovery")
 }
 
 pub(in crate::agent) async fn active_scheduled_root_task_id(
@@ -188,7 +196,7 @@ pub(in crate::agent) async fn active_scheduled_root_task_id(
         .await
         .ok()?
         .into_iter()
-        .filter(|run| run.trigger_type == "scheduled")
+        .filter(|run| is_scheduled_cycle_trigger(&run.trigger_type))
         .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
         .find_map(|run| run.root_task_id)
 }
@@ -585,5 +593,73 @@ mod summary_tests {
             "Published the post and verified the live URL returned HTTP 200."
         );
         assert!(!summary.contains("Create, deploy"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::traits::store_prelude::*;
+
+    fn root_task(goal_id: &str) -> Task {
+        Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            description: "Scheduled check".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_run_is_its_own_root_scheduled_cycle() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state: Arc<dyn StateStore> = harness.state.clone();
+        let goal = Goal::new_continuous("Synthetic daily publication", "session-a", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let failed_root = root_task(&goal.id);
+        let failed = state
+            .start_goal_run(&goal.id, "scheduled", None, Some(&failed_root.id))
+            .await
+            .unwrap();
+        state.create_task(&failed_root).await.unwrap();
+        state
+            .finish_goal_run(&failed.id, "failed", Some("budget exhausted"))
+            .await
+            .unwrap();
+
+        let recovery_root = root_task(&goal.id);
+        state
+            .start_goal_run(&goal.id, "recovery", None, Some(&recovery_root.id))
+            .await
+            .unwrap();
+        state.create_task(&recovery_root).await.unwrap();
+
+        // The recovery lead must own a fresh run budget, which requires it to
+        // be recognized as the active root of a scheduled cycle rather than a
+        // continuation of the failed run's exhausted token accounting.
+        assert!(task_has_scheduled_provenance(&state, Some(&recovery_root.id)).await);
+        assert_eq!(
+            active_scheduled_root_task_id(&state, &goal.id)
+                .await
+                .as_deref(),
+            Some(recovery_root.id.as_str())
+        );
     }
 }

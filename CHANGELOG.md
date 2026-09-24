@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.8] - 2026-09-24
+
+### Fixed
+
+- **Replies to queued notices keep their context.** Notices delivered from the notification queue (ASK timeouts, stalled goals, escalations, token alerts, background CLI results) reached the owner's chat but were never written to the agent's session history, and only `mandate_ask` bound the owner's next reply. Answering "yes" to a mandate's timeout notice got "I don't have the earlier question in this conversation." Every delivered queued notice is now recorded in owner history, and `mandate_ask_timeout` binds the next reply to the resumed mandate like an ASK does, so a late answer reaches `answer_question`.
+- **Mandate stagnation is counted in measurement periods, not review runs.** Several reviews inside one daily period each counted as a flat measurement, so a three-period no-progress window could be exhausted within an hour. Readings now count only when close to a full `measurement_cadence_secs` apart.
+- **Stagnation and the mutation quota no longer compose into a forced ASK.** When the no-progress window rejected WAIT while the rolling quota or cooldown rejected ACT, the only admissible outcomes were ASK or STOP, so an autopilot mandate asked the owner to raise its own limits. Outcome rules now live in `mandates::admissibility` with an exhaustive liveness test: WAIT stays admissible while the quota is temporarily blocked, a WAIT that explores, avoids, or retires a tactic is admissible under stagnation, and refusals list the outcomes that remain.
+- **Scheduled goal runs close through their own lead.** `complete_goal` counted the lead's own running root task as unfinished work, so every lead completion failed and runs closed only through reconciliation. Completed tasks no longer keep stale error text from a superseded attempt, and recovery runs no longer inherit the failed run's spent token budget.
+- **Unknown tools are refused before dispatch.** A call to a name with no registered adapter is recorded as `RejectedBeforeDispatch` rather than `Dispatched`, and candidate ranking applies authority before its cap so an unavailable candidate cannot hide the only authorized route.
+- **Recent-event queries follow append order.** Session and task event queries order by append identity instead of wall-clock timestamps, backed by a new index.
+
+### Changed
+
+- **Mandate notices read like a person wrote them.** Owner notices name the automation by its confirmed objective instead of an opaque id, use plain sentences instead of `key=value` counts, say what happens next, and no longer include tool-call syntax or internal boilerplate. The timeout notice says no reply is needed. Generated questions are still quoted and bounded, and rationale and task prose are still never included.
+- **GPT-6 models.** `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` are in the ChatGPT-subscription catalog, the autonomous trust tier, and the vision model patterns.
+- **`db_probe --gate-outcomes --eval-hours N`** groups each gate intervention by gate and labels it with the goal run's terminal outcome.
+
 ## [0.12.7] - 2026-09-23
 
 ### Fixed

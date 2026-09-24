@@ -659,6 +659,46 @@ async fn mutation_quota_state_on_connection(
     }))
 }
 
+/// Whether credible measurements stayed flat across the no-progress window.
+///
+/// `readings` are credible measurements, newest first, one per review run.
+/// Stagnation is measured in the owner's cadence, not in review runs: several
+/// reviews inside one measurement period (retries, owner-driven re-reviews)
+/// are one observation of the objective, so a reading counts only when it is
+/// close to a full cadence older than the last counted one. The small
+/// tolerance absorbs scheduler jitter between otherwise daily reviews.
+/// Which outcomes stagnation then refuses is decided in
+/// `mandates::admissibility`.
+fn objective_is_stagnant(
+    control: &crate::traits::MandateObjectiveControl,
+    readings: &[(i64, chrono::DateTime<chrono::Utc>)],
+) -> bool {
+    let window = usize::from(control.max_stagnant_measurements) + 1;
+    let min_spacing = chrono::Duration::seconds(control.measurement_cadence_secs.max(0) * 9 / 10);
+    let mut counted: Vec<(i64, chrono::DateTime<chrono::Utc>)> = Vec::with_capacity(window);
+    for &(value, observed_at) in readings {
+        if counted.len() == window {
+            break;
+        }
+        if counted
+            .last()
+            .is_none_or(|&(_, last)| last - observed_at >= min_spacing)
+        {
+            counted.push((value, observed_at));
+        }
+    }
+    if counted.len() < window {
+        return false;
+    }
+    let newest = counted[0].0;
+    let oldest = counted[counted.len() - 1].0;
+    let improvement = match control.direction {
+        crate::traits::ObjectiveMetricDirection::AtLeast => newest.saturating_sub(oldest),
+        crate::traits::ObjectiveMetricDirection::AtMost => oldest.saturating_sub(newest),
+    };
+    improvement < control.minimum_effect_micros
+}
+
 async fn insert_mandate_row(
     connection: &mut sqlx::SqliteConnection,
     mandate: &Mandate,
@@ -1289,7 +1329,8 @@ async fn resume_unanswered_agent_questions(
     now: &str,
 ) -> anyhow::Result<()> {
     let rows = sqlx::query(
-        "SELECT m.id, m.goal_id, m.version, m.created_by_session, d.id AS decision_id, d.question
+        "SELECT m.id, m.goal_id, m.version, m.created_by_session, m.objective,
+                d.id AS decision_id, d.question
          FROM mandates m
          LEFT JOIN mandate_decision_cycles d
            ON d.id = json_extract(m.suspension_json, '$.decision_cycle_id')
@@ -1311,6 +1352,7 @@ async fn resume_unanswered_agent_questions(
         let owner_session: String = row.get("created_by_session");
         let decision_id: Option<String> = row.get("decision_id");
         let question: Option<String> = row.get("question");
+        let objective: String = row.get("objective");
         // Authority is unchanged, so the policy version is kept: a late
         // owner answer still applies to the same policy.
         let resumed = sqlx::query(
@@ -1329,16 +1371,17 @@ async fn resume_unanswered_agent_questions(
             continue;
         }
         update_controller_status(connection, &goal_id, MandateStatus::Active, now).await?;
-        let mandate_ref = mandate_id.chars().take(8).collect::<String>();
+        let label = crate::traits::mandate_owner_label(Some(&objective));
+        let reference = mandate_id.chars().take(8).collect::<String>();
         let message = match question
             .as_deref()
             .and_then(crate::traits::owner_question_excerpt)
         {
             Some(question) => format!(
-                "Mandate {mandate_ref} resumed within its current authority because its question was not answered in time. The open question was (generated text): \"{question}\" You can still answer it; nothing was granted in the meantime."
+                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed.\n\nIt had asked: \"{question}\"\n\nNo reply is needed. If you still want to answer, reply here. (ref {reference})"
             ),
             None => format!(
-                "Mandate {mandate_ref} resumed within its current authority because its question was not answered in time. Nothing was granted in the meantime."
+                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed. (ref {reference})"
             ),
         };
         sqlx::query(
@@ -3164,14 +3207,13 @@ impl MandateStore for SqliteStateStore {
         }
         if decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
             if let Some(control) = mandate.objective_control.as_ref() {
-                let limit = i64::from(control.max_stagnant_measurements) + 1;
                 // Only credible readings form the no-progress window. A
                 // zero-confidence reading means the metric could not be read
                 // (e.g. the source omitted the field), which is a measurement
                 // outage, not evidence that the objective stalled; counting
                 // it would force a healthy mandate out of WAIT into ASK/STOP.
-                let values = sqlx::query_scalar::<_, i64>(
-                    "SELECT value_micros FROM (
+                let rows = sqlx::query_as::<_, (i64, String)>(
+                    "SELECT value_micros, observed_at FROM (
                          SELECT value_micros, observed_at, id,
                                 ROW_NUMBER() OVER (
                                     PARTITION BY goal_run_id
@@ -3181,28 +3223,36 @@ impl MandateStore for SqliteStateStore {
                          WHERE mandate_id = ? AND confidence_bps > 0
                      )
                      WHERE run_rank = 1
-                     ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?",
+                     ORDER BY julianday(observed_at) DESC, id DESC LIMIT 512",
                 )
                 .bind(&mandate.id)
-                .bind(limit)
                 .fetch_all(&mut *tx)
                 .await?;
-                if values.len() >= limit as usize {
-                    let newest = values[0];
-                    let oldest = *values.last().unwrap_or(&newest);
-                    let improvement = match control.direction {
-                        crate::traits::ObjectiveMetricDirection::AtLeast => {
-                            newest.saturating_sub(oldest)
-                        }
-                        crate::traits::ObjectiveMetricDirection::AtMost => {
-                            oldest.saturating_sub(newest)
-                        }
-                    };
-                    anyhow::ensure!(
-                        improvement >= control.minimum_effect_micros,
-                        "objective_control_stagnant: WAIT is not permitted after the configured no-progress window; choose a bounded ACT, ASK, or STOP decision"
-                    );
+                let mut readings = Vec::with_capacity(rows.len());
+                for (value, observed_at) in rows {
+                    let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_at)
+                        .map_err(|_| anyhow::anyhow!("invalid persisted measurement timestamp"))?
+                        .with_timezone(&chrono::Utc);
+                    readings.push((value, observed_at));
                 }
+                let quota =
+                    mutation_quota_state_on_connection(&mut tx, &mandate.id, &now_string).await?;
+                let admissible = crate::mandates::admissibility::admissible_outcomes(
+                    &crate::mandates::admissibility::OutcomeState {
+                        stagnant: objective_is_stagnant(control, &readings),
+                        quota_block: quota.and_then(|quota| quota.block_reason),
+                        adapts_strategy: operating_updates.is_some_and(|updates| {
+                            updates.strategy_revisions.iter().any(|revision| {
+                                revision.kind != MandateStrategyRevisionKind::Reinforce
+                            })
+                        }),
+                    },
+                );
+                anyhow::ensure!(
+                    admissible.wait,
+                    "objective_control_stagnant: a WAIT that does not change tactics is not permitted after the configured no-progress window. Admissible now: {}",
+                    admissible.describe()
+                );
             }
         }
         if decision.outcome == MandateDecisionOutcome::Stop {
@@ -6266,11 +6316,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notification.0, "mandate_review_failed");
-        assert!(notification.1.contains("reason=decision_missing"));
-        assert!(notification
-            .1
-            .contains("No action was authorized or executed"));
-        assert!(!notification.1.contains("Inspect the external target"));
+        assert!(notification.1.contains("(decision missing)"));
+        assert!(notification.1.contains("Nothing was done"));
+        assert!(!notification.1.contains("check the account"));
     }
 
     #[tokio::test]
@@ -8335,6 +8383,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_period_reviews_are_one_stagnation_observation() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        let mut control = objective_control();
+        control.measurement_cadence_secs = 86_400;
+        mandate.objective_control = Some(control);
+        mandate.max_review_secs = 86_400;
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        // Several reviews inside one daily measurement period (retries, an
+        // owner-driven re-review) read the same flat metric. That is one
+        // observation of the objective, not a multi-day no-progress window.
+        for hours_ago in 1..=5 {
+            seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
+        }
+        seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
+
+        let wait = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "the newest intervention has not had a full period yet",
+            mandate.version,
+        );
+        store
+            .record_mandate_decision(&wait, None, None)
+            .await
+            .expect("same-period readings must not exhaust the stagnation window");
+    }
+
+    fn flat_daily_readings(count: usize) -> Vec<(i64, chrono::DateTime<chrono::Utc>)> {
+        let now = chrono::Utc::now();
+        // Daily reviews drift by a few minutes; each is still its own period.
+        (0..count)
+            .map(|day| {
+                let age = chrono::Duration::hours(24 * day as i64)
+                    - chrono::Duration::minutes(5 * day as i64);
+                (10_000_000, now - age)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flat_readings_across_full_periods_are_stagnant() {
+        let mut control = objective_control();
+        control.measurement_cadence_secs = 86_400;
+        let readings = flat_daily_readings(4);
+        assert!(objective_is_stagnant(&control, &readings));
+        assert!(!objective_is_stagnant(&control, &readings[..3]));
+    }
+
+    #[tokio::test]
+    async fn stagnant_passive_wait_refusal_names_admissible_outcomes() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        // Mutation authority exists but the rolling window allows none now.
+        mandate.authority.max_mutating_actions_per_rolling_24h = 1;
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        for hours_ago in 1..=4 {
+            seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
+        }
+        seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
+        let quota = store
+            .get_mandate_mutation_quota_state(&mandate.id, &chrono::Utc::now().to_rfc3339())
+            .await
+            .unwrap()
+            .unwrap();
+        // No reservation exists, so ACT is possible and a passive WAIT is
+        // refused with a message that names the admissible alternatives.
+        assert!(quota.available_now);
+        let wait = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "no change observed",
+            mandate.version,
+        );
+        let error = store
+            .record_mandate_decision(&wait, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Admissible now: ACT"), "{error}");
+        assert!(error.contains("WAIT with a strategy revision"), "{error}");
+    }
+
+    #[tokio::test]
     async fn success_stop_requires_a_credible_current_measurement() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
@@ -8495,6 +8630,10 @@ mod tests {
         .await
         .unwrap();
         assert!(notice.contains("May I also read reply counts?"), "{notice}");
+        // Named by the objective the owner confirmed, in plain language.
+        assert!(notice.starts_with("Your automation \""), "{notice}");
+        assert!(notice.contains("No reply is needed"), "{notice}");
+        assert!(!notice.contains("within its current authority"), "{notice}");
     }
 
     #[tokio::test]

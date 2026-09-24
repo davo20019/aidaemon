@@ -1,5 +1,6 @@
 //! Owner-authorized autonomous mandate policy.
 
+pub(crate) mod admissibility;
 pub(crate) mod authority;
 pub(crate) mod history;
 

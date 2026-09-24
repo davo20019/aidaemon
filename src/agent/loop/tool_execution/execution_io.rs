@@ -632,7 +632,14 @@ pub(super) async fn execute_tool_call_io(
         Err(e) => {
             result_metadata.receipt_kind = registered_receipt_kind;
             result_metadata.access_manifest = registered_access_manifest;
-            result_metadata.invocation_stage = crate::traits::ToolInvocationStage::Dispatched;
+            result_metadata.invocation_stage = if e
+                .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()
+                .is_some()
+            {
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+            } else {
+                crate::traits::ToolInvocationStage::Dispatched
+            };
             result_metadata.transport_error = Some(e.to_string());
             // A legacy tool returning `Err` has made an explicit typed Rust
             // failure. Classify it once at this adapter boundary instead of

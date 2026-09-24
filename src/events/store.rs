@@ -1471,7 +1471,7 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
-    /// Query recent events for a session (all types)
+    /// Query recent events for a session (all types), in canonical append order.
     pub async fn query_recent_events(
         &self,
         session_id: &str,
@@ -1482,7 +1482,7 @@ impl EventStore {
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ?
-            ORDER BY created_at DESC
+            ORDER BY id DESC
             LIMIT ?
             "#,
         )
@@ -1574,7 +1574,7 @@ impl EventStore {
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE task_id = ?
-            ORDER BY created_at ASC
+            ORDER BY id ASC
             "#,
         )
         .bind(task_id)
@@ -1595,7 +1595,7 @@ impl EventStore {
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND task_id = ?
-            ORDER BY created_at ASC
+            ORDER BY id ASC
             "#,
         )
         .bind(session_id)
@@ -2099,7 +2099,7 @@ impl EventStore {
             FROM events
             WHERE session_id = ?
               AND event_type = 'task_end'
-            ORDER BY created_at DESC
+            ORDER BY id DESC
             LIMIT ?
             "#,
         )
@@ -3938,6 +3938,122 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    #[tokio::test]
+    async fn recent_events_select_latest_appends_regardless_of_timestamps() {
+        for offsets in [[0, 0, 0, 0], [30, 10, 20, 0]] {
+            let (store, _database) = setup_store().await;
+            let timestamp = Utc::now();
+            let mut ids = Vec::new();
+            for offset in offsets {
+                let mut event = Event::new(
+                    "session-ordering",
+                    EventType::UserMessage,
+                    json!({"content": "synthetic message"}),
+                );
+                event.created_at = timestamp + Duration::seconds(offset);
+                ids.push(store.append(event).await.expect("append event"));
+            }
+            store
+                .append(Event::new(
+                    "session-other",
+                    EventType::UserMessage,
+                    json!({"content": "unrelated message"}),
+                ))
+                .await
+                .expect("append unrelated event");
+
+            for limit in [0, 1, 2, 4, 10] {
+                let events = store
+                    .query_recent_events("session-ordering", limit)
+                    .await
+                    .expect("query recent events");
+                assert_eq!(
+                    events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                    ids[ids.len().saturating_sub(limit)..],
+                    "latest appends must be returned in insertion order: offsets={offsets:?}, limit={limit}",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_task_ends_select_latest_append_not_latest_timestamp() {
+        let (store, _database) = setup_store().await;
+        let timestamp = Utc::now();
+        for (task, offset) in [("task-first", 30), ("task-second", 0)] {
+            append_task_end(
+                &store,
+                "session-ordering",
+                task,
+                TaskStatus::Completed,
+                timestamp + Duration::seconds(offset),
+                None,
+                Some("synthetic completion"),
+            )
+            .await;
+        }
+        let ends = store
+            .query_recent_task_ends("session-ordering", false, 1)
+            .await
+            .unwrap();
+        assert_eq!(ends[0].task_id.as_deref(), Some("task-second"));
+    }
+
+    #[tokio::test]
+    async fn task_event_queries_preserve_append_order_regardless_of_timestamps() {
+        for offsets in [[0, 0, 0, 0], [30, 10, 20, 0]] {
+            let (store, _database) = setup_store().await;
+            let timestamp = Utc::now();
+            let mut task_ids = Vec::new();
+            let mut session_task_ids = Vec::new();
+            for (index, offset) in offsets.into_iter().enumerate() {
+                let session_id = if index == 1 {
+                    "session-other"
+                } else {
+                    "session-ordering"
+                };
+                let mut event = Event::new(
+                    session_id,
+                    EventType::UserMessage,
+                    json!({"content": "synthetic message", "task_id": "task-ordering"}),
+                );
+                event.created_at = timestamp + Duration::seconds(offset);
+                let id = store.append(event).await.expect("append event");
+                task_ids.push(id);
+                if session_id == "session-ordering" {
+                    session_task_ids.push(id);
+                }
+            }
+            store
+                .append(Event::new(
+                    "session-ordering",
+                    EventType::UserMessage,
+                    json!({"content": "unrelated task", "task_id": "task-other"}),
+                ))
+                .await
+                .expect("append unrelated task event");
+
+            let events = store
+                .query_task_events("task-ordering")
+                .await
+                .expect("query task events");
+            assert_eq!(
+                events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                task_ids,
+                "task history must preserve insertion order: offsets={offsets:?}",
+            );
+            let events = store
+                .query_task_events_for_session("session-ordering", "task-ordering")
+                .await
+                .expect("query session task events");
+            assert_eq!(
+                events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                session_task_ids,
+                "session task history must preserve insertion order: offsets={offsets:?}",
+            );
+        }
     }
 
     #[test]

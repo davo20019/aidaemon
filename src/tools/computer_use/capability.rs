@@ -6,6 +6,7 @@ const DEFAULT_VISION_MODEL_PATTERNS: &[&str] = &[
     "gpt-4o",
     "gpt-4",
     "gpt-5",
+    "gpt-6",
     "o1",
     "o3",
     "o4",

@@ -813,9 +813,32 @@ impl ManageGoalTasksTool {
         if let Some(result) = &args.result {
             task.result = Some(result.clone());
         }
-        if let Some(error) = &args.error {
-            task.error = (!error.trim().is_empty()).then(|| error.clone());
-        }
+        // A completed task's outcome is success. Error text left by a prior
+        // attempt (e.g. a failed specialist handoff the lead then finished
+        // directly), or supplied alongside the completion, is attempt history
+        // rather than an open failure. Keeping it in `error` made the task
+        // read as "completed but failed" and vetoed the whole run, so it is
+        // carried as handoff risk instead.
+        let attempt_history = if task.status == "completed" {
+            let note = args
+                .error
+                .clone()
+                .or_else(|| task.error.take())
+                .filter(|note| !note.trim().is_empty());
+            task.error = None;
+            note
+        } else {
+            if let Some(error) = &args.error {
+                task.error = (!error.trim().is_empty()).then(|| error.clone());
+            }
+            None
+        };
+        let remaining_risk = match (args.remaining_risk.clone(), attempt_history) {
+            (Some(risk), Some(note)) => Some(format!("{risk}\nPrior attempt: {note}")),
+            (Some(risk), None) => Some(risk),
+            (None, Some(note)) => Some(format!("Prior attempt: {note}")),
+            (None, None) => None,
+        };
 
         let fenced_status = matches!(
             task.status.as_str(),
@@ -873,7 +896,7 @@ impl ManageGoalTasksTool {
                     })
                     .collect(),
                 verification: args.verification.clone().unwrap_or_default(),
-                remaining_risk: args.remaining_risk.clone(),
+                remaining_risk: remaining_risk.clone(),
                 next_step: args.next_step.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
@@ -1171,7 +1194,8 @@ impl ManageGoalTasksTool {
         }
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
-        self.state.update_goal(&goal).await?;
+        // Finish the run before touching the goal: if the store refuses the
+        // run, the goal must not already claim a successful cycle.
         let run_id = match self.goal_run_id.clone() {
             Some(run_id) => Some(run_id),
             None => self
@@ -1186,6 +1210,7 @@ impl ManageGoalTasksTool {
                 .finish_goal_run(&run_id, "completed", Some(summary))
                 .await?;
         }
+        self.state.update_goal(&goal).await?;
         info!(goal_id = %self.goal_id, is_continuous, "Goal run completed");
 
         let mut response = if is_continuous {
@@ -1782,6 +1807,49 @@ mod tests {
         let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(goal.status, "active");
         assert!(goal.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn lead_completion_after_failed_attempt_clears_stale_error() {
+        let (state, _finite) = setup_test_state().await;
+        let goal = Goal::new_continuous("Synthetic daily publication", "test-session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let tool = ManageGoalTasksTool::new(goal.id.clone(), state.clone());
+        tool.call(&json!({"action": "create_task", "description": "Publish one post"}).to_string())
+            .await
+            .unwrap();
+        let run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        // The specialist attempt failed and left its error on the task.
+        let mut failed = state.get_tasks_for_goal_run(&run.id).await.unwrap()[0].clone();
+        failed.status = "failed".to_string();
+        failed.error = Some("Specialist handoff failed permanently".to_string());
+        state.update_task(&failed).await.unwrap();
+
+        // The lead then did the work directly and records success, once
+        // without restating the error and once describing it as history.
+        let scoped =
+            ManageGoalTasksTool::new(goal.id.clone(), state.clone()).with_goal_run_id(Some(run.id));
+        for error in [None, Some("specialist failed; lead published directly")] {
+            let mut update = json!({
+                "action": "update_task",
+                "task_id": failed.id,
+                "status": "completed",
+                "result": "Published and verified"
+            });
+            if let Some(error) = error {
+                update["error"] = json!(error);
+            }
+            scoped.call(&update.to_string()).await.unwrap();
+            let task = state.get_task(&failed.id).await.unwrap().unwrap();
+            assert_eq!(task.status, "completed");
+            assert!(task.error.is_none(), "{error:?}: {:?}", task.error);
+        }
+
+        let result = scoped
+            .call(&json!({"action": "complete_goal", "summary": "published"}).to_string())
+            .await
+            .unwrap();
+        assert!(result.contains("run completed"), "{result}");
     }
 
     #[tokio::test]

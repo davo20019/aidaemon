@@ -383,12 +383,18 @@ cargo run --bin db_probe --features encryption -- --invocation 42
 cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
 cargo run --bin db_probe --features encryption -- --token-hours 24
 cargo run --bin db_probe --features encryption -- --fabrication-audit --eval-hours 72
+cargo run --bin db_probe --features encryption -- --gate-outcomes --eval-hours 168
 ```
 
 `--fabrication-audit` is a post-hoc trace check: it flags tasks whose final
 assistant reply claims a side-effecting action (posted/ran/deployed/wrote a
 file, etc.) while the task made zero tool calls — a candidate fabricated
 completion. It verifies outcomes rather than predicting tool-need up front.
+
+`--gate-outcomes` (with `--eval-hours N`) measures gates by what happened after
+they intervened: each gate decision point or tool refusal is grouped by gate and
+its task labelled with the goal run's terminal status (else its `task_end`
+status). Check it before calling a gate "too strict" or "working".
 
 ## Specialist System
 

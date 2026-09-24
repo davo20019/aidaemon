@@ -281,6 +281,12 @@ impl ManageMandatesTool {
                         .max(cadence_floor),
                 )
         };
+        if effort.is_some() {
+            anyhow::ensure!(
+                daily <= MAX_MANDATE_TOKEN_BUDGET_DAILY,
+                "default_review_minutes is too short: {review_cycles} reviews per day exceed the daily review capacity ceiling; keep the current review bounds or lengthen default_review_minutes"
+            );
+        }
         anyhow::ensure!(
             (MIN_MANDATE_TOKEN_BUDGET..=MAX_MANDATE_TOKEN_BUDGET_DAILY).contains(&daily),
             "legacy daily token capacity must be between {MIN_MANDATE_TOKEN_BUDGET} and {MAX_MANDATE_TOKEN_BUDGET_DAILY}"
@@ -1171,6 +1177,13 @@ impl ManageMandatesTool {
                 "success_criteria": mandate.success_criteria,
                 "stop_conditions": mandate.stop_conditions,
                 "review_effort": mandate.review_effort,
+                // Update-native names and units, so an update built from this
+                // view round-trips the current review bounds instead of
+                // leaving a structured-output provider to invent them.
+                "min_review_minutes": mandate.min_review_secs / 60,
+                "default_review_minutes": mandate.default_review_secs / 60,
+                "max_review_minutes": mandate.max_review_secs / 60,
+                "expires_at": mandate.expires_at,
                 "strategy": strategy,
                 "objective_control": mandate.objective_control,
             }),
@@ -1885,7 +1898,7 @@ impl ManageMandatesTool {
         anyhow::ensure!(
             outcome != MandateDecisionOutcome::Act
                 || mandate.authority.max_mutating_actions_per_cycle > 0,
-            "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle"
+            "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle (if the objective is stagnant, a WAIT must carry a strategy revision that explores, avoids, or retires a tactic)"
         );
         if outcome == MandateDecisionOutcome::Act {
             let quota = self
@@ -4530,6 +4543,105 @@ mod tests {
             updated_mandate.expires_at.as_deref(),
             Some("2099-02-15T13:31:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn policy_view_round_trips_review_bounds_into_update() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Steward a synthetic account",
+            "owner-session",
+            Some(100_000),
+            Some(1_000_000),
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            4 * 60 * 60,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let owner = json!({
+            "_session_id": "owner-session",
+            "_user_role": "owner",
+            "_channel_visibility": "private"
+        });
+
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = Arc::new(ManageMandatesTool::new(
+            state.clone(),
+            ApprovalBroker::new(approval_tx),
+        ));
+        let mut get = json!({"action": "get", "mandate_id": mandate.id, "section": "policy"});
+        get.as_object_mut()
+            .unwrap()
+            .extend(owner.as_object().unwrap().clone());
+        let policy: Value = serde_json::from_str(&tool.call(&get.to_string()).await.unwrap())
+            .expect("policy view is JSON");
+        assert_eq!(policy["min_review_minutes"], 15);
+        assert_eq!(policy["default_review_minutes"], 240);
+        assert_eq!(policy["max_review_minutes"], 1440);
+
+        // A structured-output provider fills every field; without the bounds
+        // in the policy view it invented the schema minimum (1 minute).
+        let mut placeholder = json!({
+            "action": "update",
+            "mandate_id": mandate.id,
+            "review_effort": "balanced",
+            "min_review_minutes": 1,
+            "default_review_minutes": 1,
+            "max_review_minutes": 1
+        });
+        placeholder
+            .as_object_mut()
+            .unwrap()
+            .extend(owner.as_object().unwrap().clone());
+        let error = tool
+            .call(&placeholder.to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("default_review_minutes is too short"),
+            "{error}"
+        );
+        assert!(!error.contains("legacy"), "{error}");
+
+        let mut copied =
+            json!({"action": "update", "mandate_id": mandate.id, "review_effort": "thorough"});
+        for field in [
+            "min_review_minutes",
+            "default_review_minutes",
+            "max_review_minutes",
+        ] {
+            copied[field] = policy[field].clone();
+        }
+        copied
+            .as_object_mut()
+            .unwrap()
+            .extend(owner.as_object().unwrap().clone());
+        let update_tool = tool.clone();
+        let update = tokio::spawn(async move { update_tool.call(&copied.to_string()).await });
+        approval_rx
+            .recv()
+            .await
+            .expect("update confirmation")
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .unwrap();
+        update.await.unwrap().unwrap();
+        let updated = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(updated.min_review_secs, mandate.min_review_secs);
+        assert_eq!(updated.default_review_secs, mandate.default_review_secs);
+        assert_eq!(updated.max_review_secs, mandate.max_review_secs);
     }
 
     #[tokio::test]

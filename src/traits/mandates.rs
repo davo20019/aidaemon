@@ -2356,6 +2356,44 @@ pub struct MandateRunNotification {
     /// answer from chat. Rendered through [`owner_question_excerpt`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_question: Option<String>,
+    /// The owner-confirmed objective, so the notice names the automation the
+    /// owner recognizes instead of an opaque id. Rendered through
+    /// [`mandate_owner_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+}
+
+/// How owner-facing notices name a mandate: its owner-confirmed objective,
+/// flattened and capped at a word boundary so it reads as a title.
+pub fn mandate_owner_label(objective: Option<&str>) -> String {
+    const MAX_CHARS: usize = 72;
+    let flattened = objective
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    let flattened = flattened.trim_end_matches(['.', ' ']);
+    if flattened.is_empty() {
+        return "Your automation".to_string();
+    }
+    let title = if flattened.chars().count() <= MAX_CHARS {
+        flattened.to_string()
+    } else {
+        let cut = flattened.chars().take(MAX_CHARS).collect::<String>();
+        let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+        format!("{}…", cut.trim_end_matches([',', ';', ':']))
+    };
+    format!("Your automation \"{title}\"")
+}
+
+fn plural(count: impl Into<u64>, one: &str, many: &str) -> String {
+    let count = count.into();
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+fn humanize_reason(code: &str) -> String {
+    code.replace('_', " ")
 }
 
 /// Bounded, single-line rendering of a model-generated owner question. The
@@ -2404,7 +2442,13 @@ impl MandateRunNotification {
             counts,
             created_at: created_at.to_string(),
             owner_question: None,
+            objective: None,
         }
+    }
+
+    pub fn with_objective(mut self, objective: Option<&str>) -> Self {
+        self.objective = objective.map(str::to_string);
+        self
     }
 
     pub fn with_owner_question(mut self, question: Option<&str>) -> Self {
@@ -2443,43 +2487,48 @@ impl MandateRunNotification {
     }
 
     pub fn message(&self) -> String {
-        let mandate_ref = self.mandate_id.chars().take(8).collect::<String>();
-        let run_ref = self.goal_run_id.chars().take(8).collect::<String>();
-        let inspect = format!(
-            "Inspect mandate {mandate_ref} with manage_mandates(action=\"get\", mandate_id=\"{mandate_ref}\")."
+        let label = mandate_owner_label(self.objective.as_deref());
+        // A compact reference so a follow-up turn can find the mandate; the
+        // owner never needs to read or type it.
+        let reference = format!(
+            "(ref {})",
+            self.mandate_id.chars().take(8).collect::<String>()
+        );
+        let unresolved = self.counts.ambiguous_or_reserved_mutations;
+        let check_target = format!(
+            "{} may not have completed cleanly. Please check the account for a missing or duplicate action before resuming it.",
+            plural(unresolved, "external change", "external changes"),
         );
         match self.kind {
-            MandateRunNotificationKind::ActSatisfied => format!(
-                "Mandate {mandate_ref} completed bounded action review {run_ref} under policy version {}; work_tasks={}; verified_mutations={}; mutation_reservations={}. The mandate remains active. {inspect}",
-                self.mandate_version,
-                self.counts.non_root_tasks,
-                self.counts.succeeded_mutations,
-                self.counts.mutation_reservations,
-            ),
+            MandateRunNotificationKind::ActSatisfied => {
+                let done = match self.counts.succeeded_mutations {
+                    0 => "finished a review and completed its planned work".to_string(),
+                    count => format!("completed {}", plural(count, "verified action", "verified actions")),
+                };
+                format!("{label} {done}. It keeps running on its own. {reference}")
+            }
             MandateRunNotificationKind::Ask => match self.owner_question.as_deref() {
                 Some(question) => format!(
-                    "Mandate {mandate_ref} is waiting for your answer after review {run_ref} (policy version {}). The mandate reviewer asked (generated text, verify before acting): \"{question}\" Reply with your answer; an answer is guidance only and never widens authority. If you do not answer, the mandate resumes within its current authority at its next review. {inspect}",
-                    self.mandate_version,
+                    "{label} needs your input. It asked: \"{question}\"\n\nReply here to answer. Your answer guides it, but never gives it new permissions. If you don't reply, it continues on its own within its current limits at its next review. {reference}"
                 ),
                 None => format!(
-                    "Mandate {mandate_ref} is awaiting owner input after review {run_ref} under policy version {}. If you do not answer, the mandate resumes within its current authority at its next review. {inspect}",
-                    self.mandate_version,
+                    "{label} needs your input. Ask me what it wants to know. If you don't reply, it continues on its own within its current limits at its next review. {reference}"
                 ),
             },
             MandateRunNotificationKind::Stopped => format!(
-                "Mandate {mandate_ref} stopped after review {run_ref} under policy version {}. Its generated rationale remains untrusted mandate-local data and is intentionally not copied into assistant history. {inspect}",
-                self.mandate_version,
+                "{label} has stopped. Ask me why if you want the details. {reference}"
             ),
-            MandateRunNotificationKind::ReconciliationRequired { reason } => format!(
-                "Mandate {mandate_ref} paused for owner reconciliation after review {run_ref}; reason={}; work_tasks={}; mutation_reservations={}; verified_mutations={}; failed_mutations={}; never_dispatched_mutations={}; unresolved_mutations={}. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
-                reason.as_str(),
-                self.counts.non_root_tasks,
-                self.counts.mutation_reservations,
-                self.counts.succeeded_mutations,
-                self.counts.failed_mutations,
-                self.counts.never_dispatched_mutations,
-                self.counts.ambiguous_or_reserved_mutations,
-            ),
+            MandateRunNotificationKind::ReconciliationRequired { reason } => {
+                let detail = if unresolved > 0 {
+                    format!(" {check_target}")
+                } else {
+                    " Ask me for the details, then resume it when you're ready.".to_string()
+                };
+                format!(
+                    "{label} is paused for safety ({}).{detail} {reference}",
+                    humanize_reason(reason.as_str()),
+                )
+            }
             MandateRunNotificationKind::ReviewFailed { reason }
                 if matches!(
                     reason,
@@ -2488,31 +2537,19 @@ impl MandateRunNotification {
                 ) =>
             {
                 format!(
-                    "Mandate {mandate_ref} review {run_ref} was interrupted before a verified decision; reason={}. No action was authorized or executed. The mandate remains active and will retry automatically at its bounded review interval. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
-                    reason.as_str(),
+                    "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
+                    humanize_reason(reason.as_str()),
                 )
             }
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
-                "Mandate {mandate_ref} could not verify review {run_ref}; reason={}. No action was authorized or executed. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
-                reason.as_str(),
+                "{label}: a review could not be verified ({}), so nothing was done. {reference}",
+                humanize_reason(reason.as_str()),
             ),
             MandateRunNotificationKind::ExecutionLeaseLost => format!(
-                "Mandate {mandate_ref} review {run_ref} lost its execution lease before its effects could be reconciled; work_tasks={}; mutation_reservations={}; verified_mutations={}; failed_mutations={}; never_dispatched_mutations={}; unresolved_mutations={}. The mandate is paused for safety. Inspect the external target for a partial or duplicate action before resuming. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
-                self.counts.non_root_tasks,
-                self.counts.mutation_reservations,
-                self.counts.succeeded_mutations,
-                self.counts.failed_mutations,
-                self.counts.never_dispatched_mutations,
-                self.counts.ambiguous_or_reserved_mutations,
+                "{label} is paused for safety: a review was cut off before its results could be confirmed. {check_target} {reference}"
             ),
             MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation => format!(
-                "Mandate {mandate_ref} review {run_ref} was invalidated after one or more external mutations crossed the final dispatch boundary without a durable outcome; work_tasks={}; mutation_reservations={}; verified_mutations={}; failed_mutations={}; never_dispatched_mutations={}; unresolved_mutations={}. Inspect the external target for a partial or duplicate action. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
-                self.counts.non_root_tasks,
-                self.counts.mutation_reservations,
-                self.counts.succeeded_mutations,
-                self.counts.failed_mutations,
-                self.counts.never_dispatched_mutations,
-                self.counts.ambiguous_or_reserved_mutations,
+                "{label}: a review was cancelled after it had already started work outside aidaemon. {check_target} {reference}"
             ),
         }
     }
@@ -2555,9 +2592,25 @@ mod tests {
             "2026-08-11T12:00:00Z",
         );
         let message = notice.message();
-        assert!(message.contains("No action was authorized or executed"));
-        assert!(message.contains("remains active"));
+        assert!(message.contains("Nothing was done"));
+        assert!(message.contains("still active"));
         assert!(message.contains("retry automatically"));
+    }
+
+    #[test]
+    fn owner_label_names_the_objective_and_caps_at_a_word() {
+        assert_eq!(
+            mandate_owner_label(Some("Grow the newsletter.")),
+            "Your automation \"Grow the newsletter\""
+        );
+        assert_eq!(mandate_owner_label(None), "Your automation");
+        assert_eq!(mandate_owner_label(Some("  \n ")), "Your automation");
+        let long = mandate_owner_label(Some(
+            "Increase authentic audience reach and engagement on the connected X account over the next year.",
+        ));
+        assert!(long.ends_with("…\""), "{long}");
+        assert!(long.chars().count() < 100, "{long}");
+        assert!(!long.contains("  "));
     }
 
     #[test]

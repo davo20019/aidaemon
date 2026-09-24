@@ -79,12 +79,15 @@ pub(super) fn obligation_admissible(
         }
     }
     if let Some(requirement) = obligation.evidence_requirement.as_ref() {
+        // Candidate routing is ranked and capped for model guidance. Apply
+        // authority first so unavailable candidates cannot crowd out an
+        // admissible route or suppress the custom-tool fallback below.
         let candidates = crate::agent::inquiry::candidate_tools_for_requirements(
             std::slice::from_ref(requirement),
-            visible_tools.iter().copied(),
+            visible_tools.iter().copied().filter(|tool| admits(tool)),
         );
         if !candidates.is_empty() {
-            return candidates.iter().any(|tool| admits(tool));
+            return true;
         }
         // Unknown/dynamic tools without a static evidence model remain
         // possible candidates rather than being declared unavailable.
@@ -162,7 +165,7 @@ mod tests {
         assert!(!obligation_admissible(
             &obligation,
             &authority(false, &[]),
-            &["read_file"],
+            &["read_file", "check_remote"],
             read_only
         ));
         // Visible but the read-only contract forbids the mutating tool.
@@ -240,6 +243,101 @@ mod tests {
             &authority(true, &[]),
             &["read_file"],
             read_only
+        ));
+    }
+
+    #[test]
+    fn disallowed_static_candidates_do_not_hide_an_admissible_dynamic_tool() {
+        let requirement = RequestEvidenceRequirement {
+            summary: "current goal state".to_string(),
+            acceptable_scopes: vec![ToolSemanticScope::GoalState],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Canonical,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let obligation = obligation(None, Some(requirement), ToolMutationEffects::NONE);
+        let authority = authority(true, &[]);
+        let read_only = |tool: &str| Some(tool == "check_remote");
+        for visible in [
+            vec!["check_remote"],
+            vec!["manage_mandates", "check_remote"],
+            vec!["check_remote", "manage_mandates"],
+        ] {
+            assert!(obligation_admissible(
+                &obligation,
+                &authority,
+                &visible,
+                read_only
+            ));
+        }
+        assert!(!obligation_admissible(
+            &obligation,
+            &authority,
+            &["manage_mandates"],
+            read_only
+        ));
+        assert!(!obligation_admissible(
+            &obligation,
+            &ClosingAuthority {
+                forbids_tool_use: true,
+                ..authority
+            },
+            &["manage_mandates", "check_remote"],
+            read_only
+        ));
+    }
+
+    #[test]
+    fn candidate_ranking_limit_cannot_hide_the_only_authorized_tool() {
+        let requirement = RequestEvidenceRequirement {
+            summary: "inspect current state".to_string(),
+            acceptable_scopes: vec![
+                ToolSemanticScope::GoalState,
+                ToolSemanticScope::ExternalRemote,
+                ToolSemanticScope::LocalWorkspace,
+                ToolSemanticScope::HostLocal,
+                ToolSemanticScope::UserMemory,
+            ],
+            purpose: EvidencePurpose::CurrentState,
+            minimum_authority: EvidenceAuthority::Advisory,
+            temporal_scope: EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
+            receipt: None,
+            target: None,
+        };
+        let visible = [
+            "browser",
+            "goal_trace",
+            "http_request",
+            "manage_goal_tasks",
+            "manage_mandates",
+            "manage_memories",
+            "manage_people",
+            "read_file",
+            "read_node_health",
+            "read_node_sensors",
+            "web_search",
+        ];
+        let candidates = crate::agent::inquiry::candidate_tools_for_requirements(
+            std::slice::from_ref(&requirement),
+            visible,
+        );
+        assert_eq!(candidates.len(), 10);
+        assert!(!candidates.iter().any(|tool| tool == "web_search"));
+        let obligation = obligation(None, Some(requirement), ToolMutationEffects::NONE);
+        let allowed = vec!["web_search".to_string()];
+        let authority = ClosingAuthority {
+            allowed_tool_names: &allowed,
+            ..authority(true, &[])
+        };
+        assert!(obligation_admissible(
+            &obligation,
+            &authority,
+            &visible,
+            |_| Some(true)
         ));
     }
 

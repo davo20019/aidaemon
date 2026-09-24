@@ -3109,6 +3109,7 @@ fn default_vision_model_patterns() -> Vec<String> {
         "gpt-4o".to_string(),
         "gpt-4".to_string(),
         "gpt-5".to_string(),
+        "gpt-6".to_string(),
         "o1".to_string(),
         "o3".to_string(),
         "o4".to_string(),

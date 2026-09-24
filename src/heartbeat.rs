@@ -20,6 +20,15 @@ use crate::traits::{GoalSchedule, Mandate, MandateStatus, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
 const TASK_ESCALATION_SETTLE_SECS: i64 = 8;
+/// History prefix for notices delivered from the notification queue; matches
+/// the direct goal-notification path so both read the same to the agent.
+const QUEUED_NOTIFICATION_NOTE_PREFIX: &str = "Parent-visible result (goal notification)";
+
+/// Notices after which the owner's next reply may answer a mandate question:
+/// the ASK itself, and the timeout notice that says it can still be answered.
+fn notice_accepts_mandate_answer(notification_type: &str) -> bool {
+    matches!(notification_type, "mandate_ask" | "mandate_ask_timeout")
+}
 const MANDATE_REVIEW_LEASE_SECS: i64 = 30 * 60;
 const MANDATE_REVIEW_BATCH_SIZE: i64 = 20;
 const MANDATE_DISPATCH_BUSY_RETRIES: u32 = 5;
@@ -1895,6 +1904,83 @@ impl HeartbeatCoordinator {
         }
     }
 
+    /// Queue delivery bypasses `deliver_parent_text_result`, so persist every
+    /// delivered notice in owner history: a reply to it must reach an agent
+    /// that can see what it answers.
+    async fn record_delivered_notification(
+        &self,
+        entry: &crate::traits::NotificationEntry,
+        delivered_text: &str,
+    ) {
+        let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        if let Err(error) = agent
+            .record_parent_visible_result_note(
+                &entry.session_id,
+                QUEUED_NOTIFICATION_NOTE_PREFIX,
+                delivered_text,
+            )
+            .await
+        {
+            warn!(
+                notification_id = %entry.id,
+                %error,
+                "Failed to record delivered notification in owner history"
+            );
+        }
+        if notice_accepts_mandate_answer(&entry.notification_type) {
+            self.bind_mandate_answer_context(&agent, entry).await;
+        }
+    }
+
+    /// Bind the owner's next reply to a delivered mandate question so a bare
+    /// "yes" reaches `answer_question` instead of an agent with no referent.
+    /// A timed-out ASK has already resumed, so any non-terminal mandate that
+    /// still carries the question qualifies; the answer lands as late guidance.
+    async fn bind_mandate_answer_context(
+        &self,
+        agent: &Agent,
+        entry: &crate::traits::NotificationEntry,
+    ) {
+        let mandate = match self.state.get_mandate_for_goal(&entry.goal_id).await {
+            Ok(Some(mandate)) => mandate,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    goal_id = %entry.goal_id,
+                    notification_id = %entry.id,
+                    %error,
+                    "Failed to load mandate after delivering queued question notice"
+                );
+                return;
+            }
+        };
+        let answerable = match entry.notification_type.as_str() {
+            "mandate_ask" => mandate.status == MandateStatus::AwaitingInput,
+            _ => !mandate.status.is_terminal(),
+        };
+        if !answerable {
+            return;
+        }
+        if let Err(error) = agent
+            .record_mandate_owner_input_context(
+                &entry.session_id,
+                &mandate.id,
+                mandate.version,
+                entry.action_token.as_deref().unwrap_or(&entry.id),
+            )
+            .await
+        {
+            warn!(
+                mandate_id = %mandate.id,
+                notification_id = %entry.id,
+                %error,
+                "Failed to bind queued mandate question to owner dialogue state"
+            );
+        }
+    }
+
     /// Process the notification queue: attempt delivery, track attempts.
     async fn process_notification_queue(&self) {
         // Read past the normal delivery batch so quiet-hour routine entries at
@@ -1959,8 +2045,8 @@ impl HeartbeatCoordinator {
                     }
                 }
             }
+            let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
             let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
-                let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
                 let message =
                     crate::channels::present_notification(&entry.notification_type, &sanitized);
                 // A channel adapter is external I/O. It must never be allowed to
@@ -1987,50 +2073,7 @@ impl HeartbeatCoordinator {
             };
 
             if delivered {
-                if entry.notification_type == "mandate_ask" {
-                    if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
-                        // Queue delivery is the crash/retry path and bypasses
-                        // `deliver_parent_text_result`, so persist the visible
-                        // notice before installing its typed dialogue binding.
-                        if let Err(error) = agent
-                            .record_auxiliary_assistant_note(&entry.session_id, &entry.message)
-                            .await
-                        {
-                            warn!(
-                                notification_id = %entry.id,
-                                %error,
-                                "Failed to record delivered mandate ASK in owner history"
-                            );
-                        }
-                        match self.state.get_mandate_for_goal(&entry.goal_id).await {
-                            Ok(Some(mandate)) if mandate.status == MandateStatus::AwaitingInput => {
-                                if let Err(error) = agent
-                                    .record_mandate_owner_input_context(
-                                        &entry.session_id,
-                                        &mandate.id,
-                                        mandate.version,
-                                        entry.action_token.as_deref().unwrap_or(&entry.id),
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        mandate_id = %mandate.id,
-                                        notification_id = %entry.id,
-                                        %error,
-                                        "Failed to bind queued mandate ASK to owner dialogue state"
-                                    );
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => warn!(
-                                goal_id = %entry.goal_id,
-                                notification_id = %entry.id,
-                                %error,
-                                "Failed to load mandate after delivering queued ASK"
-                            ),
-                        }
-                    }
-                }
+                self.record_delivered_notification(entry, &sanitized).await;
                 if let Err(e) = self.state.mark_notification_delivered(&entry.id).await {
                     error!(notification_id = %entry.id, error = %e, "Failed to mark notification delivered");
                 }
@@ -3257,6 +3300,74 @@ mod tests {
         );
         mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         (goal, mandate)
+    }
+
+    #[tokio::test]
+    async fn queued_notices_reach_owner_history_and_timeouts_stay_answerable() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{DialogueStateStore, NotificationEntry, QuestionKind};
+
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let session_id = "telegram:test_bot:synthetic-owner";
+        let state: Arc<dyn StateStore> = harness.state.clone();
+        let (goal, mandate) = due_mandate_controller(session_id);
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let agent = Arc::new(harness.agent);
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.set_agent(Arc::downgrade(&agent));
+
+        // A routine queued notice: visible to the agent, but not a question.
+        let stalled = NotificationEntry::new(
+            &goal.id,
+            session_id,
+            "stalled",
+            "Your weekly digest goal has not made progress in 3 days.",
+        );
+        coordinator
+            .record_delivered_notification(&stalled, &stalled.message)
+            .await;
+        assert!(harness
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .unwrap()
+            .and_then(|state| state.open_question)
+            .is_none());
+
+        // The ASK-timeout notice says the question can still be answered, so
+        // the owner's next reply must be bound to the (already resumed) mandate.
+        let timeout = NotificationEntry::new(
+            &goal.id,
+            session_id,
+            "mandate_ask_timeout",
+            "Your automation kept going without your answer. It asked: 'May I post twice a day?'",
+        );
+        coordinator
+            .record_delivered_notification(&timeout, &timeout.message)
+            .await;
+
+        let history = state.get_history(session_id, 10).await.unwrap();
+        let recorded = history
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(recorded.contains("has not made progress in 3 days"));
+        assert!(recorded.contains("May I post twice a day?"));
+        let question = harness
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .unwrap()
+            .and_then(|state| state.open_question)
+            .expect("timeout notice binds the owner's next reply");
+        assert_eq!(question.kind, QuestionKind::MandateInput);
+        assert_eq!(question.mandate_id.as_deref(), Some(mandate.id.as_str()));
     }
 
     #[tokio::test]

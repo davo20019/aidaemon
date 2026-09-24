@@ -25,3 +25,6 @@ expect:
   outcome: failed
   stop_reason: error
   llm_calls_max: 7
+  # An unknown tool has no adapter, so no call may count as dispatched.
+  tool_dispatch_counts:
+    unknown_stall_tool: 0
