@@ -430,46 +430,6 @@ impl Consolidator {
         procedure.success_count >= 1
     }
 
-    /// Trigger: End of session/task
-    pub async fn on_session_end(&self, session_id: &str) {
-        if let Err(e) = self.consolidate_session(session_id).await {
-            warn!("Consolidation failed for session {}: {}", session_id, e);
-        }
-    }
-
-    /// Trigger: Daily cron job - consolidate all sessions with pending events
-    pub async fn daily_consolidation(&self) -> anyhow::Result<DailyConsolidationStats> {
-        let sessions = self
-            .event_store
-            .get_sessions_needing_consolidation()
-            .await?;
-
-        let mut stats = DailyConsolidationStats {
-            sessions_processed: sessions.len(),
-            ..Default::default()
-        };
-
-        for session_id in sessions {
-            match self.consolidate_session(&session_id).await {
-                Ok(result) => stats.total_result.add(&result),
-                Err(e) => {
-                    warn!("Consolidation failed for {}: {}", session_id, e);
-                    stats.failures += 1;
-                }
-            }
-        }
-
-        info!(
-            sessions = stats.sessions_processed,
-            events = stats.total_result.events_consolidated,
-            procedures = stats.total_result.procedures_created,
-            failures = stats.failures,
-            "Daily consolidation complete"
-        );
-
-        Ok(stats)
-    }
-
     // =========================================================================
     // Extraction Methods
     // =========================================================================
@@ -621,7 +581,10 @@ impl Consolidator {
                             domain: error_data.tool_name.clone(),
                             solution_summary: format!("Used {} to resolve", tool),
                             solution_steps: Some(vec![summary]),
-                            success_count: 1,
+                            // A later successful tool call is a correlation,
+                            // not proof. Credit arrives only from verified
+                            // reuse (`update_error_solution_outcome`).
+                            success_count: 0,
                             failure_count: 0,
                             last_used_at: Some(Utc::now()),
                             created_at: Utc::now(),

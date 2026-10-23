@@ -152,7 +152,7 @@ async fn test_session_isolation() {
 }
 
 #[tokio::test]
-async fn episode_search_finds_older_than_500_and_bumps_recall() {
+async fn episode_search_finds_older_than_500_without_counting_a_recall() {
     let (store, _db) = setup_test_store().await;
     let query = "distinctive zircon deployment";
     let embedding = store
@@ -197,6 +197,19 @@ async fn episode_search_finds_older_than_500_and_bumps_recall() {
         results.iter().any(|episode| episode.id == matching_id),
         "semantic search must not impose a newest-500 gate"
     );
+    let recall_count: i64 = sqlx::query_scalar("SELECT recall_count FROM episodes WHERE id=?")
+        .bind(matching_id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        recall_count, 0,
+        "a search is not a recall until it is shown"
+    );
+    store
+        .record_memory_recall(&[], &[matching_id])
+        .await
+        .unwrap();
     let recall_count: i64 = sqlx::query_scalar("SELECT recall_count FROM episodes WHERE id=?")
         .bind(matching_id)
         .fetch_one(&store.pool)
@@ -915,32 +928,6 @@ async fn test_increment_fact_recall() {
 
     let updated = store.get_facts(Some("test")).await.unwrap();
     assert_eq!(updated[0].recall_count, 2);
-    assert!(updated[0].last_recalled_at.is_some());
-}
-
-#[tokio::test]
-async fn test_get_relevant_facts_increments_recall() {
-    let (store, _db) = setup_test_store().await;
-
-    store
-        .upsert_fact(
-            "project",
-            "language",
-            "Rust",
-            "user",
-            None,
-            FactPrivacy::Global,
-        )
-        .await
-        .unwrap();
-
-    let facts = store.get_relevant_facts("rust language", 10).await.unwrap();
-    assert_eq!(facts.len(), 1);
-    assert_eq!(facts[0].key, "language");
-
-    let updated = store.get_facts(Some("project")).await.unwrap();
-    assert_eq!(updated.len(), 1);
-    assert_eq!(updated[0].recall_count, 1);
     assert!(updated[0].last_recalled_at.is_some());
 }
 
@@ -4947,4 +4934,264 @@ async fn escalated_recovery_candidates_respect_pause_ownership_cooldown_and_cap(
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn automated_sources_cannot_overwrite_owner_stated_facts() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "user",
+            "pet_name",
+            "Luna",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    for source in ["consolidation", "progressive", "task_learning"] {
+        store
+            .upsert_fact(
+                "user",
+                "pet_name",
+                "Pixel",
+                source,
+                None,
+                FactPrivacy::Private,
+            )
+            .await
+            .unwrap();
+    }
+    let facts = store.get_facts(Some("user")).await.unwrap();
+    let pet: Vec<_> = facts.iter().filter(|f| f.key == "pet_name").collect();
+    assert_eq!(pet.len(), 1);
+    assert_eq!(pet[0].value, "Luna");
+    assert_eq!(pet[0].source, "agent");
+
+    // The owner can still change their own fact.
+    store
+        .upsert_fact(
+            "user",
+            "pet_name",
+            "Max",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    let facts = store.get_facts(Some("user")).await.unwrap();
+    assert!(facts
+        .iter()
+        .any(|f| f.key == "pet_name" && f.value == "Max"));
+}
+
+#[tokio::test]
+async fn automated_restatement_under_a_paraphrased_key_is_folded() {
+    let (store, _db) = setup_test_store().await;
+    for (key, source) in [
+        ("acme_app:local_path", "consolidation"),
+        ("acme_app_path", "progressive"),
+    ] {
+        store
+            .upsert_fact(
+                "project",
+                key,
+                "/srv/projects/acme-app",
+                source,
+                None,
+                FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+    }
+    let facts = store.get_facts(Some("project")).await.unwrap();
+    assert_eq!(
+        facts.len(),
+        1,
+        "restatement must not add a second copy: {facts:?}"
+    );
+    assert_eq!(facts[0].key, "acme_app_local_path", "the first key is kept");
+
+    // Distinct knowledge in the same category is still stored, including a
+    // near-identical key whose value differs by a number.
+    for (key, value) in [
+        ("database_engine", "PostgreSQL 16 on a managed host"),
+        ("acme_app_version", "1.4.2"),
+        ("acme_api_version", "1.4.1"),
+    ] {
+        store
+            .upsert_fact(
+                "project",
+                key,
+                value,
+                "progressive",
+                None,
+                FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.get_facts(Some("project")).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn personal_keys_differing_by_an_entity_are_never_folded() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "user",
+            "age",
+            "9",
+            "consolidation",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "user",
+            "child_age",
+            "9",
+            "consolidation",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    let keys: Vec<String> = store
+        .get_facts(Some("user"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.key)
+        .collect();
+    assert!(keys.contains(&"age".to_string()) && keys.contains(&"child_age".to_string()));
+}
+
+#[tokio::test]
+async fn background_extraction_does_not_resurrect_a_deleted_fact() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "project",
+            "side_project_path",
+            "/srv/projects/side",
+            "consolidation",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    let id = store.get_facts(Some("project")).await.unwrap()[0].id;
+    sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    store
+        .upsert_fact(
+            "project",
+            "side_project_path",
+            "/srv/projects/side",
+            "progressive",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    assert!(store.get_facts(Some("project")).await.unwrap().is_empty());
+
+    store
+        .upsert_fact(
+            "project",
+            "side_project_path",
+            "/srv/projects/side",
+            "agent",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get_facts(Some("project")).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
+    let (store, _db) = setup_test_store().await;
+    let now = Utc::now().to_rfc3339();
+    // Seed paraphrases directly: they predate write-time folding.
+    for (key, value, source, recall) in [
+        (
+            "acme_app:local_path",
+            "/srv/projects/acme-app",
+            "consolidation",
+            9_i64,
+        ),
+        ("acme_app_path", "/srv/projects/acme-app", "agent", 1),
+        ("database_engine", "PostgreSQL 16", "progressive", 0),
+    ] {
+        let text = super::facts::build_fact_embedding_text("project", key, value);
+        let vector = store.embedding_service.embed(text).await.unwrap();
+        sqlx::query(
+            "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, privacy, embedding)
+             VALUES ('project', ?, ?, ?, ?, ?, ?, 'channel', ?)",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(source)
+        .bind(&now)
+        .bind(&now)
+        .bind(recall)
+        .bind(crate::memory::binary::encode_embedding(&vector))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(store.fold_restated_facts().await.unwrap(), 1);
+    let active = store.get_facts(Some("project")).await.unwrap();
+    assert_eq!(active.len(), 2, "distinct knowledge stays: {active:?}");
+    let kept = active
+        .iter()
+        .find(|f| f.key == "acme_app_path")
+        .expect("the owner-stated copy is the representative");
+    assert_eq!(kept.source, "agent");
+    assert_eq!(kept.recall_count, 9, "salience moves to the kept copy");
+    assert_eq!(store.fold_restated_facts().await.unwrap(), 0, "idempotent");
+}
+
+#[tokio::test]
+async fn only_rendered_memory_counts_as_recalled() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "project",
+            "language",
+            "Rust",
+            "agent",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    let fetched = store.get_relevant_facts("rust language", 10).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(
+        store.get_facts(Some("project")).await.unwrap()[0].recall_count,
+        0,
+        "a fetch is not a recall"
+    );
+
+    store
+        .record_memory_recall(&[fetched[0].id, -1_000_000_001], &[])
+        .await
+        .unwrap();
+    let updated = store.get_facts(Some("project")).await.unwrap();
+    assert_eq!(updated[0].recall_count, 1);
+    assert!(updated[0].last_recalled_at.is_some());
 }

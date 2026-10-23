@@ -61,3 +61,24 @@ fn test_scoring_heuristic() {
     msg.role = "system".into();
     assert_eq!(score_message(&msg), 0.0);
 }
+
+#[test]
+fn fact_lifetime_is_durable_unless_explicitly_transient() {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[serde(default)]
+        lifetime: crate::memory::FactLifetime,
+    }
+    let parse = |json: &str| serde_json::from_str::<Row>(json).unwrap().lifetime;
+    assert!(parse(r#"{"lifetime":"transient"}"#).is_transient());
+    assert!(parse(r#"{"lifetime":" Transient "}"#).is_transient());
+    for durable in [
+        r#"{}"#,
+        r#"{"lifetime":null}"#,
+        r#"{"lifetime":"durable"}"#,
+        r#"{"lifetime":"weekly"}"#,
+        r#"{"lifetime":3}"#,
+    ] {
+        assert!(!parse(durable).is_transient(), "{durable}");
+    }
+}

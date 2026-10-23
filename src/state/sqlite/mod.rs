@@ -480,11 +480,6 @@ impl SqliteStateStore {
         }
 
         let episodes: Vec<Episode> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
-        for episode in &episodes {
-            if let Err(error) = self.increment_episode_recall(episode.id).await {
-                tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
-            }
-        }
         Ok(episodes)
     }
 
@@ -1215,36 +1210,6 @@ impl SqliteStateStore {
         }
     }
 
-    /// Get all expertise records.
-    pub async fn get_all_expertise(&self) -> anyhow::Result<Vec<Expertise>> {
-        let rows = sqlx::query(
-            "SELECT id, domain, tasks_attempted, tasks_succeeded, tasks_failed, current_level, confidence_score, common_errors, last_task_at, created_at, updated_at
-             FROM expertise ORDER BY confidence_score DESC"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut expertise = Vec::with_capacity(rows.len());
-        for row in rows {
-            expertise.push(self.row_to_expertise(&row)?);
-        }
-        Ok(expertise)
-    }
-
-    /// Get trusted command patterns (3+ approvals) for AI context.
-    pub async fn get_trusted_command_patterns(&self) -> anyhow::Result<Vec<(String, i32)>> {
-        let rows: Vec<(String, i32)> = sqlx::query_as(
-            "SELECT pattern, approval_count FROM command_patterns
-             WHERE approval_count >= 3
-             ORDER BY approval_count DESC
-             LIMIT 10",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows)
-    }
-
     /// Increment expertise counters and update level.
     pub async fn increment_expertise(
         &self,
@@ -1350,6 +1315,9 @@ impl SqliteStateStore {
         // Normalize so duplicates conflict and retrieval similarity is stable.
         let error_pattern =
             crate::memory::procedures::extract_error_pattern(&solution.error_pattern);
+        if error_pattern.is_empty() {
+            anyhow::bail!("error solution has no error text after removing harness scaffolding");
+        }
         let domain = solution.domain.clone().unwrap_or_default();
         let steps_json = solution
             .solution_steps

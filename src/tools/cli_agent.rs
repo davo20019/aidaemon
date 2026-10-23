@@ -1643,6 +1643,8 @@ impl CliAgentTool {
             }
 
             facts_accum.truncate(20);
+            let recalled: Vec<i64> = facts_accum.iter().map(|fact| fact.id).collect();
+            let _ = self.state.record_memory_recall(&recalled, &[]).await;
             if !facts_accum.is_empty() {
                 let fact_lines: Vec<String> = facts_accum
                     .iter()

@@ -378,27 +378,6 @@ impl Agent {
             Default::default()
         };
 
-        // Cross-channel hints (only in non-DM, non-PublicExternal channels)
-        let cross_channel_hints = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else {
-            match channel_ctx.visibility {
-                ChannelVisibility::Private
-                | ChannelVisibility::Internal
-                | ChannelVisibility::PublicExternal => vec![],
-                _ => {
-                    if let Some(ref ch_id) = channel_ctx.channel_id {
-                        self.state
-                            .get_cross_channel_hints(user_text, ch_id, 5)
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        vec![]
-                    }
-                }
-            }
-        };
-
         // Episodes: channel-scoped for non-DM channels
         let episodes = if mandate_context || !memory_pipeline_allowed {
             vec![]
@@ -454,13 +433,13 @@ impl Agent {
                 .filter(|pattern| pattern.pattern_type == "failure")
                 .collect()
         };
-        // Procedures, error solutions, and expertise are operational — always load
+        // Procedures and error solutions are operational — always load
         // (except on PublicExternal where we restrict everything)
-        let (procedures, error_solutions, expertise) = if !memory_pipeline_allowed
+        let (procedures, error_solutions) = if !memory_pipeline_allowed
             || mandate_context
             || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
         {
-            (vec![], vec![], vec![])
+            (vec![], vec![])
         } else {
             (
                 self.state
@@ -471,23 +450,12 @@ impl Agent {
                     .get_relevant_error_solutions(user_text, 5)
                     .await
                     .unwrap_or_default(),
-                self.state.get_all_expertise().await.unwrap_or_default(),
             )
         };
         let profile = if memory_pipeline_allowed && !mandate_context && inject_personal {
             self.state.get_user_profile().await.ok().flatten()
         } else {
             None
-        };
-
-        // Get trusted command patterns for AI context (skip in public channels)
-        let trusted_patterns = if memory_pipeline_allowed && !mandate_context && inject_personal {
-            self.state
-                .get_trusted_command_patterns()
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
         };
 
         // People context: resolve current speaker and fetch people data (only when enabled)
@@ -506,21 +474,10 @@ impl Agent {
             if !memory_pipeline_allowed || mandate_context || !people_enabled {
                 (vec![], None, vec![])
             } else if inject_personal {
-                // In owner DMs: load full people list for system prompt
+                // In owner DMs the people list only selects the privacy rules;
+                // the owner's own profile reaches the prompt via Core Profile.
                 let all_people = self.state.get_all_people().await.unwrap_or_default();
-                // Also load the owner's personal facts so they appear in the prompt
-                let owner_facts = if let Some(owner) = all_people
-                    .iter()
-                    .find(|p| p.relationship.as_deref() == Some("owner"))
-                {
-                    self.state
-                        .get_person_facts(owner.id, None)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                (all_people, None, owner_facts)
+                (all_people, None, vec![])
             } else if let Some(ref sender_id) = channel_ctx.sender_id {
                 // Non-owner context: try to resolve who is speaking
                 match self.state.get_person_by_platform_id(sender_id).await {
@@ -548,41 +505,10 @@ impl Agent {
             patterns: &patterns,
             procedures: &procedures,
             error_solutions: &error_solutions,
-            expertise: &expertise,
             profile: profile.as_ref(),
-            trusted_command_patterns: &trusted_patterns,
-            cross_channel_hints: &cross_channel_hints,
             people: &people,
             current_person: current_person.as_ref(),
             current_person_facts: &current_person_facts,
-        };
-
-        // Generate proactive suggestions if user likes them
-        let suggestions = if profile.as_ref().is_some_and(|p| p.likes_suggestions) {
-            let engine = crate::memory::proactive::ProactiveEngine::new(
-                patterns.clone(),
-                goals.clone(),
-                procedures.clone(),
-                episodes.clone(),
-                profile.clone().unwrap_or_default(),
-            );
-            let ctx = crate::memory::proactive::SuggestionContext {
-                last_action: None,
-                current_topic: episodes
-                    .first()
-                    .and_then(|e| e.topics.as_ref()?.first().cloned()),
-                relevant_pattern_ids: vec![],
-                relevant_goal_ids: vec![],
-                relevant_procedure_ids: vec![],
-                relevant_episode_ids: vec![],
-                session_duration_mins: 0,
-                tool_call_count: 0,
-                has_errors: false,
-                user_message: user_text.to_string(),
-            };
-            engine.get_suggestions(&ctx)
-        } else {
-            vec![]
         };
 
         // Compile session context from recent events (for "what are you doing?" awareness)
@@ -752,14 +678,19 @@ impl Agent {
             &active_skills,
             &memory_context,
             self.limits.max_facts,
-            if suggestions.is_empty() {
-                None
-            } else {
-                Some(&suggestions)
-            },
             &channel_ctx.user_id_map,
         );
         let memory_section = memory_render.prompt.as_str();
+        if let Err(error) = self
+            .state
+            .record_memory_recall(
+                &memory_render.rendered_fact_ids,
+                &memory_render.rendered_episode_ids,
+            )
+            .await
+        {
+            tracing::debug!(%error, "Failed to record rendered memory recall");
+        }
 
         if self.record_decision_points {
             self.emit_decision_point(
@@ -782,12 +713,10 @@ impl Agent {
                     "fetched": {
                         "facts": facts.len(),
                         "episodes": episodes.len(),
-                        "hints": cross_channel_hints.len(),
                         "goals": goals.len(),
                         "patterns": patterns.len(),
                         "procedures": procedures.len(),
                         "error_solutions": error_solutions.len(),
-                        "expertise": expertise.len(),
                         "people": people.len(),
                         "current_person_facts": current_person_facts.len()
                     },
@@ -972,7 +901,6 @@ impl Agent {
             goals = goals.len(),
             patterns = patterns.len(),
             procedures = procedures.len(),
-            expertise = expertise.len(),
             has_session_context = !session_context_str.is_empty(),
             "Memory context loaded"
         );

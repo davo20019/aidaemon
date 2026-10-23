@@ -52,11 +52,6 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                     break;
                 }
             }
-            for episode in &episodes {
-                if let Err(error) = self.increment_episode_recall(episode.id).await {
-                    tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
-                }
-            }
             return Ok(episodes);
         }
 
@@ -122,11 +117,6 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let episodes: Vec<Episode> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
-        for episode in &episodes {
-            if let Err(error) = self.increment_episode_recall(episode.id).await {
-                tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
-            }
-        }
         Ok(episodes)
     }
 
@@ -152,9 +142,6 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
             let mut episodes = Vec::new();
             for row in rows.into_iter().take(limit) {
                 episodes.push(self.row_to_episode(&row)?);
-            }
-            for episode in &episodes {
-                let _ = self.increment_episode_recall(episode.id).await;
             }
             return Ok(episodes);
         }
@@ -212,9 +199,6 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
             .take(limit)
             .map(|(episode, _)| episode)
             .collect();
-        for episode in &episodes {
-            let _ = self.increment_episode_recall(episode.id).await;
-        }
         Ok(episodes)
     }
 }

@@ -46,6 +46,8 @@ pub struct InlineFact {
     pub graph: crate::traits::ExtractedMemoryGraph,
     #[serde(default)]
     pub personal_memory: Option<crate::traits::PersonalMemoryWrite>,
+    #[serde(default)]
+    pub lifetime: crate::memory::FactLifetime,
 }
 
 /// Estimate token count from text using a simple heuristic (~4 chars per token).
@@ -1052,7 +1054,7 @@ pub async fn extract_inline_facts(
     let llm_messages = vec![
         json!({
             "role": "system",
-            "content": "You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
+            "content": (["You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
                         Return a JSON array of objects with 'category', 'key', 'value', and optional 'graph' or 'personal_memory' fields.\n\n\
                         Categories: user (personal info), preference (likes/dislikes), project (project details), technical (technical facts).\n\
                         Use snake_case keys for non-personal facts. For personal/profile facts involving names, aliases, handles, birth dates, residence, accounts, or family relationships, include a 'personal_memory' write plan and do not encode identity in a dynamic key. The plan has entities [{local_id,entity_type,canonical_name,is_reference,canonical_name_confirmed}], aliases [{entity_local_id,value,alias_type}], facts [{subject_local_id,predicate,value,display_value,valid_from,valid_to}], relationships [{source_local_id,relationship_type,target_local_id,valid_from,valid_to}], direct_user_statement, and correction. Use local_id 'owner' for the user. A later alias mention uses is_reference=true; a newly declared person uses false. Relationship types are PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT.\n\n\
@@ -1074,7 +1076,7 @@ pub async fn extract_inline_facts(
                         - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"dark mode\"}]\n\
                         - \"My sister Alice lives in Tokyo, not Paris\" → emit personal_memory entities for Alice and Tokyo plus a LIVES_IN relationship; do not create sister_location\n\
                         - \"How's the weather?\" → []\n\n\
-                        IMPORTANT: Return ONLY the JSON array, no other text."
+                        IMPORTANT: Return ONLY the JSON array, no other text.\n\n", crate::memory::FACT_LIFETIME_INSTRUCTION].concat())
         }),
         json!({
             "role": "user",
@@ -1304,6 +1306,9 @@ pub fn spawn_progressive_extraction(
                 let existing_facts = state.get_facts(None).await.unwrap_or_default();
                 let mut written: Vec<serde_json::Value> = Vec::new();
                 for fact in facts {
+                    if fact.lifetime.is_transient() && fact.personal_memory.is_none() {
+                        continue;
+                    }
                     if let Some(mut personal) = fact.personal_memory.clone() {
                         personal.direct_user_statement = true;
                         match state

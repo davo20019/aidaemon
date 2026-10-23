@@ -28,12 +28,14 @@ pub async fn extract_task_knowledge(
     task: Task,
 ) -> anyhow::Result<()> {
     // Derive channel provenance from the parent goal (tasks do not carry session_id).
-    let derived_channel_id: Option<String> = state
-        .get_goal(&task.goal_id)
-        .await
-        .ok()
-        .flatten()
+    let goal = state.get_goal(&task.goal_id).await.ok().flatten();
+    let derived_channel_id: Option<String> = goal
+        .as_ref()
         .and_then(|g| crate::memory::derive_channel_id_from_session(&g.session_id));
+    // A recurring goal re-runs the same brief on every fire, so its "facts"
+    // are restatements of its own instructions and run state. Its procedures
+    // and error solutions still carry over; owner facts do not.
+    let learn_facts = goal.as_ref().is_none_or(|g| g.goal_type != "continuous");
 
     // Fetch activity log for this task
     let activities = state.get_task_activities(&task.id).await?;
@@ -103,6 +105,10 @@ pub async fn extract_task_knowledge(
         \"error_solutions\": [{\"error_pattern\": \"...\", \"solution_summary\": \"...\", \"domain\": \"...\"}]\n}\n\
         Categories for facts: project, technical, preference, behavior. Graph entities use local_id, name, entity_type, aliases, confidence; relationships use source_id, target_id, relation, confidence. Only include graph data directly supported by the task evidence. Never infer entity types from category or key names.\n\
         Only extract knowledge that would be useful for FUTURE tasks. If nothing worth remembering, return empty arrays.";
+    let system_prompt = format!(
+        "{system_prompt}\nFacts may carry a \"lifetime\" field. {}",
+        crate::memory::FACT_LIFETIME_INSTRUCTION
+    );
 
     let user_prompt = format!(
         "## Task\n{}\n\n## Result\n{}\n\n## Activity Log\n{}",
@@ -139,8 +145,11 @@ pub async fn extract_task_knowledge(
     // Store extracted knowledge
     let mut stored = 0usize;
 
-    for fact in &extraction.facts {
+    for fact in extraction.facts.iter().filter(|_| learn_facts) {
         if fact.category.is_empty() || fact.key.is_empty() || fact.value.is_empty() {
+            continue;
+        }
+        if fact.lifetime.is_transient() {
             continue;
         }
         if let Err(e) = state
@@ -211,7 +220,8 @@ pub async fn extract_task_knowledge(
             },
             solution_summary: es.solution_summary.clone(),
             solution_steps: None,
-            success_count: 1,
+            // Extracted, not observed: it earns credit only when reused.
+            success_count: 0,
             failure_count: 0,
             last_used_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
@@ -256,6 +266,8 @@ struct ExtractedFact {
     value: String,
     #[serde(default)]
     graph: crate::traits::ExtractedMemoryGraph,
+    #[serde(default)]
+    lifetime: crate::memory::FactLifetime,
 }
 
 #[derive(Debug, Deserialize)]

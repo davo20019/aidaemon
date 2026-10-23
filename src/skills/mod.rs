@@ -12,8 +12,8 @@ pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
 
 use crate::tools::sanitize::sanitize_external_content;
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Person,
-    PersonFact, Procedure, StateStore, UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Fact, Goal, ModelProvider, Person, PersonFact,
+    Procedure, StateStore, UserProfile,
 };
 use crate::types::{ChannelVisibility, UserRole};
 
@@ -981,12 +981,7 @@ pub struct MemoryContext<'a> {
     pub patterns: &'a [BehaviorPattern],
     pub procedures: &'a [Procedure],
     pub error_solutions: &'a [ErrorSolution],
-    pub expertise: &'a [Expertise],
     pub profile: Option<&'a UserProfile>,
-    /// Trusted command patterns (pattern string, approval count)
-    pub trusted_command_patterns: &'a [(String, i32)],
-    /// Cross-channel hints: relevant facts from other channels (category+key only, values under confidentiality)
-    pub cross_channel_hints: &'a [Fact],
     /// All tracked people (injected only in owner DMs)
     pub people: &'a [Person],
     /// The current speaker (resolved from sender_id), if any
@@ -1168,19 +1163,10 @@ pub fn build_system_prompt_with_memory(
     active: &[&Skill],
     memory: &MemoryContext,
     _max_facts: usize,
-    _suggestions: Option<&[crate::memory::proactive::Suggestion]>,
     _user_id_map: &HashMap<String, String>,
 ) -> String {
-    build_system_prompt_with_memory_report(
-        base,
-        _skills,
-        active,
-        memory,
-        _max_facts,
-        _suggestions,
-        _user_id_map,
-    )
-    .prompt
+    build_system_prompt_with_memory_report(base, _skills, active, memory, _max_facts, _user_id_map)
+        .prompt
 }
 
 pub fn build_system_prompt_with_memory_report(
@@ -1189,7 +1175,6 @@ pub fn build_system_prompt_with_memory_report(
     active: &[&Skill],
     memory: &MemoryContext,
     max_facts: usize,
-    _suggestions: Option<&[crate::memory::proactive::Suggestion]>,
     _user_id_map: &HashMap<String, String>,
 ) -> MemoryPromptReport {
     let mut prompt = base.to_string();
@@ -1364,8 +1349,7 @@ mod tests {
             ..MemoryContext::default()
         };
 
-        let prompt =
-            build_system_prompt_with_memory("", &[], &[], &memory, 0, None, &HashMap::new());
+        let prompt = build_system_prompt_with_memory("", &[], &[], &memory, 0, &HashMap::new());
 
         assert!(prompt.contains(
             "An explicit request to create or modify a safe, local, reversible artifact is already authorization"

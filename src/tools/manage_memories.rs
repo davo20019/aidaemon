@@ -884,6 +884,8 @@ impl Tool for ManageMemoriesTool {
                             .await?
                     }
                 };
+                let recalled: Vec<i64> = episodes.iter().map(|episode| episode.id).collect();
+                let _ = self.state.record_memory_recall(&[], &recalled).await;
                 if episodes.is_empty() {
                     return Ok(if query.is_empty() {
                         "No past conversations recorded yet.".to_string()

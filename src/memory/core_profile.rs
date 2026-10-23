@@ -9,7 +9,46 @@ struct RankedEntity {
     id: String,
     lines: Vec<String>,
     salience: f32,
+    class: ProfileClass,
 }
+
+/// What a pinned entity is about. Core Profile is the only memory in every
+/// owner prompt, so it is reserved for who the owner is; preferences and
+/// operational details (paths, endpoints, workflows) get small fixed shares
+/// instead of competing on raw recall counts, which background goal runs
+/// inflate for their own plumbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileClass {
+    Personal,
+    Preference,
+    Operational,
+}
+
+impl ProfileClass {
+    fn of_category(category: &str) -> Self {
+        match category.trim().to_ascii_lowercase().as_str() {
+            "user" | "people" | "relationship" | "relationships" | "family" | "identity"
+            | "personal" | "profile" => Self::Personal,
+            "preference" => Self::Preference,
+            _ => Self::Operational,
+        }
+    }
+
+    /// Most entities of this class one profile may pin.
+    fn quota(self) -> usize {
+        match self {
+            Self::Personal => CORE_PROFILE_MAX_ENTITIES,
+            Self::Preference => 5,
+            Self::Operational => 4,
+        }
+    }
+}
+
+const CORE_PROFILE_MAX_ENTITIES: usize = 20;
+/// Rendered size cap (~600 tokens). Prefix-resident, so every byte is paid on
+/// every cold prefill.
+const CORE_PROFILE_MAX_CHARS: usize = 2400;
+const CORE_PROFILE_MAX_LINE_CHARS: usize = 240;
 
 fn canonical_profile_key(key: &str) -> String {
     match key.trim().to_ascii_lowercase().as_str() {
@@ -60,6 +99,7 @@ pub async fn build_core_profile(
                 id: format!("person_{}", person.id),
                 lines: vec![line],
                 salience,
+                class: ProfileClass::Personal,
             });
         }
     }
@@ -75,6 +115,7 @@ pub async fn build_core_profile(
                 id: format!("person_fact_{}", fact.id),
                 lines: vec![format!("• {}: {}", fact.key, fact.value)],
                 salience,
+                class: ProfileClass::Personal,
             });
         }
     }
@@ -154,6 +195,11 @@ pub async fn build_core_profile(
     for (group_id, facts) in flat_groups {
         let mut max_recall = 0;
         let mut newest_update = chrono::DateTime::<Utc>::MIN_UTC;
+        let class = facts
+            .iter()
+            .map(|fact| ProfileClass::of_category(&fact.category))
+            .min_by_key(|class| *class as u8)
+            .unwrap_or(ProfileClass::Operational);
 
         let mut name = None;
         let mut details = Vec::new();
@@ -219,8 +265,12 @@ pub async fn build_core_profile(
 
         entities.push(RankedEntity {
             id: format!("flat_group_{}", group_id),
-            lines,
+            lines: lines
+                .into_iter()
+                .map(|line| crate::utils::truncate_str(&line, CORE_PROFILE_MAX_LINE_CHARS))
+                .collect(),
             salience,
+            class,
         });
     }
 
@@ -236,7 +286,7 @@ pub async fn build_core_profile(
         }
     } else {
         order_entities(&mut entities);
-        let top_n = entities.into_iter().take(20).collect::<Vec<_>>();
+        let top_n = select_within_quotas(entities);
 
         // The cache stores ids in salience order at pin time; later renders
         // follow THIS order, not live salience (see order_selected_entities).
@@ -308,6 +358,31 @@ fn order_entities(entities: &mut [RankedEntity]) {
     });
 }
 
+/// Take entities in salience order, skipping any whose class is at its quota
+/// or that would push the rendered profile past its size cap.
+fn select_within_quotas(ordered: Vec<RankedEntity>) -> Vec<RankedEntity> {
+    let mut selected = Vec::new();
+    let mut per_class = std::collections::HashMap::new();
+    let mut chars = 0usize;
+    for entity in ordered {
+        if selected.len() >= CORE_PROFILE_MAX_ENTITIES {
+            break;
+        }
+        let taken = per_class.entry(entity.class as u8).or_insert(0usize);
+        if *taken >= entity.class.quota() {
+            continue;
+        }
+        let size: usize = entity.lines.iter().map(|line| line.len() + 1).sum();
+        if chars + size > CORE_PROFILE_MAX_CHARS {
+            continue;
+        }
+        *taken += 1;
+        chars += size;
+        selected.push(entity);
+    }
+    selected
+}
+
 /// Render ordering for the selected entities. Pinned sessions order by PIN
 /// position, never by live salience: salience drifts continuously in the
 /// background (recall_count updates, daily recency decay), so sorting by it is
@@ -334,11 +409,53 @@ mod tests {
     use super::*;
 
     fn mk(id: &str, salience: f32) -> RankedEntity {
+        mk_class(id, salience, ProfileClass::Personal)
+    }
+
+    fn mk_class(id: &str, salience: f32, class: ProfileClass) -> RankedEntity {
         RankedEntity {
             id: id.to_string(),
             lines: vec![format!("line-{id}")],
             salience,
+            class,
         }
+    }
+
+    #[test]
+    fn heavily_recalled_operational_facts_cannot_crowd_out_the_owner() {
+        let mut entities: Vec<RankedEntity> = (0..12)
+            .map(|i| {
+                mk_class(
+                    &format!("op{i:02}"),
+                    100.0 + i as f32,
+                    ProfileClass::Operational,
+                )
+            })
+            .collect();
+        entities.push(mk_class("pref", 50.0, ProfileClass::Preference));
+        entities.push(mk_class("partner", 1.0, ProfileClass::Personal));
+        entities.push(mk_class("child", 0.5, ProfileClass::Personal));
+        order_entities(&mut entities);
+        let selected = select_within_quotas(entities);
+        let ids: Vec<_> = selected.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|e| e.class == ProfileClass::Operational)
+                .count(),
+            ProfileClass::Operational.quota()
+        );
+        assert!(ids.contains(&"partner") && ids.contains(&"child") && ids.contains(&"pref"));
+    }
+
+    #[test]
+    fn profile_selection_respects_the_size_cap() {
+        let mut big = mk("big", 10.0);
+        big.lines = vec!["x".repeat(CORE_PROFILE_MAX_CHARS)];
+        let entities = vec![big, mk("small", 1.0)];
+        let selected = select_within_quotas(entities);
+        let ids: Vec<_> = selected.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["small"]);
     }
 
     #[test]

@@ -100,6 +100,25 @@ pub trait FactStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Record that these facts and episodes were shown to a model. Recall
+    /// counts drive Core Profile salience and decay, so only content that
+    /// actually reached a prompt or a tool result may count; fetching a
+    /// candidate that was then cut by a budget is not a recall.
+    async fn record_memory_recall(
+        &self,
+        _fact_ids: &[i64],
+        _episode_ids: &[i64],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Supersede active automated facts that restate another active fact in
+    /// the same category, keeping the most authoritative copy. Returns how
+    /// many rows were folded. Soft: superseded rows remain as history.
+    async fn fold_restated_facts(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// Upsert a fact with channel provenance and privacy level.
     async fn upsert_fact(
         &self,
@@ -161,16 +180,6 @@ pub trait FactStore: Send + Sync {
         _requester_is_owner: bool,
     ) -> anyhow::Result<Vec<super::Fact>> {
         self.get_relevant_facts(query, max).await
-    }
-
-    /// Get cross-channel hints: channel-scoped facts from OTHER channels relevant to the query.
-    async fn get_cross_channel_hints(
-        &self,
-        _query: &str,
-        _current_channel_id: &str,
-        _max: usize,
-    ) -> anyhow::Result<Vec<super::Fact>> {
-        Ok(vec![])
     }
 
     /// Update a fact's privacy level (e.g., channel → global after approval).
@@ -432,20 +441,9 @@ pub trait LearningStore: Send + Sync {
         Ok(vec![])
     }
 
-    /// Get all expertise records.
-    async fn get_all_expertise(&self) -> anyhow::Result<Vec<super::Expertise>> {
-        Ok(vec![])
-    }
-
     /// Get the user profile.
     async fn get_user_profile(&self) -> anyhow::Result<Option<super::UserProfile>> {
         Ok(None)
-    }
-
-    /// Get trusted command patterns for AI context.
-    /// Returns patterns with 3+ approvals, ordered by approval count.
-    async fn get_trusted_command_patterns(&self) -> anyhow::Result<Vec<(String, i32)>> {
-        Ok(vec![])
     }
 
     /// Increment expertise counters and update level for a domain.

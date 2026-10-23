@@ -46,16 +46,8 @@ impl crate::traits::LearningStore for SqliteStateStore {
         SqliteStateStore::get_relevant_error_solutions(self, error, limit).await
     }
 
-    async fn get_all_expertise(&self) -> anyhow::Result<Vec<Expertise>> {
-        SqliteStateStore::get_all_expertise(self).await
-    }
-
     async fn get_user_profile(&self) -> anyhow::Result<Option<UserProfile>> {
         Ok(Some(SqliteStateStore::get_user_profile(self).await?))
-    }
-
-    async fn get_trusted_command_patterns(&self) -> anyhow::Result<Vec<(String, i32)>> {
-        SqliteStateStore::get_trusted_command_patterns(self).await
     }
 
     async fn increment_expertise(

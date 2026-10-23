@@ -752,6 +752,10 @@ impl MemoryManager {
             - \"private\": Sensitive personal info the user would want kept private\n\
             Default to \"channel\" if unsure. People facts should default to \"private\".\n\n\
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
+        let system_prompt = format!(
+            "{system_prompt}\n\n{}",
+            crate::memory::FACT_LIFETIME_INSTRUCTION
+        );
 
         for (session_id, messages) in &sessions {
             // Defense in depth immediately before the provider call. Candidate
@@ -799,7 +803,7 @@ impl MemoryManager {
                 .join("\n");
 
             let llm_messages = vec![
-                json!({"role": "system", "content": system_prompt}),
+                json!({"role": "system", "content": system_prompt.as_str()}),
                 json!({"role": "user", "content": conversation}),
             ];
 
@@ -855,6 +859,13 @@ impl MemoryManager {
                                         }
                                         continue;
                                     }
+                                    if fact.lifetime.is_transient() {
+                                        debug!(
+                                            key = fact.key,
+                                            "Skipping transient consolidated fact"
+                                        );
+                                        continue;
+                                    }
                                     // Route "people" facts to the person_facts table
                                     if fact.category == "people" {
                                         warn!(
@@ -885,13 +896,24 @@ impl MemoryManager {
                                         .as_deref()
                                         .map(FactPrivacy::from_str_lossy)
                                         .unwrap_or(FactPrivacy::Channel);
-                                    if let Err(e) = self
-                                        .upsert_fact(
+                                    // The shared store path owns dedup, the
+                                    // user-originated overwrite guard, the
+                                    // deletion tombstone, and the embedding.
+                                    let Some(state) = &self.state else {
+                                        continue;
+                                    };
+                                    let excerpt =
+                                        crate::utils::truncate_str(&user_messages_text, 200);
+                                    if let Err(e) = state
+                                        .upsert_fact_with_provenance(
                                             &fact.category,
                                             &fact.key,
                                             &fact.value,
+                                            "consolidation",
                                             ch_id.as_deref(),
                                             privacy,
+                                            Some(chrono::Utc::now()),
+                                            Some(excerpt.as_str()),
                                         )
                                         .await
                                     {
@@ -899,25 +921,7 @@ impl MemoryManager {
                                             "Failed to upsert consolidated fact [{}/{}]: {}",
                                             fact.category, fact.key, e
                                         );
-                                    } else if let Some(state) = &self.state {
-                                        let excerpt =
-                                            crate::utils::truncate_str(&user_messages_text, 200);
-                                        if let Err(e) = sqlx::query(
-                                            "UPDATE facts
-                                             SET first_seen_at = COALESCE(first_seen_at, ?),
-                                                 source_excerpt = COALESCE(source_excerpt, ?)
-                                             WHERE lower(category) = lower(?) AND lower(key) = lower(?)
-                                               AND superseded_at IS NULL",
-                                        )
-                                        .bind(chrono::Utc::now().to_rfc3339())
-                                        .bind(excerpt.as_str())
-                                        .bind(&fact.category)
-                                        .bind(&fact.key)
-                                        .execute(&self.pool)
-                                        .await
-                                        {
-                                            debug!(error = %e, key = fact.key, "Failed to attach consolidated fact provenance");
-                                        }
+                                    } else {
                                         if let Err(e) = state
                                             .refresh_fact_memory(&fact.category, &fact.key)
                                             .await
@@ -1207,119 +1211,6 @@ impl MemoryManager {
         }
     }
 
-    async fn upsert_fact(
-        &self,
-        category: &str,
-        key: &str,
-        value: &str,
-        channel_id: Option<&str>,
-        privacy: FactPrivacy,
-    ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let privacy_str = privacy.to_string();
-
-        // Use an IMMEDIATE transaction to make the SELECT → UPDATE → INSERT atomic.
-        // This prevents concurrent consolidation cycles from losing facts.
-        let mut tx = self.pool.begin().await?;
-
-        // Use supersession logic: find existing current fact
-        let existing = sqlx::query(
-            "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
-        )
-        .bind(category)
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(row) = existing {
-            let old_value: String = row.get("value");
-            let old_id: i64 = row.get("id");
-
-            if old_value != value {
-                // Mark old as superseded
-                sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
-                    .bind(&now)
-                    .bind(old_id)
-                    .execute(&mut *tx)
-                    .await?;
-
-                // Insert new fact — ignore duplicate entry errors (code 2067)
-                let insert_result = sqlx::query(
-                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
-                     VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
-                )
-                .bind(category)
-                .bind(key)
-                .bind(value)
-                .bind(&now)
-                .bind(&now)
-                .bind(channel_id)
-                .bind(&privacy_str)
-                .execute(&mut *tx)
-                .await;
-
-                match insert_result {
-                    Ok(_) => {}
-                    Err(sqlx::Error::Database(ref db_err))
-                        if db_err.code().as_deref() == Some("2067") =>
-                    {
-                        // Duplicate entry — fact already exists, ignore
-                    }
-                    Err(e) => {
-                        tx.rollback().await.ok();
-                        return Err(e.into());
-                    }
-                }
-            }
-        } else {
-            // Check for previously-deleted (superseded) fact — don't re-create via consolidation.
-            // This respects the user's explicit deletion. They can still re-add facts
-            // explicitly via the remember_fact tool which uses StateStore::upsert_fact.
-            let was_deleted = sqlx::query(
-                "SELECT id FROM facts WHERE category = ? AND key = ? AND superseded_at IS NOT NULL LIMIT 1",
-            )
-            .bind(category)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            if was_deleted.is_some() {
-                tx.commit().await?;
-                return Ok(());
-            }
-
-            // No existing fact - insert new (ignore duplicate entry errors from concurrent inserts)
-            let insert_result = sqlx::query(
-                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
-                 VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
-            )
-            .bind(category)
-            .bind(key)
-            .bind(value)
-            .bind(&now)
-            .bind(&now)
-            .bind(channel_id)
-            .bind(&privacy_str)
-            .execute(&mut *tx)
-            .await;
-
-            match insert_result {
-                Ok(_) => {}
-                Err(sqlx::Error::Database(ref db_err))
-                    if db_err.code().as_deref() == Some("2067") =>
-                {
-                    // Duplicate entry — fact already exists, ignore
-                }
-                Err(e) => {
-                    tx.rollback().await.ok();
-                    return Err(e.into());
-                }
-            }
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     // ==================== Episode Creation ====================
 
     /// Generate a clean transcript from messages, compressing tool calls.
@@ -1561,7 +1452,13 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         ];
 
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let model = runtime_snapshot.primary_model();
+        // An episode is a short summary of a finished session: fast-tier work.
+        // Running it on the primary model spent the most expensive tokens on
+        // the least read memory.
+        let model = runtime_snapshot
+            .router()
+            .map(|router| router.select(crate::router::Tier::Fast).to_string())
+            .unwrap_or_else(|| runtime_snapshot.primary_model());
         let call_start = std::time::Instant::now();
         let response = runtime_snapshot
             .provider()
@@ -1957,16 +1854,28 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
     /// Apply decay to old memories (reduce recall counts over time).
     pub async fn decay_memories(&self) -> anyhow::Result<()> {
-        // Decay facts not recalled in the last 30 days
-        let thirty_days_ago = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        // Merge paraphrased duplicates first so decay and salience see one
+        // row per piece of knowledge.
+        if let Some(state) = &self.state {
+            if let Err(error) = state.fold_restated_facts().await {
+                warn!(%error, "Failed to fold restated facts");
+            }
+        }
 
+        // Facts not shown to the model for two weeks lose a tenth of their
+        // salience per day (at least one point). A linear one-point decay let
+        // a fact recalled a hundred times stay pinned for months after it
+        // stopped mattering.
+        let fourteen_days_ago = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         sqlx::query(
-            "UPDATE facts SET recall_count = MAX(0, recall_count - 1)
+            "UPDATE facts SET recall_count = MAX(0, recall_count - MAX(1, recall_count / 10))
              WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
         )
-        .bind(&thirty_days_ago)
+        .bind(&fourteen_days_ago)
         .execute(&self.pool)
         .await?;
+
+        let thirty_days_ago = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
 
         // Decay episodes
         sqlx::query(
@@ -2513,6 +2422,8 @@ struct ExtractedFact {
     graph: crate::traits::ExtractedMemoryGraph,
     #[serde(default, deserialize_with = "deserialize_lossy_personal_memory")]
     personal_memory: Option<crate::traits::PersonalMemoryWrite>,
+    #[serde(default)]
+    lifetime: crate::memory::FactLifetime,
 }
 
 fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>

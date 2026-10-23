@@ -228,8 +228,15 @@ fn build_agent_side_partial_failure(
 /// allowing either background path here would both leak mandate content into
 /// global owner memory and make unmetered provider calls outside the durable
 /// per-run token lease.
+///
+/// Worker sessions (specialists, sub-agents, background jobs) keep their
+/// session-local summaries but never extract owner facts: their "user" turn
+/// is a delegated brief, so every scheduled run would re-learn its own
+/// instructions as durable memory. Consolidation and retention already treat
+/// these sessions as memory-isolated.
 fn post_completion_memory_plan(
     mandate_execution: bool,
+    memory_isolated_session: bool,
     memory_pipeline_allowed: bool,
     progressive_facts_enabled: bool,
     fact_extraction_eligible: bool,
@@ -239,7 +246,7 @@ fn post_completion_memory_plan(
         return (false, false);
     }
     (
-        progressive_facts_enabled && fact_extraction_eligible,
+        !memory_isolated_session && progressive_facts_enabled && fact_extraction_eligible,
         summarization_enabled,
     )
 }
@@ -334,17 +341,25 @@ mod gate_telemetry_tests {
     #[test]
     fn mandate_completion_disables_fact_extraction_and_summarization() {
         assert_eq!(
-            post_completion_memory_plan(true, true, true, true, true),
+            post_completion_memory_plan(true, false, true, true, true, true),
             (false, false)
         );
         assert_eq!(
-            post_completion_memory_plan(false, true, true, true, true),
+            post_completion_memory_plan(false, false, true, true, true, true),
             (true, true)
         );
         assert_eq!(
-            post_completion_memory_plan(false, false, true, true, true),
+            post_completion_memory_plan(false, false, false, true, true, true),
             (false, false),
             "a task-local no-memory policy suppresses every post-turn pipeline"
+        );
+    }
+
+    #[test]
+    fn worker_sessions_keep_summaries_but_never_extract_owner_facts() {
+        assert_eq!(
+            post_completion_memory_plan(false, true, true, true, true, true),
+            (false, true)
         );
     }
 
@@ -3086,6 +3101,7 @@ pub(super) async fn run_completion_phase(
             .unwrap_or_else(|| model.clone());
         let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
             agent.mandate_execution.is_some(),
+            agent.depth > 0 || crate::events::is_memory_isolated_worker_session(session_id),
             learning_ctx.memory_persistence_allowed,
             agent.context_window_config.progressive_facts,
             crate::memory::context_window::should_extract_facts(user_text),
