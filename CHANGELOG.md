@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.9] - 2026-10-22
+
+### Fixed
+
+- **Scheduled goal runs no longer write their own instructions into owner memory.** Inline fact extraction ran in goal worker sessions (`specialist:*`, `sub-*`, `background:*`), whose "user" turn is a delegated brief, so a daily blog goal re-learned its workflow under a new key on every fire (about a fifth of all stored facts). Worker sessions keep their session summaries but no longer extract owner facts, matching consolidation and retention. Task learning from a recurring (`continuous`) goal still records procedures and error solutions, but no facts.
+- **Background extractors cannot overwrite what the owner said.** The overwrite guard covered only consolidation; progressive extraction and task learning could replace an owner-stated fact. Every automated source is now blocked from changing an owner-authored value, and none can resurrect a key the owner deleted or that was merged away.
+- **Consolidation writes through the shared fact path.** Its private upsert skipped dedup, the overwrite guard, the write lock, and the embedding, so its facts were invisible to semantic recall until the next startup backfill. It now uses the same guarded path as every other writer.
+- **Paraphrased duplicates are folded instead of stored again.** An automated write whose key and value restate an active fact in the same category (full-fact similarity ≥ 0.93, the same numbers, at least half the words shared, and no entity-token difference for personal keys) refreshes that fact instead of adding a copy. The daily memory job folds existing restatements the same way, keeping the owner-stated or most recalled copy; folded rows are superseded, not deleted.
+- **Recall counts what the model saw, not what was fetched.** Retrieval used to bump `recall_count` for every candidate before the prompt budget cut it, so goal runs voted their own plumbing into the pinned Core Profile. Recall is now recorded for facts and episodes that render into the prompt, a CLI agent brief, or a memory search result, and salience unused for two weeks decays by a tenth per day instead of one point.
+- **Error-solution hints no longer match on our own wrappers.** Error patterns are extracted after removing harness scaffolding (untrusted-data envelopes, truncation notices, coaching), and an error with no remaining text is not stored. LLM-extracted and correlation-only error solutions start unproven and earn credit only when reused successfully.
+- **New requests keep the recent conversation.** A top-level `new_request` no longer acts like a silent `/clear`: the last few dialogue turns stay visible (tool rows stripped) with a continuity note, and no durable context boundary is written. An assessment too unsure to install now yields recall-only memory instead of suppressing recall; an explicit memory denial is still honoured.
+
+### Changed
+
+- **Extracted facts can be marked transient.** Consolidation, progressive extraction, and task learning may tag state that will soon be stale (the last command run, a single run's result, current disk numbers) with `"lifetime": "transient"`; such facts are not stored.
+- **Core Profile reserves its slots for the owner.** Pinned entities are selected under category quotas (at most 5 preferences and 4 operational entries such as paths or endpoints) and a ~600-token size cap, with long lines truncated.
+- **Episode summaries run on the fast model tier** instead of the primary model.
+
+### Removed
+
+- Per-turn fetches whose results never reached the prompt: expertise, trusted command patterns, cross-channel hints, owner person facts, and proactive suggestions (`memory::proactive`). Also the uncompiled `memory/vector_index.rs` and the unused `Consolidator::daily_consolidation` / `on_session_end`.
+
 ## [0.12.8] - 2026-09-24
 
 ### Fixed
