@@ -1066,7 +1066,7 @@ impl CliAgentTool {
                 .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
         };
         if let Some(preferred) = preferred {
-            if tools.get(preferred).is_some_and(&supports_split_access) {
+            if tools.get(preferred).is_some_and(supports_split_access) {
                 return Some(preferred.to_string());
             }
         }
