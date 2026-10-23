@@ -1449,11 +1449,25 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         planner_trust_tier,
     )
     .await?;
+    // An assessment too unsure to install can still restrict memory.
+    let unapplied_forbidden_scopes = if semantic_contract_applied {
+        &[][..]
+    } else {
+        task_plan
+            .as_ref()
+            .and_then(|plan| plan.contract.as_ref())
+            .map(|contract| contract.forbidden_tool_scopes.as_slice())
+            .unwrap_or_default()
+    };
     let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
         &turn_context.completion_contract,
         semantic_contract_applied,
+        unapplied_forbidden_scopes,
     );
+    // Persistence and recall are separate: an unsure assessment withholds
+    // learning but must not erase what the agent already knows.
     let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
+    let memory_recall_allowed = memory_pipeline_policy.allows_recall();
     learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;
     emitter
         .emit(
@@ -1461,13 +1475,16 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             crate::events::MemoryPolicyCompiledData {
                 task_id: task_id.clone(),
                 turn_id: Some(user_msg_id.clone()),
+                // `access` excludes the turn from every automatic memory
+                // pipeline (`memory_suppressed_turn_ids`), so it tracks
+                // persistence, not recall.
                 access: if memory_pipeline_allowed {
                     crate::events::MemoryPipelineAccess::Allowed
                 } else {
                     crate::events::MemoryPipelineAccess::Suppressed
                 },
                 reason_code: memory_pipeline_policy.reason_code().to_string(),
-                retrieval_suppressed: !memory_pipeline_allowed,
+                retrieval_suppressed: !memory_recall_allowed,
                 persistence_suppressed: !memory_pipeline_allowed,
             },
         )
@@ -1481,17 +1498,23 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             "Compiled automatic memory policy".to_string(),
             json!({
                 "condition": "memory_policy_compiled",
-                "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
+                "policy": if memory_pipeline_allowed {
+                    "allowed"
+                } else if memory_recall_allowed {
+                    "recall_only"
+                } else {
+                    "suppressed"
+                },
                 "reason_code": memory_pipeline_policy.reason_code(),
-                "retrieval_suppressed": !memory_pipeline_allowed,
-                "memory_message_projection_suppressed": !memory_pipeline_allowed,
+                "retrieval_suppressed": !memory_recall_allowed,
+                "memory_message_projection_suppressed": !memory_recall_allowed,
                 "post_task_learning_suppressed": !memory_pipeline_allowed,
             }),
         )
         .await;
     // Identity/profile retrieval is optional memory access too; compile the
     // policy first, then fetch only the bounded categories used by the prompt.
-    let owner_dm_fact_cache = if memory_pipeline_allowed
+    let owner_dm_fact_cache = if memory_recall_allowed
         && agent.depth == 0
         && user_role == UserRole::Owner
         && channel_ctx.should_inject_personal_memory()
@@ -1565,7 +1588,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     session_summary = if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && !non_owner_shared_context
-        && memory_pipeline_allowed
+        && memory_recall_allowed
     {
         agent
             .state
@@ -1631,7 +1654,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             resume_checkpoint.as_ref(),
             owner_dm_fact_cache.as_deref(),
             session_summary.as_ref(),
-            memory_pipeline_allowed,
+            memory_recall_allowed,
             preserve_conversation_context,
             project_instruction_scope,
         )

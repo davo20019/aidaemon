@@ -146,6 +146,38 @@ fn redact_archived_shared_turns(turns: &mut Vec<crate::events::FetchedTurn>) {
     turns.retain(|turn| !turn.messages.is_empty());
 }
 
+/// Recent turns a new request still sees. A new request starts a new task, not
+/// a new conversation: pronouns and elided references ("how old are they?")
+/// resolve against what was just said, whatever the relationship classifier
+/// concluded.
+const NEW_REQUEST_DIALOGUE_TURNS: usize = 6;
+const NEW_REQUEST_DIALOGUE_MAX_AGE_HOURS: i64 = 12;
+
+/// Reduce archived turns to the recent dialogue a new request may see: the
+/// last few turns inside the age window, rendered as user text and final
+/// assistant replies only. Tool calls and results are removed, so an earlier
+/// task's observations never reach the transcript as fresh evidence; the
+/// task's own receipts remain the only proof of work. Returns how many turns
+/// were dropped.
+fn retain_recent_dialogue_for_new_request(
+    turns: &mut Vec<crate::events::FetchedTurn>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let before = turns.len();
+    let cutoff = now - chrono::Duration::hours(NEW_REQUEST_DIALOGUE_MAX_AGE_HOURS);
+    turns.retain(|turn| {
+        turn.messages
+            .iter()
+            .map(|message| message.created_at)
+            .max()
+            .is_some_and(|last_activity| last_activity >= cutoff)
+    });
+    let excess = turns.len().saturating_sub(NEW_REQUEST_DIALOGUE_TURNS);
+    turns.drain(..excess);
+    redact_archived_shared_turns(turns);
+    before.saturating_sub(turns.len())
+}
+
 fn compact_parent_text(content: &str, max_chars: usize, strip_file_stubs: bool) -> String {
     let content = if strip_file_stubs {
         crate::channels::attachments::strip_inbound_file_stubs(content)
@@ -708,7 +740,32 @@ pub(super) async fn run_message_build_phase(
 
     // Split off the current turn (always the last entry now).
     let current_turn = turns.pop().expect("at least the current turn is present");
-    if !preserve_archived_context {
+    // Top-level chat keeps its recent dialogue across a new-request boundary.
+    // Delegated and mandate workers keep the strict floor: their transcript is
+    // an authority envelope, not a conversation with the user.
+    let isolated_transcript = agent.depth > 0 || agent.mandate_execution.is_some();
+    if !preserve_archived_context && !isolated_transcript {
+        let archived_turns_dropped =
+            retain_recent_dialogue_for_new_request(&mut turns, chrono::Utc::now());
+        // Bound later fetches to the retained window. The durable
+        // `session_context_boundaries` row belongs to explicit `/clear`; a
+        // semantic new-request classification must never write it.
+        let floor = turns
+            .first()
+            .map(|turn| turn.turn_seq)
+            .unwrap_or(current_turn.turn_seq);
+        let mut anchors = agent.turn_anchors.write().await;
+        let anchor = anchors.entry(session_id.to_string()).or_insert(floor);
+        *anchor = (*anchor).max(floor);
+        info!(
+            session_id,
+            iteration,
+            context_floor_turn_seq = *anchor,
+            dialogue_turns_retained = turns.len(),
+            archived_turns_dropped,
+            "Retained recent dialogue for new request"
+        );
+    } else if !preserve_archived_context {
         let archived_turns_dropped = turns.len();
         turns.clear();
 
@@ -3297,7 +3354,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_task_advances_context_floor_and_followup_cannot_resurrect_older_task() {
+    async fn new_request_keeps_recent_dialogue_but_not_prior_tool_output() {
+        // Top-level chat agent (depth 0); executor-mode harnesses keep the
+        // strict delegated-worker floor.
+        let harness = crate::testing::setup_test_agent_with_models(
+            MockProvider::new(),
+            "mock-model",
+            "mock-model",
+        )
+        .await
+        .unwrap();
+        let store = seed_store(&harness).await;
+        let session = "new-request-dialogue";
+        seed_turn(
+            &store,
+            session,
+            "kids-turn",
+            "My kids?",
+            Some(("manage_people", "person_record=stale-observation-7f3a")),
+            "You have two daughters: Mia and Zoe. Mia is the older one.",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            session,
+            "ages-turn",
+            "How old are they?",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, session, "ages-turn").await;
+
+        // The relationship producer failed to link the turns: a new request.
+        let payload =
+            build_payload_with_continuity(&harness, session, "How old are they?", 1, false).await;
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        assert!(payload_json.contains("My kids?"), "{payload_json}");
+        assert!(
+            payload_json.contains("Mia and Zoe"),
+            "the referent of \"they\" must stay visible: {payload_json}"
+        );
+        assert!(
+            !payload_json.contains("stale-observation-7f3a"),
+            "an earlier task's tool output must not reach a new request: {payload_json}"
+        );
+        assert_eq!(
+            store.session_context_boundary(session).await.unwrap(),
+            None,
+            "a new-request classification must not write the explicit /clear boundary"
+        );
+
+        // After a restart the in-memory anchor is gone; the dialogue survives.
+        harness.agent.turn_anchors.write().await.clear();
+        let after_restart =
+            build_payload_with_continuity(&harness, session, "How old are they?", 1, false).await;
+        assert!(serde_json::to_string(&after_restart)
+            .unwrap()
+            .contains("Mia and Zoe"));
+    }
+
+    #[test]
+    fn new_request_dialogue_window_is_recent_bounded_and_tool_free() {
+        let now = chrono::Utc::now();
+        let turn = |seq: i64, age_hours: i64| {
+            let at = now - chrono::Duration::hours(age_hours);
+            let message = |role: &str, content: &str| Message {
+                id: format!("m-{seq}-{role}"),
+                session_id: "window".to_string(),
+                role: role.to_string(),
+                content: Some(content.to_string()),
+                created_at: at,
+                turn_id: Some(format!("t-{seq}")),
+                ..Message::runtime_defaults()
+            };
+            crate::events::FetchedTurn {
+                turn_id: Some(format!("t-{seq}")),
+                turn_seq: seq,
+                messages: vec![
+                    message("user", &format!("question {seq}")),
+                    Message {
+                        tool_call_id: Some(format!("call-{seq}")),
+                        tool_name: Some("terminal".to_string()),
+                        ..message("tool", &format!("tool output {seq}"))
+                    },
+                    message("assistant", &format!("answer {seq}")),
+                ],
+                terminal_status: None,
+            }
+        };
+        // One day-old turn, then more recent turns than the window holds.
+        let mut turns = vec![turn(1, 30)];
+        turns.extend((2..=10).map(|seq| turn(seq, 1)));
+
+        let dropped = retain_recent_dialogue_for_new_request(&mut turns, now);
+
+        assert_eq!(turns.len(), NEW_REQUEST_DIALOGUE_TURNS);
+        assert_eq!(dropped, 10 - NEW_REQUEST_DIALOGUE_TURNS);
+        assert_eq!(
+            turns.iter().map(|turn| turn.turn_seq).collect::<Vec<_>>(),
+            (5..=10).collect::<Vec<_>>(),
+            "the newest turns are kept, oldest first"
+        );
+        assert!(turns
+            .iter()
+            .flat_map(|turn| &turn.messages)
+            .all(|message| message.role != "tool"));
+        assert!(turns[0]
+            .messages
+            .iter()
+            .any(|message| message.content.as_deref() == Some("answer 5")));
+    }
+
+    #[tokio::test]
+    async fn delegated_worker_new_task_keeps_strict_floor_and_followup_cannot_resurrect_older_task()
+    {
+        // Executor-mode harness (depth 1): delegated workers keep the strict
+        // floor that top-level chat relaxes to a dialogue window.
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let store = seed_store(&harness).await;
         seed_turn(

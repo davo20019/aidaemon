@@ -1138,12 +1138,22 @@ pub(crate) enum MemoryPipelinePolicy {
     Allowed,
     SuppressedByCurrentContract,
     SuppressedByAssessment,
-    SuppressedAssessmentUnavailable,
+    /// The assessment could not be applied (unavailable or low confidence) and
+    /// no denial was signalled. Recall stays on: without it the agent forgets
+    /// who the user is on every uncertain turn. Persistence stays off, because
+    /// learning needs an applied task description.
+    RecallOnlyAssessmentUnavailable,
 }
 
 impl MemoryPipelinePolicy {
+    /// Whether automatic memory may be written or learned from this task.
     pub(crate) const fn allows_memory(self) -> bool {
         matches!(self, Self::Allowed)
+    }
+
+    /// Whether stored memory may be recalled into this task's prompt.
+    pub(crate) const fn allows_recall(self) -> bool {
+        matches!(self, Self::Allowed | Self::RecallOnlyAssessmentUnavailable)
     }
 
     pub(crate) const fn reason_code(self) -> &'static str {
@@ -1151,17 +1161,21 @@ impl MemoryPipelinePolicy {
             Self::Allowed => "allowed_by_compiled_contract",
             Self::SuppressedByCurrentContract => "inherited_contract_denies_user_memory",
             Self::SuppressedByAssessment => "current_assessment_denies_user_memory",
-            Self::SuppressedAssessmentUnavailable => "assessment_unavailable_fail_closed",
+            Self::RecallOnlyAssessmentUnavailable => "assessment_unavailable_recall_only",
         }
     }
 }
 
 /// Compile the task-local automatic-memory policy from typed lifecycle state.
-/// Assessment failure is fail-closed for *automatic* memory only; normal tool
-/// availability remains governed by the completion contract in the main loop.
+///
+/// A denial is honoured from any source, including an assessment that was too
+/// unsure to install (`unapplied_forbidden_scopes`): restricting memory is the
+/// safe direction, so it needs no confidence. An unavailable assessment only
+/// withholds persistence.
 pub(crate) fn compile_memory_pipeline_policy(
     current_contract: &crate::agent::CompletionContract,
     semantic_contract_applied: bool,
+    unapplied_forbidden_scopes: &[crate::traits::ToolSemanticScope],
 ) -> MemoryPipelinePolicy {
     if current_contract
         .forbidden_tool_scopes
@@ -1174,7 +1188,12 @@ pub(crate) fn compile_memory_pipeline_policy(
         };
     }
     if !semantic_contract_applied {
-        return MemoryPipelinePolicy::SuppressedAssessmentUnavailable;
+        return if unapplied_forbidden_scopes.contains(&crate::traits::ToolSemanticScope::UserMemory)
+        {
+            MemoryPipelinePolicy::SuppressedByAssessment
+        } else {
+            MemoryPipelinePolicy::RecallOnlyAssessmentUnavailable
+        };
     }
     if !current_contract.allowed_tool_names.is_empty()
         && !current_contract.allowed_tool_names.iter().any(|name| {
@@ -3255,35 +3274,46 @@ mod tests {
 
     #[test]
     fn memory_policy_is_compiled_once_from_typed_task_capabilities() {
+        let user_memory = crate::traits::ToolSemanticScope::UserMemory;
         let current_contract = crate::agent::CompletionContract::default();
+        let unavailable = compile_memory_pipeline_policy(&current_contract, false, &[]);
         assert_eq!(
-            compile_memory_pipeline_policy(&current_contract, false),
-            MemoryPipelinePolicy::SuppressedAssessmentUnavailable,
-            "automatic memory must fail closed when the semantic assessment is unavailable"
+            unavailable,
+            MemoryPipelinePolicy::RecallOnlyAssessmentUnavailable,
+            "an unsure assessment must not erase what the agent knows about the user"
+        );
+        assert!(unavailable.allows_recall());
+        assert!(
+            !unavailable.allows_memory(),
+            "persistence still needs an applied assessment"
         );
 
-        let mut inherited_denial = current_contract.clone();
-        inherited_denial
-            .forbidden_tool_scopes
-            .push(crate::traits::ToolSemanticScope::UserMemory);
+        let unsure_denial =
+            compile_memory_pipeline_policy(&current_contract, false, &[user_memory]);
         assert_eq!(
-            compile_memory_pipeline_policy(&inherited_denial, false),
+            unsure_denial,
+            MemoryPipelinePolicy::SuppressedByAssessment,
+            "a denial is honoured even when the assessment was too unsure to install"
+        );
+        assert!(!unsure_denial.allows_recall());
+
+        let mut inherited_denial = current_contract.clone();
+        inherited_denial.forbidden_tool_scopes.push(user_memory);
+        assert_eq!(
+            compile_memory_pipeline_policy(&inherited_denial, false, &[]),
             MemoryPipelinePolicy::SuppressedByCurrentContract
         );
 
         let mut current_denial = current_contract.clone();
-        current_denial
-            .forbidden_tool_scopes
-            .push(crate::traits::ToolSemanticScope::UserMemory);
+        current_denial.forbidden_tool_scopes.push(user_memory);
         assert_eq!(
-            compile_memory_pipeline_policy(&current_denial, true),
+            compile_memory_pipeline_policy(&current_denial, true, &[]),
             MemoryPipelinePolicy::SuppressedByAssessment
         );
 
-        assert_eq!(
-            compile_memory_pipeline_policy(&current_contract, true),
-            MemoryPipelinePolicy::Allowed
-        );
+        let allowed = compile_memory_pipeline_policy(&current_contract, true, &[]);
+        assert_eq!(allowed, MemoryPipelinePolicy::Allowed);
+        assert!(allowed.allows_recall() && allowed.allows_memory());
     }
 
     #[test]

@@ -531,13 +531,21 @@ async fn test_synthesized_done_persisted() {
         .unwrap();
     assert!(!r2.is_empty(), "Turn 2 should produce a non-empty response");
 
-    // The different-topic Turn 2 must not receive Turn 1 as ambient prompt
-    // context, but the synthesized completion must still exist in canonical
-    // event history for explicit lookup and audit.
+    // The different-topic Turn 2 keeps Turn 1 as dialogue (so references
+    // resolve) but receives none of Turn 1's tool activity as evidence. The
+    // synthesized completion must still exist in canonical event history for
+    // explicit lookup and audit.
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = &call_log[3];
     let turn2_serialized = serde_json::to_string(&turn2_call.messages).unwrap();
-    assert!(!turn2_serialized.contains("Check my system info"));
+    assert!(turn2_serialized.contains("Check my system info"));
+    assert!(
+        turn2_call.messages.iter().all(|message| {
+            message.get("role").and_then(|role| role.as_str()) != Some("tool")
+                && message.get("tool_calls").is_none()
+        }),
+        "a new request must not see an earlier task's tool activity: {turn2_serialized}"
+    );
     drop(call_log);
 
     let canonical = harness

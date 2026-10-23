@@ -1,6 +1,16 @@
 use super::recall_guardrails::{build_critical_facts_prompt_block, extract_critical_fact_summary};
 use super::*;
 
+/// Framing for the recent dialogue a new request keeps. The earlier turns are
+/// visible so references resolve; they are not work to redo, and outputs in
+/// them may no longer describe current state.
+const NEW_REQUEST_DIALOGUE_NOTE: &str = "[Conversation Continuity]\n\
+     The messages before the current one are the recent conversation with this user \
+     (tool activity omitted). Use them to understand references such as \"they\", \
+     \"that\", or \"the second one\"; do not ask the user to repeat something they just said. \
+     Those earlier requests are already handled: do not redo them, and re-check any \
+     current state instead of repeating earlier outputs.";
+
 pub(in crate::agent) fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
     for line in prompt.lines() {
         let trimmed = line.trim();
@@ -854,13 +864,21 @@ impl Agent {
             None
         };
 
+        // Mirrors the transcript rule in `message_build_phase`: top-level chat
+        // keeps recent dialogue across a new-request boundary, so say how to
+        // read it.
+        let new_request_dialogue_note = if mandate_context || self.depth > 0 {
+            ""
+        } else {
+            NEW_REQUEST_DIALOGUE_NOTE
+        };
         let fresh_tail = Self::build_context_tail(
             critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
             memory_section,
             channel_ctx.sender_name.as_deref(),
             None,
-            "",
+            new_request_dialogue_note,
             &date_time_str,
             resume_section.as_deref(),
         );
