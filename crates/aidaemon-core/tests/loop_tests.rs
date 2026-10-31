@@ -1026,3 +1026,405 @@ fn builder_rejects_bad_configuration() {
         .build();
     assert!(matches!(bad_name, Err(BuildError::InvalidToolName(_))));
 }
+
+// ---------- regressions ----------
+
+/// Records the arguments each call ran with.
+struct RecordingTool {
+    name: &'static str,
+    annotations: ToolAnnotations,
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+#[async_trait]
+impl Tool for RecordingTool {
+    fn spec(&self) -> ToolSpec {
+        spec(self.name, "records arguments", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        self.annotations
+    }
+    async fn call(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+        self.seen.lock().unwrap().push(args);
+        Ok(ToolOutput::text("same output"))
+    }
+}
+
+fn recording(
+    name: &'static str,
+    annotations: ToolAnnotations,
+) -> (RecordingTool, Arc<Mutex<Vec<Value>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (
+        RecordingTool {
+            name,
+            annotations,
+            seen: seen.clone(),
+        },
+        seen,
+    )
+}
+
+fn no_stuck_detection() -> StuckConfig {
+    StuckConfig {
+        repeat_threshold: 0,
+        error_threshold: 0,
+        ping_pong_window: 0,
+        max_nudges: 0,
+    }
+}
+
+#[tokio::test]
+async fn approval_runs_the_rewritten_call_the_approver_saw() {
+    struct Sandbox;
+    #[async_trait]
+    impl Hook for Sandbox {
+        async fn before_tool(
+            &self,
+            _ctx: &HookContext<'_>,
+            call: &ToolCall,
+            _ann: ToolAnnotations,
+        ) -> ToolDecision {
+            match call.arguments["path"].as_str() {
+                Some(path) if !path.starts_with("/sandbox/") => ToolDecision::Rewrite {
+                    arguments: json!({ "path": format!("/sandbox{path}") }),
+                },
+                _ => ToolDecision::Allow,
+            }
+        }
+    }
+    struct AskFirst;
+    #[async_trait]
+    impl Hook for AskFirst {
+        async fn before_tool(
+            &self,
+            _ctx: &HookContext<'_>,
+            _call: &ToolCall,
+            _ann: ToolAnnotations,
+        ) -> ToolDecision {
+            ToolDecision::Interrupt {
+                reason: "needs approval".into(),
+            }
+        }
+    }
+
+    let (tool, seen) = recording("write", ToolAnnotations::WRITE);
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "write", json!({"path": "/etc/hosts"}))]),
+        text("done"),
+    ]))
+    .tool(tool)
+    .hook(Sandbox)
+    .hook(AskFirst)
+    .build()
+    .unwrap();
+
+    let paused = agent.run("s", "write it").await.unwrap();
+    let RunStatus::Interrupted { interruption } = &paused.status else {
+        panic!("expected an interruption, got {:?}", paused.status);
+    };
+    assert_eq!(
+        interruption.call.arguments,
+        json!({"path": "/sandbox/etc/hosts"})
+    );
+
+    // Through serialization, as a separate process would see it.
+    let saved = serde_json::to_string(&paused.state).unwrap();
+    let state: RunState = serde_json::from_str(&saved).unwrap();
+    let out = agent.resume(state, Resolution::Approve).await.unwrap();
+
+    assert_eq!(out.status, RunStatus::Completed);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![json!({"path": "/sandbox/etc/hosts"})],
+        "the approved call must run with the arguments shown to the approver"
+    );
+    assert_eq!(
+        out.receipts()[0].arguments,
+        json!({"path": "/sandbox/etc/hosts"})
+    );
+}
+
+#[tokio::test]
+async fn tool_call_limit_holds_inside_one_batch() {
+    let (tool, seen) = recording("write", ToolAnnotations::WRITE);
+    let (reader, read) = recording("read", ToolAnnotations::READ_ONLY);
+    let calls = vec![
+        call("c0", "read", json!({"i": 0})),
+        call("c1", "write", json!({"i": 1})),
+        call("c2", "read", json!({"i": 2})),
+        call("c3", "write", json!({"i": 3})),
+        call("c4", "write", json!({"i": 4})),
+    ];
+    let agent = base(ScriptedProvider::new([tool_calls(calls), text("unused")]))
+        .tool(tool)
+        .tool(reader)
+        .limits(Limits {
+            max_tool_calls: Some(3),
+            ..Limits::default()
+        })
+        .stuck_detection(no_stuck_detection())
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(
+        out.status,
+        RunStatus::LimitReached {
+            limit: LimitKind::ToolCalls
+        }
+    );
+    assert_eq!(read.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().len(), 1, "only c1 of the writes ran");
+    let statuses: Vec<ReceiptStatus> = out.receipts().iter().map(|r| r.status).collect();
+    assert_eq!(
+        statuses,
+        vec![
+            ReceiptStatus::Succeeded,
+            ReceiptStatus::Succeeded,
+            ReceiptStatus::Succeeded,
+            ReceiptStatus::Skipped,
+            ReceiptStatus::Skipped,
+        ]
+    );
+    // Every call still has a result, so the transcript stays well formed.
+    let ids: Vec<String> = tool_messages(&out.state).into_iter().map(|m| m.0).collect();
+    assert_eq!(ids, vec!["c0", "c1", "c2", "c3", "c4"]);
+}
+
+#[tokio::test]
+async fn wall_clock_budget_bounds_a_hanging_model_call() {
+    struct Hanging;
+    #[async_trait]
+    impl aidaemon_core::Provider for Hanging {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        async fn complete(
+            &self,
+            _request: &aidaemon_core::ModelRequest,
+        ) -> Result<aidaemon_core::ModelResponse, ProviderError> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("the wall-clock budget should end the call first")
+        }
+    }
+
+    let agent = Agent::builder("a")
+        .model("m")
+        .provider(Hanging)
+        .limits(Limits {
+            timeout: Some(Duration::from_millis(50)),
+            ..Limits::default()
+        })
+        .build()
+        .unwrap();
+
+    let out = tokio::time::timeout(Duration::from_secs(5), agent.run("s", "hi"))
+        .await
+        .expect("the run must end within its wall-clock budget")
+        .unwrap();
+    assert_eq!(
+        out.status,
+        RunStatus::LimitReached {
+            limit: LimitKind::WallClock
+        }
+    );
+}
+
+#[tokio::test]
+async fn wall_clock_budget_bounds_a_slow_tool() {
+    let slow = FnTool::new(
+        spec("slow", "sleeps", &[]),
+        ToolAnnotations::WRITE,
+        |_args: Value| async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(ToolOutput::text("never"))
+        },
+    );
+    let (after, ran_after) = recording("after", ToolAnnotations::WRITE);
+    let agent = base(ScriptedProvider::new([
+        tool_calls([
+            call("c1", "slow", json!({})),
+            call("c2", "after", json!({})),
+        ]),
+        text("unused"),
+    ]))
+    .tool(slow)
+    .tool(after)
+    .limits(Limits {
+        timeout: Some(Duration::from_millis(50)),
+        ..Limits::default()
+    })
+    .build()
+    .unwrap();
+
+    let out = tokio::time::timeout(Duration::from_secs(5), agent.run("s", "go"))
+        .await
+        .expect("the tool must be bounded by the run's wall-clock budget")
+        .unwrap();
+    assert_eq!(
+        out.status,
+        RunStatus::LimitReached {
+            limit: LimitKind::WallClock
+        }
+    );
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::TimedOut);
+    assert_eq!(out.receipts()[1].status, ReceiptStatus::Skipped);
+    assert!(ran_after.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stuck_stop_skips_the_rest_of_the_batch() {
+    let (reader, _) = recording("read", ToolAnnotations::READ_ONLY);
+    let (writer, wrote) = recording("delete", ToolAnnotations::DESTRUCTIVE);
+    let agent = base(ScriptedProvider::new([
+        tool_calls([
+            call("r1", "read", json!({})),
+            call("r2", "read", json!({})),
+            call("r3", "read", json!({})),
+            call("d1", "delete", json!({"path": "x"})),
+        ]),
+        text("unused"),
+    ]))
+    .tool(reader)
+    .tool(writer)
+    .stuck_detection(StuckConfig {
+        max_nudges: 0,
+        ..StuckConfig::default()
+    })
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert!(matches!(
+        out.status,
+        RunStatus::Stuck {
+            signal: StuckSignal::RepeatedCall { .. }
+        }
+    ));
+    assert!(
+        wrote.lock().unwrap().is_empty(),
+        "nothing may run after the stuck policy decided to stop"
+    );
+    let last = out.receipts().last().unwrap();
+    assert_eq!(last.call_id, "d1");
+    assert_eq!(last.status, ReceiptStatus::Skipped);
+    assert_eq!(tool_messages(&out.state).len(), 4);
+}
+
+#[tokio::test]
+async fn budgets_and_receipts_are_scoped_to_the_run() {
+    /// Accepts a final answer only if this run made a successful call.
+    struct NeedsWork;
+    #[async_trait]
+    impl Hook for NeedsWork {
+        async fn on_stop(&self, ctx: &HookContext<'_>, _text: &str) -> StopDecision {
+            if ctx.run_receipts().any(Receipt::succeeded) {
+                StopDecision::Accept
+            } else {
+                StopDecision::Continue {
+                    message: "no work was done in this run".into(),
+                }
+            }
+        }
+    }
+
+    let agent = base(ScriptedProvider::new([
+        // Run 1: one tool call, then an answer.
+        tool_calls([call("c1", "echo", json!({"text": "a"}))]),
+        text("first"),
+        // Run 2: claims done without work, is pushed back, then does work.
+        text("second, without work"),
+        tool_calls([call("c2", "echo", json!({"text": "b"}))]),
+        text("second"),
+        // Run 3: plain answer would be rejected; does work.
+        tool_calls([call("c3", "echo", json!({"text": "c"}))]),
+        text("third"),
+    ]))
+    .tool(echo_tool())
+    .hook(NeedsWork)
+    .limits(Limits {
+        // Each scripted reply bills 120; every run uses 2-3 replies.
+        max_tokens: Some(400),
+        ..Limits::default()
+    })
+    .build()
+    .unwrap();
+
+    let first = agent.run("s", "one").await.unwrap();
+    assert_eq!(first.status, RunStatus::Completed);
+
+    let second = agent
+        .run_from(
+            first.state.clone().with_user_message("two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.final_text.as_deref(), Some("second"));
+    assert_eq!(second.state.run_receipts().count(), 1);
+
+    let third = agent
+        .run_from(
+            second.state.clone().with_user_message("three"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        third.status,
+        RunStatus::Completed,
+        "the token budget is per run, not per session"
+    );
+    assert_eq!(third.run_usage().output_tokens, 40);
+    assert_eq!(
+        third.usage().output_tokens,
+        7 * 20,
+        "session usage still accumulates"
+    );
+    let runs: Vec<_> = third.receipts().iter().map(|r| r.run_id).collect();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0], first.state.run_id);
+    assert_eq!(runs[2], third.state.run_id);
+    assert_ne!(runs[0], runs[2]);
+}
+
+#[tokio::test]
+async fn panicking_tool_is_a_failed_receipt_not_a_crash() {
+    let boom = FnTool::new(
+        spec("boom", "panics", &[]),
+        ToolAnnotations::READ_ONLY,
+        |_args: Value| async move {
+            if true {
+                panic!("kaboom");
+            }
+            Ok(ToolOutput::text("unreachable"))
+        },
+    );
+    let agent = base(ScriptedProvider::new([
+        tool_calls([
+            call("c1", "boom", json!({})),
+            call("c2", "echo", json!({"text": "ok"})),
+        ]),
+        text("recovered"),
+    ]))
+    .tool(boom)
+    .tool(echo_tool())
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.status, RunStatus::Completed);
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Failed);
+    assert!(out.receipts()[0]
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("kaboom"));
+    assert_eq!(out.receipts()[1].status, ReceiptStatus::Succeeded);
+    let messages = tool_messages(&out.state);
+    assert!(messages[0].1.contains("panicked"), "{}", messages[0].1);
+}

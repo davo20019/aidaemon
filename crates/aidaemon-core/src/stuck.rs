@@ -164,6 +164,7 @@ mod tests {
 
     fn receipt(tool: &str, args: serde_json::Value, status: ReceiptStatus) -> Receipt {
         Receipt {
+            run_id: crate::state::RunId::new(),
             call_id: "c".into(),
             tool: tool.into(),
             arguments: args,

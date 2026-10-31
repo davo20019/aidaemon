@@ -16,8 +16,21 @@ pub struct HookContext<'a> {
     pub session_id: &'a str,
     pub turn: u32,
     pub messages: &'a [Message],
+    /// Receipts of the whole session; see [`HookContext::run_receipts`].
     pub receipts: &'a [Receipt],
+    /// Usage of the whole session.
     pub usage: Usage,
+    /// Usage of the current run.
+    pub run_usage: Usage,
+}
+
+impl HookContext<'_> {
+    /// Receipts produced by the current run only. Completion checks should
+    /// use this so work from an earlier run in the session is not credited.
+    pub fn run_receipts(&self) -> impl Iterator<Item = &Receipt> {
+        let run_id = self.run_id;
+        self.receipts.iter().filter(move |r| r.run_id == run_id)
+    }
 }
 
 /// What a `before_tool` hook decides about one call.

@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::state::RunId;
+
 /// How far a call got before its outcome was decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationStage {
-    /// Refused before the tool ran (unknown tool, bad arguments, policy).
+    /// Refused before the tool ran (unknown tool, bad arguments, policy,
+    /// or skipped because the run had to stop).
     RejectedBeforeDispatch,
     /// The tool's code was invoked.
     Dispatched,
@@ -21,6 +24,9 @@ pub enum ReceiptStatus {
     Denied,
     TimedOut,
     Cancelled,
+    /// Never started: a limit was reached or the stuck detector stopped the
+    /// run earlier in the same batch.
+    Skipped,
     UnknownTool,
     InvalidArguments,
 }
@@ -30,6 +36,10 @@ pub enum ReceiptStatus {
 /// model says happened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {
+    /// The run that made the call. Sessions continued with
+    /// [`crate::RunState::with_user_message`] hold receipts of several runs,
+    /// and turn numbers restart in each run.
+    pub run_id: RunId,
     pub call_id: String,
     pub tool: String,
     pub arguments: Value,

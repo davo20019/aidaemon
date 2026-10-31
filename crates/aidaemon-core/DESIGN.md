@@ -49,7 +49,13 @@ hooks or the tool batch.
 
 **Stop on "no tool calls", plus hard caps that cannot be disabled.** Same as
 Claude Agent SDK, Codex, OpenAI Agents SDK, Vercel AI SDK. `max_turns` is
-clamped to 1,000 so "unlimited" never means unbounded.
+clamped to 1,000 so "unlimited" never means unbounded. Budgets are per run
+(a session continued with `with_user_message` starts fresh budgets, while
+session-wide `usage` keeps accumulating). `max_tool_calls` and the wall-clock
+`timeout` are also checked before every call inside a batch, and the model
+call and each tool are bounded by the wall-clock time left, so one turn with
+many calls, or one hanging call, cannot overrun them. Calls a limit prevents
+get a `Skipped` receipt and a tool result, keeping the transcript well formed.
 
 **Typed outcomes.** Following the Claude Agent SDK's result subtypes.
 `run()` returns `Ok(RunOutcome)` for everything that happens *inside* a run,
@@ -61,8 +67,8 @@ call order.** Claude Agent SDK's rule. The daemon today runs all calls
 sequentially (`src/agent/loop/tool_execution/run.rs:826`).
 
 **Errors are tool results, never crashes.** Unknown tool, bad arguments,
-denial, timeout, cancellation and tool errors all produce a receipt and a
-message the model can react to. The unknown-tool message lists the available
+denial, timeout, cancellation, tool errors and tool panics all produce a
+receipt and a message the model can react to. The unknown-tool message lists the available
 tools.
 
 **Deterministic checks before policy.** Lookup and argument validation happen
@@ -77,7 +83,10 @@ is nothing to strip.
 
 **Receipts for every call.** aidaemon's `ToolReceiptV1`, simplified. No
 surveyed harness records refusals as first-class evidence. The receipt is the
-basis for completion checks, audits and resume.
+basis for completion checks, audits and resume. Each receipt carries its
+`run_id`, since a continued session holds several runs whose turn numbers
+restart; completion checks should read `HookContext::run_receipts()` so work
+from an earlier run is never credited to this one.
 
 **Completion verification is a hook.** `on_stop` can return `Continue` with
 a message. The test `stop_hook_can_reject_an_unsupported_done` shows a
@@ -89,7 +98,9 @@ of this hook, not kernel code; `track_requirements` would be a tool plus an
 **Interrupt and resume across processes.** `before_tool` can return
 `Interrupt`; the run ends with `RunStatus::Interrupted` and a serializable
 `RunState`. `Agent::resume(state, Approve | Deny)` continues, even in another
-process. Approval becomes a pause, not a blocking await on a channel. This is
+process. The saved call is the one the hooks produced, rewrites included, so
+`Approve` runs exactly what the approver was shown. Approval becomes a pause,
+not a blocking await on a channel. This is
 the LangGraph / OpenAI Agents SDK pattern; no Rust framework has it yet.
 State is matched to agents by stable id, avoiding the OpenAI SDK's
 name-based rebuild problem.
@@ -99,7 +110,8 @@ every request and kept out of `RunState.messages`, so any future compaction
 cannot drop it and the cacheable prefix stays byte-stable. Hook edits in
 `before_model` affect only the request, not the stored transcript.
 
-**Stuck detection with configurable thresholds.** OpenHands' detector
+**Stuck detection with configurable thresholds.** When the policy decides to
+stop, the rest of the batch is skipped, not run. OpenHands' detector
 patterns plus aidaemon's repetition guards, with thresholds in config because
 OpenHands' hardcoded ones misfired on polling (their issue #762). The default
 policy nudges `max_nudges` times, then stops; an `on_stuck` hook can override

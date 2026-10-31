@@ -60,8 +60,15 @@ pub struct RunState {
     /// Transcript without the agent's instructions (those are re-sent on
     /// every request).
     pub messages: Vec<Message>,
+    /// Receipts of every run in this session. Each carries its `run_id`;
+    /// use [`RunState::run_receipts`] for the current run only.
     pub receipts: Vec<Receipt>,
+    /// Token usage of every run in this session.
     pub usage: Usage,
+    /// Token usage of the current run only. Budgets in [`crate::Limits`]
+    /// are checked against this, like `turn` and `tool_calls`.
+    #[serde(default)]
+    pub run_usage: Usage,
     pub turn: u32,
     pub tool_calls: u32,
     /// Wall-clock time already spent, summed across resumes.
@@ -83,6 +90,7 @@ impl RunState {
             messages: vec![Message::user(input)],
             receipts: Vec::new(),
             usage: Usage::default(),
+            run_usage: Usage::default(),
             turn: 0,
             tool_calls: 0,
             elapsed_ms: 0,
@@ -93,15 +101,24 @@ impl RunState {
     }
 
     /// Continue an earlier, finished run with a new user message (same
-    /// session, new turn). Receipts and usage keep accumulating.
+    /// session, new run). Session receipts and `usage` keep accumulating;
+    /// per-run counters and budgets (`turn`, `tool_calls`, `run_usage`,
+    /// elapsed time) start again from zero.
     pub fn with_user_message(mut self, input: impl Into<String>) -> Self {
         self.messages.push(Message::user(input));
         self.run_id = RunId::new();
+        self.run_usage = Usage::default();
         self.turn = 0;
         self.tool_calls = 0;
         self.elapsed_ms = 0;
         self.nudges = 0;
         self.stuck.reset();
         self
+    }
+
+    /// Receipts produced by the current run (not earlier runs in the session).
+    pub fn run_receipts(&self) -> impl Iterator<Item = &Receipt> {
+        let run_id = self.run_id;
+        self.receipts.iter().filter(move |r| r.run_id == run_id)
     }
 }

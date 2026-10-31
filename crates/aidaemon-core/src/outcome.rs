@@ -51,8 +51,14 @@ impl RunOutcome {
         matches!(self.status, RunStatus::Completed)
     }
 
+    /// Usage of the whole session.
     pub fn usage(&self) -> Usage {
         self.state.usage
+    }
+
+    /// Usage of this run only.
+    pub fn run_usage(&self) -> Usage {
+        self.state.run_usage
     }
 
     pub fn receipts(&self) -> &[Receipt] {

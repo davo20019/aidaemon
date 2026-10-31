@@ -2,23 +2,26 @@
 //! sequences model calls and tool calls, enforces hard limits, records
 //! receipts and events, and maps every exit to a [`RunStatus`].
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
-use crate::limits::RunSnapshot;
+use crate::limits::{LimitKind, RunSnapshot};
 use crate::message::{Message, ToolCall};
 use crate::outcome::{RunOutcome, RunStatus};
 use crate::provider::{ModelRequest, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
-use crate::state::{Interruption, Pending, RunState};
+use crate::state::{Interruption, Pending, RunId, RunState};
 use crate::stuck::StuckSignal;
-use crate::tool::{ToolAnnotations, ToolContext, ToolOutput};
+use crate::tool::{ToolAnnotations, ToolContext, ToolError, ToolOutput};
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -28,11 +31,15 @@ pub(crate) struct Driver<'a> {
     base_elapsed_ms: u64,
 }
 
+const STUCK_SKIP_REASON: &str =
+    "the run was stopped by the stuck detector before this call started";
+
 /// How a tool batch ended.
 enum BatchEnd {
     Done,
     Interrupted(Interruption),
     Stuck(StuckSignal),
+    Limit(LimitKind),
     Cancelled,
 }
 
@@ -115,22 +122,27 @@ impl<'a> Driver<'a> {
                 }
             }
 
-            // 3. Call the model.
+            // 3. Call the model, bounded by the remaining wall-clock budget.
             let response = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
                     return self.finish(RunStatus::Cancelled, None).await;
                 }
-                response = self.agent.provider.complete(&request) => response,
+                response = within(self.remaining(), self.agent.provider.complete(&request)) => response,
             };
             let response = match response {
-                Ok(response) => response,
-                Err(err) => {
+                None => {
+                    let limit = LimitKind::WallClock;
+                    return self.finish(RunStatus::LimitReached { limit }, None).await;
+                }
+                Some(Ok(response)) => response,
+                Some(Err(err)) => {
                     let error = err.to_string();
                     return self.finish(RunStatus::ProviderFailed { error }, None).await;
                 }
             };
             self.state.usage.add(response.usage);
+            self.state.run_usage.add(response.usage);
             let calls: Vec<ToolCall> = response
                 .tool_calls
                 .into_iter()
@@ -208,16 +220,28 @@ impl<'a> Driver<'a> {
         for index in start..calls.len() {
             if self.cancel.is_cancelled() {
                 self.flush(&mut group, &mut nudge, &mut stop).await?;
-                for call in &calls[index..] {
-                    let (receipt, output) = rejection(
-                        call,
-                        self.state.turn,
-                        ReceiptStatus::Cancelled,
-                        "the run was cancelled before this call started".into(),
-                    );
-                    self.record(receipt, output).await?;
-                }
+                self.skip_rest(
+                    &calls[index..],
+                    ReceiptStatus::Cancelled,
+                    "the run was cancelled before this call started",
+                )
+                .await?;
                 return Ok(BatchEnd::Cancelled);
+            }
+            // The stuck policy already decided to stop: nothing else in this
+            // batch may run, mutating calls least of all.
+            if let Some(signal) = stop.take() {
+                self.skip_rest(&calls[index..], ReceiptStatus::Skipped, STUCK_SKIP_REASON)
+                    .await?;
+                return Ok(BatchEnd::Stuck(signal));
+            }
+            // Budgets hold inside a batch too, not only between turns.
+            if let Some(limit) = self.call_limit(group.len()) {
+                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                let reason = format!("the run reached its {} limit", limit_name(limit));
+                self.skip_rest(&calls[index..], ReceiptStatus::Skipped, &reason)
+                    .await?;
+                return Ok(BatchEnd::Limit(limit));
             }
 
             let mut call = calls[index].clone();
@@ -226,7 +250,12 @@ impl<'a> Driver<'a> {
             // Deterministic checks come before any policy, so a malformed
             // proposal never reaches a hook or a human.
             let Some(tool) = self.agent.tools.get(&call.name).cloned() else {
-                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                if let Some(end) = self
+                    .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                    .await?
+                {
+                    return Ok(end);
+                }
                 let available: Vec<&str> =
                     self.agent.specs.iter().map(|s| s.name.as_str()).collect();
                 let reason = format!(
@@ -234,15 +263,31 @@ impl<'a> Driver<'a> {
                     call.name,
                     available.join(", ")
                 );
-                let (receipt, output) = rejection(&call, turn, ReceiptStatus::UnknownTool, reason);
+                let (receipt, output) = rejection(
+                    self.state.run_id,
+                    &call,
+                    turn,
+                    ReceiptStatus::UnknownTool,
+                    reason,
+                );
                 track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 continue;
             };
             if let Err(reason) = tool.validate(&call.arguments) {
-                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                if let Some(end) = self
+                    .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                    .await?
+                {
+                    return Ok(end);
+                }
                 let reason = format!("invalid arguments for `{}`: {reason}", call.name);
-                let (receipt, output) =
-                    rejection(&call, turn, ReceiptStatus::InvalidArguments, reason);
+                let (receipt, output) = rejection(
+                    self.state.run_id,
+                    &call,
+                    turn,
+                    ReceiptStatus::InvalidArguments,
+                    reason,
+                );
                 track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 continue;
             }
@@ -266,22 +311,47 @@ impl<'a> Driver<'a> {
                     group.push(Approved { call, annotations });
                 }
                 Verdict::Allow => {
-                    self.flush(&mut group, &mut nudge, &mut stop).await?;
+                    if let Some(end) = self
+                        .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                        .await?
+                    {
+                        return Ok(end);
+                    }
                     let mut single = vec![Approved { call, annotations }];
                     self.flush(&mut single, &mut nudge, &mut stop).await?;
                 }
                 Verdict::Deny(reason) => {
-                    self.flush(&mut group, &mut nudge, &mut stop).await?;
-                    let (mut receipt, output) =
-                        rejection(&call, turn, ReceiptStatus::Denied, reason);
+                    if let Some(end) = self
+                        .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                        .await?
+                    {
+                        return Ok(end);
+                    }
+                    let (mut receipt, output) = rejection(
+                        self.state.run_id,
+                        &call,
+                        turn,
+                        ReceiptStatus::Denied,
+                        reason,
+                    );
                     receipt.read_only = annotations.read_only;
                     track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 }
                 Verdict::Interrupt(reason) => {
-                    self.flush(&mut group, &mut nudge, &mut stop).await?;
+                    if let Some(end) = self
+                        .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                        .await?
+                    {
+                        return Ok(end);
+                    }
+                    // Save the call exactly as the hooks left it: a resumed
+                    // `Approve` runs what the approver was shown, including
+                    // any rewrite, without consulting the hooks again.
+                    let mut pending_calls = calls.to_vec();
+                    pending_calls[index] = call.clone();
                     let interruption = Interruption { call, reason };
                     self.state.pending = Some(Pending {
-                        calls: calls.to_vec(),
+                        calls: pending_calls,
                         next: index,
                         interruption: interruption.clone(),
                     });
@@ -303,6 +373,25 @@ impl<'a> Driver<'a> {
             self.state.messages.push(Message::user(message));
         }
         Ok(BatchEnd::Done)
+    }
+
+    /// Flush the queued read-only calls before `rest[0]` is handled. If
+    /// their results made the stuck policy stop the run, `rest` is skipped
+    /// and the batch ends.
+    async fn flush_or_stop(
+        &mut self,
+        group: &mut Vec<Approved>,
+        nudge: &mut Option<String>,
+        stop: &mut Option<StuckSignal>,
+        rest: &[ToolCall],
+    ) -> Result<Option<BatchEnd>, CoreError> {
+        self.flush(group, nudge, stop).await?;
+        let Some(signal) = stop.take() else {
+            return Ok(None);
+        };
+        self.skip_rest(rest, ReceiptStatus::Skipped, STUCK_SKIP_REASON)
+            .await?;
+        Ok(Some(BatchEnd::Stuck(signal)))
     }
 
     /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
@@ -372,12 +461,21 @@ impl<'a> Driver<'a> {
             turn: self.state.turn,
             cancel: self.cancel.child_token(),
         };
+        let timeout = match self.remaining() {
+            Some(remaining) => remaining.min(self.agent.limits.tool_timeout),
+            None => self.agent.limits.tool_timeout,
+        };
         let started = Instant::now();
-        let result = tokio::time::timeout(self.agent.limits.tool_timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => None,
-                result = tool.call(call.arguments.clone(), &ctx) => Some(result),
+                // A panicking tool is a failed call, not a crashed run.
+                result = AssertUnwindSafe(tool.call(call.arguments.clone(), &ctx)).catch_unwind() => {
+                    Some(result.unwrap_or_else(|panic| {
+                        Err(ToolError(format!("the tool panicked: {}", panic_message(&*panic))))
+                    }))
+                }
             }
         })
         .await;
@@ -397,7 +495,7 @@ impl<'a> Driver<'a> {
                 ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
             ),
             Err(_) => {
-                let secs = self.agent.limits.tool_timeout.as_secs_f64();
+                let secs = timeout.as_secs_f64();
                 (
                     ReceiptStatus::TimedOut,
                     Some(format!("timed out after {secs:.1}s")),
@@ -410,6 +508,7 @@ impl<'a> Driver<'a> {
         };
 
         let receipt = Receipt {
+            run_id: self.state.run_id,
             call_id: call.id.clone(),
             tool: call.name.clone(),
             arguments: call.arguments.clone(),
@@ -424,18 +523,49 @@ impl<'a> Driver<'a> {
         (receipt, output)
     }
 
-    /// Shape the output, run `after_tool` hooks, append the tool message and
-    /// receipt, emit the event, and feed the stuck detector.
+    /// Record calls that will never start, without feeding the stuck
+    /// detector (they say nothing about what the model is doing).
+    async fn skip_rest(
+        &mut self,
+        calls: &[ToolCall],
+        status: ReceiptStatus,
+        reason: &str,
+    ) -> Result<(), CoreError> {
+        for call in calls {
+            let (receipt, mut output) = rejection(
+                self.state.run_id,
+                call,
+                self.state.turn,
+                status,
+                reason.to_string(),
+            );
+            self.append(receipt, &mut output).await?;
+        }
+        Ok(())
+    }
+
+    /// Record a result and feed the stuck detector.
     async fn record(
         &mut self,
         receipt: Receipt,
         mut output: ToolOutput,
     ) -> Result<Option<StuckAction>, CoreError> {
+        let receipt = self.append(receipt, &mut output).await?;
+        self.observe_stuck(&receipt, &output.content).await
+    }
+
+    /// Shape the output, run `after_tool` hooks, append the tool message and
+    /// receipt, and emit the event.
+    async fn append(
+        &mut self,
+        receipt: Receipt,
+        output: &mut ToolOutput,
+    ) -> Result<Receipt, CoreError> {
         output.content = truncate_middle(&output.content, self.agent.limits.max_tool_output_chars);
         {
             let ctx = self.ctx();
             for hook in &self.agent.hooks {
-                hook.after_tool(&ctx, &receipt, &mut output).await;
+                hook.after_tool(&ctx, &receipt, output).await;
             }
         }
         self.state.messages.push(Message::tool_result(
@@ -448,12 +578,15 @@ impl<'a> Driver<'a> {
             receipt: receipt.clone(),
         })
         .await?;
+        Ok(receipt)
+    }
 
-        let Some(signal) = self
-            .state
-            .stuck
-            .observe(&self.agent.stuck, &receipt, &output.content)
-        else {
+    async fn observe_stuck(
+        &mut self,
+        receipt: &Receipt,
+        output: &str,
+    ) -> Result<Option<StuckAction>, CoreError> {
+        let Some(signal) = self.state.stuck.observe(&self.agent.stuck, receipt, output) else {
             return Ok(None);
         };
         self.emit(Event::Stuck {
@@ -517,6 +650,7 @@ impl<'a> Driver<'a> {
             messages: &self.state.messages,
             receipts: &self.state.receipts,
             usage: self.state.usage,
+            run_usage: self.state.run_usage,
         }
     }
 
@@ -528,9 +662,32 @@ impl<'a> Driver<'a> {
         RunSnapshot {
             turn: self.state.turn,
             tool_calls: self.state.tool_calls,
-            usage: self.state.usage,
+            usage: self.state.run_usage,
             elapsed: self.elapsed(),
         }
+    }
+
+    /// Wall-clock budget left, if the run has one.
+    fn remaining(&self) -> Option<Duration> {
+        self.agent
+            .limits
+            .timeout
+            .map(|timeout| timeout.saturating_sub(self.elapsed()))
+    }
+
+    /// Limits that stop a batch before its next call. `queued` approved
+    /// read-only calls are waiting to run and count toward `max_tool_calls`.
+    fn call_limit(&self, queued: usize) -> Option<LimitKind> {
+        let limits = &self.agent.limits;
+        if let Some(max) = limits.max_tool_calls {
+            if u64::from(self.state.tool_calls) + queued as u64 >= u64::from(max) {
+                return Some(LimitKind::ToolCalls);
+            }
+        }
+        if self.remaining() == Some(Duration::ZERO) {
+            return Some(LimitKind::WallClock);
+        }
+        None
     }
 
     async fn emit(&self, event: Event) -> Result<(), CoreError> {
@@ -555,6 +712,7 @@ impl<'a> Driver<'a> {
         let status = match end {
             BatchEnd::Interrupted(interruption) => RunStatus::Interrupted { interruption },
             BatchEnd::Stuck(signal) => RunStatus::Stuck { signal },
+            BatchEnd::Limit(limit) => RunStatus::LimitReached { limit },
             BatchEnd::Cancelled => RunStatus::Cancelled,
             BatchEnd::Done => unreachable!("finish_batch is only called for terminal batch ends"),
         };
@@ -591,6 +749,7 @@ fn track(action: Option<StuckAction>, nudge: &mut Option<String>, stop: &mut Opt
 
 /// A receipt and model-facing message for a call that never ran.
 fn rejection(
+    run_id: RunId,
     call: &ToolCall,
     turn: u32,
     status: ReceiptStatus,
@@ -599,10 +758,12 @@ fn rejection(
     let prefix = match status {
         ReceiptStatus::Denied => "Denied",
         ReceiptStatus::Cancelled => "Cancelled",
+        ReceiptStatus::Skipped => "Skipped",
         _ => "Error",
     };
     let output = ToolOutput::error(format!("{prefix}: {reason}"));
     let receipt = Receipt {
+        run_id,
         call_id: call.id.clone(),
         tool: call.name.clone(),
         arguments: call.arguments.clone(),
@@ -615,6 +776,33 @@ fn rejection(
         details: serde_json::Value::Null,
     };
     (receipt, output)
+}
+
+/// Run `future` within `budget`; `None` if the budget ran out first.
+async fn within<F: Future>(budget: Option<Duration>, future: F) -> Option<F::Output> {
+    match budget {
+        Some(budget) => tokio::time::timeout(budget, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+fn limit_name(limit: LimitKind) -> &'static str {
+    match limit {
+        LimitKind::Turns => "turn",
+        LimitKind::Tokens => "token",
+        LimitKind::ToolCalls => "tool-call",
+        LimitKind::WallClock => "wall-clock",
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = panic.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Keep the head and tail of long output; the middle is usually the least

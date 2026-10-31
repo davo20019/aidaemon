@@ -8,12 +8,15 @@ use crate::provider::Usage;
 /// that needs more than this is a bug, not a task.
 pub const HARD_TURN_CAP: u32 = 1_000;
 
-/// Hard budgets, checked at the top of every turn. None of these can be
-/// switched off entirely: `max_turns` is clamped to [`HARD_TURN_CAP`].
+/// Hard budgets for one run. Turns, tokens and tool calls are checked at the
+/// top of every turn; tool calls and wall-clock time are also checked before
+/// every call in a batch, and the model call and each tool are bounded by the
+/// remaining wall-clock budget. `max_turns` cannot be switched off: it is
+/// clamped to [`HARD_TURN_CAP`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Limits {
     pub max_turns: u32,
-    /// Billable tokens (cached input excluded).
+    /// Billable tokens for this run (cached input excluded).
     pub max_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
     /// Wall-clock budget for the whole run, summed across resumes.
@@ -51,6 +54,7 @@ pub enum LimitKind {
 pub struct RunSnapshot {
     pub turn: u32,
     pub tool_calls: u32,
+    /// Usage of the current run.
     pub usage: Usage,
     pub elapsed: Duration,
 }
