@@ -1,0 +1,261 @@
+use std::future::Future;
+use std::marker::PhantomData;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::provider::ToolSpec;
+use crate::state::RunId;
+
+/// Effect hints that drive scheduling and policy.
+///
+/// The default is the conservative one: an unannotated tool is treated as
+/// mutating and destructive, so it runs alone and policies may ask before it
+/// runs. Mirrors MCP tool annotations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAnnotations {
+    /// Never changes anything outside the agent. Read-only calls in the same
+    /// model turn run concurrently.
+    pub read_only: bool,
+    /// May destroy or overwrite data, or act externally (send, deploy, pay).
+    pub destructive: bool,
+    /// Safe to re-run with the same arguments (matters for resume/replay).
+    pub idempotent: bool,
+}
+
+impl ToolAnnotations {
+    pub const READ_ONLY: Self = Self {
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+    };
+    pub const WRITE: Self = Self {
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+    };
+    pub const DESTRUCTIVE: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: false,
+    };
+}
+
+impl Default for ToolAnnotations {
+    fn default() -> Self {
+        Self::DESTRUCTIVE
+    }
+}
+
+/// Trusted, harness-provided context for one call.
+///
+/// This is passed beside the model's arguments rather than injected into
+/// them, so a model can never spoof a session id or role by inventing a field.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub run_id: RunId,
+    pub session_id: String,
+    pub call_id: String,
+    pub turn: u32,
+    /// Cancelled when the run is cancelled; long tools should watch it.
+    pub cancel: CancellationToken,
+}
+
+/// What a tool hands back to the model, plus structured details for receipts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolOutput {
+    /// Text the model will read.
+    pub content: String,
+    /// The tool ran but the outcome is a failure the model should react to
+    /// (non-zero exit, HTTP 4xx, no match). Recorded as a failed receipt.
+    pub is_error: bool,
+    /// Structured evidence copied into the receipt (exit code, paths, status).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub details: Value,
+}
+
+impl ToolOutput {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            details: Value::Null,
+        }
+    }
+
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            details: Value::Null,
+        }
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+/// A tool failure the harness could not turn into normal output. The loop
+/// still reports it to the model as an error result; it never ends the run.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("{0}")]
+pub struct ToolError(pub String);
+
+impl From<String> for ToolError {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ToolError {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<std::io::Error> for ToolError {
+    fn from(value: std::io::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<serde_json::Error> for ToolError {
+    fn from(value: serde_json::Error) -> Self {
+        Self(format!("invalid arguments: {value}"))
+    }
+}
+
+pub type ToolResult = Result<ToolOutput, ToolError>;
+
+/// An LLM-callable capability. Only `spec` and `call` are required.
+///
+/// Richer semantics (typed effects, access manifests, replay decisions like
+/// aidaemon's current `Tool` trait) belong in a separate opt-in trait so the
+/// simple case stays simple.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::default()
+    }
+
+    /// Deterministic argument checks run before any policy or I/O. The
+    /// default checks the schema's `required` keys; override to add more.
+    fn validate(&self, arguments: &Value) -> Result<(), String> {
+        check_required(&self.spec().parameters, arguments)
+    }
+
+    async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;
+}
+
+/// Minimal schema check: the arguments must be an object containing every
+/// `required` key. Full JSON Schema validation is left to tools that need it.
+pub(crate) fn check_required(schema: &Value, arguments: &Value) -> Result<(), String> {
+    let wants_object = schema.get("type").and_then(Value::as_str) == Some("object");
+    if !wants_object {
+        return Ok(());
+    }
+    let Some(object) = arguments.as_object() else {
+        return Err("arguments must be a JSON object".to_string());
+    };
+    let missing: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|key| !object.contains_key(*key))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required argument(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Build a tool from a closure. Handy for tests and small integrations.
+///
+/// ```
+/// use aidaemon_core::{FnTool, ToolAnnotations, ToolOutput, ToolSpec};
+/// use serde_json::{json, Value};
+///
+/// let spec = ToolSpec {
+///     name: "echo".into(),
+///     description: "Echo the text back".into(),
+///     parameters: json!({"type": "object", "required": ["text"]}),
+/// };
+/// let echo = FnTool::new(spec, ToolAnnotations::READ_ONLY, |args: Value| async move {
+///     Ok(ToolOutput::text(args["text"].as_str().unwrap_or_default().to_string()))
+/// });
+/// # let _ = echo;
+/// ```
+pub struct FnTool<F, Fut> {
+    spec: ToolSpec,
+    annotations: ToolAnnotations,
+    func: F,
+    _fut: PhantomData<fn() -> Fut>,
+}
+
+impl<F, Fut> FnTool<F, Fut>
+where
+    F: Fn(Value) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult> + Send,
+{
+    pub fn new(spec: ToolSpec, annotations: ToolAnnotations, func: F) -> Self {
+        Self {
+            spec,
+            annotations,
+            func,
+            _fut: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<F, Fut> Tool for FnTool<F, Fut>
+where
+    F: Fn(Value) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult> + Send,
+{
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        self.annotations
+    }
+
+    async fn call(&self, arguments: Value, _ctx: &ToolContext) -> ToolResult {
+        (self.func)(arguments).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn required_keys_are_checked() {
+        let schema = json!({"type": "object", "required": ["path", "text"]});
+        assert!(check_required(&schema, &json!({"path": "a", "text": "b"})).is_ok());
+        let err = check_required(&schema, &json!({"path": "a"})).unwrap_err();
+        assert!(err.contains("text"), "{err}");
+        assert!(check_required(&schema, &json!("not an object")).is_err());
+    }
+
+    #[test]
+    fn unannotated_tools_are_conservative() {
+        let ann = ToolAnnotations::default();
+        assert!(!ann.read_only);
+        assert!(ann.destructive);
+    }
+}

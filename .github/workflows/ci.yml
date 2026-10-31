@@ -93,6 +93,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings
 
+      - name: Clippy (aidaemon-core)
+        run: cargo clippy -p aidaemon-core --all-targets --all-features -- -D warnings
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -162,6 +165,9 @@ jobs:
 
       - name: Harness eval fixture suite
         run: cargo test --lib harness_eval --all-features
+
+      - name: Kernel sketch tests (aidaemon-core)
+        run: cargo test -p aidaemon-core
 
   build-check:
     name: Build check (release)

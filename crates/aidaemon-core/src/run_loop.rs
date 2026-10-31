@@ -1,0 +1,659 @@
+//! The loop. Everything that is policy lives in hooks; this file only
+//! sequences model calls and tool calls, enforces hard limits, records
+//! receipts and events, and maps every exit to a [`RunStatus`].
+
+use std::time::{Duration, Instant};
+
+use futures::future::join_all;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::{AgentInner, Resolution};
+use crate::error::CoreError;
+use crate::event::Event;
+use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
+use crate::limits::RunSnapshot;
+use crate::message::{Message, ToolCall};
+use crate::outcome::{RunOutcome, RunStatus};
+use crate::provider::{ModelRequest, ToolChoice};
+use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
+use crate::state::{Interruption, Pending, RunState};
+use crate::stuck::StuckSignal;
+use crate::tool::{ToolAnnotations, ToolContext, ToolOutput};
+
+pub(crate) struct Driver<'a> {
+    agent: &'a AgentInner,
+    state: RunState,
+    cancel: CancellationToken,
+    segment_start: Instant,
+    base_elapsed_ms: u64,
+}
+
+/// How a tool batch ended.
+enum BatchEnd {
+    Done,
+    Interrupted(Interruption),
+    Stuck(StuckSignal),
+    Cancelled,
+}
+
+/// What the stuck policy asked for while recording a result.
+enum StuckAction {
+    Nudge(String),
+    Stop(StuckSignal),
+}
+
+/// The settled policy decision for one call (rewrites already applied).
+enum Verdict {
+    Allow,
+    Deny(String),
+    Interrupt(String),
+}
+
+/// A call that passed checks and policy, waiting to execute.
+struct Approved {
+    call: ToolCall,
+    annotations: ToolAnnotations,
+}
+
+impl<'a> Driver<'a> {
+    pub(crate) fn new(agent: &'a AgentInner, state: RunState, cancel: CancellationToken) -> Self {
+        let base_elapsed_ms = state.elapsed_ms;
+        Self {
+            agent,
+            state,
+            cancel,
+            segment_start: Instant::now(),
+            base_elapsed_ms,
+        }
+    }
+
+    pub(crate) async fn drive(
+        mut self,
+        resolution: Option<Resolution>,
+    ) -> Result<RunOutcome, CoreError> {
+        if let Some(pending) = self.state.pending.take() {
+            self.emit(Event::RunResumed).await?;
+            match self
+                .execute_batch(&pending.calls, pending.next, resolution)
+                .await?
+            {
+                BatchEnd::Done => self.checkpoint().await?,
+                end => return self.finish_batch(end).await,
+            }
+        } else {
+            let session_id = self.state.session_id.clone();
+            self.emit(Event::RunStarted { session_id }).await?;
+        }
+
+        loop {
+            // 1. Guards: cancellation, hard limits, custom stop conditions.
+            if self.cancel.is_cancelled() {
+                return self.finish(RunStatus::Cancelled, None).await;
+            }
+            let snapshot = self.snapshot();
+            if let Some(limit) = self.agent.limits.exceeded(&snapshot) {
+                return self.finish(RunStatus::LimitReached { limit }, None).await;
+            }
+            if let Some(reason) = self
+                .agent
+                .stop_conditions
+                .iter()
+                .find_map(|c| c.check(&snapshot))
+            {
+                return self.finish(RunStatus::Stopped { reason }, None).await;
+            }
+
+            // 2. Build the request and let hooks shape it.
+            self.state.turn += 1;
+            let turn = self.state.turn;
+            self.emit(Event::TurnStarted { turn }).await?;
+            let mut request = self.build_request();
+            {
+                let ctx = self.ctx();
+                for hook in &self.agent.hooks {
+                    hook.before_model(&ctx, &mut request).await;
+                }
+            }
+
+            // 3. Call the model.
+            let response = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    return self.finish(RunStatus::Cancelled, None).await;
+                }
+                response = self.agent.provider.complete(&request) => response,
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    let error = err.to_string();
+                    return self.finish(RunStatus::ProviderFailed { error }, None).await;
+                }
+            };
+            self.state.usage.add(response.usage);
+            let calls: Vec<ToolCall> = response
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut call)| {
+                    if call.id.trim().is_empty() {
+                        call.id = format!("call_{turn}_{i}");
+                    }
+                    call
+                })
+                .collect();
+            self.emit(Event::ModelResponded {
+                turn,
+                usage: response.usage,
+                text: response.text.clone(),
+                tool_calls: calls.len(),
+            })
+            .await?;
+            self.state
+                .messages
+                .push(Message::assistant(response.text.clone(), calls.clone()));
+
+            // 4a. No tool calls: the model thinks it is done. Ask stop hooks.
+            if calls.is_empty() {
+                let rejection = {
+                    let ctx = self.ctx();
+                    let mut rejection = None;
+                    for hook in &self.agent.hooks {
+                        if let StopDecision::Continue { message } =
+                            hook.on_stop(&ctx, &response.text).await
+                        {
+                            rejection = Some(message);
+                            break;
+                        }
+                    }
+                    rejection
+                };
+                match rejection {
+                    Some(message) => {
+                        self.emit(Event::StopRejected {
+                            message: message.clone(),
+                        })
+                        .await?;
+                        self.state.messages.push(Message::user(message));
+                        self.checkpoint().await?;
+                        continue;
+                    }
+                    None => {
+                        return self.finish(RunStatus::Completed, Some(response.text)).await;
+                    }
+                }
+            }
+
+            // 4b. Run the requested tools, then go around again.
+            match self.execute_batch(&calls, 0, None).await? {
+                BatchEnd::Done => self.checkpoint().await?,
+                end => return self.finish_batch(end).await,
+            }
+        }
+    }
+
+    /// Run `calls[start..]`. Consecutive approved read-only calls run
+    /// concurrently; anything else runs alone, in order. Results are always
+    /// appended in call order.
+    async fn execute_batch(
+        &mut self,
+        calls: &[ToolCall],
+        start: usize,
+        mut resolution: Option<Resolution>,
+    ) -> Result<BatchEnd, CoreError> {
+        let mut group: Vec<Approved> = Vec::new();
+        let mut nudge: Option<String> = None;
+        let mut stop: Option<StuckSignal> = None;
+
+        for index in start..calls.len() {
+            if self.cancel.is_cancelled() {
+                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                for call in &calls[index..] {
+                    let (receipt, output) = rejection(
+                        call,
+                        self.state.turn,
+                        ReceiptStatus::Cancelled,
+                        "the run was cancelled before this call started".into(),
+                    );
+                    self.record(receipt, output).await?;
+                }
+                return Ok(BatchEnd::Cancelled);
+            }
+
+            let mut call = calls[index].clone();
+            let turn = self.state.turn;
+
+            // Deterministic checks come before any policy, so a malformed
+            // proposal never reaches a hook or a human.
+            let Some(tool) = self.agent.tools.get(&call.name).cloned() else {
+                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                let available: Vec<&str> =
+                    self.agent.specs.iter().map(|s| s.name.as_str()).collect();
+                let reason = format!(
+                    "unknown tool `{}`. Available tools: {}",
+                    call.name,
+                    available.join(", ")
+                );
+                let (receipt, output) = rejection(&call, turn, ReceiptStatus::UnknownTool, reason);
+                track(self.record(receipt, output).await?, &mut nudge, &mut stop);
+                continue;
+            };
+            if let Err(reason) = tool.validate(&call.arguments) {
+                self.flush(&mut group, &mut nudge, &mut stop).await?;
+                let reason = format!("invalid arguments for `{}`: {reason}", call.name);
+                let (receipt, output) =
+                    rejection(&call, turn, ReceiptStatus::InvalidArguments, reason);
+                track(self.record(receipt, output).await?, &mut nudge, &mut stop);
+                continue;
+            }
+            let annotations = tool.annotations();
+
+            // Policy: a pending resolution settles the first call; otherwise
+            // ask the hooks.
+            let settled = if index == start {
+                resolution.take()
+            } else {
+                None
+            };
+            let verdict = match settled {
+                Some(Resolution::Approve) => Verdict::Allow,
+                Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
+                None => self.decide(&mut call, annotations).await,
+            };
+
+            match verdict {
+                Verdict::Allow if annotations.read_only => {
+                    group.push(Approved { call, annotations });
+                }
+                Verdict::Allow => {
+                    self.flush(&mut group, &mut nudge, &mut stop).await?;
+                    let mut single = vec![Approved { call, annotations }];
+                    self.flush(&mut single, &mut nudge, &mut stop).await?;
+                }
+                Verdict::Deny(reason) => {
+                    self.flush(&mut group, &mut nudge, &mut stop).await?;
+                    let (mut receipt, output) =
+                        rejection(&call, turn, ReceiptStatus::Denied, reason);
+                    receipt.read_only = annotations.read_only;
+                    track(self.record(receipt, output).await?, &mut nudge, &mut stop);
+                }
+                Verdict::Interrupt(reason) => {
+                    self.flush(&mut group, &mut nudge, &mut stop).await?;
+                    let interruption = Interruption { call, reason };
+                    self.state.pending = Some(Pending {
+                        calls: calls.to_vec(),
+                        next: index,
+                        interruption: interruption.clone(),
+                    });
+                    self.emit(Event::Interrupted {
+                        interruption: interruption.clone(),
+                    })
+                    .await?;
+                    return Ok(BatchEnd::Interrupted(interruption));
+                }
+            }
+        }
+        self.flush(&mut group, &mut nudge, &mut stop).await?;
+
+        if let Some(signal) = stop {
+            return Ok(BatchEnd::Stuck(signal));
+        }
+        if let Some(message) = nudge {
+            // After all tool results, so the transcript stays well formed.
+            self.state.messages.push(Message::user(message));
+        }
+        Ok(BatchEnd::Done)
+    }
+
+    /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
+    /// arguments re-validated) before the next hook sees the call.
+    async fn decide(&self, call: &mut ToolCall, annotations: ToolAnnotations) -> Verdict {
+        let ctx = self.ctx();
+        for hook in &self.agent.hooks {
+            match hook.before_tool(&ctx, call, annotations).await {
+                ToolDecision::Allow => {}
+                ToolDecision::Deny { reason } => return Verdict::Deny(reason),
+                ToolDecision::Interrupt { reason } => return Verdict::Interrupt(reason),
+                ToolDecision::Rewrite { arguments } => {
+                    call.arguments = arguments;
+                    if let Some(tool) = self.agent.tools.get(&call.name) {
+                        if let Err(reason) = tool.validate(&call.arguments) {
+                            return Verdict::Deny(format!(
+                                "a hook rewrote the arguments into an invalid call: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Verdict::Allow
+    }
+
+    /// Execute approved calls concurrently and record results in order.
+    async fn flush(
+        &mut self,
+        group: &mut Vec<Approved>,
+        nudge: &mut Option<String>,
+        stop: &mut Option<StuckSignal>,
+    ) -> Result<(), CoreError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let items = std::mem::take(group);
+        for item in &items {
+            self.emit(Event::ToolStarted {
+                call_id: item.call.id.clone(),
+                tool: item.call.name.clone(),
+            })
+            .await?;
+        }
+        let this = &*self;
+        let results = join_all(items.iter().map(|item| this.dispatch(item))).await;
+        for (receipt, output) in results {
+            let action = self.record(receipt, output).await?;
+            track(action, nudge, stop);
+        }
+        Ok(())
+    }
+
+    /// Run one tool with a timeout and cancellation, producing its receipt.
+    async fn dispatch(&self, item: &Approved) -> (Receipt, ToolOutput) {
+        let call = &item.call;
+        let tool = self
+            .agent
+            .tools
+            .get(&call.name)
+            .expect("dispatch only sees calls that passed lookup")
+            .clone();
+        let ctx = ToolContext {
+            run_id: self.state.run_id,
+            session_id: self.state.session_id.clone(),
+            call_id: call.id.clone(),
+            turn: self.state.turn,
+            cancel: self.cancel.child_token(),
+        };
+        let started = Instant::now();
+        let result = tokio::time::timeout(self.agent.limits.tool_timeout, async {
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => None,
+                result = tool.call(call.arguments.clone(), &ctx) => Some(result),
+            }
+        })
+        .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let (status, reason, output) = match result {
+            Ok(Some(Ok(output))) if output.is_error => (ReceiptStatus::Failed, None, output),
+            Ok(Some(Ok(output))) => (ReceiptStatus::Succeeded, None, output),
+            Ok(Some(Err(err))) => (
+                ReceiptStatus::Failed,
+                Some(err.0.clone()),
+                ToolOutput::error(format!("Error: {err}")),
+            ),
+            Ok(None) => (
+                ReceiptStatus::Cancelled,
+                Some("cancelled".to_string()),
+                ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
+            ),
+            Err(_) => {
+                let secs = self.agent.limits.tool_timeout.as_secs_f64();
+                (
+                    ReceiptStatus::TimedOut,
+                    Some(format!("timed out after {secs:.1}s")),
+                    ToolOutput::error(format!(
+                        "Error: `{}` timed out after {secs:.1}s.",
+                        call.name
+                    )),
+                )
+            }
+        };
+
+        let receipt = Receipt {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            arguments: call.arguments.clone(),
+            turn: self.state.turn,
+            stage: InvocationStage::Dispatched,
+            status,
+            read_only: item.annotations.read_only,
+            duration_ms,
+            reason,
+            details: output.details.clone(),
+        };
+        (receipt, output)
+    }
+
+    /// Shape the output, run `after_tool` hooks, append the tool message and
+    /// receipt, emit the event, and feed the stuck detector.
+    async fn record(
+        &mut self,
+        receipt: Receipt,
+        mut output: ToolOutput,
+    ) -> Result<Option<StuckAction>, CoreError> {
+        output.content = truncate_middle(&output.content, self.agent.limits.max_tool_output_chars);
+        {
+            let ctx = self.ctx();
+            for hook in &self.agent.hooks {
+                hook.after_tool(&ctx, &receipt, &mut output).await;
+            }
+        }
+        self.state.messages.push(Message::tool_result(
+            receipt.call_id.clone(),
+            output.content.clone(),
+        ));
+        self.state.receipts.push(receipt.clone());
+        self.state.tool_calls += 1;
+        self.emit(Event::ToolFinished {
+            receipt: receipt.clone(),
+        })
+        .await?;
+
+        let Some(signal) = self
+            .state
+            .stuck
+            .observe(&self.agent.stuck, &receipt, &output.content)
+        else {
+            return Ok(None);
+        };
+        self.emit(Event::Stuck {
+            signal: signal.clone(),
+        })
+        .await?;
+
+        let decision = {
+            let ctx = self.ctx();
+            let mut decision = None;
+            for hook in &self.agent.hooks {
+                if let Some(d) = hook.on_stuck(&ctx, &signal).await {
+                    decision = Some(d);
+                    break;
+                }
+            }
+            decision
+        }
+        .unwrap_or_else(|| {
+            if self.state.nudges < self.agent.stuck.max_nudges {
+                StuckDecision::Nudge {
+                    message: signal.nudge_text(),
+                }
+            } else {
+                StuckDecision::Stop
+            }
+        });
+
+        self.state.stuck.reset();
+        Ok(match decision {
+            StuckDecision::Nudge { message } => {
+                self.state.nudges += 1;
+                Some(StuckAction::Nudge(message))
+            }
+            StuckDecision::Stop => Some(StuckAction::Stop(signal)),
+            StuckDecision::Ignore => None,
+        })
+    }
+
+    fn build_request(&self) -> ModelRequest {
+        let mut messages = Vec::with_capacity(self.state.messages.len() + 1);
+        if !self.agent.instructions.is_empty() {
+            messages.push(Message::system(self.agent.instructions.clone()));
+        }
+        messages.extend(self.state.messages.iter().cloned());
+        ModelRequest {
+            model: self.agent.model.clone(),
+            messages,
+            tools: self.agent.specs.clone(),
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: self.agent.max_output_tokens,
+        }
+    }
+
+    fn ctx(&self) -> HookContext<'_> {
+        HookContext {
+            run_id: self.state.run_id,
+            agent_id: &self.agent.id,
+            session_id: &self.state.session_id,
+            turn: self.state.turn,
+            messages: &self.state.messages,
+            receipts: &self.state.receipts,
+            usage: self.state.usage,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.base_elapsed_ms) + self.segment_start.elapsed()
+    }
+
+    fn snapshot(&self) -> RunSnapshot {
+        RunSnapshot {
+            turn: self.state.turn,
+            tool_calls: self.state.tool_calls,
+            usage: self.state.usage,
+            elapsed: self.elapsed(),
+        }
+    }
+
+    async fn emit(&self, event: Event) -> Result<(), CoreError> {
+        if let Some(sink) = &self.agent.sink {
+            sink.emit(self.state.run_id, &event);
+        }
+        if let Some(store) = &self.agent.store {
+            store.append_event(self.state.run_id, &event).await?;
+        }
+        Ok(())
+    }
+
+    async fn checkpoint(&mut self) -> Result<(), CoreError> {
+        self.state.elapsed_ms = self.elapsed().as_millis() as u64;
+        if let Some(store) = &self.agent.store {
+            store.save_state(&self.state).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_batch(self, end: BatchEnd) -> Result<RunOutcome, CoreError> {
+        let status = match end {
+            BatchEnd::Interrupted(interruption) => RunStatus::Interrupted { interruption },
+            BatchEnd::Stuck(signal) => RunStatus::Stuck { signal },
+            BatchEnd::Cancelled => RunStatus::Cancelled,
+            BatchEnd::Done => unreachable!("finish_batch is only called for terminal batch ends"),
+        };
+        self.finish(status, None).await
+    }
+
+    async fn finish(
+        mut self,
+        status: RunStatus,
+        final_text: Option<String>,
+    ) -> Result<RunOutcome, CoreError> {
+        self.checkpoint().await?;
+        self.emit(Event::Finished {
+            status: status.clone(),
+            usage: self.state.usage,
+            turns: self.state.turn,
+        })
+        .await?;
+        Ok(RunOutcome {
+            status,
+            final_text,
+            state: self.state,
+        })
+    }
+}
+
+fn track(action: Option<StuckAction>, nudge: &mut Option<String>, stop: &mut Option<StuckSignal>) {
+    match action {
+        Some(StuckAction::Nudge(message)) => *nudge = Some(message),
+        Some(StuckAction::Stop(signal)) => *stop = Some(signal),
+        None => {}
+    }
+}
+
+/// A receipt and model-facing message for a call that never ran.
+fn rejection(
+    call: &ToolCall,
+    turn: u32,
+    status: ReceiptStatus,
+    reason: String,
+) -> (Receipt, ToolOutput) {
+    let prefix = match status {
+        ReceiptStatus::Denied => "Denied",
+        ReceiptStatus::Cancelled => "Cancelled",
+        _ => "Error",
+    };
+    let output = ToolOutput::error(format!("{prefix}: {reason}"));
+    let receipt = Receipt {
+        call_id: call.id.clone(),
+        tool: call.name.clone(),
+        arguments: call.arguments.clone(),
+        turn,
+        stage: InvocationStage::RejectedBeforeDispatch,
+        status,
+        read_only: false,
+        duration_ms: 0,
+        reason: Some(reason),
+        details: serde_json::Value::Null,
+    };
+    (receipt, output)
+}
+
+/// Keep the head and tail of long output; the middle is usually the least
+/// useful part of logs and listings.
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars || max_chars == 0 {
+        return text.to_string();
+    }
+    let head = max_chars * 2 / 3;
+    let tail = max_chars - head;
+    let omitted = total - head - tail;
+    let head_text: String = text.chars().take(head).collect();
+    let tail_text: String = text.chars().skip(total - tail).collect();
+    format!(
+        "{head_text}\n\n[... {omitted} characters omitted by the harness; narrow the request to see them ...]\n\n{tail_text}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_middle;
+
+    #[test]
+    fn truncation_keeps_head_and_tail() {
+        let text: String = (0..1000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let cut = truncate_middle(&text, 90);
+        assert!(cut.starts_with(&text[..60]));
+        assert!(cut.ends_with(&text[970..]));
+        assert!(cut.contains("910 characters omitted"));
+        assert_eq!(truncate_middle("short", 90), "short");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let text = "é".repeat(500);
+        let cut = truncate_middle(&text, 30);
+        assert!(cut.starts_with(&"é".repeat(20)));
+    }
+}

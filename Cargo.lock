@@ -137,6 +137,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-core"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "aidaemon-node-protocol"
 version = "0.1.0"
 dependencies = [
