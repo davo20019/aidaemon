@@ -23,6 +23,9 @@ pub enum ReceiptStatus {
     Cancelled,
     UnknownTool,
     InvalidArguments,
+    /// The call may or may not have completed: the process stopped while it
+    /// was running and the tool is not idempotent, so it was not re-run.
+    Indeterminate,
 }
 
 /// The durable record of one tool call. Every call produces exactly one,

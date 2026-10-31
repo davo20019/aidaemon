@@ -47,6 +47,19 @@ pub struct Pending {
     pub interruption: Interruption,
 }
 
+/// A tool batch that was executing when the state was last saved. Present
+/// only in checkpoints taken mid-turn; used for crash recovery.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InFlight {
+    pub calls: Vec<ToolCall>,
+    /// Calls that were handed to their tool.
+    #[serde(default)]
+    pub started: Vec<String>,
+    /// Calls whose result is already in the transcript.
+    #[serde(default)]
+    pub done: Vec<String>,
+}
+
 /// Everything needed to continue a run, as plain serializable data.
 ///
 /// Persist it anywhere (a database row, a file, a queue message) and hand it
@@ -68,6 +81,8 @@ pub struct RunState {
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Pending>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<InFlight>,
     #[serde(default)]
     pub nudges: u32,
     #[serde(default)]
@@ -87,6 +102,7 @@ impl RunState {
             tool_calls: 0,
             elapsed_ms: 0,
             pending: None,
+            in_flight: None,
             nudges: 0,
             stuck: StuckState::default(),
         }
@@ -101,6 +117,7 @@ impl RunState {
         self.tool_calls = 0;
         self.elapsed_ms = 0;
         self.nudges = 0;
+        self.in_flight = None;
         self.stuck.reset();
         self
     }

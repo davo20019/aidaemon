@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
     Agent, Event, FnTool, Hook, HookContext, MemoryStore, Resolution, RunState, RunStatus,
-    ToolAnnotations, ToolCall, ToolDecision, ToolOutput,
+    ToolAnnotations, ToolCall, ToolDecision, ToolInfo, ToolOutput,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -23,9 +23,9 @@ impl Hook for AskBeforeDestructive {
         &self,
         _ctx: &HookContext<'_>,
         call: &ToolCall,
-        annotations: ToolAnnotations,
+        tool: &ToolInfo,
     ) -> ToolDecision {
-        if annotations.destructive {
+        if tool.annotations.destructive {
             ToolDecision::Interrupt {
                 reason: format!("`{}` is destructive; needs approval", call.name),
             }

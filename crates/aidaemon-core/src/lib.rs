@@ -40,13 +40,17 @@ pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Message, Role, ToolCall};
 pub use outcome::{RunOutcome, RunStatus};
 pub use provider::{
-    ModelRequest, ModelResponse, Provider, ProviderError, Retry, ToolChoice, ToolSpec, Usage,
+    collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, Retry, StreamEvent,
+    ToolChoice, ToolSpec, Usage,
 };
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
-pub use state::{Interruption, Pending, RunId, RunState};
+pub use state::{InFlight, Interruption, Pending, RunId, RunState};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
-pub use tool::{FnTool, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput, ToolResult};
+pub use tool::{
+    AccessManifest, FnTool, Tool, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput,
+    ToolResult,
+};
 
 /// Re-exported so tools can observe cancellation without adding the dependency.
 pub use tokio_util::sync::CancellationToken;

@@ -122,3 +122,40 @@ pub fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
         }),
     }
 }
+
+/// Wraps a provider and streams each reply's text word by word before the
+/// final event, to exercise streaming consumers.
+pub struct StreamingProvider<P>(pub P);
+
+#[async_trait]
+impl<P: Provider> Provider for StreamingProvider<P> {
+    fn name(&self) -> &str {
+        "scripted-streaming"
+    }
+
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.0.complete(request).await
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> futures::stream::BoxStream<'a, Result<crate::StreamEvent, ProviderError>> {
+        use futures::StreamExt;
+        let fut = async move {
+            match self.0.complete(request).await {
+                Ok(response) => {
+                    let mut events: Vec<Result<crate::StreamEvent, ProviderError>> = response
+                        .text
+                        .split_inclusive(' ')
+                        .map(|w| Ok(crate::StreamEvent::TextDelta(w.to_string())))
+                        .collect();
+                    events.push(Ok(crate::StreamEvent::Done(response)));
+                    events
+                }
+                Err(err) => vec![Err(err)],
+            }
+        };
+        Box::pin(futures::stream::once(fut).flat_map(futures::stream::iter))
+    }
+}

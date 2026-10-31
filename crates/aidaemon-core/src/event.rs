@@ -19,6 +19,16 @@ pub enum Event {
     TurnStarted {
         turn: u32,
     },
+    /// Streamed model text, before the turn's `ModelResponded`.
+    TextDelta {
+        turn: u32,
+        text: String,
+    },
+    /// The run continued after a crash or restart.
+    Recovered {
+        reran: Vec<String>,
+        indeterminate: Vec<String>,
+    },
     ModelResponded {
         turn: u32,
         usage: Usage,

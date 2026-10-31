@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::ToolSpec;
+use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
 
 /// Effect hints that drive scheduling and policy.
@@ -49,6 +49,41 @@ impl Default for ToolAnnotations {
     }
 }
 
+/// What one call will touch, declared by the tool from its arguments.
+/// Policies use it for scope checks and sandboxes for confinement. Empty
+/// means "not declared", not "touches nothing".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessManifest {
+    /// Paths read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Paths created, modified or deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// Hosts contacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Commands executed (first word or full command line).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+}
+
+impl AccessManifest {
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+            && self.writes.is_empty()
+            && self.hosts.is_empty()
+            && self.commands.is_empty()
+    }
+}
+
+/// What `before_tool` hooks know about the tool behind a call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInfo {
+    pub annotations: ToolAnnotations,
+    pub access: AccessManifest,
+}
+
 /// Trusted, harness-provided context for one call.
 ///
 /// This is passed beside the model's arguments rather than injected into
@@ -74,6 +109,10 @@ pub struct ToolOutput {
     /// Structured evidence copied into the receipt (exit code, paths, status).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
+    /// Model usage spent inside the tool (for example a sub-agent). The loop
+    /// adds it to the run's usage, so budgets cover delegated work.
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 impl ToolOutput {
@@ -82,6 +121,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             details: Value::Null,
+            usage: Usage::default(),
         }
     }
 
@@ -90,7 +130,13 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             details: Value::Null,
+            usage: Usage::default(),
         }
+    }
+
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
@@ -148,6 +194,12 @@ pub trait Tool: Send + Sync {
     /// default checks the schema's `required` keys; override to add more.
     fn validate(&self, arguments: &Value) -> Result<(), String> {
         check_required(&self.spec().parameters, arguments)
+    }
+
+    /// Declare what this call will touch. Optional; policies treat an empty
+    /// manifest as undeclared.
+    fn access(&self, _arguments: &Value) -> AccessManifest {
+        AccessManifest::default()
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;

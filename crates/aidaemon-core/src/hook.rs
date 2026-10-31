@@ -6,7 +6,7 @@ use crate::provider::{ModelRequest, Usage};
 use crate::receipt::Receipt;
 use crate::state::RunId;
 use crate::stuck::StuckSignal;
-use crate::tool::{ToolAnnotations, ToolOutput};
+use crate::tool::{ToolInfo, ToolOutput};
 
 /// Read-only view of the run handed to every hook.
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +78,7 @@ pub trait Hook: Send + Sync {
         &self,
         _ctx: &HookContext<'_>,
         _call: &ToolCall,
-        _annotations: ToolAnnotations,
+        _tool: &ToolInfo,
     ) -> ToolDecision {
         ToolDecision::Allow
     }
