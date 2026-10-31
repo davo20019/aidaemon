@@ -65,12 +65,8 @@ pub fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return None;
     }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    let (chunks, _) = bytes.as_chunks::<4>();
+    Some(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 /// Deterministic hashed bag-of-words embedder. No model, no network, same
