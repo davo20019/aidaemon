@@ -13,7 +13,7 @@ use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
 use crate::limits::RunSnapshot;
-use crate::message::{Message, ToolCall};
+use crate::message::{Message, MessageOrigin, ToolCall};
 use crate::outcome::{RunOutcome, RunStatus};
 use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
@@ -192,7 +192,9 @@ impl<'a> Driver<'a> {
                             message: message.clone(),
                         })
                         .await?;
-                        self.state.messages.push(Message::user(message));
+                        self.state
+                            .messages
+                            .push(Message::from_origin(MessageOrigin::StopHook, message));
                         self.checkpoint().await?;
                         continue;
                     }
@@ -333,7 +335,9 @@ impl<'a> Driver<'a> {
         }
         if let Some(message) = nudge {
             // After all tool results, so the transcript stays well formed.
-            self.state.messages.push(Message::user(message));
+            self.state
+                .messages
+                .push(Message::from_origin(MessageOrigin::Harness, message));
         }
         Ok(BatchEnd::Done)
     }
@@ -406,15 +410,12 @@ impl<'a> Driver<'a> {
             .get(&call.name)
             .expect("dispatch only sees calls that passed lookup")
             .clone();
-        let ctx = ToolContext {
-            run_id: self.state.run_id,
-            session_id: self.state.session_id.clone(),
-            call_id: call.id.clone(),
-            turn: self.state.turn,
-            cancel: self.cancel.child_token(),
-        };
+        let ctx = ToolContext::new(self.state.session_id.clone(), call.id.clone())
+            .with_run(self.state.run_id, self.state.turn)
+            .with_cancel(self.cancel.child_token());
+        let timeout = tool.timeout().unwrap_or(self.agent.limits.tool_timeout);
         let started = Instant::now();
-        let result = tokio::time::timeout(self.agent.limits.tool_timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => None,
@@ -425,7 +426,10 @@ impl<'a> Driver<'a> {
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let (status, reason, output) = match result {
-            Ok(Some(Ok(output))) if output.is_error => (ReceiptStatus::Failed, None, output),
+            Ok(Some(Ok(output))) if output.is_error => {
+                let reason = output.content.chars().take(300).collect::<String>();
+                (ReceiptStatus::Failed, Some(reason), output)
+            }
             Ok(Some(Ok(output))) => (ReceiptStatus::Succeeded, None, output),
             Ok(Some(Err(err))) => (
                 ReceiptStatus::Failed,
@@ -438,7 +442,7 @@ impl<'a> Driver<'a> {
                 ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
             ),
             Err(_) => {
-                let secs = self.agent.limits.tool_timeout.as_secs_f64();
+                let secs = timeout.as_secs_f64();
                 (
                     ReceiptStatus::TimedOut,
                     Some(format!("timed out after {secs:.1}s")),
@@ -479,10 +483,10 @@ impl<'a> Driver<'a> {
                 hook.after_tool(&ctx, &receipt, &mut output).await;
             }
         }
-        self.state.messages.push(Message::tool_result(
-            receipt.call_id.clone(),
-            output.content.clone(),
-        ));
+        self.state.messages.push(
+            Message::tool_result(receipt.call_id.clone(), output.content.clone())
+                .with_error(!receipt.succeeded()),
+        );
         self.state.receipts.push(receipt.clone());
         self.state.tool_calls += 1;
         self.state.usage.add(output.usage);

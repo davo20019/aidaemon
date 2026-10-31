@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
-use aidaemon_core::{Hook, HookContext, Receipt, ReceiptStatus, Role, StopDecision};
+use aidaemon_core::{Hook, HookContext, MessageOrigin, Receipt, ReceiptStatus, Role, StopDecision};
 use async_trait::async_trait;
 
-use crate::{last_user_message_index, HARNESS_MARKER};
+use crate::last_user_message_index;
 
 /// One structural requirement on the receipts of the current user turn
 /// (everything after the last message the user, not the harness, wrote).
@@ -145,7 +145,9 @@ impl Hook for ReceiptCompletionCheck {
         let tail = &ctx.messages[start..];
         let rejections = tail
             .iter()
-            .filter(|m| m.role == Role::User && m.content.starts_with(REJECTION_PREFIX))
+            .filter(|m| {
+                m.origin == Some(MessageOrigin::StopHook) && m.content.starts_with(REJECTION_PREFIX)
+            })
             .count();
         if rejections >= self.max_rejections {
             return StopDecision::Accept;
@@ -164,7 +166,6 @@ impl Hook for ReceiptCompletionCheck {
         if problems.is_empty() {
             return StopDecision::Accept;
         }
-        debug_assert!(REJECTION_PREFIX.starts_with(HARNESS_MARKER));
         let mut message = format!(
             "{REJECTION_PREFIX} the run is not finished yet (check {} of {}).",
             rejections + 1,

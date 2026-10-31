@@ -130,6 +130,12 @@ struct ShellArgs {
 
 #[async_trait]
 impl Tool for Shell {
+    /// The loop must allow at least the shell's own maximum plus time to
+    /// kill the process group and collect output.
+    fn timeout(&self) -> Option<Duration> {
+        Some(self.max_timeout + Duration::from_secs(10))
+    }
+
     fn spec(&self) -> ToolSpec {
         let containment = if self.backend.is_contained() {
             "Writes outside the workspace are blocked"

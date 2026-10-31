@@ -244,3 +244,98 @@ async fn idempotent_call_in_flight_is_rerun() {
     assert_eq!(notify_calls, 1);
     assert!(out.receipts().iter().all(|r| r.succeeded()));
 }
+
+// ---------- typed message origins, error flags, timeout hints, with_limits ----------
+
+#[tokio::test]
+async fn injected_messages_carry_a_typed_origin_and_errors_are_flagged() {
+    use aidaemon_core::{FnTool, Limits, MessageOrigin, StopDecision};
+    struct RejectOnce(AtomicUsize);
+    #[async_trait]
+    impl Hook for RejectOnce {
+        async fn on_stop(&self, _: &HookContext<'_>, _: &str) -> StopDecision {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                StopDecision::Continue {
+                    message: "verify first".into(),
+                }
+            } else {
+                StopDecision::Accept
+            }
+        }
+    }
+    let failing = FnTool::new(
+        spec("grep", "search", &[]),
+        ToolAnnotations::READ_ONLY,
+        |_args: Value| async move { Ok(ToolOutput::error("no matches for pattern")) },
+    );
+    let agent = Agent::builder("a")
+        .model("m")
+        .provider(ScriptedProvider::new([
+            tool_calls([call("c1", "grep", json!({}))]),
+            text("done"),
+            text("done, verified"),
+        ]))
+        .tool(failing)
+        .hook(RejectOnce(AtomicUsize::new(0)))
+        .build()
+        .unwrap();
+    let out = agent.run("s", "find it").await.unwrap();
+
+    let msgs = &out.state.messages;
+    assert_eq!(msgs[0].origin, Some(MessageOrigin::User));
+    let tool_msg = msgs.iter().find(|m| m.role == Role::Tool).unwrap();
+    assert!(tool_msg.is_error);
+    assert_eq!(
+        out.receipts()[0].reason.as_deref(),
+        Some("no matches for pattern")
+    );
+    let injected = msgs.iter().find(|m| m.content == "verify first").unwrap();
+    assert_eq!(injected.origin, Some(MessageOrigin::StopHook));
+    assert!(injected.is_injected());
+
+    // with_limits keeps identity and tools, changes only the budget.
+    let child = agent.with_limits(Limits {
+        max_turns: 2,
+        ..Limits::default()
+    });
+    assert_eq!(child.id(), agent.id());
+    assert_eq!(child.limits().max_turns, 2);
+    assert_eq!(child.tool_specs().len(), 1);
+}
+
+#[tokio::test]
+async fn a_tool_timeout_hint_overrides_the_default() {
+    use aidaemon_core::Limits;
+    struct Patient;
+    #[async_trait]
+    impl Tool for Patient {
+        fn spec(&self) -> ToolSpec {
+            spec("patient", "takes 150ms", &[])
+        }
+        fn annotations(&self) -> ToolAnnotations {
+            ToolAnnotations::READ_ONLY
+        }
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(5))
+        }
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(ToolOutput::text("finished"))
+        }
+    }
+    let agent = Agent::builder("a")
+        .model("m")
+        .provider(ScriptedProvider::new([
+            tool_calls([call("c1", "patient", json!({}))]),
+            text("ok"),
+        ]))
+        .tool(Patient)
+        .limits(Limits {
+            tool_timeout: Duration::from_millis(20),
+            ..Limits::default()
+        })
+        .build()
+        .unwrap();
+    let out = agent.run("s", "go").await.unwrap();
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Succeeded);
+}

@@ -244,7 +244,15 @@ dependencies = [
 name = "aidaemon-sdk"
 version = "0.0.1"
 dependencies = [
+ "aidaemon-agents",
  "aidaemon-core",
+ "aidaemon-eval",
+ "aidaemon-mcp",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-store-sqlite",
+ "aidaemon-tools",
+ "tokio",
 ]
 
 [[package]]

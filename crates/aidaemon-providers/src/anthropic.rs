@@ -253,11 +253,17 @@ fn wire_messages(messages: &[Message]) -> Vec<Value> {
             Role::User => ("user", text_block(&message.content)),
             Role::Tool => (
                 "user",
-                vec![json!({
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": message.content,
-                })],
+                vec![{
+                    let mut block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+                        "content": message.content,
+                    });
+                    if message.is_error {
+                        block["is_error"] = json!(true);
+                    }
+                    block
+                }],
             ),
             Role::Assistant => {
                 let mut blocks = text_block(&message.content);

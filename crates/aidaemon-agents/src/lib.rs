@@ -187,8 +187,8 @@ impl fmt::Debug for AgentTool {
 
 impl AgentTool {
     /// Wrap an already-built agent. The child keeps the limits it was built
-    /// with; use [`ChildBudget::limits`] when building it, or
-    /// [`AgentTool::from_builder`], to get child-sized caps.
+    /// with; call [`AgentTool::budget`] (or use [`AgentTool::from_builder`])
+    /// to give it child-sized caps.
     pub fn new(agent: Agent) -> Self {
         let name = sanitize_tool_name(agent.id());
         let description = format!(
@@ -210,6 +210,12 @@ impl AgentTool {
 
     /// Build the child from `builder` with `budget` applied. This replaces
     /// any limits already set on the builder.
+    /// Give the wrapped agent child-sized caps, replacing its own limits.
+    pub fn budget(mut self, budget: ChildBudget) -> Self {
+        self.agent = self.agent.with_limits(budget.limits());
+        self
+    }
+
     pub fn from_builder(builder: AgentBuilder, budget: ChildBudget) -> Result<Self, BuildError> {
         let agent = builder.limits(budget.limits()).build()?;
         Ok(Self::new(agent))

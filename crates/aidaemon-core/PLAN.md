@@ -14,22 +14,24 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 | Item | State |
 |---|---|
 | Branch | `ccr-986102ee-12nt48` (branched from `master` at `4a36e32`) |
-| Kernel crate | `crates/aidaemon-core`, experimental, `publish = false` |
-| Tests | 30 behavioral + 8 unit + 1 doc test, all passing |
-| CI | Lint, Linux tests, release build, coverage green. macOS job never gets a runner (see "Known issues") |
+| Crates | `aidaemon-core` plus 8 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
+| Tests | 216 across the 9 crates, all passing; clippy and fmt clean |
+| CI | Lint and tests for every SDK crate run in `ci.yml`. macOS job never gets a runner (see "Known issues") |
 | PR | #13 was closed without merging; the branch was kept. Open a new PR only when asked |
-| Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF (14 concepts, compared across ~20 harnesses, with verdicts) |
+| Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
 
-### What exists in the kernel today
+### What exists
 
-Agent builder, `Provider` (+ `Retry` layer), simple `Tool` with conservative
-annotations, `ToolContext` (trusted ids beside the arguments), `Hook`
-(`before_model`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`),
-`Receipt` for every call, typed `RunOutcome` / `RunStatus`, serializable
-`RunState` with interrupt/resume, `Event` stream, `RunStore` +
-`MemoryStore`, hard `Limits`, custom `StopCondition`, configurable stuck
-detection, read-only calls in parallel, a `testing` feature with
-`ScriptedProvider`, and `examples/quickstart.rs`.
+- **Kernel** (`aidaemon-core`): agent builder, streaming `Provider` + `Retry`,
+  `Tool` with annotations, access manifests and timeout hints, five hook
+  points, receipts for every call, typed outcomes, serializable state with
+  interrupt/resume, crash-safe in-flight batches, typed message origins,
+  events, `RunStore`, limits, stuck detection, `testing` helpers.
+- **SDK crates**: providers (OpenAI-compatible, Anthropic), tools (file,
+  search, sandboxed shell, web, checklist), SQLite store, MCP client,
+  agents-as-tools, policies (approvals, scope, completion, redaction,
+  untrusted output, project instructions, context window, memory, tracing),
+  eval kit, and the `aidaemon-sdk` bundle with a `coding_agent` example.
 
 ## Decisions already made
 
@@ -46,115 +48,67 @@ detection, read-only calls in parallel, a `testing` feature with
 5. **Receipts are the source of truth** for "did the work happen"; completion
    checks read receipts, not the model's prose.
 
-## Open questions (decide before Phase 1)
+## Phase 0 decisions (settled 2026-10-31)
 
-These shape the public API. Each has a current default in the sketch.
+Kept the sketch's defaults, now part of the API:
 
-- [ ] **Tool errors.** `Tool::call` returns `ToolResult`, and any error goes
-      back to the model; it never ends the run. Keep?
-- [ ] **Errors vs statuses.** Provider outages and limits are
-      `Ok(RunOutcome { status })`, `Err` is only misuse and store failures.
-      Keep?
-- [ ] **Approvals.** Pausing for a human is a hook decision (`Interrupt`),
-      not a separate approval API. Keep?
-- [ ] **Instructions.** The system prompt is re-sent every request and never
-      stored in `RunState`. Keep?
-- [ ] **Naming.** `aidaemon-core` vs `aidaemon-sdk` for the user-facing
-      crate (a facade crate could re-export the others behind features).
+- [x] Tool errors go back to the model as error results; they never end a run.
+- [x] Provider outages and limits are `Ok(RunOutcome { status })`; `Err` is
+      only misuse and store failures.
+- [x] Pausing for a human is a hook decision (`Interrupt`), resumed with
+      `Agent::resume`.
+- [x] Instructions are re-sent on every request and never stored.
+- [x] Naming: `aidaemon-core` is the kernel; `aidaemon-sdk` is the
+      user-facing bundle.
 
 ## Roadmap
 
 Each phase ends in something runnable and tested. Phases 1-3 can overlap.
 
-### Phase 0: lock the primitives  ← Next up
+### Phase 0: lock the primitives (done)
+### Phase 1: a real model (done)
+OpenAI-compatible and Anthropic providers with streaming and prompt caching,
+tested against local mock servers. **Not yet run against a live model**:
+needs an API key (see Phase 4).
 
-- [ ] Review `src/` of the kernel against the Field Guide verdicts.
-- [ ] Answer the open questions above; update code and `DESIGN.md`.
-- [ ] Decide whether to merge the sketch to `master` now (as experimental)
-      or keep it on the branch until Phase 1.
+### Phase 2: tools worth having (done)
+Workspace-confined tools, sandbox backends (local, bubblewrap, seatbelt,
+docker), access manifests. Bubblewrap and seatbelt were only tested on the
+argument level here (not installed in the build container).
 
-Done when: the five questions are answered and the API reflects them.
+### Phase 3: durability (done)
+SQLite store with versioned migrations; crash recovery without repeating
+non-idempotent calls, tested by killing a run mid-tool and reopening the
+database.
 
-### Phase 1: a real model
+### Phase 4: measurement  ← Next up
+- [x] `aidaemon-eval`: scenarios, trajectory assertions, N-of-M reports,
+      baseline comparison, 5 scripted scenarios.
+- [ ] Live runs: run `crates/aidaemon-eval/scenarios` and the
+      `coding_agent` example against real models (needs API keys).
+- [ ] Old-vs-new comparison: translate the daemon's 16 fixtures in
+      `tests/harness_eval/fixtures/` into `aidaemon-eval` scenarios (or add a
+      `core` engine to `src/harness_eval`) and report both loops side by side.
+- [ ] Baseline the plain kernel (no policies) so each policy has a number
+      to beat.
 
-- [ ] New crate `crates/aidaemon-providers` with an OpenAI-compatible
-      provider (reuse wire logic from `src/providers/openai_compatible.rs`,
-      drop daemon-only options such as llama.cpp slot pinning into its own
-      config).
-- [ ] Anthropic provider with prompt caching on the stable prefix.
-- [ ] Streaming: add a `Provider::stream` method yielding typed deltas;
-      `complete` becomes a fold over it; matching `Event` variants.
-- [ ] Run `examples/quickstart.rs` against a real model behind an env var.
+### Phase 5: daemon policies as hooks (implemented, not yet measured)
+All listed policies exist in `aidaemon-policies`. What remains is the
+measurement gate: keep each one only if N-of-M runs show a gain.
+- [ ] Measure each policy on/off with `aidaemon_eval::compare`.
+- [ ] Just-in-time discovery of deeper `AGENTS.md` files (only start-up
+      discovery is ported).
+- [ ] Port the daemon's fastembed-backed memory as a `Recall` implementation
+      (an in-memory word-overlap `Recall` exists for tests).
 
-Done when: an example agent does a small real task end to end with a real
-provider, and streaming events reach an `EventSink`.
+### Phase 6: the rest of the framework (done, with gaps)
+Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
+- [ ] Async approval inside sub-agents (a child that interrupts currently
+      returns an error to its parent).
+- [ ] Reasoning content and images in messages.
+- [ ] Publish plan: versions, `publish = true`, crates.io names.
 
-### Phase 2: tools worth having
-
-- [ ] New crate `crates/aidaemon-tools`: read file (bounded views),
-      exact-match edit with uniqueness check, write, search (glob/grep),
-      shell, web fetch, checklist (`track_requirements`).
-- [ ] Apply the agent-computer-interface lessons by default: paginated and
-      capped output, actionable errors, validate edits before applying.
-- [ ] `ExecutionBackend` trait for containment: local, macOS Seatbelt,
-      Linux bubblewrap or Landlock, Docker. Keep it separate from approval
-      policy (the Codex two-axis model).
-- [ ] Opt-in `TypedTool` trait for typed effects and access manifests, with
-      a blanket adapter to `Tool`.
-
-Done when: a coding agent built only from SDK crates can read, edit and test
-a small synthetic repo inside a sandbox.
-
-### Phase 3: durability
-
-- [ ] New crate `crates/aidaemon-store-sqlite` implementing `RunStore`, with
-      versioned migrations (a version table, not best-effort `ALTER`s).
-- [ ] Crash-recovery test: kill mid-run, `load_state` + `run_from`, finish.
-- [ ] Idempotency keys (`run_id + tool + canonical args hash`) and per-tool
-      replay decisions, so a redone turn does not repeat side effects.
-
-Done when: a run survives a process restart without repeating a
-non-idempotent tool call.
-
-### Phase 4: measurement
-
-- [ ] Add a `core` engine to `src/harness_eval` and run the existing 16 YAML
-      fixtures against `aidaemon-core`.
-- [ ] Live eval runner: the same scenarios against a real model, N runs
-      each, reporting pass rates.
-- [ ] Baseline the plain kernel (no daemon policies) so later hooks have
-      something to beat.
-
-Done when: there is a single command that prints pass rates for the old loop
-and the new kernel side by side.
-
-### Phase 5: port daemon policies as hooks
-
-One policy per change, each gated by Phase 4 numbers. Suggested order:
-
-- [ ] Approvals and risk levels → `before_tool` (`Interrupt` / `Deny`).
-- [ ] Receipt-based completion check and checklist → `on_stop`.
-- [ ] Untrusted-output sanitization and secret redaction → `after_tool`.
-- [ ] Project instructions (AGENTS.md / CLAUDE.md resolver) → `before_model`
-      plus a `before_tool` deferral when entering a new subtree.
-- [ ] Context strategy (turn eviction, summaries, spill-to-file) →
-      `before_model`, task state kept outside the transcript.
-- [ ] Memory injection → `before_model`, in `crates/aidaemon-memory`.
-
-Done when: each ported policy shows a measured gain or is dropped.
-
-### Phase 6: the rest of the framework
-
-- [ ] `crates/aidaemon-agents`: `Agent::as_tool()`, explicit context forking,
-      child budgets that count toward the parent, structured results.
-- [ ] `crates/aidaemon-mcp`: MCP client exposing servers as `Tool`s, with
-      lazy schema loading.
-- [ ] OpenTelemetry `EventSink` (GenAI semantic conventions).
-- [ ] Move `testing` into its own crate if it grows.
-- [ ] Public docs and a second example (a non-coding agent).
-
-### Phase 7: the daemon runs on the SDK
-
+### Phase 7: the daemon runs on the SDK (not started; needs a decision)
 - [ ] Daemon builds its agent through `AgentBuilder` with its hooks.
 - [ ] Old loop runs side by side behind a flag until the new one matches or
       beats it on Phase 4 numbers.
@@ -193,9 +147,8 @@ Independent of the SDK; each is a small PR against `master`.
   `git config --global user.name/user.email` to the environment's setup
   script, or run them at the start of a session.
 - Follow the repo's `CLAUDE.md`: `cargo fmt`, `cargo clippy --all-features
-  -- -D warnings`, and the relevant tests before committing. For this crate:
-  `cargo clippy -p aidaemon-core --all-targets --all-features -- -D warnings`
-  and `cargo test -p aidaemon-core`.
+  -- -D warnings`, and the relevant tests before committing. For the SDK
+  crates, run clippy and tests with the `-p` list from "How to resume".
 - Synthetic data only in tests and docs (no real names, IDs or PII).
 
 ## How to resume
@@ -205,8 +158,11 @@ git fetch origin ccr-986102ee-12nt48
 git checkout ccr-986102ee-12nt48
 git config user.name "David Loor M."
 git config user.email "davo20019@gmail.com"
-cargo test -p aidaemon-core
+cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools \
+  -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents \
+  -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk --all-features
 cargo run -p aidaemon-core --example quickstart --features testing
+ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example coding_agent -- <dir> "<task>"
 ```
 
 Prompt to start a new session:

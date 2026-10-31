@@ -93,8 +93,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings
 
-      - name: Clippy (aidaemon-core)
-        run: cargo clippy -p aidaemon-core --all-targets --all-features -- -D warnings
+      - name: Clippy (SDK crates)
+        run: >-
+          cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk
+          --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -166,8 +170,11 @@ jobs:
       - name: Harness eval fixture suite
         run: cargo test --lib harness_eval --all-features
 
-      - name: Kernel sketch tests (aidaemon-core)
-        run: cargo test -p aidaemon-core
+      - name: SDK crate tests
+        run: >-
+          cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk --all-features
 
   build-check:
     name: Build check (release)

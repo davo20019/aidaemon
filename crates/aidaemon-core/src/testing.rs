@@ -159,3 +159,8 @@ impl<P: Provider> Provider for StreamingProvider<P> {
         Box::pin(futures::stream::once(fut).flat_map(futures::stream::iter))
     }
 }
+
+/// A tool context for calling tools directly in tests.
+pub fn tool_context() -> crate::ToolContext {
+    crate::ToolContext::new("test:synthetic-session", "call-1")
+}

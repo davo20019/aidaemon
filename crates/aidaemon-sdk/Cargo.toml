@@ -3,10 +3,36 @@ name = "aidaemon-sdk"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
-description = "aidaemon SDK: sdk (experimental)"
+description = "Build your own agents on the aidaemon kernel: one crate, features per subsystem (experimental)"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
 publish = false
 
+[features]
+default = ["providers", "tools", "policies", "agents", "sqlite"]
+providers = ["dep:aidaemon-providers"]
+tools = ["dep:aidaemon-tools"]
+policies = ["dep:aidaemon-policies"]
+agents = ["dep:aidaemon-agents"]
+sqlite = ["dep:aidaemon-store-sqlite"]
+mcp = ["dep:aidaemon-mcp"]
+eval = ["dep:aidaemon-eval"]
+testing = ["aidaemon-core/testing"]
+full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing"]
+
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
+aidaemon-providers = { path = "../aidaemon-providers", optional = true }
+aidaemon-tools = { path = "../aidaemon-tools", optional = true }
+aidaemon-policies = { path = "../aidaemon-policies", optional = true }
+aidaemon-agents = { path = "../aidaemon-agents", optional = true }
+aidaemon-store-sqlite = { path = "../aidaemon-store-sqlite", optional = true }
+aidaemon-mcp = { path = "../aidaemon-mcp", optional = true }
+aidaemon-eval = { path = "../aidaemon-eval", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "coding_agent"
+required-features = ["providers", "tools", "policies", "sqlite"]

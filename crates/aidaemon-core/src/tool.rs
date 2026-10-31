@@ -89,6 +89,7 @@ pub struct ToolInfo {
 /// This is passed beside the model's arguments rather than injected into
 /// them, so a model can never spoof a session id or role by inventing a field.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolContext {
     pub run_id: RunId,
     pub session_id: String,
@@ -96,6 +97,31 @@ pub struct ToolContext {
     pub turn: u32,
     /// Cancelled when the run is cancelled; long tools should watch it.
     pub cancel: CancellationToken,
+}
+
+impl ToolContext {
+    /// A context with a fresh run id, turn 0 and a new cancel token. The
+    /// loop fills in the real values; tests and adapters use this directly.
+    pub fn new(session_id: impl Into<String>, call_id: impl Into<String>) -> Self {
+        Self {
+            run_id: RunId::new(),
+            session_id: session_id.into(),
+            call_id: call_id.into(),
+            turn: 0,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    pub fn with_run(mut self, run_id: RunId, turn: u32) -> Self {
+        self.run_id = run_id;
+        self.turn = turn;
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
 }
 
 /// What a tool hands back to the model, plus structured details for receipts.
@@ -194,6 +220,13 @@ pub trait Tool: Send + Sync {
     /// default checks the schema's `required` keys; override to add more.
     fn validate(&self, arguments: &Value) -> Result<(), String> {
         check_required(&self.spec().parameters, arguments)
+    }
+
+    /// How long this tool may run, overriding `Limits::tool_timeout`. Tools
+    /// that take their own timeout argument (such as a shell) return a value
+    /// at least as long as their own maximum.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        None
     }
 
     /// Declare what this call will touch. Optional; policies treat an empty

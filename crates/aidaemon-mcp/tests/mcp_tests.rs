@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_core::{
-    Agent, CancellationToken, ReceiptStatus, Role, RunId, Tool, ToolAnnotations, ToolContext,
-};
+use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolContext};
 use aidaemon_mcp::{McpError, McpOptions, McpServer};
 use serde_json::{json, Value};
 
@@ -27,13 +25,7 @@ async fn spawn_with(options: McpOptions) -> McpServer {
 }
 
 fn ctx() -> ToolContext {
-    ToolContext {
-        run_id: RunId::new(),
-        session_id: "s".into(),
-        call_id: "c".into(),
-        turn: 1,
-        cancel: CancellationToken::new(),
-    }
+    ToolContext::new("s", "c")
 }
 
 fn find(server: &McpServer, name: &str) -> Arc<dyn Tool> {

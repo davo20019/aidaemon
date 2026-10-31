@@ -16,9 +16,8 @@
 //! | [`TracingSink`] | `EventSink` | the event stream |
 //!
 //! Every decision comes from typed state (annotations, access manifests,
-//! receipts, statuses) or from structural parsing, never from matching words
-//! in model prose. The only text marker any policy reads is the kernel's own
-//! [`HARNESS_MARKER`] prefix on harness-injected user messages.
+//! receipts, statuses, message origins) or from structural parsing, never
+//! from matching words in model prose.
 //!
 //! Order matters: hooks run in registration order. Register request
 //! injectors (`ProjectInstructions`, `MemoryInjection`) before
@@ -49,14 +48,10 @@ pub use untrusted::UntrustedOutput;
 
 use aidaemon_core::{Message, Role};
 
-/// Prefix the kernel (stuck nudges) and these policies (stop rejections)
-/// put on user messages they inject. It is a protocol marker, not prose:
-/// it separates harness feedback from what the user actually said.
-pub const HARNESS_MARKER: &str = "[harness]";
-
-/// True for a user message the harness injected rather than the user.
+/// True for a user message the harness or a hook injected rather than the
+/// user. Reads the typed [`aidaemon_core::MessageOrigin`], not the text.
 pub fn is_harness_message(message: &Message) -> bool {
-    message.role == Role::User && message.content.starts_with(HARNESS_MARKER)
+    message.role == Role::User && message.is_injected()
 }
 
 /// Index of the last user message that the user (not the harness) wrote.
