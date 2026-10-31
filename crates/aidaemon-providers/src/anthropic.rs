@@ -187,6 +187,23 @@ impl Provider for Anthropic {
     }
 }
 
+/// Anthropic rejects `oneOf`, `anyOf`, `allOf` and `not` at the top level of
+/// `input_schema`. Drop them there: they only express cross-field rules, which
+/// the tool's own `validate` still enforces when it is called. Nested
+/// combinators are accepted and kept.
+fn input_schema(parameters: &Value) -> Value {
+    let mut schema = parameters.clone();
+    if let Some(object) = schema.as_object_mut() {
+        for key in ["oneOf", "anyOf", "allOf", "not"] {
+            object.remove(key);
+        }
+        object
+            .entry("type")
+            .or_insert_with(|| Value::String("object".to_string()));
+    }
+    schema
+}
+
 fn ephemeral() -> Value {
     json!({"type": "ephemeral"})
 }
@@ -221,7 +238,7 @@ fn build_body(request: &ModelRequest, default_max_tokens: u32, caching: bool) ->
                 json!({
                     "name": spec.name,
                     "description": spec.description,
-                    "input_schema": spec.parameters,
+                    "input_schema": input_schema(&spec.parameters),
                 })
             })
             .collect();
@@ -495,4 +512,31 @@ fn str_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+#[cfg(test)]
+mod input_schema_tests {
+    use super::input_schema;
+    use serde_json::json;
+
+    #[test]
+    fn top_level_combinators_are_dropped_and_nested_ones_kept() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "targets": {"type": "array", "items": {"oneOf": [{"type": "string"}]}}
+            },
+            "required": ["path"],
+            "allOf": [{"not": {"required": ["tail_lines", "start_line"]}}],
+            "anyOf": [{"required": ["path"]}]
+        });
+        let sent = input_schema(&schema);
+        assert!(sent.get("allOf").is_none() && sent.get("anyOf").is_none());
+        assert_eq!(sent["required"], json!(["path"]));
+        assert_eq!(
+            sent["properties"]["targets"]["items"]["oneOf"],
+            json!([{"type": "string"}])
+        );
+    }
 }
