@@ -775,6 +775,44 @@ pub struct AgentConfig {
     /// Optional Markdown persona file. Relative paths resolve next to config.toml.
     #[serde(default)]
     pub persona_file: Option<PathBuf>,
+    /// Which loop runs agent turns. Defaults to the legacy loop.
+    #[serde(default)]
+    pub engine: AgentEngineConfig,
+}
+
+/// Which agent loop drives every turn.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEngineKind {
+    #[default]
+    Legacy,
+    /// The experimental aidaemon SDK kernel (`crates/aidaemon-core`). Needs a
+    /// build with the `sdk-engine` feature.
+    Sdk,
+}
+
+/// `[agent.engine]`: selects the loop and configures the SDK engine.
+///
+/// ```toml
+/// [agent.engine]
+/// kind = "sdk"
+/// model = "claude-sonnet-5-5"
+/// api_key = "keychain"   # or a literal key; empty falls back to ANTHROPIC_API_KEY
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AgentEngineConfig {
+    #[serde(default)]
+    pub kind: AgentEngineKind,
+    /// Anthropic model id for the SDK engine.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Anthropic API key for the SDK engine (`"keychain"` reads
+    /// `agent_engine_api_key` from the OS credential store).
+    #[serde(default)]
+    pub api_key: String,
+    /// Model turns per agent turn before the run stops.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 impl AgentConfig {
@@ -803,6 +841,7 @@ impl Default for AgentConfig {
         Self {
             name: default_agent_name(),
             persona_file: None,
+            engine: AgentEngineConfig::default(),
         }
     }
 }
@@ -4082,6 +4121,10 @@ impl AppConfig {
     /// Resolve fields set to `"keychain"` by reading them from the OS credential store.
     fn resolve_secrets(&mut self) -> anyhow::Result<()> {
         self.provider.resolve_secrets_recursive(None)?;
+
+        if self.agent.engine.api_key == "keychain" {
+            self.agent.engine.api_key = resolve_from_keychain("agent_engine_api_key")?;
+        }
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram {

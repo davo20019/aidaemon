@@ -815,6 +815,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         let candidate_config = crate::config::AgentConfig {
             name: candidate,
             persona_file: None,
+            engine: Default::default(),
         };
         match candidate_config.validated_name() {
             Ok(name) => break name,

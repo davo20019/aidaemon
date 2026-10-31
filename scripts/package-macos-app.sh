@@ -16,6 +16,9 @@
 #   scripts/package-macos-app.sh --build         # cargo build --release --features computer_use-macos first
 #   scripts/package-macos-app.sh --build --debug # fast DEBUG build (no release opt) — for local/dev
 #
+# AIDAEMON_EXTRA_FEATURES adds cargo features to --build, e.g.
+#   AIDAEMON_EXTRA_FEATURES=sdk-engine scripts/package-macos-app.sh --build
+#
 # See COMPUTER_USE_MACOS.md for the full walkthrough.
 set -euo pipefail
 
@@ -41,15 +44,16 @@ for arg in "$@"; do
 done
 
 if [ "$DO_BUILD" = "1" ]; then
+  BUILD_FEATURES="computer_use-macos${AIDAEMON_EXTRA_FEATURES:+,$AIDAEMON_EXTRA_FEATURES}"
   if [ "$PROFILE" = "debug" ]; then
     # Fast dev path: skip release optimization/LTO. Compiles far quicker; the
     # binary runs slower, which is fine for local iteration.
     echo "Building DEBUG (fast, local/dev) with computer_use-macos..."
-    ( cd "$PROJECT_DIR" && cargo build --features computer_use-macos )
+    ( cd "$PROJECT_DIR" && cargo build --features "$BUILD_FEATURES" )
     PROFILE="debug"
   else
     echo "Building release with computer_use-macos..."
-    ( cd "$PROJECT_DIR" && cargo build --release --features computer_use-macos )
+    ( cd "$PROJECT_DIR" && cargo build --release --features "$BUILD_FEATURES" )
     PROFILE="release"
   fi
 fi

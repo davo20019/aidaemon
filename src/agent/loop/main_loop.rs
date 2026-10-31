@@ -527,6 +527,21 @@ impl Agent {
         // verification, and response delivery. Phase-local clocks remain for
         // diagnostics, but TaskEnd must never report only the post-bootstrap
         // suffix of a request.
+        #[cfg(feature = "sdk-engine")]
+        if let Some(engine) = super::sdk_engine::active() {
+            // Boxed so the SDK turn does not grow this already large state machine.
+            return Box::pin(self.handle_message_sdk(
+                engine,
+                session_id,
+                user_text,
+                status_tx,
+                user_role,
+                channel_ctx,
+                heartbeat,
+                continuation_parent_task_id,
+            ))
+            .await;
+        }
         let task_start = Instant::now();
         touch_heartbeat(&heartbeat);
         info!(session_id, "handle_message_impl: starting bootstrap phase");

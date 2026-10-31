@@ -133,7 +133,21 @@ adapters, tested against local mock servers.
 - [x] Draft publishing plan in `crates/PUBLISHING.md`.
 - [ ] Owner decision on publishing (names, 0.1.0, release automation).
 
-### Phase 7: the daemon runs on the SDK (not started; needs a decision)
+### Phase 7: the daemon runs on the SDK (in progress, behind a flag)
+- [x] Engine switch: build with `--features sdk-engine` and set
+      `[agent.engine] kind = "sdk"`. Every turn that reaches
+      `handle_message_impl` (channels, continuations, goal task leads,
+      spawned children) runs on the kernel (`src/agent/runtime/sdk_engine.rs`).
+      Daemon tools are bridged and dispatched through `execute_tool_outcome`;
+      the turn emits TaskStart/UserMessage/AssistantResponse/TaskEnd so
+      channel envelopes and history work. Anthropic provider only.
+      Live check: `live_sdk_engine_runs_daemon_turns` (ignored; 5/5 on
+      claude-haiku-5-5).
+- [ ] Not yet on the SDK path: per-turn memory/fact injection, mandate
+      authority (goal runs under a mandate will have mutating calls refused),
+      ToolCall/ToolResult events (so `db_probe --gate-outcomes` and receipts
+      see no tool calls), `/clear` boundary in history replay, attachments,
+      model switching (`/model`) and the daemon's provider router.
 - [ ] Daemon builds its agent through `AgentBuilder` with its hooks.
 - [ ] Old loop runs side by side behind a flag until the new one matches or
       beats it on Phase 4 numbers.

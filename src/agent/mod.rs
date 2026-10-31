@@ -249,6 +249,9 @@ mod notes;
 mod parent_delivery;
 #[path = "runtime/project_scope.rs"]
 mod project_scope;
+#[cfg(feature = "sdk-engine")]
+#[path = "runtime/sdk_engine.rs"]
+pub(crate) mod sdk_engine;
 pub(crate) mod specialists;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;

@@ -161,6 +161,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists_dir.as_deref(),
     ));
 
+    #[cfg(feature = "sdk-engine")]
+    crate::agent::sdk_engine::install(&config)?;
+    #[cfg(not(feature = "sdk-engine"))]
+    anyhow::ensure!(
+        config.agent.engine.kind == crate::config::AgentEngineKind::Legacy,
+        "[agent.engine] kind = \"sdk\" needs a build with the `sdk-engine` feature"
+    );
+
     let agent = Arc::new(Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             llm_runtime: llm_runtime.clone(),

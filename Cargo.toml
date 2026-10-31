@@ -104,6 +104,10 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 aes-gcm = { version = "0.10", optional = true }
 portable-pty = { version = "0.8", optional = true }
 
+# SDK engine (experimental, workspace-only crates; see `sdk-engine` feature).
+aidaemon-core = { path = "crates/aidaemon-core", optional = true }
+aidaemon-providers = { path = "crates/aidaemon-providers", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
 # refactor is invasive (requires explicit `use_native_store` calls and
@@ -137,6 +141,9 @@ terminal-bridge = [
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+# Experimental: run every agent turn on the aidaemon SDK kernel instead of the
+# legacy loop when `[agent.engine] kind = "sdk"` is set. Off by default.
+sdk-engine = ["dep:aidaemon-core", "dep:aidaemon-providers"]
 
 [profile.release]
 lto = true
