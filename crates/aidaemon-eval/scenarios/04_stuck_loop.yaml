@@ -1,0 +1,22 @@
+name: stuck_loop
+description: >
+  The model keeps polling a job whose status never changes. The kernel's
+  stuck detector nudges twice (default max_nudges) and then ends the run.
+input: Wait until job 42 finishes.
+script:
+  - tool_calls:
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+  - tool_calls:
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+  - tool_calls:
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+      - { name: check_status, arguments: { job: "42" } }
+expect:
+  status: stuck
+  tool_call_counts: { check_status: 9 }
+  max_turns: 3

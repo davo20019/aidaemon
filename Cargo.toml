@@ -13,7 +13,19 @@ categories = ["command-line-utilities"]
 exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
 
 [workspace]
-members = ["crates/node-protocol", "crates/node-sdk", "crates/aidaemon-core"]
+members = [
+    "crates/node-protocol",
+    "crates/node-sdk",
+    "crates/aidaemon-core",
+    "crates/aidaemon-providers",
+    "crates/aidaemon-tools",
+    "crates/aidaemon-store-sqlite",
+    "crates/aidaemon-mcp",
+    "crates/aidaemon-agents",
+    "crates/aidaemon-policies",
+    "crates/aidaemon-eval",
+    "crates/aidaemon-sdk",
+]
 resolver = "2"
 
 [[bin]]

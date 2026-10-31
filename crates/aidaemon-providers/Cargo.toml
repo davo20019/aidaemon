@@ -1,0 +1,21 @@
+[package]
+name = "aidaemon-providers"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: providers (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

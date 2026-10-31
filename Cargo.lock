@@ -137,6 +137,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-agents"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aidaemon-core"
 version = "0.0.1"
 dependencies = [
@@ -149,6 +159,33 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "aidaemon-eval"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-eval",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-mcp"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-mcp",
+ "async-trait",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -172,6 +209,74 @@ dependencies = [
  "reqwest",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "aidaemon-policies"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aidaemon-providers"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-sdk"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+]
+
+[[package]]
+name = "aidaemon-store-sqlite"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-tools"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "globset",
+ "htmd",
+ "ignore",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

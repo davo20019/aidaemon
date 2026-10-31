@@ -1,0 +1,12 @@
+[package]
+name = "aidaemon-sdk"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: sdk (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }

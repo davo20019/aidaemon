@@ -1,0 +1,60 @@
+//! # aidaemon-providers
+//!
+//! Real model backends for the [`aidaemon_core::Provider`] trait:
+//!
+//! - [`OpenAiCompatible`]: the Chat Completions API. Works with OpenAI,
+//!   OpenRouter, Ollama, llama.cpp, vLLM and other compatible servers.
+//! - [`Anthropic`]: the Messages API, with prompt caching of the stable
+//!   prefix (system prompt and tool definitions).
+//!
+//! Both stream over SSE: [`Provider::stream`](aidaemon_core::Provider::stream)
+//! yields [`StreamEvent::TextDelta`](aidaemon_core::StreamEvent::TextDelta)
+//! items as text arrives and then exactly one
+//! [`StreamEvent::Done`](aidaemon_core::StreamEvent::Done) with the full
+//! reply (text, tool calls with parsed JSON arguments, and usage).
+//! `complete` is a fold over `stream`.
+//!
+//! HTTP failures map to [`ProviderError`](aidaemon_core::ProviderError):
+//! 429 becomes `RateLimited` (with `retry-after`), 5xx, 408, timeouts,
+//! connection failures and mid-stream error events become `Transient`,
+//! 401/403 become `Auth`, and other 4xx become `InvalidRequest` with a
+//! short excerpt of the response body. Wrap a provider in
+//! [`aidaemon_core::Retry`] to retry the retryable ones.
+//!
+//! ```no_run
+//! use aidaemon_core::{Agent, Retry};
+//! use aidaemon_providers::{Anthropic, OpenAiCompatible};
+//!
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! // Any OpenAI-compatible server; here a local Ollama.
+//! let local = OpenAiCompatible::builder()
+//!     .base_url("http://localhost:11434/v1")
+//!     .build()?;
+//!
+//! let claude = Anthropic::builder()
+//!     .api_key(std::env::var("ANTHROPIC_API_KEY")?)
+//!     .build()?;
+//!
+//! let agent = Agent::builder("helper")
+//!     .model("claude-sonnet-4-5")
+//!     .instructions("You are a concise assistant.")
+//!     .provider(Retry::new(claude))
+//!     .build()?;
+//! let outcome = agent.run("cli:synthetic-user-1", "Say hello").await?;
+//! println!("{}", outcome.final_text.unwrap_or_default());
+//! # let _ = local;
+//! # Ok(())
+//! # }
+//! ```
+
+mod anthropic;
+mod openai;
+mod sse;
+mod transport;
+
+pub use anthropic::{
+    Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
+    ANTHROPIC_VERSION,
+};
+pub use openai::{OpenAiCompatible, OpenAiCompatibleBuilder, OPENAI_DEFAULT_BASE_URL};
+pub use transport::ConfigError;
