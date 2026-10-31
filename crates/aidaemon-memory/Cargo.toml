@@ -1,0 +1,38 @@
+[package]
+name = "aidaemon-memory"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: long-term memory (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+default = []
+# Local ONNX embeddings (AllMiniLM-L6-v2) via fastembed. Downloads the model
+# on first use, so it is off by default; `HashEmbedder` works offline.
+fastembed = ["dep:fastembed"]
+# Exposes `aidaemon_memory::conformance`, the `MemoryStore` conformance kit
+# for authors of custom stores.
+conformance = ["aidaemon-core/testing"]
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+aidaemon-policies = { path = "../aidaemon-policies" }
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+fastembed = { version = "4", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-memory = { path = ".", features = ["conformance"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

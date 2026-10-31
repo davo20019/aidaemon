@@ -24,6 +24,7 @@ pub enum Resolution {
     Deny { reason: String },
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentInner {
     pub id: String,
     pub model: String,
@@ -61,6 +62,29 @@ impl Agent {
 
     pub fn tool_specs(&self) -> &[ToolSpec] {
         &self.inner.specs
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.inner.limits
+    }
+
+    /// A copy of this agent with different limits (same id, tools, hooks).
+    /// Used to give a child agent its own budget.
+    pub fn with_limits(&self, limits: Limits) -> Agent {
+        let mut inner = (*self.inner).clone();
+        inner.limits = limits;
+        Agent {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// A copy of this agent with one more hook, run after the existing ones.
+    pub fn with_hook(&self, hook: impl Hook + 'static) -> Agent {
+        let mut inner = (*self.inner).clone();
+        inner.hooks.push(Arc::new(hook));
+        Agent {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Start a new run in `session_id` with one user message.

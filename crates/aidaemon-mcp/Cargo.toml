@@ -1,0 +1,32 @@
+[package]
+name = "aidaemon-mcp"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: mcp (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+# Builds `fake_mcp_server`, a tiny scripted MCP server used by this crate's
+# tests (and handy for testing your own MCP integrations offline).
+test-server = []
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+async-trait = "0.1"
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+# Enables the fake server binary for integration tests.
+aidaemon-mcp = { path = ".", features = ["test-server"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt", "rt-multi-thread"] }
+
+[[bin]]
+name = "fake_mcp_server"
+path = "src/bin/fake_mcp_server.rs"
+required-features = ["test-server"]

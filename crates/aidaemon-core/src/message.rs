@@ -11,6 +11,19 @@ pub enum Role {
     Tool,
 }
 
+/// Who put a user-role message into the transcript. Policies use this
+/// instead of matching text to tell real user input from harness feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageOrigin {
+    /// Typed by the user (or the calling application).
+    User,
+    /// Injected by the kernel, such as a stuck-detection nudge.
+    Harness,
+    /// Injected because an `on_stop` hook rejected a final answer.
+    StopHook,
+}
+
 /// One tool invocation requested by the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -45,6 +58,13 @@ pub struct Message {
     /// Set on `Role::Tool` messages: the call this result answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Set on `Role::Tool` messages whose receipt is not a success, so
+    /// providers can flag the result (for example Anthropic's `is_error`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    /// Who injected a `Role::User` message. `None` on other roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
 }
 
 impl Message {
@@ -53,7 +73,22 @@ impl Message {
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self::plain(Role::User, content)
+        Self::from_origin(MessageOrigin::User, content)
+    }
+
+    /// A user-role message injected by the harness or a hook.
+    pub fn from_origin(origin: MessageOrigin, content: impl Into<String>) -> Self {
+        let mut message = Self::plain(Role::User, content);
+        message.origin = Some(origin);
+        message
+    }
+
+    /// True for user-role messages the harness or a hook injected.
+    pub fn is_injected(&self) -> bool {
+        matches!(
+            self.origin,
+            Some(MessageOrigin::Harness | MessageOrigin::StopHook)
+        )
     }
 
     pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
@@ -62,6 +97,8 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            is_error: false,
+            origin: None,
         }
     }
 
@@ -71,7 +108,15 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            is_error: false,
+            origin: None,
         }
+    }
+
+    /// Mark a tool result as an error.
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
     }
 
     fn plain(role: Role, content: impl Into<String>) -> Self {
@@ -80,6 +125,8 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            is_error: false,
+            origin: None,
         }
     }
 }

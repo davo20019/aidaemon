@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
@@ -15,13 +15,13 @@ use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
 use crate::limits::{LimitKind, RunSnapshot};
-use crate::message::{Message, ToolCall};
+use crate::message::{Message, MessageOrigin, ToolCall};
 use crate::outcome::{RunOutcome, RunStatus};
-use crate::provider::{ModelRequest, ToolChoice};
+use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
-use crate::state::{Interruption, Pending, RunId, RunState};
+use crate::state::{InFlight, Interruption, Pending, RunId, RunState};
 use crate::stuck::StuckSignal;
-use crate::tool::{ToolAnnotations, ToolContext, ToolError, ToolOutput};
+use crate::tool::{ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -47,6 +47,13 @@ enum BatchEnd {
 enum StuckAction {
     Nudge(String),
     Stop(StuckSignal),
+}
+
+/// How one model call ended.
+enum ModelCall {
+    Response(ModelResponse),
+    Cancelled,
+    Failed(String),
 }
 
 /// The settled policy decision for one call (rewrites already applied).
@@ -80,10 +87,26 @@ impl<'a> Driver<'a> {
     ) -> Result<RunOutcome, CoreError> {
         if let Some(pending) = self.state.pending.take() {
             self.emit(Event::RunResumed).await?;
+            let earlier: Vec<String> = pending.calls[..pending.next]
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
+            self.state.in_flight = Some(InFlight {
+                calls: pending.calls.clone(),
+                started: earlier.clone(),
+                done: earlier,
+            });
             match self
                 .execute_batch(&pending.calls, pending.next, resolution)
                 .await?
             {
+                BatchEnd::Done => self.checkpoint().await?,
+                end => return self.finish_batch(end).await,
+            }
+        } else if let Some(in_flight) = self.state.in_flight.clone() {
+            // A checkpoint taken mid-batch: the process stopped while tools
+            // were running. Finish the batch without repeating side effects.
+            match self.recover(in_flight).await? {
                 BatchEnd::Done => self.checkpoint().await?,
                 end => return self.finish_batch(end).await,
             }
@@ -122,22 +145,19 @@ impl<'a> Driver<'a> {
                 }
             }
 
-            // 3. Call the model, bounded by the remaining wall-clock budget.
-            let response = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => {
-                    return self.finish(RunStatus::Cancelled, None).await;
-                }
-                response = within(self.remaining(), self.agent.provider.complete(&request)) => response,
-            };
-            let response = match response {
+            // 3. Call the model (streamed; non-streaming providers yield a
+            //    single final event), bounded by the remaining wall-clock budget.
+            let response = match within(self.remaining(), self.call_model(&request, turn)).await {
                 None => {
                     let limit = LimitKind::WallClock;
                     return self.finish(RunStatus::LimitReached { limit }, None).await;
                 }
-                Some(Ok(response)) => response,
-                Some(Err(err)) => {
-                    let error = err.to_string();
+                Some(call) => call?,
+            };
+            let response = match response {
+                ModelCall::Response(response) => response,
+                ModelCall::Cancelled => return self.finish(RunStatus::Cancelled, None).await,
+                ModelCall::Failed(error) => {
                     return self.finish(RunStatus::ProviderFailed { error }, None).await;
                 }
             };
@@ -186,7 +206,9 @@ impl<'a> Driver<'a> {
                             message: message.clone(),
                         })
                         .await?;
-                        self.state.messages.push(Message::user(message));
+                        self.state
+                            .messages
+                            .push(Message::from_origin(MessageOrigin::StopHook, message));
                         self.checkpoint().await?;
                         continue;
                     }
@@ -196,7 +218,13 @@ impl<'a> Driver<'a> {
                 }
             }
 
-            // 4b. Run the requested tools, then go around again.
+            // 4b. Run the requested tools, then go around again. The batch is
+            //     checkpointed as in flight so a crash can be recovered.
+            self.state.in_flight = Some(InFlight {
+                calls: calls.clone(),
+                ..InFlight::default()
+            });
+            self.checkpoint().await?;
             match self.execute_batch(&calls, 0, None).await? {
                 BatchEnd::Done => self.checkpoint().await?,
                 end => return self.finish_batch(end).await,
@@ -246,6 +274,9 @@ impl<'a> Driver<'a> {
 
             let mut call = calls[index].clone();
             let turn = self.state.turn;
+            if self.is_done(&call.id) {
+                continue;
+            }
 
             // Deterministic checks come before any policy, so a malformed
             // proposal never reaches a hook or a human.
@@ -292,6 +323,10 @@ impl<'a> Driver<'a> {
                 continue;
             }
             let annotations = tool.annotations();
+            let info = ToolInfo {
+                annotations,
+                access: tool.access(&call.arguments),
+            };
 
             // Policy: a pending resolution settles the first call; otherwise
             // ask the hooks.
@@ -303,7 +338,7 @@ impl<'a> Driver<'a> {
             let verdict = match settled {
                 Some(Resolution::Approve) => Verdict::Allow,
                 Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
-                None => self.decide(&mut call, annotations).await,
+                None => self.decide(&mut call, info).await,
             };
 
             match verdict {
@@ -350,6 +385,7 @@ impl<'a> Driver<'a> {
                     let mut pending_calls = calls.to_vec();
                     pending_calls[index] = call.clone();
                     let interruption = Interruption { call, reason };
+                    self.state.in_flight = None;
                     self.state.pending = Some(Pending {
                         calls: pending_calls,
                         next: index,
@@ -364,13 +400,16 @@ impl<'a> Driver<'a> {
             }
         }
         self.flush(&mut group, &mut nudge, &mut stop).await?;
+        self.state.in_flight = None;
 
         if let Some(signal) = stop {
             return Ok(BatchEnd::Stuck(signal));
         }
         if let Some(message) = nudge {
             // After all tool results, so the transcript stays well formed.
-            self.state.messages.push(Message::user(message));
+            self.state
+                .messages
+                .push(Message::from_origin(MessageOrigin::Harness, message));
         }
         Ok(BatchEnd::Done)
     }
@@ -396,10 +435,10 @@ impl<'a> Driver<'a> {
 
     /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
     /// arguments re-validated) before the next hook sees the call.
-    async fn decide(&self, call: &mut ToolCall, annotations: ToolAnnotations) -> Verdict {
+    async fn decide(&self, call: &mut ToolCall, mut info: ToolInfo) -> Verdict {
         let ctx = self.ctx();
         for hook in &self.agent.hooks {
-            match hook.before_tool(&ctx, call, annotations).await {
+            match hook.before_tool(&ctx, call, &info).await {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
                 ToolDecision::Interrupt { reason } => return Verdict::Interrupt(reason),
@@ -411,6 +450,7 @@ impl<'a> Driver<'a> {
                                 "a hook rewrote the arguments into an invalid call: {reason}"
                             ));
                         }
+                        info.access = tool.access(&call.arguments);
                     }
                 }
             }
@@ -429,6 +469,12 @@ impl<'a> Driver<'a> {
             return Ok(());
         }
         let items = std::mem::take(group);
+        if let Some(in_flight) = self.state.in_flight.as_mut() {
+            in_flight
+                .started
+                .extend(items.iter().map(|item| item.call.id.clone()));
+        }
+        self.checkpoint().await?;
         for item in &items {
             self.emit(Event::ToolStarted {
                 call_id: item.call.id.clone(),
@@ -442,6 +488,7 @@ impl<'a> Driver<'a> {
             let action = self.record(receipt, output).await?;
             track(action, nudge, stop);
         }
+        self.checkpoint().await?;
         Ok(())
     }
 
@@ -454,16 +501,15 @@ impl<'a> Driver<'a> {
             .get(&call.name)
             .expect("dispatch only sees calls that passed lookup")
             .clone();
-        let ctx = ToolContext {
-            run_id: self.state.run_id,
-            session_id: self.state.session_id.clone(),
-            call_id: call.id.clone(),
-            turn: self.state.turn,
-            cancel: self.cancel.child_token(),
-        };
+        let ctx = ToolContext::new(self.state.session_id.clone(), call.id.clone())
+            .with_run(self.state.run_id, self.state.turn)
+            .with_cancel(self.cancel.child_token());
+        // A tool's own timeout hint replaces the default, but nothing may
+        // outlive the run's remaining wall-clock budget.
+        let per_tool = tool.timeout().unwrap_or(self.agent.limits.tool_timeout);
         let timeout = match self.remaining() {
-            Some(remaining) => remaining.min(self.agent.limits.tool_timeout),
-            None => self.agent.limits.tool_timeout,
+            Some(remaining) => remaining.min(per_tool),
+            None => per_tool,
         };
         let started = Instant::now();
         let result = tokio::time::timeout(timeout, async {
@@ -482,7 +528,10 @@ impl<'a> Driver<'a> {
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let (status, reason, output) = match result {
-            Ok(Some(Ok(output))) if output.is_error => (ReceiptStatus::Failed, None, output),
+            Ok(Some(Ok(output))) if output.is_error => {
+                let reason = output.content.chars().take(300).collect::<String>();
+                (ReceiptStatus::Failed, Some(reason), output)
+            }
             Ok(Some(Ok(output))) => (ReceiptStatus::Succeeded, None, output),
             Ok(Some(Err(err))) => (
                 ReceiptStatus::Failed,
@@ -568,12 +617,17 @@ impl<'a> Driver<'a> {
                 hook.after_tool(&ctx, &receipt, output).await;
             }
         }
-        self.state.messages.push(Message::tool_result(
-            receipt.call_id.clone(),
-            output.content.clone(),
-        ));
+        self.state.messages.push(
+            Message::tool_result(receipt.call_id.clone(), output.content.clone())
+                .with_error(!receipt.succeeded()),
+        );
         self.state.receipts.push(receipt.clone());
         self.state.tool_calls += 1;
+        self.state.usage.add(output.usage);
+        self.state.run_usage.add(output.usage);
+        if let Some(in_flight) = self.state.in_flight.as_mut() {
+            in_flight.done.push(receipt.call_id.clone());
+        }
         self.emit(Event::ToolFinished {
             receipt: receipt.clone(),
         })
@@ -624,6 +678,83 @@ impl<'a> Driver<'a> {
             StuckDecision::Stop => Some(StuckAction::Stop(signal)),
             StuckDecision::Ignore => None,
         })
+    }
+
+    /// Stream one model call, forwarding text deltas as events.
+    async fn call_model(&self, request: &ModelRequest, turn: u32) -> Result<ModelCall, CoreError> {
+        let mut events = self.agent.provider.stream(request);
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Ok(ModelCall::Cancelled),
+                next = events.next() => next,
+            };
+            match next {
+                Some(Ok(StreamEvent::TextDelta(text))) => {
+                    self.emit(Event::TextDelta { turn, text }).await?;
+                }
+                Some(Ok(StreamEvent::Done(response))) => return Ok(ModelCall::Response(response)),
+                Some(Err(err)) => return Ok(ModelCall::Failed(err.to_string())),
+                None => {
+                    return Ok(ModelCall::Failed(
+                        "provider stream ended without a final response".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Finish a batch that was running when the process stopped. Calls that
+    /// never started run normally. Calls that started but have no result are
+    /// re-run if their tool is idempotent; otherwise they get an
+    /// `Indeterminate` receipt telling the model to verify before retrying.
+    async fn recover(&mut self, in_flight: InFlight) -> Result<BatchEnd, CoreError> {
+        let mut reran = Vec::new();
+        let mut indeterminate = Vec::new();
+        for call in &in_flight.calls {
+            let started = in_flight.started.contains(&call.id);
+            if !started || in_flight.done.contains(&call.id) {
+                continue;
+            }
+            let idempotent = self
+                .agent
+                .tools
+                .get(&call.name)
+                .map(|tool| tool.annotations().idempotent)
+                .unwrap_or(false);
+            if idempotent {
+                reran.push(call.id.clone());
+                continue;
+            }
+            indeterminate.push(call.id.clone());
+            let (mut receipt, output) = rejection(
+                self.state.run_id,
+                call,
+                self.state.turn,
+                ReceiptStatus::Indeterminate,
+                format!(
+                    "`{}` was running when the agent restarted and may or may not have \
+                     completed. Check its effect before retrying it.",
+                    call.name
+                ),
+            );
+            receipt.stage = InvocationStage::Dispatched;
+            // The stuck policy cannot act mid-recovery; it sees the next call.
+            let _ = self.record(receipt, output).await?;
+        }
+        self.emit(Event::Recovered {
+            reran,
+            indeterminate,
+        })
+        .await?;
+        self.execute_batch(&in_flight.calls, 0, None).await
+    }
+
+    fn is_done(&self, call_id: &str) -> bool {
+        self.state
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.done.iter().any(|id| id == call_id))
     }
 
     fn build_request(&self) -> ModelRequest {

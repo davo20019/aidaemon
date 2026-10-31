@@ -1,8 +1,8 @@
 # aidaemon-core: design sketch
 
 Status: **experimental**. Not published, not used by the daemon yet. The
-point is to argue about the shape of the kernel with code that compiles and
-tests that pass, before porting anything from `src/agent/`.
+kernel and the SDK crates around it are implemented and tested; the daemon
+still runs its own loop (see `PLAN.md`, Phase 7).
 
 The reasoning behind each choice comes from the Harness Field Guide, a survey
 of 14 harness concepts across Claude Code, Codex, OpenHands, SWE-agent, Aider,
@@ -22,8 +22,8 @@ kernel primitive.
 
 ## Size
 
-About 2,300 lines in `src/`, including doc comments and unit tests, of which
-`run_loop.rs` is about 650. For comparison, `src/agent/loop/` in the
+About 2,900 lines in `src/`, including doc comments and unit tests, of which
+`run_loop.rs` is about 800. For comparison, `src/agent/loop/` in the
 daemon is about 62,000 lines. The loop reads top to bottom in one file:
 guards, build request, `before_model` hooks, model call, then either stop
 hooks or the tool batch.
@@ -128,23 +128,37 @@ and at every exit, and every event is journaled. After a crash,
 last completed turn. The turn in flight is redone, so a non-idempotent tool
 in it may run twice (see "Idempotent replay" below).
 
-## Deliberately left out (for now)
+## Added after the first sketch
 
-- **Streaming.** Will be a second `Provider` method yielding typed deltas,
-  with `complete` as a fold over it, and matching `Event` variants.
-- **`TypedTool`.** Typed effects, access manifests and replay decisions from
-  aidaemon's current `Tool` trait, as an opt-in trait with a blanket adapter.
-- **Context strategy.** Compaction/eviction as a `before_model` hook first;
-  promote to a dedicated `ContextStrategy` trait only if hooks are not enough.
-  Task state that must survive compaction should live outside the transcript.
-- **Idempotent replay.** Recovery after a crash redoes the turn in flight;
-  tool calls that completed in that turn before the crash are not
-  deduplicated. aidaemon's idempotency keys (`execution_id + tool + args
-  hash`) and per-tool replay decisions are the model for this.
-- **Sub-agents.** `Agent::as_tool()` with explicit context forking and child
-  budgets that count toward the parent, in an `agents` crate.
-- **OpenTelemetry exporter**, as an `EventSink`.
-- **SQLite `RunStore`**, in a `store-sqlite` crate with versioned migrations.
+- **Streaming.** `Provider::stream` yields `StreamEvent::TextDelta` items and
+  one `Done`; the default wraps `complete`. The loop always streams and emits
+  `Event::TextDelta`. `Retry` retries a stream only before any output.
+- **Usage roll-up.** `ToolOutput::usage` is added to the run, so sub-agent
+  spend counts toward the parent's token budget.
+- **Access manifests.** `Tool::access` declares reads, writes, hosts and
+  commands; `before_tool` hooks receive `ToolInfo { annotations, access }`.
+  This replaces the planned separate `TypedTool` trait.
+- **Crash-safe batches.** A batch is checkpointed as `InFlight` before tools
+  run and after each group. `run_from` on a mid-batch checkpoint finishes the
+  batch: unstarted calls run, started idempotent calls re-run, started
+  non-idempotent calls get an `Indeterminate` receipt and are not repeated.
+- **Typed message origins.** `Message::origin` (`User`, `Harness`,
+  `StopHook`) replaces text markers for telling user input from harness
+  feedback. Tool results carry `is_error`.
+- **Tool timeout hints.** `Tool::timeout` overrides `Limits::tool_timeout`
+  for tools with their own timeout argument.
+- **Derived agents.** `Agent::with_limits` and `Agent::with_hook` give a
+  child agent its own budget or policies without rebuilding it.
+
+## Still left out
+
+- **Async approval inside sub-agents.** A child that interrupts returns an
+  error to the parent; resuming a child through its parent is not modelled.
+- **Context strategy as a trait.** Compaction is a view-only `before_model`
+  hook (`ContextWindow` in `aidaemon-policies`); no dedicated trait yet.
+- **Native OpenTelemetry.** `TracingSink` emits `tracing` spans; use a
+  `tracing-opentelemetry` layer to export.
+- **Reasoning content and images** in `Message`/`ModelResponse`.
 
 ## How daemon features would map onto hooks
 
@@ -161,12 +175,37 @@ in it may run twice (see "Idempotent replay" below).
 | Budget auto-extension | custom `StopCondition` + config |
 | Decision points, gate telemetry | `EventSink` |
 
-## Next steps
+## The SDK crates
 
-1. Review this sketch; change the primitives now, while it is cheap.
-2. Add an OpenAI-compatible `Provider` in a `providers` crate and run the
-   quickstart against a real model.
-3. Add a `core` engine to `harness_eval` and run the existing fixtures
-   against it.
-4. Port daemon policies as hooks one at a time, keeping only those that show
-   a measurable gain in repeated (N-of-M) runs.
+| Crate | What it provides |
+|---|---|
+| `aidaemon-core` | The kernel described above |
+| `aidaemon-providers` | OpenAI-compatible and Anthropic providers, streaming, prompt caching |
+| `aidaemon-tools` | Workspace-confined file tools, glob/grep, shell over sandbox backends, web fetch, checklist + gate |
+| `aidaemon-store-sqlite` | `RunStore` on SQLite, versioned migrations, recovery queries |
+| `aidaemon-mcp` | stdio MCP client exposing server tools as `Tool`s |
+| `aidaemon-agents` | Agents as tools, child budgets, depth limits |
+| `aidaemon-policies` | The daemon's policies as hooks (see table above) |
+| `aidaemon-eval` | YAML scenarios, trajectory assertions, N-of-M reports |
+| `aidaemon-memory` | Long-term memory ported from the daemon: facts with supersession, episodes, hybrid recall, decay. Store, embedder and scorer are traits, so every part is replaceable |
+| `aidaemon-channels` | The `Channel` contract and `ChannelRunner`: access control, one session per conversation, queueing, streamed status edits, approvals as buttons with `/approve` fallback, `/stop` `/new` `/status` |
+| `aidaemon-channel-telegram` / `-slack` / `-discord` | Built-in adapters talking to each platform's API directly (Bot API, Socket Mode, Gateway) |
+| `aidaemon-sdk` | One dependency re-exporting all of them behind features |
+
+### Extending the SDK
+
+Every extension point is a public trait, so new functionality can live in
+any crate, including third-party ones:
+
+| To add | Implement |
+|---|---|
+| A chat channel | `aidaemon_channels::Channel` (only `name`, `capabilities`, `run`, `send` are required) |
+| A model provider | `aidaemon_core::Provider` |
+| A tool | `aidaemon_core::Tool` |
+| A policy or guardrail | `aidaemon_core::Hook` |
+| A memory backend | `aidaemon_memory::{MemoryStore, Embedder, Scorer}` or `aidaemon_policies::Recall` |
+| A sandbox | `aidaemon_tools::ExecutionBackend` |
+| Run storage | `aidaemon_core::RunStore` |
+| Telemetry | `aidaemon_core::EventSink` |
+
+Roadmap and status live in `PLAN.md`.

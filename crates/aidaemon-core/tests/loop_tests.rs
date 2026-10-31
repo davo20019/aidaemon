@@ -9,7 +9,8 @@ use aidaemon_core::{
     Agent, CoreError, Event, FnTool, Hook, HookContext, InvocationStage, LimitKind, Limits,
     MemoryStore, ProviderError, Receipt, ReceiptStatus, Resolution, Retry, Role, RunSnapshot,
     RunState, RunStatus, RunStore, StopDecision, StuckConfig, StuckDecision, StuckSignal, Tool,
-    ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolOutput, ToolResult, ToolSpec,
+    ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult,
+    ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -178,7 +179,7 @@ async fn missing_required_arguments_are_rejected_before_policy() {
             &self,
             _: &HookContext<'_>,
             _: &ToolCall,
-            _: ToolAnnotations,
+            _: &ToolInfo,
         ) -> ToolDecision {
             panic!("malformed calls must not reach policy hooks");
         }
@@ -366,9 +367,9 @@ impl Hook for DenyDestructive {
         &self,
         _: &HookContext<'_>,
         _: &ToolCall,
-        annotations: ToolAnnotations,
+        tool: &ToolInfo,
     ) -> ToolDecision {
-        if annotations.destructive {
+        if tool.annotations.destructive {
             ToolDecision::Deny {
                 reason: "destructive tools are disabled".into(),
             }
@@ -410,7 +411,7 @@ async fn rewrite_hook_changes_arguments() {
             &self,
             _: &HookContext<'_>,
             call: &ToolCall,
-            _: ToolAnnotations,
+            _: &ToolInfo,
         ) -> ToolDecision {
             let text = call.arguments["text"].as_str().unwrap_or_default();
             ToolDecision::Rewrite {
@@ -537,9 +538,9 @@ impl Hook for AskBeforeDestructive {
         &self,
         _: &HookContext<'_>,
         call: &ToolCall,
-        annotations: ToolAnnotations,
+        tool: &ToolInfo,
     ) -> ToolDecision {
-        if annotations.destructive {
+        if tool.annotations.destructive {
             ToolDecision::Interrupt {
                 reason: format!("approve {}?", call.name),
             }
@@ -1083,7 +1084,7 @@ async fn approval_runs_the_rewritten_call_the_approver_saw() {
             &self,
             _ctx: &HookContext<'_>,
             call: &ToolCall,
-            _ann: ToolAnnotations,
+            _tool: &ToolInfo,
         ) -> ToolDecision {
             match call.arguments["path"].as_str() {
                 Some(path) if !path.starts_with("/sandbox/") => ToolDecision::Rewrite {
@@ -1100,7 +1101,7 @@ async fn approval_runs_the_rewritten_call_the_approver_saw() {
             &self,
             _ctx: &HookContext<'_>,
             _call: &ToolCall,
-            _ann: ToolAnnotations,
+            _tool: &ToolInfo,
         ) -> ToolDecision {
             ToolDecision::Interrupt {
                 reason: "needs approval".into(),

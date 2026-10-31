@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::ToolSpec;
+use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
 
 /// Effect hints that drive scheduling and policy.
@@ -49,11 +49,47 @@ impl Default for ToolAnnotations {
     }
 }
 
+/// What one call will touch, declared by the tool from its arguments.
+/// Policies use it for scope checks and sandboxes for confinement. Empty
+/// means "not declared", not "touches nothing".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessManifest {
+    /// Paths read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Paths created, modified or deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// Hosts contacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Commands executed (first word or full command line).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+}
+
+impl AccessManifest {
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+            && self.writes.is_empty()
+            && self.hosts.is_empty()
+            && self.commands.is_empty()
+    }
+}
+
+/// What `before_tool` hooks know about the tool behind a call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInfo {
+    pub annotations: ToolAnnotations,
+    pub access: AccessManifest,
+}
+
 /// Trusted, harness-provided context for one call.
 ///
 /// This is passed beside the model's arguments rather than injected into
 /// them, so a model can never spoof a session id or role by inventing a field.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolContext {
     pub run_id: RunId,
     pub session_id: String,
@@ -61,6 +97,31 @@ pub struct ToolContext {
     pub turn: u32,
     /// Cancelled when the run is cancelled; long tools should watch it.
     pub cancel: CancellationToken,
+}
+
+impl ToolContext {
+    /// A context with a fresh run id, turn 0 and a new cancel token. The
+    /// loop fills in the real values; tests and adapters use this directly.
+    pub fn new(session_id: impl Into<String>, call_id: impl Into<String>) -> Self {
+        Self {
+            run_id: RunId::new(),
+            session_id: session_id.into(),
+            call_id: call_id.into(),
+            turn: 0,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    pub fn with_run(mut self, run_id: RunId, turn: u32) -> Self {
+        self.run_id = run_id;
+        self.turn = turn;
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
 }
 
 /// What a tool hands back to the model, plus structured details for receipts.
@@ -74,6 +135,10 @@ pub struct ToolOutput {
     /// Structured evidence copied into the receipt (exit code, paths, status).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
+    /// Model usage spent inside the tool (for example a sub-agent). The loop
+    /// adds it to the run's usage, so budgets cover delegated work.
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 impl ToolOutput {
@@ -82,6 +147,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             details: Value::Null,
+            usage: Usage::default(),
         }
     }
 
@@ -90,7 +156,13 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             details: Value::Null,
+            usage: Usage::default(),
         }
+    }
+
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
@@ -148,6 +220,19 @@ pub trait Tool: Send + Sync {
     /// default checks the schema's `required` keys; override to add more.
     fn validate(&self, arguments: &Value) -> Result<(), String> {
         check_required(&self.spec().parameters, arguments)
+    }
+
+    /// How long this tool may run, overriding `Limits::tool_timeout`. Tools
+    /// that take their own timeout argument (such as a shell) return a value
+    /// at least as long as their own maximum.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Declare what this call will touch. Optional; policies treat an empty
+    /// manifest as undeclared.
+    fn access(&self, _arguments: &Value) -> AccessManifest {
+        AccessManifest::default()
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;

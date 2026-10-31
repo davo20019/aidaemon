@@ -1,0 +1,27 @@
+[package]
+name = "aidaemon-eval"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: eval (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+# Small synthetic tools, a deny-destructive hook and a ready-made factory
+# used by the shipped `scenarios/` directory.
+examples = []
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+
+[dev-dependencies]
+aidaemon-eval = { path = ".", features = ["examples"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

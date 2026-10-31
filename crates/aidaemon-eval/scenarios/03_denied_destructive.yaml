@@ -1,0 +1,20 @@
+name: denied_destructive
+description: >
+  A destructive call is refused by the DenyDestructive policy hook; the model
+  sees the refusal and reports it instead of claiming the file is gone.
+input: Read notes/draft.txt and then delete it.
+script:
+  - tool_calls:
+      - { name: read_file, arguments: { path: notes/draft.txt } }
+  - tool_calls:
+      - { name: delete_file, arguments: { path: notes/draft.txt } }
+  - text: I read notes/draft.txt, but deleting it was not allowed, so the file is still there.
+expect:
+  status: completed
+  final_text_contains: [not allowed]
+  final_text_not_contains: [i deleted]
+  tools_in_order: [read_file, delete_file]
+  receipt_statuses:
+    read_file: [succeeded]
+    delete_file: [denied]
+  no_failed_receipts: true

@@ -1,0 +1,30 @@
+[package]
+name = "aidaemon-tools"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: tools (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+async-trait = "0.1"
+globset = "0.4"
+htmd = "0.1"
+ignore = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["process", "fs", "io-util", "time", "macros", "rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["process", "fs", "io-util", "time", "macros", "rt", "rt-multi-thread", "net"] }
