@@ -15,7 +15,7 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 |---|---|
 | Branch | `ccr-986102ee-12nt48` (branched from `master` at `4a36e32`) |
 | Crates | `aidaemon-core` plus 13 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
-| Tests | 399 across the 14 crates, all passing; clippy and fmt clean |
+| Tests | all passing across the 14 crates (incl. conformance kits); clippy and fmt clean |
 | CI | Lint and tests for every SDK crate run in `ci.yml`. macOS job never gets a runner (see "Known issues") |
 | PR | #13 was closed without merging; the branch was kept. Open a new PR only when asked |
 | Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
@@ -126,13 +126,12 @@ adapters, tested against local mock servers.
       Discord sharding/compression.
 
 ### Phase 6c: open to contributors
-- [ ] Conformance test kits (`Channel`, `MemoryStore`, `Provider`) any
-      third-party implementation can run.
-- [ ] `CONTRIBUTING.md` and an extension guide with naming conventions
-      (`aidaemon-channel-*`, `aidaemon-provider-*`, ...).
-- [ ] Publishing plan (crates.io names, versions, semver policy for the
-      stable contracts: core, `Channel`, memory traits). Publishing is the
-      owner's decision.
+- [x] Conformance kits for `Tool`, `Provider`, `Channel` and `MemoryStore`;
+      every built-in implementation passes them in CI.
+- [x] `CONTRIBUTING.md` and `crates/EXTENDING.md` (naming conventions
+      `aidaemon-channel-*`, `aidaemon-provider-*`, ...).
+- [x] Draft publishing plan in `crates/PUBLISHING.md`.
+- [ ] Owner decision on publishing (names, 0.1.0, release automation).
 
 ### Phase 7: the daemon runs on the SDK (not started; needs a decision)
 - [ ] Daemon builds its agent through `AgentBuilder` with its hooks.

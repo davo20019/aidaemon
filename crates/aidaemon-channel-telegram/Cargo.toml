@@ -20,5 +20,6 @@ tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
 axum = "0.8"
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net"] }

@@ -11,6 +11,9 @@ publish = false
 [features]
 # Exposes `aidaemon_channels::testing::TestChannel` for adapter and app tests.
 testing = []
+# Exposes `aidaemon_channels::conformance`, the channel conformance kit for
+# adapter authors (implies `testing` for the TestChannel reference harness).
+conformance = ["testing", "aidaemon-core/testing"]
 
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
@@ -24,5 +27,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
-aidaemon-channels = { path = ".", features = ["testing"] }
+aidaemon-channels = { path = ".", features = ["testing", "conformance"] }
 tokio = { version = "1", features = ["full"] }

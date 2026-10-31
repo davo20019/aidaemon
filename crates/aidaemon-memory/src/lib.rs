@@ -66,6 +66,8 @@
 //! Or skip [`Memory`] entirely and implement `aidaemon_policies::Recall`
 //! yourself; the SDK only ever sees that trait.
 
+#[cfg(feature = "conformance")]
+pub mod conformance;
 mod embed;
 mod error;
 mod extract;

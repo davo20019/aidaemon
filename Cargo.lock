@@ -255,6 +255,7 @@ name = "aidaemon-memory"
 version = "0.0.1"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-memory",
  "aidaemon-policies",
  "async-trait",
  "chrono",

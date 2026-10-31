@@ -119,6 +119,24 @@ README.
 
 Each built-in implementation in this repository passes its kit in CI.
 
+```rust
+// In your crate's tests:
+aidaemon_core::conformance::check_tool(&MyTool::new()).assert_all_passed();
+aidaemon_core::conformance::check_provider(&my_provider_against_mock).await.assert_all_passed();
+aidaemon_channels::conformance::check_channel(channel, &my_platform_harness).await.assert_all_passed();
+aidaemon_memory::conformance::check_store(|| async {
+    std::sync::Arc::new(MyStore::new()) as std::sync::Arc<dyn aidaemon_memory::MemoryStore>
+})
+.await
+.assert_all_passed();
+```
+
+The provider kit needs a deterministic backend (your mock server), and the
+channel kit needs a small `ChannelHarness` that injects messages and button
+presses into your platform mock; see the Telegram, Slack and Discord test
+suites for examples. If a tool's schema alone cannot produce valid
+arguments, use `check_tool_with(..., ToolKitOptions::default().valid_arguments(..))`.
+
 ## Naming and publishing your crate
 
 - Use the prefix for the kind of extension: `aidaemon-channel-<platform>`,

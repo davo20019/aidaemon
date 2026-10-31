@@ -13,6 +13,9 @@ default = []
 # Local ONNX embeddings (AllMiniLM-L6-v2) via fastembed. Downloads the model
 # on first use, so it is off by default; `HashEmbedder` works offline.
 fastembed = ["dep:fastembed"]
+# Exposes `aidaemon_memory::conformance`, the `MemoryStore` conformance kit
+# for authors of custom stores.
+conformance = ["aidaemon-core/testing"]
 
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
@@ -30,5 +33,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-memory = { path = ".", features = ["conformance"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

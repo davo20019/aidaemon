@@ -30,6 +30,8 @@ mod stuck;
 mod tool;
 
 #[cfg(feature = "testing")]
+pub mod conformance;
+#[cfg(feature = "testing")]
 pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, Resolution};

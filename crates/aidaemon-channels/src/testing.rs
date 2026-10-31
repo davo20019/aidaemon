@@ -255,13 +255,34 @@ impl Channel for TestChannel {
         conversation: &Conversation,
         message: &OutboundMessage,
     ) -> Result<MessageRef, ChannelError> {
-        let message_ref = self.next_ref(&conversation.id);
-        self.sent.lock().expect("poisoned").push(SentMessage {
-            conversation: conversation.clone(),
-            message: message.clone(),
-            message_ref: message_ref.clone(),
-        });
-        Ok(message_ref)
+        // Like a real adapter, split text over the advertised limit; each
+        // part is recorded as its own sent message. Text within the limit
+        // (everything the runner sends, since it splits first) is recorded
+        // unchanged.
+        let parts = if message.text.chars().count() > self.caps.max_message_len {
+            crate::split::split_message(&message.text, self.caps.max_message_len)
+        } else {
+            vec![message.text.clone()]
+        };
+        let mut sent = self.sent.lock().expect("poisoned");
+        let mut last = None;
+        for (i, text) in parts.into_iter().enumerate() {
+            let message_ref = self.next_ref(&conversation.id);
+            sent.push(SentMessage {
+                conversation: conversation.clone(),
+                message: OutboundMessage {
+                    text,
+                    reply_to: if i == 0 {
+                        message.reply_to.clone()
+                    } else {
+                        None
+                    },
+                },
+                message_ref: message_ref.clone(),
+            });
+            last = Some(message_ref);
+        }
+        Ok(last.unwrap_or_else(|| self.next_ref(&conversation.id)))
     }
 
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {

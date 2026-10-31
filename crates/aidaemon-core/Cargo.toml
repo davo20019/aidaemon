@@ -10,7 +10,8 @@ publish = false
 
 [features]
 # Exposes `aidaemon_core::testing` (ScriptedProvider and helpers) so users can
-# test their own tools and hooks without a real model.
+# test their own tools and hooks without a real model, and
+# `aidaemon_core::conformance` (tool and provider conformance kits).
 testing = []
 
 [dependencies]

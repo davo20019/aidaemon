@@ -14,6 +14,8 @@
 //! an [`EventRouter`] and channels together.
 
 pub mod channel;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod policy;
 mod render;
 pub mod router;
