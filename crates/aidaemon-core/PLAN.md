@@ -14,8 +14,8 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 | Item | State |
 |---|---|
 | Branch | `ccr-986102ee-12nt48` (branched from `master` at `4a36e32`) |
-| Crates | `aidaemon-core` plus 8 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
-| Tests | 216 across the 9 crates, all passing; clippy and fmt clean |
+| Crates | `aidaemon-core` plus 13 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
+| Tests | 399 across the 14 crates, all passing; clippy and fmt clean |
 | CI | Lint and tests for every SDK crate run in `ci.yml`. macOS job never gets a runner (see "Known issues") |
 | PR | #13 was closed without merging; the branch was kept. Open a new PR only when asked |
 | Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
@@ -31,7 +31,9 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
   search, sandboxed shell, web, checklist), SQLite store, MCP client,
   agents-as-tools, policies (approvals, scope, completion, redaction,
   untrusted output, project instructions, context window, memory, tracing),
-  eval kit, and the `aidaemon-sdk` bundle with a `coding_agent` example.
+  eval kit, swappable long-term memory ported from the daemon, chat
+  channels (runner + Telegram, Slack, Discord adapters), and the
+  `aidaemon-sdk` bundle with a `coding_agent` example.
 
 ## Decisions already made
 
@@ -98,8 +100,11 @@ measurement gate: keep each one only if N-of-M runs show a gain.
 - [ ] Measure each policy on/off with `aidaemon_eval::compare`.
 - [ ] Just-in-time discovery of deeper `AGENTS.md` files (only start-up
       discovery is ported).
-- [ ] Port the daemon's fastembed-backed memory as a `Recall` implementation
-      (an in-memory word-overlap `Recall` exists for tests).
+- [x] Port the daemon's memory (`aidaemon-memory`): facts with supersession,
+      episodes, hybrid scoring, decay/retention, fastembed behind a feature,
+      model-driven extraction; store/embedder/scorer are swappable traits.
+- [ ] Memory gaps: graph signal (weight kept, always 0), near-duplicate
+      merging, privacy/channel scoping, re-embedding after a model change.
 
 ### Phase 6: the rest of the framework (done, with gaps)
 Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
@@ -107,6 +112,27 @@ Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
       returns an error to its parent).
 - [ ] Reasoning content and images in messages.
 - [ ] Publish plan: versions, `publish = true`, crates.io names.
+
+### Phase 6b: channels (done, with gaps)
+`aidaemon-channels` (contract + runner) and Telegram, Slack and Discord
+adapters, tested against local mock servers.
+- [ ] Persist pending approvals (they live in memory; a restart loses them).
+- [ ] Attachment download helpers (Slack `url_private` needs the bot token;
+      Telegram needs `getFile`); attachments reach the agent as names only.
+- [ ] Contract follow-ups from the adapters: `Attachment::kind`, a message
+      ref on `ApprovalAnswer` so buttons can be removed, parent/thread link on
+      `InboundMessage`, clearer `edit` semantics for over-long text.
+- [ ] Not ported: LaTeX stripping, display-name lookup, slash commands,
+      Discord sharding/compression.
+
+### Phase 6c: open to contributors
+- [ ] Conformance test kits (`Channel`, `MemoryStore`, `Provider`) any
+      third-party implementation can run.
+- [ ] `CONTRIBUTING.md` and an extension guide with naming conventions
+      (`aidaemon-channel-*`, `aidaemon-provider-*`, ...).
+- [ ] Publishing plan (crates.io names, versions, semver policy for the
+      stable contracts: core, `Channel`, memory traits). Publishing is the
+      owner's decision.
 
 ### Phase 7: the daemon runs on the SDK (not started; needs a decision)
 - [ ] Daemon builds its agent through `AgentBuilder` with its hooks.

@@ -97,7 +97,9 @@ jobs:
         run: >-
           cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
-          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
+          -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
+          -p aidaemon-channel-discord
           --all-targets --all-features -- -D warnings
 
   test:
@@ -174,7 +176,9 @@ jobs:
         run: >-
           cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
-          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk --all-features
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
+          -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
+          -p aidaemon-channel-discord --all-features
 
   build-check:
     name: Build check (release)

@@ -1,0 +1,103 @@
+//! # aidaemon-memory (experimental)
+//!
+//! Long-term memory for agents built on `aidaemon-core`, ported from the
+//! daemon's memory system: durable **facts** keyed by
+//! `(scope, category, key)` with supersession instead of overwrite,
+//! **episodes** summarizing past sessions, hybrid retrieval (semantic +
+//! lexical + freshness + confidence + provenance), recall decay and
+//! retention.
+//!
+//! Writing is model-driven: [`FactExtractor`] and [`EpisodeSummarizer`] ask
+//! any `aidaemon_core::Provider` for a typed JSON payload. Nothing decides
+//! what to remember from phrase lists, and retrieval is scoring with
+//! relevance thresholds, not keyword gates.
+//!
+//! ## Integration
+//!
+//! The rest of the SDK never depends on this crate. It plugs in through
+//! public traits only:
+//!
+//! | Piece | Plugs in as |
+//! |---|---|
+//! | [`MemoryRecall`] | `aidaemon_policies::Recall`, for `MemoryInjection` (`before_model`) |
+//! | [`MemoryWriter`] | `aidaemon_core::Hook` (`on_stop`, background extraction) |
+//! | [`RememberTool`], [`RecallTool`] | `aidaemon_core::Tool` |
+//! | [`Memory::ingest_run`] | explicit call with a `RunOutcome` |
+//!
+//! ## Example
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), aidaemon_memory::MemoryError> {
+//! use aidaemon_memory::{HashEmbedder, Memory, MemoryRecall, NewFact, SqliteMemoryStore};
+//!
+//! let store = SqliteMemoryStore::open("memory.db").await?;
+//! let memory = Memory::new(store, HashEmbedder::default());
+//!
+//! let scope = "telegram:synthetic-user-1";
+//! memory
+//!     .remember(NewFact::new(scope, "person", "daughters", "Mia and Zoe"))
+//!     .await?;
+//! for hit in memory.recall_facts(scope, "what are my daughters called", 5).await? {
+//!     println!("{:.2} {}", hit.score, hit.fact.value);
+//! }
+//!
+//! // Automatic injection into every model request:
+//! let injection = aidaemon_policies::MemoryInjection::new(MemoryRecall::new(memory.clone()));
+//! # let _ = injection;
+//! # Ok(()) }
+//! ```
+//!
+//! ## Bring your own memory
+//!
+//! [`Memory`] holds only trait objects, so every part is swappable without
+//! touching this crate:
+//!
+//! - [`MemoryStore`]: storage (pgvector, Qdrant, a document DB, ...). Only
+//!   row storage is required; lexical scoring has a default, and overriding
+//!   [`MemoryStore::search_facts`] / [`MemoryStore::search_episodes`] lets a
+//!   backend rank natively and bypass the scorer.
+//! - [`Embedder`]: an embedding API or local model ([`HashEmbedder`] for
+//!   tests and offline use, `FastEmbedder` behind the `fastembed` feature).
+//! - [`Scorer`]: ranking ([`HybridScorer`], the daemon's weights, by
+//!   default).
+//! - Any `aidaemon_core::Provider` for [`FactExtractor`] and
+//!   [`EpisodeSummarizer`].
+//!
+//! Or skip [`Memory`] entirely and implement `aidaemon_policies::Recall`
+//! yourself; the SDK only ever sees that trait.
+
+mod embed;
+mod error;
+mod extract;
+mod memory;
+mod recall;
+mod scoring;
+mod store;
+mod tools;
+mod types;
+mod writer;
+
+#[cfg(feature = "fastembed")]
+pub use embed::FastEmbedder;
+pub use embed::{cosine, decode_embedding, encode_embedding, Embedder, HashEmbedder};
+pub use error::{MemoryError, Result};
+pub use extract::{
+    parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
+};
+pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
+pub use recall::MemoryRecall;
+pub use scoring::{
+    episode_importance, episode_recall_boost, term_overlap, tokens, HybridScorer, HybridWeights,
+    Scorer, ScoringConfig,
+};
+pub use store::{
+    latest_version, InMemoryMemoryStore, MemoryStore, Migration, SqliteMemoryStore, MIGRATIONS,
+};
+pub use tools::{RecallTool, RememberTool};
+pub use types::{
+    episode_search_text, fact_search_text, normalize_category, normalize_key, same_value,
+    DecayReport, Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, NewEpisode, NewFact,
+    Provenance, RetentionConfig, Score, ScoredEpisode, ScoredFact, Signals, StoredEmbedding,
+    UpsertOutcome, MAX_FACT_VALUE_CHARS,
+};
+pub use writer::{MemoryWriter, WriterReport};

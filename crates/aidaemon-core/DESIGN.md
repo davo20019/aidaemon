@@ -175,6 +175,25 @@ in it may run twice (see "Idempotent replay" below).
 | `aidaemon-agents` | Agents as tools, child budgets, depth limits |
 | `aidaemon-policies` | The daemon's policies as hooks (see table above) |
 | `aidaemon-eval` | YAML scenarios, trajectory assertions, N-of-M reports |
+| `aidaemon-memory` | Long-term memory ported from the daemon: facts with supersession, episodes, hybrid recall, decay. Store, embedder and scorer are traits, so every part is replaceable |
+| `aidaemon-channels` | The `Channel` contract and `ChannelRunner`: access control, one session per conversation, queueing, streamed status edits, approvals as buttons with `/approve` fallback, `/stop` `/new` `/status` |
+| `aidaemon-channel-telegram` / `-slack` / `-discord` | Built-in adapters talking to each platform's API directly (Bot API, Socket Mode, Gateway) |
 | `aidaemon-sdk` | One dependency re-exporting all of them behind features |
+
+### Extending the SDK
+
+Every extension point is a public trait, so new functionality can live in
+any crate, including third-party ones:
+
+| To add | Implement |
+|---|---|
+| A chat channel | `aidaemon_channels::Channel` (only `name`, `capabilities`, `run`, `send` are required) |
+| A model provider | `aidaemon_core::Provider` |
+| A tool | `aidaemon_core::Tool` |
+| A policy or guardrail | `aidaemon_core::Hook` |
+| A memory backend | `aidaemon_memory::{MemoryStore, Embedder, Scorer}` or `aidaemon_policies::Recall` |
+| A sandbox | `aidaemon_tools::ExecutionBackend` |
+| Run storage | `aidaemon_core::RunStore` |
+| Telemetry | `aidaemon_core::EventSink` |
 
 Roadmap and status live in `PLAN.md`.

@@ -17,8 +17,14 @@ agents = ["dep:aidaemon-agents"]
 sqlite = ["dep:aidaemon-store-sqlite"]
 mcp = ["dep:aidaemon-mcp"]
 eval = ["dep:aidaemon-eval"]
-testing = ["aidaemon-core/testing"]
-full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing"]
+memory = ["dep:aidaemon-memory"]
+fastembed = ["memory", "aidaemon-memory/fastembed"]
+channels = ["dep:aidaemon-channels"]
+telegram = ["channels", "dep:aidaemon-channel-telegram"]
+slack = ["channels", "dep:aidaemon-channel-slack"]
+discord = ["channels", "dep:aidaemon-channel-discord"]
+testing = ["aidaemon-core/testing", "aidaemon-channels?/testing"]
+full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "telegram", "slack", "discord"]
 
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
@@ -29,6 +35,11 @@ aidaemon-agents = { path = "../aidaemon-agents", optional = true }
 aidaemon-store-sqlite = { path = "../aidaemon-store-sqlite", optional = true }
 aidaemon-mcp = { path = "../aidaemon-mcp", optional = true }
 aidaemon-eval = { path = "../aidaemon-eval", optional = true }
+aidaemon-memory = { path = "../aidaemon-memory", optional = true }
+aidaemon-channels = { path = "../aidaemon-channels", optional = true }
+aidaemon-channel-telegram = { path = "../aidaemon-channel-telegram", optional = true }
+aidaemon-channel-slack = { path = "../aidaemon-channel-slack", optional = true }
+aidaemon-channel-discord = { path = "../aidaemon-channel-discord", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

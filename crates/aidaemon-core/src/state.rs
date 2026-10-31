@@ -90,7 +90,9 @@ pub struct RunState {
 }
 
 impl RunState {
-    pub(crate) fn new(agent_id: &str, session_id: &str, input: &str) -> Self {
+    /// A fresh state for a new run, so callers know the run id before it
+    /// starts. Run it with [`crate::Agent::run_from`].
+    pub fn new(agent_id: &str, session_id: &str, input: &str) -> Self {
         Self {
             run_id: RunId::new(),
             agent_id: agent_id.to_string(),

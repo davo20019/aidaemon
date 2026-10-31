@@ -1,0 +1,28 @@
+[package]
+name = "aidaemon-channels"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: chat channels and the runner that connects them to agents (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+# Exposes `aidaemon_channels::testing::TestChannel` for adapter and app tests.
+testing = []
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-channels = { path = ".", features = ["testing"] }
+tokio = { version = "1", features = ["full"] }

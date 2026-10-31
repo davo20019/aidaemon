@@ -24,6 +24,11 @@ members = [
     "crates/aidaemon-agents",
     "crates/aidaemon-policies",
     "crates/aidaemon-eval",
+    "crates/aidaemon-memory",
+    "crates/aidaemon-channels",
+    "crates/aidaemon-channel-telegram",
+    "crates/aidaemon-channel-slack",
+    "crates/aidaemon-channel-discord",
     "crates/aidaemon-sdk",
 ]
 resolver = "2"

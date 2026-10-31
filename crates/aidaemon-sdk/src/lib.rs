@@ -14,6 +14,9 @@
 //! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries |
 //! | [`mcp`] | `mcp` | MCP servers as tools |
 //! | [`eval`] | `eval` | YAML scenarios, N-of-M pass rates, baseline comparison |
+//! | [`memory`] | `memory` (+ `fastembed`) | Long-term memory: facts, episodes, hybrid recall; every part swappable |
+//! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
+//! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
 //! | [`testing`] | `testing` | Scripted provider for tests |
 //!
 //! ```no_run
@@ -68,6 +71,22 @@ pub use aidaemon_mcp as mcp;
 #[cfg(feature = "eval")]
 pub use aidaemon_eval as eval;
 
+#[cfg(feature = "memory")]
+pub use aidaemon_memory as memory;
+
+/// Chat channels: the contract, the runner, and the built-in adapters.
+#[cfg(feature = "channels")]
+pub mod channels {
+    pub use aidaemon_channels::*;
+
+    #[cfg(feature = "discord")]
+    pub use aidaemon_channel_discord as discord;
+    #[cfg(feature = "slack")]
+    pub use aidaemon_channel_slack as slack;
+    #[cfg(feature = "telegram")]
+    pub use aidaemon_channel_telegram as telegram;
+}
+
 /// The names most agents need, plus the enabled modules.
 pub mod prelude {
     pub use aidaemon_core::{
@@ -78,10 +97,14 @@ pub mod prelude {
 
     #[cfg(feature = "agents")]
     pub use crate::agents;
+    #[cfg(feature = "channels")]
+    pub use crate::channels;
     #[cfg(feature = "eval")]
     pub use crate::eval;
     #[cfg(feature = "mcp")]
     pub use crate::mcp;
+    #[cfg(feature = "memory")]
+    pub use crate::memory;
     #[cfg(feature = "policies")]
     pub use crate::policies;
     #[cfg(feature = "providers")]
