@@ -130,16 +130,12 @@ pub(crate) fn map_message(msg: &Message, bot: &BotIdentity) -> Option<InboundMes
         };
         let span = &raw_text[start..end];
         match entity.kind.as_str() {
-            "mention" => {
-                if bot.is_my_username(span.trim_start_matches('@')) {
-                    addressed = true;
-                    cuts.push((start, end));
-                }
+            "mention" if bot.is_my_username(span.trim_start_matches('@')) => {
+                addressed = true;
+                cuts.push((start, end));
             }
-            "text_mention" => {
-                if entity.user.as_ref().is_some_and(|u| bot.is_me(u)) {
-                    addressed = true;
-                }
+            "text_mention" if entity.user.as_ref().is_some_and(|u| bot.is_me(u)) => {
+                addressed = true;
             }
             "bot_command" => {
                 // `/cmd` or `/cmd@botname`.

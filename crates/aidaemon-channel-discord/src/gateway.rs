@@ -288,10 +288,12 @@ impl DiscordChannel {
                                 None => continue,
                             }
                         }
-                        OP_HEARTBEAT => {
-                            if sink.send(Message::Text(self.heartbeat_payload())).await.is_err() {
-                                return Outcome::Reconnect { delay: Delay::Backoff };
-                            }
+                        // The guard sends the heartbeat; a successful send
+                        // falls through to the no-op arm.
+                        OP_HEARTBEAT
+                            if sink.send(Message::Text(self.heartbeat_payload())).await.is_err() =>
+                        {
+                            return Outcome::Reconnect { delay: Delay::Backoff };
                         }
                         OP_HEARTBEAT_ACK => acked = true,
                         OP_RECONNECT => {
