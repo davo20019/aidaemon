@@ -27,10 +27,10 @@
 //! What it drops (on purpose, for comparison): intent gating, completion
 //! contracts and the stall/recovery ladder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aidaemon_core as sdk;
@@ -52,7 +52,7 @@ use super::Agent;
 use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
 use crate::config::{AgentEngineKind, AppConfig, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskEndData, TaskOutcome, TaskStartData, TaskStatus};
-use crate::traits::{AttachmentProvenance, Message, MessageAttachment, ToolOutcomeStatus};
+use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 const DEFAULT_MAX_TURNS: u32 = 40;
@@ -437,9 +437,7 @@ struct TurnScope<'a> {
     user_role: UserRole,
     /// The engine model, for vision gating of tool-observed images.
     model: &'a str,
-    /// Attachments each call produced, by call id, so the persisted tool
-    /// message keeps them.
-    tool_attachments: Mutex<HashMap<String, Vec<MessageAttachment>>>,
+    turn_id: &'a str,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -449,6 +447,19 @@ struct TurnScope<'a> {
 impl Agent {
     async fn dispatch_sdk_tool_call(&self, scope: &TurnScope<'_>, request: ToolRequest) {
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
+        let output = self.run_sdk_tool_call(scope, &request, &arguments).await;
+        let _ = request.reply.send(Ok(output));
+    }
+
+    /// Run one call and record it as the legacy loop does: a `ToolCall`
+    /// event, then the tool message with a typed receipt, so the run ledger
+    /// sees every operation while the run is still going.
+    async fn run_sdk_tool_call(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &ToolRequest,
+        arguments: &str,
+    ) -> sdk::ToolOutput {
         let mut ctx = ToolExecCtx {
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
@@ -469,7 +480,7 @@ impl Agent {
         let started = Instant::now();
         // Mandate runs: the same per-call authority gate as the legacy loop,
         // which issues the bounded grant or refuses the call.
-        let grant = match self.sdk_mandate_gate(&ctx, &request, &arguments).await {
+        let grant = match self.sdk_mandate_gate(&ctx, request, arguments).await {
             Ok(grant) => grant,
             Err(refusal) => {
                 info!(
@@ -478,24 +489,66 @@ impl Agent {
                     tool = %request.name,
                     "SDK engine: mandate gate refused the call"
                 );
-                let _ = request.reply.send(Ok(sdk::ToolOutput::error(refusal)));
-                return;
+                let call = crate::traits::ToolCall {
+                    id: request.call_id.clone(),
+                    name: request.name.clone(),
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                };
+                let semantics = self
+                    .semantics_for_exact_tool_call(&request.name, arguments)
+                    .await;
+                if let Err(error) = self
+                    .persist_pre_dispatch_policy_denial(
+                        scope.emitter,
+                        scope.session_id,
+                        scope.task_id,
+                        &call,
+                        arguments,
+                        refusal.clone(),
+                        "mandate_authority",
+                        semantics,
+                        None,
+                    )
+                    .await
+                {
+                    warn!(task_id = scope.task_id, %error, "SDK engine: could not record a denial");
+                }
+                return sdk::ToolOutput::error(refusal);
             }
         };
         ctx.mandate_authority = grant.as_ref();
-        let result = match self
-            .execute_tool_outcome(&request.name, &arguments, &ctx)
+
+        let mut call_data = crate::events::ToolCallData::from_tool_call(
+            request.call_id.clone(),
+            request.name.clone(),
+            request.arguments.clone(),
+            Some(scope.task_id.to_string()),
+        );
+        call_data.turn_id = Some(scope.turn_id.to_string());
+        if let Err(error) = scope.emitter.emit(EventType::ToolCall, call_data).await {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool call");
+        }
+
+        let (output, images, metadata, receipt) = match self
+            .execute_tool_outcome(&request.name, arguments, &ctx)
             .await
         {
             Ok(outcome) => {
-                let is_error = matches!(
-                    outcome.metadata.outcome_status,
-                    Some(
-                        ToolOutcomeStatus::FailedRetryable
-                            | ToolOutcomeStatus::FailedPermanent
-                            | ToolOutcomeStatus::Blocked
-                    )
+                let status = super::loop_utils::classify_tool_outcome_status(
+                    &request.name,
+                    &outcome.output,
+                    Some(arguments),
+                    Some(&outcome.metadata),
                 );
+                let evidence = super::loop_utils::tool_outcome_evidence_source(&outcome.metadata);
+                let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+                    &outcome.metadata,
+                    status,
+                    evidence,
+                    None,
+                );
+                receipt.mandate_authority = grant.clone();
                 let mut output = outcome.output;
                 let observed: Vec<&MessageAttachment> = outcome
                     .metadata
@@ -510,14 +563,6 @@ impl Agent {
                          (vision is off, unsupported, or the file is too large or unreadable).",
                     );
                 }
-                if !outcome.metadata.attachments.is_empty() {
-                    if let Ok(mut by_call) = scope.tool_attachments.lock() {
-                        by_call.insert(
-                            request.call_id.clone(),
-                            outcome.metadata.attachments.clone(),
-                        );
-                    }
-                }
                 let backgrounded = outcome.metadata.background_started || outcome.metadata.detached;
                 if backgrounded && outcome.metadata.completion_notifications_enabled {
                     scope.background_handoff.store(true, Ordering::Relaxed);
@@ -527,22 +572,70 @@ impl Agent {
                          when it finishes.",
                     );
                 }
-                Ok(sdk::ToolOutput {
-                    is_error,
-                    ..sdk::ToolOutput::text(output).with_images(images)
-                })
+                (output, images, Some(outcome.metadata), Some(receipt))
             }
-            Err(error) => Ok(sdk::ToolOutput::error(format!("Error: {error}"))),
+            Err(error) => (format!("Error: {error}"), Vec::new(), None, None),
         };
+        let failed = receipt
+            .as_ref()
+            .map(|receipt| receipt.outcome_status.is_failure() || receipt.contract_rejected)
+            .unwrap_or(true);
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
+        tool.content = Some(output.clone());
+        tool.tool_name = Some(request.name.clone());
+        tool.tool_call_id = Some(request.call_id.clone());
+        tool.turn_id = Some(scope.turn_id.to_string());
+        if let Some(metadata) = &metadata {
+            tool.attachments = metadata.attachments.clone();
+        }
+        if let Err(error) = self
+            .append_tool_message_with_receipt_event_policy(
+                scope.emitter,
+                &tool,
+                !failed,
+                duration_ms,
+                failed.then(|| output.clone()),
+                Some(scope.task_id),
+                metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.persistent_output.as_deref()),
+                receipt,
+            )
+            .await
+        {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool result");
+        }
+        // The executor's own checklist becomes ledger expectations.
+        if request.name == "track_requirements" && !failed {
+            if let Some(declared) =
+                crate::tools::track_requirements::executor_expectations_from_checklist_arguments(
+                    scope.task_id,
+                    arguments,
+                )
+            {
+                if let Err(error) = scope
+                    .emitter
+                    .emit(EventType::ExecutorExpectationsDeclared, declared)
+                    .await
+                {
+                    warn!(task_id = scope.task_id, %error, "SDK engine: could not record a checklist");
+                }
+            }
+        }
         info!(
             session_id = scope.session_id,
             task_id = scope.task_id,
             tool = %request.name,
-            failed = result.as_ref().map(|output| output.is_error).unwrap_or(true),
-            duration_ms = started.elapsed().as_millis() as u64,
+            failed,
+            duration_ms,
             "SDK engine tool call"
         );
-        let _ = request.reply.send(result);
+        sdk::ToolOutput {
+            is_error: failed,
+            ..sdk::ToolOutput::text(output).with_images(images)
+        }
     }
 
     /// Make one model call for the SDK run through the daemon's provider
@@ -671,7 +764,42 @@ impl Agent {
                 return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
             }
         }
-        Ok(from_provider_response(response))
+        let response = from_provider_response(response);
+        if !response.tool_calls.is_empty() {
+            self.persist_sdk_tool_call_message(scope, &response).await;
+        }
+        Ok(response)
+    }
+
+    /// Record an assistant message that calls tools before the calls run, so
+    /// history and the run ledger see each call with the message that made it.
+    async fn persist_sdk_tool_call_message(
+        &self,
+        scope: &TurnScope<'_>,
+        response: &sdk::ModelResponse,
+    ) {
+        let calls: Vec<crate::traits::ToolCall> = response
+            .tool_calls
+            .iter()
+            .map(|call| crate::traits::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+                extra_content: None,
+            })
+            .collect();
+        let mut assistant =
+            Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "assistant");
+        let text = response.text.trim();
+        assistant.content = (!text.is_empty()).then(|| text.to_string());
+        assistant.tool_calls_json = serde_json::to_string(&calls).ok();
+        assistant.turn_id = Some(scope.turn_id.to_string());
+        if let Err(error) = self
+            .append_assistant_message_with_event(scope.emitter, &assistant, scope.model, None, None)
+            .await
+        {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool-call message");
+        }
     }
 
     /// Charge a model call to the turn's goal. Returns true when this call
@@ -763,80 +891,6 @@ impl Agent {
                 request.name
             )),
             Err(error) => Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
-        }
-    }
-
-    /// Record a run's tool calls and results as the legacy loop does
-    /// (AssistantResponse with tool calls, then ToolResult), so later turns,
-    /// history replay and diagnostics see the evidence behind the answer.
-    #[allow(clippy::too_many_arguments)]
-    async fn persist_sdk_tool_exchanges(
-        &self,
-        emitter: &EventEmitter,
-        session_id: &str,
-        task_id: &str,
-        turn_id: &str,
-        model: &str,
-        produced: &[sdk::Message],
-        receipts: &[sdk::Receipt],
-        mut tool_attachments: HashMap<String, Vec<MessageAttachment>>,
-    ) {
-        let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for message in produced {
-            let persisted = match message.role {
-                sdk::Role::Assistant if !message.tool_calls.is_empty() => {
-                    let calls: Vec<crate::traits::ToolCall> = message
-                        .tool_calls
-                        .iter()
-                        .map(|call| {
-                            names.insert(call.id.as_str(), call.name.as_str());
-                            crate::traits::ToolCall {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.to_string(),
-                                extra_content: None,
-                            }
-                        })
-                        .collect();
-                    let mut assistant =
-                        Message::new_runtime(Uuid::new_v4().to_string(), session_id, "assistant");
-                    let text = message.content.trim();
-                    assistant.content = (!text.is_empty()).then(|| text.to_string());
-                    assistant.tool_calls_json = serde_json::to_string(&calls).ok();
-                    assistant.turn_id = Some(turn_id.to_string());
-                    self.append_assistant_message_with_event(emitter, &assistant, model, None, None)
-                        .await
-                }
-                sdk::Role::Tool => {
-                    let call_id = message.tool_call_id.clone().unwrap_or_default();
-                    let receipt = receipts.iter().rev().find(|r| r.call_id == call_id);
-                    let mut tool =
-                        Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool");
-                    tool.content = Some(message.content.clone());
-                    tool.attachments = tool_attachments.remove(&call_id).unwrap_or_default();
-                    tool.tool_name = names
-                        .get(call_id.as_str())
-                        .map(|name| name.to_string())
-                        .or_else(|| receipt.map(|r| r.tool.clone()));
-                    tool.tool_call_id = Some(call_id);
-                    tool.turn_id = Some(turn_id.to_string());
-                    self.append_tool_message_with_receipt_event_policy(
-                        emitter,
-                        &tool,
-                        !message.is_error,
-                        receipt.map(|r| r.duration_ms).unwrap_or_default(),
-                        receipt.and_then(|r| r.reason.clone()),
-                        Some(task_id),
-                        None,
-                        None,
-                    )
-                    .await
-                }
-                _ => continue,
-            };
-            if let Err(error) = persisted {
-                warn!(session_id, task_id, %error, "SDK engine: could not record a tool exchange");
-            }
         }
     }
 
@@ -1071,7 +1125,7 @@ impl Agent {
             channel_ctx: &channel_ctx,
             user_role,
             model: &model,
-            tool_attachments: Mutex::new(HashMap::new()),
+            turn_id: &turn_id,
             background_handoff: AtomicBool::new(false),
             emitter: &emitter,
             history_len: replayed,
@@ -1110,32 +1164,6 @@ impl Agent {
                     tool_calls = outcome.state.tool_calls,
                     "SDK engine run finished"
                 );
-                // Everything this run added after the user message, except a
-                // closing answer, which is persisted below as the reply.
-                let mut produced =
-                    &outcome.state.messages[(replayed + 1).min(outcome.state.messages.len())..];
-                if produced.last().is_some_and(|message| {
-                    message.role == sdk::Role::Assistant && message.tool_calls.is_empty()
-                }) {
-                    produced = &produced[..produced.len() - 1];
-                }
-                let tool_attachments = std::mem::take(
-                    &mut *scope
-                        .tool_attachments
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                );
-                self.persist_sdk_tool_exchanges(
-                    &emitter,
-                    session_id,
-                    &task_id,
-                    &turn_id,
-                    &model,
-                    produced,
-                    outcome.receipts(),
-                    tool_attachments,
-                )
-                .await;
                 let usage = outcome.run_usage();
                 let mut assistant =
                     Message::new_runtime(Uuid::new_v4().to_string(), session_id, "assistant");
@@ -1503,6 +1531,152 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls, 2);
+    }
+
+    async fn task_events(
+        harness: &crate::testing::TestHarness,
+        task_id: &str,
+    ) -> Vec<crate::events::Event> {
+        harness
+            .agent
+            .event_store
+            .query_task_events_for_session("telegram:synthetic-user-1", task_id)
+            .await
+            .unwrap()
+    }
+
+    fn remember(value: &str) -> crate::traits::ProviderResponse {
+        crate::testing::MockProvider::tool_call_response(
+            "remember_fact",
+            &format!(r#"{{"category":"preference","key":"color","value":"{value}"}}"#),
+        )
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_emits_tool_call_before_result() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider =
+            MockProvider::with_responses(vec![remember("teal"), MockProvider::text_response("ok")]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Remember teal."))
+            .await
+            .unwrap();
+        let events = task_events(&harness, &reply.task_id).await;
+        let kinds: Vec<EventType> = events
+            .iter()
+            .map(|event| event.event_type)
+            .filter(|kind| matches!(kind, EventType::ToolCall | EventType::ToolResult))
+            .collect();
+        assert_eq!(kinds, [EventType::ToolCall, EventType::ToolResult]);
+        let result = events
+            .iter()
+            .find(|event| event.event_type == EventType::ToolResult)
+            .unwrap()
+            .parse_data::<crate::events::ToolResultData>()
+            .unwrap();
+        let receipt = result.receipt.expect("tool result without a receipt");
+        assert_eq!(
+            receipt.invocation_stage,
+            crate::traits::ToolInvocationStage::Dispatched
+        );
+        let aggregate = harness
+            .agent
+            .event_store
+            .task_run_aggregate("telegram:synthetic-user-1", &reply.task_id)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.operations.len(), 1);
+        assert!(
+            aggregate.invariant_violations.is_empty(),
+            "{:?}",
+            aggregate.invariant_violations
+        );
+    }
+
+    /// Review focus: a provider failure after tools ran keeps their records.
+    #[tokio::test]
+    async fn sdk_engine_keeps_tool_results_when_provider_fails() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![remember("teal")]).with_strict_responses();
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Remember teal."))
+            .await
+            .unwrap();
+        let events = task_events(&harness, &reply.task_id).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::ToolResult)
+                .count(),
+            1
+        );
+        let end = events
+            .iter()
+            .find(|event| event.event_type == EventType::TaskEnd)
+            .unwrap()
+            .parse_data::<TaskEndData>()
+            .unwrap();
+        assert_eq!(end.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_track_requirements_declares_expectations() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        // Typed items become obligations; free-text items are only notes.
+        let checklist = serde_json::json!({"items": [
+            {"text": "read the first note", "status": "pending",
+             "requires_observation": true, "targets": ["/tmp/synthetic/first.txt"]},
+            {"text": "read the second note", "status": "pending",
+             "requires_observation": true, "targets": ["/tmp/synthetic/second.txt"]}
+        ]})
+        .to_string();
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("track_requirements", &checklist),
+            MockProvider::text_response("planned"),
+            MockProvider::text_response("planned"),
+            MockProvider::text_response("planned"),
+        ]);
+        let mut harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        harness.agent.tools.push(Arc::new(
+            crate::tools::track_requirements::TrackRequirementsTool::new(plans),
+        ));
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Pick a color and save it."))
+            .await
+            .unwrap();
+        let declared = task_events(&harness, &reply.task_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == EventType::ExecutorExpectationsDeclared)
+            .count();
+        assert_eq!(declared, 1);
+        let aggregate = harness
+            .agent
+            .event_store
+            .task_run_aggregate("telegram:synthetic-user-1", &reply.task_id)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.open_executor_expectations(), 2);
     }
 
     #[test]

@@ -697,7 +697,7 @@ pub(super) fn classify_tool_result_failure_with_context(
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
 }
 
-pub(super) fn classify_tool_outcome_status(
+pub(in crate::agent) fn classify_tool_outcome_status(
     tool_name: &str,
     result_text: &str,
     tool_arguments: Option<&str>,
@@ -732,7 +732,7 @@ pub(super) fn classify_tool_outcome_status(
 /// This is persisted with the receipt so recovery and completion logic can
 /// distinguish an authoritative typed outcome from a compatibility parse of
 /// model-visible text.
-pub(super) fn tool_outcome_evidence_source(
+pub(in crate::agent) fn tool_outcome_evidence_source(
     metadata: &crate::traits::ToolCallMetadata,
 ) -> crate::events::ToolOutcomeEvidenceSource {
     if metadata.receipt_replayed {
