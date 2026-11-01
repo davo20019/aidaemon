@@ -698,6 +698,9 @@ impl Agent {
                 // Strip any underscore-prefixed fields the LLM might have injected
                 // to prevent spoofing of internal enrichment fields.
                 map.retain(|k, _| !k.starts_with('_'));
+                if let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) {
+                    drop_unset_optional_arguments(&mut map, &tool.schema());
+                }
                 map.insert("_session_id".to_string(), json!(session_id));
                 map.insert(
                     "_channel_visibility".to_string(),
@@ -988,6 +991,73 @@ impl std::fmt::Display for UnknownToolError {
 }
 
 impl std::error::Error for UnknownToolError {}
+
+/// Drop optional top-level arguments the model filled with an empty string
+/// or an empty list. Some models send every declared field and use `""` or
+/// `[]` for "not provided"; a tool would otherwise read them as values (an
+/// empty session filter that matches nothing, an empty `schedules` list that
+/// hides `schedule`). Required fields, numbers and booleans are untouched.
+fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schema: &Value) {
+    let parameters = schema.get("parameters").unwrap_or(schema);
+    let required: Vec<&str> = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    map.retain(|key, value| {
+        if required.contains(&key.as_str()) {
+            return true;
+        }
+        match value {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(items) => !items.is_empty(),
+            _ => true,
+        }
+    });
+}
+
+#[cfg(test)]
+mod unset_argument_tests {
+    use super::*;
+
+    #[test]
+    fn empty_optional_arguments_are_dropped_and_required_ones_kept() {
+        let schema = json!({
+            "name": "search_history",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": ["action", "content"]
+            }
+        });
+        let mut args = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "action": "search",
+            "content": "",
+            "query": "broken.py",
+            "session_id": "",
+            "task_id": "  ",
+            "schedules": [],
+            "tags": ["a"],
+            "event_id": 0,
+            "include_subagents": false
+        }))
+        .unwrap();
+        drop_unset_optional_arguments(&mut args, &schema);
+        let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "content",
+                "event_id",
+                "include_subagents",
+                "query",
+                "tags"
+            ]
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]
