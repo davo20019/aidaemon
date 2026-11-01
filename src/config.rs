@@ -796,18 +796,19 @@ pub enum AgentEngineKind {
 /// ```toml
 /// [agent.engine]
 /// kind = "sdk"
-/// model = "claude-sonnet-5-5"
-/// api_key = "keychain"   # or a literal key; empty falls back to ANTHROPIC_API_KEY
+/// model = "gpt-6-sol"   # optional; pins every turn to a model the daemon's provider serves
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AgentEngineConfig {
     #[serde(default)]
     pub kind: AgentEngineKind,
-    /// Anthropic model id for the SDK engine.
+    /// Pins every SDK turn to this model, served by the daemon's providers.
     #[serde(default)]
     pub model: Option<String>,
-    /// Anthropic API key for the SDK engine (`"keychain"` reads
-    /// `agent_engine_api_key` from the OS credential store).
+    /// Ignored: the SDK engine uses the daemon's configured providers. Kept so
+    /// older configs still parse; when set, a `model` pin written for the
+    /// removed Anthropic engine client is ignored unless the provider is
+    /// Anthropic.
     #[serde(default)]
     pub api_key: String,
     /// Model turns per agent turn before the run stops.
