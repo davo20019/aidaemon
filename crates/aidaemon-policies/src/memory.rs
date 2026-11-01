@@ -12,6 +12,26 @@ use crate::{insert_after_system, last_user_message_index};
 #[async_trait]
 pub trait Recall: Send + Sync {
     async fn recall(&self, session_id: &str, query: &str, limit: usize) -> Vec<String>;
+
+    /// The system note [`MemoryInjection`] adds for `query`, or `None` for no
+    /// note. The default lists the [`Recall::recall`] snippets under a
+    /// "may be outdated" banner; a backend with its own layout (sections,
+    /// authoritative profile facts) overrides this.
+    async fn render(&self, session_id: &str, query: &str, limit: usize) -> Option<String> {
+        let snippets = self.recall(session_id, query, limit).await;
+        if snippets.is_empty() {
+            return None;
+        }
+        let mut note = String::from(
+            "[Recalled memory — background that may be outdated or irrelevant. Use it only if it \
+             helps with the current request, and prefer what the user says now.]",
+        );
+        for snippet in snippets.iter().take(limit) {
+            note.push_str("\n- ");
+            note.push_str(snippet.trim());
+        }
+        Some(note)
+    }
 }
 
 /// Injects recalled snippets for the latest user message as a system note
@@ -24,7 +44,7 @@ pub trait Recall: Send + Sync {
 pub struct MemoryInjection<R: Recall> {
     recall: R,
     limit: usize,
-    cache: Mutex<HashMap<String, (String, Vec<String>)>>,
+    cache: Mutex<HashMap<String, (String, Option<String>)>>,
 }
 
 impl<R: Recall> MemoryInjection<R> {
@@ -45,25 +65,22 @@ impl<R: Recall> MemoryInjection<R> {
         &self.recall
     }
 
-    async fn snippets(&self, session_id: &str, query: &str) -> Vec<String> {
-        if let Some((cached_query, snippets)) = self
+    async fn note(&self, session_id: &str, query: &str) -> Option<String> {
+        if let Some((cached_query, note)) = self
             .cache
             .lock()
             .ok()
             .and_then(|c| c.get(session_id).cloned())
         {
             if cached_query == query {
-                return snippets;
+                return note;
             }
         }
-        let snippets = self.recall.recall(session_id, query, self.limit).await;
+        let note = self.recall.render(session_id, query, self.limit).await;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(
-                session_id.to_string(),
-                (query.to_string(), snippets.clone()),
-            );
+            cache.insert(session_id.to_string(), (query.to_string(), note.clone()));
         }
-        snippets
+        note
     }
 }
 
@@ -74,19 +91,9 @@ impl<R: Recall> Hook for MemoryInjection<R> {
             return;
         };
         let query = ctx.messages[index].content.clone();
-        let snippets = self.snippets(ctx.session_id, &query).await;
-        if snippets.is_empty() {
-            return;
+        if let Some(note) = self.note(ctx.session_id, &query).await {
+            insert_after_system(&mut request.messages, Message::system(note));
         }
-        let mut note = String::from(
-            "[Recalled memory — background that may be outdated or irrelevant. Use it only if it \
-             helps with the current request, and prefer what the user says now.]",
-        );
-        for snippet in snippets.iter().take(self.limit) {
-            note.push_str("\n- ");
-            note.push_str(snippet.trim());
-        }
-        insert_after_system(&mut request.messages, Message::system(note));
     }
 }
 

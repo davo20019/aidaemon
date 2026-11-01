@@ -1,9 +1,9 @@
-//! [`MemoryWriter`]: background fact extraction as an `on_stop` hook.
+//! [`MemoryWriter`]: background fact extraction as an `on_run_end` hook.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::{Hook, HookContext, StopDecision};
+use aidaemon_core::{Hook, HookContext, RunOutcome};
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 
@@ -19,17 +19,17 @@ pub struct WriterReport {
 }
 
 const MAX_KEPT_REPORTS: usize = 64;
-const MAX_SEEN_TURNS: usize = 1_024;
 
 #[derive(Default)]
 struct Shared {
     reports: Mutex<VecDeque<WriterReport>>,
 }
 
-/// Extracts durable facts from the latest user turn when the model gives a
-/// final answer. Always returns [`StopDecision::Accept`] immediately: the
-/// extraction runs on a spawned task and can neither block nor fail the
-/// run. Register it after any hook that may reject a final answer.
+/// Extracts durable facts from the latest user turn once a run completes.
+/// Failed, cancelled and interrupted runs write nothing. The extraction runs
+/// on a spawned task and can neither block nor change the run, and because
+/// it fires at run end, hook order does not matter: an answer another hook
+/// rejected is never extracted.
 ///
 /// Outcomes (including model usage) are logged with `tracing` and kept in
 /// a small buffer; [`MemoryWriter::drain`] waits for pending work and
@@ -41,7 +41,6 @@ pub struct MemoryWriter {
     memory: Memory,
     shared: Arc<Shared>,
     pending: Mutex<Vec<JoinHandle<()>>>,
-    seen: Mutex<VecDeque<(String, usize)>>,
 }
 
 impl MemoryWriter {
@@ -50,7 +49,6 @@ impl MemoryWriter {
             memory,
             shared: Arc::new(Shared::default()),
             pending: Mutex::new(Vec::new()),
-            seen: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -79,38 +77,18 @@ impl MemoryWriter {
             .map(|mut r| r.drain(..).collect())
             .unwrap_or_default()
     }
-
-    /// True the first time a (run, user message) pair is seen, so a final
-    /// answer rejected by a later hook does not trigger a second extraction.
-    fn first_time(&self, run_id: &str, index: usize) -> bool {
-        let Ok(mut seen) = self.seen.lock() else {
-            return true;
-        };
-        let key = (run_id.to_string(), index);
-        if seen.contains(&key) {
-            return false;
-        }
-        if seen.len() >= MAX_SEEN_TURNS {
-            seen.pop_front();
-        }
-        seen.push_back(key);
-        true
-    }
 }
 
 #[async_trait]
 impl Hook for MemoryWriter {
-    async fn on_stop(&self, ctx: &HookContext<'_>, _final_text: &str) -> StopDecision {
-        if self.memory.extractor().is_none() {
-            return StopDecision::Accept;
+    async fn on_run_end(&self, ctx: &HookContext<'_>, outcome: &RunOutcome) {
+        if !outcome.is_completed() || self.memory.extractor().is_none() {
+            return;
         }
         let Some(index) = aidaemon_policies::last_user_message_index(ctx.messages) else {
-            return StopDecision::Accept;
+            return;
         };
         let run_id = ctx.run_id.to_string();
-        if !self.first_time(&run_id, index) {
-            return StopDecision::Accept;
-        }
         let turn = ctx.messages[index..].to_vec();
         let session_id = ctx.session_id.to_string();
         let memory = self.memory.clone();
@@ -152,6 +130,5 @@ impl Hook for MemoryWriter {
             pending.retain(|h| !h.is_finished());
             pending.push(handle);
         }
-        StopDecision::Accept
     }
 }

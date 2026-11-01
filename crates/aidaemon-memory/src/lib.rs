@@ -20,7 +20,7 @@
 //! | Piece | Plugs in as |
 //! |---|---|
 //! | [`MemoryRecall`] | `aidaemon_policies::Recall`, for `MemoryInjection` (`before_model`) |
-//! | [`MemoryWriter`] | `aidaemon_core::Hook` (`on_stop`, background extraction) |
+//! | [`MemoryWriter`] | `aidaemon_core::Hook` (`on_run_end`, background extraction) |
 //! | [`RememberTool`], [`RecallTool`] | `aidaemon_core::Tool` |
 //! | [`Memory::ingest_run`] | explicit call with a `RunOutcome` |
 //!

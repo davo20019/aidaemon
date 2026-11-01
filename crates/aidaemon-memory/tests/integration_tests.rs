@@ -348,6 +348,75 @@ async fn memory_writer_failures_never_reach_the_run() {
     assert!(reports[0].result.as_ref().unwrap_err().contains("bad key"));
 }
 
+/// Rejects the first final answer of every run.
+struct RejectOnce(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl aidaemon_core::Hook for RejectOnce {
+    async fn on_stop(
+        &self,
+        _ctx: &aidaemon_core::HookContext<'_>,
+        _final_text: &str,
+    ) -> aidaemon_core::StopDecision {
+        if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            aidaemon_core::StopDecision::Accept
+        } else {
+            aidaemon_core::StopDecision::Continue {
+                message: "check your work".into(),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_writer_extracts_once_per_completed_run_only() {
+    let extraction = Arc::new(ScriptedProvider::new([facts_reply(json!([
+        {"category": "preference", "key": "seat", "value": "window", "confidence": 0.9}
+    ]))]));
+    let memory = memory_with(Some(FactExtractor::new(extraction.clone(), "small")), None);
+    let writer = Arc::new(MemoryWriter::new(memory.clone()));
+    // Registered BEFORE a hook that rejects the first answer: the writer must
+    // still wait for the run to actually finish.
+    let agent = Agent::builder("assistant")
+        .model("m")
+        .provider(ScriptedProvider::new([
+            text("draft"),
+            text("Booked a window seat."),
+        ]))
+        .hook_arc(writer.clone())
+        .hook(RejectOnce(Default::default()))
+        .build()
+        .unwrap();
+    agent
+        .run(SESSION, "I always prefer a window seat when I fly")
+        .await
+        .unwrap();
+    assert_eq!(writer.drain().await.len(), 1);
+    let requests = extraction.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: String = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    // Fired after the accepted answer, not at the rejected draft.
+    assert!(sent.contains("Booked a window seat."), "{sent}");
+
+    // A failed run writes nothing.
+    let agent = Agent::builder("assistant")
+        .model("m")
+        .provider(ScriptedProvider::with_results([Err(ProviderError::Auth(
+            "bad key".into(),
+        ))]))
+        .hook_arc(writer.clone())
+        .build()
+        .unwrap();
+    agent
+        .run(SESSION, "I always prefer a window seat when I fly")
+        .await
+        .unwrap();
+    assert!(writer.drain().await.is_empty());
+}
+
 #[tokio::test]
 async fn ingest_run_extracts_and_summarizes() {
     let extract = ScriptedProvider::new([facts_reply(json!([

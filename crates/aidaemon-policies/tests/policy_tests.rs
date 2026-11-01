@@ -493,6 +493,57 @@ async fn memory_injection_adds_a_note_once_per_user_message() {
     assert!(!out.state.messages.iter().any(|m| m.role == Role::System));
 }
 
+/// A backend with its own note layout: sections, no generic banner.
+struct SectionedRecall;
+#[async_trait]
+impl aidaemon_policies::Recall for SectionedRecall {
+    async fn recall(&self, _session_id: &str, _query: &str, _limit: usize) -> Vec<String> {
+        vec!["unused".into()]
+    }
+    async fn render(&self, _session_id: &str, query: &str, _limit: usize) -> Option<String> {
+        (!query.contains("nothing")).then(|| "## Known Facts\n- Mia likes chess".to_string())
+    }
+}
+
+#[tokio::test]
+async fn custom_recall_render_replaces_the_default_note() {
+    let provider = Arc::new(ScriptedProvider::new([text("ok"), text("ok")]));
+    let agent = agent(provider.clone())
+        .hook(MemoryInjection::new(SectionedRecall))
+        .build()
+        .unwrap();
+    agent.run("s", "what does Mia like").await.unwrap();
+    agent.run("s2", "remember nothing").await.unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests[0].messages[1].role, Role::System);
+    assert_eq!(
+        requests[0].messages[1].content,
+        "## Known Facts\n- Mia likes chess"
+    );
+    assert!(!requests[1]
+        .messages
+        .iter()
+        .any(|m| m.content.contains("Known Facts") || m.content.contains("Recalled memory")));
+}
+
+#[tokio::test]
+async fn default_recall_render_keeps_the_snippet_note() {
+    let recall = InMemoryRecall::new();
+    recall.remember("s", "Alice Rivera prefers morning meetings");
+    let note = aidaemon_policies::Recall::render(&recall, "s", "meetings with Alice", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        note,
+        "[Recalled memory — background that may be outdated or irrelevant. Use it only if it \
+         helps with the current request, and prefer what the user says now.]\n- Alice Rivera \
+         prefers morning meetings"
+    );
+    assert!(aidaemon_policies::Recall::render(&recall, "s", "zzz", 5)
+        .await
+        .is_none());
+}
+
 // ---------- tracing ----------
 
 mod capture {
