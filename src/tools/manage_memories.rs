@@ -1069,22 +1069,26 @@ impl Tool for ManageMemoriesTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_scheduled_goal action"))?;
 
-                let schedule_inputs: Vec<String> = if let Some(list) = args.schedules.as_ref() {
-                    list.iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                } else {
-                    let schedule_raw = args
-                        .schedule
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("'schedule' is required for create_scheduled_goal action"))?;
-                    vec![schedule_raw.to_string()]
-                };
+                // Strict-schema providers send every field, so an unused
+                // `schedules` arrives as `[]` beside the real `schedule`.
+                let mut schedule_inputs: Vec<String> = args
+                    .schedules
+                    .iter()
+                    .flatten()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if schedule_inputs.is_empty() {
-                    return Ok("At least one schedule is required.".to_string());
+                    if let Some(schedule) = args.schedule.as_deref().map(str::trim) {
+                        if !schedule.is_empty() {
+                            schedule_inputs.push(schedule.to_string());
+                        }
+                    }
+                }
+                if schedule_inputs.is_empty() {
+                    anyhow::bail!(
+                        "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
+                    );
                 }
 
                 // Keep tool-path descriptions aligned with fast-path scheduling:
@@ -3763,6 +3767,45 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert_eq!(schedules.len(), 1);
         assert!(schedules[0].is_one_shot);
+    }
+
+    /// Strict-schema providers send every field, so an unused `schedules`
+    /// arrives as `[]` next to the real `schedule`.
+    #[tokio::test]
+    async fn create_scheduled_goal_uses_schedule_when_schedules_is_empty() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check the oven",
+                    "schedule": "in 2h",
+                    "schedules": [],
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Created scheduled goal"), "{result}");
+
+        let missing = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check the oven",
+                    "schedule": "",
+                    "schedules": [],
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await;
+        assert!(missing.is_err(), "a missing schedule is a failed call");
     }
 
     #[tokio::test]
