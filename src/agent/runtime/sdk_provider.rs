@@ -143,91 +143,102 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
     out
 }
 
-fn estimate(messages: &[sdk::Message]) -> usize {
-    estimate_multimodal_message_tokens(&to_daemon_messages_from(messages))
-}
-
-/// Split `messages` into droppable units: a user message, or an assistant
-/// message together with the tool results that answer it.
-fn units(messages: &[sdk::Message]) -> Vec<&[sdk::Message]> {
-    let mut units = Vec::new();
-    let mut start = 0;
-    while start < messages.len() {
-        let mut end = start + 1;
-        if messages[start].role == sdk::Role::Assistant {
-            while end < messages.len() && messages[end].role == sdk::Role::Tool {
-                end += 1;
-            }
-        }
-        units.push(&messages[start..end]);
-        start = end;
+/// The daemon-format transcript for a model call: the projected `prefix`
+/// unchanged (so the provider's prompt cache keeps hitting), then this run's
+/// own messages. If the run outgrows the budget, only the run part is
+/// trimmed, with the legacy role-quota fitter, and unpaired tool calls and
+/// results are removed; the newest messages survive.
+pub(super) fn fit_run(prefix: &[Value], run: &[sdk::Message], budget_tokens: usize) -> Vec<Value> {
+    let run_values = to_daemon_messages_from(run);
+    let prefix_tokens = estimate_multimodal_message_tokens(prefix);
+    let run_tokens = estimate_multimodal_message_tokens(&run_values);
+    let mut out = prefix.to_vec();
+    if prefix_tokens + run_tokens <= budget_tokens || run_values.len() <= 1 {
+        out.extend(run_values);
+        return out;
     }
-    units
-}
-
-/// The request transcript, fitted to `budget_tokens`, as daemon messages.
-///
-/// `history_len` counts the replayed dialogue messages that precede the
-/// current turn's user message (after any leading system messages). Earlier
-/// turns go first, oldest first, in whole units, so a tool call never loses
-/// its result. Only if the current turn alone is still too large is it
-/// trimmed with the legacy role-quota fitter, after which unpaired tool
-/// calls and results are removed.
-pub(super) fn fit_messages(
-    messages: &[sdk::Message],
-    history_len: usize,
-    budget_tokens: usize,
-) -> Vec<Value> {
-    if estimate(messages) <= budget_tokens {
-        return to_daemon_messages_from(messages);
-    }
-    let system_len = messages
-        .iter()
-        .take_while(|message| message.role == sdk::Role::System)
-        .count();
-    let (system, rest) = messages.split_at(system_len);
-    let (history, current) = rest.split_at(history_len.min(rest.len()));
-    let history_units = units(history);
-    let mut first_kept = 0;
-    let fits = |from: usize| {
-        let kept: Vec<sdk::Message> = system
-            .iter()
-            .chain(history_units[from..].iter().flat_map(|unit| unit.iter()))
-            .chain(current)
-            .cloned()
-            .collect();
-        estimate(&kept) <= budget_tokens
-    };
-    while first_kept < history_units.len() && !fits(first_kept) {
-        first_kept += 1;
-    }
-    // A replayed transcript must start with a user message.
-    while first_kept < history_units.len() && history_units[first_kept][0].role != sdk::Role::User {
-        first_kept += 1;
-    }
-    let kept: Vec<sdk::Message> = system
-        .iter()
-        .chain(
-            history_units[first_kept..]
-                .iter()
-                .flat_map(|unit| unit.iter()),
-        )
-        .chain(current)
-        .cloned()
-        .collect();
-    if estimate(&kept) <= budget_tokens {
-        return to_daemon_messages_from(&kept);
-    }
-    // The current turn alone does not fit: trim it, keeping its user message.
-    let system_values = to_daemon_messages_from(system);
-    let system_tokens = estimate_multimodal_message_tokens(&system_values);
-    let (fitted, _) = fit_messages_with_source_quotas(
-        to_daemon_messages_from(current),
-        budget_tokens.saturating_sub(system_tokens),
-    );
-    let mut out = system_values;
+    let (fitted, _) =
+        fit_messages_with_source_quotas(run_values, budget_tokens.saturating_sub(prefix_tokens));
     out.extend(repair_tool_pairs(fitted));
     out
+}
+
+/// Daemon-format messages as SDK messages, for the kernel's own view of the
+/// starting transcript. Text parts are joined and image parts kept; other
+/// media stay only in the daemon-format prefix that is actually sent.
+pub(super) fn values_to_sdk(values: &[Value]) -> Vec<sdk::Message> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let (text, images) = split_content(value.get("content"));
+            let message = match value.get("role").and_then(Value::as_str)? {
+                "system" => sdk::Message::system(text),
+                "user" => sdk::Message::user(text).with_images(images),
+                "assistant" => {
+                    let calls = value
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .map(|calls| {
+                            calls
+                                .iter()
+                                .filter_map(|call| {
+                                    let function = call.get("function")?;
+                                    let arguments = function
+                                        .get("arguments")
+                                        .and_then(Value::as_str)
+                                        .and_then(|raw| serde_json::from_str(raw).ok())
+                                        .unwrap_or_else(|| json!({}));
+                                    Some(sdk::ToolCall::new(
+                                        call.get("id")?.as_str()?,
+                                        function.get("name")?.as_str()?,
+                                        arguments,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    sdk::Message::assistant(text, calls)
+                }
+                "tool" => sdk::Message::tool_result(
+                    value.get("tool_call_id").and_then(Value::as_str)?,
+                    text,
+                ),
+                _ => return None,
+            };
+            Some(message)
+        })
+        .collect()
+}
+
+fn split_content(content: Option<&Value>) -> (String, Vec<sdk::Image>) {
+    match content {
+        Some(Value::String(text)) => (text.clone(), Vec::new()),
+        Some(Value::Array(parts)) => {
+            let mut text = Vec::new();
+            let mut images = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(value) = part.get("text").and_then(Value::as_str) {
+                            text.push(value.to_string());
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(url) = part
+                            .get("image_url")
+                            .and_then(|image| image.get("url"))
+                            .and_then(Value::as_str)
+                        {
+                            images.push(sdk::Image::url(url));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text.join("\n"), images)
+        }
+        _ => (String::new(), Vec::new()),
+    }
 }
 
 /// Drop tool results whose call is not in the assistant message before
@@ -481,29 +492,6 @@ mod tests {
         format!("{text} {}", "lorem ipsum dolor sit amet ".repeat(60))
     }
 
-    /// History of `pairs` user/assistant exchanges plus one tool pair, then
-    /// the current user message.
-    fn transcript(pairs: usize) -> (Vec<sdk::Message>, usize) {
-        let mut messages = vec![sdk::Message::system("system prompt")];
-        for i in 0..pairs {
-            messages.push(sdk::Message::user(long(&format!("question {i}"))));
-            messages.push(sdk::Message::assistant(
-                long(&format!("answer {i}")),
-                Vec::new(),
-            ));
-        }
-        messages.push(sdk::Message::user("old tool question"));
-        messages.push(sdk::Message::assistant(
-            "",
-            vec![sdk::ToolCall::new("old", "read_file", json!({}))],
-        ));
-        messages.push(sdk::Message::tool_result("old", long("old file")));
-        messages.push(sdk::Message::assistant("old answer", Vec::new()));
-        let history_len = messages.len() - 1;
-        messages.push(sdk::Message::user("current question"));
-        (messages, history_len)
-    }
-
     fn assert_tool_pairs_valid(messages: &[Value]) {
         for (index, message) in messages.iter().enumerate() {
             if message["role"] != "tool" {
@@ -537,58 +525,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn history_is_dropped_oldest_first_to_fit_the_budget() {
-        let (messages, history_len) = transcript(40);
-        let budget = 2_000;
-        let fitted = fit_messages(&messages, history_len, budget);
-        assert!(
-            crate::memory::context_window::estimate_multimodal_message_tokens(&fitted) <= budget
-        );
-        assert_eq!(fitted[0]["role"], "system");
-        assert_eq!(fitted.last().unwrap()["content"], "current question");
-        // The newest history survives; the oldest goes first.
-        let text = serde_json::to_string(&fitted).unwrap();
-        assert!(text.contains("old answer"));
-        assert!(!text.contains("question 0 "));
-        assert_tool_pairs_valid(&fitted);
+    fn prefix() -> Vec<Value> {
+        vec![
+            json!({"role": "system", "content": "core prompt"}),
+            json!({"role": "user", "content": "an earlier question"}),
+            json!({"role": "assistant", "content": "an earlier answer"}),
+            json!({"role": "system", "content": "volatile tail"}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "current question"},
+                {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "ogg"}}
+            ]}),
+        ]
     }
 
     #[test]
-    fn fitting_never_splits_a_tool_pair() {
-        let (messages, history_len) = transcript(0);
-        // Room for the system prompt and current question only.
-        let fitted = fit_messages(&messages, history_len, 120);
-        assert_tool_pairs_valid(&fitted);
-        assert_eq!(fitted.last().unwrap()["content"], "current question");
-    }
-
-    #[test]
-    fn an_oversized_current_run_keeps_valid_pairs() {
-        let mut messages = vec![
-            sdk::Message::system("system prompt"),
-            sdk::Message::user("do many things"),
+    fn values_become_sdk_messages_with_paired_tool_calls() {
+        let values = vec![
+            json!({"role": "system", "content": "core"}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+            ]}),
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "body"}),
         ];
+        let messages = values_to_sdk(&values);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, sdk::Role::System);
+        assert_eq!(messages[1].content, "look");
+        assert_eq!(messages[1].images.len(), 1);
+        assert_eq!(messages[2].tool_calls[0].arguments, json!({"path": "a"}));
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[3].content, "body");
+    }
+
+    #[test]
+    fn the_projected_prefix_is_sent_byte_for_byte() {
+        let run = vec![sdk::Message::assistant("done", Vec::new())];
+        let fitted = fit_run(&prefix(), &run, 1_000_000);
+        assert_eq!(fitted[..5], prefix()[..]);
+        assert_eq!(fitted[5]["content"], "done");
+    }
+
+    #[test]
+    fn an_oversized_run_is_trimmed_after_the_prefix_with_valid_pairs() {
+        let mut run = Vec::new();
         for i in 0..20 {
             let id = format!("c{i}");
-            messages.push(sdk::Message::assistant(
+            run.push(sdk::Message::assistant(
                 "",
                 vec![sdk::ToolCall::new(id.clone(), "terminal", json!({"i": i}))],
             ));
-            messages.push(sdk::Message::tool_result(id, long(&format!("output {i}"))));
+            run.push(sdk::Message::tool_result(id, long(&format!("output {i}"))));
         }
-        let fitted = fit_messages(&messages, 0, 1_500);
-        assert_eq!(fitted[0]["role"], "system");
-        assert_eq!(fitted[1]["content"], "do many things");
+        let fitted = fit_run(&prefix(), &run, 2_000);
+        assert_eq!(fitted[..5], prefix()[..], "the prefix is never trimmed");
         assert_tool_pairs_valid(&fitted);
-        assert!(fitted.len() < messages.len());
-    }
-
-    #[test]
-    fn fitting_keeps_everything_under_budget() {
-        let (messages, history_len) = transcript(2);
-        let fitted = fit_messages(&messages, history_len, 1_000_000);
-        assert_eq!(fitted, to_daemon_messages_from(&messages));
+        assert!(fitted.len() < 5 + run.len());
+        // The newest call survives.
+        assert!(serde_json::to_string(&fitted)
+            .unwrap()
+            .contains("output 19"));
     }
 
     #[test]

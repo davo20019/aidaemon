@@ -44,24 +44,18 @@ use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
 use super::sdk_provider::{
-    fit_messages, from_provider_response, to_chat_options, to_daemon_tools, DaemonProvider,
-    ModelCall,
+    fit_run, from_provider_response, to_chat_options, to_daemon_tools, values_to_sdk,
+    DaemonProvider, ModelCall,
 };
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
-use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
+use crate::agent::vision::encode_image_attachment;
 use crate::config::{AgentEngineKind, AppConfig, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 const DEFAULT_MAX_TURNS: u32 = 40;
-/// Prior dialogue messages (including tool calls and results) replayed into
-/// each run.
-const HISTORY_MESSAGES: usize = 200;
-/// Replayed tool results are cut to this many characters: enough to show what
-/// an earlier call returned without re-sending large outputs every turn.
-const REPLAYED_TOOL_RESULT_CHARS: usize = 2_000;
 /// Daemon tools enforce their own timeouts (terminal backgrounding, CLI
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -127,7 +121,9 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) emitter: EventEmitter,
     pub(in crate::agent) offered_tools: HashSet<String>,
     pub(in crate::agent) model: String,
-    pub(in crate::agent) instructions: String,
+    /// The transcript the legacy message builder projected for the turn's
+    /// first model call, in the daemon providers' wire format.
+    pub(in crate::agent) prefix: Vec<Value>,
     pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
 }
 
@@ -327,114 +323,6 @@ fn tool_spec(tool: &dyn crate::traits::Tool) -> sdk::ToolSpec {
         name: tool.name().to_string(),
         description,
         parameters,
-    }
-}
-
-/// Anthropic tool-use ids must match `^[a-zA-Z0-9_-]+$`; ids from other
-/// providers may not. Map both sides of a pair the same way.
-fn wire_call_id(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn replayed_tool_result(content: &str) -> String {
-    if content.chars().count() <= REPLAYED_TOOL_RESULT_CHARS {
-        return content.to_string();
-    }
-    let head: String = content.chars().take(REPLAYED_TOOL_RESULT_CHARS).collect();
-    format!("{head}\n[... earlier output truncated]")
-}
-
-/// Project the daemon's stored dialogue into SDK messages.
-///
-/// Tool calls and their results are replayed as real tool-use pairs, so the
-/// model can see the evidence behind earlier answers. A call is kept only
-/// with its result directly after it (providers reject unpaired tool use),
-/// and only for tools still offered. Text-only neighbours of the same role
-/// are merged and the transcript starts with a user message.
-fn sdk_history(history: &[Message], offered: &HashSet<String>) -> Vec<sdk::Message> {
-    let mut messages: Vec<sdk::Message> = Vec::new();
-    let mut index = 0;
-    while index < history.len() {
-        let message = &history[index];
-        index += 1;
-        let content = message.content.as_deref().map(str::trim).unwrap_or("");
-        match message.role.as_str() {
-            "user" if !content.is_empty() => push_text(&mut messages, sdk::Role::User, content),
-            "assistant" => {
-                let calls: Vec<crate::traits::ToolCall> = message
-                    .tool_calls_json
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-                    .unwrap_or_default();
-                // Results that answer this message's calls, in order.
-                let mut results: Vec<&Message> = Vec::new();
-                while index < history.len() && history[index].role == "tool" {
-                    results.push(&history[index]);
-                    index += 1;
-                }
-                let mut paired_calls = Vec::new();
-                let mut paired_results = Vec::new();
-                for call in &calls {
-                    if !offered.contains(&call.name) {
-                        continue;
-                    }
-                    let Some(result) = results
-                        .iter()
-                        .find(|result| result.tool_call_id.as_deref() == Some(call.id.as_str()))
-                    else {
-                        continue;
-                    };
-                    let id = wire_call_id(&call.id);
-                    let arguments = serde_json::from_str(&call.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    paired_calls.push(sdk::ToolCall::new(id.clone(), call.name.clone(), arguments));
-                    paired_results.push(sdk::Message::tool_result(
-                        id,
-                        replayed_tool_result(result.content.as_deref().unwrap_or("")),
-                    ));
-                }
-                if messages.is_empty() {
-                    continue;
-                }
-                if paired_calls.is_empty() {
-                    if !content.is_empty() {
-                        push_text(&mut messages, sdk::Role::Assistant, content);
-                    }
-                    continue;
-                }
-                messages.push(sdk::Message::assistant(content, paired_calls));
-                messages.extend(paired_results);
-            }
-            // Results without the call they answer, and anything else.
-            _ => {}
-        }
-    }
-    messages
-}
-
-/// Append text, merging into the previous message when it has the same role
-/// and carries no tool calls.
-fn push_text(messages: &mut Vec<sdk::Message>, role: sdk::Role, content: &str) {
-    if messages.is_empty() && role != sdk::Role::User {
-        return;
-    }
-    match messages.last_mut() {
-        Some(last) if last.role == role && last.tool_calls.is_empty() => {
-            last.content.push_str("\n\n");
-            last.content.push_str(content);
-        }
-        _ => messages.push(match role {
-            sdk::Role::User => sdk::Message::user(content),
-            _ => sdk::Message::assistant(content, Vec::new()),
-        }),
     }
 }
 
@@ -671,8 +559,10 @@ struct TurnScope<'a> {
     session_id: &'a str,
     task_id: &'a str,
     emitter: &'a EventEmitter,
-    /// Replayed dialogue messages before this turn's user message.
-    history_len: usize,
+    /// The projected starting transcript, sent byte-for-byte on every call.
+    prefix: Vec<Value>,
+    /// Kernel messages that stand for `prefix`; later ones are this run's.
+    prefix_len: usize,
     budget_goal: Option<BudgetGoal>,
     /// Set once the goal budget is used up; later model calls are refused.
     budget_exhausted: AtomicBool,
@@ -1069,7 +959,8 @@ impl Agent {
             &tools,
             &self.context_window_config,
         );
-        let messages = fit_messages(&request.messages, scope.history_len, budget);
+        let run = &request.messages[scope.prefix_len.min(request.messages.len())..];
+        let messages = fit_run(&scope.prefix, run, budget);
         let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         let est_input_tokens =
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
@@ -1309,7 +1200,6 @@ impl Agent {
         engine: &SdkEngineSettings,
         setup: SdkTurnSetup,
         session_id: &str,
-        attachments: &[MessageAttachment],
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         user_role: UserRole,
         channel_ctx: ChannelContext,
@@ -1322,7 +1212,7 @@ impl Agent {
             emitter,
             offered_tools,
             model,
-            instructions,
+            prefix,
             contract,
         } = setup;
         let user_text = user_text.as_str();
@@ -1336,36 +1226,9 @@ impl Agent {
             .cloned()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Prior dialogue; bootstrap already recorded this turn's user message.
-        let history: Vec<Message> = match self
-            .event_store
-            .get_conversation_history_since_clear(session_id, HISTORY_MESSAGES)
-            .await
-        {
-            Ok(history) => history
-                .into_iter()
-                .filter(|message| message.turn_id.as_deref() != Some(turn_id.as_str()))
-                .collect(),
-            Err(error) => {
-                warn!(session_id, %error, "SDK engine: history unavailable");
-                Vec::new()
-            }
-        };
-        let (images, vision_skipped) = sdk_images(
-            &attachments.iter().collect::<Vec<_>>(),
-            &self.vision_config,
-            &model,
-        );
-        let instructions = if vision_skipped {
-            format!("{instructions}\n\n{VISION_SKIPPED_SYSTEM_HINT}")
-        } else {
-            instructions
-        };
-
         let (calls_tx, mut calls_rx) = mpsc::channel::<DaemonCall>(16);
         let mut builder = sdk::Agent::builder("aidaemon")
             .model(model.clone())
-            .instructions(instructions)
             .provider(DaemonProvider {
                 calls: calls_tx.clone(),
             })
@@ -1421,20 +1284,15 @@ impl Agent {
             .build()
             .map_err(|error| anyhow::anyhow!("SDK engine agent: {error}"))?;
 
-        let offered: HashSet<String> = sdk_agent
-            .tool_specs()
-            .iter()
-            .map(|spec| spec.name.clone())
-            .collect();
-        let mut state = sdk::RunState::new(
-            "aidaemon",
-            session_id,
-            sdk::Message::user(user_text).with_images(images),
-        );
-        let mut messages = sdk_history(&history, &offered);
-        let replayed = messages.len();
-        messages.append(&mut state.messages);
-        state.messages = messages;
+        // The kernel's own view of the starting transcript (for its stuck
+        // detection and bookkeeping); model calls send the projected prefix
+        // bytes unchanged.
+        let mut state = sdk::RunState::new("aidaemon", session_id, sdk::Message::user(user_text));
+        let projected = values_to_sdk(&prefix);
+        if !projected.is_empty() {
+            state.messages = projected;
+        }
+        let prefix_len = state.messages.len();
 
         // Drive the run and the tool dispatcher together on this task.
         let budget_goal = match self.budget_goal_id(session_id).await {
@@ -1463,7 +1321,8 @@ impl Agent {
             ),
             background_handoff: AtomicBool::new(false),
             emitter: &emitter,
-            history_len: replayed,
+            prefix,
+            prefix_len,
             budget_goal,
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
@@ -1644,98 +1503,6 @@ mod tests {
             sdk_images(&[&photo], &vision(2), "claude-sonnet-5-5"),
             (Vec::new(), true)
         );
-    }
-
-    fn message(role: &str, content: &str) -> Message {
-        let mut message = Message::new_runtime(Uuid::new_v4().to_string(), "s", role);
-        message.content = Some(content.to_string());
-        message
-    }
-
-    #[test]
-    fn history_starts_with_user_and_merges_same_role_neighbours() {
-        let history = vec![
-            message("assistant", "orphaned greeting"),
-            message("user", "first"),
-            message("user", "second"),
-            message("tool", "tool output"),
-            message("assistant", "answer"),
-            message("assistant", ""),
-        ];
-        let projected = sdk_history(&history, &HashSet::new());
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0].role, sdk::Role::User);
-        assert_eq!(projected[0].content, "first\n\nsecond");
-        assert_eq!(projected[1].role, sdk::Role::Assistant);
-        assert_eq!(projected[1].content, "answer");
-    }
-
-    fn assistant_calling(calls: &[(&str, &str)]) -> Message {
-        let mut message = message("assistant", "");
-        let calls: Vec<crate::traits::ToolCall> = calls
-            .iter()
-            .map(|(id, name)| crate::traits::ToolCall {
-                id: id.to_string(),
-                name: name.to_string(),
-                arguments: r#"{"path":"a.txt"}"#.to_string(),
-                extra_content: None,
-            })
-            .collect();
-        message.tool_calls_json = serde_json::to_string(&calls).ok();
-        message
-    }
-
-    fn tool_result(call_id: &str, content: &str) -> Message {
-        let mut message = message("tool", content);
-        message.tool_call_id = Some(call_id.to_string());
-        message
-    }
-
-    #[test]
-    fn history_replays_paired_tool_calls_and_drops_unpaired_ones() {
-        let offered: HashSet<String> = ["read_file".to_string()].into();
-        let history = vec![
-            message("user", "read it"),
-            // Kept: offered tool with its result; the id is made wire-safe.
-            assistant_calling(&[("call:1", "read_file"), ("call-2", "read_file")]),
-            tool_result("call:1", "file body"),
-            // call-2 has no result, so it is dropped from the pair.
-            message("assistant", "It says: file body"),
-            message("user", "again"),
-            // Dropped: tool no longer offered.
-            assistant_calling(&[("call-3", "old_tool")]),
-            tool_result("call-3", "old output"),
-            // Dropped: result without its call.
-            tool_result("call-9", "stray"),
-            message("assistant", "done"),
-        ];
-        let projected = sdk_history(&history, &offered);
-        let roles: Vec<sdk::Role> = projected.iter().map(|m| m.role).collect();
-        assert_eq!(
-            roles,
-            [
-                sdk::Role::User,
-                sdk::Role::Assistant,
-                sdk::Role::Tool,
-                sdk::Role::Assistant,
-                sdk::Role::User,
-                sdk::Role::Assistant,
-            ]
-        );
-        assert_eq!(projected[1].tool_calls.len(), 1);
-        assert_eq!(projected[1].tool_calls[0].id, "call_1");
-        assert_eq!(projected[1].tool_calls[0].arguments["path"], "a.txt");
-        assert_eq!(projected[2].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(projected[2].content, "file body");
-        assert_eq!(projected[5].content, "done");
-    }
-
-    #[test]
-    fn replayed_tool_results_are_capped() {
-        let long = "x".repeat(REPLAYED_TOOL_RESULT_CHARS + 50);
-        let replayed = replayed_tool_result(&long);
-        assert!(replayed.ends_with("[... earlier output truncated]"));
-        assert!(replayed.len() < long.len());
     }
 
     fn owner_request(text: &str) -> crate::runtime_ports::InboundMessageRequest {

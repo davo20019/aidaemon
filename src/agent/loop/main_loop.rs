@@ -1368,16 +1368,50 @@ impl Agent {
         // directives) is shared with the legacy loop.
         #[cfg(feature = "sdk-engine")]
         if let Some(engine) = self.sdk_engine.clone() {
-            let mut instructions = if task_context_tail.trim().is_empty() {
-                core_prompt_bytes.clone()
-            } else {
-                format!("{core_prompt_bytes}\n\n{task_context_tail}")
-            };
-            for directive in turn_state.directives.take_system_messages() {
-                instructions.push_str("\n\n");
-                instructions.push_str(&directive.render());
-            }
-            let offered_tools = tool_defs
+            // The run starts from the transcript the legacy message builder
+            // projects for a first iteration: core prompt, the request's
+            // archived turns (new-request isolation, shared-channel redaction,
+            // summary cursor, task boundary), the volatile tail, pending
+            // directives and the current user message with its media.
+            let message_build_directives = turn_state.directives.for_message_build_phase();
+            let MessageBuildData {
+                messages: prefix,
+                tool_defs: offered_tool_defs,
+                ..
+            } = super::message_build_phase::run_message_build_phase(
+                &services,
+                &mut MessageBuildCtx {
+                    session_id,
+                    iteration: 1,
+                    user_text: &llm_user_text,
+                    current_attachments: attachments,
+                    completed_tool_calls: &learning_ctx.tool_calls,
+                    model: &model,
+                    core_prompt: &core_prompt_bytes,
+                    task_context_tail: &task_context_tail,
+                    preserve_archived_context,
+                    prior_assistant_message_id: prior_assistant_message_id.as_deref(),
+                    summary_last_message_id: session_summary
+                        .as_ref()
+                        .filter(|_| preserve_archived_context)
+                        .filter(|summary| summary.last_turn_seq.is_some())
+                        .map(|summary| summary.last_message_id.as_str()),
+                    tool_defs: &tool_defs,
+                    policy_bundle: &policy_bundle,
+                    pending_system_messages: message_build_directives.pending_system_messages,
+                    empty_response_retry_pending: false,
+                    redact_archived_shared_context: user_role != UserRole::Owner
+                        && matches!(
+                            channel_ctx.visibility,
+                            ChannelVisibility::PrivateGroup
+                                | ChannelVisibility::Public
+                                | ChannelVisibility::PublicExternal
+                        ),
+                    status_tx: &status_tx,
+                },
+            )
+            .await?;
+            let offered_tools = offered_tool_defs
                 .iter()
                 .filter_map(|definition| {
                     definition
@@ -1394,7 +1428,7 @@ impl Agent {
                 emitter: emitter.clone(),
                 offered_tools,
                 model: model.clone(),
-                instructions,
+                prefix,
                 contract: turn_context.completion_contract.clone(),
             };
             // Boxed so the SDK turn does not grow this already large state machine.
@@ -1402,7 +1436,6 @@ impl Agent {
                 &engine,
                 setup,
                 session_id,
-                attachments,
                 status_tx,
                 user_role,
                 channel_ctx,
