@@ -4379,7 +4379,7 @@ impl TelegramChannel {
         // so running it inline would deadlock: the callback can't be delivered
         // until the message handler returns, but the message handler is waiting
         // for that callback.
-        if text.starts_with('/') {
+        if super::commands::is_slash_command(&text) {
             // Slash commands `return` before the message dedup gate below, so a
             // duplicate Telegram delivery of the same update (same message id)
             // would execute the command twice — e.g. two "Context cleared."

@@ -11,7 +11,51 @@ use crate::tasks::{TaskRegistry, TaskStatus};
 use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
 use crate::types::UserRole;
 
-/// Single source of truth for command definitions.
+/// Whether a chat message is a slash command: `/name` or `/name@bot`, where
+/// `name` is letters, digits and underscores (Telegram's command syntax).
+/// A message that merely starts with a path (`/tmp/x.py is broken`) is not.
+pub(crate) fn is_slash_command(text: &str) -> bool {
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    let Some(rest) = first.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_once('@').map_or(rest, |(name, _bot)| name);
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod slash_command_tests {
+    use super::is_slash_command;
+
+    #[test]
+    fn commands_are_names_and_paths_are_messages() {
+        for command in [
+            "/help",
+            "/model gpt-5.6-terra",
+            "/clear",
+            "/start@aidaemon_bot",
+            "/set_up now",
+        ] {
+            assert!(is_slash_command(command), "{command}");
+        }
+        for message in [
+            "/tmp/aidaemon-live/prime/prime.py has a bug",
+            "/Users/alice/notes.txt",
+            "/ what",
+            "/",
+            "/123",
+            "hello /help",
+        ] {
+            assert!(!is_slash_command(message), "{message}");
+        }
+    }
+}
+
+/// Single source of truth for command definitions./// Single source of truth for command definitions.
 ///
 /// Each command is defined once here; the registry drives Telegram's
 /// `setMyCommands` API, the `/help` output, and (in the future) Slack/Discord

@@ -556,7 +556,7 @@ impl DiscordChannel {
         };
 
         // Handle slash-style commands (text commands starting with /)
-        if text.starts_with('/') {
+        if super::commands::is_slash_command(&text) {
             self.handle_text_command(ctx, &msg, &text).await;
             return;
         }
