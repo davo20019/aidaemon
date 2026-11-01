@@ -279,7 +279,7 @@ async fn scoped_workspace_arguments(
 
 // impl-Agent justification: tool dispatch with watchdog over tools/state/event_store.
 impl Agent {
-    async fn mandate_goal_id_for_tool_exec(
+    pub(super) async fn mandate_goal_id_for_tool_exec(
         &self,
         ctx: &ToolExecCtx<'_>,
     ) -> anyhow::Result<Option<String>> {
@@ -313,7 +313,7 @@ impl Agent {
         Ok(None)
     }
 
-    async fn semantics_for_exact_tool_call(
+    pub(super) async fn semantics_for_exact_tool_call(
         &self,
         name: &str,
         arguments: &str,

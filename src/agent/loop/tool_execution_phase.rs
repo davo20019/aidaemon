@@ -9,4 +9,6 @@ pub(super) use phase_impl::{
     observation_matches_completion_contract, tool_result_or_metadata_contains_verifiable_evidence,
 };
 pub(super) use phase_impl::{fallback_tool_semantic_scope, run_tool_execution_phase};
+#[cfg(feature = "sdk-engine")]
+pub(super) use phase_impl::{mandate_gate_for_tool_call, MandateGateDecision};
 pub(super) use phase_impl::{PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx};

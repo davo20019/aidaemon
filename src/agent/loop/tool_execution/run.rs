@@ -38,7 +38,7 @@ enum CorrectionGateDecision {
     GiveUpToolResult { report: String },
 }
 
-enum MandateGateDecision {
+pub(in crate::agent) enum MandateGateDecision {
     NotApplicable,
     Allow {
         grant: Option<crate::traits::MandateAuthorityGrant>,
@@ -66,7 +66,7 @@ fn committed_non_action_mandate_outcome(
     (outcome != MandateDecisionOutcome::Act).then_some(outcome)
 }
 
-async fn mandate_gate_for_tool_call(
+pub(in crate::agent) async fn mandate_gate_for_tool_call(
     agent: &Agent,
     goal_id: &str,
     tool_call_id: &str,

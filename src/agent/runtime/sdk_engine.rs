@@ -355,7 +355,7 @@ struct TurnScope<'a> {
 impl Agent {
     async fn dispatch_sdk_tool_call(&self, scope: &TurnScope<'_>, request: ToolRequest) {
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
-        let ctx = ToolExecCtx {
+        let mut ctx = ToolExecCtx {
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
             status_tx: scope.status_tx.clone(),
@@ -373,6 +373,22 @@ impl Agent {
             scope_escalation: None,
         };
         let started = Instant::now();
+        // Mandate runs: the same per-call authority gate as the legacy loop,
+        // which issues the bounded grant or refuses the call.
+        let grant = match self.sdk_mandate_gate(&ctx, &request, &arguments).await {
+            Ok(grant) => grant,
+            Err(refusal) => {
+                info!(
+                    session_id = scope.session_id,
+                    task_id = scope.task_id,
+                    tool = %request.name,
+                    "SDK engine: mandate gate refused the call"
+                );
+                let _ = request.reply.send(Ok(sdk::ToolOutput::error(refusal)));
+                return;
+            }
+        };
+        ctx.mandate_authority = grant.as_ref();
         let result = match self
             .execute_tool_outcome(&request.name, &arguments, &ctx)
             .await
@@ -402,6 +418,43 @@ impl Agent {
             "SDK engine tool call"
         );
         let _ = request.reply.send(result);
+    }
+
+    /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact
+    /// call, or the refusal text the model should see.
+    async fn sdk_mandate_gate(
+        &self,
+        ctx: &ToolExecCtx<'_>,
+        request: &ToolRequest,
+        arguments: &str,
+    ) -> Result<Option<crate::traits::MandateAuthorityGrant>, String> {
+        let goal_id = match self.mandate_goal_id_for_tool_exec(ctx).await {
+            Ok(Some(goal_id)) => goal_id,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
+        };
+        let semantics = self
+            .semantics_for_exact_tool_call(&request.name, arguments)
+            .await;
+        match super::tool_execution_phase::mandate_gate_for_tool_call(
+            self,
+            &goal_id,
+            &request.call_id,
+            &request.name,
+            arguments,
+            &semantics,
+        )
+        .await
+        {
+            Ok(super::tool_execution_phase::MandateGateDecision::NotApplicable) => Ok(None),
+            Ok(super::tool_execution_phase::MandateGateDecision::Allow { grant }) => Ok(grant),
+            Ok(super::tool_execution_phase::MandateGateDecision::Deny { reason }) => Err(format!(
+                "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). \
+                 Record a current ACT, choose a permitted action, WAIT, or ASK the owner.",
+                request.name
+            )),
+            Err(error) => Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
+        }
     }
 
     /// Record a run's tool calls and results as the legacy loop does
