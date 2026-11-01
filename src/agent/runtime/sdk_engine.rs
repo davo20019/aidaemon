@@ -497,7 +497,7 @@ impl Agent {
         // Read prior dialogue before this turn's user message is recorded.
         let history = match self
             .event_store
-            .get_conversation_history(session_id, HISTORY_MESSAGES)
+            .get_conversation_history_since_clear(session_id, HISTORY_MESSAGES)
             .await
         {
             Ok(history) => history,

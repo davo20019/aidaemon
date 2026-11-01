@@ -2238,6 +2238,28 @@ impl EventStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
+        self.conversation_history_after(session_id, limit, None)
+            .await
+    }
+
+    /// Like [`Self::get_conversation_history`], but without anything at or
+    /// before the session's `/clear` boundary.
+    pub async fn get_conversation_history_since_clear(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        let boundary = self.session_context_boundary(session_id).await?;
+        self.conversation_history_after(session_id, limit, boundary)
+            .await
+    }
+
+    async fn conversation_history_after(
+        &self,
+        session_id: &str,
+        limit: usize,
+        after_event_id: Option<i64>,
+    ) -> anyhow::Result<Vec<Message>> {
         let events = self
             .query_events_by_types(
                 session_id,
@@ -2254,6 +2276,9 @@ impl EventStore {
         // Reverse to chronological (query returns newest-first).
         let mut messages = Vec::new();
         for event in events.into_iter().rev() {
+            if after_event_id.is_some_and(|boundary| event.id <= boundary) {
+                continue;
+            }
             if let Some(msg) = crate::events::turn_from_event(
                 event.id,
                 &event.session_id,
@@ -5751,6 +5776,40 @@ mod tests {
             .await
             .expect("second reconcile");
         assert_eq!(reconciled_again, 0);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_since_clear_hides_turns_before_the_boundary() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        for (message_id, content) in [("before", "old question"), ("after", "new question")] {
+            append_event_at(
+                &store,
+                "s-clear",
+                EventType::UserMessage,
+                json!({"message_id": message_id, "content": content}),
+                now,
+            )
+            .await;
+            if message_id == "before" {
+                sqlx::query(
+                    "INSERT INTO session_context_boundaries (session_id, cleared_after_id, cleared_at)
+                     VALUES ('s-clear', (SELECT MAX(id) FROM events WHERE session_id = 's-clear'), '')",
+                )
+                .execute(&store.pool)
+                .await
+                .expect("set boundary");
+            }
+        }
+
+        let full = store.get_conversation_history("s-clear", 10).await.unwrap();
+        assert_eq!(full.len(), 2);
+        let cleared = store
+            .get_conversation_history_since_clear("s-clear", 10)
+            .await
+            .unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].content.as_deref(), Some("new question"));
     }
 
     #[tokio::test]
