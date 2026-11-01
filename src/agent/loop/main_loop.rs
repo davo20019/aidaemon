@@ -1224,32 +1224,7 @@ impl Agent {
 
         // Resolve goal_id once for per-goal token budget enforcement.
         // Executors currently carry only task_id, so we may need to lookup goal_id via task.
-        let resolved_goal_id: Option<String> = if let Some(gid) = self.goal_id.clone() {
-            Some(gid)
-        } else if let Some(ref tid) = self.task_id {
-            match self.state.get_task(tid).await {
-                Ok(Some(task)) => Some(task.goal_id),
-                Ok(None) => {
-                    warn!(
-                        session_id,
-                        task_id = %tid,
-                        "Task not found while resolving goal_id; goal budget enforcement disabled for this run"
-                    );
-                    None
-                }
-                Err(e) => {
-                    warn!(
-                        session_id,
-                        task_id = %tid,
-                        error = %e,
-                        "Failed to resolve goal_id from task; goal budget enforcement disabled for this run"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let resolved_goal_id = self.budget_goal_id(session_id).await;
         let is_scheduled_goal = if let Some(goal_id) = resolved_goal_id.as_deref() {
             goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
         } else {

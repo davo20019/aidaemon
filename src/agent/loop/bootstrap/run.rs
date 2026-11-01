@@ -1144,79 +1144,33 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // Model selection: autonomous primary models interpret the request directly.
     // Lexical policy scoring remains available for guided/local-model support,
     // but must not silently swap a capable primary model based on user wording.
-    let selected_model = {
-        let is_override =
-            match tokio::time::timeout(Duration::from_secs(2), agent.model_override.read()).await {
-                Ok(guard) => *guard,
-                Err(_) => {
-                    warn!(
-                        session_id,
-                        "Timed out acquiring model_override lock while selecting bootstrap model"
-                    );
-                    false
-                }
-            };
-        if !is_override {
-            if autonomous_bootstrap {
-                llm_runtime_snapshot.primary_model()
-            } else if let Some(ref router) = llm_router {
-                let new_model = router
-                    .select_for_profile(policy_bundle.policy.model_profile)
-                    .to_string();
-                let routed_model = new_model;
-                if agent.policy_config.policy_shadow_mode {
-                    info!(
-                        session_id,
-                        task_id = %task_id,
-                        new_profile = ?policy_bundle.policy.model_profile,
-                        new_model = %routed_model,
-                        risk_score = policy_bundle.risk_score,
-                        uncertainty_score = policy_bundle.uncertainty_score,
-                        confidence = policy_bundle.confidence,
-                        "Policy shadow routing snapshot (profile-to-model mapping)"
-                    );
-                }
-                info!(
-                    routed_model = %routed_model,
-                    policy_profile = ?policy_bundle.policy.model_profile,
-                    "Selected model for task"
-                );
-                routed_model
-            } else {
-                // No router: for top-level auto mode, pick the model from the same
-                // runtime snapshot as provider/router to avoid transient reload races.
-                // Sub-agents keep their local model selection behavior.
-                let m = if agent.depth == 0 {
-                    llm_runtime_snapshot.primary_model()
-                } else {
-                    match tokio::time::timeout(Duration::from_secs(2), agent.model.read()).await {
-                        Ok(guard) => guard.clone(),
-                        Err(_) => {
-                            warn!(
-                                session_id,
-                                "Timed out acquiring model lock while selecting bootstrap model"
-                            );
-                            llm_runtime_snapshot.primary_model()
-                        }
-                    }
-                };
-                m
-            }
-        } else {
-            // Model override keeps normal loop behavior.
-            let m = match tokio::time::timeout(Duration::from_secs(2), agent.model.read()).await {
-                Ok(guard) => guard.clone(),
-                Err(_) => {
-                    warn!(
-                        session_id,
-                        "Timed out acquiring model lock while honoring override"
-                    );
-                    llm_runtime_snapshot.primary_model()
-                }
-            };
-            m
+    let (selected_model, routed) = agent
+        .select_turn_model(
+            &llm_runtime_snapshot,
+            llm_router.as_ref(),
+            policy_bundle.policy.model_profile,
+            session_id,
+        )
+        .await;
+    if routed {
+        if agent.policy_config.policy_shadow_mode {
+            info!(
+                session_id,
+                task_id = %task_id,
+                new_profile = ?policy_bundle.policy.model_profile,
+                new_model = %selected_model,
+                risk_score = policy_bundle.risk_score,
+                uncertainty_score = policy_bundle.uncertainty_score,
+                confidence = policy_bundle.confidence,
+                "Policy shadow routing snapshot (profile-to-model mapping)"
+            );
         }
-    };
+        info!(
+            routed_model = %selected_model,
+            policy_profile = ?policy_bundle.policy.model_profile,
+            "Selected model for task"
+        );
+    }
     let mut model = selected_model.clone();
     let route_failsafe_active = route_failsafe_active_for_session(session_id);
     if route_failsafe_active && !autonomous_bootstrap {

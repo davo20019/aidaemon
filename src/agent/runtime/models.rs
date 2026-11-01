@@ -44,6 +44,60 @@ impl Agent {
         }
     }
 
+    /// The model a new turn runs on: the `/model` override when set,
+    /// otherwise the runtime's primary model for autonomous primaries, the
+    /// router's choice for `profile`, or (without a router) the primary model
+    /// for the root agent and the agent's own model for sub-agents.
+    ///
+    /// `routed` is true when the router chose it.
+    pub(in crate::agent) async fn select_turn_model(
+        &self,
+        snapshot: &crate::llm_runtime::LlmRuntimeSnapshot,
+        router: Option<&crate::router::Router>,
+        profile: crate::execution_policy::ModelProfile,
+        session_id: &str,
+    ) -> (String, bool) {
+        let is_override =
+            match tokio::time::timeout(Duration::from_secs(2), self.model_override.read()).await {
+                Ok(guard) => *guard,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring model_override lock while selecting bootstrap model"
+                    );
+                    false
+                }
+            };
+        let own_model = || async {
+            match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring model lock while selecting a model"
+                    );
+                    snapshot.primary_model()
+                }
+            }
+        };
+        if is_override {
+            return (own_model().await, false);
+        }
+        let autonomous = self.trust_tier_for_model(&snapshot.primary_model())
+            == crate::agent::trust_tier::ModelTrustTier::Autonomous;
+        if autonomous {
+            return (snapshot.primary_model(), false);
+        }
+        if let Some(router) = router {
+            return (router.select_for_profile(profile).to_string(), true);
+        }
+        if self.depth == 0 {
+            (snapshot.primary_model(), false)
+        } else {
+            (own_model().await, false)
+        }
+    }
+
     /// Re-enable auto-routing after a manual model override.
     pub async fn clear_model_override(&self) {
         match tokio::time::timeout(Duration::from_secs(2), self.model_override.write()).await {

@@ -511,6 +511,39 @@ pub(crate) fn build_goal_task_results_summary(
     summary
 }
 
+impl Agent {
+    /// The goal whose token budget this agent's turns charge: its own goal,
+    /// or the goal of the task it executes.
+    pub(in crate::agent) async fn budget_goal_id(&self, session_id: &str) -> Option<String> {
+        if let Some(gid) = self.goal_id.clone() {
+            Some(gid)
+        } else if let Some(ref tid) = self.task_id {
+            match self.state.get_task(tid).await {
+                Ok(Some(task)) => Some(task.goal_id),
+                Ok(None) => {
+                    tracing::warn!(
+                        session_id,
+                        task_id = %tid,
+                        "Task not found while resolving goal_id; goal budget enforcement disabled for this run"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        task_id = %tid,
+                        error = %e,
+                        "Failed to resolve goal_id from task; goal budget enforcement disabled for this run"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod summary_tests {
     use super::*;

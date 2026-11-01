@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
 use super::sdk_provider::{
-    from_provider_response, to_chat_options, to_daemon_messages, to_daemon_tools, DaemonProvider,
+    fit_messages, from_provider_response, to_chat_options, to_daemon_tools, DaemonProvider,
     ModelCall,
 };
 use super::tool_exec::ToolExecCtx;
@@ -58,7 +58,7 @@ use crate::types::{ChannelContext, StatusUpdate, UserRole};
 const DEFAULT_MAX_TURNS: u32 = 40;
 /// Prior dialogue messages (including tool calls and results) replayed into
 /// each run.
-const HISTORY_MESSAGES: usize = 60;
+const HISTORY_MESSAGES: usize = 200;
 /// Replayed tool results are cut to this many characters: enough to show what
 /// an earlier call returned without re-sending large outputs every turn.
 const REPLAYED_TOOL_RESULT_CHARS: usize = 2_000;
@@ -66,6 +66,7 @@ const REPLAYED_TOOL_RESULT_CHARS: usize = 2_000;
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
+const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
 
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
@@ -395,10 +396,42 @@ fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
     }
 }
 
+/// The goal whose token budget this turn charges.
+struct BudgetGoal {
+    goal_id: String,
+    /// Scheduled runs charge their per-run budget instead of the daily one.
+    scheduled: bool,
+}
+
+/// Whether a goal's token budget is used up. A scheduled run's per-run
+/// budget (when the run registered one) replaces the daily budget; a budget
+/// of zero or less means no limit.
+fn goal_budget_exhausted(
+    daily: Option<&crate::traits::GoalTokenBudgetStatus>,
+    run: Option<&crate::goal_tokens::GoalRunBudgetStatus>,
+) -> bool {
+    if let Some(run) = run {
+        return run.effective_budget_per_check > 0
+            && run.tokens_used >= run.effective_budget_per_check;
+    }
+    daily.is_some_and(|daily| {
+        daily
+            .budget_daily
+            .is_some_and(|budget| budget > 0 && daily.tokens_used_today >= budget)
+    })
+}
+
 /// Everything a dispatched call needs from the turn.
 struct TurnScope<'a> {
     session_id: &'a str,
     task_id: &'a str,
+    emitter: &'a EventEmitter,
+    /// Replayed dialogue messages before this turn's user message.
+    history_len: usize,
+    budget_goal: Option<BudgetGoal>,
+    /// Set once the goal budget is used up; later model calls are refused.
+    budget_exhausted: AtomicBool,
+    model_calls: AtomicU64,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
@@ -516,16 +549,38 @@ impl Agent {
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply, exactly as for a legacy-loop call.
     async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
+        let reply = self.sdk_model_call(scope, &call.request).await;
+        let _ = call.reply.send(reply);
+    }
+
+    async fn sdk_model_call(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &sdk::ModelRequest,
+    ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
+        if scope.budget_exhausted.load(Ordering::Relaxed) {
+            return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
+        }
+        let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime.snapshot();
-        let messages = to_daemon_messages(&call.request);
-        let tools = to_daemon_tools(&call.request.tools);
-        let options = to_chat_options(&call.request.tool_choice, call.request.max_output_tokens);
+        let tools = to_daemon_tools(&request.tools);
+        let budget = crate::memory::context_window::compute_available_budget_precomputed(
+            &request.model,
+            0,
+            &tools,
+            &self.context_window_config,
+        );
+        let messages = fit_messages(&request.messages, scope.history_len, budget);
+        let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        let est_input_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = super::llm::LlmCallTelemetry::default();
+        let started = Instant::now();
         let result = self
             .call_llm_with_recovery(
                 snapshot.provider(),
                 snapshot.router(),
-                &call.request.model,
+                &request.model,
                 &messages,
                 &tools,
                 &options,
@@ -533,20 +588,145 @@ impl Agent {
                 None,
             )
             .await;
-        let reply = match result {
-            Ok(response) => Ok(from_provider_response(response)),
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let response = match result {
+            Ok(response) => response,
             Err(error) => {
                 warn!(
                     session_id = scope.session_id,
                     task_id = scope.task_id,
-                    model = %call.request.model,
+                    model = %request.model,
                     %error,
                     "SDK engine: model call failed after recovery"
                 );
-                Err(sdk::ProviderError::Other(error.to_string()))
+                return Err(sdk::ProviderError::Other(error.to_string()));
             }
         };
-        let _ = call.reply.send(reply);
+        let usage = response.usage.clone();
+        let (input_tokens, output_tokens) = usage
+            .as_ref()
+            .map(|usage| (usage.input_tokens, usage.output_tokens))
+            .unwrap_or_default();
+        crate::events::record_model_call_telemetry(
+            scope.emitter,
+            self.state.as_ref(),
+            crate::events::ModelCallTelemetryInput {
+                session_id: scope.session_id.to_string(),
+                task_id: scope.task_id.to_string(),
+                call_purpose: None,
+                iteration: Some(iteration as u32),
+                llm_call: crate::events::LlmCallData {
+                    call_id: None,
+                    call_purpose: None,
+                    task_id: scope.task_id.to_string(),
+                    iteration: Some(iteration as u32),
+                    model: request.model.clone(),
+                    final_model: Some(telemetry.final_model.clone()),
+                    fell_back: telemetry.fell_back,
+                    attempts: telemetry.attempts,
+                    latency_ms,
+                    prompt_ms: usage.as_ref().and_then(|usage| usage.prompt_ms),
+                    decode_ms: usage.as_ref().and_then(|usage| usage.decode_ms),
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens: usage.as_ref().and_then(|u| u.cached_input_tokens),
+                    cache_creation_input_tokens: usage
+                        .as_ref()
+                        .and_then(|u| u.cache_creation_input_tokens),
+                    fresh_input_tokens: usage.as_ref().and_then(|u| u.fresh_input_tokens()),
+                    est_input_tokens: Some(est_input_tokens as u32),
+                    tool_calls_count: response.tool_calls.len() as u32,
+                    build_ms: None,
+                    prefix_hash_system: None,
+                    prefix_hash_pre_boundary: None,
+                    tool_defs_hash: None,
+                    offered_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+                    chosen_tools: response
+                        .tool_calls
+                        .iter()
+                        .map(|tc| tc.name.clone())
+                        .collect(),
+                    session_summary_hash: None,
+                    tail_hash: None,
+                    prefix_hash_archived: None,
+                    boundary_pos: None,
+                    message_count: Some(messages.len()),
+                    projected_source_message_ids: Vec::new(),
+                    projected_source_turn_ids: Vec::new(),
+                    force_text: false,
+                    token_usage_present: usage.is_some(),
+                    token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
+                    failed: false,
+                    error: None,
+                    provider_error_kind: None,
+                    provider_status: None,
+                },
+                token_usage: usage.clone(),
+            },
+        )
+        .await;
+        if let (Some(goal), Some(usage)) = (&scope.budget_goal, usage.as_ref()) {
+            if self.charge_goal_budget(scope, goal, usage).await && !response.tool_calls.is_empty()
+            {
+                return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
+            }
+        }
+        Ok(from_provider_response(response))
+    }
+
+    /// Charge a model call to the turn's goal. Returns true when this call
+    /// used up the budget; the owner is alerted once. A final answer still
+    /// goes out (as the legacy closeout grace allows); further work does not.
+    async fn charge_goal_budget(
+        &self,
+        scope: &TurnScope<'_>,
+        goal: &BudgetGoal,
+        usage: &crate::traits::TokenUsage,
+    ) -> bool {
+        let delta = usage.budget_tokens() as i64;
+        let daily = match self
+            .state
+            .add_goal_tokens_and_get_budget_status(&goal.goal_id, delta)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                warn!(goal_id = %goal.goal_id, %error, "SDK engine: goal token accounting failed");
+                None
+            }
+        };
+        let run = if goal.scheduled {
+            match &self.goal_token_registry {
+                Some(registry) => registry.add_run_tokens(&goal.goal_id, delta).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let daily = if goal.scheduled { None } else { daily.as_ref() };
+        if !goal_budget_exhausted(daily, run.as_ref()) {
+            return false;
+        }
+        if !scope.budget_exhausted.swap(true, Ordering::Relaxed) {
+            warn!(
+                session_id = scope.session_id,
+                goal_id = %goal.goal_id,
+                "SDK engine: goal token budget exhausted"
+            );
+            let message = format!(
+                "Token alert: goal '{}' used up its token budget. The run stopped safely before \
+                 completion.",
+                goal.goal_id
+            );
+            self.fanout_token_alert(
+                Some(goal.goal_id.as_str()),
+                scope.session_id,
+                &message,
+                Some(scope.session_id),
+            )
+            .await;
+        }
+        true
     }
 
     /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact
@@ -678,7 +858,17 @@ impl Agent {
         let started = Instant::now();
         let model = match &engine.model_override {
             Some(model) => model.clone(),
-            None => self.model.read().await.clone(),
+            None => {
+                let snapshot = self.llm_runtime.snapshot();
+                self.select_turn_model(
+                    &snapshot,
+                    snapshot.router().as_ref(),
+                    crate::execution_policy::ModelProfile::Balanced,
+                    session_id,
+                )
+                .await
+                .0
+            }
         };
         anyhow::ensure!(
             self.mandate_execution.is_none() || attachments.is_empty(),
@@ -862,6 +1052,18 @@ impl Agent {
         state.messages = messages;
 
         // Drive the run and the tool dispatcher together on this task.
+        let budget_goal = match self.budget_goal_id(session_id).await {
+            Some(goal_id) => Some(BudgetGoal {
+                scheduled: crate::agent::goal_dispatch::goal_has_scheduled_provenance(
+                    &self.state,
+                    &goal_id,
+                    self.task_id.as_deref(),
+                )
+                .await,
+                goal_id,
+            }),
+            None => None,
+        };
         let scope = TurnScope {
             session_id,
             task_id: &task_id,
@@ -871,6 +1073,11 @@ impl Agent {
             model: &model,
             tool_attachments: Mutex::new(HashMap::new()),
             background_handoff: AtomicBool::new(false),
+            emitter: &emitter,
+            history_len: replayed,
+            budget_goal,
+            budget_exhausted: AtomicBool::new(false),
+            model_calls: AtomicU64::new(0),
         };
         let run = sdk_agent.run_from(state, sdk::CancellationToken::new());
         tokio::pin!(run);
@@ -1213,6 +1420,118 @@ mod tests {
         assert_eq!(results, 1);
         let facts = harness.state.get_facts(None).await.unwrap();
         assert!(facts.iter().any(|fact| fact.value.contains("teal")));
+    }
+
+    async fn models_harness() -> crate::testing::TestHarness {
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::text_response("one"),
+            MockProvider::text_response("two"),
+        ]);
+        let mut harness =
+            crate::testing::setup_test_agent_with_models(provider, "primary-model", "smart-model")
+                .await
+                .unwrap();
+        harness
+            .agent
+            .set_sdk_engine(Some(SdkEngineSettings::default()));
+        harness
+    }
+
+    async fn recorded_models(harness: &crate::testing::TestHarness) -> Vec<String> {
+        harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .map(|call| call.model.clone())
+            .collect()
+    }
+
+    /// `/model` pins the model; clearing it hands selection back to the
+    /// daemon's routing, as in the legacy loop.
+    #[tokio::test]
+    async fn sdk_engine_follows_daemon_model_selection() {
+        use crate::runtime_ports::AgentIngress;
+        let harness = models_harness().await;
+        harness.agent.set_model("pinned-model".to_string()).await;
+        harness
+            .agent
+            .handle_inbound_message(owner_request("hello"))
+            .await
+            .unwrap();
+        harness.agent.clear_model_override().await;
+        harness
+            .agent
+            .handle_inbound_message(owner_request("hello again"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_models(&harness).await,
+            ["pinned-model", "primary-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_records_llm_call_telemetry() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"tea","value":"green"}"#,
+            ),
+            MockProvider::text_response("Saved."),
+        ]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Remember I like green tea."))
+            .await
+            .unwrap();
+        let calls = harness
+            .agent
+            .event_store
+            .task_event_count(
+                "telegram:synthetic-user-1",
+                &reply.task_id,
+                EventType::LlmCall,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn goal_budget_exhaustion_uses_daily_and_run_budgets() {
+        use crate::traits::GoalTokenBudgetStatus;
+        let daily = |used, budget| GoalTokenBudgetStatus {
+            budget_per_check: None,
+            budget_daily: budget,
+            tokens_used_today: used,
+        };
+        let run = |used, budget| crate::goal_tokens::GoalRunBudgetStatus {
+            effective_budget_per_check: budget,
+            tokens_used: used,
+            budget_extensions_count: 0,
+            health: Default::default(),
+        };
+        assert!(!goal_budget_exhausted(Some(&daily(10, Some(100))), None));
+        assert!(goal_budget_exhausted(Some(&daily(100, Some(100))), None));
+        assert!(!goal_budget_exhausted(Some(&daily(10_000, None)), None));
+        assert!(goal_budget_exhausted(
+            Some(&daily(10, Some(100))),
+            Some(&run(50, 50))
+        ));
+        // A scheduled run's per-run budget replaces the daily one.
+        assert!(!goal_budget_exhausted(
+            Some(&daily(1_000, Some(100))),
+            Some(&run(10, 50))
+        ));
+        assert!(!goal_budget_exhausted(None, Some(&run(10, 0))));
     }
 
     #[test]
