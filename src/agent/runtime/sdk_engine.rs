@@ -1133,7 +1133,13 @@ impl Agent {
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
         };
-        let run = sdk_agent.run_from(state, sdk::CancellationToken::new());
+        // A parent or goal cancellation stops the run at its next check.
+        let cancel = self
+            .cancel_token
+            .as_ref()
+            .map(|token| token.child_token())
+            .unwrap_or_default();
+        let run = sdk_agent.run_from(state, cancel);
         tokio::pin!(run);
         let mut in_flight = FuturesUnordered::new();
         let mut tick = tokio::time::interval(HEARTBEAT_TICK);
@@ -1677,6 +1683,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(aggregate.open_executor_expectations(), 2);
+    }
+
+    /// Review focus: a cancelled parent or goal stops the SDK run before
+    /// its next model call.
+    #[tokio::test]
+    async fn sdk_engine_stops_when_cancelled() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![MockProvider::text_response("late")]);
+        let mut harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        harness.agent.cancel_token = Some(token.clone());
+        token.cancel();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("hello"))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "Cancelled.");
+        assert_eq!(harness.provider.call_count().await, 0);
+        let end = task_events(&harness, &reply.task_id)
+            .await
+            .iter()
+            .find(|event| event.event_type == EventType::TaskEnd)
+            .unwrap()
+            .parse_data::<TaskEndData>()
+            .unwrap();
+        assert_eq!(end.status, TaskStatus::Cancelled);
     }
 
     #[test]
