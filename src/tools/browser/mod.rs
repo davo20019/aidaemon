@@ -499,6 +499,42 @@ fn validate_pdf_filename(filename: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters of page text returned with `navigate` / `new_tab`.
+const NAVIGATION_PREVIEW_CHARS: usize = 1500;
+
+/// A short, secret-redacted text preview of the page just opened, so one
+/// call shows what loaded (a model otherwise spends a `get_text` or a
+/// screenshot, which is also posted to the chat, just to look). Best effort:
+/// a failed read yields no preview, never a failed navigation.
+async fn page_text_preview(page: &dyn PageHandle) -> String {
+    let Ok(text) = page.body_text().await else {
+        return String::new();
+    };
+    format_page_preview(&text)
+}
+
+fn format_page_preview(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let total = collapsed.chars().count();
+    let shown: String = collapsed.chars().take(NAVIGATION_PREVIEW_CHARS).collect();
+    let more = if total > NAVIGATION_PREVIEW_CHARS {
+        format!(
+            "\n[Preview: first {NAVIGATION_PREVIEW_CHARS} of {total} characters. Use get_text \
+             (optionally with a selector) for the rest.]"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "\n\nPage text:\n{}{}",
+        crate::tools::sanitize::redact_secrets(&shown),
+        more
+    )
+}
+
 impl BrowserTool {
     /// Construct the browser tool, resolving and validating the session
     /// isolation mode up front.
@@ -956,7 +992,8 @@ impl BrowserTool {
                 .await;
         }
 
-        Ok(format!("Navigated to {}", url))
+        let preview = page_text_preview(page.as_ref()).await;
+        Ok(format!("Navigated to {}{}", url, preview))
     }
 
     async fn action_screenshot(
@@ -1981,6 +2018,11 @@ impl BrowserTool {
             }
         }
 
+        let preview = if url.is_some() {
+            page_text_preview(page.as_ref()).await
+        } else {
+            String::new()
+        };
         let tab_id = self
             .sessions
             .add_tab(
@@ -1996,7 +2038,7 @@ impl BrowserTool {
             .ok_or_else(|| "failed to register new tab for this session".to_string())?;
 
         match url {
-            Some(url) => Ok(format!("Opened new tab {} at {}", tab_id, url)),
+            Some(url) => Ok(format!("Opened new tab {} at {}{}", tab_id, url, preview)),
             None => Ok(format!("Opened new tab {} (active)", tab_id)),
         }
     }

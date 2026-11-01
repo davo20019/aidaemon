@@ -71,7 +71,10 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     let args =
         json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" });
     let out = tool.call(&args.to_string()).await.unwrap();
-    assert_eq!(out, "Navigated to https://example.com/");
+    assert_eq!(
+        out,
+        "Navigated to https://example.com/\n\nPage text:\nmock text"
+    );
 
     // Lock down the call ordering: ensure_ready, then create_page (this session's
     // first action), then goto, then a bounded navigation-readiness wait (Task 13
@@ -80,7 +83,7 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     // assert the create_page record exists and goto follows it.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 5, "expected 5 recorded calls: {calls:?}");
+    assert_eq!(calls.len(), 6, "expected 6 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -100,6 +103,23 @@ async fn dispatch_observation_navigate_routes_through_backend() {
         calls[4],
         MockCall::Url,
         "navigate must read the committed url to revalidate it: {calls:?}"
+    );
+    assert_eq!(
+        calls[5],
+        MockCall::BodyText,
+        "navigate returns a text preview of the page it opened: {calls:?}"
+    );
+}
+
+#[test]
+fn navigation_preview_is_bounded_and_collapsed() {
+    assert_eq!(super::format_page_preview("  \n "), "");
+    let long = "word ".repeat(1000);
+    let preview = super::format_page_preview(&long);
+    assert!(preview.starts_with("\n\nPage text:\nword word"));
+    assert!(
+        preview.contains("first 1500 of 4999 characters"),
+        "{preview}"
     );
 }
 
@@ -1813,7 +1833,10 @@ async fn public_navigation_skips_approval_and_reaches_backend() {
         .await
         .unwrap();
 
-    assert_eq!(out, "Navigated to https://example.com/");
+    assert_eq!(
+        out,
+        "Navigated to https://example.com/\n\nPage text:\nmock text"
+    );
     assert!(
         calls_contains(
             &backend,
@@ -1848,7 +1871,10 @@ async fn trusted_scheduled_navigation_skips_prompt() {
         .await
         .unwrap();
 
-    assert_eq!(out, "Navigated to https://www.nist.gov/research");
+    assert_eq!(
+        out,
+        "Navigated to https://www.nist.gov/research\n\nPage text:\nmock text"
+    );
     assert_eq!(
         recorder.count().await,
         0,
@@ -4179,7 +4205,10 @@ async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
     let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
     let out = tool.call(&args.to_string()).await.unwrap();
-    assert_eq!(out, "Navigated to https://example.com/");
+    assert_eq!(
+        out,
+        "Navigated to https://example.com/\n\nPage text:\nmock text"
+    );
     let calls = backend.calls();
     let calls = calls.lock().await;
     // Goto, then a navigation-readiness probe, then the committed-URL revalidation.
@@ -4210,7 +4239,10 @@ async fn navigate_bounds_when_navigation_never_settles() {
     let (tool, backend) = wait_tool(MockBackend::new().with_nav_never_settles());
     let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
     let out = tool.call(&args.to_string()).await.unwrap();
-    assert_eq!(out, "Navigated to https://example.com/");
+    assert_eq!(
+        out,
+        "Navigated to https://example.com/\n\nPage text:\nmock text"
+    );
     assert!(
         calls_contains(&backend, &MockCall::WaitForNavigation).await,
         "navigate must still record the bounded navigation wait"
