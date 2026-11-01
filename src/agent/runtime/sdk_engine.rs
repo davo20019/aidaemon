@@ -705,6 +705,8 @@ impl TurnScope<'_> {
 /// Everything a dispatched call needs from the turn.
 struct TurnScope<'a> {
     session_id: &'a str,
+    /// The user's message for this turn.
+    user_text: &'a str,
     task_id: &'a str,
     emitter: &'a EventEmitter,
     /// The projected starting transcript, sent byte-for-byte on every call.
@@ -1048,14 +1050,19 @@ impl Agent {
                     let directive = if scope.continue_inline_after_background {
                         super::system_directives::SystemDirective::BackgroundProcessContinue
                     } else {
-                        scope.end_with(
+                        // With notifications on, the result follows by
+                        // itself: a plain handoff, no pid or tool jargon.
+                        // Without them, the ack says how to check on it.
+                        let reply = if outcome.metadata.completion_notifications_enabled {
+                            super::post_task::build_friendly_background_handoff(scope.user_text)
+                        } else {
                             super::tool_execution_phase::build_background_detach_ack(
                                 &request.name,
                                 &output,
                                 &outcome.metadata,
-                            ),
-                            TaskOutcome::Partial,
-                        );
+                            )
+                        };
+                        scope.end_with(reply, TaskOutcome::Partial);
                         super::system_directives::SystemDirective::BackgroundHandoff {
                             notifications_active: outcome.metadata.completion_notifications_enabled,
                         }
@@ -2564,6 +2571,7 @@ impl Agent {
         let budget_goal_for_daily = budget_goal.as_ref().map(|goal| goal.goal_id.clone());
         let scope = TurnScope {
             session_id,
+            user_text,
             task_id: &task_id,
             status_tx: status_tx.clone(),
             channel_ctx: &channel_ctx,
