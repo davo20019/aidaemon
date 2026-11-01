@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use common::{channel, MockHttp, BOT_ID, CHANNEL_ID, GUILD_ID};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{watch, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 const DM_CHANNEL: &str = "100000000000000400";
@@ -23,31 +24,93 @@ fn alice() -> Value {
     json!({"id": "100000000000000001", "username": "alice", "global_name": "Alice Rivera"})
 }
 
+/// Frames waiting for the adapter, delivered so that none can be lost when
+/// it reconnects. A new connection takes over at once (the previous one
+/// stops, even if the mock has not yet noticed that client went away), and
+/// a frame stays owned by the connection that sent it until the client
+/// confirms it; frames a connection never had confirmed go back to the front
+/// of the queue when it ends. Without this, a connection whose client had
+/// already disconnected could take a frame, "send" it into a dead socket and
+/// drop it, a race that only showed up on some platforms.
+struct Inbox<T> {
+    queue: std::sync::Mutex<VecDeque<T>>,
+    notify: Notify,
+    generation: watch::Sender<u64>,
+}
+
+impl<T> Inbox<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            generation: watch::channel(0).0,
+        })
+    }
+
+    fn push(&self, frame: T) {
+        self.queue.lock().unwrap().push_back(frame);
+        self.notify.notify_waiters();
+    }
+
+    /// Put unconfirmed frames back, ahead of newer ones, in their order.
+    fn requeue(&self, frames: Vec<T>) {
+        let mut queue = self.queue.lock().unwrap();
+        for frame in frames.into_iter().rev() {
+            queue.push_front(frame);
+        }
+        drop(queue);
+        self.notify.notify_waiters();
+    }
+
+    /// Make the calling connection the only one taking frames. The returned
+    /// receiver changes when a newer connection takes over.
+    fn take_over(&self) -> watch::Receiver<u64> {
+        self.generation.send_modify(|g| *g += 1);
+        self.generation.subscribe()
+    }
+
+    async fn pop(&self) -> T {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(frame) = self.queue.lock().unwrap().pop_front() {
+                return frame;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Gateway endpoint: Hello, then READY for Identify or RESUMED for Resume,
 /// then injected `(event name, data)` dispatches with increasing sequence
-/// numbers. Heartbeats are acknowledged. One connection at a time.
+/// numbers, sent to the newest connection. Heartbeats are acknowledged; the
+/// sequence number a heartbeat carries confirms every dispatch up to it.
 struct InjectGateway {
     url: String,
-    tx: mpsc::UnboundedSender<(String, Value)>,
+    inbox: Arc<Inbox<(String, Value)>>,
 }
 
 impl InjectGateway {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
-        let (tx, rx) = mpsc::unbounded_channel::<(String, Value)>();
-        let queue = Arc::new(Mutex::new(rx));
+        let inbox: Arc<Inbox<(String, Value)>> = Inbox::new();
+        let shared = inbox.clone();
         let seq = Arc::new(AtomicU64::new(1));
         let resume_url = url.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (queue, seq, resume_url) = (queue.clone(), seq.clone(), resume_url.clone());
+                let (inbox, seq, resume_url) = (shared.clone(), seq.clone(), resume_url.clone());
                 tokio::spawn(async move {
                     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
                     let (mut out, mut inbound) = ws.split();
-                    let mut queue = queue.lock().await;
+                    let mut superseded = inbox.take_over();
+                    // Dispatches sent on this connection and not yet
+                    // confirmed by a heartbeat, with their sequence numbers.
+                    let mut unconfirmed: Vec<(u64, (String, Value))> = Vec::new();
                     let send = |v: Value| Message::Text(v.to_string());
                     let hello = json!({"op": 10, "d": {"heartbeat_interval": 45_000}});
                     if out.send(send(hello)).await.is_err() {
@@ -56,16 +119,22 @@ impl InjectGateway {
                     loop {
                         tokio::select! {
                             biased;
+                            _ = superseded.changed() => break,
                             msg = inbound.next() => {
                                 let text = match msg {
                                     Some(Ok(Message::Text(t))) => t,
-                                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                                     Some(Ok(_)) => continue,
                                 };
                                 let frame: Value = serde_json::from_str(&text).unwrap_or_default();
                                 let s = seq.fetch_add(1, Ordering::SeqCst);
                                 let reply = match frame["op"].as_u64() {
-                                    Some(1) => json!({"op": 11}),
+                                    Some(1) => {
+                                        if let Some(last) = frame["d"].as_u64() {
+                                            unconfirmed.retain(|(sent, _)| *sent > last);
+                                        }
+                                        json!({"op": 11})
+                                    }
                                     Some(2) => json!({"op": 0, "s": s, "t": "READY", "d": {
                                         "v": 10,
                                         "user": {"id": BOT_ID, "username": "aidaemon", "bot": true},
@@ -77,23 +146,27 @@ impl InjectGateway {
                                     _ => continue,
                                 };
                                 if out.send(send(reply)).await.is_err() {
-                                    return;
+                                    break;
                                 }
                             }
-                            item = queue.recv() => {
-                                let Some((t, d)) = item else { return };
+                            item = inbox.pop() => {
                                 let s = seq.fetch_add(1, Ordering::SeqCst);
-                                let frame = json!({"op": 0, "s": s, "t": t, "d": d});
+                                let frame = json!({"op": 0, "s": s, "t": item.0, "d": item.1});
+                                unconfirmed.push((s, item));
                                 if out.send(send(frame)).await.is_err() {
-                                    return;
+                                    break;
                                 }
                             }
                         }
                     }
+                    // Unconfirmed dispatches go to the next connection. The
+                    // adapter may see one twice; the kit matches probes by
+                    // their unique text, so a duplicate is harmless.
+                    inbox.requeue(unconfirmed.into_iter().map(|(_, item)| item).collect());
                 });
             }
         });
-        Self { url, tx }
+        Self { url, inbox }
     }
 }
 
@@ -112,7 +185,7 @@ impl DiscordHarness {
     }
 
     fn dispatch(&self, t: &str, d: Value) {
-        self.gateway.tx.send((t.to_string(), d)).unwrap();
+        self.gateway.inbox.push((t.to_string(), d));
     }
 }
 

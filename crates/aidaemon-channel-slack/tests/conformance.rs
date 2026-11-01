@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,60 +16,127 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use support::{MockApi, Response, APP_TOKEN, BOT_TOKEN, BOT_USER};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{watch, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 const DM: &str = "D000SYNTH";
 const GROUP: &str = "C000SYNTH";
 const ALICE: &str = "U000ALICE";
 
+/// Frames waiting for the adapter, delivered so that none can be lost when
+/// it reconnects. A new connection takes over at once (the previous one
+/// stops, even if the mock has not yet noticed that client went away), and
+/// a frame stays owned by the connection that sent it until the client
+/// confirms it; frames a connection never had confirmed go back to the front
+/// of the queue when it ends. Without this, a connection whose client had
+/// already disconnected could take a frame, "send" it into a dead socket and
+/// drop it, a race that only showed up on some platforms.
+struct Inbox<T> {
+    queue: std::sync::Mutex<VecDeque<T>>,
+    notify: Notify,
+    generation: watch::Sender<u64>,
+}
+
+impl<T> Inbox<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            generation: watch::channel(0).0,
+        })
+    }
+
+    fn push(&self, frame: T) {
+        self.queue.lock().unwrap().push_back(frame);
+        self.notify.notify_waiters();
+    }
+
+    /// Put unconfirmed frames back, ahead of newer ones, in their order.
+    fn requeue(&self, frames: Vec<T>) {
+        let mut queue = self.queue.lock().unwrap();
+        for frame in frames.into_iter().rev() {
+            queue.push_front(frame);
+        }
+        drop(queue);
+        self.notify.notify_waiters();
+    }
+
+    /// Make the calling connection the only one taking frames. The returned
+    /// receiver changes when a newer connection takes over.
+    fn take_over(&self) -> watch::Receiver<u64> {
+        self.generation.send_modify(|g| *g += 1);
+        self.generation.subscribe()
+    }
+
+    async fn pop(&self) -> T {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(frame) = self.queue.lock().unwrap().pop_front() {
+                return frame;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// A Socket Mode endpoint that sends `hello`, then forwards injected
-/// envelopes to whichever client is connected (one at a time).
+/// envelopes to the newest connected client. Envelopes are confirmed by the
+/// adapter's `{"envelope_id": ...}` acks.
 struct InjectSocket {
     url: String,
-    tx: mpsc::UnboundedSender<Value>,
+    inbox: Arc<Inbox<Value>>,
 }
 
 impl InjectSocket {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/socket", listener.local_addr().unwrap());
-        let (tx, rx) = mpsc::unbounded_channel::<Value>();
-        let queue = Arc::new(Mutex::new(rx));
+        let inbox: Arc<Inbox<Value>> = Inbox::new();
+        let shared = inbox.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let queue = queue.clone();
+                let inbox = shared.clone();
                 tokio::spawn(async move {
                     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
                     let (mut out, mut inbound) = ws.split();
-                    // One connection drains the queue at a time.
-                    let mut queue = queue.lock().await;
+                    let mut superseded = inbox.take_over();
+                    let mut unacked: Vec<Value> = Vec::new();
                     let hello = json!({ "type": "hello", "num_connections": 1 });
                     if out.send(Message::Text(hello.to_string())).await.is_err() {
                         return;
                     }
                     loop {
                         tokio::select! {
-                            // Notice a closing client before handing it a frame.
                             biased;
+                            _ = superseded.changed() => break,
                             msg = inbound.next() => match msg {
-                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                                Some(Ok(_)) => {} // acks
+                                Some(Ok(Message::Text(text))) => {
+                                    let ack: Value = serde_json::from_str(&text).unwrap_or_default();
+                                    if let Some(id) = ack["envelope_id"].as_str() {
+                                        unacked.retain(|frame| frame["envelope_id"] != id);
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                                Some(Ok(_)) => {}
                             },
-                            frame = queue.recv() => {
-                                let Some(frame) = frame else { return };
-                                if out.send(Message::Text(frame.to_string())).await.is_err() {
-                                    return;
+                            frame = inbox.pop() => {
+                                let text = frame.to_string();
+                                unacked.push(frame);
+                                if out.send(Message::Text(text)).await.is_err() {
+                                    break;
                                 }
                             }
                         }
                     }
+                    inbox.requeue(unacked);
                 });
             }
         });
-        Self { url, tx }
+        Self { url, inbox }
     }
 }
 
@@ -109,7 +177,7 @@ impl SlackHarness {
             "accepts_response_payload": false,
             "payload": { "team_id": "T000SYNTH", "type": "event_callback", "event": event }
         });
-        self.socket.tx.send(envelope).unwrap();
+        self.socket.inbox.push(envelope);
     }
 }
 
@@ -162,9 +230,7 @@ impl ChannelHarness for SlackHarness {
             .find(|el| el["text"]["text"] == json!(label))
             .expect("the prompt's button was posted");
         let n = self.next();
-        self.socket
-            .tx
-            .send(json!({
+        self.socket.inbox.push(json!({
                 "envelope_id": format!("env-{n}"),
                 "type": "interactive",
                 "payload": {
@@ -174,8 +240,7 @@ impl ChannelHarness for SlackHarness {
                     "message": { "ts": "1700000001.000000" },
                     "actions": [{ "action_id": button["action_id"], "value": button["value"] }]
                 }
-            }))
-            .unwrap();
+        }));
     }
 
     async fn sent_messages(&self) -> Vec<String> {
