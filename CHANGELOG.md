@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
+- **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
+- **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
+
+### Fixed
+
+- **Read-only requests can use the terminal again.** The authority check judged `terminal` as a whole (not read-only) and refused even a plain `find`; it now judges each call, and the terminal still enforces read-only itself.
+- **Recall of earlier work works with models that fill every field.** Optional tool arguments left as `""` or `[]` are dropped before dispatch, so `search_history` no longer filters on an empty session and `create_scheduled_goal` no longer loses `schedule` behind an empty `schedules`.
+- **An inspection step is not reopened by the edit built on it.** A checklist observation that a later item depends on is no longer invalidated by that item's changes, so "inspect → edit → verify" turns stop looping on an impossible pre-edit inspection.
+- **Background jobs hand off in plain language**, and a small text result file is quoted in its delivery caption.
+- **Scheduled-run cards show the outcome**, not the "Goal completed:" label.
+- **`/model` leads the task assessment** as well as the turn.
+- **Telegram:** inline code inside bold, italic or link text no longer shows literal backticks.
 
 ## [0.12.9] - 2026-10-22
 
