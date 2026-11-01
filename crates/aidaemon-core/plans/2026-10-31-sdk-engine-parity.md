@@ -178,6 +178,23 @@ Owner decision (2026-10-31): no side-by-side comparison and no second engine. Wh
 - [ ] **Step 4:** Full checklist: `cargo fmt`, clippy, `RUST_MIN_STACK=8388608 cargo test --all-features`, `cargo build --release --features browser`, `cargo package` succeeds.
 - [ ] **Step 5: Commit** `refactor(agent): the SDK kernel is the only agent loop`.
 
+## Task 8 measurement (2026-11-01, after Tasks 1-7)
+
+Every agent forced onto the SDK engine, `cargo test --features sdk-engine --lib`:
+**4314 passed, 106 failed** (72 integration, 22 characterization, 11 harness eval, 1 other).
+Per-test list: `.superpowers/sdd/2026-10-31-sdk-engine-parity/t8-triage.txt` (local).
+Causes, largest first:
+
+| # | Legacy behavior not yet on the SDK path | Failing tests (approx.) |
+|---|---|---|
+| D | Recovery and verification ladder: required evidence passes, verification before completion, failed-mutation recovery pass, guided `tool_choice=required` forcing, force-text closeout grace, unknown-tool stall, fabricated-delegation block | 22 |
+| C | Reply quality: empty-response retry, gutted / JSON-dump / pasted-page reply retry, `[INTENT_GATE]` and untrusted-envelope stripping, deterministic completion acks, honest fallbacks | 16 |
+| E | Dispatcher safety: duplicate `send_file` suppression, durable-receipt replay of duplicate mutations, semantic read cache, postcondition re-execution, evidence gate on blind edits, pre-execution plan / critique gate, canonical read-only batch order, nested project-instruction deferral, truncation notices | 14 |
+| B | Context projection: fresh-request isolation, `[Current Task]` boundary, old-turn truncation, compaction, byte-identical archived prefix, exact antecedent projection | 14 |
+| A | `harness_eval` snapshot on TaskEnd | 11 |
+| F | Budgets: task budget auto-extend / unproductive stop, goal budget auto-extend, scheduled-run budget stops | 6 |
+| G | Misc: audio attachments, image payload shape, status-update summaries, mandate prose closeout and owner-input context, `report_blocker` termination, specialist plan pivot, reflection learning | 15 |
+
 ## Out of scope (owner decisions)
 
 - How `aidaemon-core` ships with the published `aidaemon` crate (publish it to crates.io, or fold it into the main crate). Blocks Task 8 Step 4 (`cargo package`), not Tasks 1-7.
