@@ -44,8 +44,13 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
 
             // Only prepend anchor if not already in remaining
             if remaining.first().map(|m| m.role.as_str()) != Some("user") {
+                // Keep the newest `limit - 1` after the anchor. Taking the
+                // oldest instead dropped the latest message, so the last
+                // reply vanished from history and its question looked
+                // unanswered.
                 let mut result = vec![anchor_msg];
-                result.extend(remaining.into_iter().take(limit.saturating_sub(1)));
+                let keep = limit.saturating_sub(1);
+                result.extend(remaining.into_iter().rev().take(keep).rev());
                 return result;
             }
             return remaining;
@@ -54,4 +59,28 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
 
     // Normal case - just take last N
     messages.into_iter().skip(skip).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_with_anchor;
+    use crate::traits::Message;
+
+    fn message(index: usize, role: &str) -> Message {
+        let mut message = Message::new_runtime(format!("m{index}"), "s", role);
+        message.content = Some(format!("{role} {index}"));
+        message
+    }
+
+    #[test]
+    fn pinned_anchor_keeps_the_newest_messages() {
+        // user, then alternating assistant/user; the tail window would start
+        // on an assistant message, so the first user message is pinned.
+        let messages: Vec<Message> = (0..9)
+            .map(|index| message(index, if index % 2 == 0 { "user" } else { "assistant" }))
+            .collect();
+        let truncated = truncate_with_anchor(messages, 4);
+        let ids: Vec<&str> = truncated.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["m0", "m6", "m7", "m8"]);
+    }
 }
