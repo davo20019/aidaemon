@@ -195,6 +195,27 @@ Causes, largest first:
 | F | Budgets: task budget auto-extend / unproductive stop, goal budget auto-extend, scheduled-run budget stops | 6 |
 | G | Misc: audio attachments, image payload shape, status-update summaries, mandate prose closeout and owner-input context, `report_blocker` termination, specialist plan pivot, reflection learning | 15 |
 
+## Task 8 triage (2026-11-01): needed / covered / drop
+
+Read-only review of all 106 tests. **60 needed, 21 covered (re-assert the outcome), 20 drop (delete, list in commit), 5 need an owner decision.**
+
+Needed work, as packages:
+
+| Package | What | Tests |
+|---|---|---|
+| P1 Turn-setup order | Per-turn setup that sits after the SDK branch in `main_loop.rs` (~1121-1380): harness_eval accumulator, mandate owner-input directive, route failsafe, scheduled-run budget start/restore/persist. Move before the branch. | ~18 |
+| P2 History projection | Reuse legacy turn selection + `turn_render` instead of `sdk_history`: new-request isolation, `[Current Task]` boundary, child/mandate isolation, shared-channel redaction (privacy), summary cursor, immediate-parent compaction; core and volatile tail as separate system messages (stable prompt prefix). | ~13 |
+| P3 Reply integrity | One `on_stop` finalizer: sanitize (`sanitize_user_facing_reply`), one shared retry for empty / gutted / marker-only / pasted-page / raw-dump replies, honest fallbacks instead of "Done." and "provider failed", deterministic completion after a side effect, provider note. | ~17 |
+| P4 Dispatcher safety | Idempotency replay preflight from `execute_tool_call_io` (duplicate sends/mutations, postcondition re-exec), nested project-instruction deferral, truncation notice, user-facing status labels, mandate fence (worker task id, token lease, decision commit), `report_blocker` stop, kernel-side refusals recorded in the ledger. | ~14 |
+| P5 Budgets | Task and daily budgets charged per call; scheduled-run budgets (from P1); exhaustion replies via the graceful budget response. | 4 |
+| P6 Media | Audio blocks; vision gate matches legacy (no model-name gate). | 2 |
+| P7 Post-turn pipelines | Progressive fact extraction, incremental summarization, `post_task::process_learning` after SDK runs (no direct test; memory silently stops on SDK turns). | 0 |
+| P8 Ledger rule | Unrecovered failed operation with no later success is a reachable expectation in `RunAggregate::closeout` (shared by both engines). | 2 |
+
+Drop (old-loop crutches): `[INTENT_GATE]` relics, pre-execution plan / critique / evidence gates, reflection side call, semantic read cache, contradictory-evidence prose heuristic, prose truncation reassembly, guided `tool_choice` forcing, failed-mutation give-up gate, dialogue scope gate.
+
+Owner decisions: (1) goal/task budgets hard caps or receipt-based auto-extension (2 tests); (2) verification-purpose obligations still demanded after a mutation succeeded (2 tests); (3) `dispatcher_argument_rejection` (technical, implementer's call).
+
 ## Out of scope (owner decisions)
 
 - How `aidaemon-core` ships with the published `aidaemon` crate (publish it to crates.io, or fold it into the main crate). Blocks Task 8 Step 4 (`cargo package`), not Tasks 1-7.
