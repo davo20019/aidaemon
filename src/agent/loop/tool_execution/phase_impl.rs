@@ -26,8 +26,8 @@ pub(in crate::agent) use run_helpers::{
 };
 #[cfg(feature = "sdk-engine")]
 pub(in crate::agent) use run_helpers::{
-    build_background_detach_ack, build_external_action_completion_ack,
-    should_build_external_action_ack, summarize_completed_tool_result,
-    tool_result_indicates_background_detach,
+    blocked_for_untrusted_external_reference_message, build_background_detach_ack,
+    build_external_action_completion_ack, should_build_external_action_ack,
+    summarize_completed_tool_result, tool_result_indicates_background_detach,
 };
 pub(in crate::agent) use types::ToolExecutionCtx;

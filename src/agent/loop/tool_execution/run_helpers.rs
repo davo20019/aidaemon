@@ -358,7 +358,7 @@ pub(super) fn tool_is_currently_exposed(tool_defs: &[Value], tool_name: &str) ->
     })
 }
 
-pub(super) fn blocked_for_untrusted_external_reference_message(
+pub(in crate::agent) fn blocked_for_untrusted_external_reference_message(
     tool_name: &str,
     active_skills: &[String],
 ) -> String {

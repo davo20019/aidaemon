@@ -134,6 +134,10 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
     /// The assessed task shape continues inline work after a background start.
     pub(in crate::agent) continue_inline_after_background: bool,
+    /// Matched skills reference untrusted external content: the legacy tool
+    /// block applies, naming these skills.
+    pub(in crate::agent) restrict_untrusted_reference_tools: bool,
+    pub(in crate::agent) untrusted_reference_skills: Vec<String>,
     /// Discovers nested project instructions before deeper subtree work.
     pub(in crate::agent) instruction_tracker:
         Option<crate::project_instructions::ProjectInstructionTracker>,
@@ -679,6 +683,9 @@ struct TurnScope<'a> {
     background_ack: std::sync::Mutex<Option<String>>,
     /// Ends the run at the next turn boundary (a background handoff).
     end_run: Arc<AtomicBool>,
+    /// Skills referencing untrusted external content are active.
+    restrict_untrusted_reference_tools: bool,
+    untrusted_reference_skills: Vec<String>,
     /// `send_file` dedupe keys that already succeeded in this task.
     sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
@@ -745,7 +752,19 @@ impl Agent {
         let admitted =
             super::closeout::ClosingAuthority::from_authority(scope.contract.authority())
                 .admits_tool(&request.name, read_only);
-        let gate = if admitted {
+        // A matched skill that references untrusted external content keeps
+        // the legacy block on tools that could act on it.
+        let untrusted_block = scope.restrict_untrusted_reference_tools
+            && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
+        let gate = if untrusted_block {
+            Err((
+                super::tool_execution_phase::blocked_for_untrusted_external_reference_message(
+                    &request.name,
+                    &scope.untrusted_reference_skills,
+                ),
+                "untrusted_external_reference_blocked",
+            ))
+        } else if admitted {
             self.sdk_mandate_gate(&ctx, request, arguments)
                 .await
                 .map_err(|refusal| (refusal, "mandate_authority"))
@@ -1801,6 +1820,8 @@ impl Agent {
             learning_ctx,
             continue_inline_after_background,
             instruction_tracker,
+            restrict_untrusted_reference_tools,
+            untrusted_reference_skills,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1912,6 +1933,8 @@ impl Agent {
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
+            restrict_untrusted_reference_tools,
+            untrusted_reference_skills,
             background_ack: std::sync::Mutex::new(None),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
