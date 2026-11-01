@@ -76,44 +76,40 @@ fn durable_result_identity(result: &crate::events::ToolResultData) -> String {
         .unwrap_or_else(|| format!("receipt:{}", result.tool_call_id))
 }
 
-pub(super) async fn execute_tool_call_io(
-    agent: &Agent,
-    tc: &ToolCall,
-    ctx: &ToolExecutionIoCtx<'_>,
-) -> ToolExecutionIoResult {
-    let (start_label, start_summary) = crate::tools::sanitize::user_facing_tool_activity(
-        &tc.name,
-        &summarize_tool_args(&tc.name, ctx.effective_arguments),
-        ctx.channel_ctx.visibility,
-    );
-    // `track_requirements` renders its own checklist as the live surface (emitted
-    // as StatusUpdate::Checklist right after the call). Skip its generic ToolStart
-    // so the surface shows the plan, not a raw "track_requirements…" line first.
-    if tc.name != "track_requirements" {
-        send_status(
-            ctx.status_tx,
-            StatusUpdate::ToolStart {
-                name: start_label,
-                summary: start_summary,
-            },
-        );
-    }
+/// What the durable ledger says about an operation before it runs again.
+pub(in crate::agent) struct DurableReplayPreflight {
+    /// A completed earlier result to reuse instead of repeating the I/O.
+    pub replayed_result: Option<Box<crate::events::ToolResultData>>,
+    /// The earlier effect no longer holds: (operation id, result id, reason).
+    pub replay_invalidation: Option<(String, String, String)>,
+    /// The operation must not run (indeterminate earlier attempt, ledger error).
+    pub block_reason: Option<String>,
+}
 
-    // Claim/replay preflight happens before the new ToolCall row is appended.
+/// Claim/replay preflight for an operation with an idempotency key. A
+/// completed key reuses its durable receipt; a claimed key with no result
+/// is indeterminate after a crash and is blocked for reconciliation.
+pub(in crate::agent) async fn durable_replay_preflight(
+    agent: &Agent,
+    session_id: &str,
+    tool_name: &str,
+    effective_arguments: &str,
+    idempotency_key: Option<&str>,
+) -> DurableReplayPreflight {
     // A completed key reuses its durable receipt; a claimed key with no result
     // is indeterminate after a crash and is blocked for reconciliation.
     let tool_is_idempotent = agent
         .tools
         .iter()
-        .find(|tool| tool.name() == tc.name && tool.is_available())
+        .find(|tool| tool.name() == tool_name && tool.is_available())
         .is_some_and(|tool| tool.capabilities().idempotent);
     let mut replayed_result: Option<Box<crate::events::ToolResultData>> = None;
     let mut replay_invalidation: Option<(String, String, String)> = None;
     let mut idempotency_block_reason: Option<String> = None;
-    if let Some(idempotency_key) = ctx.idempotency_key {
+    if let Some(idempotency_key) = idempotency_key {
         match agent
             .event_store
-            .get_tool_result_by_idempotency_key(ctx.session_id, idempotency_key)
+            .get_tool_result_by_idempotency_key(session_id, idempotency_key)
             .await
         {
             Ok(Some(result)) => {
@@ -125,11 +121,9 @@ pub(super) async fn execute_tool_call_io(
                         match agent
                             .tools
                             .iter()
-                            .find(|tool| tool.name() == tc.name && tool.is_available())
+                            .find(|tool| tool.name() == tool_name && tool.is_available())
                         {
-                            Some(tool) => {
-                                tool.durable_replay_decision(ctx.effective_arguments).await
-                            }
+                            Some(tool) => tool.durable_replay_decision(effective_arguments).await,
                             None => crate::traits::DurableReplayDecision::Replay,
                         }
                     } else {
@@ -154,31 +148,74 @@ pub(super) async fn execute_tool_call_io(
             }
             Ok(None) => match agent
                 .event_store
-                .has_unresolved_tool_call_for_idempotency_key(ctx.session_id, idempotency_key)
+                .has_unresolved_tool_call_for_idempotency_key(session_id, idempotency_key)
                 .await
             {
                 Ok(true) => {
                     idempotency_block_reason = Some(format!(
                         "A prior `{}` invocation with idempotency key `{}` has no durable result. Its side effect is indeterminate after interruption; inspect the target before issuing a different operation.",
-                        tc.name, idempotency_key
+                        tool_name, idempotency_key
                     ));
                 }
                 Ok(false) => {}
                 Err(error) => {
                     idempotency_block_reason = Some(format!(
                         "Could not verify whether `{}` was already executed ({error}); refusing a potentially duplicate side effect.",
-                        tc.name
+                        tool_name
                     ));
                 }
             },
             Err(error) => {
                 idempotency_block_reason = Some(format!(
                     "Could not read the durable receipt for `{}` ({error}); refusing a potentially duplicate side effect.",
-                    tc.name
+                    tool_name
                 ));
             }
         }
     }
+    DurableReplayPreflight {
+        replayed_result,
+        replay_invalidation,
+        block_reason: idempotency_block_reason,
+    }
+}
+
+pub(super) async fn execute_tool_call_io(
+    agent: &Agent,
+    tc: &ToolCall,
+    ctx: &ToolExecutionIoCtx<'_>,
+) -> ToolExecutionIoResult {
+    let (start_label, start_summary) = crate::tools::sanitize::user_facing_tool_activity(
+        &tc.name,
+        &summarize_tool_args(&tc.name, ctx.effective_arguments),
+        ctx.channel_ctx.visibility,
+    );
+    // `track_requirements` renders its own checklist as the live surface (emitted
+    // as StatusUpdate::Checklist right after the call). Skip its generic ToolStart
+    // so the surface shows the plan, not a raw "track_requirements…" line first.
+    if tc.name != "track_requirements" {
+        send_status(
+            ctx.status_tx,
+            StatusUpdate::ToolStart {
+                name: start_label,
+                summary: start_summary,
+            },
+        );
+    }
+
+    // Claim/replay preflight happens before the new ToolCall row is appended.
+    let DurableReplayPreflight {
+        replayed_result,
+        replay_invalidation,
+        block_reason: idempotency_block_reason,
+    } = durable_replay_preflight(
+        agent,
+        ctx.session_id,
+        &tc.name,
+        ctx.effective_arguments,
+        ctx.idempotency_key,
+    )
+    .await;
 
     let operation_lineage = replayed_result
         .as_ref()

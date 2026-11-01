@@ -679,6 +679,8 @@ struct TurnScope<'a> {
     background_ack: std::sync::Mutex<Option<String>>,
     /// Ends the run at the next turn boundary (a background handoff).
     end_run: Arc<AtomicBool>,
+    /// `send_file` dedupe keys that already succeeded in this task.
+    sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
     instruction_tracker:
         Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
@@ -812,12 +814,41 @@ impl Agent {
             return deferral;
         }
 
+        // The same file and caption go out once per task.
+        let send_file_key = (request.name == "send_file")
+            .then(|| super::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
+            .flatten();
+        if let Some(key) = &send_file_key {
+            let already_sent = scope.sent_files.lock().is_ok_and(|sent| sent.contains(key));
+            if already_sent {
+                return self.sdk_suppress_duplicate_send(scope, request).await;
+            }
+        }
+        // Calls with side effects carry the legacy idempotency key, bound to
+        // the task and the canonical arguments: a repeat reuses the durable
+        // receipt instead of performing the effect twice.
+        let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
+        let preflight = super::tool_execution_phase::durable_replay_preflight(
+            self,
+            scope.session_id,
+            &request.name,
+            arguments,
+            idempotency_key.as_deref(),
+        )
+        .await;
+        if let Some(output) = self
+            .sdk_replay_or_block(scope, request, arguments, &preflight)
+            .await
+        {
+            return output;
+        }
         let mut call_data = crate::events::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
             Some(scope.task_id.to_string()),
-        );
+        )
+        .with_policy_metadata(idempotency_key.clone(), None, None);
         call_data.turn_id = Some(scope.turn_id.to_string());
         if let Err(error) = scope.emitter.emit(EventType::ToolCall, call_data).await {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool call");
@@ -860,7 +891,7 @@ impl Agent {
                     &outcome.metadata,
                     status,
                     evidence,
-                    None,
+                    idempotency_key.clone(),
                 );
                 receipt.mandate_authority = grant.clone();
                 if let Ok(mut progress) = scope.progress.lock() {
@@ -934,6 +965,11 @@ impl Agent {
         let duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
+        }
+        if let (Some(key), false) = (send_file_key, failed) {
+            if let Ok(mut sent) = scope.sent_files.lock() {
+                sent.insert(key);
+            }
         }
         if let Some(status_tx) = &scope.status_tx {
             let update = if request.name == "track_requirements" {
@@ -1447,6 +1483,165 @@ impl Agent {
         true
     }
 
+    /// The legacy step-plan idempotency key: any call that is not a pure
+    /// observation and mutates, has an external side effect, or is not
+    /// idempotent.
+    fn sdk_idempotency_key(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &ToolRequest,
+        semantics: &crate::traits::ToolCallSemantics,
+    ) -> Option<String> {
+        let capabilities = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == request.name)
+            .map(|tool| tool.capabilities())?;
+        let pure_observation = semantics.observes_state() && !semantics.mutates_state();
+        let needs_key = !pure_observation
+            && (semantics.mutates_state()
+                || capabilities.external_side_effect
+                || !capabilities.idempotent);
+        needs_key.then(|| {
+            let hash = crate::agent::prefix_fingerprint::hash_canonical(&request.arguments);
+            format!("exec:{}:{}:{hash}", scope.task_id, request.name)
+        })
+    }
+
+    /// A duplicate `send_file` in the same task: record a no-op result and
+    /// tell the model the file already went out, as the legacy guard does.
+    async fn sdk_suppress_duplicate_send(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &ToolRequest,
+    ) -> sdk::ToolOutput {
+        info!(
+            task_id = scope.task_id,
+            tool_call_id = %request.call_id,
+            "SDK engine: suppressed a duplicate send_file"
+        );
+        let mut call_data = crate::events::ToolCallData::from_tool_call(
+            request.call_id.clone(),
+            request.name.clone(),
+            request.arguments.clone(),
+            Some(scope.task_id.to_string()),
+        );
+        call_data.turn_id = Some(scope.turn_id.to_string());
+        let _ = scope.emitter.emit(EventType::ToolCall, call_data).await;
+        let result_text = "Duplicate send_file suppressed: this exact file+caption was already \
+                           sent in this task.";
+        let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
+        tool.content = Some(result_text.to_string());
+        tool.tool_name = Some(request.name.clone());
+        tool.tool_call_id = Some(request.call_id.clone());
+        tool.turn_id = Some(scope.turn_id.to_string());
+        if let Err(error) = self
+            .append_tool_message_with_receipt_event_policy(
+                scope.emitter,
+                &tool,
+                true,
+                0,
+                None,
+                Some(scope.task_id),
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a suppressed send");
+        }
+        sdk::ToolOutput::text(format!(
+            "{result_text}\n\n{}",
+            super::system_directives::SystemDirective::DuplicateSendFileAlreadySent.render()
+        ))
+    }
+
+    /// Act on the durable preflight: replay a completed earlier result
+    /// (recorded as a replayed receipt) or refuse an indeterminate repeat.
+    async fn sdk_replay_or_block(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &ToolRequest,
+        arguments: &str,
+        preflight: &super::tool_execution_phase::DurableReplayPreflight,
+    ) -> Option<sdk::ToolOutput> {
+        let call = crate::traits::ToolCall {
+            id: request.call_id.clone(),
+            name: request.name.clone(),
+            arguments: arguments.to_string(),
+            extra_content: None,
+        };
+        if let Some(reason) = &preflight.block_reason {
+            if let Err(error) = self
+                .persist_pre_dispatch_outcome_with_kernel_claim(
+                    scope.emitter,
+                    scope.session_id,
+                    scope.task_id,
+                    &call,
+                    arguments,
+                    format!("Error: {reason}"),
+                    crate::traits::ToolOutcomeStatus::Blocked,
+                    crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                    false,
+                    crate::traits::ToolCallSemantics::default(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                warn!(task_id = scope.task_id, %error, "SDK engine: could not record a blocked repeat");
+            }
+            return Some(sdk::ToolOutput::error(format!("Error: {reason}")));
+        }
+        let previous = preflight.replayed_result.as_ref()?;
+        info!(
+            task_id = scope.task_id,
+            tool = %request.name,
+            source = %previous.tool_call_id,
+            "SDK engine: replayed a durable receipt instead of repeating the call"
+        );
+        let mut call_data = crate::events::ToolCallData::from_tool_call(
+            request.call_id.clone(),
+            request.name.clone(),
+            request.arguments.clone(),
+            Some(scope.task_id.to_string()),
+        );
+        call_data.turn_id = Some(scope.turn_id.to_string());
+        let _ = scope.emitter.emit(EventType::ToolCall, call_data).await;
+        let mut receipt = previous.receipt.clone();
+        if let Some(receipt) = receipt.as_mut() {
+            receipt.invocation_stage = crate::traits::ToolInvocationStage::Replayed;
+            receipt.outcome_evidence = crate::events::ToolOutcomeEvidenceSource::DurableReplay;
+        }
+        let output = previous.result.clone();
+        let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
+        tool.content = Some(output.clone());
+        tool.tool_name = Some(request.name.clone());
+        tool.tool_call_id = Some(request.call_id.clone());
+        tool.turn_id = Some(scope.turn_id.to_string());
+        let failed = !previous.success;
+        if let Err(error) = self
+            .append_tool_message_with_receipt_event_policy(
+                scope.emitter,
+                &tool,
+                !failed,
+                0,
+                previous.error.clone(),
+                Some(scope.task_id),
+                None,
+                receipt,
+            )
+            .await
+        {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a replay");
+        }
+        Some(sdk::ToolOutput {
+            is_error: failed,
+            ..sdk::ToolOutput::text(output)
+        })
+    }
+
     /// Resolve nested project instructions for a call's targets. When new
     /// guidance applies, it joins the run's system context and the call is
     /// recorded as deferred, not executed.
@@ -1716,6 +1911,7 @@ impl Agent {
             continue_inline_after_background,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
+            sent_files: std::sync::Mutex::new(HashSet::new()),
             background_ack: std::sync::Mutex::new(None),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(

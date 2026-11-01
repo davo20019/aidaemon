@@ -15,5 +15,7 @@ pub(super) use phase_impl::{
     build_external_action_completion_ack, mandate_gate_for_tool_call, parse_checklist_from_result,
     should_build_external_action_ack, summarize_completed_tool_result, MandateGateDecision,
 };
+#[cfg(feature = "sdk-engine")]
+pub(super) use phase_impl::{durable_replay_preflight, DurableReplayPreflight};
 pub(super) use phase_impl::{fallback_tool_semantic_scope, run_tool_execution_phase};
 pub(super) use phase_impl::{PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx};
