@@ -1430,6 +1430,7 @@ impl Agent {
                 model: model.clone(),
                 prefix,
                 contract: turn_context.completion_contract.clone(),
+                learning_ctx: learning_ctx.clone(),
             };
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(

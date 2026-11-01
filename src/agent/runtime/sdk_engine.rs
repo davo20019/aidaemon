@@ -125,6 +125,8 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// first model call, in the daemon providers' wire format.
     pub(in crate::agent) prefix: Vec<Value>,
     pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
+    /// Post-task learning state from bootstrap; the run adds its tool calls.
+    pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -526,6 +528,23 @@ fn bind_receipt_to_contract(
     progress.completion_obligations_for_receipt(call_id)
 }
 
+/// One tool call as post-task learning records it (the legacy
+/// `tool_name(summary)` line, marked when it was rejected or failed so
+/// activity summaries never claim work that did not happen).
+fn learning_tool_summary(name: &str, arguments: &str, rejected: bool, failed: bool) -> String {
+    let line = format!(
+        "{name}({})",
+        crate::agent::agent_helpers::summarize_tool_args(name, arguments)
+    );
+    if rejected {
+        format!("{line} [REJECTED]")
+    } else if failed {
+        format!("{line} [FAILED]")
+    } else {
+        line
+    }
+}
+
 /// What the ledger says when the model wants to stop.
 struct StopFacts {
     /// Expectations an admissible tool could still satisfy.
@@ -581,6 +600,7 @@ struct TurnScope<'a> {
     /// are credited from receipts.
     contract: &'a crate::agent::completion_contract::CompletionContract,
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
+    learning: std::sync::Mutex<crate::agent::post_task::LearningContext>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -773,6 +793,17 @@ impl Agent {
             .map(|receipt| receipt.outcome_status.is_failure() || receipt.contract_rejected)
             .unwrap_or(true);
         let duration_ms = started.elapsed().as_millis() as u64;
+        if let Ok(mut learning) = scope.learning.lock() {
+            let rejected = metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contract_rejected);
+            learning.tool_calls.push(learning_tool_summary(
+                &request.name,
+                arguments,
+                rejected,
+                failed,
+            ));
+        }
 
         let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
         tool.content = Some(output.clone());
@@ -1214,6 +1245,7 @@ impl Agent {
             model,
             prefix,
             contract,
+            learning_ctx,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1316,6 +1348,7 @@ impl Agent {
             model: &model,
             turn_id: &turn_id,
             contract: &contract,
+            learning: std::sync::Mutex::new(learning_ctx),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
@@ -1431,6 +1464,33 @@ impl Agent {
             None,
         )
         .await;
+        // The same post-turn memory and learning pipelines as legacy turns.
+        let mut learning = scope
+            .learning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Ok(reply) = &reply {
+            if status == TaskStatus::Completed {
+                let snapshot = self.llm_runtime.snapshot();
+                super::completion_phase::spawn_post_turn_memory(
+                    self,
+                    snapshot.provider(),
+                    snapshot.router().as_ref(),
+                    &model,
+                    &task_id,
+                    session_id,
+                    user_text,
+                    reply,
+                    &channel_ctx,
+                    user_role,
+                    learning.memory_persistence_allowed,
+                );
+            }
+        }
+        learning.completed_naturally = status == TaskStatus::Completed;
+        learning.task_outcome = Some(task_outcome);
+        super::completion_phase::spawn_post_task_learning(self, learning);
         for tool in &self.tools {
             let _ = tool.on_task_end(&task_id, session_id).await;
         }
@@ -2135,6 +2195,15 @@ mod tests {
         let mut mixed = calls("remember_fact", 7, false);
         mixed.push(("system_info".to_string(), same.clone()));
         assert!(!same_tool_loop(&mixed, "remember_fact", &same));
+    }
+
+    #[test]
+    fn learning_records_each_call_like_the_legacy_loop() {
+        let args = r#"{"path":"notes.txt"}"#;
+        let ok = learning_tool_summary("read_file", args, false, false);
+        assert!(ok.starts_with("read_file(") && !ok.contains('['), "{ok}");
+        assert!(learning_tool_summary("read_file", args, false, true).ends_with(" [FAILED]"));
+        assert!(learning_tool_summary("read_file", args, true, true).ends_with(" [REJECTED]"));
     }
 
     #[test]

@@ -234,6 +234,82 @@ fn build_agent_side_partial_failure(
 /// is a delegated brief, so every scheduled run would re-learn its own
 /// instructions as durable memory. Consolidation and retention already treat
 /// these sessions as memory-isolated.
+/// After a completed turn: progressive fact extraction and incremental
+/// summary maintenance on the fast model, unless the turn's memory policy,
+/// a mandate run or a memory-isolated session rules them out.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::agent) fn spawn_post_turn_memory(
+    agent: &Agent,
+    llm_provider: Arc<dyn ModelProvider>,
+    llm_router: Option<&Router>,
+    model: &str,
+    task_id: &str,
+    session_id: &str,
+    user_text: &str,
+    reply: &str,
+    channel_ctx: &ChannelContext,
+    user_role: UserRole,
+    memory_persistence_allowed: bool,
+) {
+    let fast_model = llm_router
+        .map(|router| router.select(crate::router::Tier::Fast).to_string())
+        .unwrap_or_else(|| model.to_string());
+    let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
+        agent.mandate_execution.is_some(),
+        agent.depth > 0 || crate::events::is_memory_isolated_worker_session(session_id),
+        memory_persistence_allowed,
+        agent.context_window_config.progressive_facts,
+        crate::memory::context_window::should_extract_facts(user_text),
+        agent.context_window_config.enabled,
+    );
+    if spawn_progressive_facts {
+        crate::memory::context_window::spawn_progressive_extraction(
+            llm_provider.clone(),
+            fast_model.clone(),
+            agent.state.clone(),
+            agent.event_store.clone(),
+            task_id.to_string(),
+            user_text.to_string(),
+            reply.to_string(),
+            channel_ctx.channel_id.clone(),
+            channel_ctx.visibility,
+            user_role,
+        );
+    }
+    if spawn_summary_maintenance {
+        let summary_token_threshold = agent
+            .context_window_config
+            .summarize_token_threshold_for(&fast_model);
+        let summary_recent_tokens = agent
+            .context_window_config
+            .summary_recent_tokens_for(&fast_model);
+        crate::memory::context_window::spawn_incremental_summarization(
+            llm_provider,
+            fast_model,
+            agent.state.clone(),
+            agent.event_store.clone(),
+            session_id.to_string(),
+            summary_token_threshold,
+            summary_recent_tokens,
+            user_role,
+        );
+    }
+}
+
+/// Learn from a finished task (procedures, expertise, failure patterns) in
+/// the background. Mandate runs never write learned memory.
+pub(in crate::agent) fn spawn_post_task_learning(agent: &Agent, learning_ctx: LearningContext) {
+    if agent.mandate_execution.is_some() {
+        return;
+    }
+    let state = agent.state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = post_task::process_learning(&state, learning_ctx).await {
+            warn!("Learning failed: {}", e);
+        }
+    });
+}
+
 fn post_completion_memory_plan(
     mandate_execution: bool,
     memory_isolated_session: bool,
@@ -3079,50 +3155,19 @@ pub(super) async fn run_completion_phase(
             )
             .await?;
 
-        let fast_model = llm_router
-            .as_ref()
-            .map(|router| router.select(crate::router::Tier::Fast).to_string())
-            .unwrap_or_else(|| model.clone());
-        let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
-            agent.mandate_execution.is_some(),
-            agent.depth > 0 || crate::events::is_memory_isolated_worker_session(session_id),
+        spawn_post_turn_memory(
+            agent,
+            llm_provider.clone(),
+            llm_router.as_ref(),
+            &model,
+            task_id,
+            session_id,
+            user_text,
+            &reply,
+            &channel_ctx,
+            user_role,
             learning_ctx.memory_persistence_allowed,
-            agent.context_window_config.progressive_facts,
-            crate::memory::context_window::should_extract_facts(user_text),
-            agent.context_window_config.enabled,
         );
-        if spawn_progressive_facts {
-            crate::memory::context_window::spawn_progressive_extraction(
-                llm_provider.clone(),
-                fast_model.clone(),
-                agent.state.clone(),
-                agent.event_store.clone(),
-                task_id.to_string(),
-                user_text.to_string(),
-                reply.clone(),
-                channel_ctx.channel_id.clone(),
-                channel_ctx.visibility,
-                user_role,
-            );
-        }
-        if spawn_summary_maintenance {
-            let summary_token_threshold = agent
-                .context_window_config
-                .summarize_token_threshold_for(&fast_model);
-            let summary_recent_tokens = agent
-                .context_window_config
-                .summary_recent_tokens_for(&fast_model);
-            crate::memory::context_window::spawn_incremental_summarization(
-                llm_provider.clone(),
-                fast_model,
-                agent.state.clone(),
-                agent.event_store.clone(),
-                session_id.to_string(),
-                summary_token_threshold,
-                summary_recent_tokens,
-                user_role,
-            );
-        }
 
         let outcome = TaskOutcomeDerivation::from_completion_state(
             &validation_state,
@@ -3151,15 +3196,7 @@ pub(super) async fn run_completion_phase(
 
         learning_ctx.completed_naturally = true;
         learning_ctx.task_outcome = Some(outcome);
-        if agent.mandate_execution.is_none() {
-            let learning_ctx_for_task = learning_ctx.clone();
-            let state = agent.state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                    warn!("Learning failed: {}", e);
-                }
-            });
-        }
+        spawn_post_task_learning(agent, learning_ctx.clone());
 
         info!(
             session_id,
