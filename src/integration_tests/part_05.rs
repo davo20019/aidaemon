@@ -585,7 +585,13 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_delayed_responses(
             responses,
-            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+            // The follow-up call and both of its timeout retries hang.
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            ],
         ),
         vec![Arc::new(ExternalActionTool)],
         Some(1),
@@ -595,7 +601,7 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
 
     let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
         harness.agent.handle_message(
             "external_action_timeout",
             "Create the remote record.",
@@ -650,7 +656,13 @@ async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_delayed_responses(
             responses,
-            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+            // The follow-up call and both of its timeout retries hang.
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            ],
         ),
         vec![Arc::new(PreWrappedExternalActionTool)],
         Some(1),
@@ -659,7 +671,7 @@ async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
     .unwrap();
 
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
         harness.agent.handle_message(
             "prewrapped_external_action_timeout",
             "Create the remote record.",
