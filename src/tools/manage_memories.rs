@@ -1735,13 +1735,26 @@ impl Tool for ManageMemoriesTool {
                         ));
                     }
                     let deleted = self.state.delete_goal_schedule(&sched.id).await?;
-                    if deleted {
+                    if !deleted {
+                        return Ok(format!("Schedule {} was already removed.", sched.id));
+                    }
+                    // A goal with no schedule left would stay "active" in
+                    // listings and never run: its last schedule ends it.
+                    let remaining = self.state.get_schedules_for_goal(&goal.id).await?;
+                    if remaining.is_empty() && !Self::is_protected_system_maintenance_goal(&goal) {
+                        goal.status = "cancelled".to_string();
+                        goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        goal.updated_at = chrono::Utc::now().to_rfc3339();
+                        self.state.update_goal(&goal).await?;
                         return Ok(format!(
-                            "Cancelled schedule {} for goal {}.",
+                            "Cancelled schedule {}; it was the last schedule of goal {}, so the goal is cancelled too.",
                             sched.id, goal.id
                         ));
                     }
-                    return Ok(format!("Schedule {} was already removed.", sched.id));
+                    return Ok(format!(
+                        "Cancelled schedule {} for goal {}.",
+                        sched.id, goal.id
+                    ));
                 }
 
                 if Self::is_protected_system_maintenance_goal(&goal) {
@@ -3868,6 +3881,52 @@ mod tests {
             crate::reminders::message_from_context(goal.context.as_deref()).as_deref(),
             Some("Check the oven.")
         );
+    }
+
+    /// Cancelling a goal's only schedule cancels the goal: an active goal
+    /// with no schedule would linger in listings and never run.
+    #[tokio::test]
+    async fn cancelling_the_last_schedule_cancels_the_goal() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        tool.call(
+            &json!({
+                "action": "create_scheduled_goal",
+                "goal": "Review the inbox",
+                "schedule": "every weekday at 9am",
+                "reminder": "Review your inbox.",
+                "_user_role": "owner",
+                "_session_id": "test-session"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let goal = state
+            .get_scheduled_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.description.contains("inbox"))
+            .unwrap();
+        let schedule = state.get_schedules_for_goal(&goal.id).await.unwrap()[0].clone();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "cancel_scheduled",
+                    "goal_id": goal.id,
+                    "schedule_id": schedule.id,
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("cancelled"), "{result}");
+        let goal = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "cancelled");
     }
 
     #[tokio::test]
