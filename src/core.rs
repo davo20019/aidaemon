@@ -161,13 +161,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists_dir.as_deref(),
     ));
 
-    #[cfg(feature = "sdk-engine")]
     let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config);
-    #[cfg(not(feature = "sdk-engine"))]
-    anyhow::ensure!(
-        config.agent.engine.kind == crate::config::AgentEngineKind::Legacy,
-        "[agent.engine] kind = \"sdk\" needs a build with the `sdk-engine` feature"
-    );
 
     #[allow(unused_mut)]
     let mut agent = Agent::new(crate::agent::AgentConstruction {
@@ -214,7 +208,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         stt_config: SttConfig::from_files(&config.files),
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
     });
-    #[cfg(feature = "sdk-engine")]
     agent.set_sdk_engine(sdk_engine);
     let agent = Arc::new(agent);
 

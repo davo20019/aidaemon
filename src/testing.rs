@@ -553,18 +553,16 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
 
 /// Like [`setup_test_agent`], with every turn on the SDK kernel and the mock
 /// provider behind the daemon's provider stack.
-#[cfg(feature = "sdk-engine")]
 pub async fn setup_test_agent_sdk(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_sdk_with_llm_timeout(provider, None).await
 }
 
 /// Like [`setup_test_agent_sdk`], with a per-call model timeout.
-#[cfg(feature = "sdk-engine")]
 pub async fn setup_test_agent_sdk_with_llm_timeout(
     provider: MockProvider,
     llm_call_timeout_secs: Option<u64>,
 ) -> anyhow::Result<TestHarness> {
-    let mut harness = setup_test_agent_internal(
+    setup_test_agent_internal(
         provider,
         vec![],
         llm_call_timeout_secs,
@@ -573,11 +571,7 @@ pub async fn setup_test_agent_sdk_with_llm_timeout(
         false,
         None,
     )
-    .await?;
-    harness
-        .agent
-        .set_sdk_engine(Some(crate::agent::sdk_engine::SdkEngineSettings::default()));
-    Ok(harness)
+    .await
 }
 
 /// Build a chat-path harness with the real mandate management tool and a
@@ -1323,6 +1317,119 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 /// re-planner) off; the harness turns them on so the tests that script those
 /// auxiliary calls keep exercising them. Tests that need the production
 /// default construct `PolicyConfig::default()` explicitly.
+/// A root agent on a REAL provider and model, for ignored live checks of the
+/// agent loop. Tools: system info, remember_fact, read/write file and a
+/// yolo terminal (auto-approved). Nothing here is mocked except the channel.
+pub struct LiveHarness {
+    pub agent: Agent,
+    pub state: Arc<SqliteStateStore>,
+    pub event_store: Arc<EventStore>,
+    _db_file: tempfile::NamedTempFile,
+    _skills_dir: tempfile::TempDir,
+}
+
+pub async fn setup_live_agent(
+    provider: Arc<dyn ModelProvider>,
+    provider_kind: ProviderKind,
+    model: &str,
+) -> anyhow::Result<LiveHarness> {
+    let db_file = tempfile::NamedTempFile::new()?;
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let skills_dir = tempfile::TempDir::new()?;
+    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let pool = state.pool();
+    let event_store = Arc::new(EventStore::new(pool.clone()).await?);
+
+    let (approval_tx, mut approval_rx) =
+        mpsc::channel::<crate::tools::terminal::ApprovalRequest>(16);
+    tokio::spawn(async move {
+        while let Some(request) = approval_rx.recv().await {
+            let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
+        }
+    });
+    let terminal_tool = Arc::new(
+        TerminalTool::new(
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            60,
+            8000,
+            PermissionMode::Yolo,
+            pool.clone(),
+        )
+        .await,
+    );
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SystemInfoTool),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
+        Arc::new(crate::tools::ReadFileTool),
+        Arc::new(crate::tools::WriteFileTool),
+        terminal_tool,
+    ];
+
+    let models_config = ModelsConfig {
+        default_model: model.to_string(),
+        fallback_models: Vec::new(),
+        primary: model.to_string(),
+        fast: model.to_string(),
+        smart: model.to_string(),
+    };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider,
+        router_from_models(models_config.clone()),
+        provider_kind,
+        models_config.primary.clone(),
+    );
+    let agent = Agent::new(crate::agent::AgentConstruction {
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store: event_store.clone(),
+            tools,
+        },
+        model: model.to_string(),
+        system_prompt: "You are aidaemon, a helpful personal assistant with tools.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 120,
+        max_facts: 20,
+        daily_token_budget: None,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: Some(crate::goal_tokens::GoalTokenRegistry::new()),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig::default(),
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
+    Ok(LiveHarness {
+        agent,
+        state,
+        event_store,
+        _db_file: db_file,
+        _skills_dir: skills_dir,
+    })
+}
+
 pub fn test_policy_config() -> crate::config::PolicyConfig {
     crate::config::PolicyConfig {
         pre_execution_supervision: true,

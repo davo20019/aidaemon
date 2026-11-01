@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
+
 ## [0.12.9] - 2026-10-22
 
 ### Fixed

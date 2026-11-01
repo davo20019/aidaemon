@@ -1507,10 +1507,7 @@ impl Agent {
             // it into their `ToolExecutionCtx.correction`.
             self.correction_contexts.clone(),
         );
-        #[cfg(feature = "sdk-engine")]
-        {
-            child.sdk_engine = self.sdk_engine.clone();
-        }
+        child.sdk_engine = self.sdk_engine.clone();
         let child = Arc::new(child);
 
         if let Some(spawn_tool) = spawn_tool {

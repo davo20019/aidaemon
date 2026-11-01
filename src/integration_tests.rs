@@ -18,3 +18,4 @@ include!("integration_tests/scheduler_flaw.rs");
 include!("integration_tests/intent_classifier_bench.rs");
 include!("integration_tests/background_deliverable_tests.rs");
 include!("integration_tests/live_status_surface.rs");
+include!("integration_tests/live_sdk_turns.rs");

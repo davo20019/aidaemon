@@ -1,10 +1,8 @@
-//! Experimental: run agent turns on the aidaemon SDK kernel
-//! (`crates/aidaemon-core`) instead of the legacy loop.
+//! Agent turns on the aidaemon SDK kernel (`crates/aidaemon-core`).
 //!
-//! Enabled by building with the `sdk-engine` feature and setting
-//! `[agent.engine] kind = "sdk"`. Every path that reaches
-//! `handle_message_impl` (channel ingress, internal continuations, goal task
-//! leads, spawned children) then runs one SDK run per turn.
+//! Every path that reaches `handle_message_impl` (channel ingress, internal
+//! continuations, goal task leads, spawned children) runs one SDK run per
+//! turn.
 //!
 //! What the daemon keeps owning:
 //! - the durable turn record: `TaskStart`, `UserMessage`, `AssistantResponse`
@@ -24,8 +22,9 @@
 //! [`sdk::Image`]. Gated by `[files]` vision settings and the engine model.
 //! Replayed history stays text-only, like archived turns in the legacy loop.
 //!
-//! What it drops (on purpose, for comparison): intent gating, completion
-//! contracts and the stall/recovery ladder.
+//! Not ported, on purpose: the legacy intent gate, pre-execution plan /
+//! critique / evidence gates and the guided `tool_choice` forcing ladder.
+//! Completion is the ledger closeout (`LedgerStop`), not those gates.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -50,7 +49,7 @@ use super::sdk_provider::{
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use crate::agent::vision::encode_image_attachment;
-use crate::config::{AgentEngineKind, AppConfig, ProviderKind, VisionConfig};
+use crate::config::{AppConfig, ProviderKind, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
@@ -109,11 +108,11 @@ impl Default for SdkEngineSettings {
     }
 }
 
-/// The engine settings when the config selects the SDK engine.
-pub(crate) fn settings_from_config(config: &AppConfig) -> Option<SdkEngineSettings> {
+/// The engine settings from `[agent.engine]`.
+pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
     let engine = &config.agent.engine;
-    if engine.kind != AgentEngineKind::Sdk {
-        return None;
+    if engine.kind.is_some() {
+        warn!("[agent.engine] kind is ignored: the SDK kernel is the only agent loop");
     }
     let mut model_override = engine
         .model
@@ -142,8 +141,8 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> Option<SdkEngineSettin
         model_override,
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
     };
-    info!(model_override = ?settings.model_override, "Agent engine: SDK kernel (experimental)");
-    Some(settings)
+    info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
+    settings
 }
 
 /// Everything the SDK run asks of the daemon, served on the turn's own task.
@@ -2852,7 +2851,7 @@ mod tests {
     fn engine_config(provider_kind: &str, engine: &str) -> AppConfig {
         toml::from_str(&format!(
             "[provider]\nkind = \"{provider_kind}\"\napi_key = \"test-key\"\n\n\
-             [provider.models]\ndefault = \"model-a\"\n\n[agent.engine]\nkind = \"sdk\"\n{engine}"
+             [provider.models]\ndefault = \"model-a\"\n\n[agent.engine]\n{engine}"
         ))
         .expect("parse app config")
     }
@@ -2863,7 +2862,7 @@ mod tests {
             "openai_chatgpt",
             "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
         );
-        let settings = settings_from_config(&config).expect("sdk engine selected");
+        let settings = settings_from_config(&config);
         assert_eq!(settings.model_override, None);
     }
 
@@ -2873,14 +2872,14 @@ mod tests {
             "anthropic",
             "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
         );
-        let settings = settings_from_config(&config).expect("sdk engine selected");
+        let settings = settings_from_config(&config);
         assert_eq!(settings.model_override.as_deref(), Some("claude-haiku-5-5"));
     }
 
     #[test]
     fn engine_model_pin_without_api_key_is_honored() {
         let config = engine_config("openai_chatgpt", "model = \"gpt-6-luna\"");
-        let settings = settings_from_config(&config).expect("sdk engine selected");
+        let settings = settings_from_config(&config);
         assert_eq!(settings.model_override.as_deref(), Some("gpt-6-luna"));
     }
 
@@ -2990,9 +2989,7 @@ mod tests {
             crate::testing::setup_test_agent_with_models(provider, "primary-model", "smart-model")
                 .await
                 .unwrap();
-        harness
-            .agent
-            .set_sdk_engine(Some(SdkEngineSettings::default()));
+        harness.agent.set_sdk_engine(SdkEngineSettings::default());
         harness
     }
 
@@ -3374,9 +3371,7 @@ mod tests {
         )
         .await
         .unwrap();
-        harness
-            .agent
-            .set_sdk_engine(Some(SdkEngineSettings::default()));
+        harness.agent.set_sdk_engine(SdkEngineSettings::default());
 
         let session_id = "executor_declared_checklist";
         let response = harness

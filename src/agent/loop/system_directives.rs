@@ -21,13 +21,11 @@ pub(in crate::agent) enum SystemDirective {
     EmptyResponseRetry,
     /// The previous model call ran past its per-call ceiling and is being
     /// retried; the model should take a smaller step.
-    #[cfg_attr(not(feature = "sdk-engine"), allow(dead_code))]
     ModelCallTimedOut {
         timeout_secs: u64,
     },
     /// The final reply was empty after tool work; the retry runs with tools
     /// disabled so the model must answer from the results it already has.
-    #[cfg_attr(not(feature = "sdk-engine"), allow(dead_code))]
     EmptyFinalReplyPlainText,
     TruncationRecoveryUseWriteFile,
     TruncationRecoveryTextContinuation {

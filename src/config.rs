@@ -780,28 +780,18 @@ pub struct AgentConfig {
     pub engine: AgentEngineConfig,
 }
 
-/// Which agent loop drives every turn.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentEngineKind {
-    #[default]
-    Legacy,
-    /// The experimental aidaemon SDK kernel (`crates/aidaemon-core`). Needs a
-    /// build with the `sdk-engine` feature.
-    Sdk,
-}
-
-/// `[agent.engine]`: selects the loop and configures the SDK engine.
+/// `[agent.engine]`: configures the agent kernel.
 ///
 /// ```toml
 /// [agent.engine]
-/// kind = "sdk"
 /// model = "gpt-6-sol"   # optional; pins every turn to a model the daemon's provider serves
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AgentEngineConfig {
+    /// Ignored: the SDK kernel is the only agent loop. Kept so older configs
+    /// with `kind = "legacy"` or `kind = "sdk"` still parse.
     #[serde(default)]
-    pub kind: AgentEngineKind,
+    pub kind: Option<String>,
     /// Pins every SDK turn to this model, served by the daemon's providers.
     #[serde(default)]
     pub model: Option<String>,

@@ -17,7 +17,7 @@
 #   scripts/package-macos-app.sh --build --debug # fast DEBUG build (no release opt) — for local/dev
 #
 # AIDAEMON_EXTRA_FEATURES adds cargo features to --build, e.g.
-#   AIDAEMON_EXTRA_FEATURES=sdk-engine scripts/package-macos-app.sh --build
+#   AIDAEMON_EXTRA_FEATURES=slack scripts/package-macos-app.sh --build
 #
 # See COMPUTER_USE_MACOS.md for the full walkthrough.
 set -euo pipefail

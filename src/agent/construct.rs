@@ -75,13 +75,9 @@ pub(crate) struct AgentConstruction {
 
 // impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
 impl Agent {
-    /// Run this agent's turns (and its children's) on the SDK kernel.
-    #[cfg(feature = "sdk-engine")]
-    pub(crate) fn set_sdk_engine(
-        &mut self,
-        settings: Option<super::sdk_engine::SdkEngineSettings>,
-    ) {
-        self.sdk_engine = settings.map(Arc::new);
+    /// SDK kernel settings for this agent's turns (and its children's).
+    pub(crate) fn set_sdk_engine(&mut self, settings: super::sdk_engine::SdkEngineSettings) {
+        self.sdk_engine = Arc::new(settings);
     }
 
     pub(crate) fn new(input: AgentConstruction) -> Self {
@@ -188,8 +184,7 @@ impl Agent {
             goal_id: None,
             mandate_execution: None,
             cancel_token: None,
-            #[cfg(feature = "sdk-engine")]
-            sdk_engine: None,
+            sdk_engine: Arc::default(),
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
@@ -431,8 +426,7 @@ impl Agent {
             goal_id,
             mandate_execution,
             cancel_token,
-            #[cfg(feature = "sdk-engine")]
-            sdk_engine: None,
+            sdk_engine: Arc::default(),
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
