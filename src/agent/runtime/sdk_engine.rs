@@ -818,7 +818,7 @@ impl Agent {
             suppress_trusted_session: false,
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
-            mutation_forbidden: false,
+            mutation_forbidden: scope.contract.authority().forbids_mutation,
             scope_escalation: None,
         };
         let started = Instant::now();
@@ -829,11 +829,18 @@ impl Agent {
         // allowed tools, forbidden scopes), then for mandate runs the same
         // per-call authority gate as the legacy loop, which issues the
         // bounded grant or refuses the call.
+        // Judged per call: a mixed tool such as `terminal` is not read-only
+        // as a whole, but a call its adapter types as a pure observation is
+        // (the tool still enforces `mutation_forbidden` itself).
         let read_only = self
             .tools
             .iter()
             .find(|tool| tool.name() == request.name)
-            .map(|tool| tool.capabilities().read_only);
+            .map(|tool| {
+                tool.capabilities().read_only
+                    || (call_semantics.effect == crate::traits::ToolCallEffect::Observation
+                        && !call_semantics.mutates_state())
+            });
         let admitted =
             super::closeout::ClosingAuthority::from_authority(scope.contract.authority())
                 .admits_tool(&request.name, read_only);
@@ -3563,6 +3570,96 @@ mod tests {
             .count();
         assert_eq!(dispatched, 0);
         assert_eq!(reply.text, "I could not save it.");
+    }
+
+    /// A shell-like tool: not read-only as a whole, but each call says
+    /// whether it writes (`{"write": true}`), as `terminal` does.
+    struct ShellProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::traits::Tool for ShellProbe {
+        fn name(&self) -> &str {
+            "shell_probe"
+        }
+        fn description(&self) -> &str {
+            "Runs a synthetic command."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "name": "shell_probe",
+                "description": "Runs a synthetic command.",
+                "parameters": {"type": "object", "properties": {"write": {"type": "boolean"}}}
+            })
+        }
+        fn capabilities(&self) -> crate::traits::ToolCapabilities {
+            crate::traits::ToolCapabilities {
+                read_only: false,
+                external_side_effect: false,
+                needs_approval: false,
+                idempotent: true,
+                high_impact_write: false,
+            }
+        }
+        fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+            let writes = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|args| args["write"].as_bool())
+                .unwrap_or(true);
+            if writes {
+                crate::traits::ToolCallSemantics::mutation()
+            } else {
+                crate::traits::ToolCallSemantics::observation()
+            }
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("acme.md\nmia.txt".to_string())
+        }
+    }
+
+    /// A read-only request must not lose a mixed tool such as `terminal`:
+    /// the authority lane judges the exact call, as the legacy loop did.
+    #[tokio::test]
+    async fn read_only_contract_admits_observing_calls_of_a_mixed_tool() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let base = MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            true,
+            &[],
+            "new_request",
+            "none",
+        );
+        let mut assessment: serde_json::Value =
+            serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+        assessment["schema_version"] = 10.into();
+        assessment["contract"]["mutation_scope"] = "read_only".into();
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("shell_probe", r#"{"write":false}"#),
+            MockProvider::tool_call_response("shell_probe", r#"{"write":true}"#),
+            MockProvider::text_response("acme.md is the markdown file."),
+        ])
+        .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            provider,
+            vec![Arc::new(ShellProbe(calls.clone()))],
+            None,
+        )
+        .await
+        .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Which file in the folder is markdown?"))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the observing call runs; the writing call is refused"
+        );
+        assert_eq!(reply.text, "acme.md is the markdown file.");
     }
 
     #[test]
