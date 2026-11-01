@@ -774,7 +774,7 @@ pub(super) fn is_hard_policy_tool_budget_reached(
     policy_tool_budget > 0 && total_tool_calls_attempted >= policy_tool_budget
 }
 
-pub(super) fn tool_result_indicates_background_detach(
+pub(in crate::agent) fn tool_result_indicates_background_detach(
     tool_name: &str,
     result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
@@ -788,7 +788,7 @@ pub(super) fn tool_result_indicates_background_detach(
         || result_text.contains("spawned in background")
 }
 
-pub(super) fn build_background_detach_ack(
+pub(in crate::agent) fn build_background_detach_ack(
     tool_name: &str,
     result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
@@ -825,7 +825,7 @@ pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
         || lower == "request completed successfully"
 }
 
-pub(super) fn summarize_completed_tool_result(result_text: &str) -> String {
+pub(in crate::agent) fn summarize_completed_tool_result(result_text: &str) -> String {
     let summary = crate::traits::first_primary_message_line(result_text, &[])
         .filter(|line| !line.trim().is_empty())
         .unwrap_or_else(|| "Completed".to_string());
@@ -847,7 +847,7 @@ pub(super) fn has_nonzero_exit_code(text: &str) -> bool {
     false
 }
 
-pub(super) fn build_external_action_completion_ack(result_text: &str) -> String {
+pub(in crate::agent) fn build_external_action_completion_ack(result_text: &str) -> String {
     let primary = crate::traits::extract_primary_message_content(result_text, &[]);
     let filtered: String = primary
         .lines()
@@ -894,7 +894,7 @@ pub(crate) fn user_facing_external_action_ack(ack: &str) -> String {
     )
 }
 
-pub(super) fn should_build_external_action_ack(result_text: &str) -> bool {
+pub(in crate::agent) fn should_build_external_action_ack(result_text: &str) -> bool {
     let primary = crate::traits::extract_primary_message_content(result_text, &[]);
     let lower = primary.trim_start().to_ascii_lowercase();
     !lower.starts_with("request blocked:")

@@ -13,11 +13,19 @@ pub(in crate::agent) use project_dir::project_instruction_targets_for_tool_call;
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::run_tool_execution_phase;
 #[cfg(feature = "sdk-engine")]
-pub(in crate::agent) use run::{mandate_gate_for_tool_call, MandateGateDecision};
+pub(in crate::agent) use run::{
+    mandate_gate_for_tool_call, parse_checklist_from_result, MandateGateDecision,
+};
 pub(in crate::agent) use run_helpers::{
     accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,
     evidence_requirement_accepts_nonstandard_outcome, fallback_tool_semantic_scope,
     matching_evidence_requirement_indices, observation_matches_completion_contract,
     tool_result_or_metadata_contains_verifiable_evidence, user_facing_external_action_ack,
+};
+#[cfg(feature = "sdk-engine")]
+pub(in crate::agent) use run_helpers::{
+    build_background_detach_ack, build_external_action_completion_ack,
+    should_build_external_action_ack, summarize_completed_tool_result,
+    tool_result_indicates_background_detach,
 };
 pub(in crate::agent) use types::ToolExecutionCtx;

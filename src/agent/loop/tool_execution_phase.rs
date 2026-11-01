@@ -8,7 +8,12 @@ pub(super) use phase_impl::{
     evidence_requirement_accepts_nonstandard_outcome, matching_evidence_requirement_indices,
     observation_matches_completion_contract, tool_result_or_metadata_contains_verifiable_evidence,
 };
-pub(super) use phase_impl::{fallback_tool_semantic_scope, run_tool_execution_phase};
 #[cfg(feature = "sdk-engine")]
-pub(super) use phase_impl::{mandate_gate_for_tool_call, MandateGateDecision};
+pub(super) use phase_impl::{build_background_detach_ack, tool_result_indicates_background_detach};
+#[cfg(feature = "sdk-engine")]
+pub(super) use phase_impl::{
+    build_external_action_completion_ack, mandate_gate_for_tool_call, parse_checklist_from_result,
+    should_build_external_action_ack, summarize_completed_tool_result, MandateGateDecision,
+};
+pub(super) use phase_impl::{fallback_tool_semantic_scope, run_tool_execution_phase};
 pub(super) use phase_impl::{PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx};

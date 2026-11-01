@@ -60,6 +60,11 @@ const DEFAULT_MAX_TURNS: u32 = 40;
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
+const BACKGROUND_HANDOFF_STOP: &str = "work moved to the background";
+/// Model-call timeouts, as in the legacy LLM phase.
+const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
+const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
+const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
 const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
 
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
@@ -127,6 +132,8 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
     /// Post-task learning state from bootstrap; the run adds its tool calls.
     pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
+    /// The assessed task shape continues inline work after a background start.
+    pub(in crate::agent) continue_inline_after_background: bool,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -663,6 +670,14 @@ struct TurnScope<'a> {
     latest_tool_output: std::sync::Mutex<Option<String>>,
     /// The one reply retry has been spent.
     reply_retry_used: AtomicBool,
+    /// The assessed task shape keeps inline work going after a detach.
+    continue_inline_after_background: bool,
+    /// The neutral handoff reply once work moved to the background.
+    background_ack: std::sync::Mutex<Option<String>>,
+    /// Ends the run at the next turn boundary (a background handoff).
+    end_run: Arc<AtomicBool>,
+    /// Confirmation of the latest successful external change.
+    external_action_ack: std::sync::Mutex<Option<String>>,
     /// The latest provider note (for example a safety finish reason).
     response_note: std::sync::Mutex<Option<String>>,
     /// Set when a call moved work to the background with completion
@@ -785,6 +800,18 @@ impl Agent {
         let call_semantics = self
             .semantics_for_exact_tool_call(&request.name, arguments)
             .await;
+        // User-facing activity labels, as the legacy tool phase sends them;
+        // `track_requirements` shows its checklist instead.
+        if request.name != "track_requirements" {
+            let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                &request.name,
+                &crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments),
+                scope.channel_ctx.visibility,
+            );
+            if let Some(status_tx) = &scope.status_tx {
+                let _ = status_tx.try_send(StatusUpdate::ToolStart { name, summary });
+            }
+        }
         let (output, images, metadata, receipt) = match self
             .execute_tool_outcome(&request.name, arguments, &ctx)
             .await
@@ -839,14 +866,33 @@ impl Agent {
                          (vision is off, unsupported, or the file is too large or unreadable).",
                     );
                 }
-                let backgrounded = outcome.metadata.background_started || outcome.metadata.detached;
-                if backgrounded && outcome.metadata.completion_notifications_enabled {
-                    scope.background_handoff.store(true, Ordering::Relaxed);
-                    output.push_str(
-                        "\n\n[SYSTEM] Completion notifications are enabled for this background \
-                         work: its result will be delivered to this conversation automatically \
-                         when it finishes.",
-                    );
+                // The legacy detach transition, decided at the typed receipt:
+                // detached work is the handoff unless the assessed task shape
+                // keeps independent inline work going.
+                if super::tool_execution_phase::tool_result_indicates_background_detach(
+                    &request.name,
+                    &output,
+                    &outcome.metadata,
+                ) {
+                    let directive = if scope.continue_inline_after_background {
+                        super::system_directives::SystemDirective::BackgroundProcessContinue
+                    } else {
+                        if let Ok(mut ack) = scope.background_ack.lock() {
+                            *ack = Some(super::tool_execution_phase::build_background_detach_ack(
+                                &request.name,
+                                &output,
+                                &outcome.metadata,
+                            ));
+                        }
+                        scope.end_run.store(true, Ordering::Relaxed);
+                        super::system_directives::SystemDirective::BackgroundHandoff {
+                            notifications_active: outcome.metadata.completion_notifications_enabled,
+                        }
+                    };
+                    if outcome.metadata.completion_notifications_enabled {
+                        scope.background_handoff.store(true, Ordering::Relaxed);
+                    }
+                    output = format!("{output}\n\n{}", directive.render());
                 }
                 (output, images, Some(outcome.metadata), Some(receipt))
             }
@@ -859,6 +905,47 @@ impl Agent {
         let duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
+        }
+        if let Some(status_tx) = &scope.status_tx {
+            let update = if request.name == "track_requirements" {
+                super::tool_execution_phase::parse_checklist_from_result(&output)
+                    .map(|text| StatusUpdate::Checklist { text })
+            } else {
+                let source = if matches!(request.name.as_str(), "manage_memories" | "manage_people")
+                {
+                    crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
+                } else {
+                    super::tool_execution_phase::summarize_completed_tool_result(&output)
+                };
+                let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                    &request.name,
+                    &source,
+                    scope.channel_ctx.visibility,
+                );
+                Some(StatusUpdate::ToolComplete { name, summary })
+            };
+            if let Some(update) = update {
+                let _ = status_tx.try_send(update);
+            }
+        }
+        // A receipt-backed confirmation of an external change, delivered if
+        // the model cannot be reached afterwards.
+        let external_mutation = metadata.as_ref().is_some_and(|metadata| {
+            metadata.semantics.mutates_state()
+                && !(metadata.background_started || metadata.detached)
+        }) && self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == request.name)
+            .is_some_and(|tool| tool.capabilities().external_side_effect);
+        if external_mutation {
+            if let Ok(mut ack) = scope.external_action_ack.lock() {
+                *ack = (!failed
+                    && super::tool_execution_phase::should_build_external_action_ack(&output))
+                .then(|| {
+                    super::tool_execution_phase::build_external_action_completion_ack(&output)
+                });
+            }
         }
         if let Ok(mut learning) = scope.learning.lock() {
             let rejected = metadata
@@ -1102,8 +1189,20 @@ impl Agent {
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = super::llm::LlmCallTelemetry::default();
         let started = Instant::now();
-        let result = self
-            .call_llm_with_recovery(
+        // The legacy per-call ceiling: a hung provider must not hold the turn.
+        let ceiling = if self.mandate_execution.is_some() {
+            MANDATE_MAX_MODEL_CALL
+        } else {
+            FOREGROUND_MAX_MODEL_CALL
+        };
+        let timeout = self
+            .limits
+            .llm_call_timeout
+            .unwrap_or(DEFAULT_MODEL_CALL_TIMEOUT)
+            .min(ceiling);
+        let result = match tokio::time::timeout(
+            timeout,
+            self.call_llm_with_recovery(
                 snapshot.provider(),
                 snapshot.router(),
                 &request.model,
@@ -1112,8 +1211,16 @@ impl Agent {
                 &options,
                 &mut telemetry,
                 None,
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "model call timed out after {}s",
+                timeout.as_secs()
+            )),
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let response = match result {
             Ok(response) => response,
@@ -1356,6 +1463,7 @@ impl Agent {
             prefix,
             contract,
             learning_ctx,
+            continue_inline_after_background,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1394,6 +1502,14 @@ impl Agent {
                 });
             }
         }
+        // A background handoff ends the run before the next model call.
+        let end_run = Arc::new(AtomicBool::new(false));
+        let end_flag = end_run.clone();
+        builder = builder.stop_when(move |_: &sdk::RunSnapshot| {
+            end_flag
+                .load(Ordering::Relaxed)
+                .then(|| BACKGROUND_HANDOFF_STOP.to_string())
+        });
         builder = builder.hook(SameToolLimit);
         builder = builder.hook(LedgerStop {
             calls: calls_tx.clone(),
@@ -1410,14 +1526,6 @@ impl Agent {
                 sdk::Event::TurnStarted { turn } if *turn > 0 => {
                     StatusUpdate::Thinking(*turn as usize)
                 }
-                sdk::Event::ToolStarted { tool, .. } => StatusUpdate::ToolStart {
-                    name: tool.clone(),
-                    summary: String::new(),
-                },
-                sdk::Event::ToolFinished { receipt } => StatusUpdate::ToolComplete {
-                    name: receipt.tool.clone(),
-                    summary: format!("{:?}", receipt.status).to_lowercase(),
-                },
                 _ => return,
             };
             let _ = status_tx.try_send(update);
@@ -1462,6 +1570,10 @@ impl Agent {
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             response_note: std::sync::Mutex::new(None),
+            external_action_ack: std::sync::Mutex::new(None),
+            continue_inline_after_background,
+            background_ack: std::sync::Mutex::new(None),
+            end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
@@ -1507,6 +1619,31 @@ impl Agent {
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {
                 let (reply, status, task_outcome) = reply_for(&outcome);
+                let external_ack = scope
+                    .external_action_ack
+                    .lock()
+                    .ok()
+                    .and_then(|ack| ack.clone());
+                let background_ack = scope.background_ack.lock().ok().and_then(|ack| ack.clone());
+                let (reply, status, task_outcome) = match (&outcome.status, background_ack) {
+                    (sdk::RunStatus::Stopped { reason }, Some(ack))
+                        if reason == BACKGROUND_HANDOFF_STOP =>
+                    {
+                        (ack, TaskStatus::Completed, TaskOutcome::Partial)
+                    }
+                    _ => (reply, status, task_outcome),
+                };
+                let (reply, status, task_outcome) = match (&outcome.status, external_ack) {
+                    (
+                        sdk::RunStatus::ProviderFailed { .. } | sdk::RunStatus::LimitReached { .. },
+                        Some(ack),
+                    ) => (
+                        super::tool_execution_phase::user_facing_external_action_ack(&ack),
+                        TaskStatus::Completed,
+                        TaskOutcome::Succeeded,
+                    ),
+                    _ => (reply, status, task_outcome),
+                };
                 let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
                     let tool_calls = scope
                         .learning

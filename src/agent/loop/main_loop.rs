@@ -1431,6 +1431,9 @@ impl Agent {
                 prefix,
                 contract: turn_context.completion_contract.clone(),
                 learning_ctx: learning_ctx.clone(),
+                continue_inline_after_background: turn_context
+                    .continue_inline_after_background_start
+                    || execution_state.linear_intent_plan_has_remaining_steps(),
             };
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(
