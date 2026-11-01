@@ -294,6 +294,7 @@ fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<
                 | "--dangerously-bypass-hook-trust"
                 | "--full-auto"
                 | "--ignore-user-config"
+                | "--skip-git-repo-check"
         ) || argument.starts_with("--sandbox=")
             || argument.starts_with("-s=")
             || argument.starts_with("--add-dir=")
@@ -310,6 +311,10 @@ fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<
         index = index.saturating_add(1);
     }
     constrained.push("--ignore-user-config".to_string());
+    // Ignoring the user config also drops its trusted-project list, so codex
+    // would refuse every directory outside a git repository; the sandbox set
+    // here is the trust boundary.
+    constrained.push("--skip-git-repo-check".to_string());
     constrained.push("--sandbox".to_string());
     constrained.push("read-only".to_string());
     *args = constrained;
@@ -360,6 +365,7 @@ fn apply_scoped_cli_adapter(
                 | "--dangerously-bypass-hook-trust"
                 | "--full-auto"
                 | "--ignore-user-config"
+                | "--skip-git-repo-check"
         ) || argument.starts_with("--sandbox=")
             || argument.starts_with("-s=")
             || argument.starts_with("--add-dir=")
@@ -400,6 +406,7 @@ fn apply_scoped_cli_adapter(
         .collect::<Vec<_>>()
         .join(",");
     constrained.push("--ignore-user-config".to_string());
+    constrained.push("--skip-git-repo-check".to_string());
     constrained.extend([
         "-c".to_string(),
         format!("default_permissions={}", toml_string(PROFILE)),
@@ -4691,6 +4698,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--add-dir"));
         assert!(!args.iter().any(|arg| arg == "/synthetic/extra"));
         assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--sandbox", "read-only"]));
@@ -4727,6 +4735,12 @@ mod tests {
             "permissions.aidaemon-task.filesystem={\":minimal\"=\"read\",\"/synthetic/source/Cargo.toml\"=\"read\",\"/tmp/synthetic-result\"=\"write\"}"
         ));
         assert!(joined.contains("permissions.aidaemon-task.network.enabled=false"));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--skip-git-repo-check")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
