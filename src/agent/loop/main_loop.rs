@@ -528,10 +528,10 @@ impl Agent {
         // diagnostics, but TaskEnd must never report only the post-bootstrap
         // suffix of a request.
         #[cfg(feature = "sdk-engine")]
-        if let Some(engine) = super::sdk_engine::active() {
+        if let Some(engine) = self.sdk_engine.clone() {
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(
-                engine,
+                &engine,
                 session_id,
                 user_text,
                 attachments,

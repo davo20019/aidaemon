@@ -30,18 +30,23 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
+use super::sdk_provider::{
+    from_provider_response, to_chat_options, to_daemon_messages, to_daemon_tools, DaemonProvider,
+    ModelCall,
+};
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
@@ -50,7 +55,6 @@ use crate::events::{EventEmitter, EventType, TaskEndData, TaskOutcome, TaskStart
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment, ToolOutcomeStatus};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
-const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_MAX_TURNS: u32 = 40;
 /// Prior dialogue messages (including tool calls and results) replayed into
 /// each run.
@@ -63,57 +67,56 @@ const REPLAYED_TOOL_RESULT_CHARS: usize = 2_000;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
 
-pub(crate) struct SdkEngine {
-    provider: Arc<dyn sdk::Provider>,
-    model: String,
-    max_turns: u32,
+/// How turns run on the SDK kernel. Held by the root agent and inherited by
+/// every child it spawns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SdkEngineSettings {
+    /// `[agent.engine] model`: pins every turn to this model instead of the
+    /// daemon's own selection.
+    pub(crate) model_override: Option<String>,
+    pub(crate) max_turns: u32,
 }
 
-static ENGINE: OnceLock<SdkEngine> = OnceLock::new();
+impl Default for SdkEngineSettings {
+    fn default() -> Self {
+        Self {
+            model_override: None,
+            max_turns: DEFAULT_MAX_TURNS,
+        }
+    }
+}
 
-/// Install the SDK engine when the config selects it. Returns whether it is
-/// active. Called once at startup, before any channel starts.
-pub(crate) fn install(config: &AppConfig) -> anyhow::Result<bool> {
+/// The engine settings when the config selects the SDK engine.
+pub(crate) fn settings_from_config(config: &AppConfig) -> Option<SdkEngineSettings> {
     let engine = &config.agent.engine;
     if engine.kind != AgentEngineKind::Sdk {
-        return Ok(false);
+        return None;
     }
-    let api_key = if engine.api_key.trim().is_empty() {
-        std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-            anyhow::anyhow!(
-                "[agent.engine] kind = \"sdk\" needs api_key (or ANTHROPIC_API_KEY in the environment)"
-            )
-        })?
-    } else {
-        engine.api_key.clone()
-    };
-    let provider = aidaemon_providers::Anthropic::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|error| anyhow::anyhow!("SDK engine provider: {error}"))?;
-    let model = engine
-        .model
-        .clone()
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let installed = SdkEngine {
-        provider: Arc::new(sdk::Retry::new(provider)),
-        model: model.clone(),
+    if !engine.api_key.trim().is_empty() {
+        warn!(
+            "[agent.engine] api_key is ignored: the SDK engine uses the daemon's configured \
+             providers"
+        );
+    }
+    let settings = SdkEngineSettings {
+        model_override: engine
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty()),
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
     };
-    if ENGINE.set(installed).is_err() {
-        anyhow::bail!("SDK engine installed twice");
-    }
-    info!(model, "Agent engine: SDK kernel (experimental)");
-    Ok(true)
+    info!(model_override = ?settings.model_override, "Agent engine: SDK kernel (experimental)");
+    Some(settings)
 }
 
-pub(crate) fn active() -> Option<&'static SdkEngine> {
-    ENGINE.get()
+/// Everything the SDK run asks of the daemon, served on the turn's own task.
+pub(super) enum DaemonCall {
+    Tool(ToolRequest),
+    Model(ModelCall),
 }
 
 /// One tool call handed from the SDK run to the daemon dispatcher.
-struct ToolRequest {
+pub(super) struct ToolRequest {
     name: String,
     arguments: Value,
     call_id: String,
@@ -125,7 +128,7 @@ struct ToolRequest {
 struct BridgedTool {
     spec: sdk::ToolSpec,
     read_only: bool,
-    calls: mpsc::Sender<ToolRequest>,
+    calls: mpsc::Sender<DaemonCall>,
 }
 
 #[async_trait]
@@ -149,12 +152,12 @@ impl sdk::Tool for BridgedTool {
     async fn call(&self, arguments: Value, ctx: &sdk::ToolContext) -> sdk::ToolResult {
         let (reply, answer) = oneshot::channel();
         self.calls
-            .send(ToolRequest {
+            .send(DaemonCall::Tool(ToolRequest {
                 name: self.spec.name.clone(),
                 arguments,
                 call_id: ctx.call_id.clone(),
                 reply,
-            })
+            }))
             .await
             .map_err(|_| sdk::ToolError("tool dispatcher stopped".to_string()))?;
         answer
@@ -509,6 +512,43 @@ impl Agent {
         let _ = request.reply.send(result);
     }
 
+    /// Make one model call for the SDK run through the daemon's provider
+    /// stack: billing-aware retries, the fallback cascade and failover
+    /// providers all apply, exactly as for a legacy-loop call.
+    async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
+        let snapshot = self.llm_runtime.snapshot();
+        let messages = to_daemon_messages(&call.request);
+        let tools = to_daemon_tools(&call.request.tools);
+        let options = to_chat_options(&call.request.tool_choice, call.request.max_output_tokens);
+        let mut telemetry = super::llm::LlmCallTelemetry::default();
+        let result = self
+            .call_llm_with_recovery(
+                snapshot.provider(),
+                snapshot.router(),
+                &call.request.model,
+                &messages,
+                &tools,
+                &options,
+                &mut telemetry,
+                None,
+            )
+            .await;
+        let reply = match result {
+            Ok(response) => Ok(from_provider_response(response)),
+            Err(error) => {
+                warn!(
+                    session_id = scope.session_id,
+                    task_id = scope.task_id,
+                    model = %call.request.model,
+                    %error,
+                    "SDK engine: model call failed after recovery"
+                );
+                Err(sdk::ProviderError::Other(error.to_string()))
+            }
+        };
+        let _ = call.reply.send(reply);
+    }
+
     /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact
     /// call, or the refusal text the model should see.
     async fn sdk_mandate_gate(
@@ -625,7 +665,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_message_sdk(
         &self,
-        engine: &SdkEngine,
+        engine: &SdkEngineSettings,
         session_id: &str,
         user_text: &str,
         attachments: &[MessageAttachment],
@@ -636,6 +676,10 @@ impl Agent {
         parent_task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
+        let model = match &engine.model_override {
+            Some(model) => model.clone(),
+            None => self.model.read().await.clone(),
+        };
         anyhow::ensure!(
             self.mandate_execution.is_none() || attachments.is_empty(),
             "mandate workers cannot receive attachment-derived context"
@@ -647,7 +691,7 @@ impl Agent {
             attachments,
             &self.stt_config,
             &self.audio_config,
-            &engine.model,
+            &model,
         )
         .await;
         let user_text = enriched.as_str();
@@ -701,7 +745,7 @@ impl Agent {
         let (images, vision_skipped) = sdk_images(
             &attachments.iter().collect::<Vec<_>>(),
             &self.vision_config,
-            &engine.model,
+            &model,
         );
 
         // The legacy prompt builder: identity, matched skills, channel-scoped
@@ -753,11 +797,13 @@ impl Agent {
 
         // Tools: every registered daemon tool, unless the caller may not use
         // tools at all (the dispatcher would refuse each call anyway).
-        let (calls_tx, mut calls_rx) = mpsc::channel::<ToolRequest>(16);
+        let (calls_tx, mut calls_rx) = mpsc::channel::<DaemonCall>(16);
         let mut builder = sdk::Agent::builder("aidaemon")
-            .model(engine.model.clone())
+            .model(model.clone())
             .instructions(instructions)
-            .provider(engine.provider.clone())
+            .provider(DaemonProvider {
+                calls: calls_tx.clone(),
+            })
             .limits(sdk::Limits {
                 max_turns: engine.max_turns,
                 tool_timeout: TOOL_TIMEOUT,
@@ -822,7 +868,7 @@ impl Agent {
             status_tx: status_tx.clone(),
             channel_ctx: &channel_ctx,
             user_role,
-            model: &engine.model,
+            model: &model,
             tool_attachments: Mutex::new(HashMap::new()),
             background_handoff: AtomicBool::new(false),
         };
@@ -833,9 +879,14 @@ impl Agent {
         let outcome = loop {
             tokio::select! {
                 outcome = &mut run => break outcome,
-                Some(request) = calls_rx.recv() => {
-                    in_flight.push(self.dispatch_sdk_tool_call(&scope, request));
-                }
+                Some(call) = calls_rx.recv() => match call {
+                    DaemonCall::Tool(request) => {
+                        in_flight.push(self.dispatch_sdk_tool_call(&scope, request).boxed());
+                    }
+                    DaemonCall::Model(call) => {
+                        in_flight.push(self.serve_sdk_model_call(&scope, call).boxed());
+                    }
+                },
                 Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
                 _ = tick.tick() => touch_heartbeat(&heartbeat),
             }
@@ -872,7 +923,7 @@ impl Agent {
                     session_id,
                     &task_id,
                     &turn_id,
-                    &engine.model,
+                    &model,
                     produced,
                     outcome.receipts(),
                     tool_attachments,
@@ -889,7 +940,7 @@ impl Agent {
                     self.append_background_handoff_message_with_event(
                         &emitter,
                         &assistant,
-                        &engine.model,
+                        &model,
                         input_tokens,
                         output_tokens,
                     )
@@ -898,7 +949,7 @@ impl Agent {
                     self.append_assistant_message_with_event(
                         &emitter,
                         &assistant,
-                        &engine.model,
+                        &model,
                         input_tokens,
                         output_tokens,
                     )
@@ -1110,34 +1161,8 @@ mod tests {
         assert!(replayed.len() < long.len());
     }
 
-    /// Live check of the whole daemon path on the SDK engine: channel ingress
-    /// envelope, a daemon tool dispatched through the bridge, and dialogue
-    /// carried into the next turn. Needs a real key and installs the engine
-    /// process-wide, so run it alone:
-    /// `ANTHROPIC_API_KEY=... cargo test --features sdk-engine --lib live_sdk_engine -- --ignored`
-    #[tokio::test]
-    #[ignore = "calls the Anthropic API; needs ANTHROPIC_API_KEY"]
-    async fn live_sdk_engine_runs_daemon_turns() {
-        use crate::runtime_ports::{AgentIngress, InboundMessageRequest};
-        use crate::traits::store_prelude::*;
-
-        let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
-        let model =
-            std::env::var("AIDAEMON_MODEL").unwrap_or_else(|_| "claude-haiku-5-5".to_string());
-        let provider = aidaemon_providers::Anthropic::builder()
-            .api_key(api_key)
-            .build()
-            .unwrap();
-        let _ = ENGINE.set(SdkEngine {
-            provider: Arc::new(sdk::Retry::new(provider)),
-            model,
-            max_turns: 10,
-        });
-
-        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
-            .await
-            .unwrap();
-        let ask = |text: &str| InboundMessageRequest {
+    fn owner_request(text: &str) -> crate::runtime_ports::InboundMessageRequest {
+        crate::runtime_ports::InboundMessageRequest {
             session_id: "telegram:synthetic-user-1".to_string(),
             user_text: text.to_string(),
             attachments: Vec::new(),
@@ -1146,55 +1171,48 @@ mod tests {
             channel_ctx: ChannelContext::private("telegram"),
             heartbeat: None,
             ingress_timing: None,
-        };
+        }
+    }
 
-        let first = harness
-            .agent
-            .handle_inbound_message(ask(
-                "Use the remember_fact tool to save that my favorite color is teal \
-                 (category: preference, key: favorite_color). Then confirm in one sentence.",
-            ))
+    /// The whole daemon path on the SDK engine with the mock provider behind
+    /// the daemon's provider stack: a tool dispatched through the bridge, the
+    /// final answer delivered, and the tool result recorded.
+    #[tokio::test]
+    async fn sdk_engine_runs_on_mock_provider() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        use crate::traits::store_prelude::*;
+
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"favorite_color","value":"teal"}"#,
+            ),
+            MockProvider::text_response("Saved."),
+        ]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
             .await
             .unwrap();
-        assert!(!first.response_id.is_empty() && !first.task_id.is_empty());
-        let recorded_results = harness
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Remember that my favorite color is teal."))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "Saved.");
+        assert_eq!(harness.provider.call_count().await, 2);
+        let results = harness
             .agent
             .event_store
             .task_event_count(
                 "telegram:synthetic-user-1",
-                &first.task_id,
+                &reply.task_id,
                 EventType::ToolResult,
             )
             .await
             .unwrap();
-        assert!(recorded_results >= 1, "tool result was not recorded");
+        assert_eq!(results, 1);
         let facts = harness.state.get_facts(None).await.unwrap();
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.value.to_lowercase().contains("teal")),
-            "remember_fact was not dispatched: {facts:?}; reply: {}",
-            first.text
-        );
-
-        let second = harness
-            .agent
-            .handle_inbound_message(ask(
-                "Without using any tools: what favorite color did I mention earlier? One word.",
-            ))
-            .await
-            .unwrap();
-        assert!(
-            second.text.to_lowercase().contains("teal"),
-            "history not carried over: {}",
-            second.text
-        );
-        assert_ne!(first.task_id, second.task_id);
-        assert_eq!(
-            harness.provider.call_count().await,
-            0,
-            "legacy provider must not be called on the SDK engine"
-        );
+        assert!(facts.iter().any(|fact| fact.value.contains("teal")));
     }
 
     #[test]

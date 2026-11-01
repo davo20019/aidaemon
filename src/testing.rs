@@ -551,6 +551,17 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
 }
 
+/// Like [`setup_test_agent`], with every turn on the SDK kernel and the mock
+/// provider behind the daemon's provider stack.
+#[cfg(feature = "sdk-engine")]
+pub async fn setup_test_agent_sdk(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    let mut harness = setup_test_agent(provider).await?;
+    harness
+        .agent
+        .set_sdk_engine(Some(crate::agent::sdk_engine::SdkEngineSettings::default()));
+    Ok(harness)
+}
+
 /// Build a chat-path harness with the real mandate management tool and a
 /// deterministic one-time owner confirmation responder.
 pub async fn setup_test_agent_with_mandates(provider: MockProvider) -> anyhow::Result<TestHarness> {

@@ -252,6 +252,9 @@ mod project_scope;
 #[cfg(feature = "sdk-engine")]
 #[path = "runtime/sdk_engine.rs"]
 pub(crate) mod sdk_engine;
+#[cfg(feature = "sdk-engine")]
+#[path = "runtime/sdk_provider.rs"]
+mod sdk_provider;
 pub(crate) mod specialists;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
@@ -463,6 +466,9 @@ pub struct Agent {
     mandate_execution: Option<MandateExecutionFence>,
     /// Cancellation token — checked each iteration; cancelled by parent or user.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Set when turns run on the SDK kernel; inherited by spawned children.
+    #[cfg(feature = "sdk-engine")]
+    sdk_engine: Option<Arc<sdk_engine::SdkEngineSettings>>,
     /// Goal cancellation token registry — shared across agent hierarchy.
     goal_token_registry: Option<GoalTokenRegistry>,
     /// Weak reference to the ChannelHub for background notifications.

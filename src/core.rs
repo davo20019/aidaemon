@@ -162,14 +162,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     ));
 
     #[cfg(feature = "sdk-engine")]
-    crate::agent::sdk_engine::install(&config)?;
+    let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config);
     #[cfg(not(feature = "sdk-engine"))]
     anyhow::ensure!(
         config.agent.engine.kind == crate::config::AgentEngineKind::Legacy,
         "[agent.engine] kind = \"sdk\" needs a build with the `sdk-engine` feature"
     );
 
-    let agent = Arc::new(Agent::new(crate::agent::AgentConstruction {
+    #[allow(unused_mut)]
+    let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             llm_runtime: llm_runtime.clone(),
             state: state.clone(),
@@ -212,7 +213,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         audio_config: AudioConfig::from_files(&config.files),
         stt_config: SttConfig::from_files(&config.files),
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
-    }));
+    });
+    #[cfg(feature = "sdk-engine")]
+    agent.set_sdk_engine(sdk_engine);
+    let agent = Arc::new(agent);
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;

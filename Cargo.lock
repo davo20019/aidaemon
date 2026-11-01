@@ -73,7 +73,6 @@ dependencies = [
  "aes-gcm",
  "aidaemon-core",
  "aidaemon-node-protocol",
- "aidaemon-providers",
  "anyhow",
  "assert_cmd",
  "async-imap",

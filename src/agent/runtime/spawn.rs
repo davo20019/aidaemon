@@ -1457,7 +1457,8 @@ impl Agent {
         } else {
             self.specialists.clone()
         };
-        let child = Arc::new(Agent::with_depth(
+        #[allow(unused_mut)]
+        let mut child = Agent::with_depth(
             self.llm_runtime.clone(),
             self.state.clone(),
             self.event_store.clone(),
@@ -1505,7 +1506,12 @@ impl Agent {
             // can all read the same `Arc<CorrectionExecutionContext>` and thread
             // it into their `ToolExecutionCtx.correction`.
             self.correction_contexts.clone(),
-        ));
+        );
+        #[cfg(feature = "sdk-engine")]
+        {
+            child.sdk_engine = self.sdk_engine.clone();
+        }
+        let child = Arc::new(child);
 
         if let Some(spawn_tool) = spawn_tool {
             let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = child.clone();
