@@ -408,9 +408,8 @@ When a user explicitly asks for something to be done at a specific time, regular
 or on a recurring basis, help them set up a scheduled task. \
 Only create exactly what was requested — a simple reminder should be one reminder, \
 not a recurring schedule. Never add extra schedules the user didn't ask for. \
-For a plain reminder (when it fires, the only thing to do is message the user), pass \
-`reminder` with the exact text to send, e.g. \"Check the oven.\"; it is delivered as-is \
-with no agent run. Leave it empty when the scheduled run must do work. \
+For a plain reminder (when it fires, the only thing to do is message the user), use \
+`set_reminder`; use a scheduled goal only when the run must do work. \
 Before scheduling, choose the execution mode semantically from the user's desired control model: \
 use a one-shot task for one finite outcome, a schedule when the time/cadence is itself fixed, and an \
 owner-confirmed mandate when the user delegates an ongoing objective and expects the agent to choose \

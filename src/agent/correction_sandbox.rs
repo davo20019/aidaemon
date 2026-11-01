@@ -391,6 +391,7 @@ pub fn classify_action(action: &ProposedAction, ctx: &CorrectionSubjectContext) 
         tool,
         "remember_fact"
             | "manage_memories"
+            | "set_reminder"
             | "manage_people"
             | "create_goal"
             | "update_goal"

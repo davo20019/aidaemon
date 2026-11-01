@@ -11,10 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
 - **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
+- **`set_reminder` tool.** A plain reminder takes two required fields, `message` and `when`, instead of an action inside the 24-action `manage_memories` (where cheaper models picked the wrong action or dropped the schedule).
+- **Browser navigation shows the page.** `navigate` and `new_tab` return a short text preview, so the agent no longer needs a `get_text` or a screenshot (which was also posted to the chat) after every page it opens.
 - **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
 
 ### Fixed
 
+- **`web_fetch` keeps listing pages whole.** On download and release pages readability kept a side section (python.org: "verify your download") and dropped the release list, so the agent reported an older version as current. A short extract cut from a large page now returns the whole page text.
 - **Read-only requests can use the terminal again.** The authority check judged `terminal` as a whole (not read-only) and refused even a plain `find`; it now judges each call, and the terminal still enforces read-only itself.
 - **Recall of earlier work works with models that fill every field.** Optional tool arguments left as `""` or `[]` are dropped before dispatch, so `search_history` no longer filters on an empty session and `create_scheduled_goal` no longer loses `schedule` behind an empty `schedules`.
 - **An inspection step is not reopened by the edit built on it.** A checklist observation that a later item depends on is no longer invalidated by that item's changes, so "inspect → edit → verify" turns stop looping on an impossible pre-edit inspection.

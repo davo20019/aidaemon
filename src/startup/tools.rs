@@ -216,6 +216,7 @@ enum BaseToolId {
     RememberFact,
     ShareMemory,
     ManageMemories,
+    SetReminder,
     ManageMandates,
     SearchHistory,
     ScheduledGoalRuns,
@@ -262,6 +263,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
         name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::SetReminder,
+        name: "set_reminder",
     },
     BaseToolSpec {
         id: BaseToolId::ManageMandates,
@@ -1154,6 +1159,10 @@ async fn build_base_tool(
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
             tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            terminal_tool: None,
+        },
+        BaseToolId::SetReminder => BuiltBaseTool {
+            tool: Arc::new(crate::tools::SetReminderTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {

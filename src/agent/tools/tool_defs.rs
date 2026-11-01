@@ -289,6 +289,7 @@ impl Agent {
             "terminal",
             "remember_fact",
             "manage_memories",
+            "set_reminder",
             "manage_mandates",
             "search_history",
             "manage_people",

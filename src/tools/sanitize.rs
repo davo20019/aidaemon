@@ -726,6 +726,7 @@ fn friendly_tool_label(name: &str) -> String {
         "web_fetch" => "fetching a page",
         "search_history" => "checking exact history",
         "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
+        "set_reminder" => "setting a reminder",
         other => other,
     }
     .to_string()
