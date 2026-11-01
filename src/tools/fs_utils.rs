@@ -750,6 +750,43 @@ pub fn resolve_project_scope_reference_from(
 /// Returns true if the path matches any sensitive pattern.
 /// Uses path-component matching to avoid false positives on substrings
 /// (e.g., "my_environment.txt" won't match ".env").
+/// Where the pre-change copy of a local file is kept: one copy per file,
+/// under the daemon's data directory, so edits never leave `.bak` files in
+/// the user's tree.
+pub fn local_backup_path(path: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let name = path.file_name()?.to_string_lossy();
+    Some(
+        dirs::home_dir()?
+            .join(".aidaemon")
+            .join("file-backups")
+            .join(format!("{tag}-{name}")),
+    )
+}
+
+/// Keep one pre-change copy of `path` before a write or edit replaces it.
+/// Local files go to [`local_backup_path`]; on other backends the copy
+/// stays beside the file (`<name>.<ext>.bak`), where that backend can reach it.
+/// Best effort: a failed backup never blocks the change.
+pub async fn backup_before_overwrite(
+    backend: &crate::execution::SharedExecutionBackend,
+    path: &BackendPath,
+) {
+    if backend.kind() == BackendKind::Local {
+        if let Some(backup) = local_backup_path(Path::new(path.as_str())) {
+            if let Some(dir) = backup.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            let _ = tokio::fs::copy(path.as_str(), &backup).await;
+            return;
+        }
+    }
+    let backup = path.with_extension(&format!("{}.bak", path.extension().unwrap_or_default()));
+    let _ = backend.copy(path, &backup).await;
+}
+
 pub fn is_sensitive_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     let path_lower = path_str.to_ascii_lowercase();

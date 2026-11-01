@@ -178,14 +178,8 @@ impl Tool for WriteFileTool {
             let size = existing_metadata
                 .as_ref()
                 .map_or(0, |metadata| metadata.len);
-            // Create backup
-            let backup_extension = format!(
-                "{}.bak",
-                path.extension().map(str::to_string).unwrap_or_default()
-            );
-            let backup = path.with_extension(&backup_extension);
-            // Only keep one backup
-            let _ = backend.copy(&path, &backup).await;
+            // One backup per file, outside the user's tree when local.
+            fs_utils::backup_before_overwrite(&backend, &path).await;
             Some(size)
         } else {
             None
@@ -390,10 +384,12 @@ mod tests {
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "new content");
 
-        // Verify backup exists
-        let backup = file_path.with_extension("txt.bak");
+        // The backup lives under the daemon's data dir, not beside the file.
+        let backup = crate::tools::fs_utils::local_backup_path(&file_path).unwrap();
         let backup_content = tokio::fs::read_to_string(&backup).await.unwrap();
         assert_eq!(backup_content, "old content");
+        assert!(!file_path.with_extension("txt.bak").exists());
+        let _ = tokio::fs::remove_file(&backup).await;
     }
 
     #[tokio::test]

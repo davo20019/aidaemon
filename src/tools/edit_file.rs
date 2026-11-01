@@ -171,12 +171,7 @@ impl Tool for EditFileTool {
         };
 
         // Backup + atomic write
-        let backup_extension = format!(
-            "{}.bak",
-            path.extension().map(str::to_string).unwrap_or_default()
-        );
-        let backup = path.with_extension(&backup_extension);
-        let _ = backend.copy(&path, &backup).await;
+        fs_utils::backup_before_overwrite(&backend, &path).await;
         backend
             .write(&path, new_content.as_bytes(), WriteMode::Overwrite, false)
             .await?;
