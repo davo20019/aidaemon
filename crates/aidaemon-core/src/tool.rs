@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::message::Image;
 use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
 
@@ -129,6 +130,10 @@ impl ToolContext {
 pub struct ToolOutput {
     /// Text the model will read.
     pub content: String,
+    /// Images the model will see with the text (a screenshot, a rendered
+    /// page, an image file the tool read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
     /// The tool ran but the outcome is a failure the model should react to
     /// (non-zero exit, HTTP 4xx, no match). Recorded as a failed receipt.
     pub is_error: bool,
@@ -145,6 +150,7 @@ impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: false,
             details: Value::Null,
             usage: Usage::default(),
@@ -154,6 +160,7 @@ impl ToolOutput {
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: true,
             details: Value::Null,
             usage: Usage::default(),
@@ -162,6 +169,11 @@ impl ToolOutput {
 
     pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = usage;
+        self
+    }
+
+    pub fn with_images(mut self, images: impl IntoIterator<Item = Image>) -> Self {
+        self.images.extend(images);
         self
     }
 

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
+    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
     StreamEvent, ToolCall, ToolChoice, Usage,
 };
 use async_trait::async_trait;
@@ -267,14 +267,27 @@ fn wire_messages(messages: &[Message]) -> Vec<Value> {
     for message in messages {
         let (role, blocks) = match message.role {
             Role::System => continue,
-            Role::User => ("user", text_block(&message.content)),
+            Role::User => {
+                // Images first: Anthropic recommends them before the text
+                // that refers to them.
+                let mut blocks: Vec<Value> = message.images.iter().map(image_block).collect();
+                blocks.extend(text_block(&message.content));
+                ("user", blocks)
+            }
             Role::Tool => (
                 "user",
                 vec![{
+                    let content = if message.images.is_empty() {
+                        json!(message.content)
+                    } else {
+                        let mut parts = text_block(&message.content);
+                        parts.extend(message.images.iter().map(image_block));
+                        Value::Array(parts)
+                    };
                     let mut block = json!({
                         "type": "tool_result",
                         "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                        "content": message.content,
+                        "content": content,
                     });
                     if message.is_error {
                         block["is_error"] = json!(true);
@@ -328,6 +341,16 @@ fn text_block(text: &str) -> Vec<Value> {
     } else {
         vec![json!({"type": "text", "text": text})]
     }
+}
+
+fn image_block(image: &Image) -> Value {
+    let source = match image {
+        Image::Base64 { media_type, data } => {
+            json!({"type": "base64", "media_type": media_type, "data": data})
+        }
+        Image::Url { url } => json!({"type": "url", "url": url}),
+    };
+    json!({"type": "image", "source": source})
 }
 
 fn is_tool_result(block: &Value) -> bool {

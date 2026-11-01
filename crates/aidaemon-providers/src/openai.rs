@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
+    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
     StreamEvent, ToolCall, ToolChoice, Usage,
 };
 use async_trait::async_trait;
@@ -149,7 +149,7 @@ impl Provider for OpenAiCompatible {
 fn build_body(request: &ModelRequest) -> Value {
     let mut body = json!({
         "model": request.model,
-        "messages": request.messages.iter().map(wire_message).collect::<Vec<_>>(),
+        "messages": wire_messages(&request.messages),
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -174,10 +174,50 @@ fn build_body(request: &ModelRequest) -> Value {
     body
 }
 
+/// Map the transcript to Chat Completions messages. Tool messages there are
+/// text-only, so images from a run of consecutive tool results follow it in
+/// one user message, labelled with the call each image came from.
+fn wire_messages(messages: &[Message]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut tool_images: Vec<Value> = Vec::new();
+    for message in messages {
+        if message.role != Role::Tool && !tool_images.is_empty() {
+            out.push(json!({"role": "user", "content": std::mem::take(&mut tool_images)}));
+        }
+        out.push(wire_message(message));
+        if message.role == Role::Tool && !message.images.is_empty() {
+            let call_id = message.tool_call_id.as_deref().unwrap_or_default();
+            tool_images.push(json!({
+                "type": "text",
+                "text": format!("[Images returned by tool call {call_id}]"),
+            }));
+            tool_images.extend(message.images.iter().map(image_part));
+        }
+    }
+    if !tool_images.is_empty() {
+        out.push(json!({"role": "user", "content": tool_images}));
+    }
+    out
+}
+
+fn image_part(image: &Image) -> Value {
+    json!({"type": "image_url", "image_url": {"url": image.to_url()}})
+}
+
 fn wire_message(message: &Message) -> Value {
     match message.role {
         Role::System => json!({"role": "system", "content": message.content}),
-        Role::User => json!({"role": "user", "content": message.content}),
+        Role::User if message.images.is_empty() => {
+            json!({"role": "user", "content": message.content})
+        }
+        Role::User => {
+            let mut parts = Vec::with_capacity(message.images.len() + 1);
+            if !message.content.trim().is_empty() {
+                parts.push(json!({"type": "text", "text": message.content}));
+            }
+            parts.extend(message.images.iter().map(image_part));
+            json!({"role": "user", "content": parts})
+        }
         Role::Assistant => {
             let mut out = json!({"role": "assistant", "content": message.content});
             if !message.tool_calls.is_empty() {

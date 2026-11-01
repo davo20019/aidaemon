@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use aidaemon_core::{
-    Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
+    Image, Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use aidaemon_providers::OpenAiCompatible;
 use common::{data_events, drain, MockResponse, MockServer};
@@ -121,6 +121,47 @@ async fn request_body_shape() {
         json!({"role": "tool", "tool_call_id": "call_1", "content": "sunny"})
     );
     assert_eq!(messages[4]["tool_call_id"], "call_2");
+}
+
+#[tokio::test]
+async fn images_become_content_parts_and_follow_tool_results() {
+    let server = MockServer::start(vec![]).await;
+    let p = provider(&server);
+    let req = request(vec![
+        Message::user("What is this?").with_images([Image::base64("image/png", "AAAA")]),
+        Message::assistant(
+            "",
+            vec![
+                ToolCall::new("call_1", "screenshot", json!({})),
+                ToolCall::new("call_2", "get_weather", json!({"city": "Paris"})),
+            ],
+        ),
+        Message::tool_result("call_1", "captured")
+            .with_images([Image::url("https://example.com/s.png")]),
+        Message::tool_result("call_2", "sunny"),
+        Message::assistant("Here it is.", vec![]),
+    ]);
+    let messages = p.request_body(&req)["messages"].clone();
+    assert_eq!(
+        messages[0]["content"],
+        json!([
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+    );
+    // Both tool results stay contiguous after the call; the image follows them.
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["content"], "captured");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(
+        messages[4],
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "[Images returned by tool call call_1]"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/s.png"}},
+        ]})
+    );
+    assert_eq!(messages[5]["role"], "assistant");
+    assert_eq!(messages.as_array().unwrap().len(), 6);
 }
 
 #[tokio::test]

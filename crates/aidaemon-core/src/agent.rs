@@ -7,6 +7,7 @@ use crate::error::{BuildError, CoreError};
 use crate::event::EventSink;
 use crate::hook::Hook;
 use crate::limits::{Limits, StopCondition};
+use crate::message::Message;
 use crate::outcome::RunOutcome;
 use crate::provider::{Provider, ToolSpec};
 use crate::run_loop::Driver;
@@ -87,8 +88,13 @@ impl Agent {
         }
     }
 
-    /// Start a new run in `session_id` with one user message.
-    pub async fn run(&self, session_id: &str, input: &str) -> Result<RunOutcome, CoreError> {
+    /// Start a new run in `session_id` with one user message: text, or a
+    /// [`crate::Message`] built with `Message::user(..).with_images(..)`.
+    pub async fn run(
+        &self,
+        session_id: &str,
+        input: impl Into<Message>,
+    ) -> Result<RunOutcome, CoreError> {
         self.run_with_cancel(session_id, input, CancellationToken::new())
             .await
     }
@@ -96,7 +102,7 @@ impl Agent {
     pub async fn run_with_cancel(
         &self,
         session_id: &str,
-        input: &str,
+        input: impl Into<Message>,
         cancel: CancellationToken,
     ) -> Result<RunOutcome, CoreError> {
         let state = RunState::new(&self.inner.id, session_id, input);

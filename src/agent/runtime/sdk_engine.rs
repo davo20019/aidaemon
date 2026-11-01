@@ -18,12 +18,19 @@
 //! The system prompt comes from the legacy prompt builder (identity, skills,
 //! memory facts, project instructions, mandate isolation).
 //!
+//! Images: the current turn's image attachments go to the model on the user
+//! message, and images a tool observed (`ToolObservation` attachments, such
+//! as an image file `read_file` opened) go with that tool's result, both as
+//! [`sdk::Image`]. Gated by `[files]` vision settings and the engine model.
+//! Replayed history stays text-only, like archived turns in the legacy loop.
+//!
 //! What it drops (on purpose, for comparison): intent gating, completion
 //! contracts and the stall/recovery ladder.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aidaemon_core as sdk;
@@ -37,9 +44,10 @@ use uuid::Uuid;
 use super::agent_helpers::touch_heartbeat;
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
-use crate::config::{AgentEngineKind, AppConfig};
+use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
+use crate::config::{AgentEngineKind, AppConfig, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskEndData, TaskOutcome, TaskStartData, TaskStatus};
-use crate::traits::{Message, ToolOutcomeStatus};
+use crate::traits::{AttachmentProvenance, Message, MessageAttachment, ToolOutcomeStatus};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
@@ -282,6 +290,47 @@ fn push_text(messages: &mut Vec<sdk::Message>, role: sdk::Role, content: &str) {
     }
 }
 
+/// Encode the image attachments `model` may see. Returns the images and
+/// whether an eligible image was left out (vision off, a model without
+/// vision, or a file that is unreadable or over the size cap).
+fn sdk_images(
+    attachments: &[&MessageAttachment],
+    vision: &VisionConfig,
+    model: &str,
+) -> (Vec<sdk::Image>, bool) {
+    let eligible: Vec<_> = attachments
+        .iter()
+        .filter(|attachment| vision.mime_allowed(&attachment.mime_type))
+        .collect();
+    if eligible.is_empty() {
+        return (Vec::new(), false);
+    }
+    if !vision.model_supports_vision(model) {
+        return (Vec::new(), true);
+    }
+    let mut images = Vec::new();
+    let mut skipped = false;
+    for attachment in eligible {
+        match encode_image_attachment(
+            Path::new(&attachment.local_path),
+            &attachment.mime_type,
+            vision.max_image_bytes,
+        ) {
+            Ok(data) => images.push(sdk::Image::base64(attachment.mime_type.clone(), data)),
+            Err(error) => {
+                skipped = true;
+                warn!(
+                    path = %attachment.local_path,
+                    mime = %attachment.mime_type,
+                    %error,
+                    "SDK engine: image not sent to the model"
+                );
+            }
+        }
+    }
+    (images, skipped)
+}
+
 /// The user-facing reply for a run that did not end with a final answer.
 fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
     let text = outcome
@@ -350,6 +399,11 @@ struct TurnScope<'a> {
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
+    /// The engine model, for vision gating of tool-observed images.
+    model: &'a str,
+    /// Attachments each call produced, by call id, so the persisted tool
+    /// message keeps them.
+    tool_attachments: Mutex<HashMap<String, Vec<MessageAttachment>>>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -407,6 +461,27 @@ impl Agent {
                     )
                 );
                 let mut output = outcome.output;
+                let observed: Vec<&MessageAttachment> = outcome
+                    .metadata
+                    .attachments
+                    .iter()
+                    .filter(|a| a.provenance == AttachmentProvenance::ToolObservation)
+                    .collect();
+                let (images, skipped) = sdk_images(&observed, &self.vision_config, scope.model);
+                if skipped {
+                    output.push_str(
+                        "\n\n[SYSTEM] The image this tool observed could not be shown to you \
+                         (vision is off, unsupported, or the file is too large or unreadable).",
+                    );
+                }
+                if !outcome.metadata.attachments.is_empty() {
+                    if let Ok(mut by_call) = scope.tool_attachments.lock() {
+                        by_call.insert(
+                            request.call_id.clone(),
+                            outcome.metadata.attachments.clone(),
+                        );
+                    }
+                }
                 let backgrounded = outcome.metadata.background_started || outcome.metadata.detached;
                 if backgrounded && outcome.metadata.completion_notifications_enabled {
                     scope.background_handoff.store(true, Ordering::Relaxed);
@@ -418,7 +493,7 @@ impl Agent {
                 }
                 Ok(sdk::ToolOutput {
                     is_error,
-                    ..sdk::ToolOutput::text(output)
+                    ..sdk::ToolOutput::text(output).with_images(images)
                 })
             }
             Err(error) => Ok(sdk::ToolOutput::error(format!("Error: {error}"))),
@@ -484,6 +559,7 @@ impl Agent {
         model: &str,
         produced: &[sdk::Message],
         receipts: &[sdk::Receipt],
+        mut tool_attachments: HashMap<String, Vec<MessageAttachment>>,
     ) {
         let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for message in produced {
@@ -517,6 +593,7 @@ impl Agent {
                     let mut tool =
                         Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool");
                     tool.content = Some(message.content.clone());
+                    tool.attachments = tool_attachments.remove(&call_id).unwrap_or_default();
                     tool.tool_name = names
                         .get(call_id.as_str())
                         .map(|name| name.to_string())
@@ -551,6 +628,7 @@ impl Agent {
         engine: &SdkEngine,
         session_id: &str,
         user_text: &str,
+        attachments: &[MessageAttachment],
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         user_role: UserRole,
         channel_ctx: ChannelContext,
@@ -558,6 +636,21 @@ impl Agent {
         parent_task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
+        anyhow::ensure!(
+            self.mandate_execution.is_none() || attachments.is_empty(),
+            "mandate workers cannot receive attachment-derived context"
+        );
+        // Voice notes become text when the model cannot hear them, as in the
+        // legacy bootstrap.
+        let enriched = crate::agent::stt::maybe_enrich_user_text(
+            user_text,
+            attachments,
+            &self.stt_config,
+            &self.audio_config,
+            &engine.model,
+        )
+        .await;
+        let user_text = enriched.as_str();
         touch_heartbeat(&heartbeat);
         let task_id = Uuid::new_v4().to_string();
         let turn_id = Uuid::new_v4().to_string();
@@ -596,14 +689,20 @@ impl Agent {
         let mut user_message = Message::new_runtime(turn_id.clone(), session_id, "user");
         user_message.content = Some(user_text.to_string());
         user_message.turn_id = Some(turn_id.clone());
+        user_message.attachments = attachments.to_vec();
         self.append_user_message_with_event(
             &emitter,
             &user_message,
             user_role,
             &channel_ctx,
-            false,
+            !attachments.is_empty(),
         )
         .await?;
+        let (images, vision_skipped) = sdk_images(
+            &attachments.iter().collect::<Vec<_>>(),
+            &self.vision_config,
+            &engine.model,
+        );
 
         // The legacy prompt builder: identity, matched skills, channel-scoped
         // memory facts, project instructions, and the isolated prompt for
@@ -645,6 +744,11 @@ impl Agent {
                 warn!(session_id, task_id, %error, "SDK engine: prompt builder failed; using base prompt");
                 self.system_prompt.clone()
             }
+        };
+        let instructions = if vision_skipped {
+            format!("{instructions}\n\n{VISION_SKIPPED_SYSTEM_HINT}")
+        } else {
+            instructions
         };
 
         // Tools: every registered daemon tool, unless the caller may not use
@@ -701,7 +805,11 @@ impl Agent {
             .iter()
             .map(|spec| spec.name.clone())
             .collect();
-        let mut state = sdk::RunState::new("aidaemon", session_id, user_text);
+        let mut state = sdk::RunState::new(
+            "aidaemon",
+            session_id,
+            sdk::Message::user(user_text).with_images(images),
+        );
         let mut messages = sdk_history(&history, &offered);
         let replayed = messages.len();
         messages.append(&mut state.messages);
@@ -714,6 +822,8 @@ impl Agent {
             status_tx: status_tx.clone(),
             channel_ctx: &channel_ctx,
             user_role,
+            model: &engine.model,
+            tool_attachments: Mutex::new(HashMap::new()),
             background_handoff: AtomicBool::new(false),
         };
         let run = sdk_agent.run_from(state, sdk::CancellationToken::new());
@@ -751,6 +861,12 @@ impl Agent {
                 }) {
                     produced = &produced[..produced.len() - 1];
                 }
+                let tool_attachments = std::mem::take(
+                    &mut *scope
+                        .tool_attachments
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
                 self.persist_sdk_tool_exchanges(
                     &emitter,
                     session_id,
@@ -759,6 +875,7 @@ impl Agent {
                     &engine.model,
                     produced,
                     outcome.receipts(),
+                    tool_attachments,
                 )
                 .await;
                 let usage = outcome.run_usage();
@@ -839,6 +956,67 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vision(max_image_bytes: u64) -> VisionConfig {
+        VisionConfig {
+            enabled: true,
+            max_image_bytes,
+            mime_types: vec!["image/jpeg".to_string(), "image/png".to_string()],
+            model_patterns: vec!["claude-".to_string()],
+        }
+    }
+
+    fn attachment(file: &tempfile::NamedTempFile, mime: &str) -> MessageAttachment {
+        MessageAttachment {
+            local_path: file.path().to_string_lossy().into_owned(),
+            filename: "photo.jpg".to_string(),
+            mime_type: mime.to_string(),
+            size_bytes: 4,
+            ..MessageAttachment::default()
+        }
+    }
+
+    #[test]
+    fn image_attachments_are_encoded_for_a_vision_model() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        let photo = attachment(&file, "image/jpeg");
+        let voice = attachment(&file, "audio/ogg");
+
+        let (images, skipped) = sdk_images(&[&photo, &voice], &vision(1024), "claude-sonnet-5-5");
+        assert!(!skipped);
+        assert_eq!(images, vec![sdk::Image::base64("image/jpeg", "/9j/4A==")]);
+
+        // No image attachments: nothing to send and nothing skipped.
+        assert_eq!(
+            sdk_images(&[&voice], &vision(1024), "claude-sonnet-5-5"),
+            (Vec::new(), false)
+        );
+    }
+
+    #[test]
+    fn images_are_skipped_without_vision_or_over_the_cap() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        let photo = attachment(&file, "image/jpeg");
+
+        assert_eq!(
+            sdk_images(&[&photo], &vision(1024), "text-only-model"),
+            (Vec::new(), true)
+        );
+        let mut disabled = vision(1024);
+        disabled.enabled = false;
+        assert_eq!(
+            sdk_images(&[&photo], &disabled, "claude-sonnet-5-5"),
+            (Vec::new(), true)
+        );
+        assert_eq!(
+            sdk_images(&[&photo], &vision(2), "claude-sonnet-5-5"),
+            (Vec::new(), true)
+        );
+    }
 
     fn message(role: &str, content: &str) -> Message {
         let mut message = Message::new_runtime(Uuid::new_v4().to_string(), "s", role);

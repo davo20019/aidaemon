@@ -99,12 +99,13 @@ pub struct RunState {
 impl RunState {
     /// A fresh state for a new run, so callers know the run id before it
     /// starts. Run it with [`crate::Agent::run_from`].
-    pub fn new(agent_id: &str, session_id: &str, input: &str) -> Self {
+    /// `input` is text or a user [`Message`] (for example one with images).
+    pub fn new(agent_id: &str, session_id: &str, input: impl Into<Message>) -> Self {
         Self {
             run_id: RunId::new(),
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
-            messages: vec![Message::user(input)],
+            messages: vec![input.into()],
             receipts: Vec::new(),
             usage: Usage::default(),
             run_usage: Usage::default(),
@@ -122,8 +123,8 @@ impl RunState {
     /// session, new run). Session receipts and `usage` keep accumulating;
     /// per-run counters and budgets (`turn`, `tool_calls`, `run_usage`,
     /// elapsed time) start again from zero.
-    pub fn with_user_message(mut self, input: impl Into<String>) -> Self {
-        self.messages.push(Message::user(input));
+    pub fn with_user_message(mut self, input: impl Into<Message>) -> Self {
+        self.messages.push(input.into());
         self.run_id = RunId::new();
         self.run_usage = Usage::default();
         self.turn = 0;

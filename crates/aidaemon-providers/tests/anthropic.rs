@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use aidaemon_core::{
-    Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
+    Image, Message, ModelRequest, Provider, ProviderError, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use aidaemon_providers::{Anthropic, ConfigError};
 use common::{drain, named_events, MockResponse, MockServer};
@@ -142,6 +142,38 @@ async fn request_body_shape_and_cache_markers() {
             {"type": "text", "text": "Now summarize."},
         ]})
     );
+}
+
+#[test]
+fn images_on_user_messages_and_tool_results() {
+    let p = Anthropic::builder().api_key("k").build().unwrap();
+    let req = request(vec![
+        Message::user("What is this?").with_images([Image::base64("image/png", "AAAA")]),
+        Message::assistant("", vec![ToolCall::new("toolu_1", "screenshot", json!({}))]),
+        Message::tool_result("toolu_1", "captured")
+            .with_images([Image::url("https://example.com/s.png")]),
+    ]);
+    let body = p.request_body(&req);
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "text", "text": "What is this?"},
+        ])
+    );
+    assert_eq!(
+        body["messages"][2]["content"][0]["content"],
+        json!([
+            {"type": "text", "text": "captured"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/s.png"}},
+        ])
+    );
+
+    // An image with no text still makes a user turn.
+    let body = p.request_body(&request(vec![
+        Message::user("").with_images([Image::url("https://example.com/a.png")])
+    ]));
+    assert_eq!(body["messages"][0]["content"][0]["type"], "image");
 }
 
 #[test]

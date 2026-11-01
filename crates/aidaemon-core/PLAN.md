@@ -110,7 +110,8 @@ measurement gate: keep each one only if N-of-M runs show a gain.
 Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
 - [ ] Async approval inside sub-agents (a child that interrupts currently
       returns an error to its parent).
-- [ ] Reasoning content and images in messages.
+- [x] Images in messages and tool results (`Image`; Anthropic, OpenAI-compatible, MCP).
+- [ ] Reasoning content in messages.
 - [ ] Publish plan: versions, `publish = true`, crates.io names.
 
 ### Phase 6b: channels (done, with gaps)

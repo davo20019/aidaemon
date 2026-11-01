@@ -534,6 +534,7 @@ impl Agent {
                 engine,
                 session_id,
                 user_text,
+                attachments,
                 status_tx,
                 user_role,
                 channel_ctx,

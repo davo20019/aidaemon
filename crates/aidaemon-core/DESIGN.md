@@ -150,6 +150,20 @@ in it may run twice (see "Idempotent replay" below).
 - **Derived agents.** `Agent::with_limits` and `Agent::with_hook` give a
   child agent its own budget or policies without rebuilding it.
 
+## Images
+
+`Image` (base64 bytes or a URL) rides on `Message::images` for user
+messages and tool results, and on `ToolOutput::images`, which the loop copies
+onto the tool message. `Agent::run` and `RunState::with_user_message` take
+`impl Into<Message>`, so text still works and a caller can pass
+`Message::user(..).with_images(..)`. Providers own the wire mapping:
+Anthropic sends image blocks (inside `tool_result` content for tools);
+OpenAI-compatible sends `image_url` parts, and because its tool messages are
+text-only, follows a run of tool results with one user message holding their
+images. The MCP client attaches `image` content blocks. Whether a model can
+see images is the caller's decision; the kernel does not gate it. `Debug` on
+`Image` prints the size, not the bytes.
+
 ## Still left out
 
 - **Async approval inside sub-agents.** A child that interrupts returns an
@@ -158,7 +172,8 @@ in it may run twice (see "Idempotent replay" below).
   hook (`ContextWindow` in `aidaemon-policies`); no dedicated trait yet.
 - **Native OpenTelemetry.** `TracingSink` emits `tracing` spans; use a
   `tracing-opentelemetry` layer to export.
-- **Reasoning content and images** in `Message`/`ModelResponse`.
+- **Reasoning content** in `Message`/`ModelResponse`. (Images are in: see
+  "Images" above.)
 
 ## How daemon features would map onto hooks
 

@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
-    Agent, CoreError, Event, FnTool, Hook, HookContext, InvocationStage, LimitKind, Limits,
-    MemoryStore, ProviderError, Receipt, ReceiptStatus, Resolution, Retry, Role, RunSnapshot,
-    RunState, RunStatus, RunStore, StopDecision, StuckConfig, StuckDecision, StuckSignal, Tool,
-    ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult,
-    ToolSpec,
+    Agent, CoreError, Event, FnTool, Hook, HookContext, Image, InvocationStage, LimitKind, Limits,
+    MemoryStore, Message, ProviderError, Receipt, ReceiptStatus, Resolution, Retry, Role,
+    RunSnapshot, RunState, RunStatus, RunStore, StopDecision, StuckConfig, StuckDecision,
+    StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput,
+    ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -1428,4 +1428,54 @@ async fn panicking_tool_is_a_failed_receipt_not_a_crash() {
     assert_eq!(out.receipts()[1].status, ReceiptStatus::Succeeded);
     let messages = tool_messages(&out.state);
     assert!(messages[0].1.contains("panicked"), "{}", messages[0].1);
+}
+
+#[tokio::test]
+async fn images_reach_the_model_from_the_user_and_from_tools() {
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "snap", json!({}))]),
+        text("a red ball"),
+    ]));
+    let snap = FnTool::new(
+        spec("snap", "Take a picture", &[]),
+        ToolAnnotations::READ_ONLY,
+        |_args: Value| async move {
+            Ok(ToolOutput::text("snapped").with_images([Image::base64("image/png", "BBBB")]))
+        },
+    );
+    let agent = Agent::builder("a")
+        .model("m")
+        .provider(provider.clone())
+        .tool(snap)
+        .build()
+        .unwrap();
+
+    let input = Message::user("what is it?").with_images([Image::url("https://example.com/a.png")]);
+    let out = agent.run("s1", input).await.unwrap();
+
+    assert!(out.is_completed());
+    let requests = provider.requests();
+    let first_user = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .unwrap();
+    assert_eq!(
+        first_user.images,
+        vec![Image::url("https://example.com/a.png")]
+    );
+    let tool_message = requests[1]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert_eq!(tool_message.content, "snapped");
+    assert_eq!(
+        tool_message.images,
+        vec![Image::base64("image/png", "BBBB")]
+    );
+
+    // The encoded bytes stay out of Debug output.
+    let debug = format!("{:?}", Image::base64("image/png", "BBBB"));
+    assert!(!debug.contains("BBBB"), "{debug}");
 }

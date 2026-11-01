@@ -619,6 +619,7 @@ impl<'a> Driver<'a> {
         }
         self.state.messages.push(
             Message::tool_result(receipt.call_id.clone(), output.content.clone())
+                .with_images(output.images.iter().cloned())
                 .with_error(!receipt.succeeded()),
         );
         self.state.receipts.push(receipt.clone());

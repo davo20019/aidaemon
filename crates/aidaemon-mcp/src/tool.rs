@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aidaemon_core::{
-    Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
+    Image, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -180,9 +180,12 @@ impl Tool for McpTool {
     }
 }
 
-/// Turn a `tools/call` result into model text plus receipt details.
+/// Turn a `tools/call` result into model text, images and receipt details.
+/// Image blocks keep a one-line summary in the text and are also attached
+/// as [`Image`]s, so vision models see them.
 pub fn render_result(server: &str, result: &Value) -> ToolOutput {
     let mut parts = Vec::new();
+    let mut images = Vec::new();
     let mut non_text = 0usize;
     for block in result
         .get("content")
@@ -199,6 +202,13 @@ pub fn render_result(server: &str, result: &Value) -> ToolOutput {
         }
         non_text += 1;
         parts.push(summarize_block(kind, block));
+        if kind == "image" {
+            let data = block.get("data").and_then(Value::as_str);
+            let mime = block.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                images.push(Image::base64(mime, data));
+            }
+        }
     }
 
     let structured = result
@@ -230,7 +240,9 @@ pub fn render_result(server: &str, result: &Value) -> ToolOutput {
     } else {
         ToolOutput::text(content)
     };
-    output.with_details(Value::Object(details))
+    output
+        .with_images(images)
+        .with_details(Value::Object(details))
 }
 
 fn summarize_block(kind: &str, block: &Value) -> String {
@@ -346,6 +358,7 @@ mod tests {
         );
         assert_eq!(out.details["structured_content"], json!({"k": 1}));
         assert_eq!(out.details["non_text_blocks"], json!(2));
+        assert_eq!(out.images, vec![Image::base64("image/png", "AAAA")]);
 
         let only_structured =
             render_result("s", &json!({"content": [], "structuredContent": {"a": 2}}));
