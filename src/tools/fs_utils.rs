@@ -758,12 +758,18 @@ pub fn local_backup_path(path: &Path) -> Option<PathBuf> {
     let digest = Sha256::digest(path.to_string_lossy().as_bytes());
     let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     let name = path.file_name()?.to_string_lossy();
-    Some(
-        dirs::home_dir()?
-            .join(".aidaemon")
-            .join("file-backups")
-            .join(format!("{tag}-{name}")),
-    )
+    Some(file_backup_root()?.join(format!("{tag}-{name}")))
+}
+
+#[cfg(not(test))]
+fn file_backup_root() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".aidaemon").join("file-backups"))
+}
+
+/// Tests never write into the real home directory.
+#[cfg(test)]
+fn file_backup_root() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join("aidaemon-test-file-backups"))
 }
 
 /// Keep one pre-change copy of `path` before a write or edit replaces it.
