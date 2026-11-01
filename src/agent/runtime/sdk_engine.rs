@@ -22,7 +22,7 @@
 //! contracts and the stall/recovery ladder.
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -350,6 +350,10 @@ struct TurnScope<'a> {
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
+    /// Set when a call moved work to the background with completion
+    /// notifications on: the daemon will deliver its result later, so the
+    /// reply is a background handoff, not the terminal answer.
+    background_handoff: AtomicBool,
 }
 
 impl Agent {
@@ -402,9 +406,19 @@ impl Agent {
                             | ToolOutcomeStatus::Blocked
                     )
                 );
+                let mut output = outcome.output;
+                let backgrounded = outcome.metadata.background_started || outcome.metadata.detached;
+                if backgrounded && outcome.metadata.completion_notifications_enabled {
+                    scope.background_handoff.store(true, Ordering::Relaxed);
+                    output.push_str(
+                        "\n\n[SYSTEM] Completion notifications are enabled for this background \
+                         work: its result will be delivered to this conversation automatically \
+                         when it finishes.",
+                    );
+                }
                 Ok(sdk::ToolOutput {
                     is_error,
-                    ..sdk::ToolOutput::text(outcome.output)
+                    ..sdk::ToolOutput::text(output)
                 })
             }
             Err(error) => Ok(sdk::ToolOutput::error(format!("Error: {error}"))),
@@ -700,6 +714,7 @@ impl Agent {
             status_tx: status_tx.clone(),
             channel_ctx: &channel_ctx,
             user_role,
+            background_handoff: AtomicBool::new(false),
         };
         let run = sdk_agent.run_from(state, sdk::CancellationToken::new());
         tokio::pin!(run);
@@ -751,14 +766,27 @@ impl Agent {
                     Message::new_runtime(Uuid::new_v4().to_string(), session_id, "assistant");
                 assistant.content = Some(reply.clone());
                 assistant.turn_id = Some(turn_id.clone());
-                self.append_assistant_message_with_event(
-                    &emitter,
-                    &assistant,
-                    &engine.model,
-                    Some(usage.input_tokens.min(u32::MAX as u64) as u32),
-                    Some(usage.output_tokens.min(u32::MAX as u64) as u32),
-                )
-                .await?;
+                let input_tokens = Some(usage.input_tokens.min(u32::MAX as u64) as u32);
+                let output_tokens = Some(usage.output_tokens.min(u32::MAX as u64) as u32);
+                if scope.background_handoff.load(Ordering::Relaxed) {
+                    self.append_background_handoff_message_with_event(
+                        &emitter,
+                        &assistant,
+                        &engine.model,
+                        input_tokens,
+                        output_tokens,
+                    )
+                    .await?;
+                } else {
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant,
+                        &engine.model,
+                        input_tokens,
+                        output_tokens,
+                    )
+                    .await?;
+                }
                 let error = match &outcome.status {
                     sdk::RunStatus::ProviderFailed { error } => Some(error.clone()),
                     _ => None,
