@@ -51,7 +51,7 @@ use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
 use crate::config::{AgentEngineKind, AppConfig, VisionConfig};
-use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStartData, TaskStatus};
+use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
@@ -115,6 +115,20 @@ pub(super) enum DaemonCall {
     Tool(ToolRequest),
     Model(ModelCall),
     Stop(StopCheck),
+}
+
+/// What the legacy bootstrap settled for a turn before the SDK run starts:
+/// the recorded task, the assessed contract, the offered tools, the selected
+/// model and the system prompt.
+pub(in crate::agent) struct SdkTurnSetup {
+    /// The persisted user text (bootstrap may have added a transcript).
+    pub(in crate::agent) user_text: String,
+    pub(in crate::agent) task_id: String,
+    pub(in crate::agent) emitter: EventEmitter,
+    pub(in crate::agent) offered_tools: HashSet<String>,
+    pub(in crate::agent) model: String,
+    pub(in crate::agent) instructions: String,
+    pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -469,6 +483,79 @@ fn goal_budget_exhausted(
     })
 }
 
+/// Credit one receipt to the contract obligations it proves, as the legacy
+/// tool phase does: a satisfied mutation marks its effects, and a
+/// verifiable observation marks the evidence requirements it matches.
+/// Returns the obligation ids the receipt closes.
+#[allow(clippy::too_many_arguments)]
+fn bind_receipt_to_contract(
+    progress: &mut crate::agent::completion_contract::CompletionProgress,
+    contract: &crate::agent::completion_contract::CompletionContract,
+    call_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+    status: crate::traits::ToolOutcomeStatus,
+) -> Vec<String> {
+    use super::tool_execution_phase as evidence;
+    let semantics = &metadata.semantics;
+    if metadata.invocation_stage.performed_io()
+        && semantics.mutates_state()
+        && !metadata.contract_rejected
+        && !metadata.receipt_replayed
+    {
+        progress.record_mutation_attempt(status);
+    }
+    // Mutation before observation: a mutation invalidates older evidence, so
+    // a combined receipt must not invalidate its own post-action observation.
+    if status.satisfies_requested_condition() && semantics.mutates_state() {
+        progress.mark_mutation_receipt(contract, semantics, call_id);
+    }
+    if semantics.observes_state() {
+        let matched_contract = evidence::observation_matches_completion_contract(
+            contract,
+            semantics,
+            arguments,
+            result_text,
+            metadata,
+        );
+        let matched = evidence::matching_evidence_requirement_indices(
+            contract,
+            tool_name,
+            semantics,
+            arguments,
+            result_text,
+            metadata,
+        );
+        let available = matches!(
+            status,
+            crate::traits::ToolOutcomeStatus::Succeeded
+                | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+        ) || matched.iter().any(|index| {
+            contract
+                .evidence_requirements
+                .get(*index)
+                .is_some_and(|requirement| {
+                    evidence::evidence_requirement_accepts_nonstandard_outcome(
+                        requirement,
+                        metadata,
+                    )
+                })
+        });
+        if available
+            && evidence::tool_result_or_metadata_contains_verifiable_evidence(
+                semantics,
+                result_text,
+                metadata,
+            )
+        {
+            progress.mark_observation_receipt(contract, &matched, matched_contract, call_id);
+        }
+    }
+    progress.completion_obligations_for_receipt(call_id)
+}
+
 /// What the ledger says when the model wants to stop.
 struct StopFacts {
     /// Expectations an admissible tool could still satisfy.
@@ -518,6 +605,10 @@ struct TurnScope<'a> {
     /// The engine model, for vision gating of tool-observed images.
     model: &'a str,
     turn_id: &'a str,
+    /// The assessed contract: its authority is enforced, its expectations
+    /// are credited from receipts.
+    contract: &'a crate::agent::completion_contract::CompletionContract,
+    progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -558,16 +649,41 @@ impl Agent {
             scope_escalation: None,
         };
         let started = Instant::now();
-        // Mandate runs: the same per-call authority gate as the legacy loop,
-        // which issues the bounded grant or refuses the call.
-        let grant = match self.sdk_mandate_gate(&ctx, request, arguments).await {
+        // The contract's authority lane (forbidden tool use or mutation,
+        // allowed tools, forbidden scopes), then for mandate runs the same
+        // per-call authority gate as the legacy loop, which issues the
+        // bounded grant or refuses the call.
+        let read_only = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == request.name)
+            .map(|tool| tool.capabilities().read_only);
+        let admitted =
+            super::closeout::ClosingAuthority::from_authority(scope.contract.authority())
+                .admits_tool(&request.name, read_only);
+        let gate = if admitted {
+            self.sdk_mandate_gate(&ctx, request, arguments)
+                .await
+                .map_err(|refusal| (refusal, "mandate_authority"))
+        } else {
+            Err((
+                format!(
+                    "[AUTHORITY BLOCKED] `{}` is outside what this request allows. Use a \
+                     permitted tool or report the limitation.",
+                    request.name
+                ),
+                "request_authority",
+            ))
+        };
+        let grant = match gate {
             Ok(grant) => grant,
-            Err(refusal) => {
+            Err((refusal, reason_code)) => {
                 info!(
                     session_id = scope.session_id,
                     task_id = scope.task_id,
                     tool = %request.name,
-                    "SDK engine: mandate gate refused the call"
+                    reason_code,
+                    "SDK engine: authority gate refused the call"
                 );
                 let call = crate::traits::ToolCall {
                     id: request.call_id.clone(),
@@ -586,7 +702,7 @@ impl Agent {
                         &call,
                         arguments,
                         refusal.clone(),
-                        "mandate_authority",
+                        reason_code,
                         semantics,
                         None,
                     )
@@ -610,11 +726,23 @@ impl Agent {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool call");
         }
 
+        let call_semantics = self
+            .semantics_for_exact_tool_call(&request.name, arguments)
+            .await;
         let (output, images, metadata, receipt) = match self
             .execute_tool_outcome(&request.name, arguments, &ctx)
             .await
         {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                // An executed call keeps the semantics it was admitted with
+                // (an observation stays an observation even when it returns a
+                // negative result), as in the legacy tool phase.
+                super::tool_execution_phase::complete_tool_result_semantics(
+                    &request.name,
+                    arguments,
+                    &call_semantics,
+                    &mut outcome.metadata,
+                );
                 let status = super::loop_utils::classify_tool_outcome_status(
                     &request.name,
                     &outcome.output,
@@ -629,6 +757,18 @@ impl Agent {
                     None,
                 );
                 receipt.mandate_authority = grant.clone();
+                if let Ok(mut progress) = scope.progress.lock() {
+                    receipt.completion_obligation_ids = bind_receipt_to_contract(
+                        &mut progress,
+                        scope.contract,
+                        &request.call_id,
+                        &request.name,
+                        arguments,
+                        &outcome.output,
+                        &outcome.metadata,
+                        status,
+                    );
+                }
                 let mut output = outcome.output;
                 let observed: Vec<&MessageAttachment> = outcome
                     .metadata
@@ -739,12 +879,8 @@ impl Agent {
             return sdk::StopDecision::Accept;
         };
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
-        let authority = super::closeout::ClosingAuthority {
-            forbids_tool_use: false,
-            forbids_mutation: false,
-            allowed_tool_names: &[],
-            forbidden_tool_scopes: &[],
-        };
+        let authority =
+            super::closeout::ClosingAuthority::from_authority(scope.contract.authority());
         let visible_tools: Vec<&str> = if scope.user_role == UserRole::Public {
             Vec::new()
         } else {
@@ -1082,153 +1218,68 @@ impl Agent {
         }
     }
 
-    /// One turn on the SDK kernel. See the module docs for what is kept and
-    /// what is dropped compared with the legacy loop.
+    /// One turn on the SDK kernel, after the legacy bootstrap set it up. See
+    /// the module docs for what is kept and what is dropped compared with
+    /// the legacy loop.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_message_sdk(
         &self,
         engine: &SdkEngineSettings,
+        setup: SdkTurnSetup,
         session_id: &str,
-        user_text: &str,
         attachments: &[MessageAttachment],
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         user_role: UserRole,
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
-        parent_task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
-        let model = match &engine.model_override {
-            Some(model) => model.clone(),
-            None => {
-                let snapshot = self.llm_runtime.snapshot();
-                self.select_turn_model(
-                    &snapshot,
-                    snapshot.router().as_ref(),
-                    crate::execution_policy::ModelProfile::Balanced,
-                    session_id,
-                )
-                .await
-                .0
-            }
-        };
-        anyhow::ensure!(
-            self.mandate_execution.is_none() || attachments.is_empty(),
-            "mandate workers cannot receive attachment-derived context"
-        );
-        // Voice notes become text when the model cannot hear them, as in the
-        // legacy bootstrap.
-        let enriched = crate::agent::stt::maybe_enrich_user_text(
+        let SdkTurnSetup {
             user_text,
-            attachments,
-            &self.stt_config,
-            &self.audio_config,
-            &model,
-        )
-        .await;
-        let user_text = enriched.as_str();
+            task_id,
+            emitter,
+            offered_tools,
+            model,
+            instructions,
+            contract,
+        } = setup;
+        let user_text = user_text.as_str();
+        let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
-        let task_id = Uuid::new_v4().to_string();
-        let turn_id = Uuid::new_v4().to_string();
-        let emitter = EventEmitter::new(self.event_store.clone(), session_id.to_string())
-            .with_task_id(task_id.clone());
+        let turn_id = self
+            .current_turn_ids
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Read prior dialogue before this turn's user message is recorded.
-        let history = match self
+        // Prior dialogue; bootstrap already recorded this turn's user message.
+        let history: Vec<Message> = match self
             .event_store
             .get_conversation_history_since_clear(session_id, HISTORY_MESSAGES)
             .await
         {
-            Ok(history) => history,
+            Ok(history) => history
+                .into_iter()
+                .filter(|message| message.turn_id.as_deref() != Some(turn_id.as_str()))
+                .collect(),
             Err(error) => {
                 warn!(session_id, %error, "SDK engine: history unavailable");
                 Vec::new()
             }
         };
-
-        self.current_turn_ids
-            .write()
-            .await
-            .insert(session_id.to_string(), turn_id.clone());
-        emitter
-            .emit(
-                EventType::TaskStart,
-                TaskStartData {
-                    task_id: task_id.clone(),
-                    description: user_text.chars().take(200).collect(),
-                    parent_task_id: parent_task_id.map(str::to_string),
-                    user_message: Some(user_text.to_string()),
-                    turn_id: Some(turn_id.clone()),
-                },
-            )
-            .await?;
-        let mut user_message = Message::new_runtime(turn_id.clone(), session_id, "user");
-        user_message.content = Some(user_text.to_string());
-        user_message.turn_id = Some(turn_id.clone());
-        user_message.attachments = attachments.to_vec();
-        self.append_user_message_with_event(
-            &emitter,
-            &user_message,
-            user_role,
-            &channel_ctx,
-            !attachments.is_empty(),
-        )
-        .await?;
         let (images, vision_skipped) = sdk_images(
             &attachments.iter().collect::<Vec<_>>(),
             &self.vision_config,
             &model,
         );
-
-        // The legacy prompt builder: identity, matched skills, channel-scoped
-        // memory facts, project instructions, and the isolated prompt for
-        // mandate workers. Falls back to the base prompt if it fails.
-        let tools_offered = if user_role == UserRole::Public {
-            0
-        } else {
-            self.tools.len()
-        };
-        let instructions = match self
-            .build_system_prompt_for_message(
-                &emitter,
-                &task_id,
-                session_id,
-                user_text,
-                user_role,
-                &channel_ctx,
-                tools_offered,
-                None,
-                None,
-                None,
-                true,
-                false,
-                None,
-            )
-            .await
-        {
-            Ok((core, tail, _, skills, _)) => {
-                if !skills.is_empty() {
-                    info!(session_id, task_id, ?skills, "SDK engine: skills matched");
-                }
-                if tail.trim().is_empty() {
-                    core
-                } else {
-                    format!("{core}\n\n{tail}")
-                }
-            }
-            Err(error) => {
-                warn!(session_id, task_id, %error, "SDK engine: prompt builder failed; using base prompt");
-                self.system_prompt.clone()
-            }
-        };
         let instructions = if vision_skipped {
             format!("{instructions}\n\n{VISION_SKIPPED_SYSTEM_HINT}")
         } else {
             instructions
         };
 
-        // Tools: every registered daemon tool, unless the caller may not use
-        // tools at all (the dispatcher would refuse each call anyway).
         let (calls_tx, mut calls_rx) = mpsc::channel::<DaemonCall>(16);
         let mut builder = sdk::Agent::builder("aidaemon")
             .model(model.clone())
@@ -1241,8 +1292,14 @@ impl Agent {
                 tool_timeout: TOOL_TIMEOUT,
                 ..sdk::Limits::default()
             });
+        // Tools: the set bootstrap offered for this turn (role, policy and
+        // contract filtering already applied).
         if user_role != UserRole::Public {
-            for tool in &self.tools {
+            for tool in self
+                .tools
+                .iter()
+                .filter(|tool| offered_tools.contains(tool.name()))
+            {
                 builder = builder.tool(BridgedTool {
                     spec: tool_spec(tool.as_ref()),
                     read_only: tool.capabilities().read_only,
@@ -1317,6 +1374,10 @@ impl Agent {
             user_role,
             model: &model,
             turn_id: &turn_id,
+            contract: &contract,
+            progress: std::sync::Mutex::new(
+                crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
+            ),
             background_handoff: AtomicBool::new(false),
             emitter: &emitter,
             history_len: replayed,
@@ -1718,16 +1779,13 @@ mod tests {
             .handle_inbound_message(owner_request("Remember I like green tea."))
             .await
             .unwrap();
-        let calls = harness
-            .agent
-            .event_store
-            .task_event_count(
-                "telegram:synthetic-user-1",
-                &reply.task_id,
-                EventType::LlmCall,
-            )
+        // The run's own calls; bootstrap's assessment calls carry a purpose.
+        let calls = task_events(&harness, &reply.task_id)
             .await
-            .unwrap();
+            .iter()
+            .filter(|event| event.event_type == EventType::LlmCall)
+            .filter(|event| event.data.get("call_purpose").is_none_or(|p| p.is_null()))
+            .count();
         assert_eq!(calls, 2);
     }
 
@@ -1963,7 +2021,16 @@ mod tests {
             ),
             MockProvider::text_response(done),
             MockProvider::text_response(done),
-        ]);
+        ])
+        // Assessor: nothing typed at all — no mutation, no observation.
+        .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+            "check",
+            false,
+            false,
+            &[],
+            "new_request",
+            "local_workspace",
+        )]);
         let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2065,6 +2132,93 @@ mod tests {
         // Never after a terminal policy denial, never without reachable work.
         assert!(!closeout_demands_work(&facts(&checklist, 2, None, true)));
         assert!(!closeout_demands_work(&facts(&[], 0, None, false)));
+    }
+
+    /// An assessed contract restricting tools to `system_info`.
+    fn restricted_assessment() -> crate::traits::ProviderResponse {
+        let base = crate::testing::MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+        value["schema_version"] = 10.into();
+        value["contract"]["tool_scope"] = "restricted".into();
+        value["contract"]["allowed_tool_names"] = serde_json::json!(["system_info"]);
+        value["contract"]["forbidden_tool_scopes"] = serde_json::json!([]);
+        crate::testing::MockProvider::text_response(&value.to_string())
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_records_the_assessed_task_contract() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![MockProvider::text_response("hi")])
+            .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+                "answer",
+                false,
+                false,
+                &[],
+                "new_request",
+                "none",
+            )]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Say hi."))
+            .await
+            .unwrap();
+        let compiled = task_events(&harness, &reply.task_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == EventType::TaskContractCompiled)
+            .count();
+        assert_eq!(compiled, 1);
+        assert_eq!(reply.text, "hi");
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_refuses_tools_outside_the_contract_authority() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        use crate::traits::store_prelude::*;
+        let provider = MockProvider::with_responses(vec![
+            remember("teal"),
+            MockProvider::text_response("I could not save it."),
+        ])
+        .with_task_assessments(vec![restricted_assessment()]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Only look things up; remember teal."))
+            .await
+            .unwrap();
+        let facts = harness.state.get_facts(None).await.unwrap();
+        assert!(
+            !facts.iter().any(|fact| fact.value.contains("teal")),
+            "a tool outside the contract authority ran"
+        );
+        let dispatched = task_events(&harness, &reply.task_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == EventType::ToolResult)
+            .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+            .filter(|result| {
+                result.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.invocation_stage == crate::traits::ToolInvocationStage::Dispatched
+                })
+            })
+            .count();
+        assert_eq!(dispatched, 0);
+        assert_eq!(reply.text, "I could not save it.");
     }
 
     #[test]

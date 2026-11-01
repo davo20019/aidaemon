@@ -34,7 +34,7 @@ impl<'a> ClosingAuthority<'a> {
     /// registered tool's declared capability (None for unknown tools, which
     /// stay admissible so a custom tool is never declared unavailable
     /// prematurely).
-    pub(super) fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
+    pub(in crate::agent) fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
         if self.forbids_tool_use {
             return false;
         }
