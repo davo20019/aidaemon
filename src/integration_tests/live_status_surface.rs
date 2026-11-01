@@ -218,8 +218,8 @@ mod live_status_surface_tests {
 
         // The registry entry is consumed: a second ping (e.g. another
         // background command whose handoff was never registered) falls back
-        // to a fresh message.
-        crate::tools::terminal::deliver_background_completion_ping(
+        // to a fresh message, whose id is returned so it can be resolved later.
+        let fresh_surface = crate::tools::terminal::deliver_background_completion_ping(
             Some(&outbound),
             None,
             "telegram:synthetic-user-1",
@@ -232,5 +232,9 @@ mod live_status_surface_tests {
         let messages = channel.messages.lock().await;
         assert_eq!(edits.len(), 2, "no third edit — registry entry consumed");
         assert_eq!(messages.len(), 1, "fallback fresh message delivered");
+        assert!(
+            fresh_surface.is_some(),
+            "a fresh completion ping must be returned as a resolvable surface"
+        );
     }
 }

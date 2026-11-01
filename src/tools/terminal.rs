@@ -778,6 +778,15 @@ pub(crate) async fn deliver_background_completion_ping(
                 }
             }
         }
+        // A fresh ping is still a status surface: return its id so the
+        // post-delivery transition can resolve it instead of leaving
+        // "Preparing your result" in the chat forever.
+        match hub.send_text_tracked(session_id, message).await {
+            Ok(surface_id) => return surface_id,
+            Err(error) => {
+                warn!(pid, session_id, %error, "Fresh background completion ping failed");
+            }
+        }
     }
     deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
     None

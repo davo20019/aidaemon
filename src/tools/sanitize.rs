@@ -96,8 +96,14 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // Terminal "moved to background" completion scaffolding (terminal.rs /
         // run_helpers.rs). When the background notifier re-engages the agent loop,
         // the model reads this status/steering text from session history and
-        // regurgitates it into its user-facing reply. Strip the whole line.
-        Regex::new(r"(?m)^[^\n]*Completion notifications are enabled[^\n]*$").unwrap(),
+        // regurgitates it into its user-facing reply. Strip that sentence (and the
+        // tool's fixed follow-on sentence) only: a one-line handoff such as "Running
+        // as pid 42. Completion notifications are enabled, so ..." must keep the
+        // rest, or the whole reply is emptied and never delivered.
+        Regex::new(
+            r"[^\n.!?]*Completion notifications are enabled(?:\. The user will be notified when this process finishes)?[^\n.!?]*[.!?]?[ \t]*",
+        )
+        .unwrap(),
         // Path auto-injection notice (tool_result_notices.rs). Its [SYSTEM] tag is
         // rewritten to [CONTENT FILTERED] by the input sanitizer before the model
         // echoes it, defeating the [SYSTEM] block rule — match the sentence itself.
@@ -1408,6 +1414,22 @@ mod tests {
             !strip_diagnostic_blocks(variant).contains("Completion notifications are enabled"),
             "completion-notification variant leaked: {}",
             strip_diagnostic_blocks(variant)
+        );
+    }
+
+    #[test]
+    fn test_strip_completion_notification_sentence_keeps_rest_of_line() {
+        // Regression (2026-10-31): a one-line background handoff reply was
+        // stripped to nothing, so Telegram sent no acknowledgement at all.
+        let input = "The `sleep 45` command is running in the background as pid 67254. Completion notifications are enabled, so I'll post the result here when it finishes.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            result.contains("running in the background as pid 67254."),
+            "status sentence was stripped: {result}"
+        );
+        assert!(
+            !result.contains("Completion notifications are enabled"),
+            "{result}"
         );
     }
 
