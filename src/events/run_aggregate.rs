@@ -2140,12 +2140,19 @@ fn hint_matches_target(
     match (target.kind, hint.kind) {
         (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url) => target.value == hint.value,
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::Path) => {
+            // The target itself, or a path under it: only a directory has
+            // paths under it, so a folder-scoped item is met by work on its
+            // files while a file-bound item still needs that exact file.
             let expected = crate::execution::normalize_active_path_lexically(&target.value);
             let actual = crate::execution::normalize_active_path_lexically(&hint.value);
             expected
                 .ok()
                 .zip(actual.ok())
-                .is_some_and(|(left, right)| left == right)
+                .is_some_and(|(target, actual)| {
+                    let root = target.as_str().trim_end_matches('/');
+                    actual.as_str() == target.as_str()
+                        || actual.as_str().starts_with(&format!("{root}/"))
+                })
         }
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::ProjectScope) => {
             let expected = crate::execution::normalize_active_path_lexically(&target.value);
@@ -4279,6 +4286,50 @@ mod tests {
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
         }
+    }
+
+    /// A checklist item scoped to a folder is done by writes to files in
+    /// it; an item bound to one file is not done by a write to its parent.
+    #[test]
+    fn folder_scoped_write_item_is_closed_by_a_write_inside_the_folder() {
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/proj/calc"],
+                    "pending",
+                ),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/proj/calc/other.py"],
+                    "pending",
+                ),
+            ]),
+            call("edit", "edit_file"),
+            result(
+                "edit",
+                "edit_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/proj/calc/calc.py"),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Pending,
+            "a different file in the folder is still owed"
+        );
+        let _ = &mut events;
     }
 
     /// "Inspect, then edit, then verify": the edit (which depends on the
