@@ -667,6 +667,17 @@ fn goal_run_terminal_status(
     }
 }
 
+/// Whether this dispatch closed its run's work. Child rows that all completed
+/// close it; so does a task lead that finished the mission itself, which
+/// leaves no child rows and only its committed `completed` trigger as the
+/// receipt.
+fn dispatch_closed_run(trigger_completed: bool, work_tasks: &[crate::traits::Task]) -> bool {
+    work_tasks
+        .iter()
+        .all(crate::traits::Task::satisfies_run_completion)
+        && (trigger_completed || !work_tasks.is_empty())
+}
+
 fn task_lead_semantically_succeeded(
     task_lead_outcome: Option<TaskOutcome>,
     is_mandate_run: bool,
@@ -2196,8 +2207,16 @@ pub fn spawn_background_task_lead(
                     .iter()
                     .filter(|task| task.completed_successfully())
                     .count();
-                let all_done =
-                    !tasks.is_empty() && tasks.iter().all(|t| t.satisfies_run_completion());
+                let trigger_completed = match dispatch_trigger_task_id.as_deref() {
+                    Some(trigger_task_id) => state
+                        .get_task(trigger_task_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|task| task.status == "completed"),
+                    None => false,
+                };
+                let all_done = dispatch_closed_run(trigger_completed, &tasks);
 
                 let mut updated_goal = match state.get_goal(&goal_id).await {
                     Ok(Some(g)) => g,
@@ -3737,6 +3756,38 @@ mod tests {
             count_successful_completed_work(&[trigger, completed, cancelled], Some("trigger-1")),
             1
         );
+    }
+
+    #[test]
+    fn direct_task_lead_completion_closes_the_run() {
+        let task = |status: &str| crate::traits::Task {
+            id: format!("work-{status}"),
+            goal_id: "goal-1".to_string(),
+            description: "Publish post".to_string(),
+            status: status.to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        // The task lead did the work itself: no child rows, committed trigger.
+        assert!(dispatch_closed_run(true, &[]));
+        // No child rows and no committed trigger is not a receipt.
+        assert!(!dispatch_closed_run(false, &[]));
+        assert!(dispatch_closed_run(false, &[task("completed")]));
+        assert!(!dispatch_closed_run(true, &[task("pending")]));
+        assert!(!dispatch_closed_run(true, &[task("failed")]));
     }
 
     #[test]
