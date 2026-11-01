@@ -2339,13 +2339,8 @@ pub(super) async fn run_completion_phase(
 
         // Provider protocol markers are structural invalid output. Ordinary
         // response prose never selects a lifecycle transition.
-        let has_structural_markers = {
-            let lower = reply.trim().to_ascii_lowercase();
-            lower.contains("[consultation]")
-                || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
-                || lower.contains("[tool_use:")
-                || lower.contains("[tool_call:")
-        };
+        let has_structural_markers =
+            crate::agent::response_analysis::reply_has_protocol_markers(&reply);
         // False in-progress status: the reply asserts work is happening RIGHT
         // NOW ("I'm searching the API now...") while the task made zero tool
         // calls — nothing is running, nothing was spawned, and the task is

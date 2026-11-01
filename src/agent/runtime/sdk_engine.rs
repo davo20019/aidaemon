@@ -133,6 +133,7 @@ pub(in crate::agent) struct SdkTurnSetup {
 pub(super) struct StopCheck {
     /// Operations of this run that completed.
     completed_results: usize,
+    final_text: String,
     reply: oneshot::Sender<sdk::StopDecision>,
 }
 
@@ -145,7 +146,7 @@ struct LedgerStop {
 
 #[async_trait]
 impl sdk::Hook for LedgerStop {
-    async fn on_stop(&self, ctx: &sdk::HookContext<'_>, _final_text: &str) -> sdk::StopDecision {
+    async fn on_stop(&self, ctx: &sdk::HookContext<'_>, final_text: &str) -> sdk::StopDecision {
         let completed_results = ctx
             .run_receipts()
             .filter(|receipt| receipt.status == sdk::ReceiptStatus::Succeeded)
@@ -155,6 +156,7 @@ impl sdk::Hook for LedgerStop {
             .calls
             .send(DaemonCall::Stop(StopCheck {
                 completed_results,
+                final_text: final_text.to_string(),
                 reply,
             }))
             .await
@@ -379,7 +381,7 @@ fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
         .map(str::to_string);
     match &outcome.status {
         sdk::RunStatus::Completed => (
-            text.unwrap_or_else(|| "Done.".to_string()),
+            text.unwrap_or_default(),
             TaskStatus::Completed,
             TaskOutcome::Succeeded,
         ),
@@ -545,6 +547,62 @@ fn learning_tool_summary(name: &str, arguments: &str, rejected: bool, failed: bo
     }
 }
 
+/// A final reply that must not ship as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyDefect {
+    /// No text at all.
+    Empty,
+    /// Only internal markers or tool envelopes; sanitizing leaves nothing.
+    InternalMarkers,
+    /// A pasted file page, raw data dump, or a copy of the latest tool output.
+    ToolOutputPaste,
+}
+
+/// The legacy response-phase shape checks, all structural (sanitizer
+/// output, harness page headers, data-dump shape, overlap with the latest
+/// tool output), never wording.
+fn reply_defect(text: &str, latest_tool_output: Option<&str>) -> Option<ReplyDefect> {
+    if text.trim().is_empty() {
+        return Some(ReplyDefect::Empty);
+    }
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
+    if crate::tools::sanitize::reply_gutted_by_sanitization(text.trim().chars().count(), &sanitized)
+        || crate::agent::task_outcome::response_looks_like_plain_text_tool_call(text)
+        || crate::agent::response_analysis::reply_has_protocol_markers(text)
+    {
+        return Some(ReplyDefect::InternalMarkers);
+    }
+    let pasted = crate::agent::response_analysis::reply_is_pasted_file_page(&sanitized)
+        || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized)
+        || latest_tool_output.is_some_and(|output| {
+            crate::agent::response_analysis::reply_duplicates_tool_output(&sanitized, output)
+        });
+    pasted.then_some(ReplyDefect::ToolOutputPaste)
+}
+
+/// The reply that ships for a completed run: sanitized, and an honest
+/// fallback instead of an empty or gutted answer (never a bare "Done.").
+fn finalize_reply(text: &str, tool_calls: &[String], response_note: Option<&str>) -> String {
+    if text.trim().is_empty() {
+        return crate::agent::agent_helpers::build_empty_response_fallback(response_note);
+    }
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
+    if !crate::tools::sanitize::reply_gutted_by_sanitization(
+        text.trim().chars().count(),
+        &sanitized,
+    ) {
+        return sanitized;
+    }
+    if tool_calls.is_empty() {
+        "I ran into a formatting problem composing that answer and couldn't recover it. Ask me \
+         again and I'll re-gather the details."
+            .to_string()
+    } else {
+        let refs: Vec<&str> = tool_calls.iter().map(String::as_str).collect();
+        super::completion_checks::build_activity_summary_reply(&refs)
+    }
+}
+
 /// What the ledger says when the model wants to stop.
 struct StopFacts {
     /// Expectations an admissible tool could still satisfy.
@@ -601,6 +659,12 @@ struct TurnScope<'a> {
     contract: &'a crate::agent::completion_contract::CompletionContract,
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
     learning: std::sync::Mutex<crate::agent::post_task::LearningContext>,
+    /// The model-visible output of the latest tool call, for paste checks.
+    latest_tool_output: std::sync::Mutex<Option<String>>,
+    /// The one reply retry has been spent.
+    reply_retry_used: AtomicBool,
+    /// The latest provider note (for example a safety finish reason).
+    response_note: std::sync::Mutex<Option<String>>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -793,6 +857,9 @@ impl Agent {
             .map(|receipt| receipt.outcome_status.is_failure() || receipt.contract_rejected)
             .unwrap_or(true);
         let duration_ms = started.elapsed().as_millis() as u64;
+        if let Ok(mut latest) = scope.latest_tool_output.lock() {
+            *latest = Some(output.clone());
+        }
         if let Ok(mut learning) = scope.learning.lock() {
             let rejected = metadata
                 .as_ref()
@@ -862,8 +929,46 @@ impl Agent {
     }
 
     async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
-        let decision = self.sdk_closeout(scope, check.completed_results).await;
+        let mut decision = self.sdk_closeout(scope, check.completed_results).await;
+        if decision == sdk::StopDecision::Accept {
+            decision = self.sdk_reply_check(scope, &check.final_text);
+        }
         let _ = check.reply.send(decision);
+    }
+
+    /// One shared retry for a reply that must not ship (empty, only internal
+    /// markers, pasted tool output); after it, the finalizer's honest
+    /// fallback applies.
+    fn sdk_reply_check(&self, scope: &TurnScope<'_>, final_text: &str) -> sdk::StopDecision {
+        let latest = scope
+            .latest_tool_output
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone());
+        let Some(defect) = reply_defect(final_text, latest.as_deref()) else {
+            return sdk::StopDecision::Accept;
+        };
+        if scope.reply_retry_used.swap(true, Ordering::Relaxed) {
+            return sdk::StopDecision::Accept;
+        }
+        warn!(
+            session_id = scope.session_id,
+            task_id = scope.task_id,
+            ?defect,
+            "SDK engine: final reply rejected; retrying once"
+        );
+        let directive = match defect {
+            ReplyDefect::Empty => super::system_directives::SystemDirective::EmptyResponseRetry,
+            ReplyDefect::InternalMarkers => {
+                super::system_directives::SystemDirective::FinalAnswerRejectedInternalMarkers
+            }
+            ReplyDefect::ToolOutputPaste => {
+                super::system_directives::SystemDirective::FinalAnswerWasFilePaste
+            }
+        };
+        sdk::StopDecision::Continue {
+            message: directive.render(),
+        }
     }
 
     /// The legacy ledger-first closeout on the SDK path: replay the run
@@ -1090,6 +1195,11 @@ impl Agent {
             if self.charge_goal_budget(scope, goal, usage).await && !response.tool_calls.is_empty()
             {
                 return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
+            }
+        }
+        if let Some(note) = response.response_note.clone() {
+            if let Ok(mut latest) = scope.response_note.lock() {
+                *latest = Some(note);
             }
         }
         let response = from_provider_response(response);
@@ -1349,6 +1459,9 @@ impl Agent {
             turn_id: &turn_id,
             contract: &contract,
             learning: std::sync::Mutex::new(learning_ctx),
+            latest_tool_output: std::sync::Mutex::new(None),
+            reply_retry_used: AtomicBool::new(false),
+            response_note: std::sync::Mutex::new(None),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
@@ -1394,6 +1507,37 @@ impl Agent {
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {
                 let (reply, status, task_outcome) = reply_for(&outcome);
+                let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
+                    let tool_calls = scope
+                        .learning
+                        .lock()
+                        .map(|learning| learning.tool_calls.clone())
+                        .unwrap_or_default();
+                    let note = scope
+                        .response_note
+                        .lock()
+                        .ok()
+                        .and_then(|note| note.clone());
+                    let reply = finalize_reply(&reply, &tool_calls, note.as_deref());
+                    match channel_ctx.visibility {
+                        crate::types::ChannelVisibility::Public
+                        | crate::types::ChannelVisibility::PublicExternal => {
+                            let (sanitized, redacted) =
+                                crate::tools::sanitize::sanitize_output(&reply);
+                            if redacted
+                                && channel_ctx.visibility
+                                    == crate::types::ChannelVisibility::PublicExternal
+                            {
+                                format!("{sanitized}\n\n(Some content was filtered for security)")
+                            } else {
+                                sanitized
+                            }
+                        }
+                        _ => reply,
+                    }
+                } else {
+                    reply
+                };
                 info!(
                     session_id,
                     task_id,
@@ -2204,6 +2348,51 @@ mod tests {
         assert!(ok.starts_with("read_file(") && !ok.contains('['), "{ok}");
         assert!(learning_tool_summary("read_file", args, false, true).ends_with(" [FAILED]"));
         assert!(learning_tool_summary("read_file", args, true, true).ends_with(" [REJECTED]"));
+    }
+
+    #[test]
+    fn reply_checks_reject_empty_marker_only_and_pasted_replies() {
+        assert_eq!(reply_defect("Here is the answer.", None), None);
+        assert_eq!(reply_defect("   ", None), Some(ReplyDefect::Empty));
+        assert_eq!(
+            reply_defect("[SYSTEM] tool envelope only", None),
+            Some(ReplyDefect::InternalMarkers)
+        );
+        assert_eq!(
+            reply_defect("[tool_use: terminal]\nargs: {\"cmd\":\"ls\"}", None),
+            Some(ReplyDefect::InternalMarkers)
+        );
+        let page = "File: /tmp/notes.txt (lines 1-5 of 5, 60 bytes)\n1 | alpha\n2 | beta\n\
+                    3 | gamma\n4 | delta\n5 | epsilon";
+        assert_eq!(reply_defect(page, None), Some(ReplyDefect::ToolOutputPaste));
+        let output = "/srv/synthetic/report-alpha.txt\n/srv/synthetic/report-beta.txt\n\
+                      /srv/synthetic/report-gamma.txt\n/srv/synthetic/report-delta.txt";
+        assert_eq!(
+            reply_defect(output, Some(output)),
+            Some(ReplyDefect::ToolOutputPaste)
+        );
+    }
+
+    #[test]
+    fn final_replies_are_sanitized_and_never_a_bare_done() {
+        let clean = finalize_reply("All set.\n[SYSTEM] internal note", &[], None);
+        assert!(
+            clean.contains("All set.") && !clean.contains("[SYSTEM]"),
+            "{clean}"
+        );
+        let empty = finalize_reply("", &[], Some("SAFETY"));
+        assert!(
+            empty.starts_with("I wasn't able to process that request") && empty.contains("SAFETY"),
+            "{empty}"
+        );
+        let gutted = finalize_reply("[SYSTEM] only markers", &[], None);
+        assert!(gutted.contains("couldn't recover"), "{gutted}");
+        let with_work = finalize_reply(
+            "[SYSTEM] only markers",
+            &["write_file(notes.txt)".to_string()],
+            None,
+        );
+        assert!(!with_work.trim().is_empty() && !with_work.contains("[SYSTEM]"));
     }
 
     #[test]

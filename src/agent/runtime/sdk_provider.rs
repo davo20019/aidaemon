@@ -94,6 +94,12 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
         }
         match message.role {
             sdk::Role::System => out.push(json!({"role": "system", "content": message.content})),
+            // Harness and stop-hook messages are directives, which the
+            // daemon sends as system messages.
+            sdk::Role::User if message.is_injected() => out.push(json!({
+                "role": "system",
+                "content": message.content,
+            })),
             sdk::Role::User => out.push(json!({
                 "role": "user",
                 "content": content_with_images(&message.content, &message.images),
@@ -589,6 +595,16 @@ mod tests {
         assert!(serde_json::to_string(&fitted)
             .unwrap()
             .contains("output 19"));
+    }
+
+    #[test]
+    fn injected_directives_are_sent_as_system_messages() {
+        let directive =
+            sdk::Message::from_origin(sdk::MessageOrigin::StopHook, "[SYSTEM] answer now");
+        let messages = to_daemon_messages_from(&[sdk::Message::user("hi"), directive]);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "[SYSTEM] answer now");
     }
 
     #[test]

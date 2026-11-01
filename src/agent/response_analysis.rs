@@ -373,6 +373,16 @@ mod tool_output_paste_tests {
     }
 }
 
+/// Provider protocol markers (consultation and intent-gate envelopes,
+/// pseudo tool calls) are structurally invalid as a final answer.
+pub(in crate::agent) fn reply_has_protocol_markers(reply: &str) -> bool {
+    let lower = reply.trim().to_ascii_lowercase();
+    lower.contains("[consultation]")
+        || lower.contains(&crate::llm_markers::INTENT_GATE_MARKER.to_ascii_lowercase())
+        || lower.contains("[tool_use:")
+        || lower.contains("[tool_call:")
+}
+
 /// A final reply that is a verbatim read_file page — the harness's own page
 /// header (`File: <path> (lines A-B of N, X bytes...)`) followed by
 /// line-numbered content — is a paste, never an answer. Observed live: after
