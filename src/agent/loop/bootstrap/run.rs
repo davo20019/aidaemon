@@ -37,6 +37,47 @@ impl GateFilterStage {
     }
 }
 
+/// The task assessment's candidate models: the router's priority order, but
+/// an owner `/model` pin goes first so the whole turn runs on that model
+/// (the router's models stay behind it as fallbacks).
+fn assessment_model_order(
+    router_models: Option<Vec<String>>,
+    turn_model: &str,
+    model_override_active: bool,
+) -> Vec<String> {
+    let mut models = router_models.unwrap_or_else(|| vec![turn_model.to_string()]);
+    if model_override_active {
+        models.retain(|candidate| candidate != turn_model);
+        models.insert(0, turn_model.to_string());
+    }
+    models
+}
+
+#[cfg(test)]
+mod assessment_model_order_tests {
+    use super::assessment_model_order;
+
+    #[test]
+    fn owner_model_pin_leads_the_assessment() {
+        let router = || {
+            Some(vec![
+                "sol".to_string(),
+                "luna".to_string(),
+                "terra".to_string(),
+            ])
+        };
+        assert_eq!(
+            assessment_model_order(router(), "terra", true),
+            ["terra", "sol", "luna"]
+        );
+        assert_eq!(
+            assessment_model_order(router(), "terra", false),
+            ["sol", "luna", "terra"]
+        );
+        assert_eq!(assessment_model_order(None, "terra", true), ["terra"]);
+    }
+}
+
 fn build_tool_filter_gate_telemetry(
     stages: &[GateFilterStage],
     initial_tool_count: usize,
@@ -1270,9 +1311,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     } else {
         super::task_planning::planning_skip_reason(user_text, false)
     };
-    let planner_models = llm_router
-        .as_ref()
-        .map_or_else(|| vec![model.clone()], |router| router.all_models_ordered());
+    let model_override_active =
+        tokio::time::timeout(Duration::from_secs(2), agent.model_override.read())
+            .await
+            .map(|guard| *guard)
+            .unwrap_or(false);
+    let planner_models = assessment_model_order(
+        llm_router
+            .as_ref()
+            .map(|router| router.all_models_ordered()),
+        &model,
+        model_override_active,
+    );
     let planner_model = planner_models
         .first()
         .map_or(model.as_str(), String::as_str);
