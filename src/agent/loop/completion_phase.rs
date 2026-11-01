@@ -328,7 +328,7 @@ fn post_completion_memory_plan(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MandateDecisionCommitState {
+pub(in crate::agent) enum MandateDecisionCommitState {
     NotApplicable,
     Missing,
     Committed,
@@ -336,13 +336,13 @@ enum MandateDecisionCommitState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MandateDecisionCompletionAction {
+pub(in crate::agent) enum MandateDecisionCompletionAction {
     Allow,
     Retry,
     Reject,
 }
 
-async fn mandate_decision_commit_state(
+pub(in crate::agent) async fn mandate_decision_commit_state(
     agent: &Agent,
 ) -> anyhow::Result<MandateDecisionCommitState> {
     let Some(fence) = agent.mandate_execution.as_ref() else {
@@ -368,7 +368,7 @@ async fn mandate_decision_commit_state(
     }
 }
 
-fn mandate_decision_completion_action(
+pub(in crate::agent) fn mandate_decision_completion_action(
     state: MandateDecisionCommitState,
     retries_used: usize,
     decision_tool_available: bool,

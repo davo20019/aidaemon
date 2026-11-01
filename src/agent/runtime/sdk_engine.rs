@@ -700,6 +700,10 @@ struct TurnScope<'a> {
     /// Skills referencing untrusted external content are active.
     restrict_untrusted_reference_tools: bool,
     untrusted_reference_skills: Vec<String>,
+    /// Mandate decision correction turns used.
+    mandate_commit_retries: std::sync::atomic::AtomicU32,
+    /// Set when the run must end failed despite a final answer.
+    run_failure: std::sync::Mutex<Option<String>>,
     /// `send_file` dedupe keys that already succeeded in this task.
     sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
@@ -1092,7 +1096,13 @@ impl Agent {
                 !failed,
                 duration_ms,
                 failed.then(|| output.clone()),
-                Some(scope.task_id),
+                // Mandate receipts belong to the worker task, as in the legacy
+                // tool phase.
+                Some(
+                    self.mandate_execution
+                        .as_ref()
+                        .map_or(scope.task_id, |fence| fence.worker_task_id.as_str()),
+                ),
                 metadata
                     .as_ref()
                     .and_then(|metadata| metadata.persistent_output.as_deref()),
@@ -1134,11 +1144,73 @@ impl Agent {
     }
 
     async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
-        let mut decision = self.sdk_closeout(scope, check.completed_results).await;
+        let mut decision = self.sdk_mandate_commit_check(scope).await;
+        if decision == sdk::StopDecision::Accept {
+            decision = self.sdk_closeout(scope, check.completed_results).await;
+        }
         if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text);
         }
         let _ = check.reply.send(decision);
+    }
+
+    /// A mandate task lead's prose is never its decision: a missing typed
+    /// commit gets one bounded correction turn, then the run fails closed,
+    /// as in the legacy completion phase.
+    async fn sdk_mandate_commit_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
+        use super::completion_phase::{
+            mandate_decision_commit_state, mandate_decision_completion_action,
+            MandateDecisionCommitState, MandateDecisionCompletionAction,
+        };
+        let state = match mandate_decision_commit_state(self).await {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(task_id = scope.task_id, %error, "SDK engine: mandate decision lookup failed");
+                return sdk::StopDecision::Accept;
+            }
+        };
+        let decision_tool_available = self
+            .tools
+            .iter()
+            .any(|tool| tool.name() == "manage_mandates");
+        let retries = scope.mandate_commit_retries.load(Ordering::Relaxed) as usize;
+        match mandate_decision_completion_action(state, retries, decision_tool_available) {
+            MandateDecisionCompletionAction::Allow => sdk::StopDecision::Accept,
+            MandateDecisionCompletionAction::Retry => {
+                scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
+                self.emit_warning_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    scope.model_calls.load(Ordering::Relaxed) as usize,
+                    crate::events::DecisionType::PostExecutionValidation,
+                    "Blocked mandate prose completion without a durable decision".to_string(),
+                    serde_json::json!({
+                        "condition": "mandate_decision_commit_missing",
+                        "retry": retries + 1,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
+                sdk::StopDecision::Continue {
+                    message:
+                        super::system_directives::SystemDirective::MandateDecisionCommitRequired
+                            .render(),
+                }
+            }
+            MandateDecisionCompletionAction::Reject => {
+                let error = if state == MandateDecisionCommitState::Invalid {
+                    "Mandate deliberator found a decision for the current run with mismatched \
+                     immutable identity."
+                } else {
+                    "Mandate deliberator returned without committing an exact durable decision \
+                     after its bounded correction turn."
+                };
+                if let Ok(mut failure) = scope.run_failure.lock() {
+                    *failure = Some(error.to_string());
+                }
+                sdk::StopDecision::Accept
+            }
+        }
     }
 
     /// One shared retry for a reply that must not ship (empty, only internal
@@ -1970,6 +2042,8 @@ impl Agent {
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
+            mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
+            run_failure: std::sync::Mutex::new(None),
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
             terminal_reply: std::sync::Mutex::new(None),
@@ -2049,6 +2123,12 @@ impl Agent {
                     ),
                     _ => (reply, status, task_outcome),
                 };
+                let run_failure = scope.run_failure.lock().ok().and_then(|f| f.clone());
+                let (status, task_outcome) = if run_failure.is_some() {
+                    (TaskStatus::Failed, TaskOutcome::Failed)
+                } else {
+                    (status, task_outcome)
+                };
                 let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
                     let tool_calls = scope
                         .learning
@@ -2116,10 +2196,13 @@ impl Agent {
                 }
                 let error = match &outcome.status {
                     sdk::RunStatus::ProviderFailed { error } => Some(error.clone()),
-                    _ => None,
+                    _ => run_failure.clone(),
                 };
                 (
-                    Ok(reply),
+                    match run_failure {
+                        Some(failure) => Err(anyhow::anyhow!(failure)),
+                        None => Ok(reply),
+                    },
                     status,
                     task_outcome,
                     (error, outcome.turns(), outcome.state.tool_calls),
