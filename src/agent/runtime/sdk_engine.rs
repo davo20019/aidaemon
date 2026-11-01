@@ -168,6 +168,88 @@ impl sdk::Hook for LedgerStop {
     }
 }
 
+/// Whether `tool` with `arguments`, after the run's earlier `previous` calls,
+/// continues a same-tool loop, with the legacy guard's limits
+/// (`tool_execution/guards.rs`): 8 consecutive calls, 16 for versatile and
+/// research tools, 40 for `computer_use`; diverse arguments get the higher
+/// limit as a bonus, not a bypass.
+fn same_tool_loop(previous: &[(String, Value)], tool: &str, arguments: &Value) -> bool {
+    let mut streak: Vec<&Value> = previous
+        .iter()
+        .rev()
+        .take_while(|(name, _)| name == tool)
+        .map(|(_, args)| args)
+        .collect();
+    streak.push(arguments);
+    let total = streak.len();
+    let computer_use = tool == "computer_use";
+    let versatile = matches!(
+        tool,
+        "read_file"
+            | "search_files"
+            | "manage_goal_tasks"
+            | "check_environment"
+            | "web_search"
+            | "web_fetch"
+            | "terminal"
+    );
+    let limit = if computer_use {
+        40
+    } else if versatile {
+        super::MAX_CONSECUTIVE_SAME_TOOL + 8
+    } else {
+        super::MAX_CONSECUTIVE_SAME_TOOL
+    };
+    if total < limit {
+        return false;
+    }
+    let mut unique: Vec<&Value> = Vec::new();
+    for args in streak {
+        if !unique.contains(&args) {
+            unique.push(args);
+        }
+    }
+    let diverse = unique.len() * 2 > total;
+    let diverse_limit = if computer_use {
+        40
+    } else {
+        super::MAX_CONSECUTIVE_SAME_TOOL + 8
+    };
+    !diverse || total >= diverse_limit
+}
+
+/// The legacy consecutive-same-tool guard as a hook. A hook cannot end the
+/// run, so the looping call is refused with a redirect; if the model keeps
+/// at it, the kernel's stuck detector ends the run.
+struct SameToolLimit;
+
+#[async_trait]
+impl sdk::Hook for SameToolLimit {
+    async fn before_tool(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        call: &sdk::ToolCall,
+        _tool: &sdk::ToolInfo,
+    ) -> sdk::ToolDecision {
+        let previous: Vec<(String, Value)> = ctx
+            .run_receipts()
+            .map(|receipt| (receipt.tool.clone(), receipt.arguments.clone()))
+            .collect();
+        if !same_tool_loop(&previous, &call.name, &call.arguments) {
+            return sdk::ToolDecision::Allow;
+        }
+        warn!(tool = %call.name, "SDK engine: same tool called too many consecutive times");
+        sdk::ToolDecision::Deny {
+            reason: format!(
+                "[LOOP DETECTED] `{}` has been called too many times in a row without \
+                 finishing. Stop calling it: use a different approach, or answer with what \
+                 you have and the exact limitation.",
+                call.name
+            ),
+        }
+    }
+}
+
 /// Extra passes the ledger may demand in one run.
 const MAX_CLOSEOUT_DEMANDS: u32 = 2;
 
@@ -1307,6 +1389,7 @@ impl Agent {
                 });
             }
         }
+        builder = builder.hook(SameToolLimit);
         builder = builder.hook(LedgerStop {
             calls: calls_tx.clone(),
         });
@@ -2219,6 +2302,72 @@ mod tests {
             .count();
         assert_eq!(dispatched, 0);
         assert_eq!(reply.text, "I could not save it.");
+    }
+
+    #[test]
+    fn same_tool_streaks_follow_the_legacy_limits() {
+        let calls = |tool: &str, n: usize, distinct: bool| -> Vec<(String, serde_json::Value)> {
+            (0..n)
+                .map(|i| {
+                    let args = if distinct {
+                        serde_json::json!({ "i": i })
+                    } else {
+                        serde_json::json!({})
+                    };
+                    (tool.to_string(), args)
+                })
+                .collect()
+        };
+        let same = serde_json::json!({});
+        // Identical calls: the 8th is a loop.
+        assert!(!same_tool_loop(
+            &calls("remember_fact", 6, false),
+            "remember_fact",
+            &same
+        ));
+        assert!(same_tool_loop(
+            &calls("remember_fact", 7, false),
+            "remember_fact",
+            &same
+        ));
+        // Diverse arguments earn the +8 bonus, not a bypass.
+        let next = serde_json::json!({ "i": 99 });
+        assert!(!same_tool_loop(
+            &calls("remember_fact", 7, true),
+            "remember_fact",
+            &next
+        ));
+        assert!(same_tool_loop(
+            &calls("remember_fact", 15, true),
+            "remember_fact",
+            &next
+        ));
+        // Versatile and research tools start at 16.
+        assert!(!same_tool_loop(
+            &calls("read_file", 14, true),
+            "read_file",
+            &next
+        ));
+        assert!(same_tool_loop(
+            &calls("read_file", 15, true),
+            "read_file",
+            &next
+        ));
+        // computer_use is bounded at 40.
+        assert!(!same_tool_loop(
+            &calls("computer_use", 38, false),
+            "computer_use",
+            &same
+        ));
+        assert!(same_tool_loop(
+            &calls("computer_use", 39, false),
+            "computer_use",
+            &same
+        ));
+        // Another tool breaks the streak.
+        let mut mixed = calls("remember_fact", 7, false);
+        mixed.push(("system_info".to_string(), same.clone()));
+        assert!(!same_tool_loop(&mixed, "remember_fact", &same));
     }
 
     #[test]
