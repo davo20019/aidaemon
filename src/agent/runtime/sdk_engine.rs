@@ -788,6 +788,10 @@ struct TurnScope<'a> {
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
     background_handoff: AtomicBool,
+    /// The latest well-formed final answer a closeout demand sent back for
+    /// more work. If the model then replies with nothing, this ships instead
+    /// of a generic activity summary.
+    interrupted_answer: std::sync::Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -1246,6 +1250,13 @@ impl Agent {
             decision = self
                 .sdk_closeout(scope, check.completed_results, check.failed_without_success)
                 .await;
+            if decision != sdk::StopDecision::Accept
+                && reply_defect(&check.final_text, None).is_none()
+            {
+                if let Ok(mut interrupted) = scope.interrupted_answer.lock() {
+                    *interrupted = Some(check.final_text.clone());
+                }
+            }
         }
         if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text);
@@ -2616,6 +2627,7 @@ impl Agent {
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
             background_handoff: AtomicBool::new(false),
+            interrupted_answer: std::sync::Mutex::new(None),
             emitter: &emitter,
             prefix,
             prefix_len,
@@ -2711,6 +2723,15 @@ impl Agent {
                         .lock()
                         .ok()
                         .and_then(|note| note.clone());
+                    let interrupted = scope
+                        .interrupted_answer
+                        .lock()
+                        .ok()
+                        .and_then(|answer| answer.clone());
+                    let reply = match interrupted {
+                        Some(answer) if reply.trim().is_empty() => answer,
+                        _ => reply,
+                    };
                     let reply = finalize_reply(&reply, &tool_calls, note.as_deref());
                     match channel_ctx.visibility {
                         crate::types::ChannelVisibility::Public
@@ -3310,6 +3331,69 @@ mod tests {
     /// The legacy `executor_declared_checklist` integration test on the SDK
     /// engine: the model declares three typed items, does one and tries to
     /// stop; the ledger demands the open items until receipts close them.
+    /// The closeout interrupted a real answer, then the model went silent:
+    /// the user gets that answer, not a generic activity summary.
+    #[tokio::test]
+    async fn empty_reply_after_a_closeout_demand_ships_the_interrupted_answer() {
+        use crate::testing::MockProvider;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace
+            .path()
+            .join("never-read.txt")
+            .to_string_lossy()
+            .to_string();
+        let checklist_args = serde_json::json!({
+            "items": [
+                {"text": "read the file back", "status": "pending",
+                 "requires_observation": true, "targets": [file]}
+            ]
+        })
+        .to_string();
+        let answer = "Cancelled the Acme Corp reminder; the daily schedule is unchanged.";
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("track_requirements", &checklist_args),
+            MockProvider::text_response(answer),
+            MockProvider::text_response(""),
+            MockProvider::text_response(""),
+            MockProvider::text_response(""),
+        ])
+        .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+            "check",
+            false,
+            false,
+            &[],
+            "new_request",
+            "local_workspace",
+        )]);
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        let track = Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plans));
+        let harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            vec![track as Arc<dyn crate::traits::Tool>],
+        )
+        .await
+        .unwrap();
+
+        let response = harness
+            .agent
+            .handle_message(
+                "interrupted_answer",
+                "Cancel the reminder.",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, answer);
+    }
+
     #[tokio::test]
     async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
         use crate::testing::MockProvider;

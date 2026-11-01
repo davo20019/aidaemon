@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`web_fetch` keeps listing pages whole.** On download and release pages readability kept a side section (python.org: "verify your download") and dropped the release list, so the agent reported an older version as current. A short extract cut from a large page now returns the whole page text.
+- **A silent model no longer replaces a real answer with "I completed N actions."** When the closeout sends a correct final answer back for more work and the model then replies with nothing, that answer ships instead of a generic activity summary.
+- **Folder-scoped checklist steps close.** A write or read inside a folder the checklist named now counts for that folder.
+- **Cancelling a goal's last schedule cancels the goal**, and `list_scheduled` shows active goals that have no schedule (they never run) so they can be cancelled.
 - **Read-only requests can use the terminal again.** The authority check judged `terminal` as a whole (not read-only) and refused even a plain `find`; it now judges each call, and the terminal still enforces read-only itself.
 - **Recall of earlier work works with models that fill every field.** Optional tool arguments left as `""` or `[]` are dropped before dispatch, so `search_history` no longer filters on an empty session and `create_scheduled_goal` no longer loses `schedule` behind an empty `schedules`.
 - **An inspection step is not reopened by the edit built on it.** A checklist observation that a later item depends on is no longer invalidated by that item's changes, so "inspect → edit → verify" turns stop looping on an impossible pre-edit inspection.
