@@ -582,59 +582,6 @@ impl Agent {
         // From this point onward, use exactly what was persisted so matching,
         // rendering, routing, and dialogue projection share one source of truth.
         let user_text = canonical_user_text.as_str();
-        // On the SDK engine the kernel runs the turn bootstrap set up.
-        #[cfg(feature = "sdk-engine")]
-        if let Some(engine) = self.sdk_engine.clone() {
-            let preserve_archived_context = matches!(
-                turn_context.followup_mode,
-                Some(
-                    crate::agent::followup::FollowupMode::Followup
-                        | crate::agent::followup::FollowupMode::ClarificationAnswer
-                )
-            );
-            let tail = if preserve_archived_context {
-                &continuation_task_context_tail
-            } else {
-                &fresh_task_context_tail
-            };
-            let instructions = if tail.trim().is_empty() {
-                core_prompt_bytes.clone()
-            } else {
-                format!("{core_prompt_bytes}\n\n{tail}")
-            };
-            let offered_tools = tool_defs
-                .iter()
-                .filter_map(|definition| {
-                    definition
-                        .get("function")
-                        .and_then(|function| function.get("name"))
-                        .or_else(|| definition.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
-            let setup = super::sdk_engine::SdkTurnSetup {
-                user_text: canonical_user_text.clone(),
-                task_id: task_id.clone(),
-                emitter: emitter.clone(),
-                offered_tools,
-                model: model.clone(),
-                instructions,
-                contract: turn_context.completion_contract.clone(),
-            };
-            // Boxed so the SDK turn does not grow this already large state machine.
-            return Box::pin(self.handle_message_sdk(
-                &engine,
-                setup,
-                session_id,
-                attachments,
-                status_tx,
-                user_role,
-                channel_ctx,
-                heartbeat,
-            ))
-            .await;
-        }
         let followup_mode = turn_context
             .followup_mode
             .map(|mode| mode.as_str())
@@ -1415,6 +1362,54 @@ impl Agent {
         // cloned into each iteration's `ToolExecutionCtx` so the P2.4 per-call
         // sandbox gate fires on the remediation task-lead and all its executors.
         let correction_context = self.correction_context_for_current_goal().await;
+
+        // On the SDK engine the kernel runs the iteration loop; every per-turn
+        // setup above (assessment, contract, harness eval, budgets, pending
+        // directives) is shared with the legacy loop.
+        #[cfg(feature = "sdk-engine")]
+        if let Some(engine) = self.sdk_engine.clone() {
+            let mut instructions = if task_context_tail.trim().is_empty() {
+                core_prompt_bytes.clone()
+            } else {
+                format!("{core_prompt_bytes}\n\n{task_context_tail}")
+            };
+            for directive in turn_state.directives.take_system_messages() {
+                instructions.push_str("\n\n");
+                instructions.push_str(&directive.render());
+            }
+            let offered_tools = tool_defs
+                .iter()
+                .filter_map(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .or_else(|| definition.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            let setup = super::sdk_engine::SdkTurnSetup {
+                user_text: user_text.to_string(),
+                task_id: task_id.clone(),
+                emitter: emitter.clone(),
+                offered_tools,
+                model: model.clone(),
+                instructions,
+                contract: turn_context.completion_contract.clone(),
+            };
+            // Boxed so the SDK turn does not grow this already large state machine.
+            return Box::pin(self.handle_message_sdk(
+                &engine,
+                setup,
+                session_id,
+                attachments,
+                status_tx,
+                user_role,
+                channel_ctx,
+                heartbeat,
+            ))
+            .await;
+        }
 
         loop {
             let iteration = begin_turn_iteration(
