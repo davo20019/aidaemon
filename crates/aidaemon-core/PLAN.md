@@ -155,10 +155,11 @@ adapters, tested against local mock servers.
       daemon's provider router/fallbacks (Anthropic only), ToolCall events
       and receipts (ToolResult is recorded), intent gating and completion
       contracts (deliberately off). Scheduled goals not yet observed live.
-- [ ] Daemon builds its agent through `AgentBuilder` with its hooks.
-- [ ] Old loop runs side by side behind a flag until the new one matches or
-      beats it on Phase 4 numbers.
-- [ ] Delete the old loop.
+- [ ] Close the remaining gaps and replace the old loop. Owner decision
+      (2026-10-31): no side-by-side comparison; once the test suite passes on
+      the SDK engine, the old loop is deleted. Task-by-task breakdown with
+      tests: `plans/2026-10-31-sdk-engine-parity.md` (this directory). Tick
+      the tasks there; tick this line when its Task 8 lands.
 
 ## Parallel track: fixes found in the daemon
 
