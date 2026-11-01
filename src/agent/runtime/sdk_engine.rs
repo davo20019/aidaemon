@@ -68,6 +68,7 @@ const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
 const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
 const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
+const MANDATE_BUDGET_EXHAUSTED: &str = "the mandate cycle's token balance is exhausted";
 
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
@@ -1390,10 +1391,16 @@ impl Agent {
             prefix.extend(extra);
             fit_run(&prefix, run, budget)
         };
-        let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         let est_input_tokens =
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = super::llm::LlmCallTelemetry::default();
+        // Mandate runs share one durable token balance across the task lead
+        // and its executors: reserve before the call, settle after it, as in
+        // the legacy LLM phase.
+        let lease = self
+            .sdk_mandate_token_lease(&mut options, est_input_tokens as u32)
+            .await?;
         let started = Instant::now();
         // The legacy per-call ceiling: a hung provider must not hold the turn.
         let ceiling = if self.mandate_execution.is_some() {
@@ -1428,6 +1435,40 @@ impl Agent {
             )),
         };
         let latency_ms = started.elapsed().as_millis() as u64;
+        if let Some(lease) = lease.as_ref() {
+            match &result {
+                Ok(response) => {
+                    let delta = response
+                        .usage
+                        .as_ref()
+                        .map(|usage| i64::try_from(usage.budget_tokens()).unwrap_or(i64::MAX))
+                        .unwrap_or_else(|| {
+                            lease
+                                .budget_per_cycle
+                                .saturating_sub(lease.tokens_used_before)
+                        });
+                    if let Err(error) = self
+                        .state
+                        .settle_mandate_run_token_lease(
+                            &lease.goal_run_id,
+                            &lease.lease_token,
+                            delta,
+                        )
+                        .await
+                    {
+                        warn!(task_id = scope.task_id, %error, "SDK engine: could not settle mandate spend");
+                    }
+                }
+                Err(_) => {
+                    super::llm_phase::exhaust_mandate_run_token_lease_after_ambiguous_call(
+                        self,
+                        Some(lease),
+                        scope.session_id,
+                    )
+                    .await;
+                }
+            }
+        }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
@@ -1553,6 +1594,72 @@ impl Agent {
             .await
         {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool-call message");
+        }
+    }
+
+    /// Admit a mandate run's model call against its durable balance. Returns
+    /// the lease to settle, or an error that ends the run when the balance
+    /// cannot admit the call.
+    async fn sdk_mandate_token_lease(
+        &self,
+        options: &mut crate::traits::ChatOptions,
+        est_input_tokens: u32,
+    ) -> Result<Option<super::llm_phase::MandateRunTokenLease>, sdk::ProviderError> {
+        use super::llm_phase::{
+            acquire_mandate_run_token_lease, mandate_output_token_ceiling,
+            release_mandate_run_token_lease_without_dispatch, MandateRunTokenAdmission,
+        };
+        let lease_secs = i64::try_from(MANDATE_MAX_MODEL_CALL.as_secs())
+            .unwrap_or(900)
+            .saturating_add(30);
+        let admission = acquire_mandate_run_token_lease(self, lease_secs, &None)
+            .await
+            .map_err(|error| sdk::ProviderError::Other(error.to_string()))?;
+        match admission {
+            MandateRunTokenAdmission::NotApplicable => Ok(None),
+            MandateRunTokenAdmission::Exhausted { .. } => {
+                Err(sdk::ProviderError::Other(MANDATE_BUDGET_EXHAUSTED.into()))
+            }
+            MandateRunTokenAdmission::Acquired(lease) => {
+                let remaining = lease
+                    .budget_per_cycle
+                    .saturating_sub(lease.tokens_used_before);
+                let Some(ceiling) = mandate_output_token_ceiling(remaining, est_input_tokens)
+                else {
+                    release_mandate_run_token_lease_without_dispatch(self, Some(&lease), "").await;
+                    return Err(sdk::ProviderError::Other(MANDATE_BUDGET_EXHAUSTED.into()));
+                };
+                options.max_tokens_override = Some(
+                    options
+                        .max_tokens_override
+                        .map_or(ceiling, |configured| configured.min(ceiling)),
+                );
+                options.single_attempt_fail_closed = true;
+                // Durably mark the reservation dispatched before the provider
+                // sees the request, so an interrupted call settles fail-closed.
+                let fence = self
+                    .mandate_execution
+                    .as_ref()
+                    .ok_or_else(|| sdk::ProviderError::Other("mandate fence missing".into()))?;
+                let dispatched = self
+                    .state
+                    .mark_mandate_run_token_lease_dispatched(
+                        &lease.goal_run_id,
+                        &fence.mandate_id,
+                        fence.mandate_version,
+                        &lease.lease_token,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if !dispatched {
+                    release_mandate_run_token_lease_without_dispatch(self, Some(&lease), "").await;
+                    return Err(sdk::ProviderError::Other(
+                        "mandate model call was not durably reserved before provider dispatch"
+                            .into(),
+                    ));
+                }
+                Ok(Some(lease))
+            }
         }
     }
 

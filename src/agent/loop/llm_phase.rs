@@ -37,14 +37,14 @@ fn spawn_heartbeat_keeper(heartbeat: &Option<Arc<AtomicU64>>) -> Option<AbortOnD
 }
 
 #[derive(Debug)]
-struct MandateRunTokenLease {
-    goal_run_id: String,
-    lease_token: String,
-    tokens_used_before: i64,
-    budget_per_cycle: i64,
+pub(in crate::agent) struct MandateRunTokenLease {
+    pub(in crate::agent) goal_run_id: String,
+    pub(in crate::agent) lease_token: String,
+    pub(in crate::agent) tokens_used_before: i64,
+    pub(in crate::agent) budget_per_cycle: i64,
 }
 
-enum MandateRunTokenAdmission {
+pub(in crate::agent) enum MandateRunTokenAdmission {
     NotApplicable,
     Acquired(MandateRunTokenLease),
     Exhausted {
@@ -57,7 +57,7 @@ enum MandateRunTokenAdmission {
 /// goal run and its immutable durable token balance. Waiting workers poll the
 /// short lease. If a process dies after dispatch, expiry consumes the remaining
 /// balance fail-closed instead of admitting a retry with unknowable prior spend.
-async fn acquire_mandate_run_token_lease(
+pub(in crate::agent) async fn acquire_mandate_run_token_lease(
     agent: &Agent,
     lease_secs: i64,
     heartbeat: &Option<Arc<AtomicU64>>,
@@ -128,7 +128,7 @@ async fn acquire_mandate_run_token_lease(
     }
 }
 
-async fn release_mandate_run_token_lease_without_dispatch(
+pub(in crate::agent) async fn release_mandate_run_token_lease_without_dispatch(
     agent: &Agent,
     lease: Option<&MandateRunTokenLease>,
     session_id: &str,
@@ -159,7 +159,7 @@ async fn release_mandate_run_token_lease_without_dispatch(
 /// Once dispatch begins, a provider error or timeout does not prove that no
 /// tokens were consumed. Charge the entire remaining balance and release the
 /// lease atomically; retrying unknown spend would fail open.
-async fn exhaust_mandate_run_token_lease_after_ambiguous_call(
+pub(in crate::agent) async fn exhaust_mandate_run_token_lease_after_ambiguous_call(
     agent: &Agent,
     lease: Option<&MandateRunTokenLease>,
     session_id: &str,
@@ -210,7 +210,10 @@ fn mandate_input_token_reservation(estimated_input_tokens: u32) -> i64 {
         + MANDATE_INPUT_RESERVATION_FIXED_TOKENS
 }
 
-fn mandate_output_token_ceiling(remaining: i64, estimated_input_tokens: u32) -> Option<u32> {
+pub(in crate::agent) fn mandate_output_token_ceiling(
+    remaining: i64,
+    estimated_input_tokens: u32,
+) -> Option<u32> {
     let available =
         remaining.saturating_sub(mandate_input_token_reservation(estimated_input_tokens));
     (available > 0).then(|| u32::try_from(available).unwrap_or(u32::MAX))
