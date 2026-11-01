@@ -143,11 +143,17 @@ adapters, tested against local mock servers.
       channel envelopes and history work. Anthropic provider only.
       Live check: `live_sdk_engine_runs_daemon_turns` (ignored; 5/5 on
       claude-haiku-5-5).
-- [ ] Not yet on the SDK path: per-turn memory/fact injection, mandate
-      authority (goal runs under a mandate will have mutating calls refused),
-      ToolCall/ToolResult events (so `db_probe --gate-outcomes` and receipts
-      see no tool calls), `/clear` boundary in history replay, attachments,
-      model switching (`/model`) and the daemon's provider router.
+- [x] Live on the owner's daemon via Telegram (2026-10-31): prompt from the
+      legacy builder (memory facts, skills, project instructions, mandate
+      isolation), tool calls/results recorded and replayed as paired tool
+      use, `/clear` respected, mandate authority gate per call, sub-agents
+      and status updates working. Fixed on the way: top-level schema
+      combinators rejected by Anthropic; `truncate_with_anchor` dropping the
+      newest message (shared with the legacy loop).
+- [ ] Not yet on the SDK path: attachments (paths only), `/model` and the
+      daemon's provider router/fallbacks (Anthropic only), ToolCall events
+      and receipts (ToolResult is recorded), intent gating and completion
+      contracts (deliberately off). Scheduled goals not yet observed live.
 - [ ] Daemon builds its agent through `AgentBuilder` with its hooks.
 - [ ] Old loop runs side by side behind a flag until the new one matches or
       beats it on Phase 4 numbers.
