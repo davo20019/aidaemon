@@ -2919,8 +2919,9 @@ impl HeartbeatCoordinator {
         // and the task-lead pipeline (which adds a minute-plus of dispatch and
         // LLM latency). Falls through to the normal pipeline if the message
         // can't be delivered.
-        if let Some(reminder) = crate::reminders::parse_reminder(&goal.description) {
-            let fire_text = crate::reminders::fire_message(&reminder);
+        if let Some(fire_text) =
+            crate::reminders::fire_text_for_goal(goal.context.as_deref(), &goal.description)
+        {
             let delivered = if let Some(hub_arc) = self.hub.as_ref().and_then(|w| w.upgrade()) {
                 hub_arc
                     .send_text(&goal.session_id, &fire_text)
@@ -3918,6 +3919,31 @@ mod tests {
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "completed");
+    }
+
+    /// The typed reminder message decides the fast path, whatever wording
+    /// the model used for the description.
+    #[tokio::test]
+    async fn test_typed_reminder_message_uses_fast_path() {
+        let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+        let mut goal =
+            Goal::new_deferred_finite("Remind Alice Rivera to check the oven", "test_session");
+        goal.status = "active".to_string();
+        goal.context = Some(crate::reminders::context_for_message("Check the oven."));
+        state.create_goal(&goal).await.unwrap();
+        let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        let msgs = channel.messages_for("test_session").await;
+        assert_eq!(msgs, vec!["⏰ Reminder: Check the oven.".to_string()]);
+        let g = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(g.status, "completed");
     }
 
     #[tokio::test]

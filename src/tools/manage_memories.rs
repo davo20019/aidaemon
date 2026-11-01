@@ -343,6 +343,8 @@ struct ManageArgs {
     goal_id: Option<String>,
     schedule_id: Option<String>,
     schedule: Option<String>,
+    /// A plain reminder's message: delivered as-is when the schedule fires.
+    reminder: Option<String>,
     schedules: Option<Vec<String>>,
     fire_policy: Option<String>,
     is_one_shot: Option<bool>,
@@ -362,7 +364,7 @@ struct ManageArgs {
 fn manage_memories_schema() -> Value {
     json!({
         "name": "manage_memories",
-        "description": "Memories and goals. search=facts; search_episodes=past conversations. Store via remember_fact.",
+        "description": "Memories/goals. search=facts; search_episodes=past chats. Store via remember_fact.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -380,6 +382,7 @@ fn manage_memories_schema() -> Value {
                 "goal_id": { "type": "string" },
                 "schedule_id": { "type": "string" },
                 "schedule": { "type": "string" },
+                "reminder": { "type": "string" },
                 "schedules": { "type": "array", "items": { "type": "string" } },
                 "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] },
                 "is_one_shot": { "type": "boolean" },
@@ -1191,6 +1194,14 @@ impl Tool for ManageMemoriesTool {
                     crate::traits::Goal::new_deferred_finite(&desc, session_id)
                 };
                 goal.domain = "orchestration".to_string();
+                let reminder_message = args
+                    .reminder
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty());
+                if let Some(message) = reminder_message {
+                    goal.context = Some(crate::reminders::context_for_message(message));
+                }
 
                 self.state.create_goal(&goal).await?;
 
@@ -1234,6 +1245,19 @@ impl Tool for ManageMemoriesTool {
                     .min_by_key(|dt| dt.timestamp())
                     .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
                     .unwrap_or_else(|| "n/a".to_string());
+
+                // A reminder runs no agent and only messages the owner: no
+                // confirmation step.
+                if let Some(message) = reminder_message {
+                    self.state.activate_goal(&goal.id).await?;
+                    return Ok(format!(
+                        "Reminder set: \"{}\". {} schedule(s). Next: {}. System timezone: {}.",
+                        message,
+                        parsed.len(),
+                        next_run,
+                        tz_label
+                    ));
+                }
 
                 // Button-based confirmation via approval channel
                 if let Some(ref tx) = self.approval_tx {
@@ -3806,6 +3830,44 @@ mod tests {
             )
             .await;
         assert!(missing.is_err(), "a missing schedule is a failed call");
+    }
+
+    /// A typed reminder runs no agent and only messages the owner, so it is
+    /// active at once (no confirmation prompt) and carries its message.
+    #[tokio::test]
+    async fn create_scheduled_goal_with_reminder_message_is_active_at_once() {
+        let state = setup_state().await;
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_approval_tx(crate::tools::ApprovalBroker::new(approval_tx));
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Remind Alice Rivera to check the oven",
+                    "schedule": "in 2h",
+                    "reminder": "Check the oven.",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Reminder set"), "{result}");
+        assert!(approval_rx.try_recv().is_err(), "no confirmation prompt");
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description.contains("oven"))
+            .unwrap();
+        assert_eq!(goal.status, "active");
+        assert_eq!(
+            crate::reminders::message_from_context(goal.context.as_deref()).as_deref(),
+            Some("Check the oven.")
+        );
     }
 
     #[tokio::test]

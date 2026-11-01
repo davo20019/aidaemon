@@ -167,6 +167,32 @@ pub fn confirmation_message(reminder: &Reminder, when: &str) -> String {
 }
 
 /// The message sent when the reminder fires, e.g. "⏰ Reminder: call your daughter".
+/// Goal-context key holding a reminder's message. Set by
+/// `create_scheduled_goal` from its typed `reminder` argument; a goal
+/// carrying it is delivered as that message, with no agent run.
+pub const CONTEXT_KEY: &str = "reminder_message";
+
+/// The goal context for a typed reminder.
+pub fn context_for_message(message: &str) -> String {
+    serde_json::json!({ CONTEXT_KEY: message.trim() }).to_string()
+}
+
+/// The typed reminder message stored in a goal's context, if any.
+pub fn message_from_context(context: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(context?).ok()?;
+    let message = value.get(CONTEXT_KEY)?.as_str()?.trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
+/// The text sent when a goal fires as a reminder: its typed message, else a
+/// description phrased as a reminder ("remind me to ...", older goals).
+pub fn fire_text_for_goal(context: Option<&str>, description: &str) -> Option<String> {
+    if let Some(message) = message_from_context(context) {
+        return Some(format!("⏰ Reminder: {message}"));
+    }
+    parse_reminder(description).map(|reminder| fire_message(&reminder))
+}
+
 pub fn fire_message(reminder: &Reminder) -> String {
     match reminder.connective {
         Some("that") => format!("⏰ Reminder: remember that {}", reminder.body),
