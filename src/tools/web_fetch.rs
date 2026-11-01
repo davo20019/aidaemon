@@ -682,11 +682,34 @@ fn extract_page_text(html: &str, url: &str) -> String {
     let parsed_url = reqwest::Url::parse(url)
         .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
     let mut cursor = Cursor::new(cleaned.as_bytes());
+    let full_page = || htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone());
     match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
-        Ok(product) if !product.text.trim().is_empty() => product.text,
-        _ => htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone()),
+        Ok(product) if !product.text.trim().is_empty() => {
+            // Readability keeps one block. On an article that is the content;
+            // on a listing page (downloads, release lists, tables) it is a
+            // side section, and the answer is in what it dropped. A short
+            // extract cut from a much larger page gets the whole page.
+            let article_chars = product.text.trim().chars().count();
+            if article_chars >= MIN_ARTICLE_CHARS {
+                return product.text;
+            }
+            let full = full_page();
+            let full_chars = full.trim().chars().count();
+            if (article_chars as f64) >= MIN_ARTICLE_COVERAGE * full_chars as f64 {
+                product.text
+            } else {
+                full
+            }
+        }
+        _ => full_page(),
     }
 }
+
+/// Readability output at least this long is an article in its own right.
+const MIN_ARTICLE_CHARS: usize = 8_000;
+/// A shorter extract must cover at least this share of the page's text to
+/// count as its main content.
+const MIN_ARTICLE_COVERAGE: f64 = 0.35;
 
 /// Remove `<script>`, `<style>`, and `<noscript>` blocks (case-insensitive,
 /// unclosed blocks dropped to end-of-input).
@@ -977,6 +1000,65 @@ mod format_tests {
         let hint = info.remediation_hint.expect("remediation hint");
         assert!(hint.contains("max_chars"));
         assert!(!hint.contains("wc -l"));
+    }
+
+    /// A synthetic download page: a short release list, one long prose
+    /// section and a lot of navigation, shaped like real listing pages.
+    fn listing_page() -> String {
+        let nav: String = (0..400)
+            .map(|i| format!("<li><a href=\"/nav/{i}\">Section {i} overview</a></li>"))
+            .collect();
+        let prose: String = (0..12)
+            .map(|i| {
+                format!(
+                    "<p>Paragraph {i} explains how release artifacts are signed and how a \
+                     careful user can check that a downloaded installer is genuine before \
+                     running it on their machine, step by step.</p>"
+                )
+            })
+            .collect();
+        format!(
+            "<html><body><nav><ul>{nav}</ul></nav>\
+             <div class=\"releases\"><h2>Downloads</h2><ul>\
+             <li><a href=\"/r/9.4.2\">Download Acme 9.4.2</a></li>\
+             <li><a href=\"/r/9.4.1\">Acme 9.4.1</a></li></ul></div>\
+             <div class=\"article\"><h2>Verifying downloads</h2>{prose}</div>\
+             </body></html>"
+        )
+    }
+
+    #[test]
+    fn listing_page_keeps_content_readability_would_drop() {
+        let text = extract_page_text(&listing_page(), "https://acme.example/downloads/");
+        assert!(
+            text.contains("Download Acme 9.4.2"),
+            "{}",
+            &text[..text.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn long_article_still_uses_readability() {
+        let nav: String = (0..200)
+            .map(|i| format!("<li><a href=\"/nav/{i}\">Menu entry {i}</a></li>"))
+            .collect();
+        let body: String = (0..120)
+            .map(|i| {
+                format!(
+                    "<p>Paragraph {i} of a long synthetic article about mountain cities, \
+                     their climate, history and the people who live there today.</p>"
+                )
+            })
+            .collect();
+        let html = format!(
+            "<html><body><nav><ul>{nav}</ul></nav><article><h1>Mountain cities</h1>{body}</article></body></html>"
+        );
+        let text = extract_page_text(&html, "https://wiki.example/mountain");
+        assert!(text.contains("Paragraph 119"));
+        assert!(
+            !text.contains("Menu entry 150"),
+            "navigation leaked into an article"
+        );
     }
 
     #[test]
