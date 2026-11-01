@@ -966,6 +966,11 @@ pub struct ExecutorExpectationItem {
     /// ever carry them; recorded so the drop stays auditable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbound_targets: Vec<String>,
+    /// Indices of earlier items this one builds on (`depends_on`). An
+    /// observation another item depends on is a prerequisite: the dependent
+    /// work cannot make it stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
     /// The model's declared status (`pending`, `in_progress`, `completed`,
     /// `deferred`, ...). Receipts decide satisfaction; only an explicit
     /// `deferred`/`skipped` abandons an item.

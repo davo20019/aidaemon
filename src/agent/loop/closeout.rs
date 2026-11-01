@@ -132,6 +132,7 @@ mod tests {
             required_target: None,
             observation_targets: Vec::new(),
             summary: None,
+            prerequisite: false,
         }
     }
 

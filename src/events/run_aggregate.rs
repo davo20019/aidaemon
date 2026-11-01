@@ -80,6 +80,11 @@ pub(crate) struct RunObligation {
     /// (executor-declared items carry their own description).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// A checklist observation that a later item depends on (`depends_on`):
+    /// it is satisfied by having happened before that work, so mutations
+    /// made for the dependent work do not make it stale.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prerequisite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,6 +494,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                prerequisite: false,
             });
         }
 
@@ -531,6 +537,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                prerequisite: false,
             });
         }
 
@@ -557,6 +564,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                prerequisite: false,
             });
         }
 
@@ -579,6 +587,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                prerequisite: false,
             });
         }
 
@@ -595,6 +604,7 @@ impl RunAggregate {
                 required_target: None,
                 observation_targets: Vec::new(),
                 summary: None,
+                prerequisite: false,
             });
         }
     }
@@ -611,6 +621,11 @@ impl RunAggregate {
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
         self.executor_expectations_present = true;
         let exact_resource_targets = declared.schema_version >= 2;
+        let depended_on: BTreeSet<usize> = declared
+            .items
+            .iter()
+            .flat_map(|item| item.depends_on.iter().copied())
+            .collect();
         let mut declared_ids = BTreeSet::new();
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
@@ -684,6 +699,8 @@ impl RunAggregate {
                 summary: Some(executor_item_summary(item, class, required_effect)),
                 required_target,
                 observation_targets,
+                prerequisite: class == RunObligationClass::Observe
+                    && depended_on.contains(&item.index),
             });
         }
         for (id, obligation) in self.obligations.iter_mut() {
@@ -784,7 +801,7 @@ impl RunAggregate {
                 // Mirror the live staleness rule: an observation credited at
                 // an older revision is stale only when a later mutation could
                 // have changed the observed state.
-                if obligation.class == RunObligationClass::Observe {
+                if obligation.class == RunObligationClass::Observe && !obligation.prerequisite {
                     let stale = receipts.iter().any(|later| {
                         later.succeeded
                             && !later.mutation_effects.is_empty()
@@ -1176,6 +1193,7 @@ impl RunAggregate {
             let mutation_targets = receipt_targets(receipt);
             for obligation in self.obligations.values_mut() {
                 if obligation.class == RunObligationClass::Observe
+                    && !obligation.prerequisite
                     && obligation.state == RunObligationState::Satisfied
                     && obligation
                         .satisfied_at_revision
@@ -4181,6 +4199,7 @@ mod tests {
             targets: targets.iter().map(|t| t.to_string()).collect(),
             observation_targets: Vec::new(),
             unbound_targets: Vec::new(),
+            depends_on: Vec::new(),
             status: status.to_string(),
         }
     }
@@ -4260,6 +4279,77 @@ mod tests {
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
         }
+    }
+
+    /// "Inspect, then edit, then verify": the edit (which depends on the
+    /// inspection) must not reopen the inspection, while the verification,
+    /// which nothing depends on, still needs a read after the edit.
+    #[test]
+    fn prerequisite_inspection_is_not_staled_by_the_work_that_depends_on_it() {
+        let path = "/tmp/proj/calc.py";
+        let declare = |statuses: [&str; 3]| {
+            let inspect = checklist_item(0, ToolMutationEffects::NONE, true, &[path], statuses[0]);
+            let mut edit = checklist_item(
+                1,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[path],
+                statuses[1],
+            );
+            edit.depends_on = vec![0];
+            let mut verify =
+                checklist_item(2, ToolMutationEffects::NONE, true, &[path], statuses[2]);
+            verify.depends_on = vec![1];
+            executor_expectations(vec![inspect, edit, verify])
+        };
+        let mut events = vec![
+            declare(["in_progress", "pending", "pending"]),
+            call("read", "read_file"),
+            result(
+                "read",
+                "read_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(Some(path)),
+            ),
+            call("edit", "edit_file"),
+            result(
+                "edit",
+                "edit_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics(path),
+            ),
+            declare(["completed", "completed", "in_progress"]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied,
+            "the edit that builds on the inspection does not make it stale"
+        );
+        match aggregate.closeout(|_| true) {
+            CloseoutDecision::Reachable { obligation_ids } => assert_eq!(
+                obligation_ids,
+                vec!["task:task-1/obligation:checklist:2".to_string()],
+                "only the post-edit verification is still owed"
+            ),
+            other => panic!("expected reachable, got {other:?}"),
+        }
+
+        events.push(call("verify", "read_file"));
+        events.push(result(
+            "verify",
+            "read_file",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            terminal_observation_semantics(Some(path)),
+        ));
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+        assert!(aggregate.evidence_closed());
     }
 
     #[test]
