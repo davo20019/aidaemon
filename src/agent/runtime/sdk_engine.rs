@@ -67,6 +67,21 @@ const TERMINAL_REPLY_STOP: &str = "terminal tool result";
 const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
 const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
+/// A timed-out call is retried, as the legacy loop continued after one: the
+/// ceiling bounds a call so the turn regains control, not so it ends.
+const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
+
+/// A model call that ran past its per-call ceiling.
+#[derive(Debug)]
+struct ModelCallTimedOut(Duration);
+
+impl std::fmt::Display for ModelCallTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model call timed out after {}s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for ModelCallTimedOut {}
 const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
 /// Budget extension limits, as in the legacy loop.
 const TASK_MAX_BUDGET_EXTENSIONS: usize = 3;
@@ -731,6 +746,8 @@ struct TurnScope<'a> {
     goal_budget_extensions: std::sync::atomic::AtomicU32,
     /// Mandate decision correction turns used.
     mandate_commit_retries: std::sync::atomic::AtomicU32,
+    /// Timed-out model calls retried in this run.
+    model_call_timeouts: std::sync::atomic::AtomicU32,
     /// Set when the run must end failed despite a final answer.
     run_failure: std::sync::Mutex<Option<String>>,
     /// `send_file` dedupe keys that already succeeded in this task.
@@ -1441,8 +1458,45 @@ impl Agent {
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply, exactly as for a legacy-loop call.
     async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
-        let reply = self.sdk_model_call(scope, &call.request).await;
+        let reply = loop {
+            let reply = self.sdk_model_call(scope, &call.request).await;
+            // Only a timed-out call comes back Transient here: the provider
+            // stack has already retried everything else it can.
+            let Err(sdk::ProviderError::Transient(_)) = &reply else {
+                break reply;
+            };
+            let retries = scope.model_call_timeouts.fetch_add(1, Ordering::Relaxed);
+            if retries >= MAX_MODEL_CALL_TIMEOUT_RETRIES {
+                break reply;
+            }
+            let timeout_secs = self.sdk_model_call_timeout().as_secs();
+            warn!(
+                session_id = scope.session_id,
+                task_id = scope.task_id,
+                retry = retries + 1,
+                "SDK engine: retrying a timed-out model call"
+            );
+            if let Ok(mut extra) = scope.extra_system.lock() {
+                extra.push(
+                    super::system_directives::SystemDirective::ModelCallTimedOut { timeout_secs }
+                        .render(),
+                );
+            }
+        };
         let _ = call.reply.send(reply);
+    }
+
+    /// The legacy per-call ceiling: a hung provider must not hold the turn.
+    fn sdk_model_call_timeout(&self) -> Duration {
+        let ceiling = if self.mandate_execution.is_some() {
+            MANDATE_MAX_MODEL_CALL
+        } else {
+            FOREGROUND_MAX_MODEL_CALL
+        };
+        self.limits
+            .llm_call_timeout
+            .unwrap_or(DEFAULT_MODEL_CALL_TIMEOUT)
+            .min(ceiling)
     }
 
     async fn sdk_model_call(
@@ -1491,17 +1545,7 @@ impl Agent {
             .sdk_mandate_token_lease(&mut options, est_input_tokens as u32)
             .await?;
         let started = Instant::now();
-        // The legacy per-call ceiling: a hung provider must not hold the turn.
-        let ceiling = if self.mandate_execution.is_some() {
-            MANDATE_MAX_MODEL_CALL
-        } else {
-            FOREGROUND_MAX_MODEL_CALL
-        };
-        let timeout = self
-            .limits
-            .llm_call_timeout
-            .unwrap_or(DEFAULT_MODEL_CALL_TIMEOUT)
-            .min(ceiling);
+        let timeout = self.sdk_model_call_timeout();
         let result = match tokio::time::timeout(
             timeout,
             self.call_llm_with_recovery(
@@ -1518,10 +1562,7 @@ impl Agent {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "model call timed out after {}s",
-                timeout.as_secs()
-            )),
+            Err(_) => Err(anyhow::Error::new(ModelCallTimedOut(timeout))),
         };
         let latency_ms = started.elapsed().as_millis() as u64;
         if let Some(lease) = lease.as_ref() {
@@ -1568,6 +1609,9 @@ impl Agent {
                     %error,
                     "SDK engine: model call failed after recovery"
                 );
+                if error.is::<ModelCallTimedOut>() {
+                    return Err(sdk::ProviderError::Transient(error.to_string()));
+                }
                 return Err(sdk::ProviderError::Other(error.to_string()));
             }
         };
@@ -2499,6 +2543,7 @@ impl Agent {
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
+            model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             task_tokens: AtomicU64::new(0),
             task_budget: AtomicU64::new(self.limits.task_token_budget.unwrap_or(0)),
             task_budget_extensions: std::sync::atomic::AtomicUsize::new(0),
@@ -2945,6 +2990,65 @@ mod tests {
             .filter(|event| event.data.get("call_purpose").is_none_or(|p| p.is_null()))
             .count();
         assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_retries_a_timed_out_model_call() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_delayed_responses(
+            vec![MockProvider::text_response("Here is the answer.")],
+            vec![Duration::from_secs(3), Duration::ZERO],
+        );
+        let harness = crate::testing::setup_test_agent_sdk_with_llm_timeout(provider, Some(1))
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Summarize the plan."))
+            .await
+            .unwrap();
+        assert!(
+            reply.text.contains("Here is the answer."),
+            "a timed-out call is retried, not the end of the run: {}",
+            reply.text
+        );
+        let retried_with_directive = harness.provider.call_log.lock().await.iter().any(|call| {
+            call.messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("took longer than 1s"))
+            })
+        });
+        assert!(
+            retried_with_directive,
+            "the retry tells the model to take a smaller step"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_fails_after_repeated_model_call_timeouts() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let attempts = MAX_MODEL_CALL_TIMEOUT_RETRIES as usize + 1;
+        let provider = MockProvider::with_delayed_responses(
+            vec![MockProvider::text_response("Too late.")],
+            vec![Duration::from_secs(3); attempts],
+        );
+        let harness = crate::testing::setup_test_agent_sdk_with_llm_timeout(provider, Some(1))
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Summarize the plan."))
+            .await
+            .unwrap();
+        assert!(
+            reply.text.contains("timed out after 1s"),
+            "the retry budget is bounded: {}",
+            reply.text
+        );
     }
 
     async fn task_events(

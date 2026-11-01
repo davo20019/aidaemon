@@ -19,6 +19,12 @@ pub(in crate::agent) enum SystemDirective {
     MandateDecisionCommitRequired,
     FreshConversationContext,
     EmptyResponseRetry,
+    /// The previous model call ran past its per-call ceiling and is being
+    /// retried; the model should take a smaller step.
+    #[cfg_attr(not(feature = "sdk-engine"), allow(dead_code))]
+    ModelCallTimedOut {
+        timeout_secs: u64,
+    },
     TruncationRecoveryUseWriteFile,
     TruncationRecoveryTextContinuation {
         truncated_tail: String,
@@ -289,6 +295,12 @@ impl SystemDirective {
             Self::MandateDecisionCommitRequired => "[SYSTEM] This mandate review still has no durable decision. Plain text cannot complete the review. Your next response MUST call manage_mandates exactly once with action=\"record_decision\" and a valid ACT, WAIT, ASK, or STOP payload. Correct the validation error shown in the preceding tool result, if any. Do not return a prose decision.".to_string(),
             Self::FreshConversationContext => "This is a fresh conversation context. There are no previous tasks. Focus exclusively on the current user request. Do not reference or repeat tool calls from any prior context.".to_string(),
             Self::EmptyResponseRetry => "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response.".to_string(),
+            Self::ModelCallTimedOut { timeout_secs } => format!(
+                "[SYSTEM] Your previous response took longer than {timeout_secs}s and was discarded. \
+                 Take a smaller next step: do not author a large file or long reply in one response. \
+                 Write large files in chunks (write_file, then write_file with mode=\"append\"), or \
+                 delegate the authoring, and keep each response short."
+            ),
             Self::TruncationRecoveryUseWriteFile => "[SYSTEM] Your previous response was cut off because it exceeded the maximum output token limit. Do NOT generate long content inline. Choose by where the content lives: (1) If the content already exists in a file (e.g. a spilled tool result or fetched data), do NOT regenerate it — extract or format the part the user needs into a clean file with a tool (terminal/grep), then deliver it with the send_file tool. (2) If you must author the content yourself (a long report, a large code file), write it in chunks: call write_file with the first chunk, then call write_file with mode=\"append\" for each additional chunk. Keep your direct reply to the user brief.".to_string(),
             Self::TruncationRecoveryTextContinuation { truncated_tail } => format!(
                 "[SYSTEM] Your previous text response was cut off mid-sentence due to output token limits. \

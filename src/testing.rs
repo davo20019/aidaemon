@@ -555,7 +555,25 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
 /// provider behind the daemon's provider stack.
 #[cfg(feature = "sdk-engine")]
 pub async fn setup_test_agent_sdk(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    let mut harness = setup_test_agent(provider).await?;
+    setup_test_agent_sdk_with_llm_timeout(provider, None).await
+}
+
+/// Like [`setup_test_agent_sdk`], with a per-call model timeout.
+#[cfg(feature = "sdk-engine")]
+pub async fn setup_test_agent_sdk_with_llm_timeout(
+    provider: MockProvider,
+    llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
+    let mut harness = setup_test_agent_internal(
+        provider,
+        vec![],
+        llm_call_timeout_secs,
+        true,
+        true,
+        false,
+        None,
+    )
+    .await?;
     harness
         .agent
         .set_sdk_engine(Some(crate::agent::sdk_engine::SdkEngineSettings::default()));
