@@ -1479,3 +1479,95 @@ async fn images_reach_the_model_from_the_user_and_from_tools() {
     let debug = format!("{:?}", Image::base64("image/png", "BBBB"));
     assert!(!debug.contains("BBBB"), "{debug}");
 }
+
+// ---------- run end ----------
+
+/// Records every `on_run_end` call as (status, final_text, run receipts).
+#[derive(Default)]
+struct RunEndLog(Mutex<Vec<(RunStatus, Option<String>, usize)>>);
+struct RunEndHook(Arc<RunEndLog>);
+#[async_trait]
+impl Hook for RunEndHook {
+    async fn on_run_end(&self, ctx: &HookContext<'_>, outcome: &aidaemon_core::RunOutcome) {
+        self.0 .0.lock().unwrap().push((
+            outcome.status.clone(),
+            outcome.final_text.clone(),
+            ctx.run_receipts().count(),
+        ));
+    }
+}
+
+#[tokio::test]
+async fn on_run_end_fires_once_with_the_final_outcome() {
+    // Completed, after one rejected final answer and one tool call.
+    let log = Arc::new(RunEndLog::default());
+    let agent = base(ScriptedProvider::new([
+        text("done without work"),
+        tool_calls([call("c1", "echo", json!({"text": "a"}))]),
+        text("done"),
+    ]))
+    .tool(echo_tool())
+    .hook(RequireEvidence)
+    .hook(RunEndHook(log.clone()))
+    .build()
+    .unwrap();
+    agent.run("s", "go").await.unwrap();
+    assert_eq!(
+        *log.0.lock().unwrap(),
+        vec![(RunStatus::Completed, Some("done".to_string()), 1)]
+    );
+
+    // Provider failure.
+    let log = Arc::new(RunEndLog::default());
+    let agent = base(ScriptedProvider::with_results([Err(ProviderError::Auth(
+        "bad key".into(),
+    ))]))
+    .hook(RunEndHook(log.clone()))
+    .build()
+    .unwrap();
+    agent.run("s", "go").await.unwrap();
+    let calls = log.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(calls[0].0, RunStatus::ProviderFailed { .. }));
+    assert_eq!(calls[0].1, None);
+
+    // Cancelled before the first model call.
+    let log = Arc::new(RunEndLog::default());
+    let agent = base(ScriptedProvider::new([text("never")]))
+        .hook(RunEndHook(log.clone()))
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    agent.run_with_cancel("s", "go", cancel).await.unwrap();
+    assert_eq!(
+        *log.0.lock().unwrap(),
+        vec![(RunStatus::Cancelled, None, 0)]
+    );
+
+    // Turn limit.
+    let log = Arc::new(RunEndLog::default());
+    let agent = base(ScriptedProvider::new([]).then_repeat(tool_calls([call(
+        "c",
+        "echo",
+        json!({"text": "x"}),
+    )])))
+    .tool(echo_tool())
+    .hook(RunEndHook(log.clone()))
+    .limits(Limits {
+        max_turns: 2,
+        ..Limits::default()
+    })
+    .stuck_detection(StuckConfig {
+        repeat_threshold: 0,
+        error_threshold: 0,
+        ping_pong_window: 0,
+        max_nudges: 0,
+    })
+    .build()
+    .unwrap();
+    agent.run("s", "go").await.unwrap();
+    let calls = log.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(calls[0].0, RunStatus::LimitReached { .. }));
+}

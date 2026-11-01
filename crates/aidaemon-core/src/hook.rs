@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::message::{Message, ToolCall};
+use crate::outcome::RunOutcome;
 use crate::provider::{ModelRequest, Usage};
 use crate::receipt::Receipt;
 use crate::state::RunId;
@@ -111,6 +112,12 @@ pub trait Hook: Send + Sync {
     async fn on_stop(&self, _ctx: &HookContext<'_>, _final_text: &str) -> StopDecision {
         StopDecision::Accept
     }
+
+    /// The run ended, with any status. Fires exactly once per run, after the
+    /// outcome is final and every `on_stop` check has had its say, so it is
+    /// the place for after-the-fact work such as writing memory. It cannot
+    /// change the outcome.
+    async fn on_run_end(&self, _ctx: &HookContext<'_>, _outcome: &RunOutcome) {}
 
     /// The stuck detector fired. `None` means "no opinion"; if every hook
     /// abstains, the default policy nudges and then stops.

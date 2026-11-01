@@ -863,11 +863,25 @@ impl<'a> Driver<'a> {
             turns: self.state.turn,
         })
         .await?;
-        Ok(RunOutcome {
+        let outcome = RunOutcome {
             status,
             final_text,
             state: self.state,
-        })
+        };
+        let ctx = HookContext {
+            run_id: outcome.state.run_id,
+            agent_id: &self.agent.id,
+            session_id: &outcome.state.session_id,
+            turn: outcome.state.turn,
+            messages: &outcome.state.messages,
+            receipts: &outcome.state.receipts,
+            usage: outcome.state.usage,
+            run_usage: outcome.state.run_usage,
+        };
+        for hook in &self.agent.hooks {
+            hook.on_run_end(&ctx, &outcome).await;
+        }
+        Ok(outcome)
     }
 }
 
