@@ -170,9 +170,12 @@ fn concise_scheduled_outcome(text: &str) -> String {
     let without_urls = URL_RE.replace_all(text, "");
     let shortened = shorten_local_paths(&without_urls);
     for line in shortened.lines().map(str::trim) {
+        // Headings and lead-in labels ("Goal completed:") introduce the
+        // outcome; they are not it.
         if line.is_empty()
             || TASK_COUNT_RE.is_match(line)
             || (line.starts_with("**") && line.ends_with("**"))
+            || line.ends_with(':')
         {
             continue;
         }
@@ -360,6 +363,17 @@ mod tests {
         assert!(!output.contains("/Users/synthetic"));
         assert!(!output.contains("Vite 7.3.1"));
         assert!(!output.contains("uploaded 5 assets"));
+    }
+
+    #[test]
+    fn scheduled_completion_skips_lead_in_labels() {
+        let input = "Goal completed:\n\n**Deliver the scheduled reminder now.**\nPrepared \
+                     reminder: Check the oven now. No rescheduling.";
+
+        let output = present_scheduled_run_notification("completed", input, false);
+
+        assert!(output.contains("Check the oven"), "{output}");
+        assert!(!output.contains("Goal completed:"), "{output}");
     }
 
     #[test]
