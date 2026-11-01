@@ -155,6 +155,8 @@ pub(in crate::agent) struct SdkTurnSetup {
 pub(super) struct StopCheck {
     /// Operations of this run that completed.
     completed_results: usize,
+    /// The run's latest tool call failed and none succeeded.
+    failed_without_success: bool,
     final_text: String,
     reply: oneshot::Sender<sdk::StopDecision>,
 }
@@ -173,11 +175,17 @@ impl sdk::Hook for LedgerStop {
             .run_receipts()
             .filter(|receipt| receipt.status == sdk::ReceiptStatus::Succeeded)
             .count();
+        let failed_without_success = completed_results == 0
+            && ctx
+                .run_receipts()
+                .last()
+                .is_some_and(|receipt| receipt.status == sdk::ReceiptStatus::Failed);
         let (reply, answer) = oneshot::channel();
         if self
             .calls
             .send(DaemonCall::Stop(StopCheck {
                 completed_results,
+                failed_without_success,
                 final_text: final_text.to_string(),
                 reply,
             }))
@@ -616,6 +624,12 @@ struct StopFacts {
     /// `completed_results` when the executor's checklist was last demanded.
     executor_demanded_at: Option<usize>,
     terminal_policy_denial: bool,
+    /// A reachable observation obligation remains after a successful change
+    /// and has not been demanded yet (the owner's verify-once rule).
+    verification_after_mutation: bool,
+    /// The run's latest call failed and nothing succeeded, and its recovery
+    /// pass has not been used.
+    unrecovered_failure: bool,
 }
 
 /// The legacy completion gate (`completion_phase.rs`), read from receipts:
@@ -624,8 +638,17 @@ struct StopFacts {
 /// work changed since the last demand; nothing is demanded after a terminal
 /// policy denial.
 fn closeout_demands_work(facts: &StopFacts) -> bool {
-    if facts.terminal_policy_denial || facts.reachable_obligation_ids.is_empty() {
+    if facts.terminal_policy_denial {
         return false;
+    }
+    if facts.unrecovered_failure && facts.completed_results == 0 {
+        return true;
+    }
+    if facts.reachable_obligation_ids.is_empty() {
+        return false;
+    }
+    if facts.verification_after_mutation {
+        return true;
     }
     let executor_demands = facts
         .reachable_obligation_ids
@@ -658,6 +681,9 @@ struct TurnScope<'a> {
     /// Set once the goal budget is used up; later model calls are refused.
     budget_exhausted: AtomicBool,
     model_calls: AtomicU64,
+    /// The verify-once and failure-recovery passes have been used.
+    verification_demanded: AtomicBool,
+    recovery_demanded: AtomicBool,
     /// Extra passes the ledger demanded so far.
     closeout_demands: std::sync::atomic::AtomicU32,
     /// `completed_results` at the last checklist demand (`u64::MAX`: none).
@@ -1165,7 +1191,9 @@ impl Agent {
     async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
         let mut decision = self.sdk_mandate_commit_check(scope).await;
         if decision == sdk::StopDecision::Accept {
-            decision = self.sdk_closeout(scope, check.completed_results).await;
+            decision = self
+                .sdk_closeout(scope, check.completed_results, check.failed_without_success)
+                .await;
         }
         if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text);
@@ -1274,6 +1302,7 @@ impl Agent {
         &self,
         scope: &TurnScope<'_>,
         completed_results: usize,
+        failed_without_success: bool,
     ) -> sdk::StopDecision {
         let Ok(aggregate) = self
             .event_store
@@ -1324,11 +1353,34 @@ impl Agent {
         )
         .await;
         let demanded_at = scope.executor_demanded_at.load(Ordering::Relaxed);
+        let mutation_succeeded = aggregate.operations.values().any(|operation| {
+            operation.mutating
+                && operation.outcome == Some(crate::traits::ToolOutcomeStatus::Succeeded)
+        });
+        let observation_reachable = reachable.iter().any(|id| {
+            aggregate.obligations.get(id).is_some_and(|obligation| {
+                obligation.class == crate::events::RunObligationClass::Observe
+            })
+        });
+        let verification_after_mutation = mutation_succeeded
+            && observation_reachable
+            && !scope.verification_demanded.load(Ordering::Relaxed);
+        // A failure that is itself the expected observation satisfies its
+        // obligation; only an uncredited failure earns the recovery pass.
+        let failure_credited = aggregate
+            .obligations
+            .values()
+            .any(|obligation| obligation.state == crate::events::RunObligationState::Satisfied);
+        let unrecovered_failure = failed_without_success
+            && !failure_credited
+            && !scope.recovery_demanded.load(Ordering::Relaxed);
         let facts = StopFacts {
             reachable_obligation_ids: reachable.clone(),
             completed_results,
             executor_demanded_at: (demanded_at != u64::MAX).then_some(demanded_at as usize),
             terminal_policy_denial: aggregate.terminal_policy_denial(),
+            verification_after_mutation,
+            unrecovered_failure,
         };
         if !closeout_demands_work(&facts)
             || scope.closeout_demands.load(Ordering::Relaxed) >= MAX_CLOSEOUT_DEMANDS
@@ -1336,6 +1388,25 @@ impl Agent {
             return sdk::StopDecision::Accept;
         }
         let demands = scope.closeout_demands.fetch_add(1, Ordering::Relaxed) + 1;
+        if verification_after_mutation {
+            scope.verification_demanded.store(true, Ordering::Relaxed);
+        }
+        if unrecovered_failure && reachable.is_empty() {
+            scope.recovery_demanded.store(true, Ordering::Relaxed);
+            let evidence = scope
+                .latest_tool_output
+                .lock()
+                .ok()
+                .and_then(|output| output.clone())
+                .unwrap_or_default();
+            return sdk::StopDecision::Continue {
+                message:
+                    super::system_directives::SystemDirective::ExternalMutationRecoveryRequired(
+                        evidence.chars().take(600).collect(),
+                    )
+                    .render(),
+            };
+        }
         if reachable
             .iter()
             .any(|id| id.contains("/obligation:checklist:"))
@@ -2460,6 +2531,8 @@ impl Agent {
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
             closeout_demands: std::sync::atomic::AtomicU32::new(0),
+            verification_demanded: AtomicBool::new(false),
+            recovery_demanded: AtomicBool::new(false),
             executor_demanded_at: AtomicU64::new(u64::MAX),
         };
         // A parent or goal cancellation stops the run at its next check.
@@ -3200,6 +3273,8 @@ mod tests {
             completed_results: completed,
             executor_demanded_at: demanded_at,
             terminal_policy_denial: denial,
+            verification_after_mutation: false,
+            unrecovered_failure: false,
         };
         // Open checklist items are demanded even after other work...
         assert!(closeout_demands_work(&facts(&checklist, 2, None, false)));
@@ -3217,6 +3292,23 @@ mod tests {
         // Never after a terminal policy denial, never without reachable work.
         assert!(!closeout_demands_work(&facts(&checklist, 2, None, true)));
         assert!(!closeout_demands_work(&facts(&[], 0, None, false)));
+        // Owner decision: a reachable observation after a successful change
+        // is demanded once even after work completed.
+        let verify = StopFacts {
+            verification_after_mutation: true,
+            ..facts(&contract, 1, None, false)
+        };
+        assert!(closeout_demands_work(&verify));
+        // A failed operation with nothing succeeded gets its recovery pass.
+        let failed = StopFacts {
+            unrecovered_failure: true,
+            ..facts(&[], 0, None, false)
+        };
+        assert!(closeout_demands_work(&failed));
+        assert!(!closeout_demands_work(&StopFacts {
+            terminal_policy_denial: true,
+            ..failed
+        }));
     }
 
     /// An assessed contract restricting tools to `system_info`.
