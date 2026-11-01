@@ -68,6 +68,11 @@ const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
 const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
 const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
+/// Budget extension limits, as in the legacy loop.
+const TASK_MAX_BUDGET_EXTENSIONS: usize = 3;
+const TASK_HARD_TOKEN_CAP: u64 = 2_000_000;
+const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 1;
+const SCHEDULED_HARD_TOKEN_CAP: i64 = 2_000_000;
 const MANDATE_BUDGET_EXHAUSTED: &str = "the mandate cycle's token balance is exhausted";
 
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
@@ -456,24 +461,6 @@ struct BudgetGoal {
     scheduled: bool,
 }
 
-/// Whether a goal's token budget is used up. A scheduled run's per-run
-/// budget (when the run registered one) replaces the daily budget; a budget
-/// of zero or less means no limit.
-fn goal_budget_exhausted(
-    daily: Option<&crate::traits::GoalTokenBudgetStatus>,
-    run: Option<&crate::goal_tokens::GoalRunBudgetStatus>,
-) -> bool {
-    if let Some(run) = run {
-        return run.effective_budget_per_check > 0
-            && run.tokens_used >= run.effective_budget_per_check;
-    }
-    daily.is_some_and(|daily| {
-        daily
-            .budget_daily
-            .is_some_and(|budget| budget > 0 && daily.tokens_used_today >= budget)
-    })
-}
-
 /// Credit one receipt to the contract obligations it proves, as the legacy
 /// tool phase does: a satisfied mutation marks its effects, and a
 /// verifiable observation marks the evidence requirements it matches.
@@ -701,6 +688,21 @@ struct TurnScope<'a> {
     /// Skills referencing untrusted external content are active.
     restrict_untrusted_reference_tools: bool,
     untrusted_reference_skills: Vec<String>,
+    /// Billable tokens this run spent, and the task budget (0: none).
+    task_tokens: AtomicU64,
+    task_budget: AtomicU64,
+    task_budget_extensions: std::sync::atomic::AtomicUsize,
+    /// Distinct successful operations (tool and canonical arguments).
+    succeeded_operations: std::sync::Mutex<HashSet<String>>,
+    /// The latest successful call repeated an earlier operation.
+    repeating: AtomicBool,
+    /// Distinct successful operations so far, and the count at the last
+    /// extension.
+    succeeded_calls: std::sync::atomic::AtomicUsize,
+    successes_at_task_extension: std::sync::atomic::AtomicUsize,
+    /// The goal's effective daily budget after extensions, and their count.
+    goal_daily_budget: std::sync::Mutex<Option<i64>>,
+    goal_budget_extensions: std::sync::atomic::AtomicU32,
     /// Mandate decision correction turns used.
     mandate_commit_retries: std::sync::atomic::AtomicU32,
     /// Set when the run must end failed despite a final answer.
@@ -1023,6 +1025,22 @@ impl Agent {
         let duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
+        }
+        // Budget progress counts distinct successful operations: repeating
+        // an identical call is not new evidence.
+        if !failed {
+            let operation = format!(
+                "{}:{}",
+                request.name,
+                crate::agent::prefix_fingerprint::hash_canonical(&request.arguments)
+            );
+            if let Ok(mut seen) = scope.succeeded_operations.lock() {
+                let new_operation = seen.insert(operation);
+                if new_operation {
+                    scope.succeeded_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                scope.repeating.store(!new_operation, Ordering::Relaxed);
+            }
         }
         if let (Some(key), false) = (send_file_key, failed) {
             if let Ok(mut sent) = scope.sent_files.lock() {
@@ -1545,10 +1563,20 @@ impl Agent {
             },
         )
         .await;
-        if let (Some(goal), Some(usage)) = (&scope.budget_goal, usage.as_ref()) {
-            if self.charge_goal_budget(scope, goal, usage).await && !response.tool_calls.is_empty()
+        if let Some(usage) = usage.as_ref() {
+            if let Some(stop) = self
+                .sdk_charge_budgets(scope, usage, iteration as usize)
+                .await
             {
-                return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
+                // The legacy closeout grace: a final answer on the first call,
+                // or after real progress, still ships; otherwise the budget
+                // reply replaces it and no further work runs.
+                let grace = response.tool_calls.is_empty()
+                    && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
+                if !grace {
+                    scope.end_with(stop, TaskOutcome::Failed);
+                    return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
+                }
             }
         }
         if let Some(note) = response.response_note.clone() {
@@ -1663,59 +1691,308 @@ impl Agent {
         }
     }
 
-    /// Charge a model call to the turn's goal. Returns true when this call
-    /// used up the budget; the owner is alerted once. A final answer still
-    /// goes out (as the legacy closeout grace allows); further work does not.
-    async fn charge_goal_budget(
+    /// Charge a model call to the task, goal-daily and scheduled-run
+    /// budgets. When one is used up, it extends once more if receipts show
+    /// progress since the last extension (or the owner approves), as the
+    /// legacy budget controls do; otherwise the owner is alerted and the
+    /// honest budget reply is returned.
+    async fn sdk_charge_budgets(
+        &self,
+        scope: &TurnScope<'_>,
+        usage: &crate::traits::TokenUsage,
+        iteration: usize,
+    ) -> Option<String> {
+        let delta = usage.budget_tokens();
+        let used = scope.task_tokens.fetch_add(delta, Ordering::Relaxed) + delta;
+        let successes = scope.succeeded_calls.load(Ordering::Relaxed);
+        let learning = scope
+            .learning
+            .lock()
+            .map(|learning| learning.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        let mut directives = Vec::new();
+        let stop = if let Some(stop) = self
+            .sdk_task_budget(
+                scope,
+                used,
+                successes,
+                iteration,
+                &learning,
+                &mut directives,
+            )
+            .await
+        {
+            Some(stop)
+        } else if let Some(goal) = &scope.budget_goal {
+            self.sdk_goal_budget(
+                scope,
+                goal,
+                delta as i64,
+                successes,
+                iteration,
+                &learning,
+                &mut directives,
+            )
+            .await
+        } else {
+            None
+        };
+        if let Ok(mut extra) = scope.extra_system.lock() {
+            extra.extend(directives.iter().map(|directive| directive.render()));
+        }
+        stop
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sdk_task_budget(
+        &self,
+        scope: &TurnScope<'_>,
+        used: u64,
+        successes: usize,
+        iteration: usize,
+        learning: &crate::agent::post_task::LearningContext,
+        directives: &mut Vec<super::system_directives::SystemDirective>,
+    ) -> Option<String> {
+        let budget = scope.task_budget.load(Ordering::Relaxed);
+        if budget == 0 || used < budget {
+            return None;
+        }
+        let cap = TASK_HARD_TOKEN_CAP;
+        let proposed = budget
+            .saturating_mul(2)
+            .max(used.saturating_add(budget / 2))
+            .min(cap);
+        let extensions = scope.task_budget_extensions.load(Ordering::Relaxed);
+        let progressed = successes > scope.successes_at_task_extension.load(Ordering::Relaxed)
+            && !scope.repeating.load(Ordering::Relaxed);
+        let can_extend = budget < cap && proposed > used;
+        let approved = can_extend
+            && if extensions < TASK_MAX_BUDGET_EXTENSIONS
+                && progressed
+                && scope.user_role == UserRole::Owner
+            {
+                true
+            } else {
+                self.request_budget_continue_approval(
+                    scope.emitter,
+                    scope.task_id,
+                    iteration,
+                    scope.session_id,
+                    scope.user_role,
+                    "task",
+                    used as i64,
+                    budget as i64,
+                    proposed as i64,
+                )
+                .await
+            };
+        if approved {
+            let extension = extensions + 1;
+            scope.task_budget.store(proposed, Ordering::Relaxed);
+            scope
+                .task_budget_extensions
+                .store(extension, Ordering::Relaxed);
+            scope
+                .successes_at_task_extension
+                .store(successes, Ordering::Relaxed);
+            self.with_harness_eval(|eval| eval.record_budget_extension())
+                .await;
+            directives.push(
+                super::system_directives::SystemDirective::TaskBudgetAutoExtended {
+                    old_budget: budget as i64,
+                    new_budget: proposed as i64,
+                    extension,
+                    max_extensions: TASK_MAX_BUDGET_EXTENSIONS,
+                },
+            );
+            if let Some(status_tx) = &scope.status_tx {
+                let _ = status_tx.try_send(StatusUpdate::BudgetExtended {
+                    old_budget: budget as i64,
+                    new_budget: proposed as i64,
+                    extension,
+                    max_extensions: TASK_MAX_BUDGET_EXTENSIONS,
+                });
+            }
+            info!(
+                task_id = scope.task_id,
+                old_budget = budget,
+                new_budget = proposed,
+                extension,
+                "SDK engine: extended the task token budget"
+            );
+            return None;
+        }
+        let alert = format!(
+            "Token alert: execution in session '{}' hit task token budget (used {} / limit {}). \
+             The run was stopped to prevent overspending.",
+            scope.session_id, used, budget
+        );
+        self.fanout_token_alert(None, scope.session_id, &alert, Some(scope.session_id))
+            .await;
+        Some(crate::agent::post_task::graceful_budget_response(
+            learning, used,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sdk_goal_budget(
         &self,
         scope: &TurnScope<'_>,
         goal: &BudgetGoal,
-        usage: &crate::traits::TokenUsage,
-    ) -> bool {
-        let delta = usage.budget_tokens() as i64;
-        let daily = match self
+        delta: i64,
+        successes: usize,
+        iteration: usize,
+        learning: &crate::agent::post_task::LearningContext,
+        directives: &mut Vec<super::system_directives::SystemDirective>,
+    ) -> Option<String> {
+        let status = match self
             .state
             .add_goal_tokens_and_get_budget_status(&goal.goal_id, delta)
             .await
         {
-            Ok(status) => status,
+            Ok(Some(status)) => status,
+            Ok(None) => return None,
             Err(error) => {
                 warn!(goal_id = %goal.goal_id, %error, "SDK engine: goal token accounting failed");
-                None
+                return None;
             }
         };
-        let run = if goal.scheduled {
-            match &self.goal_token_registry {
-                Some(registry) => registry.add_run_tokens(&goal.goal_id, delta).await,
-                None => None,
-            }
-        } else {
-            None
+        let metrics = || super::graceful::ScheduledRunActivityMetrics {
+            evidence_gain_count: successes,
+            stall_count: usize::from(scope.repeating.load(Ordering::Relaxed)),
+            consecutive_same_tool_count: 0,
+            consecutive_same_tool_unique_args: 0,
+            total_successful_tool_calls: successes,
         };
-        let daily = if goal.scheduled { None } else { daily.as_ref() };
-        if !goal_budget_exhausted(daily, run.as_ref()) {
-            return false;
+        if goal.scheduled {
+            let registry = self.goal_token_registry.as_ref()?;
+            registry.add_run_tokens(&goal.goal_id, delta).await;
+            let progress = scope
+                .progress
+                .lock()
+                .ok()
+                .map(|progress| progress.clone())?;
+            let run_status = registry
+                .update_run_health(
+                    &goal.goal_id,
+                    Agent::scheduled_run_health_snapshot(
+                        learning,
+                        metrics(),
+                        scope.contract,
+                        &progress,
+                    ),
+                )
+                .await?;
+            super::goal_dispatch::persist_scheduled_run_state(
+                &self.state,
+                &goal.goal_id,
+                None,
+                &run_status,
+            )
+            .await;
+            let mut ctx = super::graceful::ScheduledRunBudgetControlCtx {
+                emitter: scope.emitter,
+                task_id: scope.task_id,
+                session_id: scope.session_id,
+                iteration,
+                goal_id: &goal.goal_id,
+                status: &run_status,
+                pending_system_messages: directives,
+                max_budget_extensions: SCHEDULED_MAX_BUDGET_EXTENSIONS,
+                hard_token_cap: SCHEDULED_HARD_TOKEN_CAP,
+            };
+            if let super::graceful::ScheduledRunBudgetControlOutcome::Exhausted {
+                tokens_used,
+                budget_per_check,
+            } = self.enforce_scheduled_run_budget_control(&mut ctx).await
+            {
+                let alert = format!(
+                    "Token alert: scheduled run for goal '{}' hit its per-run budget (used {} / \
+                     limit {}). The run stopped safely before completion.",
+                    goal.goal_id, tokens_used, budget_per_check
+                );
+                self.fanout_token_alert(
+                    Some(goal.goal_id.as_str()),
+                    scope.session_id,
+                    &alert,
+                    Some(scope.session_id),
+                )
+                .await;
+                return Some(
+                    crate::agent::post_task::graceful_scheduled_run_budget_response(
+                        learning,
+                        tokens_used,
+                        budget_per_check,
+                    ),
+                );
+            }
+            return None;
         }
-        if !scope.budget_exhausted.swap(true, Ordering::Relaxed) {
-            warn!(
-                session_id = scope.session_id,
-                goal_id = %goal.goal_id,
-                "SDK engine: goal token budget exhausted"
-            );
-            let message = format!(
-                "Token alert: goal '{}' used up its token budget. The run stopped safely before \
-                 completion.",
-                goal.goal_id
+        let mut effective_daily = scope
+            .goal_daily_budget
+            .lock()
+            .map(|budget| *budget)
+            .unwrap_or(None);
+        let mut extensions = scope.goal_budget_extensions.load(Ordering::Relaxed) as usize;
+        let outcome = {
+            let mut ctx = super::graceful::GoalBudgetControlCtx {
+                emitter: scope.emitter,
+                task_id: scope.task_id,
+                session_id: scope.session_id,
+                iteration,
+                goal_id: &goal.goal_id,
+                status: &status,
+                user_role: scope.user_role,
+                learning_ctx: learning,
+                evidence_gain_count: successes,
+                stall_count: usize::from(scope.repeating.load(Ordering::Relaxed)),
+                consecutive_same_tool_count: 0,
+                consecutive_same_tool_unique_args: 0,
+                total_successful_tool_calls: successes,
+                pending_system_messages: directives,
+                status_tx: &scope.status_tx,
+                is_scheduled_goal: false,
+                effective_goal_daily_budget: &mut effective_daily,
+                budget_extensions_count: &mut extensions,
+                max_budget_extensions: TASK_MAX_BUDGET_EXTENSIONS,
+                hard_token_cap: TASK_HARD_TOKEN_CAP as i64,
+                source: super::graceful::GoalBudgetCheckSource::PostLlm,
+            };
+            self.enforce_goal_daily_budget_control(&mut ctx).await
+        };
+        if let Ok(mut budget) = scope.goal_daily_budget.lock() {
+            *budget = effective_daily;
+        }
+        scope
+            .goal_budget_extensions
+            .store(extensions as u32, Ordering::Relaxed);
+        if let super::graceful::GoalBudgetControlOutcome::Exhausted {
+            tokens_used_today,
+            budget_daily,
+        } = outcome
+        {
+            let alert = format!(
+                "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution \
+                 was stopped to prevent overspending.",
+                goal.goal_id, tokens_used_today, budget_daily
             );
             self.fanout_token_alert(
                 Some(goal.goal_id.as_str()),
                 scope.session_id,
-                &message,
+                &alert,
                 Some(scope.session_id),
             )
             .await;
+            return Some(
+                crate::agent::post_task::graceful_goal_daily_budget_response(
+                    learning,
+                    tokens_used_today,
+                    budget_daily,
+                    false,
+                ),
+            );
         }
-        true
+        None
     }
 
     /// The legacy step-plan idempotency key: any call that is not a pure
@@ -2131,6 +2408,7 @@ impl Agent {
             }),
             None => None,
         };
+        let budget_goal_for_daily = budget_goal.as_ref().map(|goal| goal.goal_id.clone());
         let scope = TurnScope {
             session_id,
             task_id: &task_id,
@@ -2150,6 +2428,21 @@ impl Agent {
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
+            task_tokens: AtomicU64::new(0),
+            task_budget: AtomicU64::new(self.limits.task_token_budget.unwrap_or(0)),
+            task_budget_extensions: std::sync::atomic::AtomicUsize::new(0),
+            succeeded_calls: std::sync::atomic::AtomicUsize::new(0),
+            succeeded_operations: std::sync::Mutex::new(HashSet::new()),
+            repeating: AtomicBool::new(false),
+            successes_at_task_extension: std::sync::atomic::AtomicUsize::new(0),
+            goal_daily_budget: std::sync::Mutex::new(match &budget_goal_for_daily {
+                Some(goal_id) => match &self.goal_token_registry {
+                    Some(registry) => registry.get_effective_daily_budget(goal_id).await,
+                    None => None,
+                },
+                None => None,
+            }),
+            goal_budget_extensions: std::sync::atomic::AtomicU32::new(0),
             run_failure: std::sync::Mutex::new(None),
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
@@ -2214,6 +2507,12 @@ impl Agent {
                 let (reply, status, task_outcome) = match (&outcome.status, terminal) {
                     (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
                         if reason == TERMINAL_REPLY_STOP =>
+                    {
+                        (reply, TaskStatus::Completed, outcome)
+                    }
+                    // A budget stop ends the run through the provider port.
+                    (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
+                        if error.contains(GOAL_BUDGET_EXHAUSTED) =>
                     {
                         (reply, TaskStatus::Completed, outcome)
                     }
@@ -3125,35 +3424,6 @@ mod tests {
             None,
         );
         assert!(!with_work.trim().is_empty() && !with_work.contains("[SYSTEM]"));
-    }
-
-    #[test]
-    fn goal_budget_exhaustion_uses_daily_and_run_budgets() {
-        use crate::traits::GoalTokenBudgetStatus;
-        let daily = |used, budget| GoalTokenBudgetStatus {
-            budget_per_check: None,
-            budget_daily: budget,
-            tokens_used_today: used,
-        };
-        let run = |used, budget| crate::goal_tokens::GoalRunBudgetStatus {
-            effective_budget_per_check: budget,
-            tokens_used: used,
-            budget_extensions_count: 0,
-            health: Default::default(),
-        };
-        assert!(!goal_budget_exhausted(Some(&daily(10, Some(100))), None));
-        assert!(goal_budget_exhausted(Some(&daily(100, Some(100))), None));
-        assert!(!goal_budget_exhausted(Some(&daily(10_000, None)), None));
-        assert!(goal_budget_exhausted(
-            Some(&daily(10, Some(100))),
-            Some(&run(50, 50))
-        ));
-        // A scheduled run's per-run budget replaces the daily one.
-        assert!(!goal_budget_exhausted(
-            Some(&daily(1_000, Some(100))),
-            Some(&run(10, 50))
-        ));
-        assert!(!goal_budget_exhausted(None, Some(&run(10, 0))));
     }
 
     #[test]
