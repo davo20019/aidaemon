@@ -514,6 +514,28 @@ fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> 
     }
 }
 
+/// Text files up to this size are quoted in the delivery caption (Telegram
+/// captions stop at 1024 characters).
+const SMALL_TEXT_PREVIEW_BYTES: usize = 600;
+
+/// The trimmed content of a small UTF-8 text file without control
+/// characters, so a delivery can answer "what does it contain" inline.
+fn small_text_preview(path: &std::path::Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() as usize > SMALL_TEXT_PREVIEW_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(std::fs::read(path).ok()?).ok()?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Build the user-facing caption for an auto-delivered background result file.
 /// Never embeds the shell command — only the filename and an optional summary.
 fn build_deliverable_caption(filename: &str, summary: Option<&str>) -> String {
@@ -636,7 +658,9 @@ async fn deliver_attributed_background_file(
         }
     };
 
-    let caption = build_deliverable_caption(&ready.filename, None);
+    let preview = small_text_preview(&ready.canonical_path)
+        .map(|text| format!("Done. {} contains:\n{}", ready.filename, text));
+    let caption = build_deliverable_caption(&ready.filename, preview.as_deref());
     let msg = MediaMessage {
         session_id: session_id.to_string(),
         caption: caption.clone(),
@@ -9823,6 +9847,30 @@ mod tests {
             "caption must not contain backticked command"
         );
         assert!(cap.contains("netprobe_results3.txt"));
+    }
+
+    #[test]
+    fn small_text_deliverable_caption_shows_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("bg.txt");
+        std::fs::write(&small, "build-ok\n").unwrap();
+        let preview = small_text_preview(&small);
+        assert_eq!(preview.as_deref(), Some("build-ok"));
+        let cap = build_deliverable_caption(
+            "bg.txt",
+            Some(&format!("Done. bg.txt contains:\n{}", preview.unwrap())),
+        );
+        assert!(cap.contains("build-ok"), "{cap}");
+
+        let large = dir.path().join("big.txt");
+        std::fs::write(&large, "x".repeat(SMALL_TEXT_PREVIEW_BYTES + 1)).unwrap();
+        assert_eq!(small_text_preview(&large), None);
+        let binary = dir.path().join("img.png");
+        std::fs::write(&binary, [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        assert_eq!(small_text_preview(&binary), None);
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "  \n").unwrap();
+        assert_eq!(small_text_preview(&empty), None);
     }
 
     #[test]
