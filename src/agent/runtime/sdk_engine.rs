@@ -60,7 +60,9 @@ const DEFAULT_MAX_TURNS: u32 = 40;
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
-const BACKGROUND_HANDOFF_STOP: &str = "work moved to the background";
+/// The run ended on a terminal tool result (background handoff, executor
+/// blocker, direct response) whose reply ships as is.
+const TERMINAL_REPLY_STOP: &str = "terminal tool result";
 /// Model-call timeouts, as in the legacy LLM phase.
 const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
@@ -645,6 +647,16 @@ fn closeout_demands_work(facts: &StopFacts) -> bool {
     facts.completed_results == 0 || executor_demands
 }
 
+impl TurnScope<'_> {
+    /// End the run before the next model call and ship `reply`.
+    fn end_with(&self, reply: String, outcome: TaskOutcome) {
+        if let Ok(mut terminal) = self.terminal_reply.lock() {
+            *terminal = Some((reply, outcome));
+        }
+        self.end_run.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Everything a dispatched call needs from the turn.
 struct TurnScope<'a> {
     session_id: &'a str,
@@ -680,7 +692,9 @@ struct TurnScope<'a> {
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
     /// The neutral handoff reply once work moved to the background.
-    background_ack: std::sync::Mutex<Option<String>>,
+    terminal_reply: std::sync::Mutex<Option<(String, TaskOutcome)>>,
+    /// Tool calls in the latest model response (a direct response needs one).
+    last_batch_size: std::sync::atomic::AtomicUsize,
     /// Ends the run at the next turn boundary (a background handoff).
     end_run: Arc<AtomicBool>,
     /// Skills referencing untrusted external content are active.
@@ -956,14 +970,14 @@ impl Agent {
                     let directive = if scope.continue_inline_after_background {
                         super::system_directives::SystemDirective::BackgroundProcessContinue
                     } else {
-                        if let Ok(mut ack) = scope.background_ack.lock() {
-                            *ack = Some(super::tool_execution_phase::build_background_detach_ack(
+                        scope.end_with(
+                            super::tool_execution_phase::build_background_detach_ack(
                                 &request.name,
                                 &output,
                                 &outcome.metadata,
-                            ));
-                        }
-                        scope.end_run.store(true, Ordering::Relaxed);
+                            ),
+                            TaskOutcome::Partial,
+                        );
                         super::system_directives::SystemDirective::BackgroundHandoff {
                             notifications_active: outcome.metadata.completion_notifications_enabled,
                         }
@@ -972,6 +986,26 @@ impl Agent {
                         scope.background_handoff.store(true, Ordering::Relaxed);
                     }
                     output = format!("{output}\n\n{}", directive.render());
+                }
+                let satisfied = !status.is_failure();
+                // An executor's typed blocker ends its run with the structured
+                // summary; the untrusted-data wrapper is removed first so
+                // reply sanitization does not empty it.
+                if satisfied && request.name == "report_blocker" && self.task_id.is_some() {
+                    scope.end_with(
+                        super::completion_checks::strip_untrusted_wrapper(&output).to_string(),
+                        TaskOutcome::Partial,
+                    );
+                }
+                // A tool's direct response answers a root turn's lone call.
+                if satisfied
+                    && self.depth == 0
+                    && scope.last_batch_size.load(Ordering::Relaxed) == 1
+                    && !(outcome.metadata.background_started || outcome.metadata.detached)
+                {
+                    if let Some(reply) = outcome.metadata.direct_response.clone() {
+                        scope.end_with(reply, TaskOutcome::Succeeded);
+                    }
                 }
                 (output, images, Some(outcome.metadata), Some(receipt))
             }
@@ -1409,6 +1443,9 @@ impl Agent {
                 *latest = Some(note);
             }
         }
+        scope
+            .last_batch_size
+            .store(response.tool_calls.len(), Ordering::Relaxed);
         let response = from_provider_response(response);
         if !response.tool_calls.is_empty() {
             self.persist_sdk_tool_call_message(scope, &response).await;
@@ -1866,7 +1903,7 @@ impl Agent {
         builder = builder.stop_when(move |_: &sdk::RunSnapshot| {
             end_flag
                 .load(Ordering::Relaxed)
-                .then(|| BACKGROUND_HANDOFF_STOP.to_string())
+                .then(|| TERMINAL_REPLY_STOP.to_string())
         });
         builder = builder.hook(SameToolLimit);
         builder = builder.hook(LedgerStop {
@@ -1935,7 +1972,8 @@ impl Agent {
             sent_files: std::sync::Mutex::new(HashSet::new()),
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
-            background_ack: std::sync::Mutex::new(None),
+            terminal_reply: std::sync::Mutex::new(None),
+            last_batch_size: std::sync::atomic::AtomicUsize::new(0),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
@@ -1987,12 +2025,16 @@ impl Agent {
                     .lock()
                     .ok()
                     .and_then(|ack| ack.clone());
-                let background_ack = scope.background_ack.lock().ok().and_then(|ack| ack.clone());
-                let (reply, status, task_outcome) = match (&outcome.status, background_ack) {
-                    (sdk::RunStatus::Stopped { reason }, Some(ack))
-                        if reason == BACKGROUND_HANDOFF_STOP =>
+                let terminal = scope
+                    .terminal_reply
+                    .lock()
+                    .ok()
+                    .and_then(|reply| reply.clone());
+                let (reply, status, task_outcome) = match (&outcome.status, terminal) {
+                    (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
+                        if reason == TERMINAL_REPLY_STOP =>
                     {
-                        (ack, TaskStatus::Completed, TaskOutcome::Partial)
+                        (reply, TaskStatus::Completed, outcome)
                     }
                     _ => (reply, status, task_outcome),
                 };
