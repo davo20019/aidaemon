@@ -51,7 +51,7 @@ use super::tool_exec::ToolExecCtx;
 use super::Agent;
 use crate::agent::vision::{encode_image_attachment, VISION_SKIPPED_SYSTEM_HINT};
 use crate::config::{AgentEngineKind, AppConfig, VisionConfig};
-use crate::events::{EventEmitter, EventType, TaskEndData, TaskOutcome, TaskStartData, TaskStatus};
+use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStartData, TaskStatus};
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
@@ -114,7 +114,48 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> Option<SdkEngineSettin
 pub(super) enum DaemonCall {
     Tool(ToolRequest),
     Model(ModelCall),
+    Stop(StopCheck),
 }
+
+/// The model wants to stop; the dispatcher asks the run ledger.
+pub(super) struct StopCheck {
+    /// Operations of this run that completed.
+    completed_results: usize,
+    reply: oneshot::Sender<sdk::StopDecision>,
+}
+
+/// The ledger closeout as an SDK stop hook: before a final answer ships, the
+/// run ledger decides whether a still-reachable expectation needs another
+/// pass. Receipts, not the reply text, are the evidence.
+struct LedgerStop {
+    calls: mpsc::Sender<DaemonCall>,
+}
+
+#[async_trait]
+impl sdk::Hook for LedgerStop {
+    async fn on_stop(&self, ctx: &sdk::HookContext<'_>, _final_text: &str) -> sdk::StopDecision {
+        let completed_results = ctx
+            .run_receipts()
+            .filter(|receipt| receipt.status == sdk::ReceiptStatus::Succeeded)
+            .count();
+        let (reply, answer) = oneshot::channel();
+        if self
+            .calls
+            .send(DaemonCall::Stop(StopCheck {
+                completed_results,
+                reply,
+            }))
+            .await
+            .is_err()
+        {
+            return sdk::StopDecision::Accept;
+        }
+        answer.await.unwrap_or(sdk::StopDecision::Accept)
+    }
+}
+
+/// Extra passes the ledger may demand in one run.
+const MAX_CLOSEOUT_DEMANDS: u32 = 2;
 
 /// One tool call handed from the SDK run to the daemon dispatcher.
 pub(super) struct ToolRequest {
@@ -144,6 +185,13 @@ impl sdk::Tool for BridgedTool {
         } else {
             sdk::ToolAnnotations::WRITE
         }
+    }
+
+    /// Daemon tools check their own arguments (some accept aliases for
+    /// schema-required keys) and report bad ones through the dispatcher, so
+    /// the refusal reaches the run ledger. A kernel-side rejection would not.
+    fn validate(&self, _arguments: &Value) -> Result<(), String> {
+        Ok(())
     }
 
     fn timeout(&self) -> Option<Duration> {
@@ -421,6 +469,34 @@ fn goal_budget_exhausted(
     })
 }
 
+/// What the ledger says when the model wants to stop.
+struct StopFacts {
+    /// Expectations an admissible tool could still satisfy.
+    reachable_obligation_ids: Vec<String>,
+    /// Operations of this run that completed.
+    completed_results: usize,
+    /// `completed_results` when the executor's checklist was last demanded.
+    executor_demanded_at: Option<usize>,
+    terminal_policy_denial: bool,
+}
+
+/// The legacy completion gate (`completion_phase.rs`), read from receipts:
+/// contract expectations are demanded only while nothing has completed; the
+/// executor's own open checklist items are demanded again whenever completed
+/// work changed since the last demand; nothing is demanded after a terminal
+/// policy denial.
+fn closeout_demands_work(facts: &StopFacts) -> bool {
+    if facts.terminal_policy_denial || facts.reachable_obligation_ids.is_empty() {
+        return false;
+    }
+    let executor_demands = facts
+        .reachable_obligation_ids
+        .iter()
+        .any(|id| id.contains("/obligation:checklist:"))
+        && facts.executor_demanded_at != Some(facts.completed_results);
+    facts.completed_results == 0 || executor_demands
+}
+
 /// Everything a dispatched call needs from the turn.
 struct TurnScope<'a> {
     session_id: &'a str,
@@ -432,6 +508,10 @@ struct TurnScope<'a> {
     /// Set once the goal budget is used up; later model calls are refused.
     budget_exhausted: AtomicBool,
     model_calls: AtomicU64,
+    /// Extra passes the ledger demanded so far.
+    closeout_demands: std::sync::atomic::AtomicU32,
+    /// `completed_results` at the last checklist demand (`u64::MAX`: none).
+    executor_demanded_at: AtomicU64,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
@@ -635,6 +715,114 @@ impl Agent {
         sdk::ToolOutput {
             is_error: failed,
             ..sdk::ToolOutput::text(output).with_images(images)
+        }
+    }
+
+    async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
+        let decision = self.sdk_closeout(scope, check.completed_results).await;
+        let _ = check.reply.send(decision);
+    }
+
+    /// The legacy ledger-first closeout on the SDK path: replay the run
+    /// ledger, ask which expectations an admissible tool could still satisfy,
+    /// and demand a bounded extra pass only when the receipts say so.
+    async fn sdk_closeout(
+        &self,
+        scope: &TurnScope<'_>,
+        completed_results: usize,
+    ) -> sdk::StopDecision {
+        let Ok(aggregate) = self
+            .event_store
+            .task_run_aggregate(scope.session_id, scope.task_id)
+            .await
+        else {
+            return sdk::StopDecision::Accept;
+        };
+        let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
+        let authority = super::closeout::ClosingAuthority {
+            forbids_tool_use: false,
+            forbids_mutation: false,
+            allowed_tool_names: &[],
+            forbidden_tool_scopes: &[],
+        };
+        let visible_tools: Vec<&str> = if scope.user_role == UserRole::Public {
+            Vec::new()
+        } else {
+            self.tools.iter().map(|tool| tool.name()).collect()
+        };
+        let read_only = |name: &str| {
+            self.tools
+                .iter()
+                .find(|tool| tool.name() == name)
+                .map(|tool| tool.capabilities().read_only)
+        };
+        let decision = aggregate.closeout(|obligation| {
+            super::closeout::obligation_admissible(
+                obligation,
+                &authority,
+                &visible_tools,
+                read_only,
+            )
+        });
+        let reachable = match &decision {
+            crate::events::CloseoutDecision::Reachable { obligation_ids } => obligation_ids.clone(),
+            _ => Vec::new(),
+        };
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            iteration,
+            crate::events::DecisionType::PostExecutionValidation,
+            format!("Ledger closeout verdict: {}", decision.verdict()),
+            serde_json::json!({
+                "condition": "ledger_closeout",
+                "verdict": decision.verdict(),
+                "reachable_obligation_ids": reachable,
+                "authoritative": true,
+                "engine": "sdk",
+            }),
+        )
+        .await;
+        let demanded_at = scope.executor_demanded_at.load(Ordering::Relaxed);
+        let facts = StopFacts {
+            reachable_obligation_ids: reachable.clone(),
+            completed_results,
+            executor_demanded_at: (demanded_at != u64::MAX).then_some(demanded_at as usize),
+            terminal_policy_denial: aggregate.terminal_policy_denial(),
+        };
+        if !closeout_demands_work(&facts)
+            || scope.closeout_demands.load(Ordering::Relaxed) >= MAX_CLOSEOUT_DEMANDS
+        {
+            return sdk::StopDecision::Accept;
+        }
+        let demands = scope.closeout_demands.fetch_add(1, Ordering::Relaxed) + 1;
+        if reachable
+            .iter()
+            .any(|id| id.contains("/obligation:checklist:"))
+        {
+            scope
+                .executor_demanded_at
+                .store(completed_results as u64, Ordering::Relaxed);
+        }
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            iteration,
+            crate::events::DecisionType::IntentGate,
+            "Ledger expectations still reachable: bounded evidence pass requested",
+            serde_json::json!({
+                "condition": "ledger_expectations_required",
+                "reachable_obligation_ids": reachable,
+                "demands": demands,
+                "engine": "sdk",
+            }),
+        )
+        .await;
+        sdk::StopDecision::Continue {
+            message: super::system_directives::SystemDirective::LedgerExpectationsRequired {
+                expectations: aggregate.expectation_summaries(&reachable),
+            }
+            .render(),
         }
     }
 
@@ -1062,6 +1250,9 @@ impl Agent {
                 });
             }
         }
+        builder = builder.hook(LedgerStop {
+            calls: calls_tx.clone(),
+        });
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
@@ -1132,6 +1323,8 @@ impl Agent {
             budget_goal,
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
+            closeout_demands: std::sync::atomic::AtomicU32::new(0),
+            executor_demanded_at: AtomicU64::new(u64::MAX),
         };
         // A parent or goal cancellation stops the run at its next check.
         let cancel = self
@@ -1152,6 +1345,9 @@ impl Agent {
                     }
                     DaemonCall::Model(call) => {
                         in_flight.push(self.serve_sdk_model_call(&scope, call).boxed());
+                    }
+                    DaemonCall::Stop(check) => {
+                        in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
                     }
                 },
                 Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
@@ -1218,25 +1414,20 @@ impl Agent {
             }
         };
         let (error, iterations, tool_calls_count) = error;
-        let _ = emitter
-            .emit(
-                EventType::TaskEnd,
-                TaskEndData {
-                    task_id: task_id.clone(),
-                    status,
-                    outcome: Some(task_outcome),
-                    duration_secs: started.elapsed().as_secs(),
-                    iterations,
-                    tool_calls_count,
-                    error,
-                    summary: None,
-                    efficiency: None,
-                    turn_id: Some(turn_id.clone()),
-                    completion_proof: None,
-                    harness_eval: None,
-                },
-            )
-            .await;
+        // The replayed run ledger has the final say on the outcome, exactly as
+        // for legacy turns.
+        self.emit_task_end(
+            &emitter,
+            &task_id,
+            status,
+            task_outcome,
+            started,
+            iterations as usize,
+            tool_calls_count as usize,
+            error,
+            None,
+        )
+        .await;
         for tool in &self.tools {
             let _ = tool.on_task_end(&task_id, session_id).await;
         }
@@ -1248,6 +1439,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::TaskEndData;
 
     fn vision(max_image_bytes: u64) -> VisionConfig {
         VisionConfig {
@@ -1713,6 +1905,166 @@ mod tests {
             .parse_data::<TaskEndData>()
             .unwrap();
         assert_eq!(end.status, TaskStatus::Cancelled);
+    }
+
+    /// The legacy `executor_declared_checklist` integration test on the SDK
+    /// engine: the model declares three typed items, does one and tries to
+    /// stop; the ledger demands the open items until receipts close them.
+    #[tokio::test]
+    async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
+        use crate::testing::MockProvider;
+        use crate::types::ChannelVisibility;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cwd = workspace.path().to_string_lossy().to_string();
+        let dir = workspace
+            .path()
+            .join("declared")
+            .to_string_lossy()
+            .to_string();
+        let file = workspace
+            .path()
+            .join("declared/note.txt")
+            .to_string_lossy()
+            .to_string();
+        let checklist_args = serde_json::json!({
+            "items": [
+                {"text": "create the directory", "status": "pending",
+                 "mutation_effects": ["local_workspace_write"], "targets": [dir]},
+                {"text": "write the note", "status": "pending",
+                 "mutation_effects": ["local_workspace_write"], "targets": [file]},
+                {"text": "read the note back", "status": "pending",
+                 "requires_observation": true, "targets": [file]}
+            ]
+        })
+        .to_string();
+        let terminal = |command: String, key: &str, path: &str| {
+            serde_json::json!({"command": command, "working_dir": cwd, key: [path]}).to_string()
+        };
+        let early = "phase=EARLY; directory created, stopping here.";
+        let done = "phase=DONE; directory, note, and read-back all completed.";
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("track_requirements", &checklist_args),
+            MockProvider::tool_call_response(
+                "terminal",
+                &terminal(format!("mkdir -p '{dir}'"), "write_paths", &dir),
+            ),
+            MockProvider::text_response(early),
+            MockProvider::tool_call_response(
+                "terminal",
+                &terminal(
+                    format!("printf SYNTHETIC_NOTE > '{file}'"),
+                    "write_paths",
+                    &file,
+                ),
+            ),
+            MockProvider::tool_call_response(
+                "terminal",
+                &terminal(format!("cat '{file}'"), "read_paths", &file),
+            ),
+            MockProvider::text_response(done),
+            MockProvider::text_response(done),
+        ]);
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        let track = Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plans));
+        let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            vec![track as Arc<dyn crate::traits::Tool>],
+        )
+        .await
+        .unwrap();
+        harness
+            .agent
+            .set_sdk_engine(Some(SdkEngineSettings::default()));
+
+        let session_id = "executor_declared_checklist";
+        let response = harness
+            .agent
+            .handle_message(
+                session_id,
+                &format!(
+                    "Create {dir}, write a note file inside it, then read it back to confirm."
+                ),
+                None,
+                UserRole::Owner,
+                ChannelContext {
+                    visibility: ChannelVisibility::Private,
+                    platform: "telegram".to_string(),
+                    channel_name: None,
+                    channel_id: None,
+                    workspace_id: None,
+                    sender_name: Some("Alice".to_string()),
+                    sender_id: Some("telegram:synthetic-owner".to_string()),
+                    channel_member_names: vec![],
+                    user_id_map: std::collections::HashMap::new(),
+                    workspace_grant: None,
+                    trusted: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).ok().as_deref(),
+            Some("SYNTHETIC_NOTE"),
+            "the declared write must have happened"
+        );
+        assert!(
+            response.contains(done) && !response.contains(early),
+            "the early stop must not ship: {response}"
+        );
+        let decision_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id",
+        )
+        .bind(session_id)
+        .fetch_all(&harness.state.pool())
+        .await
+        .unwrap();
+        let decisions: Vec<serde_json::Value> = decision_rows
+            .iter()
+            .filter_map(|raw| serde_json::from_str(raw).ok())
+            .collect();
+        assert!(decisions
+            .iter()
+            .any(|d| d["metadata"]["condition"] == "ledger_expectations_required"));
+        let last = decisions
+            .iter()
+            .rfind(|d| d["metadata"]["condition"] == "ledger_closeout")
+            .expect("ledger closeout recorded");
+        assert_eq!(last["metadata"]["verdict"], "closed", "{last}");
+    }
+
+    #[test]
+    fn closeout_demands_are_bounded_by_receipts() {
+        let checklist = vec!["task:t/obligation:checklist:1".to_string()];
+        let contract = vec!["task:t/obligation:evidence:0".to_string()];
+        let facts = |reachable: &[String], completed, demanded_at, denial| StopFacts {
+            reachable_obligation_ids: reachable.to_vec(),
+            completed_results: completed,
+            executor_demanded_at: demanded_at,
+            terminal_policy_denial: denial,
+        };
+        // Open checklist items are demanded even after other work...
+        assert!(closeout_demands_work(&facts(&checklist, 2, None, false)));
+        // ...but only again once completed work changed since the last demand.
+        assert!(!closeout_demands_work(&facts(
+            &checklist,
+            2,
+            Some(2),
+            false
+        )));
+        assert!(closeout_demands_work(&facts(&checklist, 3, Some(2), false)));
+        // Contract expectations only while nothing has completed.
+        assert!(closeout_demands_work(&facts(&contract, 0, None, false)));
+        assert!(!closeout_demands_work(&facts(&contract, 1, None, false)));
+        // Never after a terminal policy denial, never without reachable work.
+        assert!(!closeout_demands_work(&facts(&checklist, 2, None, true)));
+        assert!(!closeout_demands_work(&facts(&[], 0, None, false)));
     }
 
     #[test]

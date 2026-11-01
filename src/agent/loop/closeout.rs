@@ -13,7 +13,7 @@ use crate::events::RunObligation;
 use crate::traits::ToolSemanticScope;
 
 /// Static authority view used to test whether a tool may still be invoked.
-pub(super) struct ClosingAuthority<'a> {
+pub(in crate::agent) struct ClosingAuthority<'a> {
     pub forbids_tool_use: bool,
     pub forbids_mutation: bool,
     pub allowed_tool_names: &'a [String],
@@ -21,7 +21,7 @@ pub(super) struct ClosingAuthority<'a> {
 }
 
 impl<'a> ClosingAuthority<'a> {
-    pub(super) fn from_authority(authority: RequestAuthority<'a>) -> Self {
+    pub(in crate::agent) fn from_authority(authority: RequestAuthority<'a>) -> Self {
         Self {
             forbids_tool_use: authority.forbids_tool_use,
             forbids_mutation: authority.forbids_mutation,
@@ -63,7 +63,7 @@ impl<'a> ClosingAuthority<'a> {
 
 /// Whether some visible tool admissible under `authority` could still
 /// satisfy `obligation`.
-pub(super) fn obligation_admissible(
+pub(in crate::agent) fn obligation_admissible(
     obligation: &RunObligation,
     authority: &ClosingAuthority<'_>,
     visible_tools: &[&str],

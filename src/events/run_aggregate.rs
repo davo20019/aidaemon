@@ -880,6 +880,27 @@ impl RunAggregate {
             .count()
     }
 
+    /// One line per obligation for a "still expected" directive: its
+    /// summary, its evidence requirement, the tools that would satisfy it,
+    /// or its id.
+    pub(crate) fn expectation_summaries(&self, obligation_ids: &[String]) -> Vec<String> {
+        obligation_ids
+            .iter()
+            .filter_map(|id| self.obligations.get(id))
+            .map(|obligation| {
+                if let Some(summary) = obligation.summary.as_ref() {
+                    summary.clone()
+                } else if let Some(requirement) = obligation.evidence_requirement.as_ref() {
+                    requirement.summary.clone()
+                } else if let Some(predicate) = obligation.receipt.as_ref() {
+                    format!("invoke {}", predicate.tool_names.join("/"))
+                } else {
+                    obligation.id.clone()
+                }
+            })
+            .collect()
+    }
+
     fn insert_obligation(&mut self, obligation: RunObligation) {
         self.obligations.insert(obligation.id.clone(), obligation);
     }

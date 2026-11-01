@@ -767,23 +767,7 @@ pub(super) async fn run_completion_phase(
             .len();
         let reachable_expectations: Vec<String> = ledger
             .as_ref()
-            .map(|aggregate| {
-                reachable_obligation_ids
-                    .iter()
-                    .filter_map(|id| aggregate.obligations.get(id))
-                    .map(|obligation| {
-                        if let Some(summary) = obligation.summary.as_ref() {
-                            summary.clone()
-                        } else if let Some(requirement) = obligation.evidence_requirement.as_ref() {
-                            requirement.summary.clone()
-                        } else if let Some(predicate) = obligation.receipt.as_ref() {
-                            format!("invoke {}", predicate.tool_names.join("/"))
-                        } else {
-                            obligation.id.clone()
-                        }
-                    })
-                    .collect()
-            })
+            .map(|aggregate| aggregate.expectation_summaries(&reachable_obligation_ids))
             .unwrap_or_default();
         if let Some(decision) = ledger_closeout.as_ref() {
             let (reachable, blocked): (Vec<String>, Vec<serde_json::Value>) = match decision {
