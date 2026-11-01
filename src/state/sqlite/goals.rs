@@ -1101,57 +1101,72 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
     }
 
     async fn get_scheduled_goals(&self) -> anyhow::Result<Vec<Goal>> {
-        let rows = sqlx::query(
-            "SELECT id, description, domain, goal_type, status, priority, conditions,
-             context, resources, budget_per_check, budget_daily, tokens_used_today, tokens_used_day,
-             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id,
-             notified_at, notification_attempts, dispatch_failures, progress_notes, source_episode_id, legacy_int_id
+        let rows = sqlx::query(&format!(
+            "SELECT {GOAL_LIST_COLUMNS}
              FROM goals
              WHERE domain = 'orchestration'
                AND (
                  EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)
                  OR status = 'pending_confirmation'
                )
-             ORDER BY created_at DESC",
-        )
+             ORDER BY created_at DESC"
+        ))
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows.iter().map(goal_from_list_row).collect())
+    }
 
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let progress_notes_json: Option<String> = r.get("progress_notes");
-                let progress_notes =
-                    progress_notes_json.and_then(|j| serde_json::from_str(&j).ok());
-                Goal {
-                    id: r.get("id"),
-                    description: r.get("description"),
-                    domain: r.get("domain"),
-                    goal_type: r.get("goal_type"),
-                    status: r.get("status"),
-                    priority: r.get("priority"),
-                    conditions: r.get("conditions"),
-                    context: r.get("context"),
-                    resources: r.get("resources"),
-                    budget_per_check: r.get("budget_per_check"),
-                    budget_daily: r.get("budget_daily"),
-                    tokens_used_today: r.get("tokens_used_today"),
-                    tokens_used_day: r.get("tokens_used_day"),
-                    last_useful_action: r.get("last_useful_action"),
-                    created_at: r.get("created_at"),
-                    updated_at: r.get("updated_at"),
-                    completed_at: r.get("completed_at"),
-                    parent_goal_id: r.get("parent_goal_id"),
-                    session_id: r.get("session_id"),
-                    notified_at: r.get("notified_at"),
-                    notification_attempts: r.get::<i32, _>("notification_attempts"),
-                    dispatch_failures: r.get::<i32, _>("dispatch_failures"),
-                    progress_notes,
-                    source_episode_id: r.get("source_episode_id"),
-                    legacy_int_id: r.get("legacy_int_id"),
-                }
-            })
-            .collect())
+    async fn get_unscheduled_active_goals(&self) -> anyhow::Result<Vec<Goal>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {GOAL_LIST_COLUMNS}
+             FROM goals
+             WHERE domain = 'orchestration'
+               AND goal_type = 'continuous'
+               AND status = 'active'
+               AND NOT EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)
+               AND NOT EXISTS (SELECT 1 FROM mandates m WHERE m.goal_id = goals.id)
+             ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(goal_from_list_row).collect())
+    }
+}
+
+const GOAL_LIST_COLUMNS: &str = "id, description, domain, goal_type, status, priority, conditions,
+             context, resources, budget_per_check, budget_daily, tokens_used_today, tokens_used_day,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id,
+             notified_at, notification_attempts, dispatch_failures, progress_notes, source_episode_id, legacy_int_id";
+
+fn goal_from_list_row(r: &sqlx::sqlite::SqliteRow) -> Goal {
+    let progress_notes_json: Option<String> = r.get("progress_notes");
+    let progress_notes = progress_notes_json.and_then(|j| serde_json::from_str(&j).ok());
+    Goal {
+        id: r.get("id"),
+        description: r.get("description"),
+        domain: r.get("domain"),
+        goal_type: r.get("goal_type"),
+        status: r.get("status"),
+        priority: r.get("priority"),
+        conditions: r.get("conditions"),
+        context: r.get("context"),
+        resources: r.get("resources"),
+        budget_per_check: r.get("budget_per_check"),
+        budget_daily: r.get("budget_daily"),
+        tokens_used_today: r.get("tokens_used_today"),
+        tokens_used_day: r.get("tokens_used_day"),
+        last_useful_action: r.get("last_useful_action"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        completed_at: r.get("completed_at"),
+        parent_goal_id: r.get("parent_goal_id"),
+        session_id: r.get("session_id"),
+        notified_at: r.get("notified_at"),
+        notification_attempts: r.get::<i32, _>("notification_attempts"),
+        dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+        progress_notes,
+        source_episode_id: r.get("source_episode_id"),
+        legacy_int_id: r.get("legacy_int_id"),
     }
 }
 

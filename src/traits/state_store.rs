@@ -1452,6 +1452,13 @@ pub trait GoalScheduleStore: Send + Sync {
     async fn get_scheduled_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
+
+    /// Active continuous orchestration goals with no schedule and no mandate
+    /// behind them: nothing will ever run them. Listed so they can be seen
+    /// and cancelled.
+    async fn get_unscheduled_active_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
+        Ok(vec![])
+    }
 }
 
 /// Goal token budget persistence and accounting.

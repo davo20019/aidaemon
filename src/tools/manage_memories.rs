@@ -1406,8 +1406,34 @@ impl Tool for ManageMemoriesTool {
             }
             "list_scheduled" => {
                 let all_goals = self.state.get_scheduled_goals().await?;
+                // Active goals left with no schedule (and no mandate) never run;
+                // show them so they can be cancelled by goal_id.
+                let unscheduled: Vec<crate::traits::Goal> = self
+                    .state
+                    .get_unscheduled_active_goals()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|goal| !Self::is_protected_system_maintenance_goal(goal))
+                    .collect();
+                let mut unscheduled_section = String::new();
+                if !unscheduled.is_empty() {
+                    unscheduled_section.push_str(&format!(
+                        "**Active without a schedule** ({}) — these never run; cancel with cancel_scheduled and the goal_id\n",
+                        unscheduled.len()
+                    ));
+                    for g in &unscheduled {
+                        let desc: String = g.description.chars().take(80).collect();
+                        unscheduled_section.push_str(&format!("- **{}** {}\n", g.id, desc));
+                    }
+                    unscheduled_section.push('\n');
+                }
                 if all_goals.is_empty() {
-                    return Ok("No scheduled goals.".to_string());
+                    return Ok(if unscheduled_section.is_empty() {
+                        "No scheduled goals.".to_string()
+                    } else {
+                        format!("No scheduled goals.\n\n{unscheduled_section}")
+                    });
                 }
                 let limit = args.limit.unwrap_or(50).clamp(1, 200);
                 let mut goals = all_goals;
@@ -1505,6 +1531,7 @@ impl Tool for ManageMemoriesTool {
                     }
                     output.push('\n');
                 }
+                output.push_str(&unscheduled_section);
                 if total_goals > goals.len() {
                     output.push_str(&format!(
                         "(Results truncated to {} goals. Provide a higher `limit` to see more.)\n",
@@ -3927,6 +3954,56 @@ mod tests {
         assert!(result.contains("cancelled"), "{result}");
         let goal = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(goal.status, "cancelled");
+    }
+
+    /// An active continuous goal with no schedule never runs; the listing
+    /// shows it so it can be cancelled, and cancelling by goal_id works.
+    #[tokio::test]
+    async fn list_scheduled_shows_and_cancels_unscheduled_active_goals() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        let mut orphan = crate::traits::Goal::new_continuous(
+            "Post one synthetic update for Acme Corp",
+            "telegram:synthetic-user-1",
+            None,
+            None,
+        );
+        orphan.status = "active".to_string();
+        state.create_goal(&orphan).await.unwrap();
+
+        let listing = tool
+            .call(
+                &json!({"action": "list_scheduled", "_user_role": "owner", "_session_id": "test-session"})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(listing.contains("Active without a schedule"), "{listing}");
+        assert!(listing.contains(&orphan.id), "{listing}");
+
+        tool.call(
+            &json!({
+                "action": "cancel_scheduled",
+                "goal_id": orphan.id,
+                "_user_role": "owner",
+                "_session_id": "test-session"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.get_goal(&orphan.id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        let listing = tool
+            .call(
+                &json!({"action": "list_scheduled", "_user_role": "owner", "_session_id": "test-session"})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(!listing.contains(&orphan.id), "{listing}");
     }
 
     #[tokio::test]
