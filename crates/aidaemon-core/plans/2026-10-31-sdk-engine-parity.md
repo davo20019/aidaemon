@@ -214,7 +214,7 @@ Needed work, as packages:
 
 Drop (old-loop crutches): `[INTENT_GATE]` relics, pre-execution plan / critique / evidence gates, reflection side call, semantic read cache, contradictory-evidence prose heuristic, prose truncation reassembly, guided `tool_choice` forcing, failed-mutation give-up gate, dialogue scope gate.
 
-Owner decisions: (1) goal/task budgets hard caps or receipt-based auto-extension (2 tests); (2) verification-purpose obligations still demanded after a mutation succeeded (2 tests); (3) `dispatcher_argument_rejection` (technical, implementer's call).
+Owner decisions (2026-11-01): triage approved. (1) Budgets extend on progress: grant an extension when new succeeded receipts appeared since the last one, with a hard ceiling (not the legacy `is_productive` heuristic). (2) A typed verification obligation stays demandable once after a mutation succeeded, within the 2-pass cap. (3) `dispatcher_argument_rejection` is the implementer's call. Order: P1, P2, P7, then P3, P4, P5, P6, P8.
 
 ## Out of scope (owner decisions)
 
