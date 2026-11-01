@@ -6514,6 +6514,14 @@ impl TerminalTool {
                     msg.push_str(
                         "\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
                     );
+                    // The notifier also watches detached processes and
+                    // delivers their result; say so, or the model tells the
+                    // user it cannot notify them.
+                    if notifier_started {
+                        msg.push_str(
+                            " Completion notifications are enabled. The user will be notified when this process finishes.",
+                        );
+                    }
                 } else if notifier_started {
                     msg.push_str(
                         "\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
@@ -6533,7 +6541,7 @@ impl TerminalTool {
                         background_started: true,
                         timed_out: !detach,
                         detached: detach,
-                        completion_notifications_enabled: !detach && notifier_started,
+                        completion_notifications_enabled: notifier_started,
                         semantics: background_semantics,
                         ..ToolCallMetadata::default()
                     },
