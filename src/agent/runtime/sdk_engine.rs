@@ -15,8 +15,11 @@
 //!   enrichment, role checks, workspace grants and the tools' own approval
 //!   prompts behave as in the legacy loop.
 //!
+//! The system prompt comes from the legacy prompt builder (identity, skills,
+//! memory facts, project instructions, mandate isolation).
+//!
 //! What it drops (on purpose, for comparison): intent gating, completion
-//! contracts, the stall/recovery ladder and per-turn memory injection.
+//! contracts and the stall/recovery ladder.
 
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
@@ -535,12 +538,54 @@ impl Agent {
         )
         .await?;
 
+        // The legacy prompt builder: identity, matched skills, channel-scoped
+        // memory facts, project instructions, and the isolated prompt for
+        // mandate workers. Falls back to the base prompt if it fails.
+        let tools_offered = if user_role == UserRole::Public {
+            0
+        } else {
+            self.tools.len()
+        };
+        let instructions = match self
+            .build_system_prompt_for_message(
+                &emitter,
+                &task_id,
+                session_id,
+                user_text,
+                user_role,
+                &channel_ctx,
+                tools_offered,
+                None,
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .await
+        {
+            Ok((core, tail, _, skills, _)) => {
+                if !skills.is_empty() {
+                    info!(session_id, task_id, ?skills, "SDK engine: skills matched");
+                }
+                if tail.trim().is_empty() {
+                    core
+                } else {
+                    format!("{core}\n\n{tail}")
+                }
+            }
+            Err(error) => {
+                warn!(session_id, task_id, %error, "SDK engine: prompt builder failed; using base prompt");
+                self.system_prompt.clone()
+            }
+        };
+
         // Tools: every registered daemon tool, unless the caller may not use
         // tools at all (the dispatcher would refuse each call anyway).
         let (calls_tx, mut calls_rx) = mpsc::channel::<ToolRequest>(16);
         let mut builder = sdk::Agent::builder("aidaemon")
             .model(engine.model.clone())
-            .instructions(self.system_prompt.clone())
+            .instructions(instructions)
             .provider(engine.provider.clone())
             .limits(sdk::Limits {
                 max_turns: engine.max_turns,
