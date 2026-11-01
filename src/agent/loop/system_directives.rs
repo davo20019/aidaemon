@@ -25,6 +25,10 @@ pub(in crate::agent) enum SystemDirective {
     ModelCallTimedOut {
         timeout_secs: u64,
     },
+    /// The final reply was empty after tool work; the retry runs with tools
+    /// disabled so the model must answer from the results it already has.
+    #[cfg_attr(not(feature = "sdk-engine"), allow(dead_code))]
+    EmptyFinalReplyPlainText,
     TruncationRecoveryUseWriteFile,
     TruncationRecoveryTextContinuation {
         truncated_tail: String,
@@ -301,6 +305,7 @@ impl SystemDirective {
                  Write large files in chunks (write_file, then write_file with mode=\"append\"), or \
                  delegate the authoring, and keep each response short."
             ),
+            Self::EmptyFinalReplyPlainText => "[SYSTEM] Your previous reply was empty. Tool mode is disabled for this turn. Reply to the user now in plain text from the tool results you already have: what you did, the concrete results (URLs, file paths, values), and anything that remains unverified. Do NOT return an empty response.".to_string(),
             Self::TruncationRecoveryUseWriteFile => "[SYSTEM] Your previous response was cut off because it exceeded the maximum output token limit. Do NOT generate long content inline. Choose by where the content lives: (1) If the content already exists in a file (e.g. a spilled tool result or fetched data), do NOT regenerate it — extract or format the part the user needs into a clean file with a tool (terminal/grep), then deliver it with the send_file tool. (2) If you must author the content yourself (a long report, a large code file), write it in chunks: call write_file with the first chunk, then call write_file with mode=\"append\" for each additional chunk. Keep your direct reply to the user brief.".to_string(),
             Self::TruncationRecoveryTextContinuation { truncated_tail } => format!(
                 "[SYSTEM] Your previous text response was cut off mid-sentence due to output token limits. \

@@ -623,8 +623,14 @@ fn reply_defect(text: &str, latest_tool_output: Option<&str>) -> Option<ReplyDef
 
 /// The reply that ships for a completed run: sanitized, and an honest
 /// fallback instead of an empty or gutted answer (never a bare "Done.").
+/// After tool work the fallback describes that work: the receipts, not a
+/// silent model, say whether anything happened.
 fn finalize_reply(text: &str, tool_calls: &[String], response_note: Option<&str>) -> String {
     if text.trim().is_empty() {
+        if !tool_calls.is_empty() {
+            let refs: Vec<&str> = tool_calls.iter().map(String::as_str).collect();
+            return super::completion_checks::build_activity_summary_reply(&refs);
+        }
         return crate::agent::agent_helpers::build_empty_response_fallback(response_note);
     }
     let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
@@ -732,6 +738,8 @@ struct TurnScope<'a> {
     latest_tool_output: std::sync::Mutex<Option<String>>,
     /// The one reply retry has been spent.
     reply_retry_used: AtomicBool,
+    /// The next model call runs with tools disabled (empty-reply retry).
+    text_only_next_call: AtomicBool,
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
     /// The neutral handoff reply once work moved to the background.
@@ -1313,6 +1321,13 @@ impl Agent {
             "SDK engine: final reply rejected; retrying once"
         );
         let directive = match defect {
+            // After real work an empty reply is the model treating the run as
+            // finished; offering tools again invites another empty turn, so
+            // the retry must answer in text from the receipts it holds.
+            ReplyDefect::Empty if scope.succeeded_calls.load(Ordering::Relaxed) > 0 => {
+                scope.text_only_next_call.store(true, Ordering::Relaxed);
+                super::system_directives::SystemDirective::EmptyFinalReplyPlainText
+            }
             ReplyDefect::Empty => super::system_directives::SystemDirective::EmptyResponseRetry,
             ReplyDefect::InternalMarkers => {
                 super::system_directives::SystemDirective::FinalAnswerRejectedInternalMarkers
@@ -1549,6 +1564,9 @@ impl Agent {
             fit_run(&prefix, run, budget)
         };
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        if scope.text_only_next_call.swap(false, Ordering::Relaxed) {
+            options.tool_choice = crate::traits::ToolChoiceMode::None;
+        }
         let est_input_tokens =
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = super::llm::LlmCallTelemetry::default();
@@ -2550,6 +2568,7 @@ impl Agent {
             learning: std::sync::Mutex::new(learning_ctx),
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
+            text_only_next_call: AtomicBool::new(false),
             response_note: std::sync::Mutex::new(None),
             external_action_ack: std::sync::Mutex::new(None),
             continue_inline_after_background,
@@ -3669,6 +3688,39 @@ mod tests {
             None,
         );
         assert!(!with_work.trim().is_empty() && !with_work.contains("[SYSTEM]"));
+        let empty_after_work = finalize_reply("", &["write_file(notes.txt)".to_string()], None);
+        assert!(
+            !empty_after_work.trim().is_empty()
+                && !empty_after_work.starts_with("I wasn't able to process"),
+            "an empty reply after tool work describes the work: {empty_after_work}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_engine_retries_an_empty_final_reply_without_tools() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![
+            remember("teal"),
+            MockProvider::text_response(""),
+            MockProvider::text_response("Saved your favorite color: teal."),
+        ]);
+        let harness = crate::testing::setup_test_agent_sdk(provider)
+            .await
+            .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Remember my favorite color is teal."))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "Saved your favorite color: teal.");
+        let calls = harness.provider.call_log.lock().await;
+        let last = calls.last().expect("retry call");
+        assert_eq!(
+            last.options.tool_choice,
+            crate::traits::ToolChoiceMode::None,
+            "the empty-reply retry after work runs with tools disabled"
+        );
     }
 
     #[test]
