@@ -216,6 +216,30 @@ Drop (old-loop crutches): `[INTENT_GATE]` relics, pre-execution plan / critique 
 
 Owner decisions (2026-11-01): triage approved. (1) Budgets extend on progress: grant an extension when new succeeded receipts appeared since the last one, with a hard ceiling (not the legacy `is_productive` heuristic). (2) A typed verification obligation stays demandable once after a mutation succeeded, within the 2-pass cap. (3) `dispatcher_argument_rejection` is the implementer's call. Order: P1, P2, P7, then P3, P4, P5, P6, P8.
 
+## Task 8 progress (2026-11-01)
+
+P1-P8 ported (commits 171dd2d..2552e9f). Forced-SDK suite: **4376 passed, 43 failed**
+(from 106). Default engine: 4418 passed, 1 failed (`test_background_cli_check_returns_result_after_reap`,
+timing flake in an untouched file; passes 3/3 alone).
+
+Remaining 43, by kind:
+- Drop (old-loop crutches, delete with the legacy loop): guided forcing, plan / critique /
+  evidence gates, reflection side call, semantic read cache, contradictory-evidence heuristic,
+  prose truncation reassembly, failed-mutation give-up gate, dialogue scope gate.
+- Re-assert (outcome holds on SDK; test checks a legacy detail): scripted plan-gate responses
+  (duplicate replay, postcondition, idempotency key, memory receipt, negative receipt, permanent
+  failure), `tool_choice=Required` assertions, decision-point names, exact call counts,
+  background handoff wording, send_file "exactly one" suppression, canonical batch overlap,
+  kernel stuck-detector thresholds, harness_eval fixtures scripted for legacy gates.
+- Open: `dispatcher_argument_rejection` (SDK labels a typed argument rejection `blocked`, the
+  ledger does not credit it), `failed_specialist_plan_reply` (spawn-timeout receipt is not a
+  failure on the SDK path), `test_synthesized_done_persisted` (SDK retries an empty reply instead
+  of pasting tool output; intentional), kernel-side refusals not in the daemon ledger.
+
+Next: resolve the open items, re-assert / delete tests, make SDK the only engine, delete the
+dead legacy iteration code, whole-branch review. Release still blocked on the `aidaemon-core`
+publishing decision.
+
 ## Out of scope (owner decisions)
 
 - How `aidaemon-core` ships with the published `aidaemon` crate (publish it to crates.io, or fold it into the main crate). Blocks Task 8 Step 4 (`cargo package`), not Tasks 1-7.
