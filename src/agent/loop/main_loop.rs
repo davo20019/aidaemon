@@ -1431,6 +1431,7 @@ impl Agent {
                 prefix,
                 contract: turn_context.completion_contract.clone(),
                 learning_ctx: learning_ctx.clone(),
+                instruction_tracker: project_instruction_tracker.take(),
                 continue_inline_after_background: turn_context
                     .continue_inline_after_background_start
                     || execution_state.linear_intent_plan_has_remaining_steps(),

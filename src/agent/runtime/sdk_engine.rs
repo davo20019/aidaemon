@@ -134,6 +134,9 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
     /// The assessed task shape continues inline work after a background start.
     pub(in crate::agent) continue_inline_after_background: bool,
+    /// Discovers nested project instructions before deeper subtree work.
+    pub(in crate::agent) instruction_tracker:
+        Option<crate::project_instructions::ProjectInstructionTracker>,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -676,6 +679,11 @@ struct TurnScope<'a> {
     background_ack: std::sync::Mutex<Option<String>>,
     /// Ends the run at the next turn boundary (a background handoff).
     end_run: Arc<AtomicBool>,
+    /// Nested project instructions discovered just in time.
+    instruction_tracker:
+        Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
+    /// System context added during the run, sent after the projected prefix.
+    extra_system: std::sync::Mutex<Vec<String>>,
     /// Confirmation of the latest successful external change.
     external_action_ack: std::sync::Mutex<Option<String>>,
     /// The latest provider note (for example a safety finish reason).
@@ -720,6 +728,9 @@ impl Agent {
             scope_escalation: None,
         };
         let started = Instant::now();
+        let call_semantics = self
+            .semantics_for_exact_tool_call(&request.name, arguments)
+            .await;
         // The contract's authority lane (forbidden tool use or mutation,
         // allowed tools, forbidden scopes), then for mandate runs the same
         // per-call authority gate as the legacy loop, which issues the
@@ -749,6 +760,10 @@ impl Agent {
         let grant = match gate {
             Ok(grant) => grant,
             Err((refusal, reason_code)) => {
+                if reason_code == "request_authority" && read_only != Some(true) {
+                    self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
+                        .await;
+                }
                 info!(
                     session_id = scope.session_id,
                     task_id = scope.task_id,
@@ -786,6 +801,17 @@ impl Agent {
         };
         ctx.mandate_authority = grant.as_ref();
 
+        // Before a call enters a deeper subtree, newly applicable nested
+        // project instructions are loaded and the call is deliberately not
+        // executed, so the model reviews them and retries (CLAUDE.md,
+        // "Project Instruction Loading").
+        if let Some(deferral) = self
+            .sdk_load_nested_instructions(scope, request, arguments, &call_semantics)
+            .await
+        {
+            return deferral;
+        }
+
         let mut call_data = crate::events::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),
@@ -797,9 +823,6 @@ impl Agent {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool call");
         }
 
-        let call_semantics = self
-            .semantics_for_exact_tool_call(&request.name, arguments)
-            .await;
         // User-facing activity labels, as the legacy tool phase sends them;
         // `track_requirements` shows its checklist instead.
         if request.name != "track_requirements" {
@@ -853,6 +876,12 @@ impl Agent {
                     );
                 }
                 let mut output = outcome.output;
+                // Tool-boundary truncation is rendered into the model-visible
+                // text only, as in the legacy tool phase.
+                if let Some(info) = outcome.metadata.truncation.as_ref() {
+                    output.push('\n');
+                    output.push_str(&crate::utils::render_truncation_notice(info));
+                }
                 let observed: Vec<&MessageAttachment> = outcome
                     .metadata
                     .attachments
@@ -1183,7 +1212,23 @@ impl Agent {
             &self.context_window_config,
         );
         let run = &request.messages[scope.prefix_len.min(request.messages.len())..];
-        let messages = fit_run(&scope.prefix, run, budget);
+        let extra: Vec<Value> = scope
+            .extra_system
+            .lock()
+            .map(|extra| {
+                extra
+                    .iter()
+                    .map(|text| serde_json::json!({"role": "system", "content": text}))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let messages = if extra.is_empty() {
+            fit_run(&scope.prefix, run, budget)
+        } else {
+            let mut prefix = scope.prefix.clone();
+            prefix.extend(extra);
+            fit_run(&prefix, run, budget)
+        };
         let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         let est_input_tokens =
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
@@ -1402,6 +1447,102 @@ impl Agent {
         true
     }
 
+    /// Resolve nested project instructions for a call's targets. When new
+    /// guidance applies, it joins the run's system context and the call is
+    /// recorded as deferred, not executed.
+    async fn sdk_load_nested_instructions(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &ToolRequest,
+        arguments: &str,
+        semantics: &crate::traits::ToolCallSemantics,
+    ) -> Option<sdk::ToolOutput> {
+        if self.mandate_execution.is_some() {
+            return None;
+        }
+        let tracker = scope.instruction_tracker.as_ref()?;
+        let targets = super::tool_execution_phase::project_instruction_targets_for_tool_call(
+            &request.name,
+            arguments,
+            semantics,
+        );
+        if targets.is_empty() {
+            return None;
+        }
+        let discovered = tracker
+            .lock()
+            .await
+            .discover_for_targets(crate::execution::active_execution_backend(), &targets)
+            .await;
+        let instructions = match discovered {
+            Ok(Some(instructions)) => instructions,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    task_id = scope.task_id,
+                    tool = %request.name,
+                    %error,
+                    "SDK engine: could not discover nested project instructions"
+                );
+                return None;
+            }
+        };
+        let sources = instructions.source_paths();
+        if let Ok(mut extra) = scope.extra_system.lock() {
+            extra.push(format!(
+                "[Just-in-time Project Instructions — loaded before subtree work]\n{}",
+                instructions.render_for_prompt()
+            ));
+        }
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            crate::events::DecisionType::InstructionsSnapshot,
+            format!("Loaded nested project instructions before {}", request.name),
+            serde_json::json!({
+                "condition": "jit_project_instructions_discovered",
+                "tool": request.name,
+                "targets": &targets,
+                "sources": &sources,
+                "action_executed": false,
+            }),
+        )
+        .await;
+        let notice = crate::agent::ToolResultNotice::ProjectInstructionsDiscovered {
+            tool_name: request.name.clone(),
+            sources: sources.join(", "),
+        }
+        .render();
+        let call = crate::traits::ToolCall {
+            id: request.call_id.clone(),
+            name: request.name.clone(),
+            arguments: arguments.to_string(),
+            extra_content: None,
+        };
+        if let Err(error) = self
+            .persist_pre_dispatch_outcome_with_kernel_claim(
+                scope.emitter,
+                scope.session_id,
+                scope.task_id,
+                &call,
+                arguments,
+                notice.clone(),
+                crate::traits::ToolOutcomeStatus::Blocked,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                crate::traits::ToolCallSemantics::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a deferred call");
+        }
+        Some(sdk::ToolOutput::error(notice))
+    }
+
     /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact
     /// call, or the refusal text the model should see.
     async fn sdk_mandate_gate(
@@ -1464,6 +1605,7 @@ impl Agent {
             contract,
             learning_ctx,
             continue_inline_after_background,
+            instruction_tracker,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1572,6 +1714,8 @@ impl Agent {
             response_note: std::sync::Mutex::new(None),
             external_action_ack: std::sync::Mutex::new(None),
             continue_inline_after_background,
+            instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
+            extra_system: std::sync::Mutex::new(Vec::new()),
             background_ack: std::sync::Mutex::new(None),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
