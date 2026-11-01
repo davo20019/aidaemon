@@ -430,7 +430,7 @@ impl SystemDirective {
                 old_budget, new_budget
             ),
             Self::LedgerExpectationsRequired { expectations } => format!(
-                "[SYSTEM] The durable run ledger still has unmet expectations that an available tool could satisfy: {}. Use the most relevant available tool to satisfy them, or state the exact live limitation you observed. After this bounded pass, report the concrete result honestly.",
+                "[SYSTEM] The durable run ledger still has unmet expectations that an available tool could satisfy: {}. No recorded tool result has matched them yet. Use the most relevant available tool to satisfy them, or state the exact live limitation you observed. Do not repeat a side effect you already performed (creating, sending, cancelling, deleting): if that work is done, say so. After this bounded pass, report the concrete result honestly.",
                 if expectations.is_empty() {
                     "(unspecified)".to_string()
                 } else {

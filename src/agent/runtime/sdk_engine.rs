@@ -189,6 +189,17 @@ pub(super) struct StopCheck {
     reply: oneshot::Sender<sdk::StopDecision>,
 }
 
+/// A replayed call's result, marked so the model does not read the earlier
+/// success as something that just happened (a reminder re-"set" after the
+/// user had it cancelled is still cancelled).
+fn replay_notice(previous_result: &str) -> String {
+    format!(
+        "[Not run again: an identical call already ran earlier in this task; its earlier result is \
+         repeated below. Nothing new happened now, and anything done since then (for example \
+         cancelling what it created) still stands.]\n\n{previous_result}"
+    )
+}
+
 /// The ledger closeout as an SDK stop hook: before a final answer ships, the
 /// run ledger decides whether a still-reachable expectation needs another
 /// pass. Receipts, not the reply text, are the evidence.
@@ -2297,7 +2308,7 @@ impl Agent {
             receipt.invocation_stage = crate::traits::ToolInvocationStage::Replayed;
             receipt.outcome_evidence = crate::events::ToolOutcomeEvidenceSource::DurableReplay;
         }
-        let output = previous.result.clone();
+        let output = replay_notice(&previous.result);
         let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
         tool.content = Some(output.clone());
         tool.tool_name = Some(request.name.clone());
@@ -3752,6 +3763,16 @@ mod tests {
             "the observing call runs; the writing call is refused"
         );
         assert_eq!(reply.text, "acme.md is the markdown file.");
+    }
+
+    #[test]
+    fn replayed_results_say_they_were_not_run_again() {
+        let text = replay_notice("Reminder set: \"Water the plants.\"");
+        assert!(text.starts_with("[Not run again:"), "{text}");
+        assert!(
+            text.ends_with("Reminder set: \"Water the plants.\""),
+            "{text}"
+        );
     }
 
     #[test]
