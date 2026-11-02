@@ -394,6 +394,28 @@ fn manage_memories_schema() -> Value {
     })
 }
 
+/// Typed effects for memory-store mutations. Memory is persistent agent
+/// state, so writes are `configuration` and a forget is also `destructive`;
+/// an untyped receipt could never close a checklist step the model declared
+/// with either label. Scheduled-goal actions keep their existing typing.
+fn memory_action_effects(arguments: &str) -> ToolMutationEffects {
+    let action = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    match action.as_deref() {
+        Some("forget") => {
+            ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::DESTRUCTIVE)
+        }
+        Some("set_privacy") => ToolMutationEffects::CONFIGURATION,
+        _ => ToolMutationEffects::NONE,
+    }
+}
+
 fn canonical_personal_display_key(key: &str) -> String {
     match key.trim().to_ascii_lowercase().as_str() {
         "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
@@ -463,7 +485,7 @@ impl Tool for ManageMemoriesTool {
                 "list_scheduled_matching",
                 "diagnose_scheduled",
             ],
-            ToolMutationEffects::NONE,
+            memory_action_effects(arguments),
         )
     }
 
@@ -550,7 +572,7 @@ impl Tool for ManageMemoriesTool {
                 let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
 
                 // Reject empty / whitespace-only / too-short keys. A blank key would
-                // make substring matching ("fk.contains(&key_lower)") true for every
+                // make partial key matching true for every
                 // fact, wiping the store. A single character is also too broad to be
                 // a safe substring match across all facts.
                 let key = key_raw.trim();
@@ -581,21 +603,27 @@ impl Tool for ManageMemoriesTool {
                 };
 
                 let key_canonical = canon(key);
-                let key_lower = key.to_lowercase();
 
-                // Within the explicitly-requested category, allow fuzzy matching
-                // (exact, canonical, substring) — the caller is targeting a known
-                // category so substring is acceptable.
-                let matches_key_in_category = |f: &crate::traits::Fact| -> bool {
-                    if f.superseded_at.is_some() {
+                // Within the explicitly-requested category an exact or canonical
+                // key match is authoritative. Only when none exists may a partial
+                // key select facts, and then only as whole `_`-separated key
+                // segments ("color" -> "favorite_color"). A fact key contained
+                // in the requested key is never a match: forgetting
+                // `qa_pet_name` used to also delete the owner's `name` fact.
+                let exact_in_category = |f: &crate::traits::Fact| -> bool {
+                    f.superseded_at.is_none()
+                        && (f.key == key || canon(&f.key) == key_canonical)
+                };
+                let key_segments: Vec<&str> = key_canonical.split('_').collect();
+                let partial_in_category = |f: &crate::traits::Fact| -> bool {
+                    if f.superseded_at.is_some() || key_canonical.is_empty() {
                         return false;
                     }
-                    let fk = f.key.to_lowercase();
                     let fk_canon = canon(&f.key);
-                    f.key == key
-                        || fk_canon == key_canonical
-                        || fk.contains(&key_lower)
-                        || key_lower.contains(&fk)
+                    let fact_segments: Vec<&str> = fk_canon.split('_').collect();
+                    fact_segments
+                        .windows(key_segments.len())
+                        .any(|window| window == key_segments.as_slice())
                 };
 
                 // Across OTHER categories (the "duplicate sweep") only accept exact
@@ -612,8 +640,14 @@ impl Tool for ManageMemoriesTool {
                 let mut seen_ids = std::collections::HashSet::new();
 
                 let facts = self.state.get_facts(Some(category)).await?;
+                let has_exact = facts.iter().any(&exact_in_category);
                 for f in &facts {
-                    if matches_key_in_category(f) && seen_ids.insert(f.id) {
+                    let selected = if has_exact {
+                        exact_in_category(f)
+                    } else {
+                        partial_in_category(f)
+                    };
+                    if selected && seen_ids.insert(f.id) {
                         to_delete.push((f.id, f.category.clone(), f.key.clone()));
                     }
                 }
@@ -4435,6 +4469,65 @@ mod tests {
         assert_eq!(active.len(), 1, "got: {active:?}");
         assert_eq!(active[0].category, "personal");
         assert_eq!(active[0].key, "color_of_car");
+    }
+
+    /// Regression: forgetting `qa_pet_name` also deleted the owner's `name`
+    /// fact because a fact key contained in the requested key matched, and
+    /// partial matching ran even when an exact key existed.
+    #[tokio::test]
+    async fn forget_never_deletes_keys_contained_in_the_requested_key() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        for (key, value) in [
+            ("qa_pet_name", "SYNTH-FINCH"),
+            ("name", "Alice Rivera"),
+            ("pet_name_history", "Rex"),
+        ] {
+            state
+                .upsert_fact("user", key, value, "test", None, FactPrivacy::Global)
+                .await
+                .unwrap();
+        }
+
+        let result = tool
+            .call(
+                &json!({"action": "forget", "category": "user", "key": "qa_pet_name"}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten 1 fact"), "got: {result}");
+
+        let active: Vec<_> = state
+            .get_facts(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.superseded_at.is_none())
+            .map(|f| f.key)
+            .collect();
+        assert!(active.contains(&"name".to_string()), "got: {active:?}");
+        assert!(active.contains(&"pet_name_history".to_string()));
+        assert!(!active.contains(&"qa_pet_name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn forget_partial_key_matches_whole_segments_only() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        for key in ["favorite_color", "colorado_trip"] {
+            state
+                .upsert_fact("preferences", key, "x", "test", None, FactPrivacy::Global)
+                .await
+                .unwrap();
+        }
+        let result = tool
+            .call(
+                &json!({"action": "forget", "category": "preferences", "key": "color"}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten 1 fact"), "got: {result}");
+        assert!(result.contains("favorite_color"), "got: {result}");
     }
 
     /// Cross-category sweep should still catch exact-key duplicates (the

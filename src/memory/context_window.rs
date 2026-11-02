@@ -1193,6 +1193,35 @@ fn is_redundant_recall_fact(
     })
 }
 
+/// True when an active fact already holds this exact canonical key and value
+/// under a DIFFERENT category, so upserting would create a second row rather
+/// than refresh the existing one.
+///
+/// This is the turn-level idempotency check: when the agent stored a fact via
+/// `remember_fact` this turn, progressive extraction re-reads the same exchange
+/// and re-files it under its own category guess (`test` → `technical`). Unlike
+/// [`is_redundant_recall_fact`] this does not care who stated the value — an
+/// identical active fact is already stored, so the write adds nothing.
+/// Same-category writes are left to the upsert, which refreshes in place.
+fn duplicates_active_fact_in_other_category(
+    category: &str,
+    fact_key: &str,
+    fact_value: &str,
+    existing: &[crate::traits::Fact],
+) -> bool {
+    let value_norm = fact_value.trim().to_lowercase();
+    if value_norm.is_empty() {
+        return false;
+    }
+    let key_norm = normalize_fact_key_for_match(fact_key);
+    existing.iter().any(|f| {
+        f.superseded_at.is_none()
+            && !f.category.trim().eq_ignore_ascii_case(category.trim())
+            && f.value.trim().to_lowercase() == value_norm
+            && normalize_fact_key_for_match(&f.key) == key_norm
+    })
+}
+
 /// Run progressive fact extraction in the background.
 /// Spawns a tokio task that extracts facts and stores them immediately.
 #[allow(clippy::too_many_arguments)]
@@ -1301,6 +1330,19 @@ pub fn spawn_progressive_extraction(
                             key = fact.key,
                             value = fact.value,
                             "Skipping recall-restatement of a fact already in memory"
+                        );
+                        continue;
+                    }
+                    if duplicates_active_fact_in_other_category(
+                        &fact.category,
+                        &fact.key,
+                        &fact.value,
+                        &existing_facts,
+                    ) {
+                        debug!(
+                            key = fact.key,
+                            category = fact.category,
+                            "Skipping progressive fact already stored under another category"
                         );
                         continue;
                     }
@@ -1824,6 +1866,56 @@ mod tests {
             "54329",
             "what is my port?",
             &[superseded],
+        ));
+    }
+
+    #[test]
+    fn progressive_skips_fact_the_agent_already_stored_this_turn() {
+        // The agent saved it via remember_fact; extraction re-files the same
+        // user-stated key/value under its own category guess. Must not duplicate,
+        // even though the user stated the value (the recall guard allows that).
+        let existing = vec![active_fact("test", "qa_color", "teal")];
+        let user_text = "remember qa_color=teal";
+        assert!(!is_redundant_recall_fact(
+            "qa_color", "teal", user_text, &existing
+        ));
+        assert!(duplicates_active_fact_in_other_category(
+            "technical",
+            "qa-color",
+            "Teal",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn progressive_duplicate_check_keeps_corrections_and_same_category_refresh() {
+        let existing = vec![active_fact("test", "qa_color", "teal")];
+        // A correction (new value) is new information.
+        assert!(!duplicates_active_fact_in_other_category(
+            "technical",
+            "qa_color",
+            "navy",
+            &existing,
+        ));
+        // Same category → the upsert refreshes in place; no duplicate row.
+        assert!(!duplicates_active_fact_in_other_category(
+            "test", "qa_color", "teal", &existing,
+        ));
+        // A different key with the same value is a different attribute.
+        assert!(!duplicates_active_fact_in_other_category(
+            "technical",
+            "qa_shade",
+            "teal",
+            &existing,
+        ));
+        // Superseded rows don't anchor the check.
+        let mut gone = active_fact("test", "qa_color", "teal");
+        gone.superseded_at = Some(chrono::Utc::now());
+        assert!(!duplicates_active_fact_in_other_category(
+            "technical",
+            "qa_color",
+            "teal",
+            &[gone],
         ));
     }
 

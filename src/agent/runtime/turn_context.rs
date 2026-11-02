@@ -489,6 +489,29 @@ impl Agent {
             &self.path_aliases.projects,
             workspace_anchor,
         );
+        // A carried-over turn that names no path inherits the scope of the
+        // request it continues before any older history. Whole-history
+        // extraction prefers whichever scope looks like a project root, so an
+        // unrelated repository mentioned turns ago used to outrank the
+        // antecedent's own workspace (e.g. a scratch dir under /tmp), and the
+        // scope lock then refused the files the antecedent had just created.
+        let mut antecedent_project_scopes = Vec::new();
+        if allow_scope_carryover && current_project_scopes.is_empty() {
+            let request_anchor = continuation_request_anchor.or_else(|| {
+                related_open_request(dialogue_state.as_ref(), followup_mode)
+                    .map(|request| request.text.as_str())
+                    .or(prev_user.as_deref())
+            });
+            if let Some(anchor) = request_anchor {
+                extract_explicit_path_scopes_from_text_anchored(
+                    anchor,
+                    &mut antecedent_project_scopes,
+                    GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+                    &self.path_aliases.projects,
+                    workspace_anchor,
+                );
+            }
+        }
         let allow_multi_project_scope = current_project_scopes.len() > 1;
         // For current-turn scopes, unify all explicitly mentioned paths into a
         // single scope that encompasses them all.  When the user mentions paths
@@ -506,6 +529,7 @@ impl Agent {
         let primary_project_scope = bound_workspace.clone().or_else(|| {
             resolve_primary_project_scope(
                 unify_current_turn_scopes(&current_project_scopes)
+                    .or_else(|| unify_current_turn_scopes(&antecedent_project_scopes))
                     .or_else(|| choose_primary_project_scope(&project_scopes)),
                 self.inherited_project_scope.as_deref(),
                 allow_multi_project_scope,
@@ -1728,6 +1752,80 @@ mod tests {
             .is_empty());
         assert!(turn_context.goal_user_text.contains(original));
         assert!(turn_context.goal_user_text.contains("workspace-gca"));
+    }
+
+    #[tokio::test]
+    async fn followup_inherits_antecedent_scope_over_older_project_root() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{
+            DialogueState, DialogueStateStore, MessageStore, UserTurnKind, UserTurnSummary,
+        };
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        // An older turn names a real project root (has a manifest); the
+        // antecedent request names a scratch dir with no project marker.
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let scratch_path = scratch.path().to_string_lossy().to_string();
+
+        let turns = [
+            ("user", format!("Look at the build script in {repo_path}")),
+            ("assistant", "Done.".to_string()),
+            (
+                "user",
+                format!("In {scratch_path} build a tiny Python package with tests"),
+            ),
+            (
+                "assistant",
+                "Created the package; 6 tests pass.".to_string(),
+            ),
+        ];
+        for (index, (role, text)) in turns.iter().enumerate() {
+            harness
+                .state
+                .append_message(&Message {
+                    content: Some(text.clone()),
+                    ..Message::new_runtime(format!("m{index}"), "test-session", *role)
+                })
+                .await
+                .expect("append history");
+        }
+        let current = "now add a command-line entry point and prove it works";
+        harness
+            .state
+            .append_message(&Message {
+                content: Some(current.to_string()),
+                ..Message::new_runtime("m-current", "test-session", "user")
+            })
+            .await
+            .expect("append current");
+        let mut state = DialogueState::new("test-session");
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "m-current".to_string(),
+            kind: UserTurnKind::Followup,
+            text: current.to_string(),
+        });
+        harness
+            .state
+            .upsert_dialogue_state(&state)
+            .await
+            .expect("persist dialogue state");
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", current)
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(scratch_path.as_str())
+        );
+        assert_eq!(turn_context.authorized_project_scopes, vec![scratch_path]);
     }
 
     #[tokio::test]
