@@ -1187,6 +1187,16 @@ impl Agent {
         .await;
     }
 
+    async fn record_kernel_notice(&self, scope: &TurnScope<'_>, notice: KernelNotice) {
+        match notice {
+            KernelNotice::Refusal(receipt) => self.record_kernel_refusal(scope, receipt).await,
+            KernelNotice::Stuck => {
+                self.with_harness_eval(|eval| eval.record_repetition_guard())
+                    .await;
+            }
+        }
+    }
+
     /// Record a call the kernel refused before dispatch in the run ledger:
     /// an unknown tool or invalid arguments is a typed failed proposal, as
     /// the legacy dispatcher recorded it; a hook denial is a policy denial.
@@ -3621,6 +3631,9 @@ impl Agent {
         let run = sdk_agent.run_from(state, cancel);
         tokio::pin!(run);
         let mut in_flight = FuturesUnordered::new();
+        // Ledger writes for kernel notices run apart from the run's own calls:
+        // they are finished after the run ends, never dropped mid-write.
+        let mut ledger_writes = FuturesUnordered::new();
         let mut tick = tokio::time::interval(HEARTBEAT_TICK);
         let outcome = loop {
             tokio::select! {
@@ -3636,22 +3649,20 @@ impl Agent {
                         in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
                     }
                 },
-                Some(notice) = refusals_rx.recv() => match notice {
-                    KernelNotice::Refusal(receipt) => {
-                        in_flight.push(self.record_kernel_refusal(&scope, receipt).boxed());
-                    }
-                    KernelNotice::Stuck => {
-                        in_flight.push(
-                            self.with_harness_eval(|eval| eval.record_repetition_guard())
-                                .map(|_| ())
-                                .boxed(),
-                        );
-                    }
-                },
+                Some(notice) = refusals_rx.recv() => {
+                    ledger_writes.push(self.record_kernel_notice(&scope, notice).boxed());
+                }
                 Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
+                Some(()) = ledger_writes.next(), if !ledger_writes.is_empty() => {}
                 _ = tick.tick() => touch_heartbeat(&heartbeat),
             }
         };
+        // The run is over: record the notices still queued and finish every
+        // ledger write before the task end is computed and appended.
+        while let Ok(notice) = refusals_rx.try_recv() {
+            ledger_writes.push(self.record_kernel_notice(&scope, notice).boxed());
+        }
+        while ledger_writes.next().await.is_some() {}
 
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {
