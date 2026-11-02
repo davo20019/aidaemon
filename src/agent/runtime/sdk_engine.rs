@@ -216,6 +216,31 @@ pub(super) struct StopCheck {
     reply: oneshot::Sender<sdk::StopDecision>,
 }
 
+/// Let a call read the session's own spilled tool results. An oversized
+/// result is saved under the session's spill directory and the model is told
+/// to read it there; a task scope (a goal's bound workspace) would otherwise
+/// refuse the daemon's own output. The grant is read-only and covers this
+/// session's directory alone, never another session's or the spill root.
+fn grant_own_spill_reads(manifest: &mut crate::traits::ToolCallAccessManifest, session_id: &str) {
+    let Some(dir) = crate::tools::result_spill::session_spill_dir_for_backend(session_id) else {
+        return;
+    };
+    // macOS temp paths have a `/private` canonical twin; grant both spellings.
+    let canonical = std::fs::canonicalize(&dir)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    for path in std::iter::once(dir).chain(canonical) {
+        if let Some(hint) = crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ProjectScope,
+            path,
+        ) {
+            if !manifest.adapter_read_targets.contains(&hint) {
+                manifest.adapter_read_targets.push(hint);
+            }
+        }
+    }
+}
+
 /// Anchor a call without a directory to the turn's project directory, as
 /// the legacy tool phase did: a scheduled goal's terminal command runs in its
 /// bound workspace, not the daemon's cwd. The model's own explicit directory
@@ -1272,6 +1297,7 @@ impl Agent {
         manifest.adapter_read_targets = tool
             .adapter_owned_access_manifest(arguments)
             .adapter_read_targets;
+        grant_own_spill_reads(&mut manifest, scope.session_id);
         let known = scope
             .known_project_dir
             .lock()
@@ -1350,15 +1376,20 @@ impl Agent {
         // bounded grant or refuses the call.
         // Judged per call: a mixed tool such as `terminal` is not read-only
         // as a whole, but a call its adapter types as a pure observation is
-        // (the tool still enforces `mutation_forbidden` itself).
+        // (the tool still enforces `mutation_forbidden` itself). Run
+        // bookkeeping typed administrative (the checklist, a blocker report)
+        // changes no user state, so it is not a mutation either.
         let read_only = self
             .tools
             .iter()
             .find(|tool| tool.name() == request.name)
             .map(|tool| {
                 tool.capabilities().read_only
-                    || (call_semantics.effect == crate::traits::ToolCallEffect::Observation
-                        && !call_semantics.mutates_state())
+                    || (matches!(
+                        call_semantics.effect,
+                        crate::traits::ToolCallEffect::Observation
+                            | crate::traits::ToolCallEffect::Administrative
+                    ) && !call_semantics.mutates_state())
             });
         let admitted =
             super::closeout::ClosingAuthority::from_authority(scope.contract.authority())
@@ -4609,11 +4640,11 @@ mod tests {
             }
         }
         fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
-            let writes = serde_json::from_str::<serde_json::Value>(arguments)
-                .ok()
-                .and_then(|args| args["write"].as_bool())
-                .unwrap_or(true);
-            if writes {
+            let args = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+            let writes = args["write"].as_bool().unwrap_or(true);
+            if args["admin"].as_bool() == Some(true) {
+                crate::traits::ToolCallSemantics::administrative()
+            } else if writes {
                 crate::traits::ToolCallSemantics::mutation()
             } else {
                 crate::traits::ToolCallSemantics::observation()
@@ -4668,6 +4699,105 @@ mod tests {
             "the observing call runs; the writing call is refused"
         );
         assert_eq!(reply.text, "acme.md is the markdown file.");
+    }
+
+    /// Run bookkeeping (`track_requirements`, `report_blocker`) is typed
+    /// administrative: it changes no user state, so a read-only request
+    /// still admits it while a writing call stays refused.
+    #[tokio::test]
+    async fn read_only_contract_admits_administrative_calls() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let base = MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            true,
+            &[],
+            "new_request",
+            "none",
+        );
+        let mut assessment: serde_json::Value =
+            serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+        assessment["schema_version"] = 10.into();
+        assessment["contract"]["mutation_scope"] = "read_only".into();
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("shell_probe", r#"{"admin":true}"#),
+            MockProvider::tool_call_response("shell_probe", r#"{"write":true}"#),
+            MockProvider::text_response("Checklist recorded; nothing written."),
+        ])
+        .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            provider,
+            vec![Arc::new(ShellProbe(calls.clone()))],
+            None,
+        )
+        .await
+        .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request(
+                "Plan the review of Acme notes; change nothing.",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the administrative call runs; the writing call is refused"
+        );
+        assert_eq!(reply.text, "Checklist recorded; nothing written.");
+    }
+
+    /// A goal run's scope covers its workspace, yet the spill notice sends the
+    /// model to the session's spill directory: the run may read its own
+    /// spilled results, not another session's, and gains no write there.
+    #[test]
+    fn scoped_runs_read_their_own_spilled_results_only() {
+        use crate::agent::tool_execution_phase::{access_manifest_scope_check, ScopeCheck};
+        use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+        let hint = |kind, value: String| ToolTargetHint::new(kind, value).unwrap();
+        let task = ToolCallAccessManifest {
+            read_targets: vec![hint(
+                ToolTargetHintKind::ProjectScope,
+                "/work/acme-blog".to_string(),
+            )],
+            write_targets: vec![hint(
+                ToolTargetHintKind::ProjectScope,
+                "/work/acme-blog".to_string(),
+            )],
+            ..Default::default()
+        };
+        let own = crate::tools::result_spill::session_spill_dir_for_backend(
+            "specialist:research:synthetic-1",
+        )
+        .unwrap();
+        let other = crate::tools::result_spill::session_spill_dir_for_backend(
+            "specialist:research:synthetic-2",
+        )
+        .unwrap();
+        let check = |read: Option<String>, write: Option<String>| {
+            let mut call = ToolCallAccessManifest {
+                read_targets: read
+                    .map(|path| vec![hint(ToolTargetHintKind::Path, path)])
+                    .unwrap_or_default(),
+                write_targets: write
+                    .map(|path| vec![hint(ToolTargetHintKind::Path, path)])
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+            grant_own_spill_reads(&mut call, "specialist:research:synthetic-1");
+            access_manifest_scope_check("read_file", &call, Some(&task), &[], None)
+        };
+        assert!(check(Some(format!("{own}/web_fetch-1a2b3c4d.txt")), None).is_none());
+        assert!(matches!(
+            check(Some(format!("{other}/web_fetch-1a2b3c4d.txt")), None),
+            Some(ScopeCheck::Rejected(_))
+        ));
+        assert!(matches!(
+            check(None, Some(format!("{own}/planted.txt"))),
+            Some(ScopeCheck::Rejected(_))
+        ));
     }
 
     #[test]

@@ -22,6 +22,27 @@ pub fn spill_dir() -> Option<PathBuf> {
     Some(std::env::temp_dir().join("aidaemon").join("tool_results"))
 }
 
+/// The directory holding one session's spilled results on the active
+/// backend: the same path `build_spilled_preview_for_backend` writes to. The
+/// spill notice tells the model to read these files, so the scope check
+/// grants a session reads of its own directory and of nothing beside it.
+pub fn session_spill_dir_for_backend(session_id: &str) -> Option<String> {
+    let backend = active_execution_backend();
+    if backend.kind() == BackendKind::Local {
+        let dir = spill_dir()?.join(sanitize_session_id(session_id));
+        return Some(dir.to_string_lossy().into_owned());
+    }
+    Some(
+        backend
+            .workspace_root()
+            .join(".aidaemon")
+            .join("tool_results")
+            .join(sanitize_session_id(session_id))
+            .as_str()
+            .to_string(),
+    )
+}
+
 /// Characters reserved from the per-model cap for the summary + notice so the
 /// preview stays close to the cap rather than overshooting it badly.
 const SPILL_ANNOTATION_RESERVE: usize = 512;
