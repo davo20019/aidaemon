@@ -145,7 +145,7 @@ bootstrap_agent() {
       return 0
     fi
     if [ "$attempt" != "5" ]; then
-      sleep 0.2
+      sleep "$attempt"
     fi
   done
   printf '%s\n' "$bootstrap_output" >&2
@@ -153,9 +153,24 @@ bootstrap_agent() {
   return 1
 }
 
+# `bootout` returns before launchd finishes removing the service while the
+# daemon drains; a bootstrap in that window fails with "5: Input/output error".
+wait_for_unload() {
+  local waited=0
+  while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do
+    if [ "$waited" -ge 60 ]; then
+      echo "warning: $LABEL still registered after 30s; bootstrapping anyway" >&2
+      return 0
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+}
+
 # (Re)load the launchd agent.
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$(id -u)/$LABEL"
+  wait_for_unload
   bootstrap_agent
   echo "Reloaded existing launchd agent."
 else
