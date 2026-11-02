@@ -11,8 +11,9 @@ pub enum Role {
     Tool,
 }
 
-/// Who put a user-role message into the transcript. Policies use this
-/// instead of matching text to tell real user input from harness feedback.
+/// Who put a message into the transcript. Policies use this instead of
+/// matching text to tell real user input from harness feedback, and
+/// providers use it to tell a hook's per-request note from the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageOrigin {
@@ -22,6 +23,9 @@ pub enum MessageOrigin {
     Harness,
     /// Injected because an `on_stop` hook rejected a final answer.
     StopHook,
+    /// A system note a `before_model` hook added to one model request (for
+    /// example recalled memory); it is not part of the run's transcript.
+    HookNote,
 }
 
 /// One tool invocation requested by the model.
@@ -112,7 +116,8 @@ pub struct Message {
     /// providers can flag the result (for example Anthropic's `is_error`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
-    /// Who injected a `Role::User` message. `None` on other roles.
+    /// Who injected a `Role::User` message, or [`MessageOrigin::HookNote`]
+    /// on a hook's system note. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<MessageOrigin>,
 }
@@ -131,6 +136,19 @@ impl Message {
         let mut message = Self::plain(Role::User, content);
         message.origin = Some(origin);
         message
+    }
+
+    /// A system note a `before_model` hook adds to one request. Providers
+    /// that place notes apart from the transcript find them by this origin.
+    pub fn hook_note(content: impl Into<String>) -> Self {
+        let mut message = Self::plain(Role::System, content);
+        message.origin = Some(MessageOrigin::HookNote);
+        message
+    }
+
+    /// True for a [`Message::hook_note`].
+    pub fn is_hook_note(&self) -> bool {
+        self.origin == Some(MessageOrigin::HookNote)
     }
 
     /// True for user-role messages the harness or a hook injected.

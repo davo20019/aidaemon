@@ -42,7 +42,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
-use super::memory_plugin::{daemon_tool_offered, memory_parts, MemoryTurn};
+use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
 use super::sdk_provider::{
     fit_run, from_provider_response, prefix_with_notes, split_injected_notes, to_chat_options,
     to_daemon_tools, values_to_sdk, DaemonProvider, ModelCall,
@@ -454,6 +454,8 @@ pub(super) struct ToolRequest {
 struct BridgedTool {
     spec: sdk::ToolSpec,
     read_only: bool,
+    /// `manage_memories` offered with only its goal actions.
+    goal_actions_only: bool,
     calls: mpsc::Sender<DaemonCall>,
 }
 
@@ -472,9 +474,13 @@ impl sdk::Tool for BridgedTool {
     }
 
     /// Daemon tools check their own arguments (some accept aliases for
-    /// schema-required keys) and report bad ones through the dispatcher, so
-    /// the refusal reaches the run ledger. A kernel-side rejection would not.
-    fn validate(&self, _arguments: &Value) -> Result<(), String> {
+    /// schema-required keys) and report bad ones through the dispatcher.
+    /// Only the goal-actions view of `manage_memories` is narrowed here; the
+    /// kernel records that refusal in the run ledger.
+    fn validate(&self, arguments: &Value) -> Result<(), String> {
+        if self.goal_actions_only {
+            crate::agent::memory_plugin::check_goal_action(arguments)?;
+        }
         Ok(())
     }
 
@@ -501,7 +507,10 @@ impl sdk::Tool for BridgedTool {
 
 /// Build an SDK tool spec from a daemon tool's OpenAI-style function schema.
 fn tool_spec(tool: &dyn crate::traits::Tool) -> sdk::ToolSpec {
-    let schema = tool.schema();
+    tool_spec_from_schema(tool, &tool.schema())
+}
+
+fn tool_spec_from_schema(tool: &dyn crate::traits::Tool, schema: &Value) -> sdk::ToolSpec {
     let parameters = schema
         .get("parameters")
         .cloned()
@@ -876,10 +885,7 @@ fn closeout_visible_tools<'a>(
     tools
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| {
-            !crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS.contains(name)
-                || owned_memory_tools.contains(name)
-        })
+        .filter(|name| daemon_tool_offer(name, owned_memory_tools) != DaemonToolOffer::Hidden)
         .collect()
 }
 
@@ -1041,9 +1047,6 @@ struct TurnScope<'a> {
     prefix: Vec<Value>,
     /// Kernel messages that stand for `prefix`; later ones are this run's.
     prefix_len: usize,
-    /// Leading system messages of that starting transcript; any more in a
-    /// request were injected by a hook.
-    prefix_system_lead: usize,
     budget_goal: Option<BudgetGoal>,
     /// Set once the goal budget is used up; later model calls are refused.
     budget_exhausted: AtomicBool,
@@ -2265,7 +2268,7 @@ impl Agent {
         );
         // Hook notes (recalled memory) ride in the wire prefix; the rest of
         // the kernel transcript after the starting prefix is this run's.
-        let (notes, kernel) = split_injected_notes(&request.messages, scope.prefix_system_lead);
+        let (notes, kernel) = split_injected_notes(&request.messages);
         let run = &kernel[scope.prefix_len.min(kernel.len())..];
         let extra: Vec<Value> = scope
             .extra_system
@@ -3441,14 +3444,30 @@ impl Agent {
         let memory = memory_parts(self.memory.as_ref(), &memory_turn).await;
         // Tools: the set bootstrap offered for this turn (role, policy and
         // contract filtering already applied), with the daemon memory tools
-        // only while the active plugin owns them.
+        // only while the active plugin owns them; `manage_memories` keeps
+        // its goal actions under any plugin.
         if user_role != UserRole::Public {
-            for tool in self.tools.iter().filter(|tool| {
-                offered_tools.contains(tool.name()) && daemon_tool_offered(tool.name(), &memory)
-            }) {
+            for tool in self
+                .tools
+                .iter()
+                .filter(|tool| offered_tools.contains(tool.name()))
+            {
+                let (spec, goal_actions_only) =
+                    match daemon_tool_offer(tool.name(), memory.owned_daemon_tools) {
+                        DaemonToolOffer::Full => (tool_spec(tool.as_ref()), false),
+                        DaemonToolOffer::GoalActions => (
+                            tool_spec_from_schema(
+                                tool.as_ref(),
+                                &crate::agent::memory_plugin::goal_actions_view(&tool.schema()),
+                            ),
+                            true,
+                        ),
+                        DaemonToolOffer::Hidden => continue,
+                    };
                 builder = builder.tool(BridgedTool {
-                    spec: tool_spec(tool.as_ref()),
+                    spec,
                     read_only: tool.capabilities().read_only,
+                    goal_actions_only,
                     calls: calls_tx.clone(),
                 });
             }
@@ -3535,11 +3554,6 @@ impl Agent {
             state.messages = projected;
         }
         let prefix_len = state.messages.len();
-        let prefix_system_lead = state
-            .messages
-            .iter()
-            .position(|message| message.role != sdk::Role::System)
-            .unwrap_or(prefix_len);
 
         // Drive the run and the tool dispatcher together on this task.
         let budget_goal = match self.budget_goal_id(session_id).await {
@@ -3613,7 +3627,6 @@ impl Agent {
             emitter: &emitter,
             prefix,
             prefix_len,
-            prefix_system_lead,
             budget_goal,
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
@@ -4951,9 +4964,18 @@ mod tests {
     /// memory plugin that does not own the daemon memory tools hides them.
     #[tokio::test]
     async fn closeout_sees_only_offered_memory_tools() {
-        let harness = crate::testing::setup_test_agent_sdk(crate::testing::MockProvider::new())
+        let seed = crate::testing::setup_test_agent_sdk(crate::testing::MockProvider::new())
             .await
             .unwrap();
+        let manage_memories: Arc<dyn crate::traits::Tool> =
+            Arc::new(crate::tools::ManageMemoriesTool::new(seed.state.clone()));
+        let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            crate::testing::MockProvider::new(),
+            vec![manage_memories],
+            None,
+        )
+        .await
+        .unwrap();
         let tools = &harness.agent.tools;
         let owned = closeout_visible_tools(
             tools,
@@ -4963,7 +4985,9 @@ mod tests {
         assert!(owned.contains(&"remember_fact"));
         let foreign = closeout_visible_tools(tools, UserRole::Owner, &[]);
         assert!(!foreign.contains(&"remember_fact"));
-        assert!(!foreign.contains(&"manage_memories"));
+        // Its goal actions stay offered under any plugin.
+        assert!(foreign.contains(&"manage_memories"));
+        assert!(!foreign.contains(&"manage_people"));
         assert!(closeout_visible_tools(tools, UserRole::Public, &[]).is_empty());
     }
 }

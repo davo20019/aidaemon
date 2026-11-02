@@ -1081,7 +1081,8 @@ impl Agent {
              to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
              Instead, use your built-in tools for self-inspection:\n",
         );
-        // The memory inspection tool is the active memory plugin's.
+        // Memory inspection is the active memory plugin's; goal actions
+        // stay on `manage_memories` under any plugin.
         if self
             .memory
             .owned_daemon_tools()
@@ -1091,7 +1092,10 @@ impl Agent {
                 "- `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n",
             );
         } else {
-            rules.push_str("- your memory recall tool — for stored facts and preferences\n");
+            rules.push_str(
+                "- `manage_memories` (goal actions) — for personal goals and scheduled tasks\n\
+                 - your memory recall tool — for stored facts and preferences\n",
+            );
         }
         rules.push_str(
             "- `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\

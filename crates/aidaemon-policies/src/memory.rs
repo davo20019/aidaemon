@@ -92,7 +92,7 @@ impl<R: Recall> Hook for MemoryInjection<R> {
         };
         let query = ctx.messages[index].content.clone();
         if let Some(note) = self.note(ctx.session_id, &query).await {
-            insert_after_system(&mut request.messages, Message::system(note));
+            insert_after_system(&mut request.messages, Message::hook_note(note));
         }
     }
 }

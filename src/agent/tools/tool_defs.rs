@@ -215,12 +215,20 @@ impl Agent {
         }
         // Daemon memory tools follow the active memory plugin, as on turns.
         let owned_memory_tools = self.memory.owned_daemon_tools();
-        defs.retain(|d| {
-            Self::tool_name_from_definition(d).is_none_or(|name| {
-                !super::memory_plugin::DAEMON_MEMORY_TOOLS.contains(&name)
-                    || owned_memory_tools.contains(&name)
+        defs = defs
+            .into_iter()
+            .filter_map(|d| {
+                let offer = Self::tool_name_from_definition(&d)
+                    .map(|name| super::memory_plugin::daemon_tool_offer(name, owned_memory_tools));
+                match offer {
+                    Some(super::memory_plugin::DaemonToolOffer::Hidden) => None,
+                    Some(super::memory_plugin::DaemonToolOffer::GoalActions) => {
+                        Some(super::memory_plugin::goal_actions_view(&d))
+                    }
+                    _ => Some(d),
+                }
             })
-        });
+            .collect();
         // Keep the core-prompt roster consistent with the per-turn tool set:
         // desktop control is never advertised outside DMs/internal sessions.
         if !Self::visibility_allows_desktop_control(channel_ctx.visibility) {

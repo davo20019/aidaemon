@@ -152,7 +152,7 @@ impl Hook for ProjectInstructions {
             return;
         };
         let at = usize::from(request.messages.first().map(|m| m.role) == Some(Role::System));
-        request.messages.insert(at, Message::system(text));
+        request.messages.insert(at, Message::hook_note(text));
     }
 }
 

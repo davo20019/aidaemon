@@ -289,28 +289,18 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
 /// own messages. If the run outgrows the budget, only the run part is
 /// trimmed, with the legacy role-quota fitter, and unpaired tool calls and
 /// results are removed; the newest messages survive.
-/// Split system notes a hook injected after the kernel's leading system
-/// messages (for example the memory note) from the kernel transcript.
-/// `prefix_system_lead` is how many leading system messages the starting
-/// transcript had; any more in `messages` were added for this request.
-pub(super) fn split_injected_notes(
-    messages: &[sdk::Message],
-    prefix_system_lead: usize,
-) -> (Vec<String>, Vec<sdk::Message>) {
-    let lead = messages
+/// Split the system notes hooks added to this request (for example the
+/// memory note, marked [`sdk::MessageOrigin::HookNote`]) from the kernel
+/// transcript.
+pub(super) fn split_injected_notes(messages: &[sdk::Message]) -> (Vec<String>, Vec<sdk::Message>) {
+    let (notes, rest): (Vec<_>, Vec<_>) = messages
         .iter()
-        .position(|message| message.role != sdk::Role::System)
-        .unwrap_or(messages.len());
-    if lead <= prefix_system_lead {
-        return (Vec::new(), messages.to_vec());
-    }
-    let notes = messages[prefix_system_lead..lead]
-        .iter()
-        .map(|message| message.content.clone())
-        .collect();
-    let mut rest = messages[..prefix_system_lead].to_vec();
-    rest.extend_from_slice(&messages[lead..]);
-    (notes, rest)
+        .cloned()
+        .partition(sdk::Message::is_hook_note);
+    (
+        notes.into_iter().map(|message| message.content).collect(),
+        rest,
+    )
 }
 
 /// The wire prefix with injected `notes` placed right after the task
@@ -549,6 +539,23 @@ pub(super) fn from_provider_response(response: ProviderResponse) -> sdk::ModelRe
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Hook notes are found by their origin, wherever they sit; a plain
+    /// system message stays in the transcript.
+    #[test]
+    fn split_injected_notes_follows_the_hook_note_origin() {
+        let messages = vec![
+            sdk::Message::system("core"),
+            sdk::Message::hook_note("recalled memory"),
+            sdk::Message::system("task tail"),
+            sdk::Message::user("hi"),
+            sdk::Message::hook_note("late note"),
+        ];
+        let (notes, rest) = split_injected_notes(&messages);
+        assert_eq!(notes, vec!["recalled memory", "late note"]);
+        let contents: Vec<&str> = rest.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["core", "task tail", "hi"]);
+    }
 
     #[test]
     fn runtime_provider_recovery_follows_the_typed_route() {

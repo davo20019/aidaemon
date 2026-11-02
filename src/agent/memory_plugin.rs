@@ -28,6 +28,91 @@ pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 pub(crate) const DAEMON_MEMORY_TOOLS: &[&str] =
     &["remember_fact", "manage_memories", "manage_people"];
 
+/// `manage_memories` actions that manage goals, not memory. They stay with
+/// the daemon whatever the plugin: under a plugin that does not own
+/// `manage_memories`, the tool is offered narrowed to these actions.
+pub(crate) const MANAGE_MEMORIES_GOAL_ACTIONS: &[&str] = &[
+    "create_personal_goal",
+    "list_goals",
+    "complete_goal",
+    "abandon_goal",
+    "create_scheduled_goal",
+    "activate_scheduled",
+    "list_scheduled",
+    "list_scheduled_matching",
+    "add_schedule",
+    "cancel_scheduled",
+    "pause_scheduled",
+    "resume_scheduled",
+    "retry_scheduled",
+    "retry_failed_scheduled",
+    "cancel_scheduled_matching",
+    "retry_scheduled_matching",
+    "diagnose_scheduled",
+];
+
+/// How a daemon tool is offered under the active plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonToolOffer {
+    Full,
+    /// `manage_memories` with only [`MANAGE_MEMORIES_GOAL_ACTIONS`].
+    GoalActions,
+    Hidden,
+}
+
+/// How the daemon tool `name` is offered while the active plugin owns the
+/// daemon memory tools `owned`.
+pub(crate) fn daemon_tool_offer(name: &str, owned: &[&str]) -> DaemonToolOffer {
+    if !DAEMON_MEMORY_TOOLS.contains(&name) || owned.contains(&name) {
+        DaemonToolOffer::Full
+    } else if name == "manage_memories" {
+        DaemonToolOffer::GoalActions
+    } else {
+        DaemonToolOffer::Hidden
+    }
+}
+
+/// `manage_memories`' function definition (bare or wrapped in `function`)
+/// narrowed to its goal actions.
+pub(crate) fn goal_actions_view(definition: &serde_json::Value) -> serde_json::Value {
+    let mut definition = definition.clone();
+    let function = match definition.get_mut("function") {
+        Some(function) => function,
+        None => &mut definition,
+    };
+    function["description"] = serde_json::Value::String(
+        "Personal goals and scheduled goals: create, list, pause, resume, retry, cancel, diagnose."
+            .to_string(),
+    );
+    if let Some(actions) = function
+        .pointer_mut("/parameters/properties/action/enum")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        actions.retain(|action| {
+            action
+                .as_str()
+                .is_some_and(|action| MANAGE_MEMORIES_GOAL_ACTIONS.contains(&action))
+        });
+    }
+    definition
+}
+
+/// Rejects a `manage_memories` call outside the goal-actions view.
+pub(crate) fn check_goal_action(arguments: &serde_json::Value) -> Result<(), String> {
+    let action = arguments
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if MANAGE_MEMORIES_GOAL_ACTIONS.contains(&action) {
+        Ok(())
+    } else {
+        Err(format!(
+            "manage_memories action `{action}` is not available here: it only manages goals. \
+             Use the memory tools you were given for facts and preferences."
+        ))
+    }
+}
+
 /// Everything a plugin needs to scope memory for one turn.
 #[derive(Clone)]
 pub(crate) struct MemoryTurn {
@@ -90,11 +175,6 @@ pub(crate) async fn memory_parts(plugin: &dyn MemoryPlugin, turn: &MemoryTurn) -
         owned_daemon_tools: plugin.owned_daemon_tools(),
         ..plugin.turn(turn).await
     }
-}
-
-/// Whether the daemon tool `name` is offered under `parts`.
-pub(crate) fn daemon_tool_offered(name: &str, parts: &MemoryParts) -> bool {
-    !DAEMON_MEMORY_TOOLS.contains(&name) || parts.owned_daemon_tools.contains(&name)
 }
 
 /// The memory plugin `[memory]` selects, or `None` for the daemon's own.
@@ -392,6 +472,22 @@ mod tests {
             .collect()
     }
 
+    fn offered_actions(call: &crate::testing::MockChatCall, tool: &str) -> Vec<String> {
+        call.tools
+            .iter()
+            .map(|definition| definition.get("function").unwrap_or(definition))
+            .find(|function| function["name"] == tool)
+            .and_then(|function| function.pointer("/parameters/properties/action/enum"))
+            .and_then(serde_json::Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| action.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn system_text(call: &crate::testing::MockChatCall) -> String {
         call.messages
             .iter()
@@ -445,9 +541,13 @@ mod tests {
         assert!(system_text(log.last().unwrap()).contains("`manage_memories` (search/list)"));
         drop(log);
 
-        let mut harness = crate::testing::setup_test_agent_sdk(MockProvider::with_responses(vec![
-            MockProvider::text_response("Hi."),
-        ]))
+        let manage_memories: Arc<dyn crate::traits::Tool> =
+            Arc::new(crate::tools::ManageMemoriesTool::new(harness.state.clone()));
+        let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            MockProvider::with_responses(vec![MockProvider::text_response("Hi.")]),
+            vec![manage_memories],
+            None,
+        )
         .await
         .unwrap();
         harness
@@ -460,14 +560,73 @@ mod tests {
             .unwrap();
         let log = harness.provider.call_log.lock().await;
         let names = offered_tool_names(log.last().unwrap());
-        for tool in DAEMON_MEMORY_TOOLS {
+        for tool in ["remember_fact", "manage_people"] {
             assert!(
                 !names.contains(&tool.to_string()),
                 "{tool} offered: {names:?}"
             );
         }
-        // The prompt names no memory tool the plugin does not offer.
-        assert!(!system_text(log.last().unwrap()).contains("manage_memories"));
+        // manage_memories keeps only its goal actions.
+        let actions = offered_actions(log.last().unwrap(), "manage_memories");
+        assert!(
+            actions.contains(&"list_scheduled".to_string()),
+            "{actions:?}"
+        );
+        assert!(!actions.contains(&"search".to_string()), "{actions:?}");
+        assert!(!actions.contains(&"forget".to_string()), "{actions:?}");
+        let system = system_text(log.last().unwrap());
+        assert!(
+            system.contains("`manage_memories` (goal actions)"),
+            "{system}"
+        );
+        assert!(!system.contains("(search/list)"), "{system}");
+    }
+
+    /// The goal-actions view keeps exactly the goal actions `manage_memories`
+    /// declares and refuses the rest.
+    #[tokio::test]
+    async fn goal_actions_view_covers_only_goal_actions() {
+        use serde_json::json;
+
+        let harness = crate::testing::setup_test_agent_sdk(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let schema = crate::traits::Tool::schema(&crate::tools::ManageMemoriesTool::new(
+            harness.state.clone(),
+        ));
+        let declared: Vec<String> = schema["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action.as_str().unwrap().to_string())
+            .collect();
+        for action in MANAGE_MEMORIES_GOAL_ACTIONS {
+            assert!(
+                declared.contains(&action.to_string()),
+                "{action} not declared"
+            );
+        }
+        let view = goal_actions_view(&schema);
+        let narrowed = view["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(narrowed.len(), MANAGE_MEMORIES_GOAL_ACTIONS.len());
+        assert!(check_goal_action(&json!({"action": "pause_scheduled"})).is_ok());
+        assert!(check_goal_action(&json!({"action": "forget"})).is_err());
+        assert!(check_goal_action(&json!({})).is_err());
+        assert_eq!(
+            daemon_tool_offer("manage_memories", &[]),
+            DaemonToolOffer::GoalActions
+        );
+        assert_eq!(
+            daemon_tool_offer("remember_fact", &[]),
+            DaemonToolOffer::Hidden
+        );
+        assert_eq!(
+            daemon_tool_offer("manage_memories", DAEMON_MEMORY_TOOLS),
+            DaemonToolOffer::Full
+        );
+        assert_eq!(daemon_tool_offer("terminal", &[]), DaemonToolOffer::Full);
     }
 
     #[tokio::test]
