@@ -19,19 +19,56 @@ use crate::types::{ChannelVisibility, UserRole};
 pub(crate) struct SdkMemory {
     memory: Memory,
     /// Each session's memory scope, set when its turn starts.
-    scopes: Arc<RwLock<HashMap<String, String>>>,
+    scopes: Arc<RwLock<SessionScopes>>,
+}
+
+/// Sessions whose scope is kept. Run-end extraction resolves the scope after
+/// the turn, so an entry must outlive its turn; the least recently started
+/// session is evicted past this bound, far beyond any number of turns in
+/// flight at once.
+const MAX_SESSION_SCOPES: usize = 1024;
+
+/// Session scopes, bounded by [`MAX_SESSION_SCOPES`].
+#[derive(Default)]
+struct SessionScopes {
+    /// Session id → (scope, turn-start sequence).
+    entries: HashMap<String, (String, u64)>,
+    next: u64,
+}
+
+impl SessionScopes {
+    fn get(&self, session_id: &str) -> Option<&str> {
+        self.entries
+            .get(session_id)
+            .map(|(scope, _)| scope.as_str())
+    }
+
+    fn insert(&mut self, session_id: String, scope: String) {
+        self.next += 1;
+        self.entries.insert(session_id, (scope, self.next));
+        if self.entries.len() > MAX_SESSION_SCOPES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(session, _)| session.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl SdkMemory {
     pub(crate) fn new(builder: MemoryBuilder) -> Self {
-        let scopes: Arc<RwLock<HashMap<String, String>>> = Arc::default();
+        let scopes: Arc<RwLock<SessionScopes>> = Arc::default();
         let resolve = scopes.clone();
         let memory = builder
             .scope_resolver(move |session_id| {
                 resolve
                     .read()
                     .ok()
-                    .and_then(|scopes| scopes.get(session_id).cloned())
+                    .and_then(|scopes| scopes.get(session_id).map(str::to_string))
                     .unwrap_or_else(|| session_scope(session_id))
             })
             .build();
@@ -89,6 +126,24 @@ impl MemoryPlugin for SdkMemory {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn session_scopes_evict_the_least_recently_started_session() {
+        use super::{SessionScopes, MAX_SESSION_SCOPES};
+
+        let mut scopes = SessionScopes::default();
+        for index in 0..MAX_SESSION_SCOPES {
+            scopes.insert(format!("session-{index}"), "owner".to_string());
+        }
+        // A new turn in the oldest session makes session-1 the oldest.
+        scopes.insert("session-0".to_string(), "owner".to_string());
+        scopes.insert("session-new".to_string(), "session:new".to_string());
+
+        assert_eq!(scopes.entries.len(), MAX_SESSION_SCOPES);
+        assert_eq!(scopes.get("session-0"), Some("owner"));
+        assert_eq!(scopes.get("session-1"), None);
+        assert_eq!(scopes.get("session-new"), Some("session:new"));
+    }
 
     use aidaemon_memory::{HashEmbedder, InMemoryMemoryStore, Memory};
 

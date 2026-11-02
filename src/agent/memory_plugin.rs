@@ -98,15 +98,31 @@ pub(crate) fn daemon_tool_offered(name: &str, parts: &MemoryParts) -> bool {
 }
 
 /// The memory plugin `[memory]` selects, or `None` for the daemon's own.
+///
+/// A backend that cannot start is logged and the daemon's own memory is
+/// used, so a broken memory store never keeps the daemon down.
 pub(crate) async fn configured_plugin(
     config: &crate::config::MemoryConfig,
     llm_runtime: &crate::llm_runtime::SharedLlmRuntime,
-) -> anyhow::Result<Option<Arc<dyn MemoryPlugin>>> {
+    state: Arc<dyn StateStore>,
+    event_store: Arc<crate::events::EventStore>,
+) -> Option<Arc<dyn MemoryPlugin>> {
     match config.backend {
-        crate::config::MemoryBackend::Daemon => Ok(None),
+        crate::config::MemoryBackend::Daemon => None,
         #[cfg(feature = "sdk-memory")]
         crate::config::MemoryBackend::Sdk => {
-            let store = aidaemon_memory::SqliteMemoryStore::open(&config.path).await?;
+            let store = match aidaemon_memory::SqliteMemoryStore::open(&config.path).await {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::error!(
+                        path = %config.path,
+                        %error,
+                        "[memory] backend = \"sdk\" could not open its store; \
+                         using the daemon's memory"
+                    );
+                    return None;
+                }
+            };
             let fast_model = llm_runtime
                 .router()
                 .map(|router| router.select(crate::router::Tier::Fast).to_string())
@@ -114,6 +130,11 @@ pub(crate) async fn configured_plugin(
             let extractor = aidaemon_memory::FactExtractor::new(
                 super::sdk_provider::RuntimeProvider {
                     runtime: llm_runtime.clone(),
+                    accounting: Some(super::sdk_provider::ModelCallAccounting {
+                        state,
+                        event_store,
+                        purpose: "sdk_memory_extraction",
+                    }),
                 },
                 fast_model,
             );
@@ -123,16 +144,16 @@ pub(crate) async fn configured_plugin(
             )
             .extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
-            Ok(Some(Arc::new(SdkMemory::new(builder))))
+            Some(Arc::new(SdkMemory::new(builder)))
         }
         #[cfg(not(feature = "sdk-memory"))]
         crate::config::MemoryBackend::Sdk => {
-            let _ = llm_runtime;
+            let _ = (llm_runtime, state, event_store);
             tracing::warn!(
                 "[memory] backend = \"sdk\" needs a build with the sdk-memory feature; \
                  using the daemon's memory"
             );
-            Ok(None)
+            None
         }
     }
 }
@@ -371,6 +392,15 @@ mod tests {
             .collect()
     }
 
+    fn system_text(call: &crate::testing::MockChatCall) -> String {
+        call.messages
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn owner_request(text: &str) -> crate::runtime_ports::InboundMessageRequest {
         crate::runtime_ports::InboundMessageRequest {
             session_id: "telegram:synthetic-user-1".to_string(),
@@ -412,6 +442,7 @@ mod tests {
             .unwrap();
         let log = harness.provider.call_log.lock().await;
         assert!(offered_tool_names(log.last().unwrap()).contains(&"remember_fact".to_string()));
+        assert!(system_text(log.last().unwrap()).contains("`manage_memories` (search/list)"));
         drop(log);
 
         let mut harness = crate::testing::setup_test_agent_sdk(MockProvider::with_responses(vec![
@@ -435,6 +466,8 @@ mod tests {
                 "{tool} offered: {names:?}"
             );
         }
+        // The prompt names no memory tool the plugin does not offer.
+        assert!(!system_text(log.last().unwrap()).contains("manage_memories"));
     }
 
     #[tokio::test]

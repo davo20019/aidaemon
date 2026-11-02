@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{DaemonMemoryInner, MemoryTurn};
 use crate::agent::recall_guardrails::{
@@ -27,6 +27,15 @@ const IDENTITY_CATEGORIES: &[&str] = &[
     "preference",
     "family",
 ];
+
+/// A recall read that fails soft: the section renders empty, and the error is
+/// logged so a broken store does not look like an empty memory.
+fn or_logged<T: Default, E: std::fmt::Display>(result: Result<T, E>, section: &str) -> T {
+    result.unwrap_or_else(|error| {
+        warn!(section, %error, "memory recall read failed; section left empty");
+        T::default()
+    })
+}
 
 /// Recall over the daemon store for one turn. It already knows the channel,
 /// role and memory policy, so the `Recall` contract's session and query are
@@ -61,16 +70,18 @@ impl DaemonRecall {
         let facts = if !allowed {
             vec![]
         } else {
-            state
-                .get_relevant_facts_for_channel(
-                    query,
-                    memory.max_facts,
-                    channel_ctx.channel_id.as_deref(),
-                    channel_ctx.visibility,
-                    user_role == UserRole::Owner,
-                )
-                .await
-                .unwrap_or_default()
+            or_logged(
+                state
+                    .get_relevant_facts_for_channel(
+                        query,
+                        memory.max_facts,
+                        channel_ctx.channel_id.as_deref(),
+                        channel_ctx.visibility,
+                        user_role == UserRole::Owner,
+                    )
+                    .await,
+                "facts",
+            )
         };
 
         // Critical facts (identity/profile): bounded identity categories only,
@@ -78,9 +89,10 @@ impl DaemonRecall {
         let mut critical_fact_summary = if allowed && inject_personal {
             let mut identity_facts = Vec::new();
             for category in IDENTITY_CATEGORIES {
-                if let Ok(mut facts) = state.get_facts(Some(category)).await {
-                    identity_facts.append(&mut facts);
-                }
+                identity_facts.append(&mut or_logged(
+                    state.get_facts(Some(category)).await,
+                    "critical_facts",
+                ));
             }
             extract_critical_fact_summary(&identity_facts)
         } else {
@@ -94,17 +106,20 @@ impl DaemonRecall {
         let episodes = if !allowed {
             vec![]
         } else if inject_personal {
-            state
-                .get_relevant_episodes(query, 3)
-                .await
-                .unwrap_or_default()
+            or_logged(state.get_relevant_episodes(query, 3).await, "episodes")
         } else {
             match channel_ctx.visibility {
                 ChannelVisibility::PublicExternal => vec![],
-                _ => state
-                    .get_relevant_episodes_for_channel(query, 3, channel_ctx.channel_id.as_deref())
-                    .await
-                    .unwrap_or_default(),
+                _ => or_logged(
+                    state
+                        .get_relevant_episodes_for_channel(
+                            query,
+                            3,
+                            channel_ctx.channel_id.as_deref(),
+                        )
+                        .await,
+                    "episodes",
+                ),
             }
         };
 
@@ -112,10 +127,7 @@ impl DaemonRecall {
         // are safe more broadly: they encode agent-side recovery guidance, not
         // user-private preferences.
         let goals = if allowed && inject_personal {
-            state
-                .get_active_personal_goals(20)
-                .await
-                .unwrap_or_default()
+            or_logged(state.get_active_personal_goals(20).await, "goals")
         } else {
             vec![]
         };
@@ -123,12 +135,9 @@ impl DaemonRecall {
             if !allowed || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
                 vec![]
             } else if inject_personal {
-                state.get_behavior_patterns(0.5).await.unwrap_or_default()
+                or_logged(state.get_behavior_patterns(0.5).await, "patterns")
             } else {
-                state
-                    .get_behavior_patterns(0.5)
-                    .await
-                    .unwrap_or_default()
+                or_logged(state.get_behavior_patterns(0.5).await, "patterns")
                     .into_iter()
                     .filter(|pattern| pattern.pattern_type == "failure")
                     .collect()
@@ -140,30 +149,22 @@ impl DaemonRecall {
                 (vec![], vec![])
             } else {
                 (
-                    state
-                        .get_relevant_procedures(query, 5)
-                        .await
-                        .unwrap_or_default(),
-                    state
-                        .get_relevant_error_solutions(query, 5)
-                        .await
-                        .unwrap_or_default(),
+                    or_logged(state.get_relevant_procedures(query, 5).await, "procedures"),
+                    or_logged(
+                        state.get_relevant_error_solutions(query, 5).await,
+                        "error_solutions",
+                    ),
                 )
             };
         let profile = if allowed && inject_personal {
-            state.get_user_profile().await.ok().flatten()
+            or_logged(state.get_user_profile().await, "profile")
         } else {
             None
         };
 
         // People context: resolve the current speaker (only when enabled).
         let people_enabled = allowed
-            && state
-                .get_setting("people_enabled")
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
+            && or_logged(state.get_setting("people_enabled").await, "people_enabled").as_deref()
                 == Some("true");
         let (people, current_person, current_person_facts) = if !people_enabled {
             (vec![], None, vec![])
@@ -171,21 +172,27 @@ impl DaemonRecall {
             // In owner DMs the people list only selects the privacy rules; the
             // owner's own profile arrives through the core profile.
             (
-                state.get_all_people().await.unwrap_or_default(),
+                or_logged(state.get_all_people().await, "people"),
                 None,
                 vec![],
             )
         } else if let Some(ref sender_id) = channel_ctx.sender_id {
             match state.get_person_by_platform_id(sender_id).await {
                 Ok(Some(person)) => {
-                    let _ = state.touch_person_interaction(person.id).await;
-                    let facts = state
-                        .get_person_facts(person.id, None)
-                        .await
-                        .unwrap_or_default();
+                    if let Err(error) = state.touch_person_interaction(person.id).await {
+                        warn!(%error, "failed to record person interaction");
+                    }
+                    let facts = or_logged(
+                        state.get_person_facts(person.id, None).await,
+                        "person_facts",
+                    );
                     (vec![], Some(person), facts)
                 }
-                _ => (vec![], None, vec![]),
+                Ok(None) => (vec![], None, vec![]),
+                Err(error) => {
+                    warn!(%error, "memory recall read failed; section left empty");
+                    (vec![], None, vec![])
+                }
             }
         } else {
             (vec![], None, vec![])
@@ -200,10 +207,11 @@ impl DaemonRecall {
                 .await
                 .get(&turn.session_id)
                 .cloned();
-            let (profile_str, new_ids, digest) =
+            let (profile_str, new_ids, digest) = or_logged(
                 crate::memory::core_profile::build_core_profile(state, cached_ids, people_enabled)
-                    .await
-                    .unwrap_or_default();
+                    .await,
+                "core_profile",
+            );
             if let Some(ids) = new_ids {
                 memory
                     .core_profile_ids
@@ -339,7 +347,8 @@ impl aidaemon_policies::Recall for DaemonRecall {
             return Vec::new();
         }
         let channel_ctx = &self.turn.channel_ctx;
-        self.memory
+        let facts = self
+            .memory
             .state
             .get_relevant_facts_for_channel(
                 query,
@@ -348,8 +357,8 @@ impl aidaemon_policies::Recall for DaemonRecall {
                 channel_ctx.visibility,
                 self.turn.user_role == UserRole::Owner,
             )
-            .await
-            .unwrap_or_default()
+            .await;
+        or_logged(facts, "facts")
             .into_iter()
             .map(|fact| format!("[{}] {}: {}", fact.category, fact.key, fact.value))
             .collect()

@@ -209,8 +209,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
     });
     agent.set_sdk_engine(sdk_engine);
-    if let Some(memory) =
-        crate::agent::memory_plugin::configured_plugin(&config.memory, &llm_runtime).await?
+    if let Some(memory) = crate::agent::memory_plugin::configured_plugin(
+        &config.memory,
+        &llm_runtime,
+        state.clone(),
+        event_store.clone(),
+    )
+    .await
     {
         agent.set_memory_plugin(memory);
     }

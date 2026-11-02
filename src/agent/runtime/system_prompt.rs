@@ -1079,9 +1079,22 @@ impl Agent {
              [Self-Inspection]\n\
              You cannot directly access your own database files. Do NOT use terminal to run `find`, `ls`, `sqlite3`, or any command \
              to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
-             Instead, use your built-in tools for self-inspection:\n\
-             - `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n\
-             - `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
+             Instead, use your built-in tools for self-inspection:\n",
+        );
+        // The memory inspection tool is the active memory plugin's.
+        if self
+            .memory
+            .owned_daemon_tools()
+            .contains(&"manage_memories")
+        {
+            rules.push_str(
+                "- `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n",
+            );
+        } else {
+            rules.push_str("- your memory recall tool — for stored facts and preferences\n");
+        }
+        rules.push_str(
+            "- `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
              - `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n\
              When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
              use these tools — never try to find raw database files.",
