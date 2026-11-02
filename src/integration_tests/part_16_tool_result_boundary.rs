@@ -402,6 +402,234 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
     );
 }
 
+/// The task-lead half of an ACT review on SDK turns: observe, commit an ACT
+/// citing that observation's receipt, create the one executor task, and
+/// answer, without mutating anything itself. The executor half is
+/// `natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedule`.
+#[tokio::test]
+async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let feed_url = format!("http://localhost:{port}/2/feed");
+    let post_url = format!("http://localhost:{port}/2/posts");
+    let server_gets = Arc::new(AtomicUsize::new(0));
+    let server_posts = Arc::new(AtomicUsize::new(0));
+    let (gets, posts) = (server_gets.clone(), server_posts.clone());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 8192];
+            let bytes = stream.read(&mut request).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            if request.starts_with("GET /2/feed") {
+                gets.fetch_add(1, Ordering::SeqCst);
+            } else {
+                posts.fetch_add(1, Ordering::SeqCst);
+            }
+            let body = r#"{"data":[{"id":"1","text":"Acme shipped release 2.0 today"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let criterion = "Each post shares grounded, current information useful to the audience";
+    let mandate_args = |action: &str| {
+        json!({
+            "action": action,
+            "objective": "Steward a synthetic account as an authentic presence",
+            "operation_scopes": [
+                {
+                    "tool": "http_request",
+                    "operation": "GET",
+                    "kind": "observation",
+                    "target_prefixes": [feed_url.clone()]
+                },
+                {
+                    "tool": "http_request",
+                    "operation": "POST",
+                    "kind": "mutation",
+                    "target_prefixes": [post_url.clone()],
+                    "mutation_effects": ["remote_mutation", "external_delivery"]
+                }
+            ],
+            "max_mutating_actions_per_cycle": 1,
+            "max_mutating_actions_per_rolling_24h": 4,
+            "min_seconds_between_mutations": 900,
+            "constraints": ["No fabrication"],
+            "success_criteria": [criterion],
+            "stop_conditions": ["Authentication is revoked"]
+        })
+        .to_string()
+    };
+    let observe_call_id = "call_observe_synthetic_feed";
+    let mut observe = MockProvider::tool_call_response(
+        "http_request",
+        &json!({"method": "GET", "url": feed_url}).to_string(),
+    );
+    observe.tool_calls[0].id = observe_call_id.to_string();
+    let act_args = json!({
+        "action": "record_decision",
+        "outcome": "act",
+        "rationale": "A fresh release is worth one grounded post",
+        "observations": ["The feed shows Acme release 2.0 shipped today"],
+        "evidence_receipt_ids": [observe_call_id],
+        "intention": "Post one grounded note about Acme release 2.0",
+        "value_criterion": criterion,
+        "expected_benefit": "The audience learns about the release the day it ships",
+        "risk": "Low: one factual post grounded in the observed feed",
+        "invalidation_criteria": "Do not post if the release is no longer in the feed"
+    })
+    .to_string();
+    let delegate_args = json!({
+        "action": "create_task",
+        "description": "Post one grounded note about Acme release 2.0",
+        "worker_profile": "executor"
+    })
+    .to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("manage_mandates", &mandate_args("draft")),
+        MockProvider::tool_call_response("manage_mandates", &mandate_args("create")),
+        MockProvider::text_response("The mandate is active."),
+        observe,
+        MockProvider::tool_call_response("manage_mandates", &act_args),
+        MockProvider::tool_call_response("manage_goal_tasks", &delegate_args),
+        MockProvider::text_response("ACT committed; the executor task will post the note."),
+    ]);
+    let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
+    harness
+        .agent
+        .handle_message(
+            "owner-chat",
+            "Manage my synthetic account as an ongoing presence; decide when to post or wait.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mandate = retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "test-heartbeat", 300))
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the mandate is due");
+    let root_task_id = uuid::Uuid::new_v4().to_string();
+    let root_task = crate::traits::Task {
+        id: root_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Review the mandate".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+    };
+    let goal_run_id = uuid::Uuid::new_v4().to_string();
+    retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_review_run(
+            &mandate.id,
+            mandate.review_lease_token.as_deref().unwrap(),
+            &goal_run_id,
+            &root_task,
+        )
+    })
+    .await
+    .unwrap();
+    let root_attempt = retry_test_sqlite_busy(|| {
+        harness
+            .state
+            .claim_task_with_lease(&root_task_id, "test-task-lead", Some("profile-task-lead"), 7_200)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
+    harness
+        .agent
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            crate::tools::ApprovalBroker::new(http_approval_tx),
+        )));
+    // As the task-lead spawn wires it: bound to this goal and run.
+    harness.agent.push_test_tool(Arc::new(
+        crate::tools::ManageGoalTasksTool::new(mandate.goal_id.clone(), harness.state.clone())
+            .with_goal_run_id(Some(goal_run_id.clone())),
+    ));
+    harness.agent.set_test_mandate_execution(
+        &mandate.id,
+        mandate.version,
+        mandate.authority.clone(),
+        &mandate.goal_id,
+        &root_task_id,
+        &root_attempt.id,
+        &root_attempt,
+    );
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.agent.handle_message(
+            "mandate-review",
+            "Review the mandate and decide.",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        ),
+    )
+    .await
+    .expect("the review should not hang")
+    .unwrap();
+
+    assert_eq!(reply, "ACT committed; the executor task will post the note.");
+    let decision = harness
+        .state
+        .get_mandate_decision_for_run(&goal_run_id)
+        .await
+        .unwrap()
+        .expect("the decision was committed");
+    assert_eq!(decision.outcome, crate::traits::MandateDecisionOutcome::Act);
+    assert_eq!(decision.evidence_receipt_ids, vec![observe_call_id.to_string()]);
+    let executor_tasks = harness
+        .state
+        .get_tasks_for_goal(&mandate.goal_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.id != root_task_id)
+        .collect::<Vec<_>>();
+    assert_eq!(executor_tasks.len(), 1, "one executor task: {executor_tasks:?}");
+    assert_eq!(
+        executor_tasks[0].description,
+        "Post one grounded note about Acme release 2.0"
+    );
+    assert_eq!(server_gets.load(Ordering::SeqCst), 1, "the lead observed once");
+    assert_eq!(server_posts.load(Ordering::SeqCst), 0, "the lead never mutates");
+    assert!(harness
+        .state
+        .list_mandate_mutation_attempts_for_run(&goal_run_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Stand-in for the GUI tool's pin registry effects: `gui_click` pins a model
 /// and leaves an unverified coordinate click, `gui_look` verifies it.
 #[cfg(feature = "computer_use")]
