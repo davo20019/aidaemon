@@ -1249,7 +1249,7 @@ impl Agent {
             self.persist_pre_dispatch_policy_denial(
                 scope.emitter,
                 scope.session_id,
-                scope.task_id,
+                self.ledger_task_id(scope),
                 &call,
                 &call.arguments,
                 reason,
@@ -1262,7 +1262,7 @@ impl Agent {
             self.persist_pre_dispatch_outcome_with_kernel_claim(
                 scope.emitter,
                 scope.session_id,
-                scope.task_id,
+                self.ledger_task_id(scope),
                 &call,
                 &call.arguments,
                 reason,
@@ -1279,6 +1279,16 @@ impl Agent {
         if let Err(error) = recorded {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a kernel refusal");
         }
+    }
+
+    /// The task an operation is ledgered on: a fenced mandate worker's
+    /// durable worker task (it belongs to the goal run, where run-scoped
+    /// receipt checks join), else the turn's task. Every tool call and its
+    /// result use this one id so a call never sits apart from its result.
+    fn ledger_task_id<'s>(&'s self, scope: &TurnScope<'s>) -> &'s str {
+        self.mandate_execution
+            .as_ref()
+            .map_or(scope.task_id, |fence| fence.worker_task_id.as_str())
     }
 
     /// Judge the call's access manifest against the task's filesystem
@@ -1458,7 +1468,7 @@ impl Agent {
                     .persist_pre_dispatch_policy_denial(
                         scope.emitter,
                         scope.session_id,
-                        scope.task_id,
+                        self.ledger_task_id(scope),
                         &call,
                         arguments,
                         refusal.clone(),
@@ -1518,7 +1528,7 @@ impl Agent {
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
-            Some(scope.task_id.to_string()),
+            Some(self.ledger_task_id(scope).to_string()),
         )
         .with_policy_metadata(idempotency_key.clone(), None, None);
         call_data.turn_id = Some(scope.turn_id.to_string());
@@ -1882,13 +1892,7 @@ impl Agent {
                 !failed,
                 duration_ms,
                 failed.then(|| output.clone()),
-                // Mandate receipts belong to the worker task, as in the legacy
-                // tool phase.
-                Some(
-                    self.mandate_execution
-                        .as_ref()
-                        .map_or(scope.task_id, |fence| fence.worker_task_id.as_str()),
-                ),
+                Some(self.ledger_task_id(scope)),
                 metadata
                     .as_ref()
                     .and_then(|metadata| metadata.persistent_output.as_deref()),
@@ -3107,7 +3111,7 @@ impl Agent {
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
-            Some(scope.task_id.to_string()),
+            Some(self.ledger_task_id(scope).to_string()),
         );
         call_data.turn_id = Some(scope.turn_id.to_string());
         let _ = scope.emitter.emit(EventType::ToolCall, call_data).await;
@@ -3125,7 +3129,7 @@ impl Agent {
                 true,
                 0,
                 None,
-                Some(scope.task_id),
+                Some(self.ledger_task_id(scope)),
                 None,
                 None,
             )
@@ -3229,7 +3233,7 @@ impl Agent {
             request.call_id.clone(),
             request.name.clone(),
             request.arguments.clone(),
-            Some(scope.task_id.to_string()),
+            Some(self.ledger_task_id(scope).to_string()),
         );
         call_data.turn_id = Some(scope.turn_id.to_string());
         let _ = scope.emitter.emit(EventType::ToolCall, call_data).await;
@@ -3252,7 +3256,7 @@ impl Agent {
                 !failed,
                 0,
                 previous.error.clone(),
-                Some(scope.task_id),
+                Some(self.ledger_task_id(scope)),
                 None,
                 receipt,
             )
@@ -3343,7 +3347,7 @@ impl Agent {
             .persist_pre_dispatch_outcome_with_kernel_claim(
                 scope.emitter,
                 scope.session_id,
-                scope.task_id,
+                self.ledger_task_id(scope),
                 &call,
                 arguments,
                 notice.clone(),

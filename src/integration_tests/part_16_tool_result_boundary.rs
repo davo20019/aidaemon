@@ -364,6 +364,42 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
         1,
         "no model call after the committed decision"
     );
+
+    // A fenced worker's operations are ledgered on its durable worker task:
+    // each call sits with its result, where the run-scoped receipt checks
+    // (decision and measurement evidence) look them up.
+    use crate::events::EventType;
+    let events = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "mandate-review",
+            &[EventType::ToolCall, EventType::ToolResult],
+            50,
+        )
+        .await
+        .unwrap();
+    let task_of = |kind: EventType| {
+        events
+            .iter()
+            .filter(|event| event.event_type == kind)
+            .filter(|event| event.data["tool_call_id"].as_str().is_some())
+            .map(|event| {
+                (
+                    event.data["tool_call_id"].as_str().unwrap().to_string(),
+                    event.data["task_id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let calls = task_of(EventType::ToolCall);
+    let results = task_of(EventType::ToolResult);
+    assert!(!calls.is_empty(), "the decision call was recorded");
+    assert_eq!(calls, results, "each call is ledgered with its result");
+    assert!(
+        calls.iter().all(|(_, task)| task == &root_task_id),
+        "operations sit on the worker task: {calls:?}"
+    );
 }
 
 /// Stand-in for the GUI tool's pin registry effects: `gui_click` pins a model
