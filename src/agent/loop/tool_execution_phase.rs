@@ -2,8 +2,10 @@
 mod phase_impl;
 
 pub(super) use phase_impl::blocked_for_untrusted_external_reference_message;
-pub(super) use phase_impl::project_instruction_targets_for_tool_call;
 pub(super) use phase_impl::user_facing_external_action_ack;
+pub(super) use phase_impl::{
+    access_manifest_scope_check, attenuate_unauthorized_read_roots, ScopeCheck,
+};
 pub(super) use phase_impl::{
     accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,
     evidence_requirement_accepts_nonstandard_outcome, matching_evidence_requirement_indices,
@@ -16,4 +18,8 @@ pub(super) use phase_impl::{
 };
 pub(super) use phase_impl::{durable_replay_preflight, DurableReplayPreflight};
 pub(super) use phase_impl::{fallback_tool_semantic_scope, run_tool_execution_phase};
+pub(super) use phase_impl::{
+    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
+    project_instruction_targets_for_tool_call,
+};
 pub(super) use phase_impl::{PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx};

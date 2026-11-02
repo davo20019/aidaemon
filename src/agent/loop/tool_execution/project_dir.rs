@@ -246,7 +246,10 @@ fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn project_dir_from_tool_args(tool_name: &str, args_json: &str) -> Option<String> {
+pub(in crate::agent) fn project_dir_from_tool_args(
+    tool_name: &str,
+    args_json: &str,
+) -> Option<String> {
     extract_project_dirs_from_tool_args(tool_name, args_json)
         .into_iter()
         .next()
@@ -256,7 +259,7 @@ pub(super) fn tool_call_includes_project_path(tool_name: &str, args_json: &str) 
     project_dir_from_tool_args(tool_name, args_json).is_some()
 }
 
-pub(super) fn maybe_inject_project_dir_into_tool_args(
+pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
     tool_name: &str,
     args_json: &str,
     known_project_dir: Option<&str>,

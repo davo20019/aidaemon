@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SDK turns keep the legacy tool boundary.** Behavior the old dispatcher owned is back on every turn:
+  - Untrusted tool output (web, MCP, terminal, channel history) is wrapped as data and sanitized again before the model sees it, and an oversized result is paged, spilled to a file, or compressed to the per-model cap.
+  - A call without a directory runs in the request's project directory (a scheduled goal's bound workspace), not the daemon's cwd.
+  - The controller refuses protected host data and undeclared writes outside the task boundary, and an exact out-of-scope terminal target goes to the approval prompt.
+  - Tools run under the configured call timeout.
+- **Mandate reviews end on their decision.** A committed WAIT, ASK or STOP ends the review without another model call, and an exhausted cycle balance closes from that decision (or a bounded WAIT) instead of failing as a provider error.
+- **Stopped runs reply in plain language.** A run that hits a limit, gets stuck or loses the provider no longer shows internal debug text; its reply is sanitized, provider errors are redacted, and secrets are filtered on public channels.
+- **Learning sees failures again.** Tool errors and the recoveries that follow feed error solutions and failure patterns; failed model calls are recorded in telemetry; token estimates are calibrated; a provider blip before any work gets the longer retry ladder; and a reply cut off while thinking lowers reasoning effort for the next call.
 - **`web_fetch` keeps listing pages whole.** On download and release pages readability kept a side section (python.org: "verify your download") and dropped the release list, so the agent reported an older version as current. A short extract cut from a large page now returns the whole page text.
 - **A silent model no longer replaces a real answer with "I completed N actions."** When the closeout sends a correct final answer back for more work and the model then replies with nothing, that answer ships instead of a generic activity summary.
 - **Folder-scoped checklist steps close.** A write or read inside a folder the checklist named now counts for that folder.

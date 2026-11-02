@@ -255,6 +255,8 @@ pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
 mod sdk_provider;
 pub(crate) mod specialists;
+#[path = "runtime/tool_result_fit.rs"]
+mod tool_result_fit;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
 pub(crate) use parent_delivery::ParentDeliveryKind;

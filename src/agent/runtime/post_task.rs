@@ -847,7 +847,7 @@ fn abbreviate_absolute_path(path: &str) -> String {
     format!("[path:.../{}]{}", tail, suffix)
 }
 
-fn redact_error_line_for_summary(key_line: &str) -> String {
+pub(in crate::agent) fn redact_error_line_for_summary(key_line: &str) -> String {
     let unix_summarized = ABS_UNIX_PATH_RE
         .replace_all(key_line, |caps: &regex::Captures<'_>| {
             abbreviate_absolute_path(caps.get(0).map(|m| m.as_str()).unwrap_or_default())

@@ -263,7 +263,7 @@ pub(super) fn narrowest_authorized_path_scopes(scopes: &[String]) -> Vec<String>
 /// with a typed sandbox denial if it genuinely needed the wider root. Write
 /// roots are never attenuated; an unauthorized write stays a violation.
 /// Returns the stripped roots (empty when nothing changed).
-pub(super) fn attenuate_unauthorized_read_roots(
+pub(in crate::agent) fn attenuate_unauthorized_read_roots(
     arguments: &mut Value,
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
@@ -532,7 +532,7 @@ pub(super) fn target_scope_violation_for_tool_call(
 /// cwd selects process location and is never implicit data authority.
 /// Outcome of checking a call's access manifest against task authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ScopeCheck {
+pub(in crate::agent) enum ScopeCheck {
     /// The call must not run: protected host data, a credential store, or an
     /// undeclared write outside the task boundary.
     Rejected(String),
@@ -571,7 +571,7 @@ pub(super) fn access_manifest_scope_violation(
         .map(|check| check.reason().to_string())
 }
 
-pub(super) fn access_manifest_scope_check(
+pub(in crate::agent) fn access_manifest_scope_check(
     tool_name: &str,
     call: &crate::traits::ToolCallAccessManifest,
     task: Option<&crate::traits::ToolCallAccessManifest>,

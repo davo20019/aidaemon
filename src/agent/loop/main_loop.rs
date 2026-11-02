@@ -1438,6 +1438,48 @@ impl Agent {
                 continue_inline_after_background: turn_context
                     .continue_inline_after_background_start
                     || execution_state.linear_intent_plan_has_remaining_steps(),
+                // Same anchor the legacy tool phase injected: execution cwd
+                // first, then the request's primary scope. A channel
+                // workspace grant scopes the file tools itself.
+                known_project_dir: if channel_ctx.active_workspace_grant(user_role).is_some() {
+                    None
+                } else {
+                    turn_context
+                        .filesystem_access
+                        .as_ref()
+                        .and_then(|access| access.execution_cwd.clone())
+                        .or_else(|| turn_context.primary_project_scope.clone())
+                },
+                project_scope: (!turn_context.allow_multi_project_scope)
+                    .then(|| turn_context.primary_project_scope.clone())
+                    .flatten(),
+                task_access: turn_context.filesystem_access.clone(),
+                authorized_scopes: {
+                    let mut scopes = if turn_context.authorized_project_scopes.is_empty() {
+                        channel_ctx
+                            .active_workspace_grant(user_role)
+                            .map(|grant| grant.project_root.clone())
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    } else {
+                        turn_context.authorized_project_scopes.clone()
+                    };
+                    if let Some(access) = turn_context.filesystem_access.as_ref() {
+                        for target in access
+                            .read_targets
+                            .iter()
+                            .chain(access.write_targets.iter())
+                            .filter(|target| {
+                                target.kind == crate::traits::ToolTargetHintKind::ProjectScope
+                            })
+                        {
+                            if !scopes.contains(&target.value) {
+                                scopes.push(target.value.clone());
+                            }
+                        }
+                    }
+                    scopes
+                },
             };
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(

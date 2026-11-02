@@ -180,6 +180,18 @@ pub(in crate::agent) struct SdkTurnSetup {
         Option<crate::project_instructions::ProjectInstructionTracker>,
     /// The compiled memory policy allows recall on this turn.
     pub(in crate::agent) memory_recall_allowed: bool,
+    /// Where calls without a directory run: the contract's execution cwd,
+    /// else the request's primary project scope (a scheduled goal's bound
+    /// workspace). `None` when a channel workspace grant scopes the file
+    /// tools itself.
+    pub(in crate::agent) known_project_dir: Option<String>,
+    /// The single-project scope lock, passed to tools as `_project_scope`.
+    pub(in crate::agent) project_scope: Option<String>,
+    /// The request's filesystem capabilities, and the directories it
+    /// authorizes: the controller-side scope check judges each call's access
+    /// manifest against them.
+    pub(in crate::agent) task_access: Option<crate::traits::ToolCallAccessManifest>,
+    pub(in crate::agent) authorized_scopes: Vec<String>,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -190,6 +202,64 @@ pub(super) struct StopCheck {
     failed_without_success: bool,
     final_text: String,
     reply: oneshot::Sender<sdk::StopDecision>,
+}
+
+/// Anchor a call without a directory to the turn's project directory, as
+/// the legacy tool phase did: a scheduled goal's terminal command runs in its
+/// bound workspace, not the daemon's cwd. The model's own explicit directory
+/// refines the anchor; an injected one never does (it may be a parent
+/// directory picked because the target does not exist yet). Returns the
+/// injected directory.
+fn anchor_call_to_project_dir(scope: &TurnScope<'_>, request: &mut ToolRequest) -> Option<String> {
+    // A channel workspace grant scopes the file tools itself.
+    if scope
+        .channel_ctx
+        .active_workspace_grant(scope.user_role)
+        .is_some()
+    {
+        return None;
+    }
+    let arguments = serde_json::to_string(&request.arguments).ok()?;
+    let mut known = scope.known_project_dir.lock().ok()?;
+    if let Some(explicit) =
+        super::tool_execution_phase::project_dir_from_tool_args(&request.name, &arguments)
+    {
+        *known = Some(explicit);
+    }
+    let (updated, injected) = super::tool_execution_phase::maybe_inject_project_dir_into_tool_args(
+        &request.name,
+        &arguments,
+        known.as_deref(),
+    )?;
+    request.arguments = serde_json::from_str(&updated).ok()?;
+    Some(injected)
+}
+
+/// Drop declared terminal read roots the task does not authorize before the
+/// scope check, so a superfluous root (`/tmp`) cannot veto an otherwise
+/// authorized call. Dropping a read root does not change what the call does.
+fn attenuate_sdk_read_roots(scope: &TurnScope<'_>, request: &mut ToolRequest) {
+    if request.name != "terminal" {
+        return;
+    }
+    let known = scope
+        .known_project_dir
+        .lock()
+        .ok()
+        .and_then(|known| known.clone());
+    let stripped = super::tool_execution_phase::attenuate_unauthorized_read_roots(
+        &mut request.arguments,
+        scope.task_access.as_ref(),
+        &scope.authorized_scopes,
+        known.as_deref(),
+    );
+    if !stripped.is_empty() {
+        info!(
+            task_id = scope.task_id,
+            stripped_read_roots = ?stripped,
+            "SDK engine: attenuated unauthorized declared read roots"
+        );
+    }
 }
 
 /// A replayed call's result, marked so the model does not read the earlier
@@ -459,8 +529,15 @@ fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
         ),
         sdk::RunStatus::LimitReached { limit } => (
             text.unwrap_or_else(|| {
+                let what = match limit {
+                    sdk::LimitKind::Turns => "the number of steps",
+                    sdk::LimitKind::Tokens => "the token budget",
+                    sdk::LimitKind::ToolCalls => "the number of tool calls",
+                    sdk::LimitKind::WallClock => "the time",
+                };
                 format!(
-                    "I stopped before finishing: the {limit:?} limit for one request was reached."
+                    "I stopped before finishing: I reached the limit on {what} for one request. \
+                     Ask me to continue and I'll pick up from here."
                 )
             }),
             TaskStatus::Completed,
@@ -468,7 +545,10 @@ fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
         ),
         sdk::RunStatus::Stuck { signal } => (
             text.unwrap_or_else(|| {
-                format!("I stopped because I was repeating myself without progress ({signal:?}).")
+                let _ = signal;
+                "I stopped because I kept repeating the same step without making progress. \
+                 Tell me how you'd like to proceed, or ask me to try a different approach."
+                    .to_string()
             }),
             TaskStatus::Completed,
             TaskOutcome::Partial,
@@ -492,7 +572,14 @@ fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
             TaskOutcome::Failed,
         ),
         sdk::RunStatus::ProviderFailed { error } => (
-            format!("The model provider failed: {error}"),
+            // Provider errors can carry paths and credentials: the user gets
+            // the key line, redacted, as the legacy error summary did.
+            format!(
+                "I couldn't finish because the model provider returned an error: {}",
+                super::post_task::redact_error_line_for_summary(
+                    error.to_string().lines().next().unwrap_or_default()
+                )
+            ),
             TaskStatus::Failed,
             TaskOutcome::Failed,
         ),
@@ -582,6 +669,30 @@ fn bind_receipt_to_contract(
         }
     }
     progress.completion_obligations_for_receipt(call_id)
+}
+
+/// Record one call for post-task learning. Errors and the recovery that
+/// follows feed error solutions, failure patterns and the outcome label, as
+/// the legacy result learning recorded them: a success after an error
+/// credits it as recovered.
+fn record_call_for_learning(
+    learning: &mut crate::agent::post_task::LearningContext,
+    summary: String,
+    output: &str,
+    failed: bool,
+) {
+    if failed {
+        if learning.first_error.is_none() {
+            learning.first_error = Some(output.to_string());
+        }
+        learning.errors.push((output.to_string(), false));
+    } else if !learning.errors.is_empty() {
+        learning.recovery_actions.push(summary.clone());
+        if let Some((_, recovered)) = learning.errors.last_mut() {
+            *recovered = true;
+        }
+    }
+    learning.tool_calls.push(summary);
 }
 
 /// One tool call as post-task learning records it (the legacy
@@ -753,8 +864,9 @@ impl TurnVerdict {
     }
 
     /// The reply the user gets, with its status and outcome: [`Self::resolve`],
-    /// then for a completed run the interrupted-answer fallback, the final
-    /// reply checks and secret redaction on public channels.
+    /// then for a completed run the interrupted-answer fallback and the final
+    /// reply checks (reply sanitization alone for a stopped run), and for
+    /// every run secret redaction on public channels.
     pub(crate) fn final_reply(
         &self,
         outcome: &sdk::RunOutcome,
@@ -762,20 +874,34 @@ impl TurnVerdict {
         visibility: crate::types::ChannelVisibility,
     ) -> (String, TaskStatus, TaskOutcome) {
         let (reply, status, task_outcome) = self.resolve(outcome);
-        if !matches!(outcome.status, sdk::RunStatus::Completed) {
-            return (reply, status, task_outcome);
-        }
-        let note = self.response_note.lock().ok().and_then(|note| note.clone());
-        let interrupted = self
-            .interrupted_answer
-            .lock()
-            .ok()
-            .and_then(|answer| answer.clone());
-        let reply = match interrupted {
-            Some(answer) if reply.trim().is_empty() => answer,
-            _ => reply,
+        let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
+            let note = self.response_note.lock().ok().and_then(|note| note.clone());
+            let interrupted = self
+                .interrupted_answer
+                .lock()
+                .ok()
+                .and_then(|answer| answer.clone());
+            let reply = match interrupted {
+                Some(answer) if reply.trim().is_empty() => answer,
+                _ => reply,
+            };
+            finalize_reply(&reply, tool_calls, note.as_deref())
+        } else {
+            // A stopped run's text (the model's partial answer, or the
+            // daemon's own explanation) gets the same reply sanitization; a
+            // partial answer that was mostly scaffolding is not shipped.
+            let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
+            if crate::tools::sanitize::reply_gutted_by_sanitization(
+                reply.trim().chars().count(),
+                &sanitized,
+            ) {
+                "I stopped before finishing and couldn't put together a clean summary of where \
+                 I got to. Ask me to continue and I'll pick up from here."
+                    .to_string()
+            } else {
+                sanitized
+            }
         };
-        let reply = finalize_reply(&reply, tool_calls, note.as_deref());
         let reply = match visibility {
             crate::types::ChannelVisibility::Public
             | crate::types::ChannelVisibility::PublicExternal => {
@@ -822,7 +948,8 @@ impl TurnVerdict {
             }
             // A budget stop ends the run through the provider port.
             (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
-                if error.contains(GOAL_BUDGET_EXHAUSTED) =>
+                if error.contains(GOAL_BUDGET_EXHAUSTED)
+                    || error.contains(MANDATE_BUDGET_EXHAUSTED) =>
             {
                 (reply, TaskStatus::Completed, outcome)
             }
@@ -900,8 +1027,19 @@ struct TurnScope<'a> {
     reply_retry_used: AtomicBool,
     /// The next model call runs with tools disabled (empty-reply retry).
     text_only_next_call: AtomicBool,
+    /// Consecutive responses cut off at the token limit with no output (the
+    /// whole budget went to thinking); the next calls lower reasoning effort.
+    thinking_truncations: std::sync::atomic::AtomicU8,
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
+    /// Where calls without a directory run; refined by the model's own
+    /// explicit directories (see `SdkTurnSetup::known_project_dir`).
+    known_project_dir: std::sync::Mutex<Option<String>>,
+    /// The single-project scope lock passed to tools.
+    project_scope: Option<String>,
+    /// See `SdkTurnSetup::task_access`.
+    task_access: Option<crate::traits::ToolCallAccessManifest>,
+    authorized_scopes: Vec<String>,
     /// Terminal replies, external acks and run failures: the turn's verdict.
     verdict: Arc<TurnVerdict>,
     /// Daemon memory tools the active memory plugin owns on this turn.
@@ -946,9 +1084,43 @@ struct TurnScope<'a> {
 }
 
 impl Agent {
-    async fn dispatch_sdk_tool_call(&self, scope: &TurnScope<'_>, request: ToolRequest) {
+    /// Judge the call's access manifest against the task's filesystem
+    /// authority. `None`: in scope (or not a known tool).
+    fn sdk_scope_check(
+        &self,
+        scope: &TurnScope<'_>,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Option<super::tool_execution_phase::ScopeCheck> {
+        let tool = self.tools.iter().find(|tool| tool.name() == tool_name)?;
+        let mut manifest = tool
+            .prepare_invocation(arguments)
+            .map(|prepared| prepared.access_manifest)
+            .unwrap_or_else(|_| tool.call_access_manifest(arguments));
+        manifest.adapter_read_targets = tool
+            .adapter_owned_access_manifest(arguments)
+            .adapter_read_targets;
+        let known = scope
+            .known_project_dir
+            .lock()
+            .ok()
+            .and_then(|known| known.clone());
+        super::tool_execution_phase::access_manifest_scope_check(
+            tool_name,
+            &manifest,
+            scope.task_access.as_ref(),
+            &scope.authorized_scopes,
+            known.as_deref(),
+        )
+    }
+
+    async fn dispatch_sdk_tool_call(&self, scope: &TurnScope<'_>, mut request: ToolRequest) {
+        let injected_dir = anchor_call_to_project_dir(scope, &mut request);
+        attenuate_sdk_read_roots(scope, &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
-        let output = self.run_sdk_tool_call(scope, &request, &arguments).await;
+        let output = self
+            .run_sdk_tool_call(scope, &request, &arguments, injected_dir.as_deref())
+            .await;
         let _ = request.reply.send(Ok(output));
     }
 
@@ -960,14 +1132,32 @@ impl Agent {
         scope: &TurnScope<'_>,
         request: &ToolRequest,
         arguments: &str,
+        injected_dir: Option<&str>,
     ) -> sdk::ToolOutput {
+        // The controller-side filesystem check, as in the legacy tool
+        // phase: protected host data and undeclared writes outside the task
+        // boundary are refused; an exact out-of-scope target a user may
+        // authorize goes to the tool's approval prompt.
+        let scope_check = self.sdk_scope_check(scope, &request.name, arguments);
+        let scope_escalation = match &scope_check {
+            Some(super::tool_execution_phase::ScopeCheck::Escalatable { reason, escalation }) => {
+                info!(
+                    tool = %request.name,
+                    reads = ?escalation.read_paths,
+                    writes = ?escalation.write_paths,
+                    "SDK engine: scope escalation routed to tool approval: {reason}"
+                );
+                Some(escalation.clone())
+            }
+            _ => None,
+        };
         let mut ctx = ToolExecCtx {
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
             status_tx: scope.status_tx.clone(),
             channel_visibility: scope.channel_ctx.visibility,
             channel_id: scope.channel_ctx.channel_id.as_deref(),
-            project_scope: None,
+            project_scope: scope.project_scope.as_deref(),
             trusted: scope.channel_ctx.trusted,
             user_role: scope.user_role,
             workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
@@ -976,7 +1166,7 @@ impl Agent {
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
             mutation_forbidden: scope.contract.authority().forbids_mutation,
-            scope_escalation: None,
+            scope_escalation: scope_escalation.as_ref(),
         };
         let started = Instant::now();
         let call_semantics = self
@@ -1012,6 +1202,17 @@ impl Agent {
                     &scope.untrusted_reference_skills,
                 ),
                 "untrusted_external_reference_blocked",
+            ))
+        } else if let (true, Some(super::tool_execution_phase::ScopeCheck::Rejected(reason))) =
+            (admitted, &scope_check)
+        {
+            Err((
+                crate::agent::ToolResultNotice::ScopeLockBlockedResult {
+                    tool_name: request.name.clone(),
+                    reason: reason.clone(),
+                }
+                .render(),
+                "controller_scope_contract_rejected",
             ))
         } else if admitted {
             self.sdk_mandate_gate(&ctx, request, arguments)
@@ -1135,7 +1336,7 @@ impl Agent {
             }
         }
         let (output, images, metadata, receipt) = match self
-            .execute_tool_outcome(&request.name, arguments, &ctx)
+            .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
         {
             Ok(mut outcome) => {
@@ -1155,6 +1356,25 @@ impl Agent {
                     Some(&outcome.metadata),
                 );
                 let evidence = super::loop_utils::tool_outcome_evidence_source(&outcome.metadata);
+                // What the model sees: untrusted output wrapped, oversized
+                // output capped. Fitted before the receipt so its provenance
+                // records how much the model saw; status and contract binding
+                // stay on the raw result.
+                let fitted = self
+                    .fit_tool_result_for_model(
+                        &super::tool_result_fit::FitScope {
+                            tool_name: &request.name,
+                            session_id: scope.session_id,
+                            task_id: scope.task_id,
+                            model: scope.model,
+                            emitter: scope.emitter,
+                            mandate_execution: self.mandate_execution.is_some(),
+                        },
+                        outcome.output.clone(),
+                        false,
+                        &mut outcome.metadata,
+                    )
+                    .await;
                 let mut receipt = crate::events::ToolReceiptV1::from_metadata(
                     &outcome.metadata,
                     status,
@@ -1174,12 +1394,21 @@ impl Agent {
                         status,
                     );
                 }
-                let mut output = outcome.output;
+                let mut output = fitted;
                 // Tool-boundary truncation is rendered into the model-visible
                 // text only, as in the legacy tool phase.
                 if let Some(info) = outcome.metadata.truncation.as_ref() {
                     output.push('\n');
                     output.push_str(&crate::utils::render_truncation_notice(info));
+                }
+                if let Some(dir) = injected_dir {
+                    output.push_str("\n\n");
+                    output.push_str(
+                        &crate::agent::ToolResultNotice::PathAutoInjectedFromProjectContext {
+                            injected_dir: dir.to_string(),
+                        }
+                        .render(),
+                    );
                 }
                 let observed: Vec<&MessageAttachment> = outcome
                     .metadata
@@ -1237,6 +1466,21 @@ impl Agent {
                         TaskOutcome::Partial,
                     );
                 }
+                // A committed non-action mandate decision (WAIT/ASK/STOP)
+                // completes the review: read from the durable decision, the
+                // run ends without another model call.
+                if satisfied
+                    && request.name == "manage_mandates"
+                    && request.arguments.get("action").and_then(Value::as_str)
+                        == Some("record_decision")
+                    && self.mandate_execution.is_some()
+                {
+                    if let Some(summary) =
+                        super::llm_phase::committed_non_action_mandate_summary(self).await
+                    {
+                        scope.end_with(summary, TaskOutcome::Succeeded);
+                    }
+                }
                 // A tool's direct response answers a root turn's lone call.
                 if satisfied
                     && self.depth == 0
@@ -1249,7 +1493,26 @@ impl Agent {
                 }
                 (output, images, Some(outcome.metadata), Some(receipt))
             }
-            Err(error) => (format!("Error: {error}"), Vec::new(), None, None),
+            Err(error) => {
+                // Oversized errors (cli_agent process output, stack traces)
+                // are capped like results.
+                let fitted = self
+                    .fit_tool_result_for_model(
+                        &super::tool_result_fit::FitScope {
+                            tool_name: &request.name,
+                            session_id: scope.session_id,
+                            task_id: scope.task_id,
+                            model: scope.model,
+                            emitter: scope.emitter,
+                            mandate_execution: self.mandate_execution.is_some(),
+                        },
+                        format!("Error: {error}"),
+                        true,
+                        &mut crate::traits::ToolCallMetadata::default(),
+                    )
+                    .await;
+                (fitted, Vec::new(), None, None)
+            }
         };
         let failed = receipt
             .as_ref()
@@ -1325,12 +1588,8 @@ impl Agent {
             let rejected = metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.contract_rejected);
-            learning.tool_calls.push(learning_tool_summary(
-                &request.name,
-                arguments,
-                rejected,
-                failed,
-            ));
+            let summary = learning_tool_summary(&request.name, arguments, rejected, failed);
+            record_call_for_learning(&mut learning, summary, &output, failed);
         }
 
         let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
@@ -1735,6 +1994,21 @@ impl Agent {
         prefix.extend(extra);
         let messages = fit_run(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        // A reasoning model that spent its whole output budget thinking gets
+        // less room to think next time: low effort, then none (the legacy
+        // LLM phase's escalating truncation recovery).
+        match scope.thinking_truncations.load(Ordering::Relaxed) {
+            0 => {}
+            1 => options.reasoning_effort_override = Some("low".to_string()),
+            _ => options.reasoning_effort_override = Some("off".to_string()),
+        }
+        // Before any tool work a provider blip gets the long retry ladder: a
+        // failure there loses the whole turn (the legacy LLM phase's rule).
+        options.uncommitted_work = scope
+            .learning
+            .lock()
+            .map(|learning| learning.tool_calls.is_empty())
+            .unwrap_or(true);
         if scope.text_only_next_call.swap(false, Ordering::Relaxed) {
             options.tool_choice = crate::traits::ToolChoiceMode::None;
         }
@@ -1744,9 +2018,32 @@ impl Agent {
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it, as in
         // the legacy LLM phase.
-        let lease = self
+        let lease = match self
             .sdk_mandate_token_lease(&mut options, est_input_tokens as u32)
-            .await?;
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                // The balance is used up. A committed WAIT/ASK/STOP already
+                // completed the review; otherwise a bounded WAIT is recorded
+                // so the controller retries, as in the legacy LLM phase. The
+                // review closes from that durable decision, not as a
+                // provider failure.
+                if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
+                    if let Some(summary) =
+                        super::llm_phase::recover_mandate_capacity_as_wait(self).await
+                    {
+                        info!(
+                            task_id = scope.task_id,
+                            "SDK engine: mandate review closed from a committed or recovered \
+                             non-action decision"
+                        );
+                        scope.end_with(summary, TaskOutcome::Succeeded);
+                    }
+                }
+                return Err(error);
+            }
+        };
         let started = Instant::now();
         let timeout = self.sdk_model_call_timeout();
         let result = match tokio::time::timeout(
@@ -1802,6 +2099,111 @@ impl Agent {
                 }
             }
         }
+        // Every call is recorded, failed ones too, so failure telemetry
+        // (`db_probe --gate-outcomes`, provider error kinds) sees SDK turns.
+        let usage = result
+            .as_ref()
+            .ok()
+            .and_then(|response| response.usage.clone());
+        let (input_tokens, output_tokens) = usage
+            .as_ref()
+            .map(|usage| (usage.input_tokens, usage.output_tokens))
+            .unwrap_or_default();
+        let failure = result.as_ref().err();
+        let provider_error =
+            failure.and_then(|error| error.downcast_ref::<crate::providers::ProviderError>());
+        let chosen_tools: Vec<String> = result
+            .as_ref()
+            .map(|response| {
+                response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::events::record_model_call_telemetry(
+            scope.emitter,
+            self.state.as_ref(),
+            crate::events::ModelCallTelemetryInput {
+                session_id: scope.session_id.to_string(),
+                task_id: scope.task_id.to_string(),
+                call_purpose: None,
+                iteration: Some(iteration as u32),
+                llm_call: crate::events::LlmCallData {
+                    call_id: None,
+                    call_purpose: None,
+                    task_id: scope.task_id.to_string(),
+                    iteration: Some(iteration as u32),
+                    model: request.model.clone(),
+                    final_model: Some(if telemetry.final_model.is_empty() {
+                        request.model.clone()
+                    } else {
+                        telemetry.final_model.clone()
+                    }),
+                    fell_back: telemetry.fell_back,
+                    attempts: if failure.is_some() {
+                        telemetry.attempts.max(1)
+                    } else {
+                        telemetry.attempts
+                    },
+                    latency_ms,
+                    prompt_ms: usage.as_ref().and_then(|usage| usage.prompt_ms),
+                    decode_ms: usage.as_ref().and_then(|usage| usage.decode_ms),
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens: usage.as_ref().and_then(|u| u.cached_input_tokens),
+                    cache_creation_input_tokens: usage
+                        .as_ref()
+                        .and_then(|u| u.cache_creation_input_tokens),
+                    fresh_input_tokens: usage.as_ref().and_then(|u| u.fresh_input_tokens()),
+                    est_input_tokens: Some(est_input_tokens as u32),
+                    tool_calls_count: chosen_tools.len() as u32,
+                    build_ms: None,
+                    prefix_hash_system: None,
+                    prefix_hash_pre_boundary: None,
+                    tool_defs_hash: None,
+                    offered_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+                    chosen_tools,
+                    session_summary_hash: None,
+                    tail_hash: None,
+                    prefix_hash_archived: None,
+                    boundary_pos: None,
+                    message_count: Some(messages.len()),
+                    projected_source_message_ids: Vec::new(),
+                    projected_source_turn_ids: Vec::new(),
+                    force_text: false,
+                    token_usage_present: usage.is_some(),
+                    token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
+                    failed: failure.is_some(),
+                    error: failure.map(|error| error.to_string()),
+                    provider_error_kind: provider_error.map(|error| error.kind),
+                    provider_status: provider_error.and_then(|error| error.status),
+                },
+                token_usage: usage.clone(),
+            },
+        )
+        .await;
+        if let Some(error) = failure {
+            let _ = scope
+                .emitter
+                .emit(
+                    EventType::Error,
+                    crate::events::ErrorData::llm_error(
+                        error.to_string(),
+                        Some(scope.task_id.to_string()),
+                    )
+                    .with_context("llm_call_failed"),
+                )
+                .await;
+        } else if usage.is_some() {
+            // Calibrates the chars/4 estimate the summarization threshold uses.
+            crate::memory::context_window::record_token_estimate_calibration(
+                &request.model,
+                est_input_tokens,
+                input_tokens as usize,
+            );
+        }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
@@ -1818,69 +2220,26 @@ impl Agent {
                 return Err(sdk::ProviderError::Other(error.to_string()));
             }
         };
-        let usage = response.usage.clone();
-        let (input_tokens, output_tokens) = usage
-            .as_ref()
-            .map(|usage| (usage.input_tokens, usage.output_tokens))
-            .unwrap_or_default();
-        crate::events::record_model_call_telemetry(
-            scope.emitter,
-            self.state.as_ref(),
-            crate::events::ModelCallTelemetryInput {
-                session_id: scope.session_id.to_string(),
-                task_id: scope.task_id.to_string(),
-                call_purpose: None,
-                iteration: Some(iteration as u32),
-                llm_call: crate::events::LlmCallData {
-                    call_id: None,
-                    call_purpose: None,
-                    task_id: scope.task_id.to_string(),
-                    iteration: Some(iteration as u32),
-                    model: request.model.clone(),
-                    final_model: Some(telemetry.final_model.clone()),
-                    fell_back: telemetry.fell_back,
-                    attempts: telemetry.attempts,
-                    latency_ms,
-                    prompt_ms: usage.as_ref().and_then(|usage| usage.prompt_ms),
-                    decode_ms: usage.as_ref().and_then(|usage| usage.decode_ms),
-                    input_tokens,
-                    output_tokens,
-                    cached_input_tokens: usage.as_ref().and_then(|u| u.cached_input_tokens),
-                    cache_creation_input_tokens: usage
-                        .as_ref()
-                        .and_then(|u| u.cache_creation_input_tokens),
-                    fresh_input_tokens: usage.as_ref().and_then(|u| u.fresh_input_tokens()),
-                    est_input_tokens: Some(est_input_tokens as u32),
-                    tool_calls_count: response.tool_calls.len() as u32,
-                    build_ms: None,
-                    prefix_hash_system: None,
-                    prefix_hash_pre_boundary: None,
-                    tool_defs_hash: None,
-                    offered_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
-                    chosen_tools: response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| tc.name.clone())
-                        .collect(),
-                    session_summary_hash: None,
-                    tail_hash: None,
-                    prefix_hash_archived: None,
-                    boundary_pos: None,
-                    message_count: Some(messages.len()),
-                    projected_source_message_ids: Vec::new(),
-                    projected_source_turn_ids: Vec::new(),
-                    force_text: false,
-                    token_usage_present: usage.is_some(),
-                    token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
-                    failed: false,
-                    error: None,
-                    provider_error_kind: None,
-                    provider_status: None,
-                },
-                token_usage: usage.clone(),
-            },
-        )
-        .await;
+        let produced_output = !response.tool_calls.is_empty()
+            || response
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty());
+        if produced_output {
+            scope.thinking_truncations.store(0, Ordering::Relaxed);
+        } else if response
+            .response_note
+            .as_deref()
+            .is_some_and(|note| note.contains("truncated"))
+        {
+            let count = scope.thinking_truncations.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                task_id = scope.task_id,
+                consecutive_truncations = count,
+                "SDK engine: response truncated at the token limit with no output; lowering \
+                 reasoning effort for the next call"
+            );
+        }
         if let Some(usage) = usage.as_ref() {
             if let Some(stop) = self
                 .sdk_charge_budgets(scope, usage, iteration as usize)
@@ -2634,6 +2993,10 @@ impl Agent {
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
             memory_recall_allowed,
+            known_project_dir,
+            project_scope,
+            task_access,
+            authorized_scopes,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -2789,7 +3152,12 @@ impl Agent {
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: AtomicBool::new(false),
+            thinking_truncations: std::sync::atomic::AtomicU8::new(0),
             continue_inline_after_background,
+            known_project_dir: std::sync::Mutex::new(known_project_dir),
+            project_scope,
+            task_access,
+            authorized_scopes,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
@@ -3936,6 +4304,37 @@ mod tests {
     }
 
     #[test]
+    fn learning_records_errors_and_the_recovery_after_them() {
+        let mut learning = crate::agent::memory_plugin::test_support::learning("build it");
+        record_call_for_learning(&mut learning, "terminal(ok)".into(), "fine", false);
+        assert!(learning.errors.is_empty() && learning.recovery_actions.is_empty());
+        record_call_for_learning(
+            &mut learning,
+            "terminal(make) [FAILED]".into(),
+            "Error: make: no rule",
+            true,
+        );
+        assert_eq!(
+            learning.first_error.as_deref(),
+            Some("Error: make: no rule")
+        );
+        assert_eq!(
+            learning.errors,
+            vec![("Error: make: no rule".to_string(), false)]
+        );
+        record_call_for_learning(&mut learning, "terminal(make build)".into(), "built", false);
+        assert_eq!(
+            learning.recovery_actions,
+            vec!["terminal(make build)".to_string()]
+        );
+        assert!(
+            learning.errors[0].1,
+            "the later success credits the error as recovered"
+        );
+        assert_eq!(learning.tool_calls.len(), 3);
+    }
+
+    #[test]
     fn reply_checks_reject_empty_marker_only_and_pasted_replies() {
         assert_eq!(reply_defect("Here is the answer.", None), None);
         assert_eq!(reply_defect("   ", None), Some(ReplyDefect::Empty));
@@ -4033,6 +4432,40 @@ mod tests {
         assert_eq!(reply, "All set.");
         assert_eq!(status, TaskStatus::Completed);
         assert_eq!(task_outcome, TaskOutcome::Succeeded);
+    }
+
+    /// A stopped run's reply gets the same checks as a completed one: no
+    /// debug text, and no secret on a public channel.
+    #[test]
+    fn stopped_run_replies_are_plain_and_redacted() {
+        let verdict = TurnVerdict::default();
+        let mut outcome = sdk::RunOutcome {
+            status: sdk::RunStatus::LimitReached {
+                limit: sdk::LimitKind::ToolCalls,
+            },
+            final_text: Some(
+                "Partial: the deploy key is sk-abc123456789012345678901234567890".into(),
+            ),
+            state: sdk::RunState::new("aidaemon", "s", "hi"),
+        };
+        let (reply, _, task_outcome) =
+            verdict.final_reply(&outcome, &[], crate::types::ChannelVisibility::Public);
+        assert!(!reply.contains("sk-abc"), "secret leaked: {reply}");
+        assert_eq!(task_outcome, TaskOutcome::Partial);
+
+        outcome.final_text = None;
+        let (reply, _, _) =
+            verdict.final_reply(&outcome, &[], crate::types::ChannelVisibility::Private);
+        assert!(reply.contains("the number of tool calls"), "{reply}");
+        assert!(!reply.contains("ToolCalls"), "debug text leaked: {reply}");
+
+        outcome.status = sdk::RunStatus::ProviderFailed {
+            error: "401 from /Users/alice/.config/key: sk-abc123456789012345678901234567890".into(),
+        };
+        let (reply, _, _) =
+            verdict.final_reply(&outcome, &[], crate::types::ChannelVisibility::Private);
+        assert!(!reply.contains("sk-abc"), "secret leaked: {reply}");
+        assert!(!reply.contains("/Users/alice"), "path leaked: {reply}");
     }
 
     /// The closeout judges reachability over the tools the turn offered: a

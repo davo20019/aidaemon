@@ -10,11 +10,17 @@ mod run_helpers;
 mod types;
 
 pub(in crate::agent) use execution_io::{durable_replay_preflight, DurableReplayPreflight};
-pub(in crate::agent) use project_dir::project_instruction_targets_for_tool_call;
+pub(in crate::agent) use project_dir::{
+    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
+    project_instruction_targets_for_tool_call,
+};
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::run_tool_execution_phase;
 pub(in crate::agent) use run::{
     mandate_gate_for_tool_call, parse_checklist_from_result, MandateGateDecision,
+};
+pub(in crate::agent) use run_helpers::{
+    access_manifest_scope_check, attenuate_unauthorized_read_roots, ScopeCheck,
 };
 pub(in crate::agent) use run_helpers::{
     accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,

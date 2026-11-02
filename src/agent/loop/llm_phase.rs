@@ -219,7 +219,9 @@ pub(in crate::agent) fn mandate_output_token_ceiling(
     (available > 0).then(|| u32::try_from(available).unwrap_or(u32::MAX))
 }
 
-async fn committed_non_action_mandate_summary(agent: &Agent) -> Option<String> {
+pub(in crate::agent) async fn committed_non_action_mandate_summary(
+    agent: &Agent,
+) -> Option<String> {
     let fence = agent.mandate_execution.as_ref()?;
     let decision = agent
         .state
@@ -253,7 +255,7 @@ async fn committed_non_action_mandate_summary(agent: &Agent) -> Option<String> {
 
 const CAPACITY_RECOVERY_WAIT_RATIONALE: &str = "This review reached its internal runaway-protection ceiling before another model turn could be admitted. No new action was authorized; the controller will retry automatically at the earliest bounded review time.";
 
-async fn recover_mandate_capacity_as_wait(agent: &Agent) -> Option<String> {
+pub(in crate::agent) async fn recover_mandate_capacity_as_wait(agent: &Agent) -> Option<String> {
     if let Some(summary) = committed_non_action_mandate_summary(agent).await {
         return Some(summary);
     }

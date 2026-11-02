@@ -240,6 +240,29 @@ Next: resolve the open items, re-assert / delete tests, make SDK the only engine
 dead legacy iteration code, whole-branch review. Release still blocked on the `aidaemon-core`
 publishing decision.
 
+## Task 8 dead-code audit (2026-11-01)
+
+Step 1 landed in `2c138cd` (SDK is the only engine). Before deleting the dead legacy
+code, an audit of it against the SDK path found behavior no failing test covered, now
+ported (each with a test that fails without it):
+
+- Tool-result boundary (`runtime/tool_result_fit.rs`): untrusted-output wrapping and
+  sanitization, per-model result cap (read_file paging, spill, compression), provenance.
+- Project-dir anchoring of directory-less calls and `_project_scope` (R52 class).
+- Controller-side filesystem scope check and terminal scope escalation (no prelude
+  projections: the SDK injects none on purpose).
+- Mandate: committed WAIT/ASK/STOP ends the review; exhausted balance closes from the
+  durable or recovered decision.
+- Stopped-run replies: plain text, sanitized, provider errors redacted, public redaction.
+- Learning errors/recoveries, failed-call telemetry, token calibration,
+  `uncommitted_work`, tool watchdog, thinking-truncation effort fallback.
+
+Dropped: edit_file whitespace retry, computer-use thinking suppression (local-model
+workarounds), terminal read/write-root projection prelude.
+
+Next: delete the dead legacy code (clippy `-D warnings`), re-assert/delete the legacy
+tests, whole-branch review.
+
 ## Out of scope (owner decisions)
 
 - How `aidaemon-core` ships with the published `aidaemon` crate (publish it to crates.io, or fold it into the main crate). Blocks Task 8 Step 4 (`cargo package`), not Tasks 1-7.
