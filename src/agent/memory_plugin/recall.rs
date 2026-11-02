@@ -74,8 +74,8 @@ impl DaemonRecall {
         };
 
         // Critical facts (identity/profile): bounded identity categories only,
-        // owner DMs at the top level.
-        let mut critical_fact_summary = if allowed && inject_personal && turn.depth == 0 {
+        // owner DMs (delegated agents included).
+        let mut critical_fact_summary = if allowed && inject_personal {
             let mut identity_facts = Vec::new();
             for category in IDENTITY_CATEGORIES {
                 if let Ok(mut facts) = state.get_facts(Some(category)).await {
@@ -655,5 +655,49 @@ mod tests {
             .await
             .unwrap_or_default();
         assert!(!suppressed.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
+    }
+
+    /// A delegated agent in an owner DM still gets the pinned identity facts.
+    #[tokio::test]
+    async fn child_owner_dm_turn_keeps_critical_identity_facts() {
+        use super::DaemonRecall;
+        use aidaemon_policies::Recall;
+        use std::sync::Arc;
+
+        let harness = crate::testing::setup_test_agent_root(MockProvider::new())
+            .await
+            .unwrap();
+        harness
+            .state
+            .upsert_fact(
+                "user",
+                "name",
+                "Alice Rivera",
+                "user",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+        let memory = super::super::DaemonMemory::new(
+            state,
+            harness.agent.event_store().clone(),
+            harness.agent.llm_runtime.clone(),
+            crate::config::ContextWindowConfig::default(),
+            10,
+            false,
+            "",
+        );
+        let turn = super::MemoryTurn {
+            depth: 1,
+            ..crate::agent::memory_plugin::test_support::turn("child-session", "Draft the reply.")
+                .await
+        };
+        let note = DaemonRecall::new(memory.inner.clone(), turn)
+            .render("child-session", "", 5)
+            .await
+            .unwrap_or_default();
+        assert!(note.contains("Owner name → Alice Rivera"), "{note}");
     }
 }

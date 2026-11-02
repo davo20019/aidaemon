@@ -469,6 +469,9 @@ pub struct Agent {
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
     /// Long-term memory for SDK turns (hooks, tools, owned daemon tools).
     memory: Arc<dyn memory_plugin::MemoryPlugin>,
+    /// The daemon store's summarization and learning, run on every turn
+    /// whatever the memory plugin.
+    transcript_writes: Arc<dyn memory_plugin::MemoryWrites>,
     /// Goal cancellation token registry — shared across agent hierarchy.
     goal_token_registry: Option<GoalTokenRegistry>,
     /// Weak reference to the ChannelHub for background notifications.

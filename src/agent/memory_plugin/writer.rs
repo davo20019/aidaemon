@@ -20,11 +20,14 @@ pub(crate) trait MemoryWrites: Send + Sync {
     fn learn(&self, learning: LearningContext);
 }
 
-/// The context-window switches the writer's plan depends on.
+/// Which writes this writer owns, and the context-window switches its plan
+/// depends on. The memory plugin owns fact extraction; the turn owns
+/// summarization and learning.
 #[derive(Clone, Copy)]
 pub(crate) struct WriterSettings {
     pub progressive_facts: bool,
     pub summarization: bool,
+    pub learning: bool,
 }
 
 /// Writes memory once per run, after the outcome is final: extraction and
@@ -53,7 +56,14 @@ impl DaemonMemoryWriter {
 impl sdk::Hook for DaemonMemoryWriter {
     async fn on_run_end(&self, _ctx: &sdk::HookContext<'_>, outcome: &sdk::RunOutcome) {
         let turn = &self.turn;
-        let (reply, status, task_outcome) = turn.verdict.resolve(outcome);
+        let mut learning = turn
+            .learning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (reply, status, task_outcome) =
+            turn.verdict
+                .final_reply(outcome, &learning.tool_calls, turn.channel_ctx.visibility);
         if status == TaskStatus::Completed {
             let (extract, summarize) = crate::agent::completion_phase::post_completion_memory_plan(
                 turn.mandate,
@@ -71,14 +81,9 @@ impl sdk::Hook for DaemonMemoryWriter {
                 self.writes.summarize(turn);
             }
         }
-        if turn.mandate {
+        if turn.mandate || !self.settings.learning {
             return;
         }
-        let mut learning = turn
-            .learning
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         learning.completed_naturally = status == TaskStatus::Completed;
         learning.task_outcome = Some(task_outcome);
         self.writes.learn(learning);
@@ -86,7 +91,7 @@ impl sdk::Hook for DaemonMemoryWriter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use aidaemon_core as sdk;
@@ -96,17 +101,17 @@ mod tests {
     use super::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
     use crate::agent::memory_plugin::MemoryTurn;
     use crate::agent::post_task::LearningContext;
-    use crate::types::{ChannelContext, UserRole};
+    use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
     #[derive(Default)]
-    struct Recorded {
-        extracted: Vec<String>,
-        summarized: usize,
-        learned: Vec<LearningContext>,
+    pub(crate) struct Recorded {
+        pub(crate) extracted: Vec<String>,
+        pub(crate) summarized: usize,
+        pub(crate) learned: Vec<LearningContext>,
     }
 
     #[derive(Default)]
-    struct RecordingWrites(Mutex<Recorded>);
+    pub(crate) struct RecordingWrites(pub(crate) Mutex<Recorded>);
 
     impl MemoryWrites for RecordingWrites {
         fn extract_facts(&self, _turn: &MemoryTurn, reply: &str) {
@@ -159,6 +164,7 @@ mod tests {
     const SETTINGS: WriterSettings = WriterSettings {
         progressive_facts: true,
         summarization: true,
+        learning: true,
     };
 
     async fn run(
@@ -248,6 +254,48 @@ mod tests {
         let recorded = writes.0.lock().unwrap();
         assert!(recorded.extracted.is_empty());
         assert_eq!(recorded.summarized, 1);
+    }
+
+    /// The writer extracts the reply the user got: secrets redacted on a
+    /// public channel, and the interrupted answer when the model's last
+    /// reply was empty.
+    #[tokio::test]
+    async fn writer_extracts_the_finalized_reply() {
+        let mut public = turn(0, "slack:synthetic-public").await;
+        public.channel_ctx.visibility = ChannelVisibility::Public;
+        let writes = run(
+            ScriptedProvider::new([
+                text("first"),
+                text("Key: sk-abc123456789012345678901234567890"),
+            ]),
+            public,
+            false,
+        )
+        .await;
+        {
+            let recorded = writes.0.lock().unwrap();
+            assert_eq!(recorded.extracted.len(), 1);
+            assert!(
+                !recorded.extracted[0].contains("sk-abc"),
+                "{:?}",
+                recorded.extracted
+            );
+        }
+
+        let interrupted = turn(0, "telegram:synthetic-user-1").await;
+        interrupted
+            .verdict
+            .record_interrupted_answer("Teal it is.".to_string());
+        let writes = run(
+            ScriptedProvider::new([text("first"), text("")]),
+            interrupted,
+            false,
+        )
+        .await;
+        assert_eq!(
+            writes.0.lock().unwrap().extracted,
+            vec!["Teal it is.".to_string()]
+        );
     }
 
     /// A plugin whose writer records into `writes`. The harness is a root

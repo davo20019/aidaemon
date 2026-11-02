@@ -706,6 +706,26 @@ fn closeout_demands_work(facts: &StopFacts) -> bool {
     facts.completed_results == 0 || executor_demands
 }
 
+/// The daemon tools the closeout may count as reachable: the registered
+/// tools, minus daemon memory tools the active memory plugin does not own.
+fn closeout_visible_tools<'a>(
+    tools: &'a [Arc<dyn crate::traits::Tool>],
+    user_role: UserRole,
+    owned_memory_tools: &[&str],
+) -> Vec<&'a str> {
+    if user_role == UserRole::Public {
+        return Vec::new();
+    }
+    tools
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            !crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS.contains(name)
+                || owned_memory_tools.contains(name)
+        })
+        .collect()
+}
+
 /// What a run settled, beyond its kernel status, that decides the turn's
 /// final status and outcome. Shared with run-end hooks (memory writers), so
 /// they judge a run exactly as the turn does.
@@ -717,9 +737,60 @@ pub(crate) struct TurnVerdict {
     external_action_ack: std::sync::Mutex<Option<String>>,
     /// Set when the run must end failed despite a final answer.
     run_failure: std::sync::Mutex<Option<String>>,
+    /// The latest provider note (for example a safety finish reason).
+    response_note: std::sync::Mutex<Option<String>>,
+    /// The latest well-formed final answer a closeout demand sent back for
+    /// more work. If the model then replies with nothing, this ships instead
+    /// of a generic activity summary.
+    interrupted_answer: std::sync::Mutex<Option<String>>,
 }
 
 impl TurnVerdict {
+    pub(crate) fn record_interrupted_answer(&self, answer: String) {
+        if let Ok(mut interrupted) = self.interrupted_answer.lock() {
+            *interrupted = Some(answer);
+        }
+    }
+
+    /// The reply the user gets, with its status and outcome: [`Self::resolve`],
+    /// then for a completed run the interrupted-answer fallback, the final
+    /// reply checks and secret redaction on public channels.
+    pub(crate) fn final_reply(
+        &self,
+        outcome: &sdk::RunOutcome,
+        tool_calls: &[String],
+        visibility: crate::types::ChannelVisibility,
+    ) -> (String, TaskStatus, TaskOutcome) {
+        let (reply, status, task_outcome) = self.resolve(outcome);
+        if !matches!(outcome.status, sdk::RunStatus::Completed) {
+            return (reply, status, task_outcome);
+        }
+        let note = self.response_note.lock().ok().and_then(|note| note.clone());
+        let interrupted = self
+            .interrupted_answer
+            .lock()
+            .ok()
+            .and_then(|answer| answer.clone());
+        let reply = match interrupted {
+            Some(answer) if reply.trim().is_empty() => answer,
+            _ => reply,
+        };
+        let reply = finalize_reply(&reply, tool_calls, note.as_deref());
+        let reply = match visibility {
+            crate::types::ChannelVisibility::Public
+            | crate::types::ChannelVisibility::PublicExternal => {
+                let (sanitized, redacted) = crate::tools::sanitize::sanitize_output(&reply);
+                if redacted && visibility == crate::types::ChannelVisibility::PublicExternal {
+                    format!("{sanitized}\n\n(Some content was filtered for security)")
+                } else {
+                    sanitized
+                }
+            }
+            _ => reply,
+        };
+        (reply, status, task_outcome)
+    }
+
     fn run_failure(&self) -> Option<String> {
         self.run_failure
             .lock()
@@ -833,6 +904,8 @@ struct TurnScope<'a> {
     continue_inline_after_background: bool,
     /// Terminal replies, external acks and run failures: the turn's verdict.
     verdict: Arc<TurnVerdict>,
+    /// Daemon memory tools the active memory plugin owns on this turn.
+    owned_memory_tools: &'static [&'static str],
     /// Tool calls in the latest model response (a direct response needs one).
     last_batch_size: std::sync::atomic::AtomicUsize,
     /// Ends the run at the next turn boundary (a background handoff).
@@ -866,16 +939,10 @@ struct TurnScope<'a> {
         Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
     /// System context added during the run, sent after the projected prefix.
     extra_system: std::sync::Mutex<Vec<String>>,
-    /// The latest provider note (for example a safety finish reason).
-    response_note: std::sync::Mutex<Option<String>>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
     background_handoff: AtomicBool,
-    /// The latest well-formed final answer a closeout demand sent back for
-    /// more work. If the model then replies with nothing, this ships instead
-    /// of a generic activity summary.
-    interrupted_answer: std::sync::Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -1337,9 +1404,9 @@ impl Agent {
             if decision != sdk::StopDecision::Accept
                 && reply_defect(&check.final_text, None).is_none()
             {
-                if let Ok(mut interrupted) = scope.interrupted_answer.lock() {
-                    *interrupted = Some(check.final_text.clone());
-                }
+                scope
+                    .verdict
+                    .record_interrupted_answer(check.final_text.clone());
             }
         }
         if decision == sdk::StopDecision::Accept {
@@ -1468,11 +1535,8 @@ impl Agent {
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
         let authority =
             super::closeout::ClosingAuthority::from_authority(scope.contract.authority());
-        let visible_tools: Vec<&str> = if scope.user_role == UserRole::Public {
-            Vec::new()
-        } else {
-            self.tools.iter().map(|tool| tool.name()).collect()
-        };
+        let visible_tools =
+            closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
         let read_only = |name: &str| {
             self.tools
                 .iter()
@@ -1834,7 +1898,7 @@ impl Agent {
             }
         }
         if let Some(note) = response.response_note.clone() {
-            if let Ok(mut latest) = scope.response_note.lock() {
+            if let Ok(mut latest) = scope.verdict.response_note.lock() {
                 *latest = Some(note);
             }
         }
@@ -2640,7 +2704,20 @@ impl Agent {
             calls: calls_tx.clone(),
         });
         // After the ledger stop, so a rejected final answer never reaches a
-        // memory writer.
+        // memory writer. Summarization and learning belong to the turn, so
+        // they run whatever the memory plugin.
+        let owned_memory_tools = memory.owned_daemon_tools;
+        if !memory_turn.mandate {
+            builder = builder.hook(crate::agent::memory_plugin::DaemonMemoryWriter::new(
+                memory_turn.clone(),
+                crate::agent::memory_plugin::WriterSettings {
+                    progressive_facts: false,
+                    summarization: self.context_window_config.enabled,
+                    learning: true,
+                },
+                self.transcript_writes.clone(),
+            ));
+        }
         for hook in memory.hooks {
             builder = builder.hook_arc(hook);
         }
@@ -2712,7 +2789,6 @@ impl Agent {
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: AtomicBool::new(false),
-            response_note: std::sync::Mutex::new(None),
             continue_inline_after_background,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
@@ -2737,13 +2813,13 @@ impl Agent {
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
             verdict: verdict.clone(),
+            owned_memory_tools,
             last_batch_size: std::sync::atomic::AtomicUsize::new(0),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
             background_handoff: AtomicBool::new(false),
-            interrupted_answer: std::sync::Mutex::new(None),
             emitter: &emitter,
             prefix,
             prefix_len,
@@ -2787,48 +2863,16 @@ impl Agent {
 
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {
-                let (reply, status, task_outcome) = scope.verdict.resolve(&outcome);
+                let tool_calls = scope
+                    .learning
+                    .lock()
+                    .map(|learning| learning.tool_calls.clone())
+                    .unwrap_or_default();
+                let (reply, status, task_outcome) =
+                    scope
+                        .verdict
+                        .final_reply(&outcome, &tool_calls, channel_ctx.visibility);
                 let run_failure = scope.verdict.run_failure();
-                let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
-                    let tool_calls = scope
-                        .learning
-                        .lock()
-                        .map(|learning| learning.tool_calls.clone())
-                        .unwrap_or_default();
-                    let note = scope
-                        .response_note
-                        .lock()
-                        .ok()
-                        .and_then(|note| note.clone());
-                    let interrupted = scope
-                        .interrupted_answer
-                        .lock()
-                        .ok()
-                        .and_then(|answer| answer.clone());
-                    let reply = match interrupted {
-                        Some(answer) if reply.trim().is_empty() => answer,
-                        _ => reply,
-                    };
-                    let reply = finalize_reply(&reply, &tool_calls, note.as_deref());
-                    match channel_ctx.visibility {
-                        crate::types::ChannelVisibility::Public
-                        | crate::types::ChannelVisibility::PublicExternal => {
-                            let (sanitized, redacted) =
-                                crate::tools::sanitize::sanitize_output(&reply);
-                            if redacted
-                                && channel_ctx.visibility
-                                    == crate::types::ChannelVisibility::PublicExternal
-                            {
-                                format!("{sanitized}\n\n(Some content was filtered for security)")
-                            } else {
-                                sanitized
-                            }
-                        }
-                        _ => reply,
-                    }
-                } else {
-                    reply
-                };
                 info!(
                     session_id,
                     task_id,
@@ -3989,5 +4033,25 @@ mod tests {
         assert_eq!(reply, "All set.");
         assert_eq!(status, TaskStatus::Completed);
         assert_eq!(task_outcome, TaskOutcome::Succeeded);
+    }
+
+    /// The closeout judges reachability over the tools the turn offered: a
+    /// memory plugin that does not own the daemon memory tools hides them.
+    #[tokio::test]
+    async fn closeout_sees_only_offered_memory_tools() {
+        let harness = crate::testing::setup_test_agent_sdk(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let tools = &harness.agent.tools;
+        let owned = closeout_visible_tools(
+            tools,
+            UserRole::Owner,
+            crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS,
+        );
+        assert!(owned.contains(&"remember_fact"));
+        let foreign = closeout_visible_tools(tools, UserRole::Owner, &[]);
+        assert!(!foreign.contains(&"remember_fact"));
+        assert!(!foreign.contains(&"manage_memories"));
+        assert!(closeout_visible_tools(tools, UserRole::Public, &[]).is_empty());
     }
 }

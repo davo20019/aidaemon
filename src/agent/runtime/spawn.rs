@@ -1509,6 +1509,7 @@ impl Agent {
         );
         child.sdk_engine = self.sdk_engine.clone();
         child.memory = self.memory.clone();
+        child.transcript_writes = self.transcript_writes.clone();
         let child = Arc::new(child);
 
         if let Some(spawn_tool) = spawn_tool {

@@ -80,6 +80,14 @@ impl Agent {
         self.sdk_engine = Arc::new(settings);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_transcript_writes(
+        &mut self,
+        writes: Arc<dyn super::memory_plugin::MemoryWrites>,
+    ) {
+        self.transcript_writes = writes;
+    }
+
     /// The memory backend for this agent's turns (and its children's).
     pub(crate) fn set_memory_plugin(
         &mut self,
@@ -160,16 +168,17 @@ impl Agent {
             info!(timeout_secs = secs, "LLM call watchdog timeout enabled");
         }
 
-        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
-            Arc::new(super::memory_plugin::DaemonMemory::new(
-                state.clone(),
-                event_store.clone(),
-                llm_runtime.clone(),
-                context_window_config.clone(),
-                max_facts,
-                record_decision_points,
-                &system_prompt,
-            ));
+        let daemon_memory = super::memory_plugin::DaemonMemory::new(
+            state.clone(),
+            event_store.clone(),
+            llm_runtime.clone(),
+            context_window_config.clone(),
+            max_facts,
+            record_decision_points,
+            &system_prompt,
+        );
+        let transcript_writes = daemon_memory.writes();
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
             state,
@@ -204,6 +213,7 @@ impl Agent {
             cancel_token: None,
             sdk_engine: Arc::default(),
             memory,
+            transcript_writes,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
@@ -412,16 +422,17 @@ impl Agent {
             .router()
             .and_then(|router| router.first_fallback().map(str::to_string))
             .unwrap_or_else(|| model.clone());
-        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
-            Arc::new(super::memory_plugin::DaemonMemory::new(
-                state.clone(),
-                event_store.clone(),
-                llm_runtime.clone(),
-                context_window_config.clone(),
-                max_facts,
-                record_decision_points,
-                &system_prompt,
-            ));
+        let daemon_memory = super::memory_plugin::DaemonMemory::new(
+            state.clone(),
+            event_store.clone(),
+            llm_runtime.clone(),
+            context_window_config.clone(),
+            max_facts,
+            record_decision_points,
+            &system_prompt,
+        );
+        let transcript_writes = daemon_memory.writes();
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
             state,
@@ -456,6 +467,7 @@ impl Agent {
             cancel_token,
             sdk_engine: Arc::default(),
             memory,
+            transcript_writes,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),

@@ -234,6 +234,14 @@ fn fast_model(snapshot: &crate::llm_runtime::LlmRuntimeSnapshot, model: &str) ->
         .unwrap_or_else(|| model.to_string())
 }
 
+impl DaemonMemory {
+    /// The daemon store's write pipelines, for the turn's own summarization
+    /// and learning.
+    pub(crate) fn writes(&self) -> Arc<dyn MemoryWrites> {
+        self.inner.clone()
+    }
+}
+
 #[async_trait]
 impl MemoryPlugin for DaemonMemory {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts {
@@ -243,7 +251,8 @@ impl MemoryPlugin for DaemonMemory {
             turn.clone(),
             WriterSettings {
                 progressive_facts: config.progressive_facts,
-                summarization: config.enabled,
+                summarization: false,
+                learning: false,
             },
             self.inner.clone(),
         );
@@ -486,5 +495,33 @@ mod tests {
         let sdk: MemoryConfig = toml::from_str("backend = \"sdk\"\npath = \"m.db\"").unwrap();
         assert_eq!(sdk.backend, MemoryBackend::Sdk);
         assert_eq!(sdk.path, "m.db");
+    }
+
+    /// Summarization and learning are the turn's, not the plugin's: they run
+    /// under a plugin that adds no writer.
+    #[tokio::test]
+    async fn transcript_memory_runs_under_any_plugin() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+
+        let mut harness =
+            crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+                MockProvider::text_response("Hi."),
+            ]))
+            .await
+            .unwrap();
+        let writes = Arc::new(writer::tests::RecordingWrites::default());
+        harness
+            .agent
+            .set_memory_plugin(Arc::new(StubMemory(Arc::default())));
+        harness.agent.set_test_transcript_writes(writes.clone());
+        harness
+            .agent
+            .handle_inbound_message(owner_request("hello there"))
+            .await
+            .unwrap();
+        let recorded = writes.0.lock().unwrap();
+        assert_eq!(recorded.learned.len(), 1);
+        assert!(recorded.extracted.is_empty());
     }
 }
