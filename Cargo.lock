@@ -72,6 +72,7 @@ version = "0.12.9"
 dependencies = [
  "aes-gcm",
  "aidaemon-core",
+ "aidaemon-memory",
  "aidaemon-node-protocol",
  "aidaemon-policies",
  "anyhow",

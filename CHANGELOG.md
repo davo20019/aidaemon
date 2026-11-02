@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Swappable long-term memory.** Agent turns reach memory only through a memory plugin: recall is injected by a `before_model` hook, extraction and learning run at run end, and the plugin owns its tools. `[memory] backend = "sdk"` (with the `sdk-memory` cargo feature) uses the `aidaemon-memory` crate instead of the daemon's own memory (`remember` / `recall` tools, a separate SQLite file at `[memory] path`). Default `daemon`. Background memory jobs (consolidation, retention, people intelligence, `/memory`) still use the daemon store.
+
 ### Changed
 
+- **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.
 - **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
 - **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
 - **`set_reminder` tool.** A plain reminder takes two required fields, `message` and `when`, instead of an action inside the 24-action `manage_memories` (where cheaper models picked the wrong action or dropped the schedule).

@@ -171,6 +171,13 @@ working_memory_cap = 50
 # encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
 
+# Long-term memory for agent turns. "daemon" (default) is the built-in memory
+# in the state database; "sdk" uses the aidaemon-memory crate (build with
+# --features sdk-memory) and keeps its facts in a separate SQLite file.
+# [memory]
+# backend = "daemon"
+# path = "aidaemon-memory.db"
+
 # Exact user/assistant recall follows this canonical-event retention window.
 # Set messages_days = 0 for opt-in permanent active-database history.
 # Diagnostic/tool events use a separate, shorter lifecycle.

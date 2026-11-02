@@ -107,6 +107,8 @@ portable-pty = { version = "0.8", optional = true }
 # The agent kernel (workspace crate).
 aidaemon-core = { path = "crates/aidaemon-core" }
 aidaemon-policies = { path = "crates/aidaemon-policies" }
+# Optional SDK memory backend (`[memory] backend = "sdk"`).
+aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
@@ -141,6 +143,8 @@ terminal-bridge = [
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+# The aidaemon-memory crate as the memory plugin for agent turns.
+sdk-memory = ["dep:aidaemon-memory", "aidaemon-memory/fastembed"]
 
 [profile.release]
 lto = true

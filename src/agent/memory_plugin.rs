@@ -15,8 +15,12 @@ use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
 
 mod recall;
+#[cfg(feature = "sdk-memory")]
+mod sdk_memory;
 mod writer;
 pub(crate) use recall::DaemonRecall;
+#[cfg(feature = "sdk-memory")]
+pub(crate) use sdk_memory::SdkMemory;
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
@@ -91,6 +95,46 @@ pub(crate) async fn memory_parts(plugin: &dyn MemoryPlugin, turn: &MemoryTurn) -
 /// Whether the daemon tool `name` is offered under `parts`.
 pub(crate) fn daemon_tool_offered(name: &str, parts: &MemoryParts) -> bool {
     !DAEMON_MEMORY_TOOLS.contains(&name) || parts.owned_daemon_tools.contains(&name)
+}
+
+/// The memory plugin `[memory]` selects, or `None` for the daemon's own.
+pub(crate) async fn configured_plugin(
+    config: &crate::config::MemoryConfig,
+    llm_runtime: &crate::llm_runtime::SharedLlmRuntime,
+) -> anyhow::Result<Option<Arc<dyn MemoryPlugin>>> {
+    match config.backend {
+        crate::config::MemoryBackend::Daemon => Ok(None),
+        #[cfg(feature = "sdk-memory")]
+        crate::config::MemoryBackend::Sdk => {
+            let store = aidaemon_memory::SqliteMemoryStore::open(&config.path).await?;
+            let fast_model = llm_runtime
+                .router()
+                .map(|router| router.select(crate::router::Tier::Fast).to_string())
+                .unwrap_or_else(|| llm_runtime.snapshot().primary_model());
+            let extractor = aidaemon_memory::FactExtractor::new(
+                super::sdk_provider::RuntimeProvider {
+                    runtime: llm_runtime.clone(),
+                },
+                fast_model,
+            );
+            let builder = aidaemon_memory::Memory::builder(
+                Arc::new(store),
+                Arc::new(aidaemon_memory::FastEmbedder::new()),
+            )
+            .extractor(extractor);
+            tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
+            Ok(Some(Arc::new(SdkMemory::new(builder))))
+        }
+        #[cfg(not(feature = "sdk-memory"))]
+        crate::config::MemoryBackend::Sdk => {
+            let _ = llm_runtime;
+            tracing::warn!(
+                "[memory] backend = \"sdk\" needs a build with the sdk-memory feature; \
+                 using the daemon's memory"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// The daemon's own SQLite memory: recall through [`MemoryInjection`]
@@ -430,5 +474,17 @@ mod tests {
             .agent
             .set_memory_plugin(Arc::new(StubMemory(Arc::default())));
         assert!(!roster(&harness.agent).contains(&"remember_fact".to_string()));
+    }
+
+    #[test]
+    fn memory_backend_defaults_to_daemon_and_parses_sdk() {
+        use crate::config::{MemoryBackend, MemoryConfig};
+
+        let default: MemoryConfig = toml::from_str("").unwrap();
+        assert_eq!(default.backend, MemoryBackend::Daemon);
+        assert_eq!(default.path, "aidaemon-memory.db");
+        let sdk: MemoryConfig = toml::from_str("backend = \"sdk\"\npath = \"m.db\"").unwrap();
+        assert_eq!(sdk.backend, MemoryBackend::Sdk);
+        assert_eq!(sdk.path, "m.db");
     }
 }

@@ -41,7 +41,7 @@ pub(super) struct ReplayNote {
 }
 
 #[derive(Clone)]
-pub(super) struct LearningContext {
+pub(crate) struct LearningContext {
     pub(super) user_text: String,
     /// False when the task's compiled capability policy suppresses all
     /// automatic memory persistence. Canonical task/event telemetry is still

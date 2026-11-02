@@ -56,6 +56,38 @@ impl sdk::Provider for DaemonProvider {
     }
 }
 
+/// The daemon's live provider stack as a standalone SDK provider, for SDK
+/// components that call a model outside an agent run (memory extraction).
+#[cfg_attr(not(feature = "sdk-memory"), allow(dead_code))]
+pub(crate) struct RuntimeProvider {
+    pub(crate) runtime: crate::llm_runtime::SharedLlmRuntime,
+}
+
+#[async_trait]
+impl sdk::Provider for RuntimeProvider {
+    fn name(&self) -> &str {
+        "daemon-runtime"
+    }
+
+    async fn complete(
+        &self,
+        request: &sdk::ModelRequest,
+    ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
+        let provider = self.runtime.snapshot().provider();
+        let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        provider
+            .chat_with_options(
+                &request.model,
+                &to_daemon_messages_from(&request.messages),
+                &to_daemon_tools(&request.tools),
+                &options,
+            )
+            .await
+            .map(from_provider_response)
+            .map_err(|error| sdk::ProviderError::Other(error.to_string()))
+    }
+}
+
 fn image_block(image: &sdk::Image) -> Value {
     json!({"type": "image_url", "image_url": {"url": image.to_url()}})
 }

@@ -237,7 +237,8 @@ fn build_agent_side_partial_failure(
 /// After a completed turn: progressive fact extraction and incremental
 /// summary maintenance on the fast model, unless the turn's memory policy,
 /// a mandate run or a memory-isolated session rules them out.
-#[allow(clippy::too_many_arguments)]
+// Only the legacy completion phase calls these; they go when it does.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(in crate::agent) fn spawn_post_turn_memory(
     agent: &Agent,
     llm_provider: Arc<dyn ModelProvider>,
@@ -298,6 +299,7 @@ pub(in crate::agent) fn spawn_post_turn_memory(
 
 /// Learn from a finished task (procedures, expertise, failure patterns) in
 /// the background. Mandate runs never write learned memory.
+#[allow(dead_code)]
 pub(in crate::agent) fn spawn_post_task_learning(agent: &Agent, learning_ctx: LearningContext) {
     if agent.mandate_execution.is_some() {
         return;

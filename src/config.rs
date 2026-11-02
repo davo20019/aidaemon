@@ -419,6 +419,41 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Which long-term memory agent turns use.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub backend: MemoryBackend,
+    /// SQLite file for the `sdk` backend.
+    #[serde(default = "default_sdk_memory_path")]
+    pub path: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            backend: MemoryBackend::default(),
+            path: default_sdk_memory_path(),
+        }
+    }
+}
+
+fn default_sdk_memory_path() -> String {
+    "aidaemon-memory.db".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBackend {
+    /// The daemon's own memory in its state database.
+    #[default]
+    Daemon,
+    /// The `aidaemon-memory` crate (needs the `sdk-memory` cargo feature).
+    Sdk,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

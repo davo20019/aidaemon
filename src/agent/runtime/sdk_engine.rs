@@ -710,7 +710,7 @@ fn closeout_demands_work(facts: &StopFacts) -> bool {
 /// final status and outcome. Shared with run-end hooks (memory writers), so
 /// they judge a run exactly as the turn does.
 #[derive(Default)]
-pub(in crate::agent) struct TurnVerdict {
+pub(crate) struct TurnVerdict {
     /// The neutral handoff reply once work moved to the background.
     terminal_reply: std::sync::Mutex<Option<(String, TaskOutcome)>>,
     /// Confirmation of the latest successful external change.
