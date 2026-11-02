@@ -61,13 +61,19 @@ impl MemoryTurn {
 pub(crate) struct MemoryParts {
     pub hooks: Vec<Arc<dyn sdk::Hook>>,
     pub tools: Vec<Arc<dyn sdk::Tool>>,
-    /// Daemon tools this plugin owns; offered only while it is the active plugin.
+    /// Daemon tools this plugin owns; offered only while it is the active
+    /// plugin. Filled from [`MemoryPlugin::owned_daemon_tools`].
     pub owned_daemon_tools: &'static [&'static str],
 }
 
 #[async_trait]
 pub(crate) trait MemoryPlugin: Send + Sync {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
+
+    /// The daemon memory tools ([`DAEMON_MEMORY_TOOLS`]) this plugin owns.
+    fn owned_daemon_tools(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// The parts `plugin` adds to `turn`. A mandate worker gets none, whatever
@@ -76,7 +82,10 @@ pub(crate) async fn memory_parts(plugin: &dyn MemoryPlugin, turn: &MemoryTurn) -
     if turn.mandate {
         return MemoryParts::default();
     }
-    plugin.turn(turn).await
+    MemoryParts {
+        owned_daemon_tools: plugin.owned_daemon_tools(),
+        ..plugin.turn(turn).await
+    }
 }
 
 /// Whether the daemon tool `name` is offered under `parts`.
@@ -199,9 +208,12 @@ impl MemoryPlugin for DaemonMemory {
                 Arc::new(aidaemon_policies::MemoryInjection::new(recall)),
                 Arc::new(writer),
             ],
-            tools: Vec::new(),
-            owned_daemon_tools: DAEMON_MEMORY_TOOLS,
+            ..MemoryParts::default()
         }
+    }
+
+    fn owned_daemon_tools(&self) -> &'static [&'static str] {
+        DAEMON_MEMORY_TOOLS
     }
 }
 
@@ -393,5 +405,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hook.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_memory_owns_its_tools() {
+        use crate::testing::MockProvider;
+
+        let mut harness = crate::testing::setup_test_agent_sdk(MockProvider::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.agent.memory.owned_daemon_tools(),
+            ["remember_fact", "manage_memories", "manage_people"]
+        );
+        let roster = |agent: &crate::agent::Agent| {
+            agent
+                .session_static_tool_roster(UserRole::Owner, &ChannelContext::private("telegram"))
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert!(roster(&harness.agent).contains(&"remember_fact".to_string()));
+        harness
+            .agent
+            .set_memory_plugin(Arc::new(StubMemory(Arc::default())));
+        assert!(!roster(&harness.agent).contains(&"remember_fact".to_string()));
     }
 }

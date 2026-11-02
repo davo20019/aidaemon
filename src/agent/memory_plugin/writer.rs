@@ -263,9 +263,12 @@ mod tests {
                     SETTINGS,
                     self.0.clone(),
                 ))],
-                owned_daemon_tools: crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS,
                 ..Default::default()
             }
+        }
+
+        fn owned_daemon_tools(&self) -> &'static [&'static str] {
+            crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS
         }
     }
 
