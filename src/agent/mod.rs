@@ -243,6 +243,7 @@ mod followup;
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+pub(crate) mod memory_plugin;
 #[path = "runtime/notes.rs"]
 mod notes;
 #[path = "runtime/parent_delivery.rs"]
@@ -466,6 +467,8 @@ pub struct Agent {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// SDK kernel settings for this agent's turns; inherited by spawned children.
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
+    /// Long-term memory for SDK turns (hooks, tools, owned daemon tools).
+    memory: Arc<dyn memory_plugin::MemoryPlugin>,
     /// Goal cancellation token registry — shared across agent hierarchy.
     goal_token_registry: Option<GoalTokenRegistry>,
     /// Weak reference to the ChannelHub for background notifications.

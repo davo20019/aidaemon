@@ -80,6 +80,14 @@ impl Agent {
         self.sdk_engine = Arc::new(settings);
     }
 
+    /// The memory backend for this agent's turns (and its children's).
+    pub(crate) fn set_memory_plugin(
+        &mut self,
+        memory: Arc<dyn super::memory_plugin::MemoryPlugin>,
+    ) {
+        self.memory = memory;
+    }
+
     pub(crate) fn new(input: AgentConstruction) -> Self {
         let AgentConstruction {
             dependencies:
@@ -185,6 +193,7 @@ impl Agent {
             mandate_execution: None,
             cancel_token: None,
             sdk_engine: Arc::default(),
+            memory: Arc::new(super::memory_plugin::DaemonMemory),
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
@@ -427,6 +436,7 @@ impl Agent {
             mandate_execution,
             cancel_token,
             sdk_engine: Arc::default(),
+            memory: Arc::new(super::memory_plugin::DaemonMemory),
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),

@@ -42,6 +42,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
+use super::memory_plugin::{daemon_tool_offered, memory_parts, MemoryTurn};
 use super::sdk_provider::{
     fit_run, from_provider_response, to_chat_options, to_daemon_tools, values_to_sdk,
     DaemonProvider, ModelCall,
@@ -177,6 +178,8 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// Discovers nested project instructions before deeper subtree work.
     pub(in crate::agent) instruction_tracker:
         Option<crate::project_instructions::ProjectInstructionTracker>,
+    /// The compiled memory policy allows recall on this turn.
+    pub(in crate::agent) memory_recall_allowed: bool,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -2497,6 +2500,7 @@ impl Agent {
             instruction_tracker,
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
+            memory_recall_allowed,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -2520,14 +2524,27 @@ impl Agent {
                 tool_timeout: TOOL_TIMEOUT,
                 ..sdk::Limits::default()
             });
+        // Memory comes from the active plugin; a mandate worker gets none.
+        let memory_turn = MemoryTurn {
+            session_id: session_id.to_string(),
+            task_id: task_id.clone(),
+            user_text: user_text.to_string(),
+            user_role,
+            channel_ctx: channel_ctx.clone(),
+            memory_pipeline_allowed: memory_recall_allowed,
+            memory_persistence_allowed: learning_ctx.memory_persistence_allowed,
+            mandate: self.mandate_execution.is_some(),
+            depth: self.depth,
+            model: model.clone(),
+        };
+        let memory = memory_parts(self.memory.as_ref(), &memory_turn).await;
         // Tools: the set bootstrap offered for this turn (role, policy and
-        // contract filtering already applied).
+        // contract filtering already applied), with the daemon memory tools
+        // only while the active plugin owns them.
         if user_role != UserRole::Public {
-            for tool in self
-                .tools
-                .iter()
-                .filter(|tool| offered_tools.contains(tool.name()))
-            {
+            for tool in self.tools.iter().filter(|tool| {
+                offered_tools.contains(tool.name()) && daemon_tool_offered(tool.name(), &memory)
+            }) {
                 builder = builder.tool(BridgedTool {
                     spec: tool_spec(tool.as_ref()),
                     read_only: tool.capabilities().read_only,
@@ -2547,6 +2564,16 @@ impl Agent {
         builder = builder.hook(LedgerStop {
             calls: calls_tx.clone(),
         });
+        // After the ledger stop, so a rejected final answer never reaches a
+        // memory writer.
+        for hook in memory.hooks {
+            builder = builder.hook_arc(hook);
+        }
+        if user_role != UserRole::Public {
+            for tool in memory.tools {
+                builder = builder.tool_arc(tool);
+            }
+        }
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
