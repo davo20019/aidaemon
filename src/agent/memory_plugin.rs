@@ -15,7 +15,9 @@ use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
 
 mod recall;
+mod writer;
 pub(crate) use recall::DaemonRecall;
+pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
 /// lists them in [`MemoryParts::owned_daemon_tools`].
@@ -41,6 +43,10 @@ pub(crate) struct MemoryTurn {
     pub mandate: bool,
     pub depth: usize,
     pub model: String,
+    /// The run's learning context; the dispatcher adds its tool calls.
+    pub learning: Arc<std::sync::Mutex<crate::agent::post_task::LearningContext>>,
+    /// How the turn judges the run's final status.
+    pub verdict: Arc<crate::agent::sdk_engine::TurnVerdict>,
 }
 
 impl MemoryTurn {
@@ -88,6 +94,9 @@ pub(crate) struct DaemonMemory {
 
 pub(crate) struct DaemonMemoryInner {
     state: Arc<dyn StateStore>,
+    event_store: Arc<crate::events::EventStore>,
+    llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+    context_window_config: crate::config::ContextWindowConfig,
     max_facts: usize,
     record_decision_points: bool,
     /// The configured assistant name (pinned among the critical facts).
@@ -100,6 +109,9 @@ pub(crate) struct DaemonMemoryInner {
 impl DaemonMemory {
     pub(crate) fn new(
         state: Arc<dyn StateStore>,
+        event_store: Arc<crate::events::EventStore>,
+        llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+        context_window_config: crate::config::ContextWindowConfig,
         max_facts: usize,
         record_decision_points: bool,
         system_prompt: &str,
@@ -107,6 +119,9 @@ impl DaemonMemory {
         Self {
             inner: Arc::new(DaemonMemoryInner {
                 state,
+                event_store,
+                llm_runtime,
+                context_window_config,
                 max_facts,
                 record_decision_points,
                 assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
@@ -118,14 +133,123 @@ impl DaemonMemory {
     }
 }
 
+/// The daemon store's extraction, summarization and learning pipelines.
+impl MemoryWrites for DaemonMemoryInner {
+    fn extract_facts(&self, turn: &MemoryTurn, reply: &str) {
+        let snapshot = self.llm_runtime.snapshot();
+        crate::memory::context_window::spawn_progressive_extraction(
+            snapshot.provider(),
+            fast_model(&snapshot, &turn.model),
+            self.state.clone(),
+            self.event_store.clone(),
+            turn.task_id.clone(),
+            turn.user_text.clone(),
+            reply.to_string(),
+            turn.channel_ctx.channel_id.clone(),
+            turn.channel_ctx.visibility,
+            turn.user_role,
+        );
+    }
+
+    fn summarize(&self, turn: &MemoryTurn) {
+        let snapshot = self.llm_runtime.snapshot();
+        let fast_model = fast_model(&snapshot, &turn.model);
+        crate::memory::context_window::spawn_incremental_summarization(
+            snapshot.provider(),
+            fast_model.clone(),
+            self.state.clone(),
+            self.event_store.clone(),
+            turn.session_id.clone(),
+            self.context_window_config
+                .summarize_token_threshold_for(&fast_model),
+            self.context_window_config
+                .summary_recent_tokens_for(&fast_model),
+            turn.user_role,
+        );
+    }
+
+    fn learn(&self, learning: crate::agent::post_task::LearningContext) {
+        crate::agent::completion_phase::spawn_learning(self.state.clone(), learning);
+    }
+}
+
+/// The router's fast tier, else the turn's model.
+fn fast_model(snapshot: &crate::llm_runtime::LlmRuntimeSnapshot, model: &str) -> String {
+    snapshot
+        .router()
+        .map(|router| router.select(crate::router::Tier::Fast).to_string())
+        .unwrap_or_else(|| model.to_string())
+}
+
 #[async_trait]
 impl MemoryPlugin for DaemonMemory {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts {
         let recall = DaemonRecall::new(self.inner.clone(), turn.clone());
+        let config = &self.inner.context_window_config;
+        let writer = DaemonMemoryWriter::new(
+            turn.clone(),
+            WriterSettings {
+                progressive_facts: config.progressive_facts,
+                summarization: config.enabled,
+            },
+            self.inner.clone(),
+        );
         MemoryParts {
-            hooks: vec![Arc::new(aidaemon_policies::MemoryInjection::new(recall))],
+            hooks: vec![
+                Arc::new(aidaemon_policies::MemoryInjection::new(recall)),
+                Arc::new(writer),
+            ],
             tools: Vec::new(),
             owned_daemon_tools: DAEMON_MEMORY_TOOLS,
+        }
+    }
+}
+
+/// Turn fixtures for memory plugin tests.
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use super::MemoryTurn;
+    use crate::agent::post_task::LearningContext;
+    use crate::types::{ChannelContext, UserRole};
+
+    pub(crate) fn learning(user_text: &str) -> LearningContext {
+        LearningContext {
+            user_text: user_text.to_string(),
+            memory_persistence_allowed: true,
+            intent_domains: Vec::new(),
+            tool_calls: Vec::new(),
+            errors: Vec::new(),
+            first_error: None,
+            recovery_actions: Vec::new(),
+            start_time: chrono::Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+            task_outcome: None,
+            replay_notes: Vec::new(),
+        }
+    }
+
+    /// An owner-DM turn with memory allowed.
+    pub(crate) async fn turn(session_id: &str, user_text: &str) -> MemoryTurn {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
+        MemoryTurn {
+            session_id: session_id.to_string(),
+            task_id: "task-1".to_string(),
+            emitter: crate::events::EventEmitter::new(events, session_id),
+            user_text: user_text.to_string(),
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("telegram"),
+            memory_pipeline_allowed: true,
+            memory_persistence_allowed: true,
+            mandate: false,
+            depth: 0,
+            model: "mock-model".to_string(),
+            learning: Arc::new(Mutex::new(learning(user_text))),
+            verdict: Arc::default(),
         }
     }
 }
@@ -136,20 +260,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn turn(mandate: bool) -> MemoryTurn {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
         MemoryTurn {
-            session_id: "telegram:synthetic-user-1".to_string(),
-            task_id: "task-1".to_string(),
-            emitter: crate::events::EventEmitter::new(events, "telegram:synthetic-user-1"),
-            user_text: "hello".to_string(),
-            user_role: UserRole::Owner,
-            channel_ctx: ChannelContext::private("telegram"),
-            memory_pipeline_allowed: true,
-            memory_persistence_allowed: true,
             mandate,
-            depth: 0,
-            model: "mock-model".to_string(),
+            ..test_support::turn("telegram:synthetic-user-1", "hello").await
         }
     }
 

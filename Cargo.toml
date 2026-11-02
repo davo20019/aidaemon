@@ -148,6 +148,7 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

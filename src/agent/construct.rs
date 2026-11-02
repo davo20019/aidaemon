@@ -163,6 +163,9 @@ impl Agent {
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
             Arc::new(super::memory_plugin::DaemonMemory::new(
                 state.clone(),
+                event_store.clone(),
+                llm_runtime.clone(),
+                context_window_config.clone(),
                 max_facts,
                 record_decision_points,
                 &system_prompt,
@@ -412,6 +415,9 @@ impl Agent {
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
             Arc::new(super::memory_plugin::DaemonMemory::new(
                 state.clone(),
+                event_store.clone(),
+                llm_runtime.clone(),
+                context_window_config.clone(),
                 max_facts,
                 record_decision_points,
                 &system_prompt,

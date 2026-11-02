@@ -623,23 +623,24 @@ mod tests {
             .await
             .unwrap();
         let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
-        let memory = super::super::DaemonMemory::new(state, 10, false, "");
-        let emitter = crate::events::EventEmitter::new(
+        let memory = super::super::DaemonMemory::new(
+            state,
             harness.agent.event_store().clone(),
-            "memory-policy-session",
+            harness.agent.llm_runtime.clone(),
+            crate::config::ContextWindowConfig::default(),
+            10,
+            false,
+            "",
         );
+        let base = crate::agent::memory_plugin::test_support::turn(
+            "memory-policy-session",
+            "Use the current owner context.",
+        )
+        .await;
         let turn = |allowed: bool| super::MemoryTurn {
-            session_id: "memory-policy-session".to_string(),
-            task_id: "memory-task".to_string(),
-            emitter: emitter.clone(),
-            user_text: "Use the current owner context.".to_string(),
-            user_role: UserRole::Owner,
-            channel_ctx: ChannelContext::private("synthetic-owner"),
             memory_pipeline_allowed: allowed,
             memory_persistence_allowed: allowed,
-            mandate: false,
-            depth: 0,
-            model: "mock-model".to_string(),
+            ..base.clone()
         };
         let allowed = DaemonRecall::new(memory.inner.clone(), turn(true))
             .render("memory-policy-session", "", 5)

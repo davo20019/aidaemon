@@ -302,7 +302,14 @@ pub(in crate::agent) fn spawn_post_task_learning(agent: &Agent, learning_ctx: Le
     if agent.mandate_execution.is_some() {
         return;
     }
-    let state = agent.state.clone();
+    spawn_learning(agent.state.clone(), learning_ctx);
+}
+
+/// Learn from a finished task in the background.
+pub(in crate::agent) fn spawn_learning(
+    state: Arc<dyn crate::traits::StateStore>,
+    learning_ctx: LearningContext,
+) {
     tokio::spawn(async move {
         if let Err(e) = post_task::process_learning(&state, learning_ctx).await {
             warn!("Learning failed: {}", e);
@@ -310,7 +317,7 @@ pub(in crate::agent) fn spawn_post_task_learning(agent: &Agent, learning_ctx: Le
     });
 }
 
-fn post_completion_memory_plan(
+pub(in crate::agent) fn post_completion_memory_plan(
     mandate_execution: bool,
     memory_isolated_session: bool,
     memory_pipeline_allowed: bool,

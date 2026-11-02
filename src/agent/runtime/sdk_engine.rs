@@ -706,10 +706,80 @@ fn closeout_demands_work(facts: &StopFacts) -> bool {
     facts.completed_results == 0 || executor_demands
 }
 
+/// What a run settled, beyond its kernel status, that decides the turn's
+/// final status and outcome. Shared with run-end hooks (memory writers), so
+/// they judge a run exactly as the turn does.
+#[derive(Default)]
+pub(in crate::agent) struct TurnVerdict {
+    /// The neutral handoff reply once work moved to the background.
+    terminal_reply: std::sync::Mutex<Option<(String, TaskOutcome)>>,
+    /// Confirmation of the latest successful external change.
+    external_action_ack: std::sync::Mutex<Option<String>>,
+    /// Set when the run must end failed despite a final answer.
+    run_failure: std::sync::Mutex<Option<String>>,
+}
+
+impl TurnVerdict {
+    fn run_failure(&self) -> Option<String> {
+        self.run_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+
+    /// The turn's reply, status and outcome for a finished run.
+    pub(in crate::agent) fn resolve(
+        &self,
+        outcome: &sdk::RunOutcome,
+    ) -> (String, TaskStatus, TaskOutcome) {
+        let (reply, status, task_outcome) = reply_for(outcome);
+        let external_ack = self
+            .external_action_ack
+            .lock()
+            .ok()
+            .and_then(|ack| ack.clone());
+        let terminal = self
+            .terminal_reply
+            .lock()
+            .ok()
+            .and_then(|reply| reply.clone());
+        let (reply, status, task_outcome) = match (&outcome.status, terminal) {
+            (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
+                if reason == TERMINAL_REPLY_STOP =>
+            {
+                (reply, TaskStatus::Completed, outcome)
+            }
+            // A budget stop ends the run through the provider port.
+            (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
+                if error.contains(GOAL_BUDGET_EXHAUSTED) =>
+            {
+                (reply, TaskStatus::Completed, outcome)
+            }
+            _ => (reply, status, task_outcome),
+        };
+        let (reply, status, task_outcome) = match (&outcome.status, external_ack) {
+            (
+                sdk::RunStatus::ProviderFailed { .. } | sdk::RunStatus::LimitReached { .. },
+                Some(ack),
+            ) => (
+                super::tool_execution_phase::user_facing_external_action_ack(&ack),
+                TaskStatus::Completed,
+                TaskOutcome::Succeeded,
+            ),
+            _ => (reply, status, task_outcome),
+        };
+        if self.run_failure().is_some() {
+            (reply, TaskStatus::Failed, TaskOutcome::Failed)
+        } else {
+            (reply, status, task_outcome)
+        }
+    }
+}
+
 impl TurnScope<'_> {
     /// End the run before the next model call and ship `reply`.
     fn end_with(&self, reply: String, outcome: TaskOutcome) {
-        if let Ok(mut terminal) = self.terminal_reply.lock() {
+        if let Ok(mut terminal) = self.verdict.terminal_reply.lock() {
             *terminal = Some((reply, outcome));
         }
         self.end_run.store(true, Ordering::Relaxed);
@@ -751,7 +821,8 @@ struct TurnScope<'a> {
     /// are credited from receipts.
     contract: &'a crate::agent::completion_contract::CompletionContract,
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
-    learning: std::sync::Mutex<crate::agent::post_task::LearningContext>,
+    /// Shared with the memory writer, which learns from it at run end.
+    learning: Arc<std::sync::Mutex<crate::agent::post_task::LearningContext>>,
     /// The model-visible output of the latest tool call, for paste checks.
     latest_tool_output: std::sync::Mutex<Option<String>>,
     /// The one reply retry has been spent.
@@ -760,8 +831,8 @@ struct TurnScope<'a> {
     text_only_next_call: AtomicBool,
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
-    /// The neutral handoff reply once work moved to the background.
-    terminal_reply: std::sync::Mutex<Option<(String, TaskOutcome)>>,
+    /// Terminal replies, external acks and run failures: the turn's verdict.
+    verdict: Arc<TurnVerdict>,
     /// Tool calls in the latest model response (a direct response needs one).
     last_batch_size: std::sync::atomic::AtomicUsize,
     /// Ends the run at the next turn boundary (a background handoff).
@@ -788,8 +859,6 @@ struct TurnScope<'a> {
     mandate_commit_retries: std::sync::atomic::AtomicU32,
     /// Timed-out model calls retried in this run.
     model_call_timeouts: std::sync::atomic::AtomicU32,
-    /// Set when the run must end failed despite a final answer.
-    run_failure: std::sync::Mutex<Option<String>>,
     /// `send_file` dedupe keys that already succeeded in this task.
     sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
@@ -797,8 +866,6 @@ struct TurnScope<'a> {
         Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
     /// System context added during the run, sent after the projected prefix.
     extra_system: std::sync::Mutex<Vec<String>>,
-    /// Confirmation of the latest successful external change.
-    external_action_ack: std::sync::Mutex<Option<String>>,
     /// The latest provider note (for example a safety finish reason).
     response_note: std::sync::Mutex<Option<String>>,
     /// Set when a call moved work to the background with completion
@@ -1179,7 +1246,7 @@ impl Agent {
             .find(|tool| tool.name() == request.name)
             .is_some_and(|tool| tool.capabilities().external_side_effect);
         if external_mutation {
-            if let Ok(mut ack) = scope.external_action_ack.lock() {
+            if let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
                 *ack = (!failed
                     && super::tool_execution_phase::should_build_external_action_ack(&output))
                 .then(|| {
@@ -1332,7 +1399,7 @@ impl Agent {
                     "Mandate deliberator returned without committing an exact durable decision \
                      after its bounded correction turn."
                 };
-                if let Ok(mut failure) = scope.run_failure.lock() {
+                if let Ok(mut failure) = scope.verdict.run_failure.lock() {
                     *failure = Some(error.to_string());
                 }
                 sdk::StopDecision::Accept
@@ -2526,6 +2593,9 @@ impl Agent {
                 tool_timeout: TOOL_TIMEOUT,
                 ..sdk::Limits::default()
             });
+        let memory_persistence_allowed = learning_ctx.memory_persistence_allowed;
+        let learning = Arc::new(std::sync::Mutex::new(learning_ctx));
+        let verdict = Arc::new(TurnVerdict::default());
         // Memory comes from the active plugin; a mandate worker gets none.
         let memory_turn = MemoryTurn {
             session_id: session_id.to_string(),
@@ -2535,10 +2605,12 @@ impl Agent {
             user_role,
             channel_ctx: channel_ctx.clone(),
             memory_pipeline_allowed: memory_recall_allowed,
-            memory_persistence_allowed: learning_ctx.memory_persistence_allowed,
+            memory_persistence_allowed,
             mandate: self.mandate_execution.is_some(),
             depth: self.depth,
             model: model.clone(),
+            learning: learning.clone(),
+            verdict: verdict.clone(),
         };
         let memory = memory_parts(self.memory.as_ref(), &memory_turn).await;
         // Tools: the set bootstrap offered for this turn (role, policy and
@@ -2636,12 +2708,11 @@ impl Agent {
             model: &model,
             turn_id: &turn_id,
             contract: &contract,
-            learning: std::sync::Mutex::new(learning_ctx),
+            learning: learning.clone(),
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: AtomicBool::new(false),
             response_note: std::sync::Mutex::new(None),
-            external_action_ack: std::sync::Mutex::new(None),
             continue_inline_after_background,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
@@ -2663,10 +2734,9 @@ impl Agent {
                 None => None,
             }),
             goal_budget_extensions: std::sync::atomic::AtomicU32::new(0),
-            run_failure: std::sync::Mutex::new(None),
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
-            terminal_reply: std::sync::Mutex::new(None),
+            verdict: verdict.clone(),
             last_batch_size: std::sync::atomic::AtomicUsize::new(0),
             end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
@@ -2717,48 +2787,8 @@ impl Agent {
 
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {
-                let (reply, status, task_outcome) = reply_for(&outcome);
-                let external_ack = scope
-                    .external_action_ack
-                    .lock()
-                    .ok()
-                    .and_then(|ack| ack.clone());
-                let terminal = scope
-                    .terminal_reply
-                    .lock()
-                    .ok()
-                    .and_then(|reply| reply.clone());
-                let (reply, status, task_outcome) = match (&outcome.status, terminal) {
-                    (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
-                        if reason == TERMINAL_REPLY_STOP =>
-                    {
-                        (reply, TaskStatus::Completed, outcome)
-                    }
-                    // A budget stop ends the run through the provider port.
-                    (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
-                        if error.contains(GOAL_BUDGET_EXHAUSTED) =>
-                    {
-                        (reply, TaskStatus::Completed, outcome)
-                    }
-                    _ => (reply, status, task_outcome),
-                };
-                let (reply, status, task_outcome) = match (&outcome.status, external_ack) {
-                    (
-                        sdk::RunStatus::ProviderFailed { .. } | sdk::RunStatus::LimitReached { .. },
-                        Some(ack),
-                    ) => (
-                        super::tool_execution_phase::user_facing_external_action_ack(&ack),
-                        TaskStatus::Completed,
-                        TaskOutcome::Succeeded,
-                    ),
-                    _ => (reply, status, task_outcome),
-                };
-                let run_failure = scope.run_failure.lock().ok().and_then(|f| f.clone());
-                let (status, task_outcome) = if run_failure.is_some() {
-                    (TaskStatus::Failed, TaskOutcome::Failed)
-                } else {
-                    (status, task_outcome)
-                };
+                let (reply, status, task_outcome) = scope.verdict.resolve(&outcome);
+                let run_failure = scope.verdict.run_failure();
                 let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
                     let tool_calls = scope
                         .learning
@@ -2872,33 +2902,8 @@ impl Agent {
             None,
         )
         .await;
-        // The same post-turn memory and learning pipelines as legacy turns.
-        let mut learning = scope
-            .learning
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Ok(reply) = &reply {
-            if status == TaskStatus::Completed {
-                let snapshot = self.llm_runtime.snapshot();
-                super::completion_phase::spawn_post_turn_memory(
-                    self,
-                    snapshot.provider(),
-                    snapshot.router().as_ref(),
-                    &model,
-                    &task_id,
-                    session_id,
-                    user_text,
-                    reply,
-                    &channel_ctx,
-                    user_role,
-                    learning.memory_persistence_allowed,
-                );
-            }
-        }
-        learning.completed_naturally = status == TaskStatus::Completed;
-        learning.task_outcome = Some(task_outcome);
-        super::completion_phase::spawn_post_task_learning(self, learning);
+        // Post-turn memory and learning run in the memory plugin's run-end
+        // hook.
         for tool in &self.tools {
             let _ = tool.on_task_end(&task_id, session_id).await;
         }

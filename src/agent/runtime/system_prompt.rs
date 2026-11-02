@@ -1437,10 +1437,10 @@ mod tests {
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{
-            ConversationSummary, Fact, Goal, Mandate, MandateAuthority, MandateObjectiveControl,
+            ConversationSummary, Goal, Mandate, MandateAuthority, MandateObjectiveControl,
             MandateStore, ObjectiveMetricDirection, TaskAttempt,
         };
-        use crate::types::{ChannelContext, FactPrivacy, UserRole};
+        use crate::types::{ChannelContext, UserRole};
 
         let mut harness = setup_test_agent(MockProvider::new())
             .await
