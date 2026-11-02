@@ -1859,6 +1859,14 @@ impl Agent {
             record_call_for_learning(&mut learning, summary, &output, failed);
         }
 
+        // The model sees the receipt footer replayed history renders
+        // (`conversation_turn`), so it can cite the result by `result_id`
+        // (mandate evidence_receipt_ids). The stored result stays raw; the
+        // footer is projected from the stored receipt on replay.
+        let model_view = match &receipt {
+            Some(receipt) => format!("{}\n{output}", receipt.context_header()),
+            None => output.clone(),
+        };
         let mut tool = Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "tool");
         tool.content = Some(output.clone());
         tool.tool_name = Some(request.name.clone());
@@ -1917,7 +1925,7 @@ impl Agent {
         );
         sdk::ToolOutput {
             is_error: failed,
-            ..sdk::ToolOutput::text(output).with_images(images)
+            ..sdk::ToolOutput::text(model_view).with_images(images)
         }
     }
 
@@ -4747,6 +4755,61 @@ mod tests {
             "the administrative call runs; the writing call is refused"
         );
         assert_eq!(reply.text, "Checklist recorded; nothing written.");
+    }
+
+    /// The model cites receipts (mandate `evidence_receipt_ids`) by the
+    /// `result_id` in the receipt footer, so a live tool result carries the
+    /// same footer replayed history does; the stored result stays raw so a
+    /// replay does not repeat it.
+    #[tokio::test]
+    async fn live_tool_results_carry_the_receipt_footer() {
+        use crate::runtime_ports::AgentIngress;
+        use crate::testing::MockProvider;
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("shell_probe", r#"{"write":false}"#),
+            MockProvider::text_response("acme.md is the markdown file."),
+        ]);
+        let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            provider,
+            vec![Arc::new(ShellProbe(Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            )))],
+            None,
+        )
+        .await
+        .unwrap();
+        let reply = harness
+            .agent
+            .handle_inbound_message(owner_request("Which file in the folder is markdown?"))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "acme.md is the markdown file.");
+        let calls = harness.provider.call_log.lock().await;
+        let tool_message = calls
+            .last()
+            .and_then(|call| {
+                call.messages
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "tool")
+                    .cloned()
+            })
+            .expect("the answer call sees the tool result");
+        let content = tool_message["content"].as_str().unwrap_or_default();
+        assert!(content.starts_with("[Tool receipt v"), "{content}");
+        assert!(content.contains("result_id=sha256:"), "{content}");
+        assert!(content.contains("acme.md\nmia.txt"), "{content}");
+        drop(calls);
+        let stored = task_events(&harness, &reply.task_id)
+            .await
+            .iter()
+            .filter(|event| event.event_type == EventType::ToolResult)
+            .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+            .map(|result| result.result)
+            .collect::<Vec<_>>();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].contains("acme.md\nmia.txt"), "{stored:?}");
+        assert!(!stored[0].contains("[Tool receipt v"), "{stored:?}");
     }
 
     /// A goal run's scope covers its workspace, yet the spill notice sends the

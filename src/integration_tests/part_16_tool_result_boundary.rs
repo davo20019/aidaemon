@@ -65,11 +65,17 @@ async fn test_sdk_untrusted_tool_output_reaches_model_wrapped() {
         .iter()
         .find(|content| content.contains("Weather is sunny."))
         .expect("the model saw the web_fetch result");
+    // Only the runtime's own receipt footer may precede the envelope; every
+    // byte of tool output sits inside it.
+    let body = fetched
+        .strip_prefix("[Tool receipt v")
+        .and_then(|rest| rest.split_once("]\n").map(|(_, body)| body))
+        .unwrap_or(fetched);
     assert!(
-        fetched.starts_with("[UNTRUSTED EXTERNAL DATA from 'web_fetch'"),
+        body.starts_with("[UNTRUSTED EXTERNAL DATA from 'web_fetch'"),
         "untrusted output must reach the model wrapped as data; got: {fetched}"
     );
-    assert!(fetched.contains("[END UNTRUSTED EXTERNAL DATA]"));
+    assert!(body.trim_end().ends_with("[END UNTRUSTED EXTERNAL DATA]"));
 }
 
 #[tokio::test]
