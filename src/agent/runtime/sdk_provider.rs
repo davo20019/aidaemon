@@ -154,6 +154,62 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
 /// own messages. If the run outgrows the budget, only the run part is
 /// trimmed, with the legacy role-quota fitter, and unpaired tool calls and
 /// results are removed; the newest messages survive.
+/// Split system notes a hook injected after the kernel's leading system
+/// messages (for example the memory note) from the kernel transcript.
+/// `prefix_system_lead` is how many leading system messages the starting
+/// transcript had; any more in `messages` were added for this request.
+pub(super) fn split_injected_notes(
+    messages: &[sdk::Message],
+    prefix_system_lead: usize,
+) -> (Vec<String>, Vec<sdk::Message>) {
+    let lead = messages
+        .iter()
+        .position(|message| message.role != sdk::Role::System)
+        .unwrap_or(messages.len());
+    if lead <= prefix_system_lead {
+        return (Vec::new(), messages.to_vec());
+    }
+    let notes = messages[prefix_system_lead..lead]
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    let mut rest = messages[..prefix_system_lead].to_vec();
+    rest.extend_from_slice(&messages[lead..]);
+    (notes, rest)
+}
+
+/// The wire prefix with injected `notes` placed right after the task
+/// context tail (so the session-static core and the archived history keep
+/// their cached bytes), or after the leading system messages without a tail.
+pub(super) fn prefix_with_notes(prefix: &[Value], notes: &[String]) -> Vec<Value> {
+    let mut out = prefix.to_vec();
+    if notes.is_empty() {
+        return out;
+    }
+    let is_system = |message: &Value| message.get("role").and_then(Value::as_str) == Some("system");
+    let at = out
+        .iter()
+        .position(|message| {
+            is_system(message)
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content
+                            .starts_with(crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER)
+                    })
+        })
+        .map(|tail| tail + 1)
+        .unwrap_or_else(|| out.iter().position(|m| !is_system(m)).unwrap_or(out.len()));
+    for (offset, note) in notes.iter().enumerate() {
+        out.insert(
+            at + offset,
+            serde_json::json!({"role": "system", "content": note}),
+        );
+    }
+    out
+}
+
 pub(super) fn fit_run(prefix: &[Value], run: &[sdk::Message], budget_tokens: usize) -> Vec<Value> {
     let run_values = to_daemon_messages_from(run);
     let prefix_tokens = estimate_multimodal_message_tokens(prefix);

@@ -1177,7 +1177,20 @@ pub fn build_system_prompt_with_memory_report(
     max_facts: usize,
     _user_id_map: &HashMap<String, String>,
 ) -> MemoryPromptReport {
-    let mut prompt = base.to_string();
+    let mut report = render_memory_section(memory, max_facts);
+    report.prompt = format!(
+        "{base}{}{}",
+        report.prompt,
+        render_active_skills_content(active)
+    );
+    report
+}
+
+/// The daemon memory block: communication preferences, the memory tool
+/// guide, query-ranked recall, people privacy rules and current-speaker
+/// context.
+pub fn render_memory_section(memory: &MemoryContext, max_facts: usize) -> MemoryPromptReport {
+    let mut prompt = String::new();
 
     // 1. Communication Style (from user profile)
     if let Some(profile) = memory.profile {
@@ -1262,6 +1275,13 @@ pub fn build_system_prompt_with_memory_report(
         }
     }
 
+    report.prompt = prompt;
+    report
+}
+
+/// Matched skill CONTENT (active skill bodies and their bundled resources).
+pub fn render_active_skills_content(active: &[&Skill]) -> String {
+    let mut prompt = String::new();
     // 14. Available Skills
     //
     // Pillar A Task 6: the skills AVAILABILITY catalog is session-static and now
@@ -1283,9 +1303,7 @@ pub fn build_system_prompt_with_memory_report(
             }
         }
     }
-
-    report.prompt = prompt;
-    report
+    prompt
 }
 
 #[allow(dead_code)]

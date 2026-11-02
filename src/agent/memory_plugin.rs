@@ -5,12 +5,17 @@
 //! tools it wants, plus the daemon memory tools it owns. Swapping the plugin
 //! swaps the memory backend without touching the turn code.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
 
+use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
+
+mod recall;
+pub(crate) use recall::DaemonRecall;
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
 /// lists them in [`MemoryParts::owned_daemon_tools`].
@@ -18,10 +23,12 @@ pub(crate) const DAEMON_MEMORY_TOOLS: &[&str] =
     &["remember_fact", "manage_memories", "manage_people"];
 
 /// Everything a plugin needs to scope memory for one turn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MemoryTurn {
     pub session_id: String,
     pub task_id: String,
+    /// The turn's event emitter (decision points, memory telemetry).
+    pub emitter: crate::events::EventEmitter,
     /// The persisted user message for the turn.
     pub user_text: String,
     pub user_role: UserRole,
@@ -71,15 +78,54 @@ pub(crate) fn daemon_tool_offered(name: &str, parts: &MemoryParts) -> bool {
     !DAEMON_MEMORY_TOOLS.contains(&name) || parts.owned_daemon_tools.contains(&name)
 }
 
-/// The daemon's own SQLite memory.
-pub(crate) struct DaemonMemory;
+/// The daemon's own SQLite memory: recall through [`MemoryInjection`]
+/// over [`DaemonRecall`], plus the daemon memory tools.
+///
+/// [`MemoryInjection`]: aidaemon_policies::MemoryInjection
+pub(crate) struct DaemonMemory {
+    inner: Arc<DaemonMemoryInner>,
+}
+
+pub(crate) struct DaemonMemoryInner {
+    state: Arc<dyn StateStore>,
+    max_facts: usize,
+    record_decision_points: bool,
+    /// The configured assistant name (pinned among the critical facts).
+    assistant_name: Option<String>,
+    /// Per session, the entities the core profile selected last, so the
+    /// selection stays stable across turns.
+    core_profile_ids: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+}
+
+impl DaemonMemory {
+    pub(crate) fn new(
+        state: Arc<dyn StateStore>,
+        max_facts: usize,
+        record_decision_points: bool,
+        system_prompt: &str,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DaemonMemoryInner {
+                state,
+                max_facts,
+                record_decision_points,
+                assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
+                    system_prompt,
+                ),
+                core_profile_ids: tokio::sync::RwLock::new(HashMap::new()),
+            }),
+        }
+    }
+}
 
 #[async_trait]
 impl MemoryPlugin for DaemonMemory {
-    async fn turn(&self, _turn: &MemoryTurn) -> MemoryParts {
+    async fn turn(&self, turn: &MemoryTurn) -> MemoryParts {
+        let recall = DaemonRecall::new(self.inner.clone(), turn.clone());
         MemoryParts {
+            hooks: vec![Arc::new(aidaemon_policies::MemoryInjection::new(recall))],
+            tools: Vec::new(),
             owned_daemon_tools: DAEMON_MEMORY_TOOLS,
-            ..MemoryParts::default()
         }
     }
 }
@@ -89,10 +135,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn turn(mandate: bool) -> MemoryTurn {
+    async fn turn(mandate: bool) -> MemoryTurn {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
         MemoryTurn {
             session_id: "telegram:synthetic-user-1".to_string(),
             task_id: "task-1".to_string(),
+            emitter: crate::events::EventEmitter::new(events, "telegram:synthetic-user-1"),
             user_text: "hello".to_string(),
             user_role: UserRole::Owner,
             channel_ctx: ChannelContext::private("telegram"),
@@ -161,11 +210,12 @@ mod tests {
     #[tokio::test]
     async fn mandate_turn_gets_no_memory_parts() {
         let plugin = StubMemory(Arc::default());
-        assert_eq!(memory_parts(&plugin, &turn(false)).await.hooks.len(), 1);
-        let parts = memory_parts(&plugin, &turn(true)).await;
+        assert_eq!(
+            memory_parts(&plugin, &turn(false).await).await.hooks.len(),
+            1
+        );
+        let parts = memory_parts(&plugin, &turn(true).await).await;
         assert!(parts.hooks.is_empty() && parts.tools.is_empty());
-        let parts = memory_parts(&DaemonMemory, &turn(true)).await;
-        assert!(parts.owned_daemon_tools.is_empty());
     }
 
     #[tokio::test]

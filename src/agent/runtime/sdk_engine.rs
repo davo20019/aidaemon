@@ -44,8 +44,8 @@ use uuid::Uuid;
 use super::agent_helpers::touch_heartbeat;
 use super::memory_plugin::{daemon_tool_offered, memory_parts, MemoryTurn};
 use super::sdk_provider::{
-    fit_run, from_provider_response, to_chat_options, to_daemon_tools, values_to_sdk,
-    DaemonProvider, ModelCall,
+    fit_run, from_provider_response, prefix_with_notes, split_injected_notes, to_chat_options,
+    to_daemon_tools, values_to_sdk, DaemonProvider, ModelCall,
 };
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
@@ -727,6 +727,9 @@ struct TurnScope<'a> {
     prefix: Vec<Value>,
     /// Kernel messages that stand for `prefix`; later ones are this run's.
     prefix_len: usize,
+    /// Leading system messages of that starting transcript; any more in a
+    /// request were injected by a hook.
+    prefix_system_lead: usize,
     budget_goal: Option<BudgetGoal>,
     /// Set once the goal budget is used up; later model calls are refused.
     budget_exhausted: AtomicBool,
@@ -1583,7 +1586,10 @@ impl Agent {
             &tools,
             &self.context_window_config,
         );
-        let run = &request.messages[scope.prefix_len.min(request.messages.len())..];
+        // Hook notes (recalled memory) ride in the wire prefix; the rest of
+        // the kernel transcript after the starting prefix is this run's.
+        let (notes, kernel) = split_injected_notes(&request.messages, scope.prefix_system_lead);
+        let run = &kernel[scope.prefix_len.min(kernel.len())..];
         let extra: Vec<Value> = scope
             .extra_system
             .lock()
@@ -1594,13 +1600,9 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default();
-        let messages = if extra.is_empty() {
-            fit_run(&scope.prefix, run, budget)
-        } else {
-            let mut prefix = scope.prefix.clone();
-            prefix.extend(extra);
-            fit_run(&prefix, run, budget)
-        };
+        let mut prefix = prefix_with_notes(&scope.prefix, &notes);
+        prefix.extend(extra);
+        let messages = fit_run(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         if scope.text_only_next_call.swap(false, Ordering::Relaxed) {
             options.tool_choice = crate::traits::ToolChoiceMode::None;
@@ -2528,6 +2530,7 @@ impl Agent {
         let memory_turn = MemoryTurn {
             session_id: session_id.to_string(),
             task_id: task_id.clone(),
+            emitter: emitter.clone(),
             user_text: user_text.to_string(),
             user_role,
             channel_ctx: channel_ctx.clone(),
@@ -2603,6 +2606,11 @@ impl Agent {
             state.messages = projected;
         }
         let prefix_len = state.messages.len();
+        let prefix_system_lead = state
+            .messages
+            .iter()
+            .position(|message| message.role != sdk::Role::System)
+            .unwrap_or(prefix_len);
 
         // Drive the run and the tool dispatcher together on this task.
         let budget_goal = match self.budget_goal_id(session_id).await {
@@ -2669,6 +2677,7 @@ impl Agent {
             emitter: &emitter,
             prefix,
             prefix_len,
+            prefix_system_lead,
             budget_goal,
             budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),

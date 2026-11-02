@@ -160,6 +160,13 @@ impl Agent {
             info!(timeout_secs = secs, "LLM call watchdog timeout enabled");
         }
 
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
+            Arc::new(super::memory_plugin::DaemonMemory::new(
+                state.clone(),
+                max_facts,
+                record_decision_points,
+                &system_prompt,
+            ));
         Self {
             llm_runtime,
             state,
@@ -193,7 +200,7 @@ impl Agent {
             mandate_execution: None,
             cancel_token: None,
             sdk_engine: Arc::default(),
-            memory: Arc::new(super::memory_plugin::DaemonMemory),
+            memory,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
@@ -228,7 +235,6 @@ impl Agent {
             turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             interactive_slot,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
             stt_config,
@@ -403,6 +409,13 @@ impl Agent {
             .router()
             .and_then(|router| router.first_fallback().map(str::to_string))
             .unwrap_or_else(|| model.clone());
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> =
+            Arc::new(super::memory_plugin::DaemonMemory::new(
+                state.clone(),
+                max_facts,
+                record_decision_points,
+                &system_prompt,
+            ));
         Self {
             llm_runtime,
             state,
@@ -436,7 +449,7 @@ impl Agent {
             mandate_execution,
             cancel_token,
             sdk_engine: Arc::default(),
-            memory: Arc::new(super::memory_plugin::DaemonMemory),
+            memory,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
@@ -463,7 +476,6 @@ impl Agent {
             // Sub-agents never pin the interactive slot — only the root agent's
             // main generation loop does. They default to the background slot.
             interactive_slot: None,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
             stt_config,

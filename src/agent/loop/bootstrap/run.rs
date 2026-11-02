@@ -661,8 +661,6 @@ async fn build_isolated_mandate_bootstrap(
             tool_defs.len(),
             None,
             None,
-            None,
-            false,
             false,
             None,
         )
@@ -1516,34 +1514,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             }),
         )
         .await;
-    // Identity/profile retrieval is optional memory access too; compile the
-    // policy first, then fetch only the bounded categories used by the prompt.
-    let owner_dm_fact_cache = if memory_recall_allowed
-        && agent.depth == 0
-        && user_role == UserRole::Owner
-        && channel_ctx.should_inject_personal_memory()
-    {
-        let mut identity_facts = Vec::new();
-        for category in &[
-            "identity",
-            "personal",
-            "profile",
-            "user",
-            "assistant",
-            "bot",
-            "relationship",
-            "preference",
-            "family",
-        ] {
-            if let Ok(mut facts) = agent.state.get_facts(Some(category)).await {
-                identity_facts.append(&mut facts);
-            }
-        }
-        Some(identity_facts)
-    } else {
-        None
-    };
-
     // Emergency pre-call compaction is token-driven and happens before the
     // tail/cursor snapshot is built, so this turn can safely use the refreshed
     // state. It is itself a memory read/write pipeline and is therefore gated
@@ -1656,9 +1626,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             &channel_ctx,
             tool_defs.len(),
             resume_checkpoint.as_ref(),
-            owner_dm_fact_cache.as_deref(),
             session_summary.as_ref(),
-            memory_recall_allowed,
             preserve_conversation_context,
             project_instruction_scope,
         )

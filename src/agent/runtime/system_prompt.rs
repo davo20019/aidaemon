@@ -1,4 +1,3 @@
-use super::recall_guardrails::{build_critical_facts_prompt_block, extract_critical_fact_summary};
 use super::*;
 
 /// Framing for the recent dialogue a new request keeps. The earlier turns are
@@ -180,9 +179,7 @@ impl Agent {
         channel_ctx: &ChannelContext,
         tools_count: usize,
         resume_checkpoint: Option<&ResumeCheckpoint>,
-        owner_dm_fact_cache: Option<&[crate::traits::Fact]>,
         session_summary: Option<&crate::traits::ConversationSummary>,
-        memory_pipeline_allowed: bool,
         preserve_conversation_context: bool,
         project_instruction_scope: Option<&str>,
     ) -> anyhow::Result<(
@@ -311,9 +308,6 @@ impl Agent {
         // status on an internal channel must not implicitly import the owner's
         // private memory graph into an externally-acting agent.
         let mandate_context = self.mandate_execution.is_some();
-        let inject_personal = !mandate_context
-            && user_role == UserRole::Owner
-            && channel_ctx.should_inject_personal_memory();
         let non_owner_shared_context = user_role != UserRole::Owner
             && matches!(
                 channel_ctx.visibility,
@@ -321,195 +315,6 @@ impl Agent {
                     | ChannelVisibility::Public
                     | ChannelVisibility::PublicExternal
             );
-        // Memory retrieval remains current-request-scoped. Conversation
-        // continuity is assembled separately from typed task lineage below;
-        // mixing previous prose into this query would create an unremovable
-        // stale-context channel when semantic assessment refines a provisional
-        // follow-up into a new task.
-        let retrieval_query = user_text.to_string();
-
-        // Facts: always use channel-scoped semantic retrieval.
-        // Previously the owner_dm_fact_cache (all facts) was used here, but
-        // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
-        // to bleed into prompts for unrelated queries like "count lines in router.rs".
-        let facts = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else {
-            self.state
-                .get_relevant_facts_for_channel(
-                    &retrieval_query,
-                    self.limits.max_facts,
-                    channel_ctx.channel_id.as_deref(),
-                    channel_ctx.visibility,
-                    user_role == UserRole::Owner,
-                )
-                .await?
-        };
-
-        // Critical facts (identity/profile) use the pre-fetched identity-only
-        // cache from bootstrap, NOT get_facts(None) which returns ALL facts.
-        let mut critical_fact_summary = if mandate_context || !memory_pipeline_allowed {
-            Default::default()
-        } else if inject_personal && user_role == UserRole::Owner {
-            if let Some(identity_facts) = owner_dm_fact_cache {
-                extract_critical_fact_summary(identity_facts)
-            } else {
-                // No cache available (non-bootstrap path) — fetch identity
-                // categories directly instead of get_facts(None) which returns all.
-                let mut identity_facts = Vec::new();
-                for cat in &[
-                    "identity",
-                    "personal",
-                    "profile",
-                    "user",
-                    "assistant",
-                    "bot",
-                    "relationship",
-                    "preference",
-                    "family",
-                ] {
-                    if let Ok(mut facts) = self.state.get_facts(Some(cat)).await {
-                        identity_facts.append(&mut facts);
-                    }
-                }
-                extract_critical_fact_summary(&identity_facts)
-            }
-        } else {
-            Default::default()
-        };
-
-        // Episodes: channel-scoped for non-DM channels
-        let episodes = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_relevant_episodes(user_text, 3)
-                .await
-                .unwrap_or_default()
-        } else {
-            match channel_ctx.visibility {
-                ChannelVisibility::PublicExternal => vec![],
-                _ => self
-                    .state
-                    .get_relevant_episodes_for_channel(
-                        user_text,
-                        3,
-                        channel_ctx.channel_id.as_deref(),
-                    )
-                    .await
-                    .unwrap_or_default(),
-            }
-        };
-
-        // Personal goals/profile remain DM-only. Operational failure patterns are
-        // safe to use more broadly because they encode agent-side recovery guidance,
-        // not user-private preferences.
-        let goals = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_active_personal_goals(20)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
-        let patterns = if !memory_pipeline_allowed
-            || mandate_context
-            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
-        {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_behavior_patterns(0.5)
-                .await
-                .unwrap_or_default()
-        } else {
-            self.state
-                .get_behavior_patterns(0.5)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|pattern| pattern.pattern_type == "failure")
-                .collect()
-        };
-        // Procedures and error solutions are operational — always load
-        // (except on PublicExternal where we restrict everything)
-        let (procedures, error_solutions) = if !memory_pipeline_allowed
-            || mandate_context
-            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
-        {
-            (vec![], vec![])
-        } else {
-            (
-                self.state
-                    .get_relevant_procedures(user_text, 5)
-                    .await
-                    .unwrap_or_default(),
-                self.state
-                    .get_relevant_error_solutions(user_text, 5)
-                    .await
-                    .unwrap_or_default(),
-            )
-        };
-        let profile = if memory_pipeline_allowed && !mandate_context && inject_personal {
-            self.state.get_user_profile().await.ok().flatten()
-        } else {
-            None
-        };
-
-        // People context: resolve current speaker and fetch people data (only when enabled)
-        let people_enabled = memory_pipeline_allowed
-            && !mandate_context
-            && self
-                .state
-                .get_setting("people_enabled")
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("true");
-
-        let (people, current_person, current_person_facts) =
-            if !memory_pipeline_allowed || mandate_context || !people_enabled {
-                (vec![], None, vec![])
-            } else if inject_personal {
-                // In owner DMs the people list only selects the privacy rules;
-                // the owner's own profile reaches the prompt via Core Profile.
-                let all_people = self.state.get_all_people().await.unwrap_or_default();
-                (all_people, None, vec![])
-            } else if let Some(ref sender_id) = channel_ctx.sender_id {
-                // Non-owner context: try to resolve who is speaking
-                match self.state.get_person_by_platform_id(sender_id).await {
-                    Ok(Some(person)) => {
-                        // Update interaction tracking (fire-and-forget)
-                        let _ = self.state.touch_person_interaction(person.id).await;
-                        let facts = self
-                            .state
-                            .get_person_facts(person.id, None)
-                            .await
-                            .unwrap_or_default();
-                        (vec![], Some(person), facts)
-                    }
-                    _ => (vec![], None, vec![]),
-                }
-            } else {
-                (vec![], None, vec![])
-            };
-
-        // Build extended system prompt with all memory components
-        let memory_context = MemoryContext {
-            facts: &facts,
-            episodes: &episodes,
-            goals: &goals,
-            patterns: &patterns,
-            procedures: &procedures,
-            error_solutions: &error_solutions,
-            profile: profile.as_ref(),
-            people: &people,
-            current_person: current_person.as_ref(),
-            current_person_facts: &current_person_facts,
-        };
 
         // Compile session context from recent events (for "what are you doing?" awareness)
         let session_context_str = if mandate_context || non_owner_shared_context {
@@ -566,62 +371,6 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
-        let (core_profile_str, core_profile_digest) = if memory_pipeline_allowed
-            && inject_personal
-            && user_role == UserRole::Owner
-            && self.depth == 0
-        {
-            let cached_ids = self
-                .session_core_profile_ids
-                .read()
-                .await
-                .get(session_id)
-                .cloned();
-            let (profile_str, new_ids, digest) = crate::memory::core_profile::build_core_profile(
-                &self.state,
-                cached_ids,
-                people_enabled,
-            )
-            .await
-            .unwrap_or_default();
-
-            if let Some(ids) = new_ids {
-                self.session_core_profile_ids
-                    .write()
-                    .await
-                    .insert(session_id.to_string(), ids);
-            }
-            (profile_str, digest)
-        } else {
-            (String::new(), Vec::new())
-        };
-
-        // Per-render core_profile selection digest (id + content hash per entity).
-        // Emitted as telemetry so a future core_profile churn self-explains: diffing
-        // consecutive digests shows exactly which entity's content changed or whether
-        // the selected set shifted — closing the "why did the core bust?" gap.
-        if self.record_decision_points && !core_profile_digest.is_empty() {
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                DecisionType::CoreProfileSelection,
-                format!(
-                    "Core profile selection: {} entities",
-                    core_profile_digest.len()
-                ),
-                json!({
-                    "code": "core_profile_digest",
-                    "count": core_profile_digest.len(),
-                    "entities": core_profile_digest
-                        .iter()
-                        .map(|(id, h)| json!({ "id": id, "h": h }))
-                        .collect::<Vec<_>>(),
-                }),
-            )
-            .await;
-        }
-
         let core_inputs = core_prompt::assemble_core_inputs(
             user_role,
             channel_ctx,
@@ -637,7 +386,6 @@ impl Agent {
                 .map(|(name, desc)| (name.to_string(), desc))
                 .collect(),
             channel_rules,
-            core_profile_str,
         );
         // Pillar A Task 7: per-session core cache. On a HIT (aggregate hash
         // unchanged since this session's last task) the rendered bytes are reused
@@ -661,77 +409,10 @@ impl Agent {
             }
             decision.bytes
         };
-        if let Some(configured_name) = infer_assistant_name_from_prompt(&self.system_prompt) {
-            critical_fact_summary.assistant_name = Some(configured_name);
-        }
-
         // ---- TAIL assembly (per-task volatile context) ----
-        // Critical facts (identity/profile) — exact stored values, volatile.
-        let critical_facts_block = build_critical_facts_prompt_block(&critical_fact_summary);
-
-        // Query-ranked memory recall + people/current-speaker context + matched
-        // skill CONTENT. These flow through `build_system_prompt_with_memory`
-        // (which no longer emits the availability catalog — that is CORE now).
-        let memory_render = skills::build_system_prompt_with_memory_report(
-            "",
-            &skills_snapshot,
-            &active_skills,
-            &memory_context,
-            self.limits.max_facts,
-            &channel_ctx.user_id_map,
-        );
-        let memory_section = memory_render.prompt.as_str();
-        if let Err(error) = self
-            .state
-            .record_memory_recall(
-                &memory_render.rendered_fact_ids,
-                &memory_render.rendered_episode_ids,
-            )
-            .await
-        {
-            tracing::debug!(%error, "Failed to record rendered memory recall");
-        }
-
-        if self.record_decision_points {
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                DecisionType::MemoryRetrieval,
-                format!(
-                    "Memory fetched/rendered: facts={}/{} episodes={}/{} procedures={}/{}",
-                    facts.len(),
-                    memory_render.rendered_fact_ids.len(),
-                    episodes.len(),
-                    memory_render.rendered_episode_ids.len(),
-                    procedures.len(),
-                    memory_render.rendered_procedure_ids.len()
-                ),
-                json!({
-                    "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
-                    "pipeline_suppressed": !memory_pipeline_allowed,
-                    "fetched": {
-                        "facts": facts.len(),
-                        "episodes": episodes.len(),
-                        "goals": goals.len(),
-                        "patterns": patterns.len(),
-                        "procedures": procedures.len(),
-                        "error_solutions": error_solutions.len(),
-                        "people": people.len(),
-                        "current_person_facts": current_person_facts.len()
-                    },
-                    "rendered": {
-                        "fact_ids": memory_render.rendered_fact_ids,
-                        "episode_ids": memory_render.rendered_episode_ids,
-                        "goal_ids": memory_render.rendered_goal_ids,
-                        "procedure_ids": memory_render.rendered_procedure_ids,
-                        "error_solution_ids": memory_render.rendered_error_solution_ids,
-                        "pattern_ids": memory_render.rendered_pattern_ids
-                    }
-                }),
-            )
-            .await;
-        }
+        // Matched skill CONTENT. Long-term memory reaches the model through
+        // the memory plugin's note, not this prompt.
+        let skills_content = skills::render_active_skills_content(&active_skills);
 
         // Current date and time — volatile by definition; lives in the tail so
         // message zero (the core) stays byte-stable across turns.
@@ -802,9 +483,8 @@ impl Agent {
             NEW_REQUEST_DIALOGUE_NOTE
         };
         let fresh_tail = Self::build_context_tail(
-            critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
-            memory_section,
+            &skills_content,
             channel_ctx.sender_name.as_deref(),
             None,
             new_request_dialogue_note,
@@ -812,9 +492,8 @@ impl Agent {
             resume_section.as_deref(),
         );
         let continuation_tail = Self::build_context_tail(
-            critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
-            memory_section,
+            &skills_content,
             channel_ctx.sender_name.as_deref(),
             session_summary,
             &session_context_str,
@@ -893,17 +572,6 @@ impl Agent {
             )
             .await;
         }
-
-        info!(
-            session_id,
-            facts = facts.len(),
-            episodes = episodes.len(),
-            goals = goals.len(),
-            patterns = patterns.len(),
-            procedures = procedures.len(),
-            has_session_context = !session_context_str.is_empty(),
-            "Memory context loaded"
-        );
 
         Ok((
             core_prompt_bytes,
@@ -1069,7 +737,6 @@ impl Agent {
             Vec::new(),
             bundled_specialists,
             channel_rules,
-            String::new(),
         );
         let core_prompt_bytes = {
             let mut cache = self.core_prompts.write().await;
@@ -1092,7 +759,7 @@ impl Agent {
         // MemoryContext emits owner-memory affordances and a `Your Memory`
         // shell that do not belong in an externally acting mandate worker.
         let date_time_str = prompt_now.format("%A, %B %-d, %Y %H:%M UTC").to_string();
-        let tail = Self::build_context_tail(None, None, "", None, None, "", &date_time_str, None);
+        let tail = Self::build_context_tail(None, "", None, None, "", &date_time_str, None);
 
         if self.record_decision_points {
             let mut core_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1521,9 +1188,8 @@ impl Agent {
     /// checkpoint. Empty sections are dropped.
     #[allow(clippy::too_many_arguments)]
     fn build_context_tail(
-        critical_facts_block: Option<&str>,
         project_instructions_block: Option<&str>,
-        memory_section: &str,
+        skills_content: &str,
         sender_name: Option<&str>,
         session_summary: Option<&crate::traits::ConversationSummary>,
         session_context_str: &str,
@@ -1532,18 +1198,13 @@ impl Agent {
     ) -> String {
         let mut tail = String::from(crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER);
 
-        if let Some(block) = critical_facts_block {
-            tail.push_str("\n\n");
-            tail.push_str(block);
-        }
-
         if let Some(block) = project_instructions_block {
             tail.push_str("\n\n");
             tail.push_str(block);
         }
 
-        if !memory_section.trim().is_empty() {
-            tail.push_str(memory_section);
+        if !skills_content.trim().is_empty() {
+            tail.push_str(skills_content);
         }
 
         if let Some(name) = sender_name {
@@ -1646,7 +1307,6 @@ mod tests {
                 .into_iter()
                 .map(|(n, d)| (n.to_string(), d))
                 .collect(),
-            String::new(),
             String::new(),
         );
         let rendered = render_core_prompt(&core_inputs);
@@ -1759,9 +1419,7 @@ mod tests {
                 &ChannelContext::private("synthetic-owner"),
                 0,
                 None,
-                None,
                 Some(&summary),
-                true,
                 false,
                 None,
             )
@@ -1773,86 +1431,6 @@ mod tests {
         assert!(!tail.contains("Compacted Conversation State"));
         assert!(!tail.contains("Recent Session Context"));
         assert!(continuation_tail.contains("STALE_OUTPUT_FORMAT"));
-    }
-
-    #[tokio::test]
-    async fn suppressed_memory_pipeline_removes_core_profile_from_the_same_session() {
-        use crate::testing::{setup_test_agent_root, MockProvider};
-        use crate::traits::{FactStore, StateStore};
-        use crate::types::{ChannelContext, FactPrivacy, UserRole};
-
-        let harness = setup_test_agent_root(MockProvider::new())
-            .await
-            .expect("setup test harness");
-        harness
-            .state
-            .upsert_fact(
-                "personal",
-                "private_profile_sentinel",
-                "SYNTHETIC_CORE_PROFILE_VALUE",
-                "owner_dm",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .expect("seed profile fact");
-        let profile_state: std::sync::Arc<dyn StateStore> = harness.state.clone();
-        let (seeded_profile, _, _) =
-            crate::memory::core_profile::build_core_profile(&profile_state, None, false)
-                .await
-                .expect("build seeded profile");
-        assert!(seeded_profile.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
-        let emitter = crate::events::EventEmitter::new(
-            harness.agent.event_store().clone(),
-            "memory-policy-session".to_string(),
-        );
-        let (allowed_core, _, _, _, _) = harness
-            .agent
-            .build_system_prompt_for_message(
-                &emitter,
-                "memory-allowed-task",
-                "memory-policy-session",
-                "Use the current owner context.",
-                UserRole::Owner,
-                &ChannelContext::private("synthetic-owner"),
-                0,
-                None,
-                None,
-                None,
-                true,
-                false,
-                None,
-            )
-            .await
-            .expect("build memory-allowed prompt");
-        assert!(
-            allowed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"),
-            "memory-allowed core omitted seeded profile; profile_header={} core_bytes={}",
-            allowed_core.contains("## Core Profile"),
-            allowed_core.len()
-        );
-
-        let (suppressed_core, suppressed_tail, _, _, _) = harness
-            .agent
-            .build_system_prompt_for_message(
-                &emitter,
-                "memory-suppressed-task",
-                "memory-policy-session",
-                "Answer without persistent personal context.",
-                UserRole::Owner,
-                &ChannelContext::private("synthetic-owner"),
-                0,
-                None,
-                None,
-                None,
-                false,
-                false,
-                None,
-            )
-            .await
-            .expect("build memory-suppressed prompt");
-        assert!(!suppressed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
-        assert!(!suppressed_tail.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
     }
 
     #[tokio::test]
@@ -1992,22 +1570,6 @@ mod tests {
             &attempt,
         );
         let now = chrono::Utc::now();
-        let private_fact = Fact {
-            id: 1,
-            category: "identity".to_string(),
-            key: "owner_name".to_string(),
-            value: "Secret Owner Name".to_string(),
-            source: "owner_dm".to_string(),
-            created_at: now,
-            updated_at: now,
-            superseded_at: None,
-            recall_count: 0,
-            last_recalled_at: None,
-            channel_id: None,
-            privacy: FactPrivacy::Private,
-            first_seen_at: None,
-            source_excerpt: None,
-        };
         let summary = ConversationSummary {
             session_id: "mandate-session".to_string(),
             summary: "SECRET PRIOR CONVERSATION".to_string(),
@@ -2031,9 +1593,7 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(std::slice::from_ref(&private_fact)),
                 Some(&summary),
-                false,
                 false,
                 project_dir.path().to_str(),
             )
@@ -2166,9 +1726,7 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(std::slice::from_ref(&private_fact)),
                 Some(&summary),
-                false,
                 false,
                 project_dir.path().to_str(),
             )
@@ -2201,7 +1759,6 @@ mod tests {
     fn context_tail_carries_all_volatile_sections_and_marker() {
         let tail = Agent::build_context_tail(
             None,
-            None,
             "",
             None,
             None,
@@ -2223,7 +1780,6 @@ mod tests {
         let checkpoint_section =
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
         let tail = Agent::build_context_tail(
-            None,
             None,
             "",
             None,
@@ -2307,7 +1863,6 @@ mod tests {
         };
         let tail = Agent::build_context_tail(
             None,
-            None,
             "",
             None,
             Some(&summary),
@@ -2326,7 +1881,6 @@ mod tests {
     fn context_tail_includes_scoped_project_instructions() {
         let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
         let tail = Agent::build_context_tail(
-            None,
             Some(instructions),
             "",
             None,

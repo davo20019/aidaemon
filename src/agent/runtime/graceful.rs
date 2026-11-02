@@ -1511,31 +1511,53 @@ impl Agent {
         if !self.record_decision_points {
             return;
         }
-        let code = emission
-            .metadata
-            .as_object()
-            .and_then(|obj| {
-                ["condition", "route_reason", "reason"]
-                    .iter()
-                    .find_map(|key| obj.get(*key).and_then(Value::as_str))
-            })
-            .map(|value| value.to_string())
-            .or_else(|| Some(emission.decision_type.as_str().to_string()));
-        let _ = emitter
-            .emit(
-                EventType::DecisionPoint,
-                DecisionPointData {
-                    decision_type: emission.decision_type,
-                    task_id: task_id.to_string(),
-                    iteration: iteration.min(u32::MAX as usize) as u32,
-                    severity: emission.severity,
-                    code,
-                    metadata: emission.metadata,
-                    summary: emission.summary,
-                },
-            )
-            .await;
+        emit_decision_point_event(
+            emitter,
+            task_id,
+            iteration,
+            emission.decision_type,
+            emission.severity,
+            emission.summary,
+            emission.metadata,
+        )
+        .await;
     }
+}
+
+/// Emit one decision point event. Callers check whether decision points are
+/// recorded.
+pub(in crate::agent) async fn emit_decision_point_event(
+    emitter: &crate::events::EventEmitter,
+    task_id: &str,
+    iteration: usize,
+    decision_type: DecisionType,
+    severity: crate::events::DiagnosticSeverity,
+    summary: String,
+    metadata: Value,
+) {
+    let code = metadata
+        .as_object()
+        .and_then(|obj| {
+            ["condition", "route_reason", "reason"]
+                .iter()
+                .find_map(|key| obj.get(*key).and_then(Value::as_str))
+        })
+        .map(|value| value.to_string())
+        .or_else(|| Some(decision_type.as_str().to_string()));
+    let _ = emitter
+        .emit(
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type,
+                task_id: task_id.to_string(),
+                iteration: iteration.min(u32::MAX as usize) as u32,
+                severity,
+                code,
+                metadata,
+                summary,
+            },
+        )
+        .await;
 }
 
 #[cfg(test)]

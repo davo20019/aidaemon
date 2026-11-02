@@ -26,7 +26,7 @@ use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
 use crate::router::{self, Router};
 use crate::runtime_ports::OutboundRouter;
-use crate::skills::{self, MemoryContext};
+use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
     AgentRole, ChatOptions, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
@@ -560,10 +560,6 @@ pub struct Agent {
     /// applied to the main-loop `ChatOptions.id_slot` so the interactive
     /// conversation pins a dedicated slot that background tasks cannot evict.
     interactive_slot: Option<u32>,
-    /// Caches the salient fact IDs and person IDs for the core profile per session.
-    /// Locks the selected facts on the first owner turn to prevent the profile from
-    /// shifting within a session due to recall_count bumps.
-    session_core_profile_ids: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>>,
     /// Vision/image encoding settings for multimodal LLM requests.
     vision_config: VisionConfig,
     /// Native audio input settings for multimodal LLM requests.
