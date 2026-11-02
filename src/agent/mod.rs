@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -16,8 +16,8 @@ use crate::config::{
 };
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
-    LlmCallData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
-    ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData,
+    SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
+    ThinkingStartData, ToolCallInfo, ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -29,8 +29,8 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
-    AgentRole, ChatOptions, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
-    ToolCapabilities, ToolChoiceMode, ToolRole,
+    AgentRole, ChatOptions, Message, ModelProvider, StateStore, Tool, ToolCall, ToolCapabilities,
+    ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
@@ -82,20 +82,8 @@ impl CorrectionContextRegistry {
     }
 }
 
-/// Constants for stall and repetitive behavior detection
-const MAX_STALL_ITERATIONS: usize = 5;
-const DEFERRED_NO_TOOL_SWITCH_THRESHOLD: usize = 2;
-const MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES: usize = 1;
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
-/// After this many deferred-no-tool retries, accept substantive text-only responses
-/// instead of continuing to force tool use. This prevents stalls on simple
-/// conversational queries (greetings, capability questions, jokes) that don't need tools.
-const DEFERRED_NO_TOOL_ACCEPT_THRESHOLD: usize = 2;
-const MAX_REPETITIVE_CALLS: usize = 8;
 const RECENT_CALLS_WINDOW: usize = 12;
-/// After this many identical calls (same tool+args hash), skip execution and
-/// inject a coaching message so the LLM adapts before the hard stall fires.
-const REPETITIVE_REDIRECT_THRESHOLD: usize = 3;
 /// If the same tool NAME is called this many consecutive iterations (even with
 /// different arguments), treat it as a loop.  This catches the case where the
 /// LLM keeps calling e.g. `terminal` with varied commands without progress.
@@ -105,10 +93,6 @@ const MAX_CONSECUTIVE_SAME_TOOL: usize = 8;
 /// Hard iteration cap even in "unlimited" mode — prevents runaway resource
 /// consumption if stall detection is bypassed (e.g. alternating tool names).
 const HARD_ITERATION_CAP: usize = 200;
-/// Maximum character length for old-interaction assistant messages in history.
-/// Longer content is truncated with a "[prior turn, truncated]" marker to
-/// prevent stale context from polluting subsequent interactions.
-const MAX_OLD_ASSISTANT_CONTENT_CHARS: usize = 200;
 /// The adjacent prior assistant answer is recent transcript, not generic
 /// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
 /// genuinely oversized answers use deterministic head/tail compaction.
@@ -118,15 +102,11 @@ const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
 /// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
 /// cap keeps the question head and the option tail and elides the middle.
 const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
-/// Window size for detecting alternating tool patterns (A-B-A-B cycles).
-const ALTERNATING_PATTERN_WINDOW: usize = 10;
-const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 pub mod activity_gate;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
 use response_analysis::looks_like_incomplete_retry_plan;
-use response_analysis::reply_is_pasted_file_page;
 #[cfg(test)]
 use response_analysis::sanitize_response_analysis;
 #[cfg(test)]
@@ -149,30 +129,21 @@ pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 mod policy_signals;
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
-use policy_signals::{
-    build_policy_bundle, default_clarifying_question, detect_explicit_outcome_signal,
-    tool_is_side_effecting,
-};
+use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
 #[path = "loop/evidence_state.rs"]
 mod evidence_state;
-pub(in crate::agent) use evidence_state::{
-    assess_pre_execution_evidence_gate, has_completed_side_effecting_tool_call,
-    record_successful_tool_evidence, EvidenceState,
-};
+pub(in crate::agent) use evidence_state::EvidenceState;
 #[path = "loop/validation_state.rs"]
 mod validation_state;
-#[allow(unused_imports)]
-pub(in crate::agent) use validation_state::{
-    build_abandon_request, build_partial_done_blocked_request,
-    build_partial_done_blocked_request_with_plan, build_reduce_scope_request,
-    build_reduce_scope_request_with_plan, ApprovalState, LoopRepetitionReason, ValidationFailure,
-    ValidationOutcome,
-};
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
     persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
     ExecutorStepResult, PartialResult, StepValidationOutcome, TaskValidationOutcome,
     ValidationState,
+};
+#[allow(unused_imports)]
+pub(in crate::agent) use validation_state::{
+    ApprovalState, LoopRepetitionReason, ValidationFailure, ValidationOutcome,
 };
 #[path = "loop/execution_state.rs"]
 mod execution_state;
@@ -180,11 +151,8 @@ mod execution_state;
 pub(crate) use execution_state::ExecutionBudget;
 pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
-    classify_step_execution_outcome, compile_step_execution_plan, select_initial_execution_budget,
-    ApprovalRequirement, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
+    select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
 };
-#[path = "loop/approach_pivot.rs"]
-mod approach_pivot;
 #[path = "policy/heuristic_telemetry.rs"]
 pub(crate) mod heuristic_telemetry;
 #[path = "loop/loop_utils.rs"]
@@ -194,29 +162,16 @@ mod recall_guardrails;
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
 use loop_utils::{
-    build_task_boundary_hint, classify_execution_failure_kind, classify_tool_outcome_status,
-    extract_command_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
-    failure_class_from_outcome_status, fixup_message_ordering, hash_tool_call, is_trigger_session,
-    semantic_failure_limit, strip_appended_diagnostics, tool_outcome_evidence_source,
-    ExecutionFailureKind, ToolFailureClass,
+    extract_command_from_args, fixup_message_ordering, is_trigger_session, semantic_failure_limit,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
 #[path = "runtime/task_outcome.rs"]
 mod task_outcome;
 use post_task::LearningContext;
-pub(in crate::agent) use post_task::ReplayNoteCategory;
-pub(in crate::agent) use task_outcome::{
-    response_has_user_value, response_looks_like_plain_text_tool_call, TaskOutcomeDerivation,
-    TaskTerminalCause,
-};
 #[allow(dead_code, unused_imports)]
 #[path = "loop/state/mod.rs"]
 mod loop_state;
-#[path = "loop/stopping_conditions.rs"]
-mod stopping_conditions;
-#[path = "loop/tool_loop_state.rs"]
-mod tool_loop_state;
 
 #[cfg(feature = "computer_use")]
 mod computer_use;
@@ -260,8 +215,6 @@ mod tool_result_fit;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
 pub(crate) use parent_delivery::ParentDeliveryKind;
-#[path = "loop/response_phase.rs"]
-mod response_phase;
 #[path = "loop/services.rs"]
 mod services;
 pub(in crate::agent) use completion_contract::inherit_request_constraints;
@@ -282,13 +235,6 @@ pub(in crate::agent) use history::{
     parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
     SemanticAuthorityRequirements, SemanticCompletionRequirements, SemanticEvidencePolicy,
 };
-pub(in crate::agent) use history::{
-    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
-    mutation_contract_fulfilled,
-};
-#[path = "runtime/llm.rs"]
-mod llm;
-pub(in crate::agent) use llm::LlmCallTelemetry;
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
@@ -296,6 +242,8 @@ pub(in crate::agent) mod eval;
 mod hand_holding_telemetry;
 #[path = "loop/inquiry.rs"]
 mod inquiry;
+#[path = "runtime/llm.rs"]
+mod llm;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
 #[path = "loop/main_loop.rs"]
@@ -306,8 +254,6 @@ mod message_build_phase;
 mod models;
 #[path = "loop/prefix_fingerprint.rs"]
 mod prefix_fingerprint;
-#[path = "loop/request_dump.rs"]
-mod request_dump;
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
@@ -317,10 +263,6 @@ mod sliding_window;
 mod spawn;
 #[path = "loop/stopping_helpers.rs"]
 mod stopping_helpers;
-#[path = "loop/stopping_phase.rs"]
-mod stopping_phase;
-#[path = "loop/stopping_progress.rs"]
-mod stopping_progress;
 pub(crate) mod stt;
 #[path = "loop/system_directives.rs"]
 mod system_directives;
@@ -332,8 +274,6 @@ mod tool_defs;
 mod tool_exec;
 #[path = "loop/tool_execution_phase.rs"]
 mod tool_execution_phase;
-#[path = "loop/tool_prelude_phase.rs"]
-mod tool_prelude_phase;
 #[path = "loop/tool_result_notices.rs"]
 mod tool_result_notices;
 #[path = "loop/turn_eviction.rs"]
@@ -342,13 +282,9 @@ pub(crate) mod turn_eviction;
 pub(crate) mod turn_render;
 #[path = "loop/turn_render_cache.rs"]
 pub(crate) mod turn_render_cache;
-#[path = "loop/turn_transition.rs"]
-mod turn_transition;
 pub(crate) mod vision;
 
-pub(in crate::agent) use eval::{
-    HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed, StopReason,
-};
+pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
@@ -368,7 +304,7 @@ pub(crate) use policy_metrics::set_route_failsafe_for_session_for_test;
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
 pub(in crate::agent) use policy_metrics::{
-    current_uncertainty_threshold, provider_kind_metric_label, record_llm_payload_invalid_metric,
+    provider_kind_metric_label, record_llm_payload_invalid_metric,
     route_failsafe_active_for_session, POLICY_METRICS,
 };
 // `observe_route_reason_for_drift` / `RouteDriftSignal` are wired but currently
@@ -383,9 +319,9 @@ mod agent_helpers;
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
-    build_empty_response_fallback, filter_tool_defs_for_untrusted_external_reference,
-    is_resume_request, is_untrusted_external_reference_blocked_tool, summarize_tool_args,
-    truncate_for_resume, ResumeCheckpoint, ResumeExecutionSnapshot,
+    filter_tool_defs_for_untrusted_external_reference, is_resume_request,
+    is_untrusted_external_reference_blocked_tool, truncate_for_resume, ResumeCheckpoint,
+    ResumeExecutionSnapshot,
 };
 pub use agent_helpers::{send_status, touch_heartbeat};
 #[cfg(test)]
@@ -483,10 +419,6 @@ pub struct Agent {
     /// (core.rs ordering) via `set_plan_store`; `None` on subagents and in tests,
     /// in which case checklist verification/recap degrade to current behavior.
     plan_store: RwLock<Option<Arc<crate::plans::PlanStore>>>,
-    /// Once-per-task guards for the requirement-checklist soft verification.
-    /// Keys: "{task_id}:nudged" (nudged once) and "{task_id}:recapped" (recap
-    /// posted once). Keeps the nudge/recap from firing on every iteration.
-    checklist_turn_flags: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
@@ -609,7 +541,7 @@ pub struct Agent {
 #[allow(dead_code)]
 const MAX_CORRECTION_CONTEXTS: usize = 64;
 
-pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
+pub(in crate::agent) use system_directives::SystemDirective;
 
 struct AgentLimits {
     max_depth: usize,
@@ -1421,11 +1353,8 @@ mod session_goal_cancellation_tests {
 
 #[cfg(test)]
 mod final_reply_marker_tests {
-    use std::collections::HashMap;
 
-    use chrono::Utc;
-
-    use super::{post_task, user_facing_task_description, Agent, LearningContext};
+    use super::{user_facing_task_description, Agent};
 
     #[test]
     fn strips_control_markers_from_final_reply() {
@@ -1504,46 +1433,6 @@ mod final_reply_marker_tests {
         assert!(sanitized.contains("your personal AI assistant"));
         assert!(!sanitized.contains("ChatGPT"));
         assert!(!sanitized.contains("Gemini"));
-    }
-
-    #[test]
-    fn strips_leaked_tool_protocol_tokens_after_graceful_summary() {
-        let learning_ctx = LearningContext {
-            user_text: "debug this failure".to_string(),
-            memory_persistence_allowed: true,
-            intent_domains: vec![],
-            tool_calls: vec!["terminal(`vendor/bin/drush status`)".to_string()],
-            errors: vec![],
-            first_error: None,
-            recovery_actions: vec![],
-            start_time: Utc::now(),
-            completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
-            task_outcome: None,
-            replay_notes: Vec::new(),
-        };
-        let mut tool_failure_count = HashMap::new();
-        tool_failure_count.insert(
-            "terminal".to_string(),
-            super::semantic_failure_limit("terminal"),
-        );
-        let graceful = post_task::graceful_stall_response(
-            &learning_ctx,
-            false,
-            "deferred-no-tool",
-            &tool_failure_count,
-        );
-        assert!(graceful.contains("command execution"));
-
-        let leaked = format!(
-            "{}\n<|tool_calls_section_begin|>\nfunctions.terminal:0 {{\"command\":\"pwd\"}}",
-            graceful
-        );
-        let sanitized = Agent::sanitize_final_reply_markers(&leaked);
-        assert!(!sanitized.contains("<|tool_calls_section_begin|>"));
-        assert!(!sanitized.contains("functions.terminal:0"));
-        assert!(sanitized.contains("command execution"));
     }
 
     #[test]

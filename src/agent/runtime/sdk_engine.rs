@@ -147,6 +147,14 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
 }
 
 /// Everything the SDK run asks of the daemon, served on the turn's own task.
+/// What the kernel's event sink hands to the turn's dispatcher.
+enum KernelNotice {
+    /// A call the kernel refused before dispatch.
+    Refusal(sdk::Receipt),
+    /// The stuck detector fired.
+    Stuck,
+}
+
 pub(super) enum DaemonCall {
     Tool(ToolRequest),
     Model(ModelCall),
@@ -192,6 +200,10 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// manifest against them.
     pub(in crate::agent) task_access: Option<crate::traits::ToolCallAccessManifest>,
     pub(in crate::agent) authorized_scopes: Vec<String>,
+    /// Persisted message and turn ids whose content reached the projected
+    /// prefix, recorded on every model call's telemetry.
+    pub(in crate::agent) projected_source_message_ids: Vec<String>,
+    pub(in crate::agent) projected_source_turn_ids: Vec<String>,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -233,6 +245,40 @@ fn anchor_call_to_project_dir(scope: &TurnScope<'_>, request: &mut ToolRequest) 
     )?;
     request.arguments = serde_json::from_str(&updated).ok()?;
     Some(injected)
+}
+
+/// Defer the checklist's advisory steps once the run is done: a step with
+/// no typed mutation effect and no observation requirement is display only,
+/// and left pending it would make restart recovery pause the plan and ask to
+/// resume work that is finished. Typed steps keep their state. Returns
+/// whether anything changed.
+fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bool {
+    use crate::plans::StepStatus;
+    let mut changed = false;
+    for step in &mut plan.steps {
+        if matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+            && step.required_mutation_effects.is_empty()
+            && !step.requires_observation
+        {
+            step.status = StepStatus::Deferred;
+            step.result_summary = Some(
+                "Advisory checklist item; authoritative completion is owned by the typed task proof"
+                    .to_string(),
+            );
+            step.completed_at = Some(chrono::Utc::now());
+            changed = true;
+        }
+    }
+    if changed {
+        plan.sync_active_step();
+    }
+    changed
+}
+
+/// The task budget's one 80% warning is due: past 80%, not yet exhausted,
+/// not already given.
+fn task_budget_warning_due(used: u64, budget: u64, already_sent: bool) -> bool {
+    budget > 0 && !already_sent && used >= budget.saturating_mul(80) / 100 && used < budget
 }
 
 /// Drop declared terminal read roots the task does not authorize before the
@@ -1040,6 +1086,9 @@ struct TurnScope<'a> {
     /// See `SdkTurnSetup::task_access`.
     task_access: Option<crate::traits::ToolCallAccessManifest>,
     authorized_scopes: Vec<String>,
+    /// See `SdkTurnSetup::projected_source_message_ids`.
+    projected_source_message_ids: Vec<String>,
+    projected_source_turn_ids: Vec<String>,
     /// Terminal replies, external acks and run failures: the turn's verdict.
     verdict: Arc<TurnVerdict>,
     /// Daemon memory tools the active memory plugin owns on this turn.
@@ -1068,6 +1117,11 @@ struct TurnScope<'a> {
     goal_budget_extensions: std::sync::atomic::AtomicU32,
     /// Mandate decision correction turns used.
     mandate_commit_retries: std::sync::atomic::AtomicU32,
+    /// Verify-before-claim demands for an unverified GUI coordinate click.
+    #[cfg(feature = "computer_use")]
+    gui_verify_demands: std::sync::atomic::AtomicU32,
+    /// The one 80% budget warning (task or scheduled run) was given.
+    budget_warning_sent: AtomicBool,
     /// Timed-out model calls retried in this run.
     model_call_timeouts: std::sync::atomic::AtomicU32,
     /// `send_file` dedupe keys that already succeeded in this task.
@@ -1084,6 +1138,111 @@ struct TurnScope<'a> {
 }
 
 impl Agent {
+    /// Reconcile this task's checklist after a completed run (see
+    /// [`reconcile_plan_projection`]) and record its final shape.
+    async fn reconcile_checklist_projection(
+        &self,
+        emitter: &EventEmitter,
+        session_id: &str,
+        task_id: &str,
+    ) {
+        let Some(plan_store) = self.plan_store.read().await.clone() else {
+            return;
+        };
+        let Some(mut plan) = plan_store
+            .get_recent_for_session(session_id, 1)
+            .await
+            .ok()
+            .and_then(|plans| plans.into_iter().next())
+            .filter(|plan| plan.task_id.as_deref() == Some(task_id))
+        else {
+            return;
+        };
+        if reconcile_plan_projection(&mut plan) {
+            if let Err(error) = plan_store.update(&plan).await {
+                warn!(task_id, %error, "SDK engine: could not reconcile the checklist");
+            }
+        }
+        let unchecked = plan.unchecked_steps().len();
+        let deferred = plan
+            .steps
+            .iter()
+            .filter(|step| step.status == crate::plans::StepStatus::Deferred)
+            .count();
+        self.emit_decision_point(
+            emitter,
+            task_id,
+            0,
+            crate::events::DecisionType::GateTelemetry,
+            "checklist turn completed",
+            serde_json::json!({
+                "event": "checklist_complete",
+                "total": plan.steps.len(),
+                "completed": plan.completed_steps(),
+                "deferred": deferred,
+                "unchecked": unchecked,
+                "engine": "sdk",
+            }),
+        )
+        .await;
+    }
+
+    /// Record a call the kernel refused before dispatch in the run ledger:
+    /// an unknown tool or invalid arguments is a typed failed proposal, as
+    /// the legacy dispatcher recorded it; a hook denial is a policy denial.
+    async fn record_kernel_refusal(&self, scope: &TurnScope<'_>, receipt: sdk::Receipt) {
+        let call = crate::traits::ToolCall {
+            id: receipt.call_id.clone(),
+            name: receipt.tool.clone(),
+            arguments: receipt.arguments.to_string(),
+            extra_content: None,
+        };
+        let reason = receipt
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("`{}` was refused before it ran", receipt.tool));
+        let semantics = self
+            .semantics_for_exact_tool_call(&call.name, &call.arguments)
+            .await;
+        let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
+            // The same-tool limit is the only deny hook on SDK turns.
+            self.with_harness_eval(|eval| eval.record_repetition_guard())
+                .await;
+            self.persist_pre_dispatch_policy_denial(
+                scope.emitter,
+                scope.session_id,
+                scope.task_id,
+                &call,
+                &call.arguments,
+                reason,
+                "kernel_hook_denied",
+                semantics,
+                None,
+            )
+            .await
+        } else {
+            self.persist_pre_dispatch_outcome_with_kernel_claim(
+                scope.emitter,
+                scope.session_id,
+                scope.task_id,
+                &call,
+                &call.arguments,
+                reason,
+                crate::traits::ToolOutcomeStatus::FailedPermanent,
+                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
+                false,
+                semantics,
+                None,
+                None,
+                None,
+            )
+            .await
+        };
+        if let Err(error) = recorded {
+            warn!(task_id = scope.task_id, %error, "SDK engine: could not record a kernel refusal");
+        }
+    }
+
     /// Judge the call's access manifest against the task's filesystem
     /// authority. `None`: in scope (or not a known tool).
     fn sdk_scope_check(
@@ -1375,6 +1534,17 @@ impl Agent {
                         &mut outcome.metadata,
                     )
                     .await;
+                // What the store keeps: the tool's own summary when it gives
+                // one, else what the model saw.
+                let durable_is_summary = outcome.metadata.persistent_output.is_some();
+                let durable = outcome
+                    .metadata
+                    .persistent_output
+                    .clone()
+                    .unwrap_or_else(|| fitted.clone());
+                if let Some(provenance) = outcome.metadata.result_provenance.as_mut() {
+                    provenance.record_durable_view(&durable, durable_is_summary);
+                }
                 let mut receipt = crate::events::ToolReceiptV1::from_metadata(
                     &outcome.metadata,
                     status,
@@ -1494,6 +1664,38 @@ impl Agent {
                 (output, images, Some(outcome.metadata), Some(receipt))
             }
             Err(error) => {
+                // A tool that returns `Err` made an explicit typed failure: it
+                // gets a `FailedPermanent` receipt, as in the legacy tool
+                // phase, so the run ledger and the task outcome see it.
+                let prepared = self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name() == request.name)
+                    .and_then(|tool| tool.prepare_invocation(arguments).ok());
+                let mut metadata = crate::traits::ToolCallMetadata {
+                    outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
+                    transport_error: Some(error.to_string()),
+                    invocation_stage: if error
+                        .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()
+                        .is_some()
+                    {
+                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+                    } else {
+                        crate::traits::ToolInvocationStage::Dispatched
+                    },
+                    ..crate::traits::ToolCallMetadata::default()
+                };
+                if let Some(prepared) = prepared {
+                    metadata.receipt_kind = prepared.receipt_kind;
+                    metadata.access_manifest = Some(prepared.access_manifest);
+                }
+                super::tool_execution_phase::complete_tool_result_semantics(
+                    &request.name,
+                    arguments,
+                    &call_semantics,
+                    &mut metadata,
+                );
+                let error_text = format!("Error: {error}");
                 // Oversized errors (cli_agent process output, stack traces)
                 // are capped like results.
                 let fitted = self
@@ -1506,12 +1708,33 @@ impl Agent {
                             emitter: scope.emitter,
                             mandate_execution: self.mandate_execution.is_some(),
                         },
-                        format!("Error: {error}"),
+                        error_text.clone(),
                         true,
-                        &mut crate::traits::ToolCallMetadata::default(),
+                        &mut metadata,
                     )
                     .await;
-                (fitted, Vec::new(), None, None)
+                let status = crate::traits::ToolOutcomeStatus::FailedPermanent;
+                let evidence = super::loop_utils::tool_outcome_evidence_source(&metadata);
+                let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+                    &metadata,
+                    status,
+                    evidence,
+                    idempotency_key.clone(),
+                );
+                receipt.mandate_authority = grant.clone();
+                if let Ok(mut progress) = scope.progress.lock() {
+                    receipt.completion_obligation_ids = bind_receipt_to_contract(
+                        &mut progress,
+                        scope.contract,
+                        &request.call_id,
+                        &request.name,
+                        arguments,
+                        &error_text,
+                        &metadata,
+                        status,
+                    );
+                }
+                (fitted, Vec::new(), Some(metadata), Some(receipt))
             }
         };
         let failed = receipt
@@ -1669,9 +1892,47 @@ impl Agent {
             }
         }
         if decision == sdk::StopDecision::Accept {
+            decision = self.sdk_gui_click_check(scope).await;
+        }
+        if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text);
         }
         let _ = check.reply.send(decision);
+    }
+
+    /// A GUI success claim must not ship while the task's last coordinate
+    /// click is unverified: a raw (x, y) click has no element identity, so
+    /// only a follow-up observation (which clears the flag) can confirm it
+    /// (2026-07-12: an unverified click at a guessed position was reported as
+    /// a successful Like). Bounded, so a model that never looks cannot loop.
+    #[cfg(feature = "computer_use")]
+    async fn sdk_gui_click_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
+        const MAX_GUI_VERIFY_DEMANDS: u32 = 3;
+        if self.depth != 0
+            || !crate::agent::computer_use::task_has_unverified_coordinate_click(scope.task_id)
+                .await
+            || scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed) >= MAX_GUI_VERIFY_DEMANDS
+        {
+            return sdk::StopDecision::Accept;
+        }
+        self.emit_warning_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            crate::events::DecisionType::PostExecutionValidation,
+            "GUI success claim blocked: unverified coordinate click".to_string(),
+            serde_json::json!({ "condition": "gui_coordinate_click_unverified", "engine": "sdk" }),
+        )
+        .await;
+        sdk::StopDecision::Continue {
+            message: super::system_directives::SystemDirective::GuiCoordinateClickUnverified
+                .render(),
+        }
+    }
+
+    #[cfg(not(feature = "computer_use"))]
+    async fn sdk_gui_click_check(&self, _scope: &TurnScope<'_>) -> sdk::StopDecision {
+        sdk::StopDecision::Accept
     }
 
     /// A mandate task lead's prose is never its decision: a missing typed
@@ -1823,6 +2084,10 @@ impl Agent {
             serde_json::json!({
                 "condition": "ledger_closeout",
                 "verdict": decision.verdict(),
+                "proof_basis": match &decision {
+                    crate::events::CloseoutDecision::Closed { proof_basis } => Some(*proof_basis),
+                    _ => None,
+                },
                 "reachable_obligation_ids": reachable,
                 "authoritative": true,
                 "engine": "sdk",
@@ -1967,6 +2232,18 @@ impl Agent {
         if scope.budget_exhausted.load(Ordering::Relaxed) {
             return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
         }
+        // A computer_use GUI loop pins a vision-capable model for its task;
+        // every later call of the task uses it.
+        #[cfg(feature = "computer_use")]
+        let pinned_request = {
+            let mut pinned = request.clone();
+            pinned.model =
+                crate::agent::computer_use::resolve_model_for_task(scope.task_id, &pinned.model)
+                    .await;
+            pinned
+        };
+        #[cfg(feature = "computer_use")]
+        let request = &pinned_request;
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime.snapshot();
         let tools = to_daemon_tools(&request.tools);
@@ -2002,6 +2279,10 @@ impl Agent {
             1 => options.reasoning_effort_override = Some("low".to_string()),
             _ => options.reasoning_effort_override = Some("off".to_string()),
         }
+        // llama.cpp slot pinning (opt-in): the root interactive agent carries
+        // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
+        // `None` and use the provider's background slot.
+        options.id_slot = self.interactive_slot;
         // Before any tool work a provider blip gets the long retry ladder: a
         // failure there loses the whole turn (the legacy LLM phase's rule).
         options.uncommitted_work = scope
@@ -2170,8 +2451,8 @@ impl Agent {
                     prefix_hash_archived: None,
                     boundary_pos: None,
                     message_count: Some(messages.len()),
-                    projected_source_message_ids: Vec::new(),
-                    projected_source_turn_ids: Vec::new(),
+                    projected_source_message_ids: scope.projected_source_message_ids.clone(),
+                    projected_source_turn_ids: scope.projected_source_turn_ids.clone(),
                     force_text: false,
                     token_usage_present: usage.is_some(),
                     token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
@@ -2322,7 +2603,7 @@ impl Agent {
             .map_err(|error| sdk::ProviderError::Other(error.to_string()))?;
         match admission {
             MandateRunTokenAdmission::NotApplicable => Ok(None),
-            MandateRunTokenAdmission::Exhausted { .. } => {
+            MandateRunTokenAdmission::Exhausted => {
                 Err(sdk::ProviderError::Other(MANDATE_BUDGET_EXHAUSTED.into()))
             }
             MandateRunTokenAdmission::Acquired(lease) => {
@@ -2414,6 +2695,36 @@ impl Agent {
         } else {
             None
         };
+        // One warning at 80% of the task budget (scheduled runs warn on their
+        // own per-run budget instead).
+        let budget = scope.task_budget.load(Ordering::Relaxed);
+        let scheduled = scope
+            .budget_goal
+            .as_ref()
+            .is_some_and(|goal| goal.scheduled);
+        if stop.is_none()
+            && !scheduled
+            && task_budget_warning_due(
+                used,
+                budget,
+                scope.budget_warning_sent.load(Ordering::Relaxed),
+            )
+        {
+            scope.budget_warning_sent.store(true, Ordering::Relaxed);
+            let hint: String = scope.user_text.chars().take(150).collect();
+            directives.push(
+                super::system_directives::SystemDirective::TaskTokenBudgetWarning {
+                    used,
+                    budget,
+                    pct: used.saturating_mul(100) / budget,
+                    task_anchor: if hint.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Current task: {}", hint.trim())
+                    },
+                },
+            );
+        }
         if let Ok(mut extra) = scope.extra_system.lock() {
             extra.extend(directives.iter().map(|directive| directive.render()));
         }
@@ -2567,6 +2878,37 @@ impl Agent {
                 &run_status,
             )
             .await;
+            // One warning at 80% of the per-run budget, so the run can wrap
+            // up before it is stopped (the legacy stopping phase's rule).
+            if let Some(pct) = Agent::scheduled_run_budget_pressure_pct(
+                &run_status,
+                scope.budget_warning_sent.load(Ordering::Relaxed),
+            ) {
+                scope.budget_warning_sent.store(true, Ordering::Relaxed);
+                directives.push(
+                    super::system_directives::SystemDirective::ScheduledRunBudgetPressure {
+                        used: run_status.tokens_used,
+                        budget: run_status.effective_budget_per_check,
+                        pct,
+                    },
+                );
+                self.emit_warning_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    iteration,
+                    crate::events::DecisionType::StoppingCondition,
+                    "Scheduled run resource-pressure threshold reached".to_string(),
+                    serde_json::json!({
+                        "condition": "scheduled_run_budget_pressure",
+                        "goal_id": goal.goal_id,
+                        "budget": run_status.effective_budget_per_check,
+                        "tokens_used": run_status.tokens_used,
+                        "pct": pct,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
+            }
             let mut ctx = super::graceful::ScheduledRunBudgetControlCtx {
                 emitter: scope.emitter,
                 task_id: scope.task_id,
@@ -2760,6 +3102,29 @@ impl Agent {
             arguments: arguments.to_string(),
             extra_content: None,
         };
+        if let Some((operation_id, result_id, reason)) = &preflight.replay_invalidation {
+            // The earlier effect no longer holds, so the call runs again.
+            self.emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                scope.model_calls.load(Ordering::Relaxed) as usize,
+                crate::events::DecisionType::IdempotencyReceiptInvalidated,
+                format!(
+                    "Reconciled durable receipt for {} is no longer authoritative",
+                    request.name
+                ),
+                serde_json::json!({
+                    "condition": "idempotency_receipt_invalidated",
+                    "tool": request.name,
+                    "tool_call_id": request.call_id,
+                    "operation_id": operation_id,
+                    "result_id": result_id,
+                    "reason": reason,
+                    "engine": "sdk",
+                }),
+            )
+            .await;
+        }
         if let Some(reason) = &preflight.block_reason {
             if let Err(error) = self
                 .persist_pre_dispatch_outcome_with_kernel_claim(
@@ -2784,6 +3149,24 @@ impl Agent {
             return Some(sdk::ToolOutput::error(format!("Error: {reason}")));
         }
         let previous = preflight.replayed_result.as_ref()?;
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            crate::events::DecisionType::IdempotencyReceiptReplayed,
+            format!(
+                "Replayed durable receipt for {} without repeating I/O",
+                request.name
+            ),
+            serde_json::json!({
+                "condition": "idempotency_receipt_replayed",
+                "tool": request.name,
+                "tool_call_id": request.call_id,
+                "receipt_outcome": previous.receipt.as_ref().map(|receipt| receipt.outcome_status),
+                "engine": "sdk",
+            }),
+        )
+        .await;
         info!(
             task_id = scope.task_id,
             tool = %request.name,
@@ -2997,6 +3380,8 @@ impl Agent {
             project_scope,
             task_access,
             authorized_scopes,
+            projected_source_message_ids,
+            projected_source_turn_ids,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -3010,6 +3395,10 @@ impl Agent {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let (calls_tx, mut calls_rx) = mpsc::channel::<DaemonCall>(16);
+        // Calls the kernel refuses itself (unknown tool, invalid arguments, a
+        // hook denial) never reach the daemon dispatcher; the event sink hands
+        // their receipts over so the run ledger records them too.
+        let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
         let mut builder = sdk::Agent::builder("aidaemon")
             .model(model.clone())
             .provider(DaemonProvider {
@@ -3092,8 +3481,26 @@ impl Agent {
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
+        // The kernel holds one sink: heartbeat, kernel refusals for the
+        // ledger, and the thinking status all go through it.
         builder = builder.event_sink(move |_run, event: &sdk::Event| {
             touch_heartbeat(&sink_heartbeat);
+            match event {
+                sdk::Event::ToolFinished { receipt }
+                    if matches!(
+                        receipt.status,
+                        sdk::ReceiptStatus::UnknownTool
+                            | sdk::ReceiptStatus::InvalidArguments
+                            | sdk::ReceiptStatus::Denied
+                    ) =>
+                {
+                    let _ = refusals_tx.send(KernelNotice::Refusal(receipt.clone()));
+                }
+                sdk::Event::Stuck { .. } => {
+                    let _ = refusals_tx.send(KernelNotice::Stuck);
+                }
+                _ => {}
+            }
             let Some(status_tx) = sink_status.as_ref() else {
                 return;
             };
@@ -3158,10 +3565,15 @@ impl Agent {
             project_scope,
             task_access,
             authorized_scopes,
+            projected_source_message_ids,
+            projected_source_turn_ids,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "computer_use")]
+            gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
+            budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             task_tokens: AtomicU64::new(0),
             task_budget: AtomicU64::new(self.limits.task_token_budget.unwrap_or(0)),
@@ -3224,6 +3636,18 @@ impl Agent {
                         in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
                     }
                 },
+                Some(notice) = refusals_rx.recv() => match notice {
+                    KernelNotice::Refusal(receipt) => {
+                        in_flight.push(self.record_kernel_refusal(&scope, receipt).boxed());
+                    }
+                    KernelNotice::Stuck => {
+                        in_flight.push(
+                            self.with_harness_eval(|eval| eval.record_repetition_guard())
+                                .map(|_| ())
+                                .boxed(),
+                        );
+                    }
+                },
                 Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
                 _ = tick.tick() => touch_heartbeat(&heartbeat),
             }
@@ -3241,6 +3665,10 @@ impl Agent {
                         .verdict
                         .final_reply(&outcome, &tool_calls, channel_ctx.visibility);
                 let run_failure = scope.verdict.run_failure();
+                if status == TaskStatus::Completed {
+                    self.reconcile_checklist_projection(&emitter, session_id, &task_id)
+                        .await;
+                }
                 info!(
                     session_id,
                     task_id,
@@ -4301,6 +4729,46 @@ mod tests {
         assert!(ok.starts_with("read_file(") && !ok.contains('['), "{ok}");
         assert!(learning_tool_summary("read_file", args, false, true).ends_with(" [FAILED]"));
         assert!(learning_tool_summary("read_file", args, true, true).ends_with(" [REJECTED]"));
+    }
+
+    #[test]
+    fn advisory_checklist_steps_are_deferred_once_the_run_is_done() {
+        let mut plan = crate::plans::TaskPlan::new(
+            "telegram:synthetic",
+            "synthetic request",
+            "synthetic plan",
+            vec!["Summarize the already proven result".to_string()],
+            "test",
+        );
+        assert!(reconcile_plan_projection(&mut plan));
+        assert_eq!(plan.steps[0].status, crate::plans::StepStatus::Deferred);
+        assert!(plan.is_finished());
+    }
+
+    #[test]
+    fn typed_checklist_steps_keep_their_state() {
+        let mut plan = crate::plans::TaskPlan::new(
+            "telegram:synthetic",
+            "synthetic request",
+            "synthetic plan",
+            vec!["Observe canonical state".to_string()],
+            "test",
+        );
+        plan.steps[0].requires_observation = true;
+        assert!(!reconcile_plan_projection(&mut plan));
+        assert_eq!(plan.steps[0].status, crate::plans::StepStatus::InProgress);
+    }
+
+    #[test]
+    fn task_budget_warns_once_at_eighty_percent() {
+        assert!(!task_budget_warning_due(79, 100, false));
+        assert!(task_budget_warning_due(80, 100, false));
+        assert!(!task_budget_warning_due(90, 100, true), "only once");
+        assert!(
+            !task_budget_warning_due(100, 100, false),
+            "exhausted stops instead"
+        );
+        assert!(!task_budget_warning_due(90, 0, false), "no budget");
     }
 
     #[test]

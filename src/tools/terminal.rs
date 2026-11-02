@@ -7987,29 +7987,6 @@ impl Tool for TerminalTool {
         }
     }
 
-    fn project_contract_mutation_effects(
-        &self,
-        mut semantics: ToolCallSemantics,
-        required_effects: ToolMutationEffects,
-    ) -> ToolCallSemantics {
-        if semantics.mutates_state() && !required_effects.is_empty() {
-            // A terminal is an opaque bounded workspace adapter. It may be
-            // assigned the contract's derived/workspace lane when the typed
-            // obligation explicitly names this operation, but it can never
-            // masquerade as a path-aware source edit or a remote mutation.
-            let local_output = required_effects.intersect(
-                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
-                    .union(ToolMutationEffects::LOCAL_DERIVED_WRITE),
-            );
-            semantics.mutation_effects = if local_output.is_empty() {
-                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
-            } else {
-                local_output
-            };
-        }
-        semantics
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         // For backwards compatibility, delegate to call_with_status with no sender.
         self.call_with_status(arguments, None).await

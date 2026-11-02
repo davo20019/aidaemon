@@ -165,19 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn pushes_and_takes_system_directives() {
-        let mut state = PendingDirectives::default();
-
-        state.push_system_message(SystemDirective::RouteFailsafeActive);
-        state.push_system_message(SystemDirective::RecoveryModeModelSwitch);
-
-        assert_eq!(state.system_message_count(), 2);
-        let taken = state.take_system_messages();
-        assert_eq!(taken.len(), 2);
-        assert_eq!(state.system_message_count(), 0);
-    }
-
-    #[test]
     fn stores_and_takes_acknowledgements() {
         let mut state = PendingDirectives::default();
 
@@ -224,5 +211,18 @@ mod tests {
 
         state.set_cli_agent_boundary_injected(false);
         assert!(!state.cli_agent_boundary_injected());
+    }
+
+    #[test]
+    fn pushes_and_takes_system_directives() {
+        let mut state = PendingDirectives::default();
+
+        state.push_system_message(SystemDirective::RouteFailsafeActive);
+        state.push_system_message(SystemDirective::MandateDecisionCommitRequired);
+
+        assert_eq!(state.system_message_count(), 2);
+        let taken = state.take_system_messages();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(state.system_message_count(), 0);
     }
 }

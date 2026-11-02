@@ -1,4 +1,3 @@
-use crate::router::Router;
 use crate::traits::{ModelProvider, ProviderResponse};
 use crate::utils::truncate_str;
 use serde::{Deserialize, Serialize};
@@ -1040,7 +1039,6 @@ fn uses_current_receipt_dialect(contract: Option<&PlannedContractSignals>) -> bo
 
 /// Result of the task-start assessment call.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct TaskPlan {
     pub goal: String,
     pub steps: Vec<TaskPlanStep>,
@@ -1532,7 +1530,6 @@ async fn record_auxiliary_model_failure(
 ///
 /// Returns None if the assessment call fails, times out, or returns
 /// unparseable JSON. Failure is silent and callers continue without a plan.
-#[allow(dead_code)]
 pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
     model_candidates: &[String],
@@ -2358,118 +2355,6 @@ pub(crate) fn planning_skip_reason(
     }
 
     None
-}
-
-/// Re-planner: evaluates whether the current plan step is complete.
-///
-/// Called after each tool execution round when the current step has had
-/// enough tool calls since the last evaluation. Uses a focused LLM
-/// prompt to judge step completion.
-///
-/// Returns Some(evidence) if the step is complete, None if not or on failure.
-pub(crate) async fn evaluate_step_completion(
-    provider: Arc<dyn ModelProvider>,
-    router: &Router,
-    step_description: &str,
-    tool_results_summary: &str,
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
-) -> Option<String> {
-    let model = router.select(crate::router::Tier::Primary).to_string();
-
-    let prompt = format!(
-        "You are evaluating whether a task step is complete.\n\n\
-         Current step: \"{}\"\n\n\
-         Tool results from this step:\n{}\n\n\
-         Has the agent gathered enough information or completed enough work \
-         to move to the next step? Be practical \u{2014} if the key information \
-         has been found, the step is complete even if more could theoretically \
-         be explored.\n\n\
-         Return JSON only:\n\
-         {{\"complete\": true/false, \"evidence\": \"brief summary of what was accomplished\"}}",
-        step_description,
-        truncate_str(tool_results_summary, 1500)
-    );
-
-    let messages = vec![
-        json!({
-            "role": "system",
-            "content": "You are a task progress evaluator. Return ONLY valid JSON."
-        }),
-        json!({ "role": "user", "content": prompt }),
-    ];
-
-    let call_start = Instant::now();
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        provider.chat(&model, &messages, &[]),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            warn!(error = %e, "Re-planner call failed");
-            return None;
-        }
-        Err(_) => {
-            warn!("Re-planner call timed out (10s)");
-            return None;
-        }
-    };
-    record_auxiliary_model_call(
-        telemetry,
-        "replanner",
-        &model,
-        &result,
-        call_start.elapsed().as_millis() as u64,
-        AuxiliaryAttemptTelemetry {
-            attempt: 1,
-            fell_back: false,
-            validation_error: None,
-        },
-    )
-    .await;
-
-    let content = result.content.as_deref().unwrap_or("");
-    let json_str = crate::utils::extract_json_object(content)?;
-
-    #[derive(Deserialize)]
-    struct ReplanResult {
-        complete: bool,
-        #[serde(default)]
-        evidence: String,
-    }
-
-    match serde_json::from_str::<ReplanResult>(&json_str) {
-        Ok(r) if r.complete => {
-            info!(evidence = %r.evidence, "Re-planner: step complete");
-            Some(r.evidence)
-        }
-        Ok(_) => {
-            info!("Re-planner: step not yet complete");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "Re-planner response parse failed");
-            None
-        }
-    }
-}
-
-/// Build a summary of recent tool calls for the re-planner prompt.
-pub(crate) fn summarize_tool_calls_for_replan(tool_calls: &[String], max_entries: usize) -> String {
-    tool_calls
-        .iter()
-        .rev()
-        .take(max_entries)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|call| {
-            let display = crate::agent::post_task::display_tool_call(call);
-            format!("- {}", display)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]

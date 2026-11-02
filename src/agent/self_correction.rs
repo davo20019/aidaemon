@@ -43,40 +43,6 @@ pub fn decide_attempt(
     }
 }
 
-/// Deterministic, order-independent fingerprint of an approach (its set of
-/// `"tool_name(summary)"` calls). Used to identify a failed approach in the
-/// durable ledger. Order-independent so a re-ordered-but-equivalent attempt
-/// hashes the same; bounded so it stays a compact ledger key.
-pub fn approach_signature(tool_calls: &[String]) -> String {
-    let mut parts: Vec<&str> = tool_calls
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    parts.sort_unstable();
-    parts.dedup();
-    let joined = parts.join("|");
-    crate::utils::truncate_str(&joined, 500)
-}
-
-/// Budget-only pivot decision: may the loop pivot to *another* approach? Unlike
-/// `decide_attempt`, there is no prospective signature, so this never blocks a
-/// repeat — it only enforces the K distinct-failure budget.
-pub fn decide_pivot_budget(prior: &[SelfCorrectionAttempt], k: usize) -> AttemptDecision {
-    let is_failed = |s: &str| s == attempt_status::FAILED || s == attempt_status::BLOCKED;
-    let mut distinct = std::collections::HashSet::new();
-    for a in prior.iter().filter(|a| is_failed(&a.status)) {
-        distinct.insert(a.approach_signature.as_str());
-    }
-    if distinct.len() >= k {
-        AttemptDecision::StopBudget
-    } else {
-        AttemptDecision::Proceed {
-            attempt_index: distinct.len() + 1,
-        }
-    }
-}
-
 /// Bounded, durable policy engine for self-correction. Library only: it decides
 /// whether an attempt may proceed and persists attempt outcomes; it never spawns
 /// or executes anything.
@@ -219,104 +185,12 @@ impl SelfCorrectionController {
         )
         .await
     }
-
-    /// Budget check for an in-loop approach pivot: may the loop pivot again?
-    pub async fn pivot_budget(&self, subject_id: &str) -> anyhow::Result<AttemptDecision> {
-        let prior = self.state.get_self_correction_attempts(subject_id).await?;
-        Ok(decide_pivot_budget(&prior, self.max_attempts))
-    }
-
-    /// Honest summary of what was tried, or `None` if nothing failed. Persists a
-    /// single terminal `gave_up` row (idempotent per subject).
-    pub async fn give_up_report(&self, subject_id: &str) -> anyhow::Result<Option<String>> {
-        let prior = self.state.get_self_correction_attempts(subject_id).await?;
-        let is_failed = |s: &str| s == attempt_status::FAILED || s == attempt_status::BLOCKED;
-
-        let mut distinct = Vec::new();
-        for a in prior.iter().filter(|a| is_failed(&a.status)) {
-            if !distinct.contains(&a.approach_signature) {
-                distinct.push(a.approach_signature.clone());
-            }
-        }
-        if distinct.is_empty() {
-            return Ok(None);
-        }
-
-        let mut report = format!(
-            "I tried {} different approach{} and none worked:\n",
-            distinct.len(),
-            if distinct.len() == 1 { "" } else { "es" }
-        );
-        for sig in &distinct {
-            report.push_str("- ");
-            report.push_str(sig);
-            report.push('\n');
-        }
-
-        // Idempotent terminal marker: only one gave_up row per subject.
-        let already_gave_up = prior.iter().any(|a| a.status == attempt_status::GAVE_UP);
-        if !already_gave_up {
-            // Reconstruct the subject kind from history (all rows share it).
-            let kind = prior
-                .first()
-                .and_then(|a| SelfCorrectionSubjectKind::from_str(&a.subject_kind))
-                .unwrap_or(SelfCorrectionSubjectKind::Task);
-            self.record(
-                subject_id,
-                kind,
-                "<gave_up>",
-                prior.len() + 1,
-                attempt_status::GAVE_UP,
-                None,
-                None,
-            )
-            .await?;
-        }
-
-        Ok(Some(report))
-    }
-}
-
-/// Wrap the controller's give-up report into a user-facing reply: the honest
-/// enumeration of what was tried. Used as
-/// the last-resort message when the in-loop pivot budget is exhausted.
-pub fn compose_give_up_reply(report: &str) -> String {
-    let redacted = crate::tools::sanitize::redact_secrets(report);
-    redacted.trim_end().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn compose_give_up_reply_redacts_secrets_in_signatures() {
-        // A failing approach signature can contain a non-terminal tool's raw args,
-        // e.g. an http_request URL with an API key. The give-up reply must not leak it.
-        // Token shape: sk-[a-zA-Z0-9]{20,} matches the API key pattern in SECRET_PATTERNS.
-        let report = "I tried 1 different approach and none worked:\n- http_request(https://api.example.com/x?api_key=sk-ABCDEF1234567890abcdef)\n";
-        let reply = compose_give_up_reply(report);
-        assert!(
-            !reply.contains("sk-ABCDEF1234567890abcdef"),
-            "secret token leaked into give-up reply: {reply}"
-        );
-        assert!(
-            reply.contains("[REDACTED:API key]"),
-            "expected [REDACTED:API key] placeholder in reply: {reply}"
-        );
-    }
-
-    #[test]
-    fn compose_give_up_reply_keeps_report_without_asking_for_a_routine_pivot() {
-        let report = "I tried 2 different approaches and none worked:\n- terminal(du -ah ~)\n- terminal(find ~ -size +500M)\n";
-        let reply = compose_give_up_reply(report);
-        // The original report content is preserved verbatim.
-        assert!(reply.contains("I tried 2 different approaches"));
-        assert!(reply.contains("terminal(du -ah ~)"));
-        assert!(!reply.contains('?'));
-        // Non-empty and ends without trailing whitespace runaway.
-        assert!(!reply.trim().is_empty());
-    }
     use crate::traits::SelfCorrectionSubjectKind;
     use std::sync::Arc;
 
@@ -368,60 +242,6 @@ mod tests {
             ctrl.attempt("t1", k, "sig-d").await.unwrap(),
             AttemptDecision::StopBudget
         );
-    }
-
-    #[tokio::test]
-    async fn give_up_report_is_none_without_failures_and_summarizes_after() {
-        let ctrl = SelfCorrectionController::new(temp_state().await, 3);
-        let k = SelfCorrectionSubjectKind::Task;
-        assert!(ctrl.give_up_report("t2").await.unwrap().is_none());
-
-        ctrl.record_failure("t2", k, "du -ah ~", 1, None)
-            .await
-            .unwrap();
-        ctrl.record_failure("t2", k, "find ~ -size +500M", 2, None)
-            .await
-            .unwrap();
-        let report = ctrl.give_up_report("t2").await.unwrap().unwrap();
-        assert!(report.contains("du -ah ~"));
-        assert!(report.contains("find ~ -size +500M"));
-        assert!(report.contains("2")); // tried 2 approaches
-    }
-
-    #[tokio::test]
-    async fn give_up_report_is_idempotent_writes_single_gave_up_row() {
-        let state = temp_state().await;
-        let ctrl = SelfCorrectionController::new(state.clone(), 3);
-        let k = SelfCorrectionSubjectKind::Task;
-        ctrl.record_failure("t4", k, "a", 1, None).await.unwrap();
-        ctrl.record_failure("t4", k, "b", 2, None).await.unwrap();
-
-        // Two give-up calls must each return a summary but write only ONE gave_up row.
-        assert!(ctrl.give_up_report("t4").await.unwrap().is_some());
-        assert!(ctrl.give_up_report("t4").await.unwrap().is_some());
-
-        let rows = state.get_self_correction_attempts("t4").await.unwrap();
-        let gave_up_count = rows
-            .iter()
-            .filter(|r| r.status == crate::traits::attempt_status::GAVE_UP)
-            .count();
-        assert_eq!(
-            gave_up_count, 1,
-            "give_up_report must write exactly one gave_up row"
-        );
-    }
-
-    #[tokio::test]
-    async fn record_success_does_not_count_as_failure() {
-        let ctrl = SelfCorrectionController::new(temp_state().await, 3);
-        let k = SelfCorrectionSubjectKind::Task;
-        ctrl.record_success("t3", k, "sig-ok", 1).await.unwrap();
-        // A success leaves the budget intact: the next attempt still proceeds.
-        assert_eq!(
-            ctrl.attempt("t3", k, "sig-next").await.unwrap(),
-            AttemptDecision::Proceed { attempt_index: 2 }
-        );
-        assert!(ctrl.give_up_report("t3").await.unwrap().is_none());
     }
 
     fn attempt(sig: &str, status: &str) -> SelfCorrectionAttempt {
@@ -508,120 +328,6 @@ mod tests {
         assert_eq!(
             decide_attempt(&prior, "a", 3),
             AttemptDecision::Proceed { attempt_index: 4 }
-        );
-    }
-
-    #[test]
-    fn approach_signature_is_deterministic_and_order_independent() {
-        let a = vec!["terminal(du -ah ~)".to_string(), "read_file(x)".to_string()];
-        let b = vec!["read_file(x)".to_string(), "terminal(du -ah ~)".to_string()];
-        // Same set of calls → same signature regardless of order; non-empty.
-        assert_eq!(approach_signature(&a), approach_signature(&b));
-        assert!(!approach_signature(&a).is_empty());
-        // Different approaches → different signatures.
-        let c = vec!["terminal(find ~ -size +500M)".to_string()];
-        assert_ne!(approach_signature(&a), approach_signature(&c));
-    }
-
-    #[test]
-    fn approach_signature_empty_is_stable() {
-        assert_eq!(approach_signature(&[]), approach_signature(&[]));
-    }
-
-    #[test]
-    fn decide_pivot_budget_proceeds_until_k_then_stops() {
-        let mk = |sig: &str| SelfCorrectionAttempt {
-            id: 0,
-            subject_id: "t".to_string(),
-            subject_kind: "task".to_string(),
-            approach_signature: sig.to_string(),
-            attempt_index: 1,
-            status: attempt_status::FAILED.to_string(),
-            blocked_reason: None,
-            evidence_ref: None,
-            created_at: "2026-06-23 00:00:00".to_string(),
-        };
-        // 0 failures → proceed (attempt 1).
-        assert_eq!(
-            decide_pivot_budget(&[], 3),
-            AttemptDecision::Proceed { attempt_index: 1 }
-        );
-        // 2 distinct failures, k=3 → proceed (attempt 3).
-        let two = vec![mk("a"), mk("b")];
-        assert_eq!(
-            decide_pivot_budget(&two, 3),
-            AttemptDecision::Proceed { attempt_index: 3 }
-        );
-        // 3 distinct failures → StopBudget.
-        let three = vec![mk("a"), mk("b"), mk("c")];
-        assert_eq!(decide_pivot_budget(&three, 3), AttemptDecision::StopBudget);
-        // Duplicate failed signatures count once (still under budget).
-        let dup = vec![mk("a"), mk("a"), mk("a")];
-        assert_eq!(
-            decide_pivot_budget(&dup, 3),
-            AttemptDecision::Proceed { attempt_index: 2 }
-        );
-    }
-
-    #[tokio::test]
-    async fn pivot_budget_reads_durable_failures() {
-        let ctrl = SelfCorrectionController::new(temp_state().await, 3);
-        let k = crate::traits::SelfCorrectionSubjectKind::Task;
-        assert_eq!(
-            ctrl.pivot_budget("tp").await.unwrap(),
-            AttemptDecision::Proceed { attempt_index: 1 }
-        );
-        ctrl.record_failure("tp", k, "a", 1, None).await.unwrap();
-        ctrl.record_failure("tp", k, "b", 2, None).await.unwrap();
-        ctrl.record_failure("tp", k, "c", 3, None).await.unwrap();
-        assert_eq!(
-            ctrl.pivot_budget("tp").await.unwrap(),
-            AttemptDecision::StopBudget
-        );
-    }
-
-    #[tokio::test]
-    async fn pivot_lifecycle_proceeds_twice_then_exhausts_and_reports() {
-        let state = temp_state().await;
-        let ctrl = SelfCorrectionController::new(state.clone(), 3); // MAX_APPROACH_PIVOTS + 1
-        let k = crate::traits::SelfCorrectionSubjectKind::Task;
-        let task = "loop-task-1";
-
-        // Simulate three failing approaches with distinct signatures, checking the
-        // budget gate the way stopping_phase will: record_failure then pivot_budget.
-        let sig1 = approach_signature(&["terminal(du -ah ~)".to_string()]);
-        ctrl.record_failure(task, k, &sig1, 1, None).await.unwrap();
-        assert!(matches!(
-            ctrl.pivot_budget(task).await.unwrap(),
-            AttemptDecision::Proceed { .. }
-        ));
-
-        let sig2 = approach_signature(&["terminal(find ~ -size +500M)".to_string()]);
-        ctrl.record_failure(task, k, &sig2, 2, None).await.unwrap();
-        assert!(matches!(
-            ctrl.pivot_budget(task).await.unwrap(),
-            AttemptDecision::Proceed { .. }
-        ));
-
-        let sig3 = approach_signature(&["terminal(du -x -d2 ~)".to_string()]);
-        ctrl.record_failure(task, k, &sig3, 3, None).await.unwrap();
-        // Three distinct failures → budget exhausted.
-        assert_eq!(
-            ctrl.pivot_budget(task).await.unwrap(),
-            AttemptDecision::StopBudget
-        );
-
-        // The give-up report enumerates all three approaches and is idempotent.
-        let report = ctrl.give_up_report(task).await.unwrap().unwrap();
-        assert!(report.contains("du -ah ~"));
-        assert!(report.contains("find ~ -size +500M"));
-        assert!(report.contains("du -x -d2 ~"));
-
-        // A separate task has its own fresh budget (per-task isolation == per-turn
-        // reset for interactive, durable for scheduled).
-        assert_eq!(
-            ctrl.pivot_budget("loop-task-2").await.unwrap(),
-            AttemptDecision::Proceed { attempt_index: 1 }
         );
     }
 
@@ -712,36 +418,6 @@ mod tests {
             decision,
             AttemptDecision::Proceed { attempt_index: 3 },
             "EXECUTED must not count toward the distinct-failure budget"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_give_up_report_omits_executed_attempts() {
-        let state = temp_state().await;
-        let ctrl = SelfCorrectionController::new(state.clone(), 3);
-        let k = SelfCorrectionSubjectKind::Task;
-
-        // One real failure and one executed — only the failure appears in the report.
-        ctrl.record_failure("e4", k, "sig-fail", 1, None)
-            .await
-            .unwrap();
-        ctrl.record_executed("e4", k, "sig-exec-only", 2, None)
-            .await
-            .unwrap();
-
-        let report = ctrl.give_up_report("e4").await.unwrap().unwrap();
-        assert!(
-            report.contains("sig-fail"),
-            "failed approach must appear in give-up report"
-        );
-        assert!(
-            !report.contains("sig-exec-only"),
-            "EXECUTED approach must not appear in give-up report"
-        );
-        // Report says "1 different approach", not 2.
-        assert!(
-            report.contains("1 different approach"),
-            "give_up_report must count only failures: {report}"
         );
     }
 

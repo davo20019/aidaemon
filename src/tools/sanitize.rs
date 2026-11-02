@@ -324,141 +324,6 @@ fn strip_meta_instructions(content: &str) -> String {
     result
 }
 
-/// Minimum number of consecutive identical units required before the
-/// degeneration guard collapses them. Set conservatively high so ordinary
-/// repetition (a list with repeated prefixes, a refrain) is left untouched and
-/// only runaway model loops are caught.
-const DEGENERATION_MIN_RUN: usize = 4;
-
-/// Minimum normalized length of a repeating sentence cycle before it is
-/// collapsed. Prevents collapsing short repeated tokens like "Yes. Yes. ...".
-const DEGENERATION_MIN_UNIT_LEN: usize = 8;
-
-/// Collapse runaway model degeneration (repetition loops) in a user-facing
-/// reply. Models — especially local ones — sometimes collapse into emitting the
-/// same line or sentence over and over (often after their context fills with
-/// repetitive placeholders). This keeps the first occurrence of the looped unit
-/// and drops the runaway tail so the user sees a coherent reply instead of a
-/// wall of duplicated text.
-///
-/// Conservative by design: only collapses runs of [`DEGENERATION_MIN_RUN`] or
-/// more consecutive identical units. Returns `(collapsed_text, did_collapse)`.
-pub fn collapse_degenerate_repetition(text: &str) -> (String, bool) {
-    // Pass 1: collapse runs of identical consecutive lines into a single copy.
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut collapsed_lines: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut did_collapse = false;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let mut run = 1;
-        while i + run < lines.len() && lines[i + run] == line {
-            run += 1;
-        }
-        if !line.trim().is_empty() && run >= DEGENERATION_MIN_RUN {
-            did_collapse = true;
-            collapsed_lines.push(line);
-        } else {
-            for l in lines.iter().skip(i).take(run) {
-                collapsed_lines.push(l);
-            }
-        }
-        i += run;
-    }
-    let line_collapsed = collapsed_lines.join("\n");
-
-    // Pass 2: collapse consecutive repeated sentence cycles within the text.
-    let (sentence_collapsed, sentence_did) = collapse_repeated_sentence_cycles(&line_collapsed);
-    (sentence_collapsed, did_collapse || sentence_did)
-}
-
-/// Split text into sentence-ish tokens such that concatenating the tokens
-/// reproduces the input exactly. Boundaries occur after sentence-ending
-/// punctuation (`.`, `!`, `?`, including any trailing inline whitespace) and
-/// after newlines.
-fn split_into_sentence_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        current.push(ch);
-        if matches!(ch, '.' | '!' | '?') {
-            while let Some(&next) = chars.peek() {
-                if next == ' ' || next == '\t' {
-                    current.push(next);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            tokens.push(std::mem::take(&mut current));
-        } else if ch == '\n' {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Detect and collapse consecutive repetitions of a cycle of sentence tokens.
-/// A "cycle" of length `c` is a run of `c` tokens repeated back-to-back; this
-/// catches both single-sentence loops and multi-sentence loops.
-fn collapse_repeated_sentence_cycles(text: &str) -> (String, bool) {
-    let tokens = split_into_sentence_tokens(text);
-    let n = tokens.len();
-    if n < DEGENERATION_MIN_RUN {
-        return (text.to_string(), false);
-    }
-    let norm: Vec<String> = tokens.iter().map(|t| t.trim().to_lowercase()).collect();
-
-    let mut out: Vec<&str> = Vec::with_capacity(n);
-    let mut did = false;
-    let mut i = 0;
-    while i < n {
-        let max_c = (n - i) / DEGENERATION_MIN_RUN;
-        let mut chosen_c = 0;
-        let mut chosen_reps = 0;
-        for c in 1..=max_c {
-            // Skip cycles whose normalized content is too short to be a
-            // meaningful loop (avoids collapsing short repeated tokens).
-            let unit_len: usize = norm[i..i + c].iter().map(String::len).sum();
-            if unit_len < DEGENERATION_MIN_UNIT_LEN {
-                continue;
-            }
-            let mut reps = 1;
-            loop {
-                let start = i + reps * c;
-                if start + c > n {
-                    break;
-                }
-                if (0..c).all(|k| norm[i + k] == norm[start + k]) {
-                    reps += 1;
-                } else {
-                    break;
-                }
-            }
-            if reps >= DEGENERATION_MIN_RUN {
-                chosen_c = c;
-                chosen_reps = reps;
-                break;
-            }
-        }
-        if chosen_c > 0 {
-            did = true;
-            for t in tokens.iter().skip(i).take(chosen_c) {
-                out.push(t);
-            }
-            i += chosen_c * chosen_reps;
-        } else {
-            out.push(&tokens[i]);
-            i += 1;
-        }
-    }
-    (out.join(""), did)
-}
-
 /// Sanitize structural protocol artifacts before text is shown to end users.
 ///
 /// Ordinary capability names are valid user-facing prose. They are not a
@@ -687,23 +552,6 @@ pub fn extract_uuid_identifiers(text: &str) -> Vec<String> {
         identifiers.insert(found.as_str().to_ascii_lowercase());
     }
     identifiers.into_iter().collect()
-}
-
-/// Remove complete lines that expose one of the exact internal identifiers.
-/// This is a last-resort fallback after the model has already received one
-/// chance to restate the outcome naturally.
-pub fn remove_lines_with_identifiers(text: &str, identifiers: &[String]) -> String {
-    text.lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            !identifiers
-                .iter()
-                .any(|identifier| lower.contains(identifier))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
 }
 
 /// Maximum length of a user-facing status-ping summary (characters, not bytes).
@@ -1193,44 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn test_collapse_degenerate_repeated_lines() {
-        let input =
-            "Here is the result.\nLoop line.\nLoop line.\nLoop line.\nLoop line.\nLoop line.";
-        let (result, collapsed) = collapse_degenerate_repetition(input);
-        assert!(collapsed);
-        assert_eq!(result.matches("Loop line.").count(), 1);
-        assert!(result.contains("Here is the result."));
-    }
-
-    #[test]
-    fn test_collapse_degenerate_repeated_sentence_cycle() {
-        let unit = "of course! I'll send another one. Which specific one were you interested in? ";
-        let input = format!("Which one would you like? {}", unit.repeat(6));
-        let (result, collapsed) = collapse_degenerate_repetition(&input);
-        assert!(collapsed);
-        // The looped unit is kept exactly once.
-        assert_eq!(result.matches("I'll send another one.").count(), 1);
-        assert!(result.contains("Which one would you like?"));
-    }
-
-    #[test]
-    fn test_collapse_leaves_normal_text_untouched() {
-        let input = "First point here. Second different point. A third unique sentence. Done.";
-        let (result, collapsed) = collapse_degenerate_repetition(input);
-        assert!(!collapsed);
-        assert_eq!(result, input);
-    }
-
-    #[test]
-    fn test_collapse_ignores_short_repetition() {
-        // Only three repeats — below the conservative threshold — stays as-is.
-        let input = "Yes. Yes. Yes.";
-        let (result, collapsed) = collapse_degenerate_repetition(input);
-        assert!(!collapsed);
-        assert_eq!(result, input);
-    }
-
-    #[test]
     fn test_redact_secrets_api_key() {
         let input = r#"{"api_key": "sk-abc123456789012345678901234567890"}"#;
         let result = redact_secrets(input);
@@ -1686,19 +1496,5 @@ mod tests {
         ));
 
         assert_eq!(found, vec![first.to_string(), second.to_string()]);
-    }
-
-    #[test]
-    fn identifier_line_filter_preserves_the_natural_outcome() {
-        let id = "34453851-0ad1-4707-b527-736a497196c5".to_string();
-        let reply = format!(
-            "I started the existing daily blog run.\n\n- Manual run: {id}\n- Status: pending\n\nI'll report when it finishes."
-        );
-
-        let filtered = remove_lines_with_identifiers(&reply, &[id]);
-
-        assert!(filtered.contains("started the existing daily blog run"));
-        assert!(!filtered.contains("Manual run"));
-        assert!(filtered.contains("I'll report when it finishes"));
     }
 }

@@ -69,46 +69,6 @@ impl ExecutionPolicy {
             },
         }
     }
-
-    pub fn escalate(&mut self, reason: impl Into<String>) -> bool {
-        let reason = reason.into();
-        let next = match self.model_profile {
-            ModelProfile::Cheap => Some(ModelProfile::Balanced),
-            ModelProfile::Balanced => Some(ModelProfile::Strong),
-            ModelProfile::Strong => None,
-        };
-        if let Some(profile) = next {
-            let mut replacement = Self::for_profile(profile);
-            replacement.policy_rev = self.policy_rev.saturating_add(1);
-            replacement
-                .escalation_reasons
-                .extend(self.escalation_reasons.iter().cloned());
-            replacement.escalation_reasons.push(reason);
-            *self = replacement;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn deescalate(&mut self) -> bool {
-        let next = match self.model_profile {
-            ModelProfile::Strong => Some(ModelProfile::Balanced),
-            ModelProfile::Balanced => Some(ModelProfile::Cheap),
-            ModelProfile::Cheap => None,
-        };
-        if let Some(profile) = next {
-            let mut replacement = Self::for_profile(profile);
-            replacement.policy_rev = self.policy_rev.saturating_add(1);
-            replacement
-                .escalation_reasons
-                .extend(self.escalation_reasons.iter().cloned());
-            *self = replacement;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,15 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn escalation_bounds() {
-        let mut policy = ExecutionPolicy::for_profile(ModelProfile::Balanced);
-        assert!(policy.escalate("stall"));
-        assert_eq!(policy.model_profile, ModelProfile::Strong);
-        assert!(!policy.escalate("already_max"));
-        assert_eq!(policy.model_profile, ModelProfile::Strong);
-    }
-
-    #[test]
     fn epistemic_uncertainty_enables_full_verification_without_changing_authority() {
         let mut bundle = PolicyBundle::from_scores(0.1, 0.0, 1.0);
         let approval = bundle.policy.approval_mode;
@@ -340,14 +291,5 @@ mod tests {
         assert_eq!(bundle.policy.verify_level, VerifyLevel::Full);
         assert_eq!(bundle.policy.approval_mode, approval);
         assert!(bundle.policy.tool_budget >= 60);
-    }
-
-    #[test]
-    fn deescalation_bounds() {
-        let mut policy = ExecutionPolicy::for_profile(ModelProfile::Balanced);
-        assert!(policy.deescalate());
-        assert_eq!(policy.model_profile, ModelProfile::Cheap);
-        assert!(!policy.deescalate());
-        assert_eq!(policy.model_profile, ModelProfile::Cheap);
     }
 }

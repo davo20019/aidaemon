@@ -193,26 +193,8 @@ async fn test_satisfied_tool_result_is_not_reopened_by_reply_wording() {
 
     assert_eq!(response, "I'm here. What would you like me to help you with?");
 
-    let call_log = harness.provider.call_log.lock().await;
-    assert!(
-        call_log.len() >= 2,
-        "expected at least two LLM calls, got {}",
-        call_log.len()
-    );
-    let second_call_has_checkpoint = call_log[1].messages.iter().any(|message| {
-        message.get("role").and_then(|r| r.as_str()) == Some("system")
-            && message
-                .get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|content| {
-                    content.contains("EXECUTION CHECKPOINT")
-                        && content.contains("Check the system details")
-                })
-    });
-    assert!(
-        second_call_has_checkpoint,
-        "second LLM call should include the execution checkpoint"
-    );
+    // The receipt satisfied the check; the reply's wording does not reopen it.
+    assert_eq!(harness.provider.call_count().await, 2);
 }
 
 // ==================== Orchestrator Tool Presence Regression Tests ====================
@@ -463,118 +445,6 @@ async fn test_unrelated_task_drops_immediate_parent_tool_evidence() {
     assert_eq!(
         user_msgs[0].get("content").and_then(|value| value.as_str()),
         Some("Who is mia?")
-    );
-}
-
-/// Regression: when the final LLM response is empty after tool calls, a
-/// synthesized "Done" message is returned. Before the fix it was NOT saved
-/// to the DB, causing the next interaction's history to merge the two user
-/// messages (missing assistant in between) and bleeding context.
-#[tokio::test]
-async fn test_synthesized_done_persisted() {
-    // At depth=0 (orchestrator), iteration 1 is the first routing call.
-    // The mock tool_call_response triggers hallucinated-tool detection which
-    // forces needs_tools=true → Simple intent → tools loaded → loop continues.
-    let provider = MockProvider::with_responses(vec![
-        // Turn 1, iteration 1: tool call
-        MockProvider::tool_call_response("system_info", "{}"),
-        // Turn 1, iteration 2 (tools available): tool call is executed
-        MockProvider::tool_call_response("system_info", "{}"),
-        // Turn 1, iteration 3: empty response → "Done" synthesis at depth=0
-        MockProvider::text_response(""),
-        // Turn 2, iteration 1: short deferral, bounced by the deferred-action gate
-        MockProvider::text_response("Let me check my memory first."),
-        // Turn 2, iteration 2 (execution): final user-visible answer
-        MockProvider::text_response("Weather is sunny."),
-    ]);
-
-    let mut harness = setup_test_agent(provider).await.unwrap();
-    // Reset to depth=0 so orchestrator mode + "Done" synthesis fires
-    harness.agent.set_test_orchestrator_mode();
-
-    // Turn 1: should trigger completion recovery (tool output or Done synthesis)
-    let r1 = harness
-        .agent
-        .handle_message(
-            "done_persist_test",
-            "Check my system info",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    // After tool execution with empty final response, the agent recovers from
-    // the latest tool output ("Here is the latest tool output:") or synthesizes "Done".
-    assert!(
-        r1.starts_with("Done")
-            || r1.starts_with("Here is the latest tool output")
-            || r1.starts_with("Here's the command output")
-            || r1.starts_with("Here are the results"),
-        "Expected Done synthesis or tool output recovery, got: {}",
-        r1
-    );
-
-    // Turn 2: different topic
-    let r2 = harness
-        .agent
-        .handle_message(
-            "done_persist_test",
-            "Tell me the weather",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(!r2.is_empty(), "Turn 2 should produce a non-empty response");
-
-    // The different-topic Turn 2 keeps Turn 1 as dialogue (so references
-    // resolve) but receives none of Turn 1's tool activity as evidence. The
-    // synthesized completion must still exist in canonical event history for
-    // explicit lookup and audit.
-    let call_log = harness.provider.call_log.lock().await;
-    let turn2_call = &call_log[3];
-    let turn2_serialized = serde_json::to_string(&turn2_call.messages).unwrap();
-    assert!(turn2_serialized.contains("Check my system info"));
-    assert!(
-        turn2_call.messages.iter().all(|message| {
-            message.get("role").and_then(|role| role.as_str()) != Some("tool")
-                && message.get("tool_calls").is_none()
-        }),
-        "a new request must not see an earlier task's tool activity: {turn2_serialized}"
-    );
-    drop(call_log);
-
-    let canonical = harness
-        .agent
-        .event_store()
-        .get_conversation_history("done_persist_test", 100)
-        .await
-        .unwrap();
-    assert_eq!(
-        canonical
-            .iter()
-            .filter(|message| message.role == "user")
-            .count(),
-        2,
-        "both user messages must remain in canonical history"
-    );
-    let completion_assistant = canonical.iter().any(|message| {
-        message.role == "assistant"
-            && message.content.as_deref().is_some_and(|content| {
-                content.starts_with("Done")
-                    || content.starts_with("Here is the latest tool output")
-                    || content.starts_with("Here's the command output")
-                    || content.starts_with("Here are the results")
-                    || content.starts_with("Here's")
-            })
-    });
-    assert!(
-        completion_assistant,
-        "canonical history should contain the persisted completion assistant message from Turn 1"
     );
 }
 

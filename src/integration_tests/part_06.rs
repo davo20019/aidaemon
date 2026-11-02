@@ -386,67 +386,6 @@ async fn test_typed_observation_survives_multiple_no_tool_candidates() {
     );
 }
 
-/// Trust tier does not weaken typed execution obligations. An Autonomous model
-/// chooses its own strategy, but it still gets one bounded evidence pass before
-/// a zero-tool text response may terminate the task.
-#[tokio::test]
-async fn test_autonomous_tier_performs_bounded_execution_evidence_pass() {
-    let deferred_text =
-        "I'll find your resume and send it over right away.\nStarting the send-resume workflow...";
-    let provider = MockProvider::with_responses(vec![
-        // 1) First call: text with no evidence. The obligation controller asks
-        //    the same capable model to resolve the request with a tool.
-        MockProvider::text_response(deferred_text),
-        // 2) The model chooses the tool; the controller does not prescribe the
-        //    implementation strategy.
-        MockProvider::tool_call_response("system_info", "{}"),
-        // 3) A concrete result may now be presented.
-        MockProvider::text_response("I completed the requested system inspection."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
-
-    let policy = crate::config::PolicyConfig {
-        trust_tier: "autonomous".to_string(),
-        ..Default::default()
-    };
-    let harness =
-        setup_test_agent_with_models_and_policy(provider, "primary-model", "smart-model", policy)
-            .await
-            .unwrap();
-
-    let response = harness
-        .agent
-        .handle_message(
-            "autonomous_deferred_session",
-            "Run the command pwd on this machine and summarize the result.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "I completed the requested system inspection.");
-    assert_eq!(
-        harness.provider.call_count().await,
-        3,
-        "the Autonomous model should receive exactly one evidence-seeking retry"
-    );
-    let calls = harness.provider.call_log.lock().await;
-    assert!(calls.iter().any(|call| matches!(
-        call.options.tool_choice,
-        crate::traits::ToolChoiceMode::Required
-    )));
-}
-
 #[tokio::test]
 async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() {
     let denial = "I cannot change that setting because no matching control is exposed.";
@@ -494,10 +433,6 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
     let calls = harness.provider.call_log.lock().await;
     assert_eq!(calls.len(), 3);
     let recovery = &calls[1];
-    assert!(matches!(
-        recovery.options.tool_choice,
-        crate::traits::ToolChoiceMode::Required
-    ));
     assert!(recovery.messages.iter().any(|message| {
         message
             .get("content")

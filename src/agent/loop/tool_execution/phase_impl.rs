@@ -1,13 +1,8 @@
-mod budget_blocking;
 mod execution_io;
-mod guards;
-mod post_loop;
 mod project_dir;
 mod reflection;
-mod result_learning;
 mod run;
 mod run_helpers;
-mod types;
 
 pub(in crate::agent) use execution_io::{durable_replay_preflight, DurableReplayPreflight};
 pub(in crate::agent) use project_dir::{
@@ -15,7 +10,6 @@ pub(in crate::agent) use project_dir::{
     project_instruction_targets_for_tool_call,
 };
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
-pub(in crate::agent) use run::run_tool_execution_phase;
 pub(in crate::agent) use run::{
     mandate_gate_for_tool_call, parse_checklist_from_result, MandateGateDecision,
 };
@@ -33,4 +27,3 @@ pub(in crate::agent) use run_helpers::{
     build_external_action_completion_ack, should_build_external_action_ack,
     summarize_completed_tool_result, tool_result_indicates_background_detach,
 };
-pub(in crate::agent) use types::ToolExecutionCtx;

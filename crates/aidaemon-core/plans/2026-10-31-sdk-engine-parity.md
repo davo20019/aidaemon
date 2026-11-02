@@ -260,8 +260,33 @@ ported (each with a test that fails without it):
 Dropped: edit_file whitespace retry, computer-use thinking suppression (local-model
 workarounds), terminal read/write-root projection prelude.
 
-Next: delete the dead legacy code (clippy `-D warnings`), re-assert/delete the legacy
-tests, whole-branch review.
+## Task 8 Steps 2-3 (2026-11-02)
+
+Dead legacy code deleted until `cargo clippy --all-features -- -D warnings` is clean
+(span-driven deletion, then orphaned impls, imports, variants and fields; the
+`#[allow(dead_code)]` suppressions in `src/agent/loop/` were removed first). The deletion
+surfaced more unported behavior, now ported with tests:
+
+- `Err` tool results get a `FailedPermanent` receipt; kernel-side refusals (unknown tool,
+  invalid arguments, hook denial) are recorded in the run ledger through the event sink.
+- Contract-free runs whose operations all failed close `failed`; a pending ledger with no
+  operations closes `failed`, not `partial` (`RunAggregate::only_failed_operations`).
+- `computer_use` model pin and the unverified-coordinate-click guard (bounded, in the stop
+  hook); 80% task and scheduled-run budget warnings; checklist projection reconciliation at
+  completion; llama.cpp slot pin; closeout `proof_basis`, replay and invalidation decision
+  points; projected source ids on model-call telemetry; repetition-guard harness telemetry.
+
+The 4 open items: `dispatcher_argument_rejection` passes; the specialist timeout is now a
+typed failed outcome (test re-asserted on it, no phrase gate); the empty-reply retry stays
+(test deleted); kernel refusals are in the ledger.
+
+Legacy-only tests: re-asserted on typed state where the outcome holds (receipts, outcomes,
+call counts, decision points), deleted where they pinned a dropped mechanism (forcing,
+plan/critique/evidence gates, reflection, read cache, prose truncation, projection prelude,
+dialogue scope gate). Harness eval fixtures follow the kernel's bounds (stuck detector: two
+nudges, then stop; closeout cap 2).
+
+Next: whole-branch review; live N-of-M runs on goals and mandates.
 
 ## Out of scope (owner decisions)
 

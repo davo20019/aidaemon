@@ -255,10 +255,6 @@ pub(in crate::agent) fn project_dir_from_tool_args(
         .next()
 }
 
-pub(super) fn tool_call_includes_project_path(tool_name: &str, args_json: &str) -> bool {
-    project_dir_from_tool_args(tool_name, args_json).is_some()
-}
-
 pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
     tool_name: &str,
     args_json: &str,
@@ -337,117 +333,6 @@ pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
     Some((updated, injected_dir))
 }
 
-pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
-    let backend = crate::execution::active_execution_backend();
-    let (scope, candidate) = if backend.kind() == crate::execution::BackendKind::Local {
-        let Some(scope) = crate::tools::fs_utils::validate_path(scope_path).ok() else {
-            return true;
-        };
-        let Some(candidate) = crate::tools::fs_utils::validate_path(candidate_path).ok() else {
-            return true;
-        };
-        (scope, candidate)
-    } else {
-        let Some(scope) = crate::execution::normalize_active_path_lexically(scope_path)
-            .ok()
-            .map(|path| std::path::PathBuf::from(path.as_str()))
-        else {
-            return false;
-        };
-        let Some(candidate) = crate::execution::normalize_active_path_lexically(candidate_path)
-            .ok()
-            .map(|path| std::path::PathBuf::from(path.as_str()))
-        else {
-            return false;
-        };
-        (scope, candidate)
-    };
-    // Allow descendant paths (original behavior)
-    if candidate.starts_with(&scope) {
-        return true;
-    }
-    // Allow ancestor paths up to 2 levels above the scope.
-    // This lets users search parent directories (e.g. "find Rust projects in ~/projects/"
-    // when scope is locked to ~/projects/aidaemon/). The bot can already reach these via
-    // terminal, so blocking search_files just forces a worse fallback.
-    if scope.starts_with(&candidate) {
-        let relative = scope
-            .strip_prefix(&candidate)
-            .unwrap_or(std::path::Path::new(""));
-        let depth = relative.components().count();
-        return depth <= 2;
-    }
-    false
-}
-
-pub(super) fn is_file_recheck_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "search_files" | "project_inspect")
-}
-
-pub(super) fn extract_project_dir_from_project_inspect_output(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = trimmed.strip_prefix("# Project: ") {
-            return normalize_project_dir(path.trim());
-        }
-    }
-    None
-}
-
-pub(super) fn project_inspect_reports_file_entries(output: &str) -> bool {
-    let mut in_structure = false;
-    let mut in_code_block = false;
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if !in_structure {
-            if trimmed.eq_ignore_ascii_case("## Structure") {
-                in_structure = true;
-            }
-            continue;
-        }
-
-        if trimmed == "```" {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if !in_code_block || trimmed.is_empty() {
-            continue;
-        }
-
-        if !trimmed.ends_with('/') {
-            return true;
-        }
-    }
-
-    false
-}
-
-pub(super) fn extract_search_files_scanned_dir(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let Some(idx) = line.find("files scanned in ") else {
-            continue;
-        };
-        let rest = &line[idx + "files scanned in ".len()..];
-        let raw_path = rest
-            .trim()
-            .trim_end_matches(')')
-            .trim_end_matches(':')
-            .trim();
-        if raw_path.is_empty() {
-            continue;
-        }
-        if let Some(normalized) = normalize_project_dir(raw_path) {
-            return Some(normalized);
-        }
-    }
-    None
-}
-
-pub(super) fn search_files_result_no_matches(output: &str) -> bool {
-    output.to_ascii_lowercase().contains("no matches found")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,31 +382,6 @@ mod tests {
         let updated =
             maybe_inject_project_dir_into_tool_args("search_files", args, Some("/tmp/inferred"));
         assert!(updated.is_none());
-    }
-
-    #[test]
-    fn parses_project_inspect_and_search_paths() {
-        let inspect = "# Project: /tmp/dogs\n\n## Structure\n```\nindex.html\nstyles.css\n```\n";
-        let search = "No matches found (0 files scanned in /tmp/dogs)";
-        assert_eq!(
-            extract_project_dir_from_project_inspect_output(inspect).as_deref(),
-            Some("/tmp/dogs")
-        );
-        assert!(project_inspect_reports_file_entries(inspect));
-        assert_eq!(
-            extract_search_files_scanned_dir(search).as_deref(),
-            Some("/tmp/dogs")
-        );
-        assert!(search_files_result_no_matches(search));
-
-        // Current search_files output keeps the dir at end-of-line (no glued
-        // paren); both formats must extract.
-        let search_current = "No matches found. 0 files scanned in /tmp/dogs";
-        assert_eq!(
-            extract_search_files_scanned_dir(search_current).as_deref(),
-            Some("/tmp/dogs")
-        );
-        assert!(search_files_result_no_matches(search_current));
     }
 
     #[test]
@@ -656,19 +516,6 @@ mod tests {
         let parsed: Value = serde_json::from_str(&updated).expect("valid arguments");
         assert_eq!(parsed["working_dir"], injected);
         assert_eq!(parsed["command"], "cd /tmp/explicit && npm run build");
-    }
-
-    #[test]
-    fn scope_allows_descendant_and_near_ancestor_paths() {
-        // Descendant: always allowed
-        assert!(scope_allows_project_dir("/tmp/a", "/tmp/a/src"));
-        // Sibling: blocked
-        assert!(!scope_allows_project_dir("/tmp/a", "/tmp/b/src"));
-        // Ancestor up to 2 levels: allowed
-        assert!(scope_allows_project_dir("/tmp/a/b", "/tmp/a")); // 1 level up
-        assert!(scope_allows_project_dir("/tmp/a/b/c", "/tmp/a")); // 2 levels up
-                                                                   // Ancestor more than 2 levels: blocked
-        assert!(!scope_allows_project_dir("/tmp/a/b/c/d", "/tmp/a")); // 3 levels up
     }
 
     #[test]

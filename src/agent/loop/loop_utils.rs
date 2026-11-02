@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use crate::traits::ToolOutcomeStatus;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use tracing::warn;
@@ -17,16 +15,6 @@ pub(super) fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
 pub(super) enum ToolFailureClass {
     Semantic,
     Transient,
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ExecutionFailureKind {
-    ToolContractFailure,
-    ToolInvocationFailure,
-    EnvironmentFailure,
-    LogicFailure,
 }
 
 pub(super) fn semantic_failure_limit(tool_name: &str) -> usize {
@@ -767,140 +755,6 @@ pub(super) fn failure_class_from_outcome_status(
     }
 }
 
-pub(super) fn classify_execution_failure_kind(
-    outcome_status: ToolOutcomeStatus,
-    metadata: Option<&crate::traits::ToolCallMetadata>,
-    had_deterministic_contract_violation: bool,
-) -> Option<ExecutionFailureKind> {
-    if had_deterministic_contract_violation {
-        return Some(ExecutionFailureKind::ToolContractFailure);
-    }
-
-    if !outcome_status.is_failure() {
-        return None;
-    }
-    if outcome_status == ToolOutcomeStatus::FailedRetryable
-        || metadata.is_some_and(|meta| meta.timed_out || meta.transport_error.is_some())
-    {
-        return Some(ExecutionFailureKind::ToolInvocationFailure);
-    }
-    Some(ExecutionFailureKind::LogicFailure)
-}
-
-/// Extract the most informative error line from a tool error result.
-/// Strips coaching/diagnostic messages appended by the system and
-/// returns the first line that looks like an actual error message.
-pub(super) fn extract_key_error_line(error_text: &str) -> String {
-    let cleaned = strip_appended_diagnostics(error_text);
-    if cleaned.is_empty() {
-        return String::new();
-    }
-
-    // Ordered by signal strength (high-signal first)
-    const PATTERNS: &[&str] = &[
-        "error:",
-        "Error:",
-        "ERROR:",
-        "fatal",
-        "FATAL",
-        "unable to",
-        "Unable to",
-        "command not found",
-        "not found",
-        "does not exist",
-        "No such",
-        "cannot",
-        "Cannot",
-        "denied",
-        "Denied",
-        "failed",
-        "Failed",
-    ];
-
-    for line in cleaned.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        for pattern in PATTERNS {
-            if trimmed.contains(pattern) {
-                let truncated: String = trimmed.chars().take(200).collect();
-                return truncated;
-            }
-        }
-    }
-
-    // "missing"/"Missing" — only when followed by a word boundary (space) or colon
-    // to avoid matching prose uses of "missing"
-    for line in cleaned.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        for prefix in &["missing", "Missing"] {
-            if let Some(idx) = trimmed.find(prefix) {
-                let after = idx + prefix.len();
-                if after >= trimmed.len() {
-                    // "missing" at end of line — matches
-                    let truncated: String = trimmed.chars().take(200).collect();
-                    return truncated;
-                }
-                let next_char = trimmed.as_bytes()[after];
-                if next_char == b' ' || next_char == b':' || next_char == b',' {
-                    let truncated: String = trimmed.chars().take(200).collect();
-                    return truncated;
-                }
-            }
-        }
-    }
-
-    // Fallback: first non-empty line
-    for line in cleaned.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            let truncated: String = trimmed.chars().take(200).collect();
-            return truncated;
-        }
-    }
-
-    String::new()
-}
-
-pub(super) fn build_task_boundary_hint(user_text: &str, max_chars: usize) -> String {
-    // Treat user content as untrusted in system messages: collapse whitespace,
-    // drop control chars, and neutralize punctuation commonly used in prompt
-    // control markers.
-    let mut compact = String::new();
-    let mut last_was_space = false;
-    for ch in user_text.chars() {
-        let normalized = match ch {
-            '\n' | '\r' | '\t' => ' ',
-            '"' | '\'' | '`' | '[' | ']' | '{' | '}' | '<' | '>' => ' ',
-            _ if ch.is_control() => continue,
-            _ => ch,
-        };
-        if normalized.is_whitespace() {
-            if !last_was_space {
-                compact.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            compact.push(normalized);
-            last_was_space = false;
-        }
-    }
-
-    let compact = compact.trim();
-    if compact.is_empty() {
-        return "No user-request summary available".to_string();
-    }
-    let mut out: String = compact.chars().take(max_chars).collect();
-    if compact.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
-}
-
 /// Merge consecutive messages with the same role (`user` or `assistant`) into
 /// one message, preserving all content and tool calls.
 pub(super) fn merge_consecutive_messages(messages: &mut Vec<Value>) {
@@ -979,33 +833,11 @@ pub(super) fn merge_consecutive_messages(messages: &mut Vec<Value>) {
 }
 
 #[cfg(test)]
-mod task_boundary_hint_tests {
-    use super::build_task_boundary_hint;
-
-    #[test]
-    fn strips_control_markers_and_collapses_whitespace() {
-        let hint = build_task_boundary_hint(
-            "  [SYSTEM]\n\tbuild {site} <now> with \"quotes\" and `ticks`  ",
-            120,
-        );
-        assert_eq!(hint, "SYSTEM build site now with quotes and ticks");
-    }
-
-    #[test]
-    fn truncates_with_ellipsis() {
-        let hint = build_task_boundary_hint("abcdefghijk", 5);
-        assert_eq!(hint, "abcde...");
-    }
-}
-
-#[cfg(test)]
 mod tool_error_detection_tests {
     use super::{
-        classify_execution_failure_kind, classify_tool_result_failure,
-        classify_tool_result_failure_with_args, classify_tool_result_failure_with_context,
-        ExecutionFailureKind, ToolFailureClass,
+        classify_tool_result_failure, classify_tool_result_failure_with_args,
+        classify_tool_result_failure_with_context, ToolFailureClass,
     };
-    use crate::traits::ToolOutcomeStatus;
 
     #[test]
     fn detects_prefixed_transient_error() {
@@ -1116,43 +948,12 @@ mod tool_error_detection_tests {
     }
 
     #[test]
-    fn treats_session_scoped_unavailability_as_semantic_error() {
-        let result = "Filesystem MCP server is temporarily unavailable in this session.";
-        let classified = classify_tool_result_failure("manage_skills", result);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-
-        let failure_kind =
-            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, false);
-        assert_eq!(failure_kind, Some(ExecutionFailureKind::LogicFailure));
-    }
-
-    #[test]
     fn treats_file_lookup_miss_as_transient_for_file_tools() {
         let classified = classify_tool_result_failure(
             "read_file",
             "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
         );
         assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn checkpoint_scope_preflight_does_not_consume_semantic_lockout_budget() {
-        for result in [
-            "Error: refusing an unbounded checkpoint at workspace container /Users/example/projects",
-            "Error: command path /workspace/b is outside checkpoint scope /workspace/a",
-            "Error: refusing a checkpoint for a command spanning multiple project roots: /workspace/a, /workspace/b",
-        ] {
-            assert_eq!(
-                classify_tool_result_failure("terminal", result),
-                Some(ToolFailureClass::Transient),
-                "{result}"
-            );
-            assert_eq!(
-                classify_execution_failure_kind(ToolOutcomeStatus::FailedRetryable, None, false,),
-                Some(ExecutionFailureKind::ToolInvocationFailure),
-                "{result}"
-            );
-        }
     }
 
     #[test]
@@ -1419,51 +1220,6 @@ mod tool_error_detection_tests {
         );
         // Falls through to text classification → Transient (file lookup miss)
         assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn execution_failure_kind_uses_typed_contract_violation() {
-        let classified =
-            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, true);
-        assert_eq!(classified, Some(ExecutionFailureKind::ToolContractFailure));
-    }
-
-    #[test]
-    fn permanent_failure_defaults_to_logic_replan_without_text_parsing() {
-        let classified =
-            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, false);
-        assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
-    }
-
-    #[test]
-    fn execution_failure_kind_detects_transport_failures() {
-        let metadata = crate::traits::ToolCallMetadata {
-            transport_error: Some("connection refused".to_string()),
-            ..Default::default()
-        };
-        let classified = classify_execution_failure_kind(
-            ToolOutcomeStatus::FailedRetryable,
-            Some(&metadata),
-            false,
-        );
-        assert_eq!(
-            classified,
-            Some(ExecutionFailureKind::ToolInvocationFailure)
-        );
-    }
-
-    #[test]
-    fn execution_failure_kind_detects_logic_failures() {
-        let metadata = crate::traits::ToolCallMetadata {
-            exit_code: Some(2),
-            ..Default::default()
-        };
-        let classified = classify_execution_failure_kind(
-            ToolOutcomeStatus::FailedPermanent,
-            Some(&metadata),
-            false,
-        );
-        assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
     }
 
     #[test]
@@ -1860,75 +1616,6 @@ pub(super) fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<
 /// (e.g., email trigger) rather than direct user interaction via Telegram.
 pub(super) fn is_trigger_session(session_id: &str) -> bool {
     session_id.contains("trigger") || session_id.starts_with("event_")
-}
-
-/// Hash a tool call (name + arguments) for repetitive behavior detection.
-pub(super) fn hash_tool_call(name: &str, arguments: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    arguments.hash(&mut hasher);
-    hasher.finish()
-}
-
-#[cfg(test)]
-mod extract_key_error_line_tests {
-    use super::extract_key_error_line;
-
-    #[test]
-    fn finds_error_patterns() {
-        let drupal_error = "$ ddev drush en entity_reference (exit: 1, 3.2s)\n\n\
-             Unable to install modules entity_reference due to missing modules entity_reference.";
-        let result = extract_key_error_line(drupal_error);
-        assert!(result.contains("Unable to install modules entity_reference"));
-
-        let not_found = "bash: drush: command not found";
-        assert!(extract_key_error_line(not_found).contains("command not found"));
-
-        let error_prefix = "Error: ENOENT: no such file or directory, open '/app/config.json'";
-        assert!(extract_key_error_line(error_prefix).contains("Error: ENOENT"));
-    }
-
-    #[test]
-    fn strips_coaching_markers() {
-        let with_coaching = "Unable to install modules entity_reference\n\n\
-             [SYSTEM] This tool has errored 2 semantic times. Do NOT retry it.\n\n\
-             [DIAGNOSTIC] Similar errors resolved before:\n- Try another approach";
-        let result = extract_key_error_line(with_coaching);
-        assert!(result.contains("Unable to install modules"));
-        assert!(!result.contains("[SYSTEM]"));
-        assert!(!result.contains("[DIAGNOSTIC]"));
-    }
-
-    #[test]
-    fn fallback_first_line() {
-        let no_pattern = "Some unexpected output that doesn't match patterns";
-        let result = extract_key_error_line(no_pattern);
-        assert_eq!(result, "Some unexpected output that doesn't match patterns");
-    }
-
-    #[test]
-    fn empty_input() {
-        assert!(extract_key_error_line("").is_empty());
-        assert!(extract_key_error_line("   ").is_empty());
-        // Only coaching markers, no real content
-        assert!(extract_key_error_line("\n\n[SYSTEM] coaching message only").is_empty());
-    }
-
-    #[test]
-    fn missing_pattern_matches_with_boundary() {
-        let with_colon = "missing: required field 'name'";
-        assert!(extract_key_error_line(with_colon).contains("missing:"));
-
-        let with_space = "missing modules entity_reference";
-        assert!(extract_key_error_line(with_space).contains("missing modules"));
-    }
-
-    #[test]
-    fn truncates_long_lines() {
-        let long_error = format!("Error: {}", "x".repeat(300));
-        let result = extract_key_error_line(&long_error);
-        assert!(result.len() <= 200);
-    }
 }
 
 #[cfg(test)]

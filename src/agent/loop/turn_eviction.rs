@@ -2,7 +2,6 @@
 //!
 //! The new field/module is unused until Task 7 (the message-build integration
 //! consumes it); keep the lib clippy gate clean in the meantime.
-#![allow(dead_code)]
 
 pub(crate) fn archived_budget(
     context_budget: usize,

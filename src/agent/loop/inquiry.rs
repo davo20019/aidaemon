@@ -410,24 +410,6 @@ pub(in crate::agent) fn requirement_has_builtin_evidence_route(
     })
 }
 
-pub(in crate::agent) fn tool_call_supports_any_requirement(
-    tool_name: &str,
-    arguments: &str,
-    requirements: &[RequestEvidenceRequirement],
-) -> bool {
-    let capabilities = evidence_capabilities_for_tool_call(tool_name, arguments);
-    requirements.iter().any(|requirement| {
-        requirement_is_exact_invocation(requirement)
-            && requirement
-                .receipt
-                .as_ref()
-                .is_some_and(|receipt| receipt.tool_names.iter().any(|name| name == tool_name))
-            || capabilities
-                .iter()
-                .any(|capability| capability_supports_requirement(capability, requirement))
-    })
-}
-
 pub(in crate::agent) fn candidate_tools_for_requirements<'a>(
     requirements: &[RequestEvidenceRequirement],
     visible_tool_names: impl IntoIterator<Item = &'a str>,
@@ -652,53 +634,6 @@ mod tests {
                     .purposes
                     .contains(&EvidencePurpose::HistoricalRecord)
         }));
-    }
-
-    #[test]
-    fn secondary_domain_tool_is_relevant_to_a_compound_evidence_contract() {
-        let need = requirement(
-            ToolSemanticScope::ExternalRemote,
-            EvidencePurpose::CurrentState,
-            EvidenceAuthority::Direct,
-            EvidenceTemporalScope::Current,
-        );
-        assert!(tool_call_supports_any_requirement(
-            "http_request",
-            r#"{"method":"GET","url":"https://example.test/feed"}"#,
-            &[need],
-        ));
-    }
-
-    #[test]
-    fn node_receipt_tools_cover_current_state_and_playback_outcome_needs() {
-        let current_state = requirement(
-            ToolSemanticScope::ExternalRemote,
-            EvidencePurpose::CurrentState,
-            EvidenceAuthority::Direct,
-            EvidenceTemporalScope::Current,
-        );
-        let playback_outcome = requirement(
-            ToolSemanticScope::ExternalRemote,
-            EvidencePurpose::Outcome,
-            EvidenceAuthority::Direct,
-            EvidenceTemporalScope::Current,
-        );
-
-        assert!(tool_call_supports_any_requirement(
-            "read_node_health",
-            r#"{"node":"Synthetic Companion"}"#,
-            std::slice::from_ref(&current_state),
-        ));
-        assert!(tool_call_supports_any_requirement(
-            "send_node_audio",
-            r#"{"node":"Synthetic Companion","text":"Hello"}"#,
-            std::slice::from_ref(&playback_outcome),
-        ));
-        assert!(!tool_call_supports_any_requirement(
-            "read_node_health",
-            r#"{"node":"Synthetic Companion"}"#,
-            &[playback_outcome],
-        ));
     }
 
     #[test]

@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.
+- **The legacy loop's code is deleted** (about 37,000 lines): its phases, gates, forcing ladder, recovery builders and the tests that only exercised them. The replay-note learning channel, which only the dropped gates fed, is gone with them.
 - **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
 - **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
 - **`set_reminder` tool.** A plain reminder takes two required fields, `message` and `when`, instead of an action inside the 24-action `manage_memories` (where cheaper models picked the wrong action or dropped the schedule).
@@ -27,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A call without a directory runs in the request's project directory (a scheduled goal's bound workspace), not the daemon's cwd.
   - The controller refuses protected host data and undeclared writes outside the task boundary, and an exact out-of-scope terminal target goes to the approval prompt.
   - Tools run under the configured call timeout.
+  - A tool that returns an error, and a call the kernel refuses itself (unknown tool, invalid arguments, the same-tool limit), now leave a typed receipt in the run ledger.
+  - A `computer_use` loop's pinned vision model serves the rest of its task, and a GUI success claim waits for a look after an unverified coordinate click.
+- **Task outcomes follow receipts.** A run with no contract whose operations all failed is recorded as failed, and a run that owed work but ran nothing is failed rather than partial. Before, both could read as succeeded or partial.
+- **Budget pressure is visible again.** A task or scheduled run gets one warning at 80% of its token budget before it is stopped.
+- **Finished checklists don't come back.** Advisory checklist steps are closed when the run completes, so a restart no longer pauses the plan and asks to resume finished work.
 - **Mandate reviews end on their decision.** A committed WAIT, ASK or STOP ends the review without another model call, and an exhausted cycle balance closes from that decision (or a bounded WAIT) instead of failing as a provider error.
 - **Stopped runs reply in plain language.** A run that hits a limit, gets stuck or loses the provider no longer shows internal debug text; its reply is sanitized, provider errors are redacted, and secrets are filtered on public channels.
 - **Learning sees failures again.** Tool errors and the recoveries that follow feed error solutions and failure patterns; failed model calls are recorded in telemetry; token estimates are calibrated; a provider blip before any work gets the longer retry ladder; and a reply cut off while thinking lowers reasoning effort for the next call.

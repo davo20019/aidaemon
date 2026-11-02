@@ -11,15 +11,9 @@
 //! tool results summarized; identity-critical verbatim; terminal-state
 //! placeholder when no substantive assistant remains).
 
-// The public renderer and its helpers are consumed by the message-build
-// integration in Task 7 (Pillar B). Until then they have no in-crate caller
-// outside this module's own golden tests, so silence dead-code lints.
-#![allow(dead_code)]
-
 use super::recall_guardrails::text_relates_to_critical_identity;
 use super::sliding_window::summarize_tool_result;
-// `Message`, `ToolCall`, `json`, `Value`, and `MAX_OLD_ASSISTANT_CONTENT_CHARS`
-// all live in the `agent` module scope.
+// `Message`, `ToolCall`, `json` and `Value` live in the `agent` module scope.
 use super::*;
 use crate::config::{AudioConfig, SttConfig, VisionConfig};
 use crate::events::TerminalState;
@@ -134,21 +128,6 @@ pub(crate) fn is_failure_boilerplate(content: &str) -> bool {
         || t.starts_with("This scheduled run hit its per-run processing budget")
         || t.starts_with("I sent the requested file(s), but ran into issues")
         || t.starts_with("I completed the main deliverable but wasn't able to finish")
-}
-
-/// Char-safe truncation to the old-assistant cap. Matches the legacy inline
-/// behaviour: take the first N *characters* (never byte-slicing) and append an
-/// ellipsis only when content actually exceeded the cap.
-fn truncate_old_assistant(content: &str) -> String {
-    if content.chars().count() > MAX_OLD_ASSISTANT_CONTENT_CHARS {
-        let truncated: String = content
-            .chars()
-            .take(MAX_OLD_ASSISTANT_CONTENT_CHARS)
-            .collect();
-        format!("{}…", truncated)
-    } else {
-        content.to_string()
-    }
 }
 
 fn retain_adjacent_tool_result(content: &str) -> String {
@@ -756,7 +735,8 @@ mod tests {
                     1. Search your entire machine for anything related to \"Acme\"?\n\
                     2. Look in other common folders like `~/Documents` or `~/Downloads`?\n\
                     3. Send you one of your other recent resumes instead?";
-        assert!(menu.chars().count() > MAX_OLD_ASSISTANT_CONTENT_CHARS);
+        // Longer than the 200-char cap old assistant turns were truncated to.
+        assert!(menu.chars().count() > 200);
         let turn = vec![user("Send me my Acme resume"), assistant(menu)];
         let out = render_turn(
             &turn,

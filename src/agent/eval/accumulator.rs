@@ -1,4 +1,4 @@
-use crate::agent::{CompletionContract, CompletionProgress};
+use crate::agent::CompletionContract;
 use crate::events::{
     HarnessEvalSnapshot, HarnessScoresPayload, QualityEvalPayload, RoutingEvalPayload,
     TaskEfficiencyData, TaskOutcome,
@@ -223,66 +223,15 @@ impl HarnessEvalAccumulator {
         }
     }
 
-    pub fn record_message_build(
-        &mut self,
-        tool_defs_count: u32,
-        est_input_tokens: u32,
-        context_drops: u32,
-    ) {
-        self.progress.tool_defs_count = tool_defs_count;
-        self.progress.est_input_tokens = est_input_tokens;
-        self.progress.context_drops = context_drops;
-    }
-
-    pub fn record_evidence_gate_block(&mut self) {
-        self.evidence_gate_blocks = self.evidence_gate_blocks.saturating_add(1);
-    }
-
-    pub fn record_critique_replan(&mut self) {
-        self.critique_replan_fires = self.critique_replan_fires.saturating_add(1);
-    }
-
-    pub fn record_deferred_no_tool_event(&mut self) {
-        self.progress.deferred_no_tool_events =
-            self.progress.deferred_no_tool_events.saturating_add(1);
+    /// A repetition guard fired: the same-tool limit denied a call, or the
+    /// kernel's stuck detector saw the run repeating itself.
+    pub fn record_repetition_guard(&mut self) {
+        self.progress.repetition_guard_fires =
+            self.progress.repetition_guard_fires.saturating_add(1);
     }
 
     pub fn record_budget_extension(&mut self) {
         self.progress.budget_extensions = self.progress.budget_extensions.saturating_add(1);
-    }
-
-    pub fn record_model_escalated(&mut self) {
-        self.model_escalated = true;
-    }
-
-    pub fn record_iteration_progress(
-        &mut self,
-        iteration: u32,
-        tool_calls_attempted: u32,
-        tool_calls_succeeded: u32,
-        evidence_gain: u32,
-        no_progress: bool,
-    ) {
-        self.progress.iterations = iteration;
-        self.progress.tool_calls_attempted = tool_calls_attempted;
-        self.progress.tool_calls_succeeded = tool_calls_succeeded;
-        self.progress.evidence_gain_total = evidence_gain;
-        if no_progress {
-            self.progress.no_progress_iterations =
-                self.progress.no_progress_iterations.saturating_add(1);
-        }
-        if tool_calls_succeeded > 0 {
-            self.tools_actually_used = true;
-        }
-    }
-
-    pub fn record_stall_guard(&mut self) {
-        self.progress.stall_guard_fires = self.progress.stall_guard_fires.saturating_add(1);
-    }
-
-    pub fn record_repetition_guard(&mut self) {
-        self.progress.repetition_guard_fires =
-            self.progress.repetition_guard_fires.saturating_add(1);
     }
 
     pub fn record_completion_contract(&mut self, contract: &CompletionContract) {
@@ -299,39 +248,9 @@ impl HarnessEvalAccumulator {
             self.contract.forbidden_mutation_attempts.saturating_add(1);
     }
 
-    pub fn record_plan_progress(&mut self, completed: u32, total: u32) {
-        self.progress.plan_steps_completed = Some(completed);
-        self.progress.plan_steps_total = Some(total);
-    }
-
-    pub fn record_completion_progress(&mut self, progress: &CompletionProgress) {
-        self.contract.mutation_attempt_count = progress.mutation_attempt_count as u32;
-        self.contract.indeterminate_mutation_count = progress.indeterminate_mutation_count as u32;
-        self.contract.mutation_count = progress.mutation_count as u32;
-        self.contract.observation_count = progress.observation_count as u32;
-        self.contract.verification_count = progress.verification_count as u32;
-        self.contract.verification_blocks = progress.verification_block_count as u32;
-        self.contract.evidence_requirements_satisfied =
-            progress.satisfied_evidence_requirements() as u32;
-        self.progress.observation_count = progress.observation_count as u32;
-        self.progress.verification_count = progress.verification_count as u32;
-    }
-
-    pub fn record_post_exec_validation_failure(&mut self) {
-        self.post_exec_validation_failures = self.post_exec_validation_failures.saturating_add(1);
-    }
-
     #[allow(dead_code)] // wired when unrecovered error paths gain eval hooks
     pub fn record_unrecovered_error(&mut self) {
         self.unrecovered_errors = self.unrecovered_errors.saturating_add(1);
-    }
-
-    pub fn record_approval_denied(&mut self) {
-        self.approval_denied = true;
-    }
-
-    pub fn record_stop_reason(&mut self, reason: StopReason) {
-        self.stop_reason = reason;
     }
 
     pub fn record_llm_efficiency(&mut self, efficiency: &TaskEfficiencyData) {

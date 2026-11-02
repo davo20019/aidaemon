@@ -7,6 +7,23 @@
 // what the model receives, read from the provider's own call log.
 // ==========================================================================
 
+/// The effective outcome of the latest task in `session`.
+async fn latest_task_outcome(
+    harness: &crate::testing::TestHarness,
+    session: &str,
+) -> crate::events::TaskOutcome {
+    harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::TaskEnd], 5)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end")
+        .effective_outcome()
+}
+
 /// The tool messages the model received on its `call`-th request.
 async fn tool_messages_seen_by_model(harness: &crate::testing::TestHarness, call: usize) -> Vec<String> {
     let log = harness.provider.call_log.lock().await;
@@ -340,5 +357,92 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
         harness.provider.call_count().await - calls_before,
         1,
         "no model call after the committed decision"
+    );
+}
+
+/// Stand-in for the GUI tool's pin registry effects: `gui_click` pins a model
+/// and leaves an unverified coordinate click, `gui_look` verifies it.
+#[cfg(feature = "computer_use")]
+struct GuiStandIn {
+    name: &'static str,
+}
+
+#[cfg(feature = "computer_use")]
+#[async_trait::async_trait]
+impl crate::traits::Tool for GuiStandIn {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "GUI test tool"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "description": "GUI test tool",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn call(&self, args: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args)?;
+        let task_id = args["_task_id"].as_str().unwrap_or_default().to_string();
+        let pins = crate::tools::computer_use::pin_registry::ComputerUsePinRegistry::shared();
+        if self.name == "gui_click" {
+            pins.pin(task_id.clone(), "synthetic-vision-model").await;
+            pins.mark_unverified_coordinate_click(&task_id).await;
+            Ok("Clicked at (412, 380).".to_string())
+        } else {
+            pins.clear_unverified_coordinate_click(&task_id).await;
+            Ok("The heart is filled.".to_string())
+        }
+    }
+}
+
+/// A GUI success claim does not ship while the last coordinate click is
+/// unverified, and the task's pinned vision model serves its later calls.
+#[cfg(feature = "computer_use")]
+#[tokio::test]
+async fn test_sdk_unverified_gui_click_blocks_the_success_claim() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("gui_click", "{}"),
+        MockProvider::text_response("I liked the post."),
+        MockProvider::tool_call_response("gui_look", "{}"),
+        MockProvider::text_response("Confirmed: the post is liked."),
+    ]);
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(GuiStandIn { name: "gui_click" }),
+        Arc::new(GuiStandIn { name: "gui_look" }),
+    ];
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "tg_gui_click",
+            "Like the latest post",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Confirmed: the post is liked.");
+    let log = harness.provider.call_log.lock().await;
+    assert!(
+        log.iter().any(|call| call.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("COORDINATE click")))),
+        "the model was told to verify the click"
+    );
+    assert_eq!(
+        log.last().map(|call| call.model.as_str()),
+        Some("synthetic-vision-model"),
+        "calls after the pin use the pinned model"
     );
 }

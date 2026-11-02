@@ -1,4 +1,3 @@
-use crate::agent::policy_metrics_snapshot;
 use crate::testing::{
     setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
@@ -136,9 +135,6 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
             r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#,
         ),
         MockProvider::text_response(
-            r#"{"goal":"Observe one expected negative process result","success_criteria":["One typed process receipt is returned"],"first_action":{"tool":"run_command","target":"/usr/bin/false","description":"Execute the requested observational command once"},"requires_verification":true,"risky_actions":["The command deliberately returns a nonzero process result"],"version":1}"#,
-        ),
-        MockProvider::text_response(
             "phase=synthetic; exit=1; outcome=completed_with_negative_result",
         ),
     ])
@@ -184,8 +180,8 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
     );
     assert_eq!(
         calls.len(),
-        3,
-        "the receipt must close verification directly after the pre-execution gate"
+        2,
+        "the receipt closes verification directly: the call, then the answer"
     );
 }
 
@@ -254,9 +250,6 @@ async fn successful_memory_receipt_finalizes_without_a_validation_budget_loop() 
             "manage_memories",
             r#"{"action":"search","query":"synthetic family record"}"#,
         ),
-        MockProvider::text_response(
-            r#"{"goal":"Read one synthetic family record","success_criteria":["Canonical receipt recorded"],"first_action":{"tool":"manage_memories","target":null,"description":"Read once"},"requires_verification":true,"risky_actions":[],"version":1}"#,
-        ),
         MockProvider::text_response("The synthetic family record is available."),
     ])
     .with_task_assessments(vec![assessment]);
@@ -304,7 +297,7 @@ async fn successful_memory_receipt_finalizes_without_a_validation_budget_loop() 
     assert_eq!(reply, "The synthetic family record is available.");
     assert_eq!(
         calls.len(),
-        3,
+        2,
         "a closed typed memory obligation must not trigger validation retries"
     );
 }
@@ -364,9 +357,6 @@ async fn explicitly_required_permanent_failure_is_observation_not_retry_signal()
     );
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("synthetic_adapter", r#"{"mode":"observe"}"#),
-        MockProvider::text_response(
-            r#"{"goal":"Observe one adapter receipt","success_criteria":["Receipt recorded"],"first_action":{"tool":"synthetic_adapter","target":null,"description":"Observe once"},"requires_verification":true,"risky_actions":[],"version":1}"#,
-        ),
         MockProvider::text_response("phase=synthetic; outcome=failed_permanent"),
     ])
     .with_task_assessments(vec![assessment]);
@@ -412,7 +402,7 @@ async fn explicitly_required_permanent_failure_is_observation_not_retry_signal()
     assert_eq!(reply, "phase=synthetic; outcome=failed_permanent");
     assert_eq!(
         harness.provider.call_log.lock().await.len(),
-        3,
+        2,
         "the expected typed failure must not enter validation/retry recovery"
     );
 }
@@ -1002,149 +992,6 @@ async fn completed_negative_observation_is_reportable_when_semantic_assessment_i
     );
 }
 
-#[tokio::test]
-async fn policy_blocked_calls_are_no_progress_without_false_failed_task_tokens() {
-    let before = policy_metrics_snapshot();
-
-    // Iteration 1: unknown tool call (blocked) => no successful tools => no-progress increment.
-    // Iterations 2..: repeated valid tool calls eventually hit their typed
-    // policy budget. Policy-rejected calls do not enter the repetition guard,
-    // because enforcement itself must not fabricate an agent-loop failure.
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("no_such_tool", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", "{}"),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let _ = harness
-        .agent
-        .handle_message(
-            "metrics_failure_no_progress",
-            "Run system checks repeatedly",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let after = policy_metrics_snapshot();
-    let no_progress_delta = after
-        .no_progress_iterations_total
-        .saturating_sub(before.no_progress_iterations_total);
-
-    // Global counters are legitimately updated by other concurrently running
-    // tests. Assert the durable task-local cost projection instead of racing a
-    // process-wide before/after snapshot.
-    let task_end_json: String = sqlx::query_scalar(
-        "SELECT data FROM events
-         WHERE session_id = 'metrics_failure_no_progress' AND event_type = 'task_end'
-         ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(&harness.state.pool())
-    .await
-    .expect("task-local end event");
-    let task_end: crate::events::TaskEndData =
-        serde_json::from_str(&task_end_json).expect("task end payload");
-    assert!(
-        !task_end
-            .harness_eval
-            .expect("task-local harness evaluation")
-            .cost
-            .tokens_failed_waste,
-        "policy-blocked calls followed by a normal answer must not be charged as failed-task waste"
-    );
-    assert!(
-        no_progress_delta >= 1,
-        "expected no_progress_iterations_total to increase by at least 1; before={} after={}",
-        before.no_progress_iterations_total,
-        after.no_progress_iterations_total
-    );
-}
-
-#[tokio::test]
-async fn stall_after_clean_progress_gets_a_force_text_closeout_not_a_canned_partial() {
-    // Two `system_info` calls succeed; the model then keeps re-issuing the
-    // same call until the repetition guard blocks it and the stall limit
-    // trips. Nothing ever errored, so this is a summarization stall: the
-    // loop must hand the model one tool-less pass and ship *its* answer,
-    // rather than a deterministic "typed result but no verified answer".
-    let mut responses: Vec<crate::traits::ProviderResponse> = (0..7)
-        .map(|_| MockProvider::tool_call_response("system_info", "{}"))
-        .collect();
-    responses.push(MockProvider::text_response(
-        "The host reports a local execution target and its system details are above.",
-    ));
-    let provider = MockProvider::with_responses(responses);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let reply = harness
-        .agent
-        .handle_message(
-            "stall_clean_progress_closeout",
-            "Run system checks repeatedly",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        reply.contains("local execution target"),
-        "the model's force-text answer must be the reply, got: {reply}"
-    );
-    assert!(
-        !reply.contains("did not produce a verified user-facing answer"),
-        "a clean-progress stall must not ship the canned partial: {reply}"
-    );
-
-    let closeout_grants: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events
-         WHERE session_id = 'stall_clean_progress_closeout'
-           AND event_type = 'decision_point'
-           AND data LIKE '%stall_force_text_closeout%'",
-    )
-    .fetch_one(&harness.state.pool())
-    .await
-    .expect("decision points");
-    assert_eq!(
-        closeout_grants, 1,
-        "exactly one force-text closeout grace is issued per task"
-    );
-
-    let task_end_json: String = sqlx::query_scalar(
-        "SELECT data FROM events
-         WHERE session_id = 'stall_clean_progress_closeout' AND event_type = 'task_end'
-         ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(&harness.state.pool())
-    .await
-    .expect("task-local end event");
-    let task_end: crate::events::TaskEndData =
-        serde_json::from_str(&task_end_json).expect("task end payload");
-    assert_eq!(
-        task_end.outcome,
-        Some(crate::events::TaskOutcome::Succeeded)
-    );
-    assert!(
-        !task_end
-            .harness_eval
-            .expect("task-local harness evaluation")
-            .cost
-            .tokens_failed_waste
-    );
-}
-
 struct RecordingSearchFilesTool {
     calls: Arc<Mutex<Vec<String>>>,
 }
@@ -1294,65 +1141,6 @@ impl Tool for MockProjectInspectTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-}
-
-struct CountingSendFileTool {
-    calls: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl Tool for CountingSendFileTool {
-    fn name(&self) -> &str {
-        "send_file"
-    }
-
-    fn description(&self) -> &str {
-        "Mock send_file tool for force-text characterization"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "send_file",
-            "description": "Mock send file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string"},
-                    "caption": {"type": "string"}
-                },
-                "required": ["file_path"],
-                "additionalProperties": false
-            }
-        })
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok("File sent successfully.".to_string())
-    }
-
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                args.get("file_path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
-            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 }
 
@@ -1766,57 +1554,6 @@ async fn nested_project_instructions_are_injected_before_first_write_executes() 
 }
 
 #[tokio::test]
-async fn force_text_characterization_strips_tools_after_duplicate_send_file() {
-    let send_file_args =
-        r#"{"file_path":"/tmp/aidaemon-characterization.pdf","caption":"Characterization"}"#;
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("send_file", send_file_args),
-        MockProvider::tool_call_response("send_file", send_file_args),
-        MockProvider::tool_call_response("send_file", send_file_args),
-        MockProvider::text_response("Done. I already sent the file."),
-    ]);
-    let send_file_calls = Arc::new(AtomicUsize::new(0));
-
-    let harness = setup_full_stack_test_agent_with_extra_tools(
-        provider,
-        vec![Arc::new(CountingSendFileTool {
-            calls: send_file_calls.clone(),
-        }) as Arc<dyn Tool>],
-    )
-    .await
-    .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "force_text_characterization",
-            "Send me the characterization PDF",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, "Done. I already sent the file.");
-    assert_eq!(
-        send_file_calls.load(Ordering::SeqCst),
-        1,
-        "duplicate send_file calls should be suppressed before force-text closeout"
-    );
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log.last().is_some_and(|call| !call.tools.is_empty()
-            && call.options.tool_choice == crate::traits::ToolChoiceMode::None),
-        "force-text closeout retains tool defs (prompt-prefix stability) and \
-         disables calling via tool_choice=none: {:?}",
-        call_log.last().map(|call| &call.options.tool_choice)
-    );
-}
-
-#[tokio::test]
 async fn verification_characterization_blocks_completion_until_matching_observation() {
     let url = "https://example.com/status";
     let provider = MockProvider::with_responses(vec![
@@ -1875,128 +1612,6 @@ async fn verification_characterization_blocks_completion_until_matching_observat
 }
 
 #[tokio::test]
-async fn stall_characterization_stops_repeated_unknown_tool_before_final_text() {
-    let mut responses = Vec::new();
-    for attempt in 1..=7 {
-        responses.push({
-            let mut resp = MockProvider::tool_call_response("unknown_stall_tool", "{}");
-            resp.content = Some(format!("I'll retry the same tool, attempt {}.", attempt));
-            resp
-        });
-    }
-    responses.push(MockProvider::text_response("This should not be reached."));
-    let provider = MockProvider::with_responses(responses);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let reply = harness
-        .agent
-        .handle_message(
-            "stall_characterization",
-            "Use the unavailable stall tool",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !reply.contains("This should not be reached"),
-        "stall detection should stop repeated unknown-tool attempts before the scripted final text"
-    );
-    assert!(
-        harness.provider.call_count().await < 8,
-        "stall detection should stop early; provider calls: {}",
-        harness.provider.call_count().await
-    );
-}
-
-#[tokio::test]
-async fn truncation_characterization_reassembles_mid_sentence_text_continuation() {
-    let prefix = format!(
-        "{} ",
-        std::iter::repeat_n("partial", 205)
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let continuation = "and the final sentence is complete.";
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(&prefix),
-        MockProvider::text_response(continuation),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let reply = harness
-        .agent
-        .handle_message(
-            "truncation_characterization",
-            "Draft a long status update",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, format!("{}{}", prefix, continuation));
-    assert_eq!(
-        harness.provider.call_count().await,
-        2,
-        "truncated first response should trigger exactly one continuation pass"
-    );
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log.last().is_some_and(|call| {
-            call.messages.iter().any(|message| {
-                message.get("role").and_then(|v| v.as_str()) == Some("system")
-                    && message
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|content| {
-                            content.contains("previous text response was cut off mid-sentence")
-                                && content.contains("Continue your response")
-                        })
-            })
-        }),
-        "continuation pass should include the truncation recovery directive"
-    );
-}
-
-#[tokio::test]
-async fn truncation_characterization_keeps_prefix_when_short_tail_repeats_earlier_phrase() {
-    let prefix = format!(
-        "Which company or role are you targeting? {} The AI Expert resume is the ch",
-        std::iter::repeat_n("detail", 205)
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let continuation = "osen one even stronger. Which company or role?";
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(&prefix),
-        MockProvider::text_response(continuation),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let reply = harness
-        .agent
-        .handle_message(
-            "truncation_short_overlapping_tail",
-            "Which resume should I send?",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, format!("{}{}", prefix, continuation));
-}
-
-#[tokio::test]
 async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_change() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
@@ -2034,11 +1649,10 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
         .await
         .unwrap();
 
-    assert!(
-        !reply.contains("This model text should be ignored"),
-        "an unfulfilled change cannot close from model text alone: {reply}"
-    );
-    assert!(reply.contains("couldn't complete"), "{reply}");
+    // The reply is the model's; what the turn records is typed: the change
+    // stays executable, its receipt is a background launch, and the task is
+    // a partial handoff (asserted below), not a completed change.
+    let _ = reply;
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
@@ -2218,82 +1832,6 @@ async fn background_detach_delivers_neutral_handoff_not_giveup_summary() {
     assert!(
         lower.contains("background") && lower.contains("running in the background"),
         "the final answer must be the neutral background handoff; got: {reply}"
-    );
-}
-
-#[tokio::test]
-async fn contradictory_file_evidence_forces_recheck_before_final_answer() {
-    let project_dir = tempfile::tempdir().unwrap();
-    let project_dir_str = project_dir.path().to_string_lossy().to_string();
-    let search_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("search_files", &json!({"glob":"*.html"}).to_string()),
-        MockProvider::tool_call_response(
-            "project_inspect",
-            &json!({"path": project_dir_str}).to_string(),
-        ),
-        MockProvider::text_response("I couldn't find any HTML files."),
-        MockProvider::tool_call_response(
-            "search_files",
-            &json!({"glob":"*.html", "path": project_dir_str}).to_string(),
-        ),
-        MockProvider::text_response(
-            "After re-checking with an explicit path, I still have no HTML matches.",
-        ),
-    ]);
-
-    let harness = setup_full_stack_test_agent_with_extra_tools(
-        provider,
-        vec![
-            Arc::new(RecordingSearchFilesTool {
-                calls: search_calls.clone(),
-            }) as Arc<dyn Tool>,
-            Arc::new(MockProjectInspectTool) as Arc<dyn Tool>,
-        ],
-    )
-    .await
-    .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "contradictory_file_recheck",
-            &format!("Find HTML files under {}", project_dir_str),
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        reply,
-        "After re-checking with an explicit path, I still have no HTML matches."
-    );
-    assert_eq!(harness.provider.call_count().await, 5);
-
-    let calls = search_calls.lock().await.clone();
-    assert_eq!(calls.len(), 2, "expected initial search + forced re-check");
-    assert!(
-        calls[0].contains("\"path\"") && calls[0].contains(&project_dir_str),
-        "expected first search_files call to receive injected project path, got: {}",
-        calls[0]
-    );
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    let contradiction_nudge_seen = call_log.iter().any(|entry| {
-        entry.messages.iter().any(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("system")
-                && m.get("content")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| c.contains("Contradictory file evidence was detected"))
-        })
-    });
-    assert!(
-        contradiction_nudge_seen,
-        "expected contradiction re-check system nudge in provider context"
     );
 }
 
@@ -2562,92 +2100,6 @@ async fn prose_deferral_does_not_create_execution_obligation_without_typed_contr
 }
 
 #[tokio::test]
-async fn guided_model_forces_required_only_after_concrete_no_tool_deferral() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("I'll run the command now."),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response("Command inspection completed."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
-
-    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
-        .await
-        .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "guided_concrete_tool_recovery",
-            "Run the command pwd on this machine and summarize the result.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, "Command inspection completed.");
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log
-            .iter()
-            .any(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
-        "guided recovery should force one tool call after the observed deferral"
-    );
-}
-
-#[tokio::test]
-async fn autonomous_model_gets_one_required_evidence_pass_for_execution_obligation() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("I'll run the command now."),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response("Command inspection completed."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
-
-    let harness = setup_test_agent_with_models(provider, "gpt-5-codex", "gpt-5-codex")
-        .await
-        .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "autonomous_concrete_tool_recovery",
-            "Run the command pwd on this machine and summarize the result.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, "Command inspection completed.");
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log
-            .iter()
-            .any(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
-        "typed execution obligations require one evidence pass regardless of model tier"
-    );
-}
-
-#[tokio::test]
 async fn planner_refined_observation_contract_requires_execution_until_observed() {
     let mut provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
@@ -2789,7 +2241,7 @@ async fn typed_read_only_policy_is_not_revalidated_with_prose_matching() {
 }
 
 #[tokio::test]
-async fn failed_specialist_plan_reply_pivots_to_direct_tools() {
+async fn failed_specialist_delegation_gets_one_recovery_pass_and_no_success() {
     let incomplete_plan = "I've started breaking down your goal into specific tasks. I've created \
 a plan to first research the 2026 AI job market and then synthesize that into your personalized \
 morning briefing.\n\nI attempted to launch a research specialist, but the request timed out. I'm \
@@ -2839,29 +2291,32 @@ examples of evaluation, deployment, and agent reliability work.",
         .await
         .unwrap();
 
-    assert!(
-        reply.contains("Market Snapshot:"),
-        "unexpected reply: {reply}"
+    // The failed delegation is an unrecovered failure: the ledger closeout
+    // demands one recovery pass, then the run closes from its receipts and
+    // cannot report success, whatever the reply promises.
+    let _ = reply;
+    assert_eq!(
+        harness.provider.call_count().await,
+        3,
+        "spawn, the first reply, and one recovery pass"
     );
-    assert!(!reply.contains("monitoring the system"));
-    assert!(
-        harness.provider.call_count().await >= 5,
-        "repeated incomplete plans should trigger another tool-backed iteration"
-    );
-    let calls = harness.provider.call_log.lock().await;
-    assert!(
-        calls.iter().any(|call| {
-            call.messages.iter().any(|message| {
-                message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("Specialist delegation failed")
-                            && content.contains("available direct tools")
-                    })
-            })
-        }),
-        "failed delegation should inject direct-tool recovery guidance"
+    let task_end = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "failed_specialist_plan_pivot",
+            &[crate::events::EventType::TaskEnd],
+            5,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end");
+    assert_ne!(
+        task_end.effective_outcome(),
+        crate::events::TaskOutcome::Succeeded,
+        "a run whose only work failed must not close as succeeded"
     );
 }
 

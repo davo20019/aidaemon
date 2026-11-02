@@ -12,16 +12,6 @@ pub(super) fn first_question_line(text: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub(super) fn default_clarifying_question(_user_text: &str, missing_info: &[String]) -> String {
-    if !missing_info.is_empty() {
-        return format!(
-            "Could you clarify {} so I can proceed correctly?",
-            missing_info.join(", ")
-        );
-    }
-    "Which exact target should I use for this action?".to_string()
-}
-
 pub(super) fn build_policy_bundle(
     _user_text: &str,
     available_capabilities: &HashMap<String, ToolCapabilities>,
@@ -76,17 +66,6 @@ pub(super) fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str
         return Some(("negative", false));
     }
     None
-}
-
-pub(super) fn tool_is_side_effecting(
-    name: &str,
-    capabilities: &HashMap<String, ToolCapabilities>,
-) -> bool {
-    !capabilities
-        .get(name)
-        .copied()
-        .unwrap_or_default()
-        .read_only
 }
 
 /// Returns true if the message is a trivial acknowledgment, greeting, or

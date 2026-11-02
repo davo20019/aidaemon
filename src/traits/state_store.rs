@@ -1296,15 +1296,6 @@ pub trait MandateStore: Send + Sync {
         Ok(None)
     }
 
-    /// Project one strict common-dispatch receipt into an existing reservation.
-    /// Only exact grant/task/call matches may transition a reserved row.
-    async fn project_mandate_mutation_outcome(
-        &self,
-        _projection: &super::MandateMutationOutcomeProjection,
-    ) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
     async fn list_mandate_mutation_attempts_for_run(
         &self,
         _goal_run_id: &str,

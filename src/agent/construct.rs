@@ -217,7 +217,6 @@ impl Agent {
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             // Seed the in-memory ignore-set from config so a fresh start never
@@ -471,7 +470,6 @@ impl Agent {
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions,
             billing_failed_models,
             required_tool_choice_ignored_models,

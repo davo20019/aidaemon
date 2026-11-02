@@ -1934,18 +1934,6 @@ pub trait Tool: Send + Sync {
         ToolCallAccessManifest::default()
     }
 
-    /// Project a typed task obligation onto the adapter's observable mutation
-    /// effect.  Opaque adapters keep their own conservative classification;
-    /// specialized adapters may refine it only from the already-compiled
-    /// effect contract, never from natural-language command text.
-    fn project_contract_mutation_effects(
-        &self,
-        semantics: ToolCallSemantics,
-        _required_effects: ToolMutationEffects,
-    ) -> ToolCallSemantics {
-        semantics
-    }
-
     /// Reconcile a successful durable receipt with current state before replay.
     ///
     /// The conservative default always replays. An override may return

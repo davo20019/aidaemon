@@ -4,12 +4,12 @@ use crate::traits::{
     MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
     MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
     MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
-    MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
-    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
-    MandateStatus, MandateStore, MandateStrategyRevision, MandateStrategyRevisionKind,
-    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
+    MandateMutationEvidence, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
+    MandateMutationReservation, MandateObjectiveMeasurement, MandateOperatingUpdates,
+    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
+    MandateRunFinalizationResult, MandateRunProofCounts, MandateStatus, MandateStore,
+    MandateStrategyRevision, MandateStrategyRevisionKind, MandateSuspension, MandateSuspensionKind,
+    MandateTerminationKind, MandateWakeSignal, Task,
 };
 use sha2::{Digest, Sha256};
 
@@ -4157,119 +4157,6 @@ impl MandateStore for SqliteStateStore {
         mutation_quota_state_on_connection(&mut connection, mandate_id, as_of).await
     }
 
-    async fn project_mandate_mutation_outcome(
-        &self,
-        projection: &MandateMutationOutcomeProjection,
-    ) -> anyhow::Result<bool> {
-        anyhow::ensure!(
-            projection.grant.counts_toward_cycle_budget
-                && projection.grant.reserved_action_attempt > 0,
-            "mutation outcome requires an exact metered grant"
-        );
-        anyhow::ensure!(
-            projection.grant.tool_call_id.as_deref() == Some(projection.tool_call_id.as_str()),
-            "mutation outcome tool call does not match its bound grant"
-        );
-        anyhow::ensure!(
-            matches!(
-                projection.status,
-                MandateMutationAttemptStatus::Succeeded
-                    | MandateMutationAttemptStatus::Failed
-                    | MandateMutationAttemptStatus::Ambiguous
-            ),
-            "a receipt projection requires a post-dispatch outcome status"
-        );
-        for (label, value) in [
-            ("goal run id", projection.goal_run_id.as_str()),
-            ("task id", projection.task_id.as_str()),
-            ("task attempt id", projection.task_attempt_id.as_str()),
-            ("tool call id", projection.tool_call_id.as_str()),
-        ] {
-            validate_canonical_identifier(label, value, 256)?;
-        }
-        validate_timestamp("mutation outcome completed_at", &projection.completed_at)?;
-        if projection.status == MandateMutationAttemptStatus::Succeeded {
-            anyhow::ensure!(
-                projection.receipt_schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
-                    && projection.outcome_evidence.is_some()
-                    && !projection.timed_out
-                    && !projection.background_started
-                    && !projection.detached
-                    && !projection.completion_notifications_enabled
-                    && !projection.transport_error_present
-                    && projection.semantics_match
-                    && projection.exit_code.is_none_or(|code| code == 0),
-                "mutation success lacks strict receipt proof"
-            );
-        }
-
-        let result = sqlx::query(
-            "UPDATE mandate_mutation_attempts
-             SET status = ?, outcome_evidence = ?, http_status = ?, exit_code = ?,
-                 completed_at = ?
-             WHERE mandate_id = ? AND mandate_version = ?
-               AND decision_cycle_id = ? AND reserved_action_attempt = ?
-               AND action_digest = ? AND goal_run_id = ?
-               AND task_id = ? AND task_attempt_id = ? AND tool_call_id = ?
-               AND status = 'reserved' AND dispatch_claimed_at IS NOT NULL
-               AND (
-                   ? != 'succeeded'
-                   OR tool_name != 'http_request'
-                   OR ((? BETWEEN 200 AND 299) AND ? != 202)
-               )",
-        )
-        .bind(projection.status.as_str())
-        .bind(projection.outcome_evidence.map(|value| value.as_str()))
-        .bind(projection.http_status.map(i64::from))
-        .bind(projection.exit_code)
-        .bind(&projection.completed_at)
-        .bind(&projection.grant.mandate_id)
-        .bind(projection.grant.mandate_version)
-        .bind(&projection.grant.decision_cycle_id)
-        .bind(projection.grant.reserved_action_attempt)
-        .bind(&projection.grant.action_digest)
-        .bind(&projection.goal_run_id)
-        .bind(&projection.task_id)
-        .bind(&projection.task_attempt_id)
-        .bind(&projection.tool_call_id)
-        .bind(projection.status.as_str())
-        .bind(projection.http_status.map(i64::from))
-        .bind(projection.http_status.map(i64::from))
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 1 {
-            return Ok(true);
-        }
-        // The canonical ToolResult append projects the same receipt and ledger
-        // transition atomically. The execution loop repeats this call as a
-        // defensive compatibility check, so accept an exact terminal match.
-        let already_projected = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM mandate_mutation_attempts
-             WHERE mandate_id = ? AND mandate_version = ? AND decision_cycle_id = ?
-               AND reserved_action_attempt = ? AND action_digest = ?
-               AND goal_run_id = ? AND task_id = ? AND task_attempt_id = ?
-               AND tool_call_id = ? AND status = ?
-               AND COALESCE(http_status, -1) = COALESCE(?, -1)
-               AND COALESCE(exit_code, -2147483648) = COALESCE(?, -2147483648)
-             LIMIT 1",
-        )
-        .bind(&projection.grant.mandate_id)
-        .bind(projection.grant.mandate_version)
-        .bind(&projection.grant.decision_cycle_id)
-        .bind(projection.grant.reserved_action_attempt)
-        .bind(&projection.grant.action_digest)
-        .bind(&projection.goal_run_id)
-        .bind(&projection.task_id)
-        .bind(&projection.task_attempt_id)
-        .bind(&projection.tool_call_id)
-        .bind(projection.status.as_str())
-        .bind(projection.http_status.map(i64::from))
-        .bind(projection.exit_code)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(already_projected.is_some())
-    }
-
     async fn list_mandate_mutation_attempts_for_run(
         &self,
         goal_run_id: &str,
@@ -5347,34 +5234,6 @@ mod tests {
         run
     }
 
-    async fn start_existing_claimed_run(
-        store: &SqliteStateStore,
-        goal: &Goal,
-        mandate: &Mandate,
-    ) -> GoalRun {
-        let claimed = store
-            .claim_due_mandates(1, "test-heartbeat-next", 300)
-            .await
-            .unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].id, mandate.id);
-        let root_task_id = uuid::Uuid::new_v4().to_string();
-        let run = store
-            .start_goal_run(&goal.id, "mandate", None, Some(&root_task_id))
-            .await
-            .unwrap();
-        store
-            .create_task(&review_root(goal, &run.id, &root_task_id))
-            .await
-            .unwrap();
-        sqlx::query("UPDATE goal_runs SET status = 'running' WHERE id = ?")
-            .bind(&run.id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        run
-    }
-
     struct MutationFence {
         root_attempt: crate::traits::TaskAttempt,
         worker_task: Task,
@@ -5467,33 +5326,6 @@ mod tests {
             }],
             account_identifiers: Vec::new(),
             reserved_at: reserved_at.to_rfc3339(),
-        }
-    }
-
-    fn outcome_projection(
-        reservation: &MandateMutationReservation,
-        status: MandateMutationAttemptStatus,
-        http_status: Option<u16>,
-        completed_at: chrono::DateTime<chrono::Utc>,
-    ) -> MandateMutationOutcomeProjection {
-        MandateMutationOutcomeProjection {
-            grant: reservation.grant.clone(),
-            goal_run_id: reservation.goal_run_id.clone(),
-            task_id: reservation.task_id.clone(),
-            task_attempt_id: reservation.task_attempt_id.clone(),
-            tool_call_id: reservation.tool_call_id.clone(),
-            status,
-            receipt_schema_version: crate::events::ToolReceiptV1::SCHEMA_VERSION,
-            outcome_evidence: Some(MandateMutationEvidence::StructuredMetadata),
-            timed_out: false,
-            background_started: false,
-            detached: false,
-            completion_notifications_enabled: false,
-            transport_error_present: false,
-            semantics_match: true,
-            http_status,
-            exit_code: None,
-            completed_at: completed_at.to_rfc3339(),
         }
     }
 
@@ -7034,497 +6866,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooldown_failure_and_rolling_expiry_are_cross_cycle_safety_state() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 2);
-        mandate.authority.max_mutating_actions_per_rolling_24h = 2;
-        let run = claim_and_start_run(&store, &goal, &mandate).await;
-        let act = MandateDecisionCycle::new(
-            &mandate.id,
-            &run.id,
-            MandateDecisionOutcome::Act,
-            "Two spaced actions fit the envelope",
-            mandate.version,
-        );
-        let intention = Intention::new(
-            &mandate.id,
-            &act.id,
-            &run.id,
-            "Perform two governed actions",
-            "It tests rolling quota semantics",
-        );
-        store
-            .record_mandate_decision(&act, Some(&intention), None)
-            .await
-            .unwrap();
-        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
-        let base = chrono::Utc::now();
-        let first = reservation(&mandate, &act, &run, &fence, 1, 201, base);
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
-        assert!(!store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(2),
-            ))
-            .await
-            .unwrap());
-        assert!(store
-            .project_mandate_mutation_outcome(&outcome_projection(
-                &first,
-                MandateMutationAttemptStatus::Failed,
-                Some(400),
-                base + chrono::Duration::seconds(1),
-            ))
-            .await
-            .unwrap());
-        let too_soon = reservation(
-            &mandate,
-            &act,
-            &run,
-            &fence,
-            2,
-            202,
-            base + chrono::Duration::seconds(899),
-        );
-        assert!(store
-            .reserve_mandate_action_attempt(&too_soon)
-            .await
-            .unwrap()
-            .is_none());
-        let cooldown = store
-            .get_mandate_mutation_quota_state(
-                &mandate.id,
-                &(base + chrono::Duration::seconds(899)).to_rfc3339(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            cooldown.block_reason,
-            Some(MandateMutationQuotaBlockReason::Cooldown)
-        );
-        assert_eq!(cooldown.reserved_in_rolling_24h, 1);
-
-        let second = reservation(
-            &mandate,
-            &act,
-            &run,
-            &fence,
-            2,
-            203,
-            base + chrono::Duration::seconds(900),
-        );
-        assert!(store
-            .reserve_mandate_action_attempt(&second)
-            .await
-            .unwrap()
-            .is_some());
-        let full = store
-            .get_mandate_mutation_quota_state(
-                &mandate.id,
-                &(base + chrono::Duration::seconds(901)).to_rfc3339(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            full.block_reason,
-            Some(MandateMutationQuotaBlockReason::Rolling24hExhausted)
-        );
-        assert_eq!(full.remaining_in_rolling_24h, 0);
-
-        let observation = crate::traits::ToolCallSemantics::observation().with_target_hint(
-            crate::traits::ToolTargetHintKind::Url,
-            "https://api.x.com/2/tweets",
-        );
-        assert!(crate::mandates::authority::authorize_mandate_observation(
-            &mandate,
-            "http_request",
-            r#"{"method":"GET","url":"https://api.x.com/2/tweets"}"#,
-            &observation,
-            &(base + chrono::Duration::seconds(901)),
-        )
-        .is_ok());
-
-        let expired = store
-            .get_mandate_mutation_quota_state(
-                &mandate.id,
-                &(base + chrono::Duration::hours(24) + chrono::Duration::seconds(1)).to_rfc3339(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(expired.reserved_in_rolling_24h, 1);
-        assert_eq!(expired.remaining_in_rolling_24h, 1);
-        assert!(expired.available_now);
-    }
-
-    #[tokio::test]
-    async fn rolling_quota_survives_policy_versions_pause_resume_and_new_cycles() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 1);
-        mandate.authority.max_mutating_actions_per_rolling_24h = 1;
-        let first_run = claim_and_start_run(&store, &goal, &mandate).await;
-        let first_act = MandateDecisionCycle::new(
-            &mandate.id,
-            &first_run.id,
-            MandateDecisionOutcome::Act,
-            "Use the sole daily slot",
-            mandate.version,
-        );
-        let first_intention = Intention::new(
-            &mandate.id,
-            &first_act.id,
-            &first_run.id,
-            "Use one daily action",
-            "It tests cross-cycle accounting",
-        );
-        store
-            .record_mandate_decision(&first_act, Some(&first_intention), None)
-            .await
-            .unwrap();
-        let first_fence = claim_mutation_fence(&store, &goal, &mandate, &first_run).await;
-        let base = chrono::Utc::now();
-        let first = reservation(&mandate, &first_act, &first_run, &first_fence, 1, 301, base);
-        assert!(store
-            .reserve_mandate_action_attempt(&first)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &first,
-                base + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
-        assert!(store
-            .project_mandate_mutation_outcome(&outcome_projection(
-                &first,
-                MandateMutationAttemptStatus::Failed,
-                Some(400),
-                base + chrono::Duration::seconds(1),
-            ))
-            .await
-            .unwrap());
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
-            .await
-            .unwrap());
-        assert!(store
-            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
-            .await
-            .unwrap());
-        let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert!(current.version > mandate.version);
-        let second_run = start_existing_claimed_run(&store, &goal, &current).await;
-        let second_act = MandateDecisionCycle::new(
-            &current.id,
-            &second_run.id,
-            MandateDecisionOutcome::Act,
-            "A new cycle still sees the old reservation",
-            current.version,
-        );
-        let second_intention = Intention::new(
-            &current.id,
-            &second_act.id,
-            &second_run.id,
-            "Try another action",
-            "The daily ledger must reject it",
-        );
-        store
-            .record_mandate_decision(&second_act, Some(&second_intention), None)
-            .await
-            .unwrap();
-        let second_fence = claim_mutation_fence(&store, &goal, &current, &second_run).await;
-        let second = reservation(
-            &current,
-            &second_act,
-            &second_run,
-            &second_fence,
-            1,
-            302,
-            base + chrono::Duration::seconds(901),
-        );
-        assert!(store
-            .reserve_mandate_action_attempt(&second)
-            .await
-            .unwrap()
-            .is_none());
-        let quota = store
-            .get_mandate_mutation_quota_state(
-                &current.id,
-                &(base + chrono::Duration::seconds(901)).to_rfc3339(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(quota.reserved_in_rolling_24h, 1);
-        assert_eq!(
-            quota.block_reason,
-            Some(MandateMutationQuotaBlockReason::Rolling24hExhausted)
-        );
-    }
-
-    #[tokio::test]
-    async fn canonical_tool_result_atomically_projects_the_mandate_ledger() {
-        let (store, _database) = test_store().await;
-        let (goal, mandate) = controller("owner-session", 1);
-        let run = claim_and_start_run(&store, &goal, &mandate).await;
-        let decision = MandateDecisionCycle::new(
-            &mandate.id,
-            &run.id,
-            MandateDecisionOutcome::Act,
-            "Exercise atomic receipt projection",
-            mandate.version,
-        );
-        let intention = Intention::new(
-            &mandate.id,
-            &decision.id,
-            &run.id,
-            "Issue one governed request",
-            "The event and ledger must commit together",
-        );
-        store
-            .record_mandate_decision(&decision, Some(&intention), None)
-            .await
-            .unwrap();
-        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
-        let now = chrono::Utc::now();
-        let reservation = reservation(&mandate, &decision, &run, &fence, 1, 777, now);
-        store
-            .reserve_mandate_action_attempt(&reservation)
-            .await
-            .unwrap()
-            .expect("reserved mutation");
-        assert!(store
-            .claim_mandate_mutation_dispatch(&dispatch_claim(
-                &reservation,
-                now + chrono::Duration::milliseconds(1),
-            ))
-            .await
-            .unwrap());
-
-        let semantics = crate::traits::ToolCallSemantics::mutation_with(
-            crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
-        );
-        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
-            &crate::traits::ToolCallMetadata {
-                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
-                http_status: Some(201),
-                semantics,
-                ..Default::default()
-            },
-            crate::traits::ToolOutcomeStatus::Succeeded,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
-            Some("mandate-atomic-receipt".to_string()),
-        );
-        receipt.mandate_authority = Some(reservation.grant.clone());
-        let result = crate::events::ToolResultData {
-            message_id: None,
-            tool_call_id: reservation.tool_call_id.clone(),
-            name: "http_request".to_string(),
-            result: "created".to_string(),
-            success: true,
-            duration_ms: 1,
-            error: None,
-            task_id: Some(fence.worker_task.id.clone()),
-            annotations: vec![],
-            turn_id: None,
-            attachments: vec![],
-            receipt: Some(receipt),
-        };
-        let event_store = crate::events::EventStore::new(store.pool()).await.unwrap();
-        event_store
-            .append(crate::events::Event::new(
-                "specialist:mandate",
-                crate::events::EventType::ToolResult,
-                serde_json::to_value(result).unwrap(),
-            ))
-            .await
-            .unwrap();
-
-        let attempts = store
-            .list_mandate_mutation_attempts_for_run(&run.id)
-            .await
-            .unwrap();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].status, MandateMutationAttemptStatus::Succeeded);
-        assert!(store
-            .project_mandate_mutation_outcome(&outcome_projection(
-                &reservation,
-                MandateMutationAttemptStatus::Succeeded,
-                Some(201),
-                now + chrono::Duration::seconds(1),
-            ))
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn strict_receipts_finalize_act_and_mixed_failure_fails_closed() {
-        for include_failure in [false, true] {
-            let (store, _database) = test_store().await;
-            let cycle_cap = if include_failure { 2 } else { 1 };
-            let (goal, mut mandate) = controller("owner-session", cycle_cap);
-            mandate.authority.max_mutating_actions_per_rolling_24h = cycle_cap;
-            let run = claim_and_start_run(&store, &goal, &mandate).await;
-            let act = MandateDecisionCycle::new(
-                &mandate.id,
-                &run.id,
-                MandateDecisionOutcome::Act,
-                "Execute and prove the governed action",
-                mandate.version,
-            );
-            let intention = Intention::new(
-                &mandate.id,
-                &act.id,
-                &run.id,
-                "Execute governed mutation",
-                "Strict receipts determine completion",
-            );
-            store
-                .record_mandate_decision(&act, Some(&intention), None)
-                .await
-                .unwrap();
-            let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
-            let base = chrono::Utc::now();
-            let first = reservation(&mandate, &act, &run, &fence, 1, 401, base);
-            assert!(store
-                .reserve_mandate_action_attempt(&first)
-                .await
-                .unwrap()
-                .is_some());
-            assert!(store
-                .claim_mandate_mutation_dispatch(&dispatch_claim(
-                    &first,
-                    base + chrono::Duration::milliseconds(1),
-                ))
-                .await
-                .unwrap());
-            assert!(!store
-                .project_mandate_mutation_outcome(&outcome_projection(
-                    &first,
-                    MandateMutationAttemptStatus::Succeeded,
-                    Some(202),
-                    base + chrono::Duration::milliseconds(500),
-                ))
-                .await
-                .unwrap());
-            assert!(store
-                .project_mandate_mutation_outcome(&outcome_projection(
-                    &first,
-                    MandateMutationAttemptStatus::Succeeded,
-                    Some(200),
-                    base + chrono::Duration::seconds(1),
-                ))
-                .await
-                .unwrap());
-            if include_failure {
-                let second = reservation(
-                    &mandate,
-                    &act,
-                    &run,
-                    &fence,
-                    2,
-                    402,
-                    base + chrono::Duration::seconds(900),
-                );
-                assert!(store
-                    .reserve_mandate_action_attempt(&second)
-                    .await
-                    .unwrap()
-                    .is_some());
-                assert!(store
-                    .claim_mandate_mutation_dispatch(&dispatch_claim(
-                        &second,
-                        base + chrono::Duration::milliseconds(900_001),
-                    ))
-                    .await
-                    .unwrap());
-                assert!(store
-                    .project_mandate_mutation_outcome(&outcome_projection(
-                        &second,
-                        MandateMutationAttemptStatus::Failed,
-                        Some(400),
-                        base + chrono::Duration::seconds(901),
-                    ))
-                    .await
-                    .unwrap());
-            }
-            complete_mutation_fence(&store, &fence).await;
-            let result = store
-                .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
-                    mandate_id: mandate.id.clone(),
-                    expected_mandate_version: mandate.version,
-                    goal_run_id: run.id.clone(),
-                    finalized_at: (base + chrono::Duration::seconds(1_000)).to_rfc3339(),
-                })
-                .await
-                .unwrap();
-            if include_failure {
-                assert!(matches!(
-                    result,
-                    MandateRunFinalizationResult::ReconciliationRequired {
-                        reason: MandateReconciliationReason::MutationOutcomeFailed,
-                        ..
-                    }
-                ));
-                assert_eq!(
-                    store.get_goal_runs(&goal.id).await.unwrap()[0].status,
-                    "failed"
-                );
-                assert!(store
-                    .get_current_goal_run(&goal.id)
-                    .await
-                    .unwrap()
-                    .is_none());
-                assert_eq!(
-                    store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
-                    IntentionStatus::Suspended
-                );
-                assert_eq!(
-                    store
-                        .get_mandate(&mandate.id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .status,
-                    MandateStatus::AwaitingInput
-                );
-                assert_eq!(
-                    store.get_goal(&goal.id).await.unwrap().unwrap().status,
-                    "paused"
-                );
-            } else {
-                assert!(matches!(
-                    result,
-                    MandateRunFinalizationResult::ActSatisfied { .. }
-                ));
-                assert_eq!(
-                    store.get_goal_runs(&goal.id).await.unwrap()[0].status,
-                    "completed"
-                );
-                assert_eq!(
-                    store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
-                    IntentionStatus::Satisfied
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn proof_distinguishes_never_dispatched_from_claimed_ambiguity() {
         for claim_before_finalization in [false, true] {
             let (store, _database) = test_store().await;
@@ -8674,5 +8015,554 @@ mod tests {
                 .status,
             MandateStatus::AwaitingInput
         );
+    }
+
+    async fn start_existing_claimed_run(
+        store: &SqliteStateStore,
+        goal: &Goal,
+        mandate: &Mandate,
+    ) -> GoalRun {
+        let claimed = store
+            .claim_due_mandates(1, "test-heartbeat-next", 300)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, mandate.id);
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let run = store
+            .start_goal_run(&goal.id, "mandate", None, Some(&root_task_id))
+            .await
+            .unwrap();
+        store
+            .create_task(&review_root(goal, &run.id, &root_task_id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE goal_runs SET status = 'running' WHERE id = ?")
+            .bind(&run.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        run
+    }
+
+    /// Settle a dispatched attempt with an explicit completion time, as the
+    /// canonical tool-result append does at its own event time. Quota and
+    /// cooldown tests need the time chosen; the transition is the same.
+    async fn finish_attempt(
+        store: &SqliteStateStore,
+        reservation: &MandateMutationReservation,
+        status: MandateMutationAttemptStatus,
+        http_status: Option<u16>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        sqlx::query(
+            "UPDATE mandate_mutation_attempts
+             SET status = ?, outcome_evidence = ?, http_status = ?, completed_at = ?
+             WHERE mandate_id = ? AND mandate_version = ?
+               AND decision_cycle_id = ? AND reserved_action_attempt = ?
+               AND action_digest = ? AND goal_run_id = ?
+               AND task_id = ? AND task_attempt_id = ? AND tool_call_id = ?
+               AND status = 'reserved' AND dispatch_claimed_at IS NOT NULL",
+        )
+        .bind(match status {
+            MandateMutationAttemptStatus::Succeeded => "succeeded",
+            MandateMutationAttemptStatus::Failed => "failed",
+            MandateMutationAttemptStatus::Ambiguous => "ambiguous",
+            other => panic!("not a post-dispatch outcome: {other:?}"),
+        })
+        .bind("structured_metadata")
+        .bind(http_status.map(i64::from))
+        .bind(completed_at.to_rfc3339())
+        .bind(&reservation.grant.mandate_id)
+        .bind(reservation.grant.mandate_version)
+        .bind(&reservation.grant.decision_cycle_id)
+        .bind(reservation.grant.reserved_action_attempt)
+        .bind(&reservation.grant.action_digest)
+        .bind(&reservation.goal_run_id)
+        .bind(&reservation.task_id)
+        .bind(&reservation.task_attempt_id)
+        .bind(&reservation.tool_call_id)
+        .execute(&store.pool)
+        .await
+        .unwrap()
+        .rows_affected()
+            == 1
+    }
+
+    #[tokio::test]
+    async fn cooldown_failure_and_rolling_expiry_are_cross_cycle_safety_state() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 2);
+        mandate.authority.max_mutating_actions_per_rolling_24h = 2;
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let act = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "Two spaced actions fit the envelope",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &act.id,
+            &run.id,
+            "Perform two governed actions",
+            "It tests rolling quota semantics",
+        );
+        store
+            .record_mandate_decision(&act, Some(&intention), None)
+            .await
+            .unwrap();
+        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
+        let base = chrono::Utc::now();
+        let first = reservation(&mandate, &act, &run, &fence, 1, 201, base);
+        assert!(store
+            .reserve_mandate_action_attempt(&first)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .claim_mandate_mutation_dispatch(&dispatch_claim(
+                &first,
+                base + chrono::Duration::milliseconds(1),
+            ))
+            .await
+            .unwrap());
+        assert!(!store
+            .claim_mandate_mutation_dispatch(&dispatch_claim(
+                &first,
+                base + chrono::Duration::milliseconds(2),
+            ))
+            .await
+            .unwrap());
+        assert!(
+            finish_attempt(
+                &store,
+                &first,
+                MandateMutationAttemptStatus::Failed,
+                Some(400),
+                base + chrono::Duration::seconds(1)
+            )
+            .await
+        );
+        let too_soon = reservation(
+            &mandate,
+            &act,
+            &run,
+            &fence,
+            2,
+            202,
+            base + chrono::Duration::seconds(899),
+        );
+        assert!(store
+            .reserve_mandate_action_attempt(&too_soon)
+            .await
+            .unwrap()
+            .is_none());
+        let cooldown = store
+            .get_mandate_mutation_quota_state(
+                &mandate.id,
+                &(base + chrono::Duration::seconds(899)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cooldown.block_reason,
+            Some(MandateMutationQuotaBlockReason::Cooldown)
+        );
+        assert_eq!(cooldown.reserved_in_rolling_24h, 1);
+
+        let second = reservation(
+            &mandate,
+            &act,
+            &run,
+            &fence,
+            2,
+            203,
+            base + chrono::Duration::seconds(900),
+        );
+        assert!(store
+            .reserve_mandate_action_attempt(&second)
+            .await
+            .unwrap()
+            .is_some());
+        let full = store
+            .get_mandate_mutation_quota_state(
+                &mandate.id,
+                &(base + chrono::Duration::seconds(901)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            full.block_reason,
+            Some(MandateMutationQuotaBlockReason::Rolling24hExhausted)
+        );
+        assert_eq!(full.remaining_in_rolling_24h, 0);
+
+        let observation = crate::traits::ToolCallSemantics::observation().with_target_hint(
+            crate::traits::ToolTargetHintKind::Url,
+            "https://api.x.com/2/tweets",
+        );
+        assert!(crate::mandates::authority::authorize_mandate_observation(
+            &mandate,
+            "http_request",
+            r#"{"method":"GET","url":"https://api.x.com/2/tweets"}"#,
+            &observation,
+            &(base + chrono::Duration::seconds(901)),
+        )
+        .is_ok());
+
+        let expired = store
+            .get_mandate_mutation_quota_state(
+                &mandate.id,
+                &(base + chrono::Duration::hours(24) + chrono::Duration::seconds(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.reserved_in_rolling_24h, 1);
+        assert_eq!(expired.remaining_in_rolling_24h, 1);
+        assert!(expired.available_now);
+    }
+
+    #[tokio::test]
+    async fn rolling_quota_survives_policy_versions_pause_resume_and_new_cycles() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.authority.max_mutating_actions_per_rolling_24h = 1;
+        let first_run = claim_and_start_run(&store, &goal, &mandate).await;
+        let first_act = MandateDecisionCycle::new(
+            &mandate.id,
+            &first_run.id,
+            MandateDecisionOutcome::Act,
+            "Use the sole daily slot",
+            mandate.version,
+        );
+        let first_intention = Intention::new(
+            &mandate.id,
+            &first_act.id,
+            &first_run.id,
+            "Use one daily action",
+            "It tests cross-cycle accounting",
+        );
+        store
+            .record_mandate_decision(&first_act, Some(&first_intention), None)
+            .await
+            .unwrap();
+        let first_fence = claim_mutation_fence(&store, &goal, &mandate, &first_run).await;
+        let base = chrono::Utc::now();
+        let first = reservation(&mandate, &first_act, &first_run, &first_fence, 1, 301, base);
+        assert!(store
+            .reserve_mandate_action_attempt(&first)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .claim_mandate_mutation_dispatch(&dispatch_claim(
+                &first,
+                base + chrono::Duration::milliseconds(1),
+            ))
+            .await
+            .unwrap());
+        assert!(
+            finish_attempt(
+                &store,
+                &first,
+                MandateMutationAttemptStatus::Failed,
+                Some(400),
+                base + chrono::Duration::seconds(1)
+            )
+            .await
+        );
+        assert!(store
+            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
+            .await
+            .unwrap());
+        assert!(store
+            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
+            .await
+            .unwrap());
+        let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert!(current.version > mandate.version);
+        let second_run = start_existing_claimed_run(&store, &goal, &current).await;
+        let second_act = MandateDecisionCycle::new(
+            &current.id,
+            &second_run.id,
+            MandateDecisionOutcome::Act,
+            "A new cycle still sees the old reservation",
+            current.version,
+        );
+        let second_intention = Intention::new(
+            &current.id,
+            &second_act.id,
+            &second_run.id,
+            "Try another action",
+            "The daily ledger must reject it",
+        );
+        store
+            .record_mandate_decision(&second_act, Some(&second_intention), None)
+            .await
+            .unwrap();
+        let second_fence = claim_mutation_fence(&store, &goal, &current, &second_run).await;
+        let second = reservation(
+            &current,
+            &second_act,
+            &second_run,
+            &second_fence,
+            1,
+            302,
+            base + chrono::Duration::seconds(901),
+        );
+        assert!(store
+            .reserve_mandate_action_attempt(&second)
+            .await
+            .unwrap()
+            .is_none());
+        let quota = store
+            .get_mandate_mutation_quota_state(
+                &current.id,
+                &(base + chrono::Duration::seconds(901)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(quota.reserved_in_rolling_24h, 1);
+        assert_eq!(
+            quota.block_reason,
+            Some(MandateMutationQuotaBlockReason::Rolling24hExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_tool_result_atomically_projects_the_mandate_ledger() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "Exercise atomic receipt projection",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &decision.id,
+            &run.id,
+            "Issue one governed request",
+            "The event and ledger must commit together",
+        );
+        store
+            .record_mandate_decision(&decision, Some(&intention), None)
+            .await
+            .unwrap();
+        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
+        let now = chrono::Utc::now();
+        let reservation = reservation(&mandate, &decision, &run, &fence, 1, 777, now);
+        store
+            .reserve_mandate_action_attempt(&reservation)
+            .await
+            .unwrap()
+            .expect("reserved mutation");
+        assert!(store
+            .claim_mandate_mutation_dispatch(&dispatch_claim(
+                &reservation,
+                now + chrono::Duration::milliseconds(1),
+            ))
+            .await
+            .unwrap());
+
+        let semantics = crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+        );
+        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+            &crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                http_status: Some(201),
+                semantics,
+                ..Default::default()
+            },
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            Some("mandate-atomic-receipt".to_string()),
+        );
+        receipt.mandate_authority = Some(reservation.grant.clone());
+        let result = crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: reservation.tool_call_id.clone(),
+            name: "http_request".to_string(),
+            result: "created".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(fence.worker_task.id.clone()),
+            annotations: vec![],
+            turn_id: None,
+            attachments: vec![],
+            receipt: Some(receipt),
+        };
+        let event_store = crate::events::EventStore::new(store.pool()).await.unwrap();
+        event_store
+            .append(crate::events::Event::new(
+                "specialist:mandate",
+                crate::events::EventType::ToolResult,
+                serde_json::to_value(result).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let attempts = store
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, MandateMutationAttemptStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn strict_receipts_finalize_act_and_mixed_failure_fails_closed() {
+        for include_failure in [false, true] {
+            let (store, _database) = test_store().await;
+            let cycle_cap = if include_failure { 2 } else { 1 };
+            let (goal, mut mandate) = controller("owner-session", cycle_cap);
+            mandate.authority.max_mutating_actions_per_rolling_24h = cycle_cap;
+            let run = claim_and_start_run(&store, &goal, &mandate).await;
+            let act = MandateDecisionCycle::new(
+                &mandate.id,
+                &run.id,
+                MandateDecisionOutcome::Act,
+                "Execute and prove the governed action",
+                mandate.version,
+            );
+            let intention = Intention::new(
+                &mandate.id,
+                &act.id,
+                &run.id,
+                "Execute governed mutation",
+                "Strict receipts determine completion",
+            );
+            store
+                .record_mandate_decision(&act, Some(&intention), None)
+                .await
+                .unwrap();
+            let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
+            let base = chrono::Utc::now();
+            let first = reservation(&mandate, &act, &run, &fence, 1, 401, base);
+            assert!(store
+                .reserve_mandate_action_attempt(&first)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .claim_mandate_mutation_dispatch(&dispatch_claim(
+                    &first,
+                    base + chrono::Duration::milliseconds(1),
+                ))
+                .await
+                .unwrap());
+            assert!(
+                finish_attempt(
+                    &store,
+                    &first,
+                    MandateMutationAttemptStatus::Succeeded,
+                    Some(200),
+                    base + chrono::Duration::seconds(1)
+                )
+                .await
+            );
+            if include_failure {
+                let second = reservation(
+                    &mandate,
+                    &act,
+                    &run,
+                    &fence,
+                    2,
+                    402,
+                    base + chrono::Duration::seconds(900),
+                );
+                assert!(store
+                    .reserve_mandate_action_attempt(&second)
+                    .await
+                    .unwrap()
+                    .is_some());
+                assert!(store
+                    .claim_mandate_mutation_dispatch(&dispatch_claim(
+                        &second,
+                        base + chrono::Duration::milliseconds(900_001),
+                    ))
+                    .await
+                    .unwrap());
+                assert!(
+                    finish_attempt(
+                        &store,
+                        &second,
+                        MandateMutationAttemptStatus::Failed,
+                        Some(400),
+                        base + chrono::Duration::seconds(901)
+                    )
+                    .await
+                );
+            }
+            complete_mutation_fence(&store, &fence).await;
+            let result = store
+                .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                    mandate_id: mandate.id.clone(),
+                    expected_mandate_version: mandate.version,
+                    goal_run_id: run.id.clone(),
+                    finalized_at: (base + chrono::Duration::seconds(1_000)).to_rfc3339(),
+                })
+                .await
+                .unwrap();
+            if include_failure {
+                assert!(matches!(
+                    result,
+                    MandateRunFinalizationResult::ReconciliationRequired {
+                        reason: MandateReconciliationReason::MutationOutcomeFailed,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    store.get_goal_runs(&goal.id).await.unwrap()[0].status,
+                    "failed"
+                );
+                assert!(store
+                    .get_current_goal_run(&goal.id)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
+                    IntentionStatus::Suspended
+                );
+                assert_eq!(
+                    store
+                        .get_mandate(&mandate.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    MandateStatus::AwaitingInput
+                );
+                assert_eq!(
+                    store.get_goal(&goal.id).await.unwrap().unwrap().status,
+                    "paused"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    MandateRunFinalizationResult::ActSatisfied { .. }
+                ));
+                assert_eq!(
+                    store.get_goal_runs(&goal.id).await.unwrap()[0].status,
+                    "completed"
+                );
+                assert_eq!(
+                    store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
+                    IntentionStatus::Satisfied
+                );
+            }
+        }
     }
 }

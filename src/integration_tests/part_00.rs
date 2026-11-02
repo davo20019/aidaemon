@@ -12,7 +12,7 @@ use crate::testing::{
     setup_test_agent_with_models, setup_test_agent_with_models_and_policy,
     setup_test_agent_with_policy, MockProvider, MockTool,
 };
-use crate::tools::{EditFileTool, ReadFileTool};
+use crate::tools::EditFileTool;
 use crate::traits::store_prelude::*;
 use crate::traits::{Goal, Procedure, ProviderResponse, StateStore, UserProfile};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
@@ -567,79 +567,6 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
         .filter_map(|tool| tool["function"]["name"].as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"manage_mandates"));
-}
-
-#[tokio::test]
-async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical_reads() {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    use std::io::Write;
-    writeln!(file, "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta").unwrap();
-    let path = file.path().to_string_lossy().into_owned();
-    let first_args = json!({"path": path, "start_line": 1, "end_line": 3}).to_string();
-    let overlap_args = json!({"path": path, "start_line": 2, "end_line": 5}).to_string();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &overlap_args),
-        MockProvider::text_response("The cached resume section contains beta and gamma."),
-    ]);
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(ReadFileTool)],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let response = harness
-        .agent
-        .handle_message(
-            "semantic_read_cache",
-            "Inspect the resume section and answer from the file.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response,
-        "The cached resume section contains beta and gamma."
-    );
-    let proposed_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_call' \
-         AND json_extract(data, '$.name') = 'read_file'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(proposed_reads, 3);
-    let physical_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_result' \
-         AND json_extract(data, '$.name') = 'read_file' \
-         AND json_extract(data, '$.receipt.invocation_stage') = 'dispatched'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(physical_reads, 1);
-
-    let calls = harness.provider.call_log.lock().await;
-    let all_tool_content = calls
-        .iter()
-        .flat_map(|call| call.messages.iter())
-        .filter(|message| message.get("role").and_then(|value| value.as_str()) == Some("tool"))
-        .filter_map(|message| message.get("content").and_then(|value| value.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_tool_content.contains("complete task-local file artifact"));
-    assert!(all_tool_content.contains("Uncovered intervals: 4-5"));
 }
 
 #[tokio::test]

@@ -2086,16 +2086,6 @@ pub enum MandateMutationAttemptStatus {
 }
 
 impl MandateMutationAttemptStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reserved => "reserved",
-            Self::NeverDispatched => "never_dispatched",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Ambiguous => "ambiguous",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "reserved" => Some(Self::Reserved),
@@ -2116,13 +2106,6 @@ pub enum MandateMutationEvidence {
 }
 
 impl MandateMutationEvidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ToolReported => "tool_reported",
-            Self::StructuredMetadata => "structured_metadata",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "tool_reported" => Some(Self::ToolReported),
@@ -2157,29 +2140,6 @@ pub struct MandateMutationAttempt {
     pub exit_code: Option<i32>,
     pub reserved_at: String,
     pub completed_at: Option<String>,
-}
-
-/// Strict, content-free receipt projection emitted by the common dispatcher
-/// after the durable ToolResult event append succeeds.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MandateMutationOutcomeProjection {
-    pub grant: MandateAuthorityGrant,
-    pub goal_run_id: String,
-    pub task_id: String,
-    pub task_attempt_id: String,
-    pub tool_call_id: String,
-    pub status: MandateMutationAttemptStatus,
-    pub receipt_schema_version: u16,
-    pub outcome_evidence: Option<MandateMutationEvidence>,
-    pub timed_out: bool,
-    pub background_started: bool,
-    pub detached: bool,
-    pub completion_notifications_enabled: bool,
-    pub transport_error_present: bool,
-    pub semantics_match: bool,
-    pub http_status: Option<u16>,
-    pub exit_code: Option<i32>,
-    pub completed_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

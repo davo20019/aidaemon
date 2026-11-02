@@ -630,7 +630,6 @@ async fn build_isolated_mandate_bootstrap(
     let base_tool_defs = tool_defs.clone();
 
     let llm_runtime_snapshot = agent.llm_runtime.snapshot();
-    let llm_provider = llm_runtime_snapshot.provider();
     // Spawn selected this worker's model before its immutable fence was built.
     // Keep that exact model and expose no generic router to later loop phases.
     let model = match tokio::time::timeout(Duration::from_secs(2), agent.model.read()).await {
@@ -701,7 +700,6 @@ async fn build_isolated_mandate_bootstrap(
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
         task_outcome: None,
-        replay_notes: Vec::new(),
     };
     let mut turn_context = TurnContext {
         // This fixed daemon string prevents a model-authored task from becoming
@@ -735,15 +733,12 @@ async fn build_isolated_mandate_bootstrap(
         resume_execution_snapshot: None,
         emitter,
         learning_ctx,
-        active_skill_names,
         active_untrusted_external_reference_skills: Vec::new(),
         restrict_untrusted_external_reference_tools: false,
-        tools_allowed_for_user: true,
         available_capabilities,
         base_tool_defs,
         tool_defs,
         policy_bundle,
-        llm_provider,
         llm_router: None,
         model,
         route_failsafe_active: false,
@@ -976,7 +971,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
         task_outcome: None,
-        replay_notes: Vec::new(),
     };
     if let Some((label, is_positive)) = detect_explicit_outcome_signal(user_text) {
         if is_positive {
@@ -1711,15 +1705,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
         emitter,
         learning_ctx,
-        active_skill_names,
         active_untrusted_external_reference_skills,
         restrict_untrusted_external_reference_tools,
-        tools_allowed_for_user,
         available_capabilities,
         base_tool_defs,
         tool_defs,
         policy_bundle,
-        llm_provider,
         llm_router,
         model,
         route_failsafe_active,
@@ -1812,8 +1803,25 @@ mod mandate_bootstrap_isolation_tests {
         }
     }
 
+    async fn assert_durable_mandate_origin(agent: &Agent, session_id: &str) {
+        let events = agent
+            .event_store
+            .query_events_by_types(session_id, &[EventType::UserMessage], 10)
+            .await
+            .expect("query mandate user message");
+        let user_message = events
+            .first()
+            .expect("mandate bootstrap emitted a canonical user message");
+        assert_eq!(
+            user_message
+                .data
+                .get("execution_origin")
+                .and_then(serde_json::Value::as_str),
+            Some("mandate")
+        );
+    }
+
     fn assert_isolated(data: &BootstrapData, forbidden: &[&str]) {
-        assert!(data.active_skill_names.is_empty());
         assert!(data.active_untrusted_external_reference_skills.is_empty());
         assert!(!data.restrict_untrusted_external_reference_tools);
         assert!(data.session_summary.is_none());
@@ -1838,24 +1846,6 @@ mod mandate_bootstrap_isolation_tests {
                 "isolated bootstrap leaked {sentinel:?}"
             );
         }
-    }
-
-    async fn assert_durable_mandate_origin(agent: &Agent, session_id: &str) {
-        let events = agent
-            .event_store
-            .query_events_by_types(session_id, &[EventType::UserMessage], 10)
-            .await
-            .expect("query mandate user message");
-        let user_message = events
-            .first()
-            .expect("mandate bootstrap emitted a canonical user message");
-        assert_eq!(
-            user_message
-                .data
-                .get("execution_origin")
-                .and_then(serde_json::Value::as_str),
-            Some("mandate")
-        );
     }
 
     #[tokio::test]

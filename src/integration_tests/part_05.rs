@@ -887,7 +887,7 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
 /// Regression: once a duplicate send_file is suppressed, the task should be
 /// forced into text-only mode instead of repeatedly attempting more file sends.
 #[tokio::test]
-async fn test_duplicate_send_file_forces_text_closeout() {
+async fn test_repeated_send_file_executes_once() {
     struct CountingSendFileTool {
         calls: Arc<AtomicUsize>,
     }
@@ -1007,9 +1007,11 @@ async fn test_duplicate_send_file_forces_text_closeout() {
                     .is_some_and(|c| c.contains("Duplicate send_file suppressed"))
         })
         .count();
+    // Tools stay available after a duplicate; every repeat of the same
+    // file and caption is suppressed instead of sent.
     assert_eq!(
-        dedupe_msgs, 1,
-        "Expected exactly one duplicate suppression message"
+        dedupe_msgs, 2,
+        "each repeated identical send_file is suppressed"
     );
 }
 
@@ -1324,138 +1326,39 @@ async fn test_failed_mutation_gets_recovery_pass_before_report() {
         .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
         .filter_map(|result| result.receipt.map(|receipt| receipt.outcome_status))
         .collect::<Vec<_>>();
-    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::FailedPermanent));
-    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::Succeeded));
+    assert!(
+        statuses.contains(&crate::traits::ToolOutcomeStatus::FailedPermanent),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses.contains(&crate::traits::ToolOutcomeStatus::Succeeded),
+        "{statuses:?}"
+    );
 
     // The pivot's success ships — not a failure report.
     assert!(
         response.contains("record is created") || response.contains("abc123"),
         "recovered outcome must ship: {response:?}"
     );
-}
-
-/// End-to-end proof of the runtime self-repair contract: a directory
-/// capability the execution prelude projected on the model's behalf cannot be
-/// prepared (its parent is a file), so the terminal adapter reports a typed
-/// `RuntimePreparationFailure`; the dispatcher drops its own projection and
-/// re-runs the prepared call without consuming a model iteration. The model's
-/// command then runs exactly as declared and the model never sees the
-/// runtime's mistake as a tool error.
-#[tokio::test]
-async fn test_full_stack_runtime_repairs_its_own_unpreparable_projection() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let blocker = workspace.path().join("blocker");
-    std::fs::write(&blocker, "a file, not a directory").expect("blocker");
-    // A future root beneath an existing FILE: passes the pre-projection disk
-    // check (it does not exist) but can never be materialized (ENOTDIR).
-    let impossible_root = blocker.join("sub").to_string_lossy().to_string();
-    let output = workspace.path().join("out.txt").to_string_lossy().to_string();
-    let cwd = workspace.path().to_string_lossy().to_string();
-
-    // The typed assessment declares the impossible root as a write root, so
-    // the contract compiler classifies it as a directory capability and the
-    // prelude projects it into the terminal call's `write_roots`.
-    let base = MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_workspace_write"],
-        "new_request",
-        "local_workspace",
-    );
-    let mut assessment: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["contract"]["filesystem_access"] = serde_json::json!({
-        "execution_cwd": cwd,
-        "read_paths": [],
-        "write_paths": [output],
-        "read_roots": [],
-        "write_roots": [impossible_root],
-    });
-    let assessment = MockProvider::text_response(&assessment.to_string());
-
-    let terminal_args = serde_json::json!({
-        "command": format!("printf SYNTHETIC_REPAIR_OK > '{output}'"),
-        "working_dir": cwd,
-        "write_paths": [output],
-    })
-    .to_string();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("terminal", &terminal_args),
-        MockProvider::text_response("Wrote the file."),
-    ])
-    .with_task_assessments(vec![assessment]);
-    let harness = setup_full_stack_test_agent(provider).await.unwrap();
-
-    let session_id = "runtime_projection_repair";
-    let response = harness
+    // A later success credits the run: the earlier failure does not make it
+    // partial.
+    let task_end = harness
         .agent
-        .handle_message(
-            session_id,
-            &format!("Write SYNTHETIC_REPAIR_OK to {output} (output root {impossible_root})."),
-            None,
-            UserRole::Owner,
-            ChannelContext {
-                visibility: ChannelVisibility::Private,
-                platform: "telegram".to_string(),
-                channel_name: None,
-                channel_id: None,
-                workspace_id: None,
-                sender_name: Some("Alice".to_string()),
-                sender_id: Some("telegram:synthetic-owner".to_string()),
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                workspace_grant: None,
-                trusted: false,
-            },
-            None,
+        .event_store()
+        .query_events_by_types(
+            "tg_mutation_recovery",
+            &[crate::events::EventType::TaskEnd],
+            5,
         )
         .await
-        .unwrap();
-    assert!(!response.is_empty());
-
-    // The model's command ran exactly as declared.
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end");
     assert_eq!(
-        std::fs::read_to_string(&output).expect("command output must exist"),
-        "SYNTHETIC_REPAIR_OK"
+        task_end.effective_outcome(),
+        crate::events::TaskOutcome::Succeeded
     );
-
-    let decision_rows: Vec<String> = sqlx::query_scalar(
-        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id",
-    )
-    .bind(session_id)
-    .fetch_all(&harness.state.pool())
-    .await
-    .unwrap();
-    let repaired = decision_rows
-        .iter()
-        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
-        .find(|data| {
-            data["metadata"]["condition"].as_str() == Some("runtime_projection_repaired")
-        })
-        .expect("the dispatcher must record that it repaired its own projection");
-    assert_eq!(repaired["metadata"]["field"], "write_roots");
-    assert_eq!(repaired["metadata"]["value"], impossible_root);
-    assert_eq!(repaired["metadata"]["model_iteration_consumed"], false);
-
-    // No tool result carrying the runtime's own preparation error ever
-    // reached the model; the single durable terminal receipt is the
-    // dispatched command.
-    let tool_results: Vec<String> = sqlx::query_scalar(
-        "SELECT data FROM events WHERE session_id = ? AND event_type = 'tool_result' AND tool_name = 'terminal' ORDER BY id",
-    )
-    .bind(session_id)
-    .fetch_all(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(tool_results.len(), 1, "{tool_results:?}");
-    let receipt: serde_json::Value = serde_json::from_str(&tool_results[0]).unwrap();
-    assert!(
-        !receipt.to_string().contains("could not prepare"),
-        "runtime preparation failure leaked to the model: {receipt}"
-    );
-    assert_eq!(receipt["receipt"]["invocation_stage"], "dispatched");
-    assert_eq!(receipt["receipt"]["exit_code"], 0);
 }
 
 /// A pre-dispatch denial the contract itself asked for (`non_success_terminal`
@@ -1570,14 +1473,6 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     assert!(
         !conditions.iter().any(|c| c == "tools_required_no_tool_response"),
         "gate looped: {conditions:?}"
-    );
-    assert!(
-        conditions.iter().any(|c| c == "negative_completion_contract"),
-        "{conditions:?}"
-    );
-    assert!(
-        conditions.iter().any(|c| c == "policy_denial_terminal_observation"),
-        "denial must be accepted as the terminal observation: {conditions:?}"
     );
     // The ledger-first arbiter (shadow by default) must agree: nothing is
     // reachable after the credited denial, so the run is closed on evidence.

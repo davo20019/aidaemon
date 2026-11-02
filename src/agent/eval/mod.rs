@@ -3,7 +3,7 @@
 mod accumulator;
 mod scoring;
 
-pub use accumulator::{HarnessEvalAccumulator, HarnessEvalSeed, StopReason};
+pub use accumulator::{HarnessEvalAccumulator, HarnessEvalSeed};
 pub use scoring::HarnessEvalConfig;
 
 pub(in crate::agent) type HarnessEvalHandle =

@@ -296,63 +296,6 @@ impl Agent {
     /// ignore forced `tool_choice=required` is persisted (JSON array).
     const REQUIRED_TOOL_CHOICE_IGNORED_KEY: &'static str = "required_tool_choice_ignored_models";
 
-    /// Whether `model` has previously ignored a forced `tool_choice=required`
-    /// call (returned text with zero tool calls), meaning forcing it again
-    /// would only burn tokens — and on some stacks (llama.cpp + Gemma)
-    /// degenerate into a repetition loop until the token limit.
-    pub(crate) async fn required_tool_choice_ignored(&self, model: &str) -> bool {
-        self.required_tool_choice_ignored_models
-            .read()
-            .await
-            .contains(model)
-    }
-
-    /// Record that `model` ignored a forced `tool_choice=required` call.
-    /// Returns true when the model was newly flagged.
-    ///
-    /// On a newly-flagged model the updated set is also persisted to the
-    /// settings KV (JSON), so the flag survives daemon restarts and the
-    /// witnessed meltdown is never re-armed.
-    pub(crate) async fn record_required_tool_choice_ignored(&self, model: &str) -> bool {
-        let newly_flagged = self
-            .required_tool_choice_ignored_models
-            .write()
-            .await
-            .insert(model.to_string());
-
-        if newly_flagged {
-            // Snapshot under the read lock, then persist outside it.
-            let snapshot: Vec<String> = {
-                let set = self.required_tool_choice_ignored_models.read().await;
-                let mut v: Vec<String> = set.iter().cloned().collect();
-                v.sort();
-                v
-            };
-            self.persist_required_tool_choice_ignored(&snapshot).await;
-        }
-
-        newly_flagged
-    }
-
-    /// Persist the runtime-learned ignore-set to the settings KV as a JSON
-    /// array. Best-effort: a storage error is logged, never propagated.
-    pub(in crate::agent) async fn persist_required_tool_choice_ignored(&self, models: &[String]) {
-        match serde_json::to_string(models) {
-            Ok(json) => {
-                if let Err(e) = self
-                    .state
-                    .set_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY, &json)
-                    .await
-                {
-                    warn!(error = %e, "Failed to persist required_tool_choice_ignored_models");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to serialize required_tool_choice_ignored_models");
-            }
-        }
-    }
-
     /// Test-only: clear the in-memory ignore-set so a subsequent
     /// `load_required_tool_choice_ignored()` exercises the persisted-KV path.
     #[cfg(test)]

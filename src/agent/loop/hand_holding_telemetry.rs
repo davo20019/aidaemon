@@ -52,27 +52,6 @@ pub(crate) fn planner_skip_metadata(reason: &str, model: &str, trust_tier: &str)
     })
 }
 
-pub(crate) fn replanner_result_metadata(
-    action: &str,
-    model: &str,
-    trust_tier: &str,
-    step_index: usize,
-    step_description: &str,
-    advanced: bool,
-    evidence: Option<&str>,
-) -> Value {
-    json!({
-        "component": "replanner",
-        "action": action,
-        "model": model,
-        "trust_tier": trust_tier,
-        "step_index": step_index,
-        "step_description": step_description,
-        "advanced": advanced,
-        "evidence": evidence
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,23 +109,5 @@ mod tests {
                 "trust_tier": "guided"
             })
         );
-    }
-
-    #[test]
-    fn replanner_result_metadata_records_shape() {
-        let metadata = replanner_result_metadata(
-            "advanced",
-            "gemma-4-26b",
-            "guided",
-            2,
-            "Run the verification command",
-            true,
-            Some("tests passed"),
-        );
-        assert_eq!(metadata["component"], "replanner");
-        assert_eq!(metadata["action"], "advanced");
-        assert_eq!(metadata["step_index"], 2);
-        assert_eq!(metadata["advanced"], true);
-        assert_eq!(metadata["evidence"], "tests passed");
     }
 }

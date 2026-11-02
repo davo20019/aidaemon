@@ -52,9 +52,6 @@ pub(super) struct MessageBuildData {
     /// rendering, compaction, and eviction into the provider-visible payload.
     pub projected_source_message_ids: Vec<String>,
     pub projected_source_turn_ids: Vec<String>,
-    /// Estimated input tokens (messages + tool schemas) for this call, used for
-    /// est-vs-actual drift telemetry in the `LlmCall` event.
-    pub est_input_tokens: u32,
 }
 
 fn take_projected_source_ids(messages: &mut [Value]) -> (Vec<String>, Vec<String>) {
@@ -1699,20 +1696,11 @@ pub(super) async fn run_message_build_phase(
     // Providers stay order-preserving (no sort in adapters).
     Agent::sort_tool_definitions_by_name(&mut effective_tool_defs);
 
-    let est_input_tokens = {
-        let est_msg_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
-        let est_tool_tokens =
-            crate::memory::context_window::estimate_tool_definition_tokens(&effective_tool_defs);
-        (est_msg_tokens + est_tool_tokens) as u32
-    };
-
     Ok(MessageBuildData {
         messages,
         tool_defs: effective_tool_defs,
         projected_source_message_ids,
         projected_source_turn_ids,
-        est_input_tokens,
     })
 }
 

@@ -1,44 +1,7 @@
 use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use super::llm_phase::LlmPhaseCtx;
 use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
-use super::response_phase::ResponsePhaseCtx;
-use super::stopping_phase::StoppingPhaseCtx;
-use super::tool_execution_phase::ToolExecutionCtx;
-use super::tool_prelude_phase::ToolPreludeCtx;
-use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
-
-/// Build a user-facing message when the force-text safety net fires and there
-/// is no salvageable tool output to return.
-///
-/// This path runs only after automatic force-text recovery is exhausted. It
-/// must not guess from wording that the user should restate an otherwise valid
-/// request or choose a routine execution tactic.
-fn build_stuck_no_output_fallback(_user_text: &str) -> String {
-    "I wasn't able to complete that because automatic execution recovery produced no usable result."
-        .to_string()
-}
-
-/// Project durable task-kernel lane closures into the next model step. The
-/// base definition set is immutable so a later, unrelated task starts with the
-/// complete registered capability set again.
-fn tool_definitions_after_dispatch_stops(
-    tool_defs: &[serde_json::Value],
-    stopped_tools: &std::collections::BTreeSet<String>,
-) -> Vec<serde_json::Value> {
-    tool_defs
-        .iter()
-        .filter(|definition| {
-            definition
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|name| !stopped_tools.contains(name))
-        })
-        .cloned()
-        .collect()
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContinuationReceiptAssimilation {
@@ -405,101 +368,6 @@ fn task_assessment_conversation_context(
     )
 }
 
-/// Enter one agent-loop iteration and update the state that is common to every
-/// phase path. Keeping this boundary small avoids threading the full turn
-/// context through another driver object while making iteration entry explicit.
-async fn begin_turn_iteration(
-    task_id: &str,
-    model: &mut String,
-    turn_state: &mut super::loop_state::TurnState,
-    execution_state: &ExecutionState,
-    completion_progress: &CompletionProgress,
-    heartbeat: &Option<Arc<AtomicU64>>,
-) -> usize {
-    let iteration = turn_state.counters.advance_iteration();
-    touch_heartbeat(heartbeat);
-    let plan_progress = execution_state
-        .active_linear_intent_plan
-        .as_ref()
-        .map(|plan| {
-            (
-                plan.steps.iter().filter(|step| step.completed).count() as u32,
-                plan.steps.len() as u32,
-            )
-        });
-    #[cfg(feature = "computer_use")]
-    {
-        let resolved_model =
-            crate::agent::computer_use::resolve_model_for_task(task_id, model.as_str()).await;
-        *model = resolved_model;
-    }
-    #[cfg(not(feature = "computer_use"))]
-    let _ = (task_id, model);
-
-    turn_state
-        .with_harness_eval(|eval| {
-            eval.record_completion_progress(completion_progress);
-            eval.record_iteration_progress(
-                iteration as u32,
-                turn_state.counters.total_tool_calls_attempted() as u32,
-                turn_state.counters.total_successful_tool_calls() as u32,
-                turn_state.evidence.evidence_gain_count() as u32,
-                false,
-            );
-            if let Some((completed, total)) = plan_progress {
-                eval.record_plan_progress(completed, total);
-            }
-        })
-        .await;
-    iteration
-}
-
-/// Apply restart-only state changes at one shared driver boundary. Most
-/// restarts merely select the loop back-edge; approach pivots additionally
-/// reset stale evidence and inject the next-attempt directive.
-fn prepare_turn_restart(
-    agent: &Agent,
-    reason: TurnRestartReason,
-    turn_state: &mut super::loop_state::TurnState,
-    approach_pivots_used: &mut usize,
-    model: &str,
-) {
-    let failure_record = match reason {
-        TurnRestartReason::ApproachPivot { failure_record } => failure_record,
-        TurnRestartReason::StallForceTextCloseout => {
-            // The stopping phase already switched the turn to force-text mode
-            // and queued the closeout directive; the stall count it measured
-            // belonged to the tool-calling approach that mode ends. The
-            // force-text safety net bounds the pass from here.
-            turn_state.stall.reset_for_force_text_closeout();
-            crate::agent::heuristic_telemetry::global().record(
-                "stall_force_text_closeout",
-                model,
-                agent.trust_tier_for_model(model),
-                crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
-            );
-            return;
-        }
-        _ => return,
-    };
-
-    *approach_pivots_used += 1;
-    turn_state.stall.reset_for_pivot();
-    turn_state.failures.reset_for_pivot();
-    turn_state
-        .directives
-        .push_system_message(SystemDirective::ApproachPivotRequired {
-            attempt: *approach_pivots_used,
-            failure_record,
-        });
-    crate::agent::heuristic_telemetry::global().record(
-        "approach_pivot",
-        model,
-        agent.trust_tier_for_model(model),
-        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
-    );
-}
-
 // impl-Agent justification: handle_message_impl drives the turn lifecycle and owns TurnState construction.
 impl Agent {
     /// Run the agentic loop for a user message in the given session.
@@ -555,15 +423,12 @@ impl Agent {
             resume_execution_snapshot,
             emitter,
             mut learning_ctx,
-            active_skill_names,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
-            tools_allowed_for_user,
-            mut available_capabilities,
-            mut base_tool_defs,
+            available_capabilities,
+            base_tool_defs,
             mut tool_defs,
             mut policy_bundle,
-            llm_provider,
             llm_router,
             mut model,
             route_failsafe_active,
@@ -624,9 +489,8 @@ impl Agent {
         let unhandled_error_emitter = emitter.clone();
         let unhandled_error_task_id = task_id.clone();
         let loop_result = tracing::Instrument::instrument(async move {
-        let mut last_progress_summary = Instant::now();
-        const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
-        let mut approach_pivots_used: usize = 0;
+        let _last_progress_summary = Instant::now();
+        let _approach_pivots_used: usize = 0;
         const MAX_BUDGET_EXTENSIONS: usize = 3;
         const HARD_TOKEN_CAP: i64 = 2_000_000;
 
@@ -1084,7 +948,7 @@ impl Agent {
             turn_state.attach_harness_eval(handle);
         }
 
-        let execution_requirement =
+        let _execution_requirement =
             ExecutionRequirement::from_finalized_contract(&turn_context.completion_contract);
 
         let (execution_budget_tier, execution_budget_route, execution_budget) =
@@ -1326,17 +1190,17 @@ impl Agent {
                     .raise_effective_task_budget_to(per_check_budget);
             }
         }
-        let effective_task_timeout = if is_scheduled_goal {
+        let _effective_task_timeout = if is_scheduled_goal {
             None
         } else {
             self.limits.task_timeout
         };
-        let max_budget_extensions = if is_scheduled_goal {
+        let _max_budget_extensions = if is_scheduled_goal {
             SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS
         } else {
             MAX_BUDGET_EXTENSIONS
         };
-        let hard_token_cap = if is_scheduled_goal {
+        let _hard_token_cap = if is_scheduled_goal {
             SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP
         } else {
             HARD_TOKEN_CAP
@@ -1344,7 +1208,7 @@ impl Agent {
         // Runtime-only override for goal daily budget extensions.
         // Shared via GoalTokenRegistry so task-leads/executors for the same goal
         // can inherit the same temporary budget without persisting it to SQLite.
-        let mut effective_goal_daily_budget: Option<i64> = if let (Some(goal_id), Some(registry)) = (
+        let _effective_goal_daily_budget: Option<i64> = if let (Some(goal_id), Some(registry)) = (
             resolved_goal_id.as_deref(),
             self.goal_token_registry.as_ref(),
         ) {
@@ -1361,7 +1225,7 @@ impl Agent {
         // behavior byte-for-byte on non-remediation paths. Fetched once here and
         // cloned into each iteration's `ToolExecutionCtx` so the P2.4 per-call
         // sandbox gate fires on the remediation task-lead and all its executors.
-        let correction_context = self.correction_context_for_current_goal().await;
+        let _correction_context = self.correction_context_for_current_goal().await;
 
         // On the SDK engine the kernel runs the iteration loop; every per-turn
         // setup above (assessment, contract, harness eval, budgets, pending
@@ -1377,7 +1241,8 @@ impl Agent {
             let MessageBuildData {
                 messages: prefix,
                 tool_defs: offered_tool_defs,
-                ..
+                projected_source_message_ids,
+                projected_source_turn_ids,
             } = super::message_build_phase::run_message_build_phase(
                 &services,
                 &mut MessageBuildCtx {
@@ -1454,6 +1319,8 @@ impl Agent {
                     .then(|| turn_context.primary_project_scope.clone())
                     .flatten(),
                 task_access: turn_context.filesystem_access.clone(),
+                projected_source_message_ids,
+                projected_source_turn_ids,
                 authorized_scopes: {
                     let mut scopes = if turn_context.authorized_project_scopes.is_empty() {
                         channel_ctx
@@ -1722,305 +1589,6 @@ mod stuck_fallback_tests {
     use super::*;
 
     #[test]
-    fn durable_dispatch_stop_projection_removes_only_closed_tool_lanes() {
-        let definition = |name: &str| {
-            json!({
-                "type": "function",
-                "function": {"name": name, "parameters": {"type": "object"}}
-            })
-        };
-        let all = vec![
-            definition("terminal"),
-            definition("run_command"),
-            definition("read_file"),
-            definition("system_info"),
-        ];
-        let stopped =
-            std::collections::BTreeSet::from(["run_command".to_string(), "terminal".to_string()]);
-
-        let projected = tool_definitions_after_dispatch_stops(&all, &stopped);
-        let names = projected
-            .iter()
-            .filter_map(|value| value.pointer("/function/name")?.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, ["read_file", "system_info"]);
-        assert_eq!(all.len(), 4, "the registered base set remains immutable");
-    }
-
-    fn detached_command_evidence(
-        status: crate::traits::ToolOutcomeStatus,
-        exit_code: i32,
-        result: &str,
-    ) -> crate::events::ContinuationToolEvidence {
-        let arguments = json!({
-            "command": "/usr/bin/false",
-            "working_dir": "/tmp",
-        });
-        let mut metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(status),
-            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-            receipt_kind: crate::traits::ToolReceiptKind::Process,
-            exit_code: Some(exit_code),
-            semantics: crate::traits::ToolCallSemantics::observation()
-                .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
-            ..crate::traits::ToolCallMetadata::default()
-        };
-        super::super::tool_execution_phase::complete_tool_result_semantics(
-            "terminal",
-            &serde_json::to_string(&arguments).unwrap(),
-            &metadata.semantics.clone(),
-            &mut metadata,
-        );
-        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
-            &metadata,
-            status,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
-            None,
-        );
-        receipt.result_provenance.result_id = Some("result:synthetic-negative".to_string());
-        crate::events::ContinuationToolEvidence {
-            call: crate::events::ToolCallData {
-                tool_call_id: "call-parent".to_string(),
-                name: "terminal".to_string(),
-                arguments,
-                summary: None,
-                task_id: Some("task-parent".to_string()),
-                idempotency_key: None,
-                policy_rev: None,
-                risk_score: None,
-                stable_operation_key: None,
-                obligation_ids: Vec::new(),
-                max_operation_attempts: None,
-                max_operation_invocations: None,
-                operation_lineage: None,
-                turn_id: None,
-            },
-            result: crate::events::ToolResultData {
-                message_id: None,
-                tool_call_id: "call-parent".to_string(),
-                name: "terminal".to_string(),
-                result: result.to_string(),
-                success: status == crate::traits::ToolOutcomeStatus::Succeeded,
-                duration_ms: 1,
-                error: None,
-                task_id: Some("task-parent".to_string()),
-                annotations: Vec::new(),
-                turn_id: None,
-                attachments: Vec::new(),
-                receipt: Some(receipt),
-            },
-        }
-    }
-
-    #[test]
-    fn adopted_negative_parent_receipt_closes_child_outcome_obligation() {
-        let mut contract = CompletionContract {
-            scope_task_id: Some("task-child".to_string()),
-            adopted_from_task_ids: vec!["task-parent".to_string()],
-            requires_observation: true,
-            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
-                summary: "Observed process outcome".to_string(),
-                acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-                purpose: crate::traits::EvidencePurpose::Outcome,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-                required_content_markers: Vec::new(),
-                receipt: Some(crate::traits::RequestReceiptPredicate {
-                    tool_names: vec!["terminal".to_string()],
-                    exit_codes: vec![1],
-                    outcome_statuses: vec![
-                        crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-                    ],
-                    outcome_condition: None,
-                    requires_output: false,
-                    contract_rejected: None,
-                    min_invocations: None,
-                    max_invocations: None,
-                }),
-                target: None,
-            }],
-            ..CompletionContract::default()
-        };
-        contract.adopt_for_task("task-child");
-        let mut progress = CompletionProgress::new(&contract, "task-child");
-        let evidence = detached_command_evidence(
-            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-            1,
-            "",
-        );
-
-        let assimilation = assimilate_continuation_receipt(
-            &contract,
-            &mut progress,
-            &evidence,
-            "task-parent",
-            "result:synthetic-negative",
-        )
-        .unwrap();
-
-        assert!(assimilation.observation_credited);
-        assert_eq!(assimilation.matched_requirement_indices, [0]);
-        assert!(progress.all_evidence_requirements_satisfied());
-        assert!(!progress.verification_pending);
-    }
-
-    #[test]
-    fn parent_receipt_cannot_close_an_unrelated_child_requirement() {
-        let contract = CompletionContract {
-            scope_task_id: Some("task-child".to_string()),
-            adopted_from_task_ids: vec!["task-parent".to_string()],
-            requires_observation: true,
-            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
-                summary: "Read package edition".to_string(),
-                acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
-                purpose: crate::traits::EvidencePurpose::Content,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-                required_content_markers: vec!["edition".to_string()],
-                receipt: None,
-                target: None,
-            }],
-            ..CompletionContract::default()
-        };
-        let mut progress = CompletionProgress::new(&contract, "task-child");
-        let evidence = detached_command_evidence(
-            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-            1,
-            "",
-        );
-
-        let assimilation = assimilate_continuation_receipt(
-            &contract,
-            &mut progress,
-            &evidence,
-            "task-parent",
-            "result:synthetic-negative",
-        )
-        .unwrap();
-
-        assert!(!assimilation.observation_credited);
-        assert!(progress.verification_pending);
-        assert!(!progress.all_evidence_requirements_satisfied());
-    }
-
-    #[test]
-    fn detached_receipt_closes_exact_parent_owned_generic_obligation() {
-        let child_requirement = crate::traits::RequestEvidenceRequirement {
-            summary: "Observe an unrelated child-only fact".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: Vec::new(),
-            receipt: None,
-            target: None,
-        };
-        let parent_requirement = crate::traits::RequestEvidenceRequirement {
-            summary: "Observe the detached command result".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-            purpose: crate::traits::EvidencePurpose::Content,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: Vec::new(),
-            receipt: None,
-            target: None,
-        };
-        let contract = CompletionContract {
-            scope_task_id: Some("task-child".to_string()),
-            adopted_from_task_ids: vec!["task-parent".to_string()],
-            requires_observation: true,
-            // The parent requirement deliberately is not at its source index.
-            // Cross-task proof must use the durable binding, never position.
-            evidence_requirements: vec![child_requirement, parent_requirement.clone()],
-            adopted_evidence_bindings: vec![crate::traits::AdoptedEvidenceBinding {
-                source_obligation_id: "task:task-parent/obligation:evidence:0".to_string(),
-                requirement: parent_requirement,
-            }],
-            ..CompletionContract::default()
-        };
-        let mut progress = CompletionProgress::new(&contract, "task-child");
-        let mut evidence = detached_command_evidence(
-            crate::traits::ToolOutcomeStatus::Succeeded,
-            0,
-            "SYNTHETIC_LONG_OK",
-        );
-        evidence
-            .result
-            .receipt
-            .as_mut()
-            .unwrap()
-            .continuation_obligation_ids =
-            vec!["task:task-parent/obligation:evidence:0".to_string()];
-
-        let assimilation = assimilate_continuation_receipt(
-            &contract,
-            &mut progress,
-            &evidence,
-            "task-parent",
-            "result:synthetic-negative",
-        )
-        .expect("causally bound receipt");
-
-        assert!(assimilation.observation_credited);
-        assert_eq!(assimilation.matched_requirement_indices, [1]);
-        assert_eq!(progress.satisfied_evidence_requirements(), 1);
-        assert!(progress.verification_pending);
-    }
-
-    #[test]
-    fn exact_visible_antecedent_can_close_conversation_content_obligation() {
-        let contract = CompletionContract {
-            requires_observation: true,
-            evidence_requirements: vec![crate::traits::RequestEvidenceRequirement {
-                summary: "Values supplied in the exact preceding setup".to_string(),
-                acceptable_scopes: vec![crate::traits::ToolSemanticScope::ConversationHistory],
-                purpose: crate::traits::EvidencePurpose::HistoricalRecord,
-                minimum_authority: crate::traits::EvidenceAuthority::Canonical,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
-                required_content_markers: vec![
-                    "SILVER COMET".to_string(),
-                    "eighty-three".to_string(),
-                ],
-                receipt: None,
-                target: None,
-            }],
-            ..CompletionContract::default()
-        };
-        let recent = vec![
-            json!({
-                "message_id": "unrelated-user",
-                "role": "user",
-                "content": "The unrelated value is eighty-three."
-            }),
-            json!({
-                "message_id": "antecedent-user",
-                "role": "user",
-                "content": "Keep phrase SILVER COMET and quantity eighty-three in volatile context."
-            }),
-            json!({
-                "message_id": "antecedent-assistant",
-                "role": "assistant",
-                "content": "Setup acknowledged."
-            }),
-        ];
-        let mut progress = CompletionProgress::new(&contract, "task-child");
-
-        let assimilation = assimilate_visible_antecedent_context(
-            &contract,
-            &mut progress,
-            &recent,
-            "antecedent-user",
-        )
-        .expect("exact visible context should be canonical evidence");
-
-        assert_eq!(assimilation.source_message_ids.len(), 2);
-        assert_eq!(assimilation.matched_requirement_indices, [0]);
-        assert!(progress.all_evidence_requirements_satisfied());
-        assert!(!progress.verification_pending);
-    }
-
-    #[test]
     fn exact_antecedent_is_projected_as_bounded_typed_context_without_word_matching() {
         let recent = vec![
             json!({
@@ -2141,29 +1709,5 @@ mod stuck_fallback_tests {
             task_assessment_conversation_context(Some(FollowupMode::Followup), None, &recent)
                 .expect("follow-up context");
         assert!(context.contains("Check the first device."));
-    }
-
-    #[test]
-    fn fallback_does_not_infer_missing_details_from_request_wording() {
-        let msg = build_stuck_no_output_fallback("Web search");
-        assert!(msg.contains("automatic execution recovery"));
-        assert!(!msg.contains('?'));
-        assert!(!msg.contains("processing limit"));
-    }
-
-    #[test]
-    fn fallback_is_wording_independent() {
-        let msg = build_stuck_no_output_fallback("look it up");
-        let detailed = build_stuck_no_output_fallback(
-            "search the web for what Caro is a nickname for and summarize the top results",
-        );
-        assert_eq!(msg, detailed);
-    }
-
-    #[test]
-    fn fallback_never_emits_legacy_processing_limit_string() {
-        for input in ["Web search", "do something", "", "look up cats"] {
-            assert!(!build_stuck_no_output_fallback(input).contains("processing limit"));
-        }
     }
 }

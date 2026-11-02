@@ -1744,6 +1744,20 @@ impl RunAggregate {
         })
     }
 
+    /// The run did work and every operation that reached a terminal
+    /// receipt failed: nothing succeeded and nothing was refused by policy.
+    /// A run with no contract has no other proof that it accomplished
+    /// anything, so its success cannot be credited.
+    pub(crate) fn only_failed_operations(&self) -> bool {
+        let mut terminal = self
+            .operations
+            .values()
+            .filter(|operation| operation.has_terminal_receipt() && !operation.policy_denied)
+            .peekable();
+        terminal.peek().is_some()
+            && terminal.all(|operation| operation.outcome.is_some_and(|status| status.is_failure()))
+    }
+
     pub(crate) fn terminal_decision(&self) -> RunTerminalDecision {
         if !self.expectations_present() || self.obligations.is_empty() {
             return RunTerminalDecision::Unspecified;

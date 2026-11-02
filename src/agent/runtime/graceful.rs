@@ -2,7 +2,6 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum GoalBudgetCheckSource {
-    PreCheck,
     PostLlm,
 }
 
@@ -182,6 +181,8 @@ impl Agent {
         }
     }
 
+    /// The percentage to warn at once a scheduled run has used 80% of its
+    /// per-run budget (not yet exhausted, not already warned).
     pub(super) fn scheduled_run_budget_pressure_pct(
         status: &crate::goal_tokens::GoalRunBudgetStatus,
         warning_already_sent: bool,
@@ -427,11 +428,6 @@ impl Agent {
         };
 
         let (auto_condition, manual_condition, source_label) = match ctx.source {
-            GoalBudgetCheckSource::PreCheck => (
-                "goal_daily_budget_extension",
-                "goal_daily_budget_extension_manual",
-                "pre-check",
-            ),
             GoalBudgetCheckSource::PostLlm => (
                 "goal_daily_budget_extension_post_llm",
                 "goal_daily_budget_extension_manual_post_llm",
@@ -664,93 +660,6 @@ impl Agent {
         }
     }
 
-    async fn append_graceful_assistant_summary(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        summary: String,
-    ) -> anyhow::Result<String> {
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
-        self.append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
-            .await?;
-        Ok(summary)
-    }
-
-    /// Graceful response when task timeout is reached.
-    pub(super) async fn graceful_timeout_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        elapsed: Duration,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_timeout_response(learning_ctx, elapsed);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when task token budget is exhausted.
-    pub(super) async fn graceful_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used: u64,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_budget_response(learning_ctx, tokens_used);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when a scheduled run hits its per-run budget.
-    pub(super) async fn graceful_scheduled_run_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used: i64,
-        budget_per_check: i64,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_scheduled_run_budget_response(
-            learning_ctx,
-            tokens_used,
-            budget_per_check,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when a goal hits its daily token budget.
-    pub(super) async fn graceful_goal_daily_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used_today: i64,
-        budget_daily: i64,
-        is_scheduled_goal: bool,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_goal_daily_budget_response(
-            learning_ctx,
-            tokens_used_today,
-            budget_daily,
-            is_scheduled_goal,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
     fn dedupe_alert_sessions(sessions: Vec<String>) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -916,138 +825,6 @@ impl Agent {
         )
     }
 
-    /// Graceful response when agent is stalled (no progress).
-    pub(super) async fn graceful_stall_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        sent_file_successfully: bool,
-        tool_failure_count: &HashMap<String, usize>,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_stall_response(
-            learning_ctx,
-            sent_file_successfully,
-            DEFERRED_NO_TOOL_ERROR_MARKER,
-            tool_failure_count,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when agent stalled after making meaningful progress.
-    pub(super) async fn graceful_partial_stall_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        sent_file_successfully: bool,
-        tool_failure_count: &HashMap<String, usize>,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_partial_stall_response(
-            learning_ctx,
-            sent_file_successfully,
-            DEFERRED_NO_TOOL_ERROR_MARKER,
-            tool_failure_count,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Attempt a knowledge-only fallback when tools have failed.
-    ///
-    /// Makes one LLM call WITHOUT tools, asking the model to answer from
-    /// its training knowledge. Returns `Some(answer)` if the model gives a
-    /// substantive response (>30 chars), `None` otherwise.
-    pub(super) async fn try_knowledge_fallback(
-        &self,
-        user_text: &str,
-        error_summary: &str,
-    ) -> Option<String> {
-        if self.mandate_execution.is_some() {
-            return None;
-        }
-        let system = format!(
-            "The user asked a question but all tool-based approaches failed ({}).\n\
-             Answer the question from your training knowledge if possible.\n\
-             If you genuinely cannot answer without tools, say so briefly.\n\
-             Do NOT mention tool failures or activity summaries.",
-            error_summary
-        );
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": system}),
-            serde_json::json!({"role": "user", "content": user_text}),
-        ];
-        let provider = self.llm_runtime.provider();
-        let model = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!("Timed out acquiring model lock during knowledge fallback");
-                return None;
-            }
-        };
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            provider.chat(&model, &messages, &[]),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                let text = resp.content.unwrap_or_default();
-                if text.trim().len() > 30 {
-                    Some(text.trim().to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Attempt a knowledge-only fallback and, if successful, append the
-    /// answer as an assistant message.  Returns `Some(answer)` on success.
-    pub(super) async fn graceful_knowledge_fallback(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        user_text: &str,
-        error_summary: &str,
-    ) -> Option<anyhow::Result<String>> {
-        let answer = self
-            .try_knowledge_fallback(user_text, error_summary)
-            .await?;
-        Some(
-            self.append_graceful_assistant_summary(emitter, session_id, answer)
-                .await,
-        )
-    }
-
-    /// Graceful response when repetitive tool calls are detected.
-    pub(super) async fn graceful_repetitive_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tool_name: &str,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_repetitive_response(learning_ctx, tool_name);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when hard iteration cap is reached (legacy mode).
-    pub(super) async fn graceful_cap_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        iterations: usize,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_cap_response(learning_ctx, iterations);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
     /// Emit TaskEnd after recording an exact bootstrap protocol direct-return.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn emit_direct_return_task_end(
@@ -1142,12 +919,28 @@ impl Agent {
             ) => crate::events::TaskOutcome::Succeeded,
             (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
             (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
+            // The contract's work is still owed and nothing ran at all: there
+            // is no progress to call partial.
+            (_, crate::events::RunTerminalDecision::Pending)
+                if outcome == crate::events::TaskOutcome::Succeeded
+                    && run_aggregate.operations.is_empty() =>
+            {
+                crate::events::TaskOutcome::Failed
+            }
             (_, crate::events::RunTerminalDecision::Pending)
                 if outcome == crate::events::TaskOutcome::Succeeded =>
             {
                 crate::events::TaskOutcome::Partial
             }
             (_, crate::events::RunTerminalDecision::Pending) => outcome,
+            // No contract to judge by: receipts are the only proof, and a run
+            // whose operations all failed accomplished nothing, whether it
+            // ended on a reply or was stopped.
+            (_, crate::events::RunTerminalDecision::Unspecified)
+                if run_aggregate.only_failed_operations() =>
+            {
+                crate::events::TaskOutcome::Failed
+            }
             (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
         };
         let durable_tool_calls_count = self

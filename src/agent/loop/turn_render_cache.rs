@@ -17,11 +17,6 @@
 //! logging live at the Task-7 call site, NOT in the pure helper — keep the
 //! helper pure so it stays unit-testable, exactly as `core_cache_decision`.
 
-// Consumed by the message-build integration in Task 7 (Pillar B). Until then
-// the type/field/helpers have no in-crate caller outside this module's own
-// tests, so silence dead-code lints (mirrors `turn_render.rs`).
-#![allow(dead_code)]
-
 // `Message`, `Value`, and `json` all live in the `agent` module scope.
 use super::prefix_fingerprint::hash_canonical;
 use super::*;
