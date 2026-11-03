@@ -6228,6 +6228,70 @@ mod tests {
         );
     }
 
+    /// An executor's blocker is input to the task lead, which owns the run's
+    /// outcome: the mandate run stays running so the lead can still call the
+    /// model (budget fence) and finalize. The lead's own blocker still blocks.
+    #[tokio::test]
+    async fn executor_blocker_leaves_the_mandate_run_to_its_task_lead() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 2);
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let act = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "One bounded note is warranted",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &act.id,
+            &run.id,
+            "Post one bounded note",
+            "It advances the mandate",
+        );
+        store
+            .record_mandate_decision(&act, Some(&intention), None)
+            .await
+            .unwrap();
+        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
+        let blocked = |reason: &str| crate::traits::TaskAttemptPatch {
+            status: "blocked".to_string(),
+            result: None,
+            error: None,
+            blocker: Some(reason.to_string()),
+            context: None,
+            handoff: None,
+        };
+        async fn run_status(store: &SqliteStateStore, run_id: &str) -> String {
+            sqlx::query_scalar::<_, String>("SELECT status FROM goal_runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+        }
+
+        assert!(store
+            .patch_task_from_attempt(
+                &fence.worker_attempt.id,
+                &fence.worker_attempt.lease_token,
+                &blocked("the target is unreachable"),
+            )
+            .await
+            .unwrap());
+        assert_eq!(run_status(&store, &run.id).await, "running");
+
+        assert!(store
+            .patch_task_from_attempt(
+                &fence.root_attempt.id,
+                &fence.root_attempt.lease_token,
+                &blocked("the lead cannot continue"),
+            )
+            .await
+            .unwrap());
+        assert_eq!(run_status(&store, &run.id).await, "blocked");
+    }
+
     #[tokio::test]
     async fn lifecycle_transition_revokes_open_cycle_and_stale_owner_snapshot() {
         let (store, _database) = test_store().await;

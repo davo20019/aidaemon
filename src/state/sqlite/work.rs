@@ -1193,11 +1193,16 @@ impl WorkCoordinationStore for SqliteStateStore {
             .execute(&mut *tx)
             .await?;
         } else if patch.status == "blocked" {
+            // A mandate run's outcome belongs to its task lead (the root
+            // task): an executor's blocker is input to that lead, which must
+            // keep its live run to call the model and finalize.
             sqlx::query(
                 "UPDATE goal_runs SET status = 'blocked', updated_at = datetime('now')
-                 WHERE id = ? AND status IN ('pending', 'running')",
+                 WHERE id = ? AND status IN ('pending', 'running')
+                   AND (trigger_type <> 'mandate' OR root_task_id IS NULL OR root_task_id = ?)",
             )
             .bind(&goal_run_id)
+            .bind(&task_id)
             .execute(&mut *tx)
             .await?;
         }
