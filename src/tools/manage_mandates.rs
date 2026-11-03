@@ -50,7 +50,10 @@ const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
+/// Evidence a strategy revision may cite (`MandateStrategyRevision::validate`).
+const MAX_STRATEGY_EVIDENCE_RECEIPTS: usize = 8;
 const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
+const LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.";
 const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
 const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
 const PRIORITY_FIELD_DESCRIPTION: &str = "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.";
@@ -2091,15 +2094,25 @@ impl ManageMandatesTool {
         // the authority-bearing decision itself. Structured providers can
         // populate only part of an optional field family; do not let that
         // prevent a valid ACT/WAIT/ASK/STOP decision from being committed.
-        let learning_fields_complete = learning_note_fields_complete(
-            args.learning_note.as_deref(),
-            args.learning_evidence_receipt_ids.as_deref(),
-        );
+        // A note whose receipt ids are omitted cites the decision's own
+        // evidence (learning evidence must be a subset of it, and the model
+        // may not see ids the runtime attached), capped at the strategy
+        // revision limit.
+        let cited_learning_evidence = clean_strings(args.learning_evidence_receipt_ids.as_deref());
+        let learning_evidence = if cited_learning_evidence.is_empty() {
+            decision
+                .evidence_receipt_ids
+                .iter()
+                .take(MAX_STRATEGY_EVIDENCE_RECEIPTS)
+                .cloned()
+                .collect()
+        } else {
+            cited_learning_evidence
+        };
+        let learning_fields_complete =
+            learning_note_fields_complete(args.learning_note.as_deref(), Some(&learning_evidence));
         let learning = if learning_fields_complete {
-            normalized_learning_note(
-                args.learning_note.as_deref(),
-                args.learning_evidence_receipt_ids.as_deref(),
-            )?
+            normalized_learning_note(args.learning_note.as_deref(), Some(&learning_evidence))?
         } else {
             None
         };
@@ -2514,7 +2527,7 @@ impl Tool for ManageMandatesTool {
                     "measurement_value_micros": { "type": "integer", "description": "Millionths of one unit (25 engagements = 25000000)." }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
                     "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
                     "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
-                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "strategy_key": bounded_text(64),
+                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION), "strategy_key": bounded_text(64),
                     "target_session_id": described(bounded_text(256), TRANSFER_SESSION_DESCRIPTION),
                     "strategy_kind": text_enum(STRATEGY_KINDS), "strategy_confidence_bps": integer_range(0, 10000), "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
@@ -4107,6 +4120,49 @@ mod tests {
         assert_eq!(
             decision.evidence_receipt_ids,
             vec!["call_read_acme_feed".to_string()]
+        );
+    }
+
+    /// A learning note whose receipt ids are omitted cites the decision's
+    /// own evidence instead of being dropped with its strategy revision.
+    #[tokio::test]
+    async fn learning_note_without_receipt_ids_cites_the_decision_evidence() {
+        let run = review_run(false).await;
+        file_receipt(&run, "call_read_acme_feed", "http_request").await;
+        let result = tool_for(&run)
+            .call(&lead_args(
+                &run,
+                json!({
+                    "action": "record_decision",
+                    "outcome": "wait",
+                    "rationale": "The feed has nothing new since the last note",
+                    "learning_note": "The Acme feed updates in the morning",
+                    "strategy_key": "acme_feed_timing",
+                    "strategy_kind": "explore",
+                    "strategy_confidence_bps": 6_000
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(result.contains("WAIT recorded"), "{result}");
+        let notes = run
+            .state
+            .list_mandate_learning_notes(&run.mandate.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1, "the learning note was kept");
+        assert_eq!(
+            notes[0].evidence_receipt_ids,
+            vec!["call_read_acme_feed".to_string()]
+        );
+        assert_eq!(
+            run.state
+                .list_current_mandate_strategy(&run.mandate.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the strategy revision was kept"
         );
     }
 

@@ -3266,7 +3266,9 @@ impl MandateStore for SqliteStateStore {
                 .ok_or_else(|| anyhow::anyhow!("STOP requires a typed termination_kind"))?;
             match termination_kind {
                 MandateTerminationKind::SuccessCriteriaSatisfied => {
-                    if let Some(control) = mandate.objective_control.as_ref() {
+                    if let Some(control) =
+                        mandate.objective_control.as_ref().filter(|_| control_loop)
+                    {
                         anyhow::ensure!(
                             current_measurement.is_some_and(|(value, confidence)| {
                                 confidence > 0 && control.target_reached(value)
@@ -7905,6 +7907,8 @@ mod tests {
     async fn success_stop_requires_a_credible_current_measurement() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
+        // STOP on target is part of autopilot's measured control loop.
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
         let control = objective_control();
         let target = control.target_micros;
         mandate.objective_control = Some(control);
@@ -7927,6 +7931,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("credible"), "{error}");
+    }
+
+    /// A bounded mandate's advisory control does not gate a success STOP on
+    /// a target-reaching measurement; the owner criterion match still does.
+    #[tokio::test]
+    async fn bounded_success_stop_does_not_require_a_target_measurement() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        mandate.success_criteria = vec!["One grounded note is posted".to_string()];
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let mut stop = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Stop,
+            "the note is posted",
+            mandate.version,
+        );
+        stop.termination_kind = Some(MandateTerminationKind::SuccessCriteriaSatisfied);
+        stop.termination_match = Some("One grounded note is posted".to_string());
+        let root_task_id = run.root_task_id.clone().expect("review root task");
+        let receipt = crate::events::ToolReceiptV1::from_metadata(
+            &crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                semantics: crate::traits::ToolCallSemantics::observation(),
+                ..Default::default()
+            },
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        let result = crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: "call_read_notes".to_string(),
+            name: "http_request".to_string(),
+            result: "one note posted".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(root_task_id.clone()),
+            annotations: vec![],
+            turn_id: None,
+            attachments: vec![],
+            receipt: Some(receipt),
+        };
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES ('specialist:mandate', 'tool_result', ?, ?, ?, 'http_request')",
+        )
+        .bind(serde_json::to_string(&result).unwrap())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&root_task_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        stop.evidence_receipt_ids = vec!["call_read_notes".to_string()];
+        store
+            .record_mandate_decision(&stop, None, None)
+            .await
+            .expect("a bounded mandate stops on its criterion");
     }
 
     /// Drive one review to a finalized ASK exactly as the task lead would,
