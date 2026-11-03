@@ -175,11 +175,7 @@ pub fn estimate_tool_definition_tokens(tool_defs: &[Value]) -> usize {
 
 /// Return the configured total context window for a model.
 pub fn model_context_budget(model: &str, config: &ContextWindowConfig) -> usize {
-    config
-        .model_budgets
-        .get(model)
-        .copied()
-        .unwrap_or(config.default_budget)
+    config.context_budget_for(model)
 }
 
 fn truncate_description(value: &mut Value, max_chars: usize) {

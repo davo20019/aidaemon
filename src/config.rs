@@ -3429,9 +3429,9 @@ pub struct ContextWindowConfig {
     /// Enable context window management (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default total model context budget used by history fitting (default:
-    /// 128000, which every current hosted model's window covers; set
-    /// `model_budgets` for a smaller local model).
+    /// Context budget for a model whose family has no known window (default:
+    /// 128000). Known hosted families use their own window; set
+    /// `model_budgets` for a local or unlisted model.
     #[serde(default = "default_context_budget")]
     pub default_budget: usize,
     /// Per-model token budgets (model name → budget). Overrides default_budget.
@@ -3507,13 +3507,19 @@ impl ContextWindowConfig {
         self.max_tool_result_chars
     }
 
-    /// Token-pressure high-water mark, clamped for small model windows.
-    pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
-        let model_budget = self
-            .model_budgets
+    /// The model's total context budget: an explicit `model_budgets` entry,
+    /// else the model family's known window, else `default_budget`.
+    pub fn context_budget_for(&self, model: &str) -> usize {
+        self.model_budgets
             .get(model)
             .copied()
-            .unwrap_or(self.default_budget);
+            .or_else(|| known_context_budget(model))
+            .unwrap_or(self.default_budget)
+    }
+
+    /// Token-pressure high-water mark, clamped for small model windows.
+    pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
+        let model_budget = self.context_budget_for(model);
         self.summarize_token_threshold
             .min(model_budget.saturating_mul(3) / 5)
             .max(512)
@@ -3525,6 +3531,36 @@ impl ContextWindowConfig {
             .min(self.summarize_token_threshold_for(model) / 2)
             .max(256)
     }
+}
+
+/// Context budgets for hosted model families, by the model name's prefix
+/// (a provider route such as `openrouter/` or `models/` is ignored). Each is
+/// about 85% of the family's input window: the daemon's token count is an
+/// estimate, and reasoning output shares the window on some APIs. GPT models
+/// use the window the ChatGPT/Codex backend serves (272k), not the larger
+/// public API one.
+const KNOWN_CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    ("gpt-6", 272_000),
+    ("gpt-5", 272_000),
+    ("gpt-4.1", 1_000_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("claude-", 200_000),
+    ("gemini-", 1_000_000),
+    ("grok-4", 256_000),
+];
+
+/// The budget for a model family listed in [`KNOWN_CONTEXT_WINDOWS`].
+pub(crate) fn known_context_budget(model: &str) -> Option<usize> {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    KNOWN_CONTEXT_WINDOWS
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map(|(_, window)| window / 100 * 85)
 }
 
 fn default_context_budget() -> usize {
@@ -4237,6 +4273,21 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     fn watchdog_task_inactivity_timeout_defaults_to_300() {
         let cfg = WatchdogConfig::default();
         assert_eq!(cfg.task_inactivity_timeout_secs, 300);
+    }
+
+    #[test]
+    fn context_budget_follows_config_then_known_window_then_default() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 231_200);
+        assert_eq!(config.context_budget_for("claude-opus-5-5"), 170_000);
+        assert_eq!(config.context_budget_for("models/gemini-3-pro"), 850_000);
+        assert_eq!(config.context_budget_for("Claude-Sonnet-5-5"), 170_000);
+        assert_eq!(
+            config.context_budget_for("my-local-model"),
+            config.default_budget
+        );
+        config.model_budgets.insert("gpt-6-sol".to_string(), 50_000);
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 50_000);
     }
 
     #[test]
