@@ -1704,7 +1704,7 @@ impl HeartbeatCoordinator {
     /// (timeout, tool cooldown, orchestrator misjudgment, a bug nobody's hit
     /// yet) can never turn into a repeated real-world side effect. It reads
     /// task_activity rows that are already logged for every tool call
-    /// (`src/agent/loop/tool_execution/run.rs`), so it needs no schema change.
+    /// (`src/agent/turn/tool_execution/run.rs`), so it needs no schema change.
     /// Fails closed toward "don't block" on any parse/lookup miss — a false
     /// negative here just falls back to prior behavior, never a false positive
     /// that would wrongly skip real unfinished work. Scoping by `goal_run_id`

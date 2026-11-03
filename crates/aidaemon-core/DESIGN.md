@@ -64,7 +64,7 @@ misuse (resuming another agent's state) and store failures.
 
 **Read-only calls run concurrently, everything else serially, results in
 call order.** Claude Agent SDK's rule. The daemon today runs all calls
-sequentially (`src/agent/loop/tool_execution/run.rs:826`).
+sequentially (`src/agent/turn/tool_execution/run.rs`).
 
 **Errors are tool results, never crashes.** Unknown tool, bad arguments,
 denial, timeout, cancellation, tool errors and tool panics all produce a

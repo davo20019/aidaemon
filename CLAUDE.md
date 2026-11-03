@@ -111,8 +111,10 @@ Where to look first:
 - `src/core.rs` wires the daemon together and coordinates startup modules.
 - `src/startup/` owns most subsystem setup: stores, provider/router, tools,
   skills, MCP, memory pipeline, channel startup, DB security, and final wiring.
-- `src/agent/` contains the agent runtime. Important subareas are `loop/`,
-  `runtime/`, `intent/`, `policy/`, `tools/`, `specialists/`, and `eval/`.
+- `src/agent/` contains the agent runtime. Important subareas are `turn/`
+  (per-turn bootstrap, assessment, tool offering and closeout, which hands
+  every turn to the SDK engine in `runtime/sdk_engine.rs`), `runtime/`,
+  `intent/`, `policy/`, `tools/`, `specialists/`, and `eval/`.
 - `src/tools/` contains LLM-callable tools plus deterministic local tools such
   as file read/write/edit/search, command execution, git helpers, browser,
   computer-use, MCP, OAuth/API management, memory, goals, and diagnostics.
@@ -271,7 +273,7 @@ all succeeded or were credited closes as `succeeded` with
 (`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
 
 The ledger-first arbiter (`RunAggregate::closeout`, admissibility in
-`src/agent/loop/closeout.rs`) is the intended home for any new "may the loop
+`src/agent/turn/closeout.rs`) is the intended home for any new "may the loop
 demand more work?" decision: authority gates admission, expectations are
 verified by receipts, and only a *reachable* expectation may ask for another
 pass. It is authoritative: the completion phase asks for more work only on a

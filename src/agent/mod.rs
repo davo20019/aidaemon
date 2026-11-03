@@ -88,10 +88,10 @@ mod policy_signals;
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
 use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
-#[path = "loop/evidence_state.rs"]
+#[path = "turn/evidence_state.rs"]
 mod evidence_state;
 pub(in crate::agent) use evidence_state::EvidenceState;
-#[path = "loop/validation_state.rs"]
+#[path = "turn/validation_state.rs"]
 mod validation_state;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
@@ -103,7 +103,7 @@ pub(crate) use validation_state::{
 pub(in crate::agent) use validation_state::{
     ApprovalState, LoopRepetitionReason, ValidationFailure, ValidationOutcome,
 };
-#[path = "loop/execution_state.rs"]
+#[path = "turn/execution_state.rs"]
 mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
@@ -111,7 +111,7 @@ pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
     select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
 };
-#[path = "loop/loop_utils.rs"]
+#[path = "turn/loop_utils.rs"]
 mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
@@ -126,21 +126,21 @@ mod post_task;
 mod task_outcome;
 use post_task::LearningContext;
 #[allow(dead_code, unused_imports)]
-#[path = "loop/state/mod.rs"]
+#[path = "turn/state/mod.rs"]
 mod loop_state;
 
 #[cfg(feature = "computer_use")]
 mod computer_use;
 
-#[path = "loop/bootstrap_phase.rs"]
+#[path = "turn/bootstrap_phase.rs"]
 mod bootstrap_phase;
-#[path = "loop/closeout.rs"]
+#[path = "turn/closeout.rs"]
 mod closeout;
-#[path = "loop/completion_checks.rs"]
+#[path = "turn/completion_checks.rs"]
 mod completion_checks;
 #[path = "runtime/completion_contract.rs"]
 mod completion_contract;
-#[path = "loop/completion_phase.rs"]
+#[path = "turn/completion_phase.rs"]
 mod completion_phase;
 #[path = "runtime/core_prompt.rs"]
 mod core_prompt;
@@ -171,7 +171,7 @@ mod tool_result_fit;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
 pub(crate) use parent_delivery::ParentDeliveryKind;
-#[path = "loop/services.rs"]
+#[path = "turn/services.rs"]
 mod services;
 pub(in crate::agent) use completion_contract::inherit_request_constraints;
 pub(in crate::agent) use completion_contract::persistable_completion_contract;
@@ -194,33 +194,33 @@ pub(in crate::agent) use history::{
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
-#[path = "loop/hand_holding_telemetry.rs"]
+#[path = "turn/hand_holding_telemetry.rs"]
 mod hand_holding_telemetry;
-#[path = "loop/inquiry.rs"]
+#[path = "turn/inquiry.rs"]
 mod inquiry;
 #[path = "runtime/llm.rs"]
 mod llm;
-#[path = "loop/llm_phase.rs"]
+#[path = "turn/llm_phase.rs"]
 mod llm_phase;
-#[path = "loop/main_loop.rs"]
+#[path = "turn/main_loop.rs"]
 mod main_loop;
-#[path = "loop/message_build_phase.rs"]
+#[path = "turn/message_build_phase.rs"]
 mod message_build_phase;
 #[path = "runtime/models.rs"]
 mod models;
-#[path = "loop/prefix_fingerprint.rs"]
+#[path = "turn/prefix_fingerprint.rs"]
 mod prefix_fingerprint;
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
-#[path = "loop/sliding_window.rs"]
+#[path = "turn/sliding_window.rs"]
 mod sliding_window;
 #[path = "runtime/spawn.rs"]
 mod spawn;
-#[path = "loop/stopping_helpers.rs"]
+#[path = "turn/stopping_helpers.rs"]
 mod stopping_helpers;
 pub(crate) mod stt;
-#[path = "loop/system_directives.rs"]
+#[path = "turn/system_directives.rs"]
 mod system_directives;
 #[path = "runtime/system_prompt.rs"]
 mod system_prompt;
@@ -228,15 +228,15 @@ mod system_prompt;
 mod tool_defs;
 #[path = "tools/tool_exec.rs"]
 mod tool_exec;
-#[path = "loop/tool_execution_phase.rs"]
+#[path = "turn/tool_execution_phase.rs"]
 mod tool_execution_phase;
-#[path = "loop/tool_result_notices.rs"]
+#[path = "turn/tool_result_notices.rs"]
 mod tool_result_notices;
-#[path = "loop/turn_eviction.rs"]
+#[path = "turn/turn_eviction.rs"]
 pub(crate) mod turn_eviction;
-#[path = "loop/turn_render.rs"]
+#[path = "turn/turn_render.rs"]
 pub(crate) mod turn_render;
-#[path = "loop/turn_render_cache.rs"]
+#[path = "turn/turn_render_cache.rs"]
 pub(crate) mod turn_render_cache;
 pub(crate) mod vision;
 
