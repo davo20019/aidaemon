@@ -521,7 +521,10 @@ impl ManageMandatesTool {
                     .err()
             })
         });
-        let validation_error = authority.validate().err();
+        let validation_error = authority
+            .validate()
+            .err()
+            .or_else(|| unreachable_scope_targets(&authority.operation_scopes));
         let ready_to_confirm =
             missing.is_empty() && validation_error.is_none() && control_validation.is_none();
         Ok(serde_json::to_string_pretty(&json!({
@@ -636,6 +639,9 @@ impl ManageMandatesTool {
             "delegated operations require operation_scopes from a validated draft; legacy independent authority lists cannot create new mandates"
         );
         authority.validate().map_err(anyhow::Error::msg)?;
+        if let Some(reason) = unreachable_scope_targets(&authority.operation_scopes) {
+            anyhow::bail!(reason);
+        }
 
         let min_review_secs = minutes_to_secs(
             args.min_review_minutes,
@@ -1727,6 +1733,9 @@ impl ManageMandatesTool {
             mandate.expires_at = Some(expires_at.clone());
         }
         mandate.authority.validate().map_err(anyhow::Error::msg)?;
+        if let Some(reason) = unreachable_scope_targets(&mandate.authority.operation_scopes) {
+            anyhow::bail!(reason);
+        }
 
         let controller = self
             .state
@@ -2666,6 +2675,25 @@ fn normalized_termination_fields(
         MAX_POLICY_ENTRY_TEXT,
     )?;
     Ok((kind, matched))
+}
+
+/// A scope whose tool can never reach its target fails at the first review,
+/// long after the owner confirmed it. `web_fetch` refuses local and private
+/// hosts by design; reject such a scope while it is still a draft.
+fn unreachable_scope_targets(scopes: &[MandateOperationScope]) -> Option<String> {
+    scopes
+        .iter()
+        .filter(|scope| scope.tool == "web_fetch")
+        .flat_map(|scope| scope.target_prefixes.iter())
+        .find_map(|prefix| {
+            crate::tools::web_fetch::validate_url_for_ssrf(prefix)
+                .err()
+                .map(|reason| {
+                    format!(
+                        "web_fetch cannot reach {prefix} ({reason}); use http_request for local or private targets"
+                    )
+                })
+        })
 }
 
 fn validate_act_evidence(
@@ -4447,6 +4475,70 @@ mod tests {
         assert!(strategy.body.contains("Prefer useful replies"));
         assert!(!strategy.body.contains("later filesystem edit"));
         assert_eq!(strategy.content_sha256.len(), 64);
+    }
+
+    async fn draft_with_observation_tool(tool_name: &str) -> Value {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(harness.state.clone(), ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(
+                &json!({
+                    "action": "draft",
+                    "objective": "Post one note about the Acme feed",
+                    "operation_scopes": [
+                        {
+                            "tool": tool_name,
+                            "operation": "GET",
+                            "kind": "observation",
+                            "target_prefixes": ["http://localhost:8977/feed"]
+                        },
+                        {
+                            "tool": "http_request",
+                            "operation": "POST",
+                            "kind": "mutation",
+                            "target_prefixes": ["http://localhost:8977/notes"],
+                            "mutation_effects": ["remote_mutation", "external_delivery"]
+                        }
+                    ],
+                    "max_mutating_actions_per_cycle": 1,
+                    "max_mutating_actions_per_rolling_24h": 1,
+                    "min_seconds_between_mutations": 900,
+                    "success_criteria": ["The note is grounded in the Acme feed"],
+                    "_session_id": "owner-session",
+                    "_user_role": "owner",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(&result).unwrap()
+    }
+
+    #[tokio::test]
+    async fn draft_rejects_web_fetch_scope_for_localhost() {
+        let value = draft_with_observation_tool("web_fetch").await;
+        assert_eq!(value["ready_to_confirm"], false, "{value}");
+        assert!(
+            value["validation_status"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("use http_request"),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_accepts_http_request_scope_for_localhost() {
+        let value = draft_with_observation_tool("http_request").await;
+        assert!(
+            !value["validation_status"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("use http_request"),
+            "{value}"
+        );
     }
 
     #[tokio::test]
