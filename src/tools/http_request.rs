@@ -2065,7 +2065,7 @@ impl Tool for HttpRequestTool {
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2076,7 +2076,7 @@ impl Tool for HttpRequestTool {
                     },
                     "url": {
                         "type": "string",
-                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
+                        "description": "Full endpoint URL: HTTPS, or plain http only for localhost. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
                     },
                     "auth_profile": {
                         "type": "string",
@@ -2359,6 +2359,26 @@ impl Tool for HttpRequestTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schema the model reads must state the localhost exception the
+    /// URL check enforces; a mandate executor once refused an authorized
+    /// http://localhost target because the description said "HTTPS only".
+    #[test]
+    fn schema_states_the_localhost_exception_it_enforces() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
+        let schema = tool.schema();
+        let description = schema["description"].as_str().unwrap();
+        let url = schema["parameters"]["properties"]["url"]["description"]
+            .as_str()
+            .unwrap();
+        for text in [description, url] {
+            assert!(text.contains("localhost"), "{text}");
+        }
+    }
     use crate::config::{HttpAuthProfile, HttpAuthType};
 
     #[test]
