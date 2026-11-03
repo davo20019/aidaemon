@@ -393,8 +393,9 @@ struct TurnScope<'a> {
     /// System context raised during the run and not yet sent; the next model
     /// call pins it at the run's current end (`placed_directives`).
     extra_system: std::sync::Mutex<Vec<String>>,
-    /// Directives with the run position they were raised at.
-    placed_directives: std::sync::Mutex<Vec<(usize, String)>>,
+    /// Directives and mid-turn user messages, with the run position they
+    /// arrived at.
+    placed_directives: std::sync::Mutex<Vec<(usize, Value)>>,
     /// The run's summarized older rounds, once it outgrew the context.
     compaction: std::sync::Mutex<Option<compaction::RunCompaction>>,
     /// Set when a call moved work to the background with completion

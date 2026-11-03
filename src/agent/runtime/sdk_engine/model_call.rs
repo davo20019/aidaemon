@@ -14,6 +14,10 @@ pub(super) const STREAMING_MAX_MODEL_CALL: Duration = Duration::from_secs(600);
 /// regains control, not so it ends.
 pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
 
+/// Heads a user message taken into a running turn.
+pub(super) const STEERING_MARKER: &str =
+    "[The user sent this while you were working. Take it into account from here on.]";
+
 /// The output ceiling a thinking cutoff raises to.
 pub(super) const MAX_RAISED_OUTPUT_TOKENS: u32 = 32_768;
 
@@ -67,9 +71,10 @@ pub(super) async fn with_idle_timeout<F: std::future::Future>(
     }
 }
 
-/// `run` with each directive inserted as a system message before the run
-/// message at its position (after the last one when it is at the end).
-pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, String)]) -> Vec<Value> {
+/// `run` with each placed message (a system directive, or a user message
+/// taken mid-turn) inserted before the run message at its position (after
+/// the last one when it is at the end).
+pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, Value)]) -> Vec<Value> {
     if directives.is_empty() {
         return run;
     }
@@ -78,7 +83,7 @@ pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, Strin
         directives
             .iter()
             .filter(move |(position, _)| (*position).min(len) == index)
-            .map(|(_, text)| serde_json::json!({"role": "system", "content": text}))
+            .map(|(_, message)| message.clone())
     };
     let mut out = Vec::with_capacity(len + directives.len());
     for (index, message) in run.into_iter().enumerate() {
@@ -192,11 +197,18 @@ impl Agent {
                 .lock()
                 .map(|mut queue| std::mem::take(&mut *queue))
                 .unwrap_or_default();
+            let steering = self.sdk_take_steering(scope).await;
             let mut placed = scope
                 .placed_directives
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            placed.extend(raised.into_iter().map(|text| (run.len(), text)));
+            placed.extend(raised.into_iter().map(|text| {
+                (
+                    run.len(),
+                    serde_json::json!({"role": "system", "content": text}),
+                )
+            }));
+            placed.extend(steering.into_iter().map(|message| (run.len(), message)));
             interleave_directives(run, &placed)
         };
         // An oversized run is compacted (older rounds summarized) before
@@ -500,6 +512,55 @@ impl Agent {
             self.persist_sdk_tool_call_message(scope, &response).await;
         }
         Ok(response)
+    }
+
+    /// Messages the same sender sent while this root turn runs, taken from
+    /// the channel queue (see `TaskRegistry::take_steering_messages`),
+    /// recorded in the conversation history, and returned as user messages
+    /// for the run. Mandate runs and agents without a channel queue take
+    /// none.
+    pub(super) async fn sdk_take_steering(&self, scope: &TurnScope<'_>) -> Vec<Value> {
+        // The queue is keyed by the chat's session, which only the turn
+        // serving that chat runs in: children and goal runs have sessions of
+        // their own. Mandate runs never take user input.
+        if self.mandate_execution.is_some() {
+            return Vec::new();
+        }
+        let Some(registry) = self.task_registry.get() else {
+            return Vec::new();
+        };
+        let taken = registry
+            .take_steering_messages(scope.session_id, scope.user_role, scope.channel_ctx)
+            .await;
+        let mut messages = Vec::with_capacity(taken.len());
+        for queued in taken {
+            let mut message =
+                Message::new_runtime(Uuid::new_v4().to_string(), scope.session_id, "user");
+            message.content = Some(queued.text.clone());
+            message.turn_id = Some(scope.turn_id.to_string());
+            if let Err(error) = self
+                .append_user_message_with_event(
+                    scope.emitter,
+                    &message,
+                    scope.user_role,
+                    scope.channel_ctx,
+                    false,
+                )
+                .await
+            {
+                warn!(task_id = scope.task_id, %error, "SDK engine: could not record a mid-turn message");
+            }
+            info!(
+                task_id = scope.task_id,
+                chars = queued.text.len(),
+                "SDK engine: took a message sent mid-turn into the run"
+            );
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("{STEERING_MARKER}\n{}", queued.text),
+            }));
+        }
+        messages
     }
 
     /// Admit a mandate run's model call against its durable balance. Returns

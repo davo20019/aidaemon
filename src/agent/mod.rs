@@ -360,6 +360,10 @@ pub struct Agent {
     /// Weak self-reference for background task spawning.
     /// Set after Arc creation via `set_self_ref()`.
     self_ref: RwLock<Option<Weak<Agent>>>,
+    /// The channels' per-session message queue. A root turn takes messages
+    /// the same sender sends while it runs into the run (mid-turn steering).
+    /// Set after channel startup via `set_task_registry()`.
+    task_registry: std::sync::OnceLock<Arc<crate::tasks::TaskRegistry>>,
     /// Context window management configuration.
     context_window_config: crate::config::ContextWindowConfig,
     /// Policy rollout and enforcement configuration.
@@ -612,6 +616,12 @@ impl Agent {
 
     /// Set a weak self-reference for background task spawning.
     /// Must be called after wrapping the Agent in Arc.
+    /// Share the channels' task registry so a running root turn can take
+    /// messages the same sender queues behind it (mid-turn steering).
+    pub(crate) fn set_task_registry(&self, registry: Arc<crate::tasks::TaskRegistry>) {
+        let _ = self.task_registry.set(registry);
+    }
+
     pub async fn set_self_ref(&self, weak: Weak<Agent>) {
         *self.self_ref.write().await = Some(weak);
     }

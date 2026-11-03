@@ -1524,8 +1524,8 @@ fn directives_stay_where_they_were_raised() {
         wire("assistant", "next"),
     ];
     let placed = vec![
-        (2, "budget at 80%".to_string()),
-        (3, "timed out".to_string()),
+        (2, wire("system", "budget at 80%")),
+        (3, wire("system", "timed out")),
     ];
     let sent = interleave_directives(run.clone(), &placed);
     let roles: Vec<&str> = sent.iter().map(|m| m["role"].as_str().unwrap()).collect();

@@ -274,6 +274,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
+    agent.set_task_registry(task_registry.clone());
 
     // 11. Channels
     let channel_agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> = agent.clone();
