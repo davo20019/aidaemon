@@ -25,6 +25,37 @@ struct RequiredContextProjection {
     truncated: bool,
 }
 
+/// Keep only the tool definitions the request's authority offers. A tool the
+/// request names exactly is offered even when its scope is forbidden, the same
+/// "exact beats broad" rule `ClosingAuthority::admits_tool` applies at call
+/// time and at closeout; without it the list hid tools both of those admit, so
+/// closeout could demand work through a tool the model never saw. `scope_of`
+/// resolves a tool's declared scope before the name-based fallback.
+fn retain_offered_tool_definitions(
+    tool_defs: &mut Vec<serde_json::Value>,
+    authority: &crate::agent::completion_contract::RequestAuthority<'_>,
+    scope_of: impl Fn(&str) -> Option<crate::traits::ToolSemanticScope>,
+) {
+    tool_defs.retain(|definition| {
+        let Some(name) = definition
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        if !authority.offers_tool_name(name) {
+            return false;
+        }
+        let explicitly_allowed = authority
+            .allowed_tool_names
+            .iter()
+            .any(|allowed| allowed == name);
+        explicitly_allowed
+            || scope_of(name).is_none_or(|scope| !authority.forbidden_tool_scopes.contains(&scope))
+    });
+}
+
 /// Materialize the exact dialogue edge selected by the relationship resolver
 /// as a bounded, typed payload near the current request. This is presentation
 /// of already-authorized volatile context, not a second relationship
@@ -370,6 +401,18 @@ fn task_assessment_conversation_context(
 
 // impl-Agent justification: handle_message_impl drives the turn lifecycle and owns TurnState construction.
 impl Agent {
+    /// A registered tool's declared scope, else the name-based fallback.
+    fn offered_tool_semantic_scope(&self, name: &str) -> Option<crate::traits::ToolSemanticScope> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name && tool.is_available())
+            .and_then(|tool| {
+                tool.semantic_affordances()
+                    .map(|affordances| affordances.scope)
+            })
+            .or_else(|| super::tool_execution_phase::fallback_tool_semantic_scope(name))
+    }
+
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
     /// `heartbeat` is an optional atomic timestamp updated on each activity point.
@@ -757,48 +800,11 @@ impl Agent {
                 SystemDirective::ToolUseForbiddenByRequest { outstanding_needs },
             );
         } else {
-            if !turn_context
-                .completion_contract
-                .allowed_tool_names
-                .is_empty()
-            {
-                let authority = turn_context.completion_contract.authority();
-                tool_defs.retain(|definition| {
-                    definition
-                        .get("function")
-                        .and_then(|function| function.get("name"))
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|name| authority.offers_tool_name(name))
-                });
-            }
-            if !turn_context
-                .completion_contract
-                .forbidden_tool_scopes
-                .is_empty()
-            {
-            let forbidden_scopes = &turn_context.completion_contract.forbidden_tool_scopes;
-            tool_defs.retain(|definition| {
-                let Some(name) = definition
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    return false;
-                };
-                let scope = self
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name() == name && tool.is_available())
-                    .and_then(|tool| {
-                        tool.semantic_affordances()
-                            .map(|affordances| affordances.scope)
-                    })
-                    .or_else(|| {
-                        super::tool_execution_phase::fallback_tool_semantic_scope(name)
-                    });
-                !scope.is_some_and(|scope| forbidden_scopes.contains(&scope))
-            });
-            }
+            retain_offered_tool_definitions(
+                &mut tool_defs,
+                &turn_context.completion_contract.authority(),
+                |name| self.offered_tool_semantic_scope(name),
+            );
         }
         let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(
             &turn_context.completion_contract.evidence_requirements,
@@ -860,46 +866,12 @@ impl Agent {
         // denied-scope contract.
         if turn_context.completion_contract.forbids_tool_use {
             tool_defs.clear();
-        } else if !turn_context
-            .completion_contract
-            .allowed_tool_names
-            .is_empty()
-        {
-            let authority = turn_context.completion_contract.authority();
-            tool_defs.retain(|definition| {
-                definition
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| authority.offers_tool_name(name))
-            });
-        }
-        if !turn_context
-            .completion_contract
-            .forbidden_tool_scopes
-            .is_empty()
-        {
-            let forbidden = &turn_context.completion_contract.forbidden_tool_scopes;
-            tool_defs.retain(|definition| {
-                let Some(name) = definition
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    return false;
-                };
-                self.tools
-                    .iter()
-                    .find(|tool| tool.name() == name && tool.is_available())
-                    .and_then(|tool| {
-                        tool.semantic_affordances()
-                            .map(|affordances| affordances.scope)
-                    })
-                    .or_else(|| {
-                        super::tool_execution_phase::fallback_tool_semantic_scope(name)
-                    })
-                    .is_none_or(|scope| !forbidden.contains(&scope))
-            });
+        } else {
+            retain_offered_tool_definitions(
+                &mut tool_defs,
+                &turn_context.completion_contract.authority(),
+                |name| self.offered_tool_semantic_scope(name),
+            );
         }
         if !turn_context.completion_contract.forbids_tool_use
             && !turn_context
@@ -1583,6 +1555,63 @@ impl Agent {
 #[cfg(test)]
 #[path = "characterization_tests.rs"]
 mod characterization_tests;
+
+#[cfg(test)]
+mod offered_tool_tests {
+    use super::*;
+    use crate::traits::ToolSemanticScope;
+
+    fn names(defs: &[Value]) -> Vec<&str> {
+        defs.iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect()
+    }
+
+    /// An exactly named tool beats a forbidden scope in the offered list, as
+    /// it does at the call gate and at closeout; other tools in that scope,
+    /// including one whose scope only its declaration knows, stay hidden.
+    #[test]
+    fn exactly_named_tool_is_offered_despite_a_forbidden_scope() {
+        let mut defs: Vec<Value> = ["http_request", "web_fetch", "custom_remote", "read_file"]
+            .iter()
+            .map(|name| json!({"function": {"name": name}}))
+            .collect();
+        let allowed = vec![
+            "http_request".to_string(),
+            "custom_remote".to_string(),
+            "read_file".to_string(),
+        ];
+        let forbidden = vec![ToolSemanticScope::ExternalRemote];
+        let authority = crate::agent::completion_contract::RequestAuthority {
+            forbids_mutation: false,
+            forbids_tool_use: false,
+            allowed_tool_names: &allowed,
+            forbidden_tool_scopes: &forbidden,
+            owner_control_plane_tools: &[],
+        };
+        retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
+            "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
+            other => super::super::tool_execution_phase::fallback_tool_semantic_scope(other),
+        });
+        assert_eq!(names(&defs), ["http_request", "custom_remote", "read_file"]);
+
+        // Without an allowlist nothing is exact, so the scope rule hides both
+        // remote tools, the declared-only one included.
+        let mut defs: Vec<Value> = ["http_request", "custom_remote", "read_file"]
+            .iter()
+            .map(|name| json!({"function": {"name": name}}))
+            .collect();
+        let authority = crate::agent::completion_contract::RequestAuthority {
+            allowed_tool_names: &[],
+            ..authority
+        };
+        retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
+            "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
+            other => super::super::tool_execution_phase::fallback_tool_semantic_scope(other),
+        });
+        assert_eq!(names(&defs), ["read_file"]);
+    }
+}
 
 #[cfg(test)]
 mod stuck_fallback_tests {
