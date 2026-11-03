@@ -119,6 +119,23 @@ fn build_tool_filter_gate_telemetry(
     )
 }
 
+/// A request assessment's tool narrowing leaves the owner's control-plane
+/// tools in place (see `Tool::owner_control_plane`). It never applies when the
+/// request forbids tool use, and it adds only tools the turn already offers.
+fn admit_owner_control_plane(
+    contract: &mut crate::agent::CompletionContract,
+    owner_control_plane_tools: &[String],
+) {
+    if contract.forbids_tool_use || contract.allowed_tool_names.is_empty() {
+        return;
+    }
+    for name in owner_control_plane_tools {
+        if !contract.allowed_tool_names.contains(name) {
+            contract.allowed_tool_names.push(name.clone());
+        }
+    }
+}
+
 /// Commit one authoritative task envelope before any optional memory access,
 /// tool filtering, project-instruction loading, or prompt construction.
 /// Relationship, contract, and task ownership are deliberately finalized in
@@ -137,6 +154,7 @@ async fn finalize_turn_assessment(
     plan: Option<&super::task_planning::TaskPlan>,
     available_tool_names: &[String],
     available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
+    owner_control_plane_tools: &[String],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
@@ -450,6 +468,10 @@ async fn finalize_turn_assessment(
         turn_context.completion_contract.response_contract = compiled_response_contract;
     }
     turn_context.completion_contract.adopt_for_task(task_id);
+    admit_owner_control_plane(
+        &mut turn_context.completion_contract,
+        owner_control_plane_tools,
+    );
 
     // Persist the finalized contract on its own correctness-critical event.
     // Decision points are an optional flight recorder and may be disabled for
@@ -559,6 +581,7 @@ async fn finalize_turn_assessment(
                         "requires_observation": turn_context.completion_contract.requires_observation,
                         "evidence_requirements": turn_context.completion_contract.evidence_requirements,
                         "required_invocations": effective_required_invocations,
+                        "allowed_tool_names": turn_context.completion_contract.allowed_tool_names,
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
                         "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
                         "response_contract": turn_context.completion_contract.response_contract.as_ref().map(|contract| json!({
@@ -1426,6 +1449,22 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .iter()
         .map(|tool| (tool.name().to_string(), tool.receipt_kind("{}")))
         .collect::<Vec<_>>();
+    // Only the owner in a private chat, never a mandate worker, keeps the
+    // control tools this turn already offers when an assessment narrows it.
+    let owner_control_plane_tools = if user_role == UserRole::Owner
+        && channel_ctx.visibility == ChannelVisibility::Private
+        && agent.mandate_execution.is_none()
+    {
+        agent
+            .tools
+            .iter()
+            .filter(|tool| tool.owner_control_plane())
+            .map(|tool| tool.name().to_string())
+            .filter(|name| available_tool_names.contains(name))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let (turn_context, semantic_contract_applied) = finalize_turn_assessment(
         agent,
         &emitter,
@@ -1438,6 +1477,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         task_plan.as_ref(),
         &available_tool_names,
         &available_tool_receipt_kinds,
+        &owner_control_plane_tools,
         relationship_fallback.as_ref(),
         task_assessment_attempted,
         assessment_decision_type,

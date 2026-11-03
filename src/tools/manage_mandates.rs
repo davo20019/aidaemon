@@ -2469,6 +2469,10 @@ impl Tool for ManageMandatesTool {
         "manage_mandates"
     }
 
+    fn owner_control_plane(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Draft, create, inspect, and govern owner-confirmed ongoing mandates."
     }

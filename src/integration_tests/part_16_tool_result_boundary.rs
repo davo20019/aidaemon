@@ -716,3 +716,62 @@ async fn test_sdk_unverified_gui_click_blocks_the_success_claim() {
         "calls after the pin use the pinned model"
     );
 }
+
+/// An assessment that narrows the turn's tools must not hide the owner's own
+/// mandate control in a private chat: every committing mandate action is
+/// already owner-gated and confirmed. A shared channel gets no exemption.
+#[tokio::test]
+async fn test_owner_mandate_control_survives_assessment_tool_narrowing() {
+    for (visibility, expect_control) in [
+        (crate::types::ChannelVisibility::Private, true),
+        (crate::types::ChannelVisibility::PrivateGroup, false),
+    ] {
+        let base = MockProvider::semantic_task_assessment(
+            "answer",
+            false,
+            false,
+            &[],
+            "new_request",
+            "none",
+        );
+        let mut assessment: serde_json::Value =
+            serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+        assessment["schema_version"] = 10.into();
+        assessment["contract"]["tool_scope"] = "restricted".into();
+        assessment["contract"]["allowed_tool_names"] = json!(["system_info"]);
+        assessment["contract"]["forbidden_tool_scopes"] = json!([]);
+        let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+            "Here is the draft for you to confirm.",
+        )])
+        .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
+        let harness = setup_test_agent_with_mandates(provider).await.unwrap();
+        let mut channel = ChannelContext::private("test");
+        channel.visibility = visibility;
+        harness
+            .agent
+            .handle_message(
+                "owner-chat",
+                "Draft a mandate that reviews the Acme feed hourly.",
+                None,
+                UserRole::Owner,
+                channel,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = harness.provider.call_log.lock().await;
+        let offered = calls
+            .last()
+            .expect("the turn called the model")
+            .tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(offered.contains(&"system_info".to_string()), "{offered:?}");
+        assert_eq!(
+            offered.contains(&"manage_mandates".to_string()),
+            expect_control,
+            "{visibility:?}: {offered:?}"
+        );
+    }
+}

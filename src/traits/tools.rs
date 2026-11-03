@@ -1899,6 +1899,14 @@ pub trait Tool: Send + Sync {
         ToolCapabilities::default()
     }
 
+    /// The tool only manages the owner's own durable policy (mandates), and
+    /// every committing action is already owner-gated: a private owner
+    /// channel plus confirmation. A request assessment that narrows a turn's
+    /// tools leaves such a tool to the owner in a private chat.
+    fn owner_control_plane(&self) -> bool {
+        false
+    }
+
     /// Machine-receipt protocol emitted by this adapter.
     ///
     /// Keep this independent from natural-language descriptions and call
