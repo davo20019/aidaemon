@@ -830,6 +830,7 @@ impl OpenAiCompatibleProvider {
             }
             match tokio::time::timeout(gap, stream.next()).await {
                 Ok(Some(Ok(bytes))) => {
+                    crate::providers::streaming::note_stream_progress();
                     for payload in framer.feed(&bytes) {
                         if !acc.apply_payload(&payload) {
                             break 'consume false; // [DONE]

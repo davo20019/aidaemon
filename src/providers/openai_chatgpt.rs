@@ -188,6 +188,7 @@ impl OpenAiChatGptProvider {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ProviderError::network(&e))?;
+            super::streaming::note_stream_progress();
             for payload in framer.feed(&chunk) {
                 if payload == "[DONE]" {
                     continue;

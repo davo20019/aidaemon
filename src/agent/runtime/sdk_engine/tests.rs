@@ -1366,3 +1366,62 @@ fn a_scheduled_run_keeps_its_per_check_budget() {
     assert_eq!(task_token_budget(Some(500_000), Some(0)), 500_000);
     assert_eq!(task_token_budget(Some(500_000), Some(-1)), 500_000);
 }
+
+#[test]
+fn a_thinking_cutoff_raises_output_room_before_lowering_effort() {
+    // The first cutoff doubles the room the model actually used.
+    assert_eq!(raised_output_ceiling(Some(4_096), 0), Some(8_192));
+    // A repeat doubles again from the raised ceiling, up to the cap.
+    assert_eq!(raised_output_ceiling(Some(8_192), 8_192), Some(16_384));
+    assert_eq!(
+        raised_output_ceiling(Some(20_000), 20_000),
+        Some(MAX_RAISED_OUTPUT_TOKENS)
+    );
+    assert_eq!(
+        raised_output_ceiling(Some(MAX_RAISED_OUTPUT_TOKENS), 0),
+        None
+    );
+    // Unknown usage gives nothing to scale from.
+    assert_eq!(raised_output_ceiling(None, 0), None);
+    assert_eq!(raised_output_ceiling(Some(0), 0), None);
+
+    // Effort stays as configured on the first cutoff.
+    assert_eq!(thinking_cutoff_effort(0), None);
+    assert_eq!(thinking_cutoff_effort(1), None);
+    assert_eq!(thinking_cutoff_effort(2).as_deref(), Some("low"));
+    assert_eq!(thinking_cutoff_effort(5).as_deref(), Some("off"));
+}
+
+#[tokio::test]
+async fn a_streaming_call_outlives_the_idle_limit_while_chunks_arrive() {
+    let idle = Duration::from_millis(60);
+    let streaming = async {
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            crate::providers::streaming::note_stream_progress();
+        }
+        "done"
+    };
+    // 160ms of output at 20ms gaps passes a 60ms idle limit.
+    assert_eq!(
+        with_idle_timeout(idle, Duration::from_secs(5), streaming).await,
+        Ok("done")
+    );
+
+    // A silent call (a provider that does not stream) gets the idle limit.
+    let silent = tokio::time::sleep(Duration::from_millis(300));
+    assert_eq!(
+        with_idle_timeout(idle, Duration::from_secs(5), silent).await,
+        Err(idle)
+    );
+
+    // Progress never extends a call past the hard limit.
+    let endless = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            crate::providers::streaming::note_stream_progress();
+        }
+    };
+    let hard = Duration::from_millis(120);
+    assert_eq!(with_idle_timeout(idle, hard, endless).await, Err(hard));
+}

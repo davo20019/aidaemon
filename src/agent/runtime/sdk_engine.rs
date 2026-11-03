@@ -79,7 +79,10 @@ use hooks::*;
 pub(crate) use outcome::TurnVerdict;
 use stop::*;
 
-const DEFAULT_MAX_TURNS: u32 = 40;
+/// Model turns per run. Token budgets, the same-tool guard and the stuck
+/// detector bound runaway work; this only stops a run that defeats all three.
+/// Long coding tasks routinely need well over a hundred tool rounds.
+const DEFAULT_MAX_TURNS: u32 = 150;
 /// Daemon tools enforce their own timeouts (terminal backgrounding, CLI
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -326,8 +329,11 @@ struct TurnScope<'a> {
     /// The next model call runs with tools disabled (empty-reply retry).
     text_only_next_call: AtomicBool,
     /// Consecutive responses cut off at the token limit with no output (the
-    /// whole budget went to thinking); the next calls lower reasoning effort.
+    /// whole budget went to thinking). The next call first gets more output
+    /// room; only repeated cutoffs lower reasoning effort.
     thinking_truncations: std::sync::atomic::AtomicU8,
+    /// Raised output-token ceiling after a thinking cutoff (0: none).
+    raised_output_tokens: std::sync::atomic::AtomicU32,
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
     /// Where calls without a directory run; refined by the model's own
@@ -706,6 +712,7 @@ impl Agent {
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: AtomicBool::new(false),
             thinking_truncations: std::sync::atomic::AtomicU8::new(0),
+            raised_output_tokens: std::sync::atomic::AtomicU32::new(0),
             continue_inline_after_background,
             known_project_dir: std::sync::Mutex::new(known_project_dir),
             project_scope,

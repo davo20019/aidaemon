@@ -7,9 +7,65 @@ use super::*;
 pub(super) const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 pub(super) const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
 pub(super) const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
+/// Total time a call may take while its stream keeps delivering chunks; the
+/// per-call ceiling above bounds silence, not progress.
+pub(super) const STREAMING_MAX_MODEL_CALL: Duration = Duration::from_secs(600);
 /// A timed-out call is retried: the ceiling bounds a call so the turn
 /// regains control, not so it ends.
 pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
+
+/// The output ceiling a thinking cutoff raises to.
+pub(super) const MAX_RAISED_OUTPUT_TOKENS: u32 = 32_768;
+
+/// The doubled output ceiling after a cutoff that used `used` tokens, or
+/// `None` when it cannot grow (unknown usage, or already at the cap).
+pub(super) fn raised_output_ceiling(used: Option<u32>, current: u32) -> Option<u32> {
+    let base = used.filter(|used| *used > 0)?.max(current);
+    let raised = base.saturating_mul(2).min(MAX_RAISED_OUTPUT_TOKENS);
+    (raised > base).then_some(raised)
+}
+
+/// Reasoning effort after `cutoffs` consecutive thinking cutoffs: unchanged
+/// for the first (the raised output ceiling is the fix), then low, then off.
+pub(super) fn thinking_cutoff_effort(cutoffs: u8) -> Option<String> {
+    match cutoffs {
+        0 | 1 => None,
+        2 => Some("low".to_string()),
+        _ => Some("off".to_string()),
+    }
+}
+
+/// Run `call`, failing once it has been silent for `idle` or has run for
+/// `hard` in all. Silence is measured from the latest streamed chunk, so a
+/// streaming call that keeps producing output is not cut off at `idle`; a
+/// provider that does not stream reports nothing and gets `idle` in all.
+/// The error carries the limit that fired.
+pub(super) async fn with_idle_timeout<F: std::future::Future>(
+    idle: Duration,
+    hard: Duration,
+    call: F,
+) -> Result<F::Output, Duration> {
+    let progress = crate::providers::streaming::StreamProgress::new();
+    let started = Instant::now();
+    let call = crate::providers::streaming::with_stream_progress(progress.clone(), call);
+    tokio::pin!(call);
+    loop {
+        let idle_deadline = progress.last_activity() + idle;
+        let hard_deadline = started + hard;
+        tokio::select! {
+            output = &mut call => return Ok(output),
+            _ = tokio::time::sleep_until(idle_deadline.min(hard_deadline).into()) => {
+                let now = Instant::now();
+                if now >= hard_deadline {
+                    return Err(hard);
+                }
+                if now >= progress.last_activity() + idle {
+                    return Err(idle);
+                }
+            }
+        }
+    }
+}
 
 /// A model call that ran past its per-call ceiling.
 #[derive(Debug)]
@@ -118,13 +174,19 @@ impl Agent {
         prefix.extend(extra);
         let messages = fit_run(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
-        // A reasoning model that spent its whole output budget thinking gets
-        // less room to think next time: low effort, then none.
-        match scope.thinking_truncations.load(Ordering::Relaxed) {
-            0 => {}
-            1 => options.reasoning_effort_override = Some("low".to_string()),
-            _ => options.reasoning_effort_override = Some("off".to_string()),
+        // A reasoning model that spent its whole output budget thinking was
+        // usually on a hard step: give it more output room first, and lower
+        // reasoning effort only when the cutoffs repeat.
+        let raised = scope.raised_output_tokens.load(Ordering::Relaxed);
+        if raised > 0 {
+            options.max_tokens_override = Some(
+                options
+                    .max_tokens_override
+                    .map_or(raised, |cap| cap.max(raised)),
+            );
         }
+        options.reasoning_effort_override =
+            thinking_cutoff_effort(scope.thinking_truncations.load(Ordering::Relaxed));
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
         // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
         // `None` and use the provider's background slot.
@@ -171,9 +233,10 @@ impl Agent {
             }
         };
         let started = Instant::now();
-        let timeout = self.sdk_model_call_timeout();
-        let result = match tokio::time::timeout(
-            timeout,
+        let idle_timeout = self.sdk_model_call_timeout();
+        let result = match with_idle_timeout(
+            idle_timeout,
+            idle_timeout.max(STREAMING_MAX_MODEL_CALL),
             self.call_llm_with_recovery(
                 snapshot.provider(),
                 snapshot.router(),
@@ -188,7 +251,7 @@ impl Agent {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(anyhow::Error::new(ModelCallTimedOut(timeout))),
+            Err(limit) => Err(anyhow::Error::new(ModelCallTimedOut(limit))),
         };
         let latency_ms = started.elapsed().as_millis() as u64;
         if let Some(lease) = lease.as_ref() {
@@ -359,11 +422,19 @@ impl Agent {
             .is_some_and(|note| note.contains("truncated"))
         {
             let count = scope.thinking_truncations.fetch_add(1, Ordering::Relaxed) + 1;
+            let raised = raised_output_ceiling(
+                usage.as_ref().map(|usage| usage.output_tokens),
+                scope.raised_output_tokens.load(Ordering::Relaxed),
+            );
+            if let Some(raised) = raised {
+                scope.raised_output_tokens.store(raised, Ordering::Relaxed);
+            }
             warn!(
                 task_id = scope.task_id,
                 consecutive_truncations = count,
-                "SDK engine: response truncated at the token limit with no output; lowering \
-                 reasoning effort for the next call"
+                raised_output_tokens = ?raised,
+                next_effort = ?thinking_cutoff_effort(count),
+                "SDK engine: response truncated at the token limit with no output"
             );
         }
         if let Some(usage) = usage.as_ref() {
