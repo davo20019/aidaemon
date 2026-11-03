@@ -1177,8 +1177,8 @@ impl Agent {
                 continue_inline_after_background: turn_context
                     .continue_inline_after_background_start
                     || execution_state.linear_intent_plan_has_remaining_steps(),
-                // Same anchor the legacy tool phase injected: execution cwd
-                // first, then the request's primary scope. A channel
+                // Where directory-less calls run: execution cwd first, then
+                // the request's primary scope. A channel
                 // workspace grant scopes the file tools itself.
                 known_project_dir: if channel_ctx.active_workspace_grant(user_role).is_some() {
                     None
@@ -1403,7 +1403,7 @@ impl Agent {
             return Err(error.context("lifecycle recovery response could not be persisted"));
         }
         // `emit_task_end` owns semantic non-success accounting for completed
-        // status projections. Preserve the legacy explicit increment only for
+        // status projections. Keep an explicit increment only for
         // this new hard-failed recovery path, whose transport status is
         // intentionally `Failed` and is excluded from that central branch.
         // If an earlier phase already emitted TaskEnd, its accounting has

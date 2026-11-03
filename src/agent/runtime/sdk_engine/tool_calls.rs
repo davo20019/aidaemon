@@ -32,8 +32,8 @@ pub(super) fn grant_own_spill_reads(
     }
 }
 
-/// Anchor a call without a directory to the turn's project directory, as
-/// the legacy tool phase did: a scheduled goal's terminal command runs in its
+/// Anchor a call without a directory to the turn's project directory: a
+/// scheduled goal's terminal command runs in its
 /// bound workspace, not the daemon's cwd. The model's own explicit directory
 /// refines the anchor; an injected one never does (it may be a parent
 /// directory picked because the target does not exist yet). Returns the
@@ -105,8 +105,8 @@ pub(super) fn replay_notice(previous_result: &str) -> String {
     )
 }
 
-/// Credit one receipt to the contract obligations it proves, as the legacy
-/// tool phase does: a satisfied mutation marks its effects, and a
+/// Credit one receipt to the contract obligations it proves: a satisfied
+/// mutation marks its effects, and a
 /// verifiable observation marks the evidence requirements it matches.
 /// Returns the obligation ids the receipt closes.
 #[allow(clippy::too_many_arguments)]
@@ -179,9 +179,8 @@ pub(super) fn bind_receipt_to_contract(
 }
 
 /// Record one call for post-task learning. Errors and the recovery that
-/// follows feed error solutions, failure patterns and the outcome label, as
-/// the legacy result learning recorded them: a success after an error
-/// credits it as recovered.
+/// follows feed error solutions, failure patterns and the outcome label: a
+/// success after an error credits it as recovered.
 pub(super) fn record_call_for_learning(
     learning: &mut crate::agent::post_task::LearningContext,
     summary: String,
@@ -202,7 +201,7 @@ pub(super) fn record_call_for_learning(
     learning.tool_calls.push(summary);
 }
 
-/// One tool call as post-task learning records it (the legacy
+/// One tool call as post-task learning records it (a
 /// `tool_name(summary)` line, marked when it was rejected or failed so
 /// activity summaries never claim work that did not happen).
 pub(super) fn learning_tool_summary(
@@ -270,8 +269,7 @@ impl Agent {
         let _ = request.reply.send(Ok(output));
     }
 
-    /// Run one call and record it as the legacy loop does: a `ToolCall`
-    /// event, then the tool message with a typed receipt, so the run ledger
+    /// Run one call and record it: a `ToolCall` event, then the tool message with a typed receipt, so the run ledger
     /// sees every operation while the run is still going.
     pub(super) async fn run_sdk_tool_call(
         &self,
@@ -280,8 +278,7 @@ impl Agent {
         arguments: &str,
         injected_dir: Option<&str>,
     ) -> sdk::ToolOutput {
-        // The controller-side filesystem check, as in the legacy tool
-        // phase: protected host data and undeclared writes outside the task
+        // The controller-side filesystem check: protected host data and undeclared writes outside the task
         // boundary are refused; an exact out-of-scope target a user may
         // authorize goes to the tool's approval prompt.
         let scope_check = self.sdk_scope_check(scope, &request.name, arguments);
@@ -317,9 +314,9 @@ impl Agent {
             .semantics_for_exact_tool_call(&request.name, arguments)
             .await;
         // The contract's authority lane (forbidden tool use or mutation,
-        // allowed tools, forbidden scopes), then for mandate runs the same
-        // per-call authority gate as the legacy loop, which issues the
-        // bounded grant or refuses the call.
+        // allowed tools, forbidden scopes), then for mandate runs the
+        // per-call mandate authority gate, which issues the bounded grant or
+        // refuses the call.
         // Judged per call: a mixed tool such as `terminal` is not read-only
         // as a whole, but a call its adapter types as a pure observation is
         // (the tool still enforces `mutation_forbidden` itself). Run
@@ -348,8 +345,8 @@ impl Agent {
                     .iter()
                     .find(|tool| tool.name() == request.name)
                     .is_some_and(|tool| tool.owner_control_plane_call(arguments)));
-        // A matched skill that references untrusted external content keeps
-        // the legacy block on tools that could act on it.
+        // A matched skill that references untrusted external content blocks
+        // the tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools
             && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
         let gate = if untrusted_block {
@@ -450,7 +447,7 @@ impl Agent {
                 return self.sdk_suppress_duplicate_send(scope, request).await;
             }
         }
-        // Calls with side effects carry the legacy idempotency key, bound to
+        // Calls with side effects carry an idempotency key, bound to
         // the task and the canonical arguments: a repeat reuses the durable
         // receipt instead of performing the effect twice.
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
@@ -480,7 +477,7 @@ impl Agent {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool call");
         }
 
-        // User-facing activity labels, as the legacy tool phase sends them;
+        // User-facing activity labels for the channel's status line;
         // `track_requirements` shows its checklist instead.
         if request.name != "track_requirements" {
             let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
@@ -499,7 +496,7 @@ impl Agent {
             Ok(mut outcome) => {
                 // An executed call keeps the semantics it was admitted with
                 // (an observation stays an observation even when it returns a
-                // negative result), as in the legacy tool phase.
+                // negative result).
                 crate::agent::tool_execution::complete_tool_result_semantics(
                     &request.name,
                     arguments,
@@ -565,7 +562,7 @@ impl Agent {
                 }
                 let mut output = fitted;
                 // Tool-boundary truncation is rendered into the model-visible
-                // text only, as in the legacy tool phase.
+                // text only.
                 if let Some(info) = outcome.metadata.truncation.as_ref() {
                     output.push('\n');
                     output.push_str(&crate::utils::render_truncation_notice(info));
@@ -673,8 +670,7 @@ impl Agent {
             }
             Err(error) => {
                 // A tool that returns `Err` made an explicit typed failure: it
-                // gets a `FailedPermanent` receipt, as in the legacy tool
-                // phase, so the run ledger and the task outcome see it.
+                // gets a `FailedPermanent` receipt, so the run ledger and the task outcome see it.
                 let prepared = self
                     .tools
                     .iter()
@@ -918,7 +914,7 @@ impl Agent {
         }
     }
 
-    /// The legacy step-plan idempotency key: any call that is not a pure
+    /// The idempotency key for a step-plan call: any call that is not a pure
     /// observation and mutates, has an external side effect, or is not
     /// idempotent.
     pub(super) fn sdk_idempotency_key(
@@ -944,7 +940,7 @@ impl Agent {
     }
 
     /// A duplicate `send_file` in the same task: record a no-op result and
-    /// tell the model the file already went out, as the legacy guard does.
+    /// tell the model the file already went out.
     pub(super) async fn sdk_suppress_duplicate_send(
         &self,
         scope: &TurnScope<'_>,

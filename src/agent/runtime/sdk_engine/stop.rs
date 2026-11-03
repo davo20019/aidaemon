@@ -17,7 +17,7 @@ pub(super) enum ReplyDefect {
     ToolOutputPaste,
 }
 
-/// The legacy response-phase shape checks, all structural (sanitizer
+/// Reply shape checks, all structural (sanitizer
 /// output, harness page headers, data-dump shape, overlap with the latest
 /// tool output), never wording.
 pub(super) fn reply_defect(text: &str, latest_tool_output: Option<&str>) -> Option<ReplyDefect> {
@@ -89,7 +89,7 @@ pub(super) struct StopFacts {
     pub(super) unrecovered_failure: bool,
 }
 
-/// The legacy completion gate (`post_turn.rs`), read from receipts:
+/// When the closeout may demand more work, read from receipts:
 /// contract expectations are demanded only while nothing has completed; the
 /// executor's own open checklist items are demanded again whenever completed
 /// work changed since the last demand; nothing is demanded after a terminal
@@ -198,7 +198,7 @@ impl Agent {
 
     /// A mandate task lead's prose is never its decision: a missing typed
     /// commit gets one bounded correction turn when the run could still make
-    /// it, then the run fails closed, as in the legacy completion phase.
+    /// it, then the run fails closed.
     pub(super) async fn sdk_mandate_commit_check(
         &self,
         scope: &TurnScope<'_>,
@@ -364,7 +364,7 @@ impl Agent {
         }
     }
 
-    /// The legacy ledger-first closeout on the SDK path: replay the run
+    /// The ledger-first closeout: replay the run
     /// ledger, ask which expectations an admissible tool could still satisfy,
     /// and demand a bounded extra pass only when the receipts say so.
     pub(super) async fn sdk_closeout(

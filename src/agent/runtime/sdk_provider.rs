@@ -212,8 +212,7 @@ fn content_with_images(text: &str, images: &[sdk::Image]) -> Value {
 /// The request's transcript as the daemon providers expect it.
 ///
 /// Images a tool observed cannot ride on a `tool` message for every backend,
-/// so, as in the legacy loop, they follow the contiguous block of tool
-/// results as a user message.
+/// so they follow the contiguous block of tool results as a user message.
 #[cfg(test)]
 pub(super) fn to_daemon_messages(request: &sdk::ModelRequest) -> Vec<Value> {
     to_daemon_messages_from(&request.messages)
@@ -287,7 +286,7 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
 /// The daemon-format transcript for a model call: the projected `prefix`
 /// unchanged (so the provider's prompt cache keeps hitting), then this run's
 /// own messages. If the run outgrows the budget, only the run part is
-/// trimmed, with the legacy role-quota fitter, and unpaired tool calls and
+/// trimmed, with the daemon's role-quota fitter, and unpaired tool calls and
 /// results are removed; the newest messages survive.
 /// Split the system notes hooks added to this request (for example the
 /// memory note, marked [`sdk::MessageOrigin::HookNote`]) from the kernel

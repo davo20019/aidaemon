@@ -1,9 +1,8 @@
 //! Prepare a tool result for the model before the model sees it.
 //!
-//! Moved from the legacy tool phase so SDK turns keep the same boundary:
-//! untrusted output is sanitized and wrapped as data, and an oversized
-//! result is paged (`read_file`), spilled to a file the model can page
-//! through, or compressed head+tail. The transformation is recorded as a
+//! The tool-result boundary: untrusted output is sanitized and wrapped as
+//! data, and an oversized result is paged (`read_file`), spilled to a file
+//! the model can page through, or compressed head+tail. The transformation is recorded as a
 //! decision point so `db_probe --task` explains what the model saw.
 
 use crate::events::{EventEmitter, EventType};

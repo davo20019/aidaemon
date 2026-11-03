@@ -90,7 +90,7 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
         ),
         sdk::RunStatus::ProviderFailed { error } => (
             // Provider errors can carry paths and credentials: the user gets
-            // the key line, redacted, as the legacy error summary did.
+            // the key line, redacted.
             format!(
                 "I couldn't finish because the model provider returned an error: {}",
                 crate::agent::post_task::redact_error_line_for_summary(

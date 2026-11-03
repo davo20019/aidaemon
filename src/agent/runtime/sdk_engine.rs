@@ -11,16 +11,16 @@
 //! - tool dispatch: every daemon tool is exposed to the SDK, but calls are
 //!   executed by `Agent::execute_tool_outcome` on this turn's task, so argument
 //!   enrichment, role checks, workspace grants and the tools' own approval
-//!   prompts behave as in the legacy loop.
+//!   prompts all apply.
 //!
-//! The system prompt comes from the legacy prompt builder (identity, skills,
-//! memory facts, project instructions, mandate isolation).
+//! The system prompt comes from the daemon's prompt builder (identity,
+//! skills, memory facts, project instructions, mandate isolation).
 //!
 //! Images: the current turn's image attachments go to the model on the user
 //! message, and images a tool observed (`ToolObservation` attachments, such
 //! as an image file `read_file` opened) go with that tool's result, both as
 //! [`sdk::Image`]. Gated by `[files]` vision settings and the engine model.
-//! Replayed history stays text-only, like archived turns in the legacy loop.
+//! Replayed history stays text-only, like every archived turn.
 //!
 //! Layout: this file builds the per-turn kernel agent and runs the
 //! `DaemonCall` select loop. The daemon side of each call lives in
@@ -28,9 +28,9 @@
 //! (closeout and stop-time demands) and `budgets`; `hooks` holds the
 //! kernel-side adapters and `outcome` turns a finished run into the reply.
 //!
-//! Not ported, on purpose: the legacy intent gate, pre-execution plan /
-//! critique / evidence gates and the guided `tool_choice` forcing ladder.
-//! Completion is the ledger closeout (`LedgerStop`), not those gates.
+//! There is no intent gate, no pre-execution plan / critique / evidence gate
+//! and no guided `tool_choice` forcing: completion is the ledger closeout
+//! (`LedgerStop`), judged from receipts.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -164,7 +164,7 @@ pub(super) enum DaemonCall {
     Stop(StopCheck),
 }
 
-/// What the legacy bootstrap settled for a turn before the SDK run starts:
+/// What turn setup (`main_loop.rs`) settled before the SDK run starts:
 /// the recorded task, the assessed contract, the offered tools, the selected
 /// model and the system prompt.
 pub(in crate::agent) struct SdkTurnSetup {
@@ -174,16 +174,16 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) emitter: EventEmitter,
     pub(in crate::agent) offered_tools: HashSet<String>,
     pub(in crate::agent) model: String,
-    /// The transcript the legacy message builder projected for the turn's
-    /// first model call, in the daemon providers' wire format.
+    /// The transcript `message_build` projected for the run's first model
+    /// call, in the daemon providers' wire format.
     pub(in crate::agent) prefix: Vec<Value>,
     pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
     /// Post-task learning state from bootstrap; the run adds its tool calls.
     pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
     /// The assessed task shape continues inline work after a background start.
     pub(in crate::agent) continue_inline_after_background: bool,
-    /// Matched skills reference untrusted external content: the legacy tool
-    /// block applies, naming these skills.
+    /// Matched skills reference untrusted external content: tools that could
+    /// act on it are blocked, naming these skills.
     pub(in crate::agent) restrict_untrusted_reference_tools: bool,
     pub(in crate::agent) untrusted_reference_skills: Vec<String>,
     /// Discovers nested project instructions before deeper subtree work.
@@ -401,8 +401,8 @@ impl Agent {
     }
 
     /// Record a call the kernel refused before dispatch in the run ledger:
-    /// an unknown tool or invalid arguments is a typed failed proposal, as
-    /// the legacy dispatcher recorded it; a hook denial is a policy denial.
+    /// an unknown tool or invalid arguments is a typed failed proposal; a
+    /// hook denial is a policy denial.
     async fn record_kernel_refusal(&self, scope: &TurnScope<'_>, receipt: sdk::Receipt) {
         let call = crate::traits::ToolCall {
             id: receipt.call_id.clone(),
@@ -466,9 +466,8 @@ impl Agent {
             .map_or(scope.task_id, |fence| fence.worker_task_id.as_str())
     }
 
-    /// One turn on the SDK kernel, after the legacy bootstrap set it up. See
-    /// the module docs for what is kept and what is dropped compared with
-    /// the legacy loop.
+    /// One turn on the SDK kernel, after turn setup built `setup`. See the
+    /// module docs for what the daemon owns and what the kernel drives.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_message_sdk(
         &self,
@@ -878,8 +877,7 @@ impl Agent {
             }
         };
         let (error, iterations, tool_calls_count) = error;
-        // The replayed run ledger has the final say on the outcome, exactly as
-        // for legacy turns.
+        // The replayed run ledger has the final say on the outcome.
         self.emit_task_end(
             &emitter,
             &task_id,

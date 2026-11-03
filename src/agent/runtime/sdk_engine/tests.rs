@@ -181,7 +181,7 @@ async fn recorded_models(harness: &crate::testing::TestHarness) -> Vec<String> {
 }
 
 /// `/model` pins the model; clearing it hands selection back to the
-/// daemon's routing, as in the legacy loop.
+/// daemon's routing.
 #[tokio::test]
 async fn sdk_engine_follows_daemon_model_selection() {
     use crate::runtime_ports::AgentIngress;
@@ -468,8 +468,7 @@ async fn sdk_engine_stops_when_cancelled() {
     assert_eq!(end.status, TaskStatus::Cancelled);
 }
 
-/// The legacy `executor_declared_checklist` integration test on the SDK
-/// engine: the model declares three typed items, does one and tries to
+/// An executor's declared checklist: the model declares three typed items, does one and tries to
 /// stop; the ledger demands the open items until receipts close them.
 /// The closeout interrupted a real answer, then the model went silent:
 /// the user gets that answer, not a generic activity summary.
@@ -848,7 +847,7 @@ impl crate::traits::Tool for ShellProbe {
 }
 
 /// A read-only request must not lose a mixed tool such as `terminal`:
-/// the authority lane judges the exact call, as the legacy loop did.
+/// the authority lane judges the exact call.
 #[tokio::test]
 async fn read_only_contract_admits_observing_calls_of_a_mixed_tool() {
     use crate::runtime_ports::AgentIngress;
@@ -1045,7 +1044,7 @@ fn replayed_results_say_they_were_not_run_again() {
 }
 
 #[test]
-fn same_tool_streaks_follow_the_legacy_limits() {
+fn same_tool_streaks_follow_the_guard_limits() {
     let calls = |tool: &str, n: usize, distinct: bool| -> Vec<(String, serde_json::Value)> {
         (0..n)
             .map(|i| {
@@ -1111,7 +1110,7 @@ fn same_tool_streaks_follow_the_legacy_limits() {
 }
 
 #[test]
-fn learning_records_each_call_like_the_legacy_loop() {
+fn learning_records_each_call_with_its_outcome() {
     let args = r#"{"path":"notes.txt"}"#;
     let ok = learning_tool_summary("read_file", args, false, false);
     assert!(ok.starts_with("read_file(") && !ok.contains('['), "{ok}");

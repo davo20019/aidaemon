@@ -3,12 +3,12 @@
 
 use super::*;
 
-/// Model-call timeouts, as in the legacy LLM phase.
+/// Per-call ceilings: the default, a foreground turn's, a mandate run's.
 pub(super) const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
 pub(super) const FOREGROUND_MAX_MODEL_CALL: Duration = Duration::from_secs(90);
 pub(super) const MANDATE_MAX_MODEL_CALL: Duration = Duration::from_secs(840);
-/// A timed-out call is retried, as the legacy loop continued after one: the
-/// ceiling bounds a call so the turn regains control, not so it ends.
+/// A timed-out call is retried: the ceiling bounds a call so the turn
+/// regains control, not so it ends.
 pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
 
 /// A model call that ran past its per-call ceiling.
@@ -26,7 +26,7 @@ impl std::error::Error for ModelCallTimedOut {}
 impl Agent {
     /// Make one model call for the SDK run through the daemon's provider
     /// stack: billing-aware retries, the fallback cascade and failover
-    /// providers all apply, exactly as for a legacy-loop call.
+    /// providers all apply.
     pub(super) async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
         let reply = loop {
             let reply = self.sdk_model_call(scope, &call.request).await;
@@ -58,7 +58,7 @@ impl Agent {
         let _ = call.reply.send(reply);
     }
 
-    /// The legacy per-call ceiling: a hung provider must not hold the turn.
+    /// The per-call ceiling: a hung provider must not hold the turn.
     pub(super) fn sdk_model_call_timeout(&self) -> Duration {
         let ceiling = if self.mandate_execution.is_some() {
             MANDATE_MAX_MODEL_CALL
@@ -119,8 +119,7 @@ impl Agent {
         let messages = fit_run(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         // A reasoning model that spent its whole output budget thinking gets
-        // less room to think next time: low effort, then none (the legacy
-        // LLM phase's escalating truncation recovery).
+        // less room to think next time: low effort, then none.
         match scope.thinking_truncations.load(Ordering::Relaxed) {
             0 => {}
             1 => options.reasoning_effort_override = Some("low".to_string()),
@@ -131,7 +130,7 @@ impl Agent {
         // `None` and use the provider's background slot.
         options.id_slot = self.interactive_slot;
         // Before any tool work a provider blip gets the long retry ladder: a
-        // failure there loses the whole turn (the legacy LLM phase's rule).
+        // failure there loses the whole turn.
         options.uncommitted_work = scope
             .learning
             .lock()
@@ -144,8 +143,7 @@ impl Agent {
             crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = crate::agent::llm::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
-        // and its executors: reserve before the call, settle after it, as in
-        // the legacy LLM phase.
+        // and its executors: reserve before the call, settle after it.
         let lease = match self
             .sdk_mandate_token_lease(&mut options, est_input_tokens as u32)
             .await
@@ -154,7 +152,7 @@ impl Agent {
             Err(error) => {
                 // The balance is used up. A committed WAIT/ASK/STOP already
                 // completed the review; otherwise a bounded WAIT is recorded
-                // so the controller retries, as in the legacy LLM phase. The
+                // so the controller retries. The
                 // review closes from that durable decision, not as a
                 // provider failure.
                 if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
@@ -373,7 +371,7 @@ impl Agent {
                 .sdk_charge_budgets(scope, usage, iteration as usize)
                 .await
             {
-                // The legacy closeout grace: a final answer on the first call,
+                // Closeout grace: a final answer on the first call,
                 // or after real progress, still ships; otherwise the budget
                 // reply replaces it and no further work runs.
                 let grace = response.tool_calls.is_empty()

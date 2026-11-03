@@ -1,10 +1,9 @@
 // ==========================================================================
 // Tool-result boundary on SDK turns
 //
-// The legacy dispatcher wrapped untrusted output and capped oversized
-// results before the model saw them; the SDK dispatch passed raw output
-// through until the boundary moved to `tool_result_fit`. These tests pin
-// what the model receives, read from the provider's own call log.
+// `tool_result_fit` wraps untrusted output and caps oversized results
+// before the model sees them. These tests pin what the model receives,
+// read from the provider's own call log.
 // ==========================================================================
 
 /// The effective outcome of the latest task in `session`.

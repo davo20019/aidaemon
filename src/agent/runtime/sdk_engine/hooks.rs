@@ -41,8 +41,8 @@ impl sdk::Hook for LedgerStop {
 }
 
 /// Whether `tool` with `arguments`, after the run's earlier `previous` calls,
-/// continues a same-tool loop, with the legacy guard's limits
-/// (`tool_execution/guards.rs`): 8 consecutive calls, 16 for versatile and
+/// continues a same-tool loop: 8 consecutive calls
+/// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for versatile and
 /// research tools, 40 for `computer_use`; diverse arguments get the higher
 /// limit as a bonus, not a bypass.
 pub(super) fn same_tool_loop(previous: &[(String, Value)], tool: &str, arguments: &Value) -> bool {
@@ -90,7 +90,7 @@ pub(super) fn same_tool_loop(previous: &[(String, Value)], tool: &str, arguments
     !diverse || total >= diverse_limit
 }
 
-/// The legacy consecutive-same-tool guard as a hook. A hook cannot end the
+/// The consecutive-same-tool guard. A hook cannot end the
 /// run, so the looping call is refused with a redirect; if the model keeps
 /// at it, the kernel's stuck detector ends the run.
 pub(super) struct SameToolLimit;

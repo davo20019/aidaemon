@@ -4,7 +4,7 @@
 use super::*;
 
 pub(super) const GOAL_BUDGET_EXHAUSTED: &str = "the goal's token budget is used up";
-/// Budget extension limits, as in the legacy loop.
+/// How often, and how far, a used-up budget may extend.
 pub(super) const TASK_MAX_BUDGET_EXTENSIONS: usize = 3;
 pub(super) const TASK_HARD_TOKEN_CAP: u64 = 2_000_000;
 pub(super) const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 1;
@@ -31,8 +31,8 @@ pub(super) fn task_token_budget(configured: Option<u64>, scheduled_per_check: Op
 impl Agent {
     /// Charge a model call to the task, goal-daily and scheduled-run
     /// budgets. When one is used up, it extends once more if receipts show
-    /// progress since the last extension (or the owner approves), as the
-    /// legacy budget controls do; otherwise the owner is alerted and the
+    /// progress since the last extension (or the owner approves); otherwise
+    /// the owner is alerted and the
     /// honest budget reply is returned.
     pub(super) async fn sdk_charge_budgets(
         &self,
@@ -259,7 +259,7 @@ impl Agent {
             )
             .await;
             // One warning at 80% of the per-run budget, so the run can wrap
-            // up before it is stopped (the legacy stopping phase's rule).
+            // up before it is stopped.
             if let Some(pct) = Agent::scheduled_run_budget_pressure_pct(
                 &run_status,
                 scope.budget_warning_sent.load(Ordering::Relaxed),
