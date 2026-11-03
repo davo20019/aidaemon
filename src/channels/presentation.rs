@@ -403,3 +403,41 @@ mod tests {
         assert!(output.contains("_Recurring schedule remains active._"));
     }
 }
+
+/// The reply to a message that arrives while a task runs in its session.
+/// Without attachments the running task takes it in at its next step when
+/// it is from the same sender (`TaskRegistry::take_steering_messages`);
+/// otherwise it runs as its own turn once the current one ends.
+pub(crate) fn queued_message_notice(
+    text: &str,
+    current_task: &str,
+    has_attachments: bool,
+) -> String {
+    let preview: String = text.chars().take(50).collect();
+    let suffix = if text.chars().count() > 50 { "..." } else { "" };
+    if has_attachments {
+        format!(
+            "📥 Got \"{preview}{suffix}\". I'll handle it right after the current task: {current_task}"
+        )
+    } else {
+        format!(
+            "📥 Got \"{preview}{suffix}\". I'll take it into account in the current task \
+             ({current_task}), or handle it right after if it can't join."
+        )
+    }
+}
+
+#[cfg(test)]
+mod queued_notice_tests {
+    use super::queued_message_notice;
+
+    #[test]
+    fn the_notice_says_what_will_happen_to_the_message() {
+        let joining = queued_message_notice("Also count the lines", "Read four files", false);
+        assert!(joining.contains("take it into account in the current task (Read four files)"));
+        let waiting = queued_message_notice("see the attached log", "Read four files", true);
+        assert!(waiting.contains("right after the current task: Read four files"));
+        let long = queued_message_notice(&"x".repeat(80), "t", false);
+        assert!(long.contains(&format!("{}...", "x".repeat(50))));
+    }
+}

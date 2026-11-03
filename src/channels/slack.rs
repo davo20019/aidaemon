@@ -2046,17 +2046,13 @@ impl SlackChannel {
                             .get_running_task_description(&session_id)
                             .await
                             .unwrap_or_else(|| "processing".to_string());
-                        let preview: String = agent_text.chars().take(50).collect();
-                        let suffix = if agent_text.len() > 50 { "..." } else { "" };
+                        let notice = crate::channels::presentation::queued_message_notice(
+                            &agent_text,
+                            &current_task,
+                            !inbound_attachments.is_empty(),
+                        );
                         let _ = self
-                            .post_message(
-                                &channel_id,
-                                &format!(
-                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                    queue_pos, preview, suffix, current_task
-                                ),
-                                reply_thread.as_deref(),
-                            )
+                            .post_message(&channel_id, &notice, reply_thread.as_deref())
                             .await;
                     }
                     return;

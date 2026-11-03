@@ -715,18 +715,12 @@ impl DiscordChannel {
                             .get_running_task_description(&session_id)
                             .await
                             .unwrap_or_else(|| "processing".to_string());
-                        let preview: String = text.chars().take(50).collect();
-                        let suffix = if text.len() > 50 { "..." } else { "" };
-                        let _ = msg
-                            .channel_id
-                            .say(
-                                &ctx.http,
-                                format!(
-                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                    queue_pos, preview, suffix, current_task
-                                ),
-                            )
-                            .await;
+                        let notice = crate::channels::presentation::queued_message_notice(
+                            &text,
+                            &current_task,
+                            !inbound_attachments.is_empty(),
+                        );
+                        let _ = msg.channel_id.say(&ctx.http, notice).await;
                     }
                     return;
                 }
