@@ -58,6 +58,8 @@ const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// still reported synchronously with its exit code, then it is handed to
 /// background tracking with a typed `process_state` receipt.
 const DETACH_STARTUP_GRACE: Duration = Duration::from_millis(1500);
+/// Per-stream tail of startup output returned with a background launch.
+const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 
 /// A disowned background process (notifier-active, non-detached) that makes no
 /// progress (no CPU time, disk I/O, output growth, or process-tree change) for
@@ -1458,10 +1460,12 @@ fn format_background_progress_message(elapsed_secs: u64, output: &str) -> String
 /// One deterministic transition after the frequent progress-ping budget is
 /// exhausted. This deliberately does not re-enter the agent loop: doing that
 /// from inside the process-monitoring `select!` used to block observation of
-/// the process exit and could strand the promised final result.
+/// the process exit and could strand the promised final result. It is the last
+/// edit the card gets, so its duration is a floor ("over") that stays true
+/// rather than a clock that silently stops.
 fn format_background_monitoring_notice(elapsed_secs: u64, output: &str) -> String {
     let mut message = format!(
-        "⏳ **Taking longer than expected** · {}\n\nIt's still running and I'm still monitoring it. I'll let you know when it finishes or if it needs attention.",
+        "⏳ **Taking longer than expected** · running for over {}\n\nI'm still monitoring it and will let you know when it finishes or if it needs attention. Ask me for its status or to stop it anytime.",
         humanize_elapsed(elapsed_secs)
     );
     if let Some(note) = output_count_note(output) {
@@ -5127,14 +5131,21 @@ impl TerminalTool {
 
                 // Non-daemon command: move process to background tracking.
                 let elapsed = foreground_wait.as_secs();
-                let partial_stdout = {
-                    let b = stdout_buf.lock().await;
-                    let tail = if b.len() > 500 {
-                        &b[b.len() - 500..]
-                    } else {
-                        &b
+                // Both streams: many services (cloudflared, ngrok, dev
+                // servers) log their URL or ready line on stderr only.
+                let partial_output = {
+                    let tail_of = |b: &[u8]| {
+                        let start = b.len().saturating_sub(PARTIAL_OUTPUT_TAIL_BYTES);
+                        String::from_utf8_lossy(&b[start..]).trim().to_string()
                     };
-                    String::from_utf8_lossy(tail).to_string()
+                    let stdout = tail_of(&stdout_buf.lock().await);
+                    let stderr = tail_of(&stderr_buf.lock().await);
+                    match (stdout.is_empty(), stderr.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => stdout,
+                        (true, false) => stderr,
+                        (false, false) => format!("{stdout}\n{stderr}"),
+                    }
                 };
                 let notify_on_completion = Arc::new(AtomicBool::new(true));
                 let owner_task_id = task_id
@@ -5234,6 +5245,7 @@ impl TerminalTool {
                         running.get(&pid).map(|p| p.stderr_buf.clone())
                     };
                     let started_at_for_notify = Instant::now() - foreground_wait;
+                    let detached_for_notify = detach;
                     let max_output_chars = self.max_output_chars;
                     let status_tx_for_notify = status_tx.clone();
                     if let (Some(stdout_buf), Some(stderr_buf)) =
@@ -5550,6 +5562,13 @@ impl TerminalTool {
                                                 "Terminal background progress pings suppressed (check/kill already handled notification)"
                                             );
                                             return;
+                                        }
+                                        // A detached service runs until killed:
+                                        // "still working, I'll share the result"
+                                        // cards promise an end that never comes.
+                                        // Only its exit is news.
+                                        if detached_for_notify {
+                                            continue;
                                         }
 
                                         ping_count += 1;
@@ -6182,8 +6201,7 @@ impl TerminalTool {
                 let mut msg = if detach {
                     format!(
                         "Detached launch: the process passed its {:.1}s startup check and is running in the background (pid={}).\n\
-                         IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
-                         Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
+                         It keeps running until killed; do not launch it again. If its startup output below does not yet show what you need (a URL, port, or ready line), wait briefly and use action=\"check\" with pid={} to read it. Use action=\"kill\" with pid={} to stop it.",
                         foreground_wait.as_secs_f32(),
                         pid,
                         pid,
@@ -6219,8 +6237,8 @@ impl TerminalTool {
                         "\n\nThis process is task-owned and will be auto-killed when the current task ends.",
                     );
                 }
-                if !partial_stdout.is_empty() {
-                    msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
+                if !partial_output.is_empty() {
+                    msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_output));
                 }
                 let background_semantics = background_process_semantics(&command_semantics);
                 Ok(ToolCallOutcome {
@@ -7669,6 +7687,49 @@ impl Tool for TerminalTool {
             );
         }
         Ok(())
+    }
+
+    async fn session_context_note(&self, session_id: &str) -> Option<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        let mut lines: Vec<(u32, String)> = Vec::new();
+        for (pid, proc) in self.running.lock().await.iter() {
+            if proc.notify_session_id != session_id || proc.reader_handle.is_finished() {
+                continue;
+            }
+            let mode = if proc.detached {
+                "detached, runs until killed"
+            } else {
+                "background, user is notified when it finishes"
+            };
+            lines.push((
+                *pid,
+                format!(
+                    "- pid={} ({}), running for {}: `{}`",
+                    pid,
+                    mode,
+                    humanize_elapsed(proc.started_at.elapsed().as_secs()),
+                    truncate_str(&proc.command, 160)
+                ),
+            ));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        lines.sort_by_key(|(pid, _)| *pid);
+        let mut note = String::from(
+            "Background processes started earlier in this conversation are still running:\n",
+        );
+        for (_, line) in lines {
+            note.push_str(&line);
+            note.push('\n');
+        }
+        note.push_str(
+            "Read one's output with terminal action=\"check\" and its pid, and stop it with action=\"kill\". Do not launch a running one again.",
+        );
+        Some(note)
     }
 }
 
@@ -9396,7 +9457,7 @@ mod tests {
     #[test]
     fn monitoring_notice_is_terminally_honest() {
         let notice = format_background_monitoring_notice(170, "192.0.2.31\n192.0.2.32\n192.0.2.45");
-        assert!(notice.contains("**Taking longer than expected** · 2m 50s"));
+        assert!(notice.contains("**Taking longer than expected** · running for over 2m 50s"));
         assert!(notice.contains("I'm still monitoring it"));
         assert!(notice.contains("if it needs attention"));
         assert!(notice.contains("_3 lines received so far._"));
@@ -9758,6 +9819,78 @@ mod tests {
         assert!(outcome.metadata.timed_out);
         assert!(!outcome.metadata.detached);
         assert!(outcome.metadata.completion_notifications_enabled);
+    }
+
+    /// A service that logs its URL on stderr (cloudflared does) must show it
+    /// in the launch result, and the session's next turn must see the running
+    /// process so a follow-up checks it rather than relaunching it.
+    #[tokio::test]
+    async fn detached_service_shows_stderr_startup_and_is_listed_for_its_session() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true,"_session_id":"sess_service","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.detached);
+        assert!(
+            outcome
+                .output
+                .contains("ready at https://synthetic-tunnel.example.test"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            !outcome.output.contains("do NOT wait or repeatedly check"),
+            "{}",
+            outcome.output
+        );
+
+        let note = tool
+            .session_context_note("sess_service")
+            .await
+            .expect("a running detached process is listed for its session");
+        assert!(note.contains("detached, runs until killed"), "{note}");
+        assert!(note.contains("sleep 30"), "{note}");
+        assert!(tool.session_context_note("sess_other").await.is_none());
+
+        let pid = tool
+            .running
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("tracked pid");
+        tool.call_with_status_outcome(
+            &format!(r#"{{"action":"kill","pid":{pid},"_session_id":"sess_service","_user_role":"Owner"}}"#),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(tool.session_context_note("sess_service").await.is_none());
     }
 
     #[tokio::test]

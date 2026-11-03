@@ -1227,7 +1227,11 @@ impl Tool for PlayedNodeAudioTool {
     }
 }
 
-struct BackgroundDetachTool;
+/// `detached`: the model asked for a long-lived service (true) rather than a
+/// job the daemon moved to the background after its foreground timeout.
+struct BackgroundDetachTool {
+    detached: bool,
+}
 
 #[async_trait]
 impl Tool for BackgroundDetachTool {
@@ -1267,7 +1271,8 @@ impl Tool for BackgroundDetachTool {
             output: "Background job started.".to_string(),
             metadata: ToolCallMetadata {
                 background_started: true,
-                detached: true,
+                detached: self.detached,
+                timed_out: !self.detached,
                 completion_notifications_enabled: true,
                 ..ToolCallMetadata::default()
             },
@@ -1631,7 +1636,7 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
 
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
-        vec![Arc::new(BackgroundDetachTool) as Arc<dyn Tool>],
+        vec![Arc::new(BackgroundDetachTool { detached: false }) as Arc<dyn Tool>],
     )
     .await
     .unwrap();
@@ -1805,7 +1810,7 @@ async fn background_detach_delivers_neutral_handoff_not_giveup_summary() {
     // background handoff applies.
     let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
         provider,
-        vec![Arc::new(BackgroundDetachTool) as Arc<dyn Tool>],
+        vec![Arc::new(BackgroundDetachTool { detached: false }) as Arc<dyn Tool>],
         None,
     )
     .await
@@ -1832,6 +1837,69 @@ async fn background_detach_delivers_neutral_handoff_not_giveup_summary() {
     assert!(
         lower.contains("background") && lower.contains("running in the background"),
         "the final answer must be the neutral background handoff; got: {reply}"
+    );
+}
+
+// A launch the model detached on purpose is a long-lived service (a tunnel, a
+// dev server): it never finishes, so a "results will follow" handoff strands
+// the user. The run continues past the launch receipt, the model sees it, and
+// the model's own report of what is running is the reply.
+#[tokio::test]
+async fn detached_service_launch_continues_the_run_to_the_models_report() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("background_task", r#"{"job":"tunnel"}"#),
+        MockProvider::text_response(
+            "The tunnel is running at https://synthetic-tunnel.example.test. Ask me to stop it anytime.",
+        ),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(BackgroundDetachTool { detached: true }) as Arc<dyn Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "detached_service_launch",
+            "Expose the local site through a tunnel",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        reply.contains("https://synthetic-tunnel.example.test"),
+        "the model's report of the running service must be the reply; got: {reply}"
+    );
+    assert!(
+        !reply.contains("Still on it"),
+        "a detached service must not end in the background handoff; got: {reply}"
+    );
+    let call_log = harness.provider.call_log.lock().await.clone();
+    let follow_up = call_log
+        .iter()
+        .rev()
+        .find(|call| {
+            call.messages
+                .iter()
+                .any(|m| m.to_string().contains("Background job started."))
+        })
+        .expect("the model is called again after the launch receipt");
+    let transcript = follow_up
+        .messages
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<String>();
+    assert!(
+        !transcript.contains("Do NOT call additional tools"),
+        "the launch result must not tell the model to stop working"
     );
 }
 

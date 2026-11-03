@@ -1652,15 +1652,21 @@ impl Agent {
                          (vision is off, unsupported, or the file is too large or unreadable).",
                     );
                 }
-                // The legacy detach transition, decided at the typed receipt:
-                // detached work is the handoff unless the assessed task shape
-                // keeps independent inline work going.
+                // The detach transition, decided at the typed receipt. A
+                // launch the model asked to detach is a long-lived service
+                // (server, tunnel, watcher) that never "finishes": its useful
+                // result is its startup output, so the run continues and the
+                // model reports it. Work the daemon pushed to the background
+                // is the handoff unless the assessed task shape keeps
+                // independent inline work going.
                 if super::tool_execution_phase::tool_result_indicates_background_detach(
                     &request.name,
                     &output,
                     &outcome.metadata,
                 ) {
-                    let directive = if scope.continue_inline_after_background {
+                    let directive = if scope.continue_inline_after_background
+                        || outcome.metadata.detached
+                    {
                         super::system_directives::SystemDirective::BackgroundProcessContinue
                     } else {
                         // With notifications on, the result follows by
@@ -1676,13 +1682,13 @@ impl Agent {
                             )
                         };
                         scope.end_with(reply, TaskOutcome::Partial);
+                        if outcome.metadata.completion_notifications_enabled {
+                            scope.background_handoff.store(true, Ordering::Relaxed);
+                        }
                         super::system_directives::SystemDirective::BackgroundHandoff {
                             notifications_active: outcome.metadata.completion_notifications_enabled,
                         }
                     };
-                    if outcome.metadata.completion_notifications_enabled {
-                        scope.background_handoff.store(true, Ordering::Relaxed);
-                    }
                     output = format!("{output}\n\n{}", directive.render());
                 }
                 let satisfied = !status.is_failure();
@@ -1956,7 +1962,7 @@ impl Agent {
             decision = self.sdk_gui_click_check(scope).await;
         }
         if decision == sdk::StopDecision::Accept {
-            decision = self.sdk_reply_check(scope, &check.final_text);
+            decision = self.sdk_reply_check(scope, &check.final_text).await;
         }
         let _ = check.reply.send(decision);
     }
@@ -1968,14 +1974,19 @@ impl Agent {
     /// a successful Like). Bounded, so a model that never looks cannot loop.
     #[cfg(feature = "computer_use")]
     async fn sdk_gui_click_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
-        const MAX_GUI_VERIFY_DEMANDS: u32 = 3;
+        use super::closeout::{StopDemand, StopDemandVerdict};
         if self.depth != 0
             || !crate::agent::computer_use::task_has_unverified_coordinate_click(scope.task_id)
                 .await
-            || scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed) >= MAX_GUI_VERIFY_DEMANDS
         {
             return sdk::StopDecision::Accept;
         }
+        let demand = StopDemand::GuiClickVerification;
+        let used = scope.gui_verify_demands.load(Ordering::Relaxed);
+        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+            return sdk::StopDecision::Accept;
+        }
+        scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed);
         self.emit_warning_decision_point(
             scope.emitter,
             scope.task_id,
@@ -1997,13 +2008,11 @@ impl Agent {
     }
 
     /// A mandate task lead's prose is never its decision: a missing typed
-    /// commit gets one bounded correction turn, then the run fails closed,
-    /// as in the legacy completion phase.
+    /// commit gets one bounded correction turn when the run could still make
+    /// it, then the run fails closed, as in the legacy completion phase.
     async fn sdk_mandate_commit_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
-        use super::completion_phase::{
-            mandate_decision_commit_state, mandate_decision_completion_action,
-            MandateDecisionCommitState, MandateDecisionCompletionAction,
-        };
+        use super::closeout::{StopDemand, StopDemandVerdict};
+        use super::completion_phase::{mandate_decision_commit_state, MandateDecisionCommitState};
         let state = match mandate_decision_commit_state(self).await {
             Ok(state) => state,
             Err(error) => {
@@ -2011,54 +2020,104 @@ impl Agent {
                 return sdk::StopDecision::Accept;
             }
         };
-        let decision_tool_available = self
-            .tools
-            .iter()
-            .any(|tool| tool.name() == "manage_mandates");
-        let retries = scope.mandate_commit_retries.load(Ordering::Relaxed) as usize;
-        match mandate_decision_completion_action(state, retries, decision_tool_available) {
-            MandateDecisionCompletionAction::Allow => sdk::StopDecision::Accept,
-            MandateDecisionCompletionAction::Retry => {
-                scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
-                self.emit_warning_decision_point(
-                    scope.emitter,
-                    scope.task_id,
-                    scope.model_calls.load(Ordering::Relaxed) as usize,
-                    crate::events::DecisionType::PostExecutionValidation,
-                    "Blocked mandate prose completion without a durable decision".to_string(),
-                    serde_json::json!({
-                        "condition": "mandate_decision_commit_missing",
-                        "retry": retries + 1,
-                        "engine": "sdk",
-                    }),
-                )
-                .await;
-                sdk::StopDecision::Continue {
-                    message:
-                        super::system_directives::SystemDirective::MandateDecisionCommitRequired
-                            .render(),
+        let error = match state {
+            MandateDecisionCommitState::NotApplicable | MandateDecisionCommitState::Committed => {
+                return sdk::StopDecision::Accept;
+            }
+            MandateDecisionCommitState::Invalid => {
+                "Mandate deliberator found a decision for the current run with mismatched \
+                 immutable identity."
+            }
+            MandateDecisionCommitState::Missing => {
+                let demand = StopDemand::MandateDecisionCommit;
+                let used = scope.mandate_commit_retries.load(Ordering::Relaxed) as u32;
+                match self.sdk_stop_demand_verdict(scope, demand, used).await {
+                    StopDemandVerdict::Demand => {
+                        scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
+                        self.emit_warning_decision_point(
+                            scope.emitter,
+                            scope.task_id,
+                            scope.model_calls.load(Ordering::Relaxed) as usize,
+                            crate::events::DecisionType::PostExecutionValidation,
+                            "Blocked mandate prose completion without a durable decision"
+                                .to_string(),
+                            serde_json::json!({
+                                "condition": demand.condition(),
+                                "retry": used + 1,
+                                "engine": "sdk",
+                            }),
+                        )
+                        .await;
+                        return sdk::StopDecision::Continue {
+                            message:
+                                super::system_directives::SystemDirective::MandateDecisionCommitRequired
+                                    .render(),
+                        };
+                    }
+                    StopDemandVerdict::Exhausted => {
+                        "Mandate deliberator returned without committing an exact durable \
+                         decision after its bounded correction turn."
+                    }
+                    StopDemandVerdict::Unreachable => {
+                        "Mandate deliberator returned without a durable decision, and this \
+                         run's authority does not admit manage_mandates record_decision, so \
+                         no correction turn could commit one."
+                    }
                 }
             }
-            MandateDecisionCompletionAction::Reject => {
-                let error = if state == MandateDecisionCommitState::Invalid {
-                    "Mandate deliberator found a decision for the current run with mismatched \
-                     immutable identity."
-                } else {
-                    "Mandate deliberator returned without committing an exact durable decision \
-                     after its bounded correction turn."
-                };
-                if let Ok(mut failure) = scope.verdict.run_failure.lock() {
-                    *failure = Some(error.to_string());
-                }
-                sdk::StopDecision::Accept
-            }
+        };
+        if let Ok(mut failure) = scope.verdict.run_failure.lock() {
+            *failure = Some(error.to_string());
         }
+        sdk::StopDecision::Accept
+    }
+
+    /// Ask the closeout arbiter whether `demand` may be made now, against the
+    /// same authority and visible tools the ledger closeout uses, and record
+    /// the verdict.
+    async fn sdk_stop_demand_verdict(
+        &self,
+        scope: &TurnScope<'_>,
+        demand: super::closeout::StopDemand,
+        used: u32,
+    ) -> super::closeout::StopDemandVerdict {
+        let authority =
+            super::closeout::ClosingAuthority::from_authority(scope.contract.authority());
+        let visible_tools =
+            closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
+        let find = |name: &str| self.tools.iter().find(|tool| tool.name() == name);
+        let verdict = super::closeout::stop_demand_verdict(
+            demand,
+            used,
+            &authority,
+            &visible_tools,
+            |name| find(name).map(|tool| tool.capabilities().read_only),
+            |name, arguments| find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments)),
+        );
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            crate::events::DecisionType::PostExecutionValidation,
+            format!("Stop demand {}: {}", demand.condition(), verdict.as_str()),
+            serde_json::json!({
+                "condition": "stop_demand",
+                "demand": demand.condition(),
+                "verdict": verdict.as_str(),
+                "used": used,
+                "budget": demand.budget(),
+                "authoritative": true,
+                "engine": "sdk",
+            }),
+        )
+        .await;
+        verdict
     }
 
     /// One shared retry for a reply that must not ship (empty, only internal
     /// markers, pasted tool output); after it, the finalizer's honest
     /// fallback applies.
-    fn sdk_reply_check(&self, scope: &TurnScope<'_>, final_text: &str) -> sdk::StopDecision {
+    async fn sdk_reply_check(&self, scope: &TurnScope<'_>, final_text: &str) -> sdk::StopDecision {
         let latest = scope
             .latest_tool_output
             .lock()
@@ -2067,9 +2126,15 @@ impl Agent {
         let Some(defect) = reply_defect(final_text, latest.as_deref()) else {
             return sdk::StopDecision::Accept;
         };
-        if scope.reply_retry_used.swap(true, Ordering::Relaxed) {
+        let used = u32::from(scope.reply_retry_used.load(Ordering::Relaxed));
+        if self
+            .sdk_stop_demand_verdict(scope, super::closeout::StopDemand::ReplyRepair, used)
+            .await
+            != super::closeout::StopDemandVerdict::Demand
+        {
             return sdk::StopDecision::Accept;
         }
+        scope.reply_retry_used.store(true, Ordering::Relaxed);
         warn!(
             session_id = scope.session_id,
             task_id = scope.task_id,

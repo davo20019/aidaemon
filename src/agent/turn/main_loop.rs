@@ -593,6 +593,17 @@ impl Agent {
         } else {
             fresh_task_context_tail
         };
+        // Live tool state that outlives turns (background processes still
+        // running) is part of every turn's context, whatever the request's
+        // wording: a follow-up must see what is running, not relaunch it.
+        for tool in &self.tools {
+            if let Some(note) = tool.session_context_note(session_id).await {
+                if !task_context_tail.is_empty() {
+                    task_context_tail.push_str("\n\n");
+                }
+                task_context_tail.push_str(&note);
+            }
+        }
         let prior_assistant_message_id = preserve_archived_context
             .then(|| {
                 dialogue_state

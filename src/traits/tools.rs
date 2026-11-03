@@ -1880,6 +1880,13 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
+    /// Live state this tool holds for a session that outlives a turn (for
+    /// example background processes still running), rendered for the next
+    /// turn's task context so a follow-up sees it instead of guessing.
+    async fn session_context_note(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// Categorize this tool for role-based scoping.
     /// Default: Action (most tools are action tools).
     fn tool_role(&self) -> ToolRole {

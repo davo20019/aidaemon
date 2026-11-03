@@ -253,7 +253,7 @@ impl SystemDirective {
                     "[SYSTEM] A background task was moved to the background. Do NOT call additional tools or poll status in this turn. Reply to the user now with the current status.".to_string()
                 }
             }
-            Self::BackgroundProcessContinue => "[SYSTEM] A background process was launched successfully and is now running. Continue with the remaining steps of the user's request (e.g., testing endpoints, verifying output). The background process is already running — proceed directly with the next action.".to_string(),
+            Self::BackgroundProcessContinue => "[SYSTEM] A background process was launched successfully and is now running. Continue with the remaining steps of the user's request (e.g., testing endpoints, verifying output). If the result above does not yet show what the user needs from its startup output (a URL, port, or ready line), read it with action=\"check\" on that pid rather than relaunching it. Then tell the user what is running and how to reach or stop it.".to_string(),
             Self::ExternalMutationRecoveryRequired(evidence) => format!(
                 "[SYSTEM] The change the user asked for has NOT been made — your earlier attempt(s) failed and were never fixed:\n{}\nYou are NOT done. Try a DIFFERENT approach NOW using tools. Do NOT repeat the same command or method that failed above — change strategy (e.g., if an inline one-liner failed on quoting or parsing, write the code to a file with write_file and run the file; if an API call failed, re-check the payload or endpoint first). If no alternative can possibly work, state plainly what you could not do and why.",
                 evidence
