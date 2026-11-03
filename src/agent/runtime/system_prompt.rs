@@ -1284,7 +1284,7 @@ quiet uses the default cadence, active accelerates it, urgent uses the owner-con
     );
     if control_loop {
         rules.push_str(
-            "\nObjective control loop: during OBSERVE read the metric from objective_control.measurement_source, then call manage_mandates record_measurement with value_micros (millionths of one unit: 25 engagements = 25000000), confidence_bps, and attributed_intention_ids for prior intentions this value reflects, before the decision. Compare it with baseline_micros and target_micros in the given direction; the history block lists prior objective_measurements and next_measurement_due. If the metric cannot be read, record value_micros 0 with confidence_bps 0 and never guess: an unreadable metric is an outage, not stagnation, and no reason to ASK or STOP. ACT when the expected_benefit names a movement of at least minimum_effect_micros or advances an owner-authored criterion or cadence. STOP with success_criteria_satisfied only when the latest measurement reaches the target. If credible measurements (confidence_bps > 0) have not improved across max_stagnant_measurements periods, a WAIT that keeps the same tactic is rejected: ACT when a slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the quota is exhausted or cooling down, WAIT stays admissible.",
+            "\nObjective control loop: during OBSERVE read the metric from objective_control.measurement_source, then call manage_mandates record_measurement with measurement_value_micros (millionths of one unit: 25 engagements = 25000000), measurement_confidence_bps, and attributed_intention_ids for prior intentions this value reflects, before the decision. Compare it with baseline_micros and target_micros in the given direction; the history block lists prior objective_measurements and next_measurement_due. If the metric cannot be read, record measurement_value_micros 0 with measurement_confidence_bps 0 and never guess: an unreadable metric is an outage, not stagnation, and no reason to ASK or STOP. ACT when the expected_benefit names a movement of at least minimum_effect_micros or advances an owner-authored criterion or cadence. STOP with success_criteria_satisfied only when the latest measurement reaches the target. If credible measurements (measurement_confidence_bps > 0) have not improved across max_stagnant_measurements periods, a WAIT that keeps the same tactic is rejected: ACT when a slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the quota is exhausted or cooling down, WAIT stays admissible.",
         );
     }
     rules
@@ -1316,6 +1316,56 @@ mod tests {
         let autopilot = task_lead_rules("Autopilot is owner-confirmed.", true);
         assert!(autopilot.contains("record_measurement"), "{autopilot}");
         assert!(autopilot.contains("max_stagnant_measurements"));
+    }
+
+    /// The rules name manage_mandates arguments; each must be one the tool's
+    /// schema accepts, or a model that follows the prompt is refused by
+    /// `additionalProperties: false`.
+    #[tokio::test]
+    async fn task_lead_rules_name_only_real_manage_mandates_arguments() {
+        use crate::traits::Tool;
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = crate::tools::ManageMandatesTool::new(
+            harness.state.clone(),
+            crate::tools::ApprovalBroker::new(approval_tx),
+        );
+        let schema = tool.schema();
+        let properties = schema["parameters"]["properties"]
+            .as_object()
+            .expect("manage_mandates properties");
+        let rules = task_lead_rules("Autopilot is owner-confirmed.", true);
+        for argument in [
+            "evidence_receipt_ids",
+            "activity_level",
+            "value_criterion",
+            "expected_benefit",
+            "risk",
+            "invalidation_criteria",
+            "intention",
+            "termination_kind",
+            "reconsider_minutes",
+            "strategy_key",
+            "strategy_kind",
+            "measurement_value_micros",
+            "measurement_confidence_bps",
+            "attributed_intention_ids",
+        ] {
+            assert!(rules.contains(argument), "rules no longer name {argument}");
+            assert!(
+                properties.contains_key(argument),
+                "rules name {argument}, which manage_mandates does not accept"
+            );
+        }
+        for retired in [
+            "record value_micros",
+            "with value_micros",
+            " confidence_bps,",
+        ] {
+            assert!(!rules.contains(retired), "rules still say {retired:?}");
+        }
     }
 
     #[test]
