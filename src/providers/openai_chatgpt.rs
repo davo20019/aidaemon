@@ -227,6 +227,17 @@ impl OpenAiChatGptProvider {
     }
 }
 
+/// A stable cache-routing key for a set of instructions.
+fn prompt_cache_key(instructions: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(instructions.as_bytes());
+    let hex: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("aidaemon-{hex}")
+}
+
 fn user_agent() -> String {
     format!(
         "aidaemon/{} ({}; {})",
@@ -557,8 +568,13 @@ fn user_content_parts(content: Option<&Value>) -> Vec<Value> {
 
 /// Translate chat-completions messages into Responses input items.
 ///
-/// Returns `(instructions, input_items)`. System and developer messages become
-/// top-level `instructions` because the Responses API has no system role.
+/// Returns `(instructions, input_items)`. The leading system and developer
+/// messages become top-level `instructions`; later ones (a per-turn context
+/// tail after the history, directives raised mid-run) stay where they are as
+/// `developer` input messages. Hoisting those too would rewrite
+/// `instructions`, which precede every input item, so each one would
+/// invalidate the prompt cache for the whole request and lose its place in
+/// the conversation.
 fn build_input(messages: &[Value]) -> (String, Vec<Value>) {
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -578,8 +594,15 @@ fn build_input(messages: &[Value]) -> (String, Vec<Value>) {
         match role {
             "system" | "developer" => {
                 let text = message_text(content);
-                if !text.is_empty() {
+                if text.is_empty() {
+                } else if input.is_empty() {
                     instructions.push(text);
+                } else {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": text}],
+                    }));
                 }
             }
             "tool" => {
@@ -701,6 +724,12 @@ fn build_request_body(
     body.insert("store".into(), json!(false));
 
     if !instructions.is_empty() {
+        // Routes requests sharing these instructions to the same cache
+        // shard, as Codex does with its conversation id.
+        body.insert(
+            "prompt_cache_key".into(),
+            json!(prompt_cache_key(&instructions)),
+        );
         body.insert("instructions".into(), json!(instructions));
     }
     if !tools.is_empty() {
@@ -906,6 +935,38 @@ mod tests {
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][0]["text"], "Hi");
+    }
+
+    #[test]
+    fn later_system_messages_stay_in_place_as_developer_input() {
+        let messages = vec![
+            json!({"role": "system", "content": "Core."}),
+            json!({"role": "user", "content": "Earlier turn"}),
+            json!({"role": "assistant", "content": "Reply"}),
+            json!({"role": "system", "content": "Task tail."}),
+            json!({"role": "user", "content": "Now"}),
+            json!({"role": "system", "content": "Mid-run directive."}),
+        ];
+        let (instructions, input) = build_input(&messages);
+        assert_eq!(instructions, "Core.");
+        let roles: Vec<&str> = input
+            .iter()
+            .map(|item| item["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "developer", "user", "developer"]
+        );
+        assert_eq!(input[2]["content"][0]["text"], "Task tail.");
+        assert_eq!(input[4]["content"][0]["text"], "Mid-run directive.");
+
+        // The cache key follows the instructions alone.
+        let body = build_request_body("m", &messages, &[], &ChatOptions::default(), None);
+        let mut later = messages.clone();
+        later.push(json!({"role": "system", "content": "Another directive."}));
+        let later_body = build_request_body("m", &later, &[], &ChatOptions::default(), None);
+        assert_eq!(body["prompt_cache_key"], later_body["prompt_cache_key"]);
+        assert_eq!(body["instructions"], later_body["instructions"]);
     }
 
     #[test]

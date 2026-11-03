@@ -390,8 +390,11 @@ struct TurnScope<'a> {
     /// Nested project instructions discovered just in time.
     instruction_tracker:
         Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
-    /// System context added during the run, sent after the projected prefix.
+    /// System context raised during the run and not yet sent; the next model
+    /// call pins it at the run's current end (`placed_directives`).
     extra_system: std::sync::Mutex<Vec<String>>,
+    /// Directives with the run position they were raised at.
+    placed_directives: std::sync::Mutex<Vec<(usize, String)>>,
     /// The run's summarized older rounds, once it outgrew the context.
     compaction: std::sync::Mutex<Option<compaction::RunCompaction>>,
     /// Set when a call moved work to the background with completion
@@ -727,6 +730,7 @@ impl Agent {
             projected_source_turn_ids,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
+            placed_directives: std::sync::Mutex::new(Vec::new()),
             compaction: std::sync::Mutex::new(None),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),

@@ -1496,3 +1496,29 @@ fn the_summary_request_carries_calls_and_the_previous_summary() {
     assert!(body.contains("-> call read_file"));
     assert!(body.contains("[tool result] fn main() {}"));
 }
+
+#[test]
+fn directives_stay_where_they_were_raised() {
+    let run = vec![
+        wire_call("a"),
+        wire_result("a", "ok"),
+        wire("assistant", "next"),
+    ];
+    let placed = vec![
+        (2, "budget at 80%".to_string()),
+        (3, "timed out".to_string()),
+    ];
+    let sent = interleave_directives(run.clone(), &placed);
+    let roles: Vec<&str> = sent.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        ["assistant", "tool", "system", "assistant", "system"]
+    );
+    assert_eq!(sent[2]["content"], "budget at 80%");
+    // A later call only appends: what was sent before is an exact prefix.
+    let mut longer = run.clone();
+    longer.push(wire_call("b"));
+    let resent = interleave_directives(longer, &placed);
+    assert_eq!(&resent[..4], &sent[..4]);
+    assert!(interleave_directives(run.clone(), &[]) == run);
+}

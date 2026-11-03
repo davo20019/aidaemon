@@ -67,6 +67,28 @@ pub(super) async fn with_idle_timeout<F: std::future::Future>(
     }
 }
 
+/// `run` with each directive inserted as a system message before the run
+/// message at its position (after the last one when it is at the end).
+pub(super) fn interleave_directives(run: Vec<Value>, directives: &[(usize, String)]) -> Vec<Value> {
+    if directives.is_empty() {
+        return run;
+    }
+    let len = run.len();
+    let at = |index: usize| {
+        directives
+            .iter()
+            .filter(move |(position, _)| (*position).min(len) == index)
+            .map(|(_, text)| serde_json::json!({"role": "system", "content": text}))
+    };
+    let mut out = Vec::with_capacity(len + directives.len());
+    for (index, message) in run.into_iter().enumerate() {
+        out.extend(at(index));
+        out.push(message);
+    }
+    out.extend(at(len));
+    out
+}
+
 /// A model call that ran past its per-call ceiling.
 #[derive(Debug)]
 pub(super) struct ModelCallTimedOut(Duration);
@@ -160,30 +182,29 @@ impl Agent {
         // the kernel transcript after the starting prefix is this run's.
         let (notes, kernel) = split_injected_notes(&request.messages);
         let run = &kernel[scope.prefix_len.min(kernel.len())..];
-        let extra: Vec<Value> = scope
-            .extra_system
-            .lock()
-            .map(|extra| {
-                extra
-                    .iter()
-                    .map(|text| serde_json::json!({"role": "system", "content": text}))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut prefix = prefix_with_notes(&scope.prefix, &notes);
-        prefix.extend(extra);
+        let prefix = prefix_with_notes(&scope.prefix, &notes);
+        // Directives raised since the last call are pinned where the run
+        // stands now, so the sent transcript only ever grows at its end.
+        let run = to_daemon_messages_from(run);
+        let run = {
+            let raised: Vec<String> = scope
+                .extra_system
+                .lock()
+                .map(|mut queue| std::mem::take(&mut *queue))
+                .unwrap_or_default();
+            let mut placed = scope
+                .placed_directives
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            placed.extend(raised.into_iter().map(|text| (run.len(), text)));
+            interleave_directives(run, &placed)
+        };
         // An oversized run is compacted (older rounds summarized) before
         // quota fitting, which stays as the fallback.
         let prefix_tokens =
             crate::memory::context_window::estimate_multimodal_message_tokens(&prefix);
         let run = self
-            .sdk_compacted_run(
-                scope,
-                &request.model,
-                prefix_tokens,
-                &to_daemon_messages_from(run),
-                budget,
-            )
+            .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
         let messages = fit_run_values(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
