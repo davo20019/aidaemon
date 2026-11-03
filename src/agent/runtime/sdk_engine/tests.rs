@@ -1062,51 +1062,70 @@ fn same_tool_streaks_follow_the_guard_limits() {
     assert!(!same_tool_loop(
         &calls("remember_fact", 6, false),
         "remember_fact",
-        &same
+        &same,
+        false
     ));
     assert!(same_tool_loop(
         &calls("remember_fact", 7, false),
         "remember_fact",
-        &same
+        &same,
+        false
     ));
     // Diverse arguments earn the +8 bonus, not a bypass.
     let next = serde_json::json!({ "i": 99 });
     assert!(!same_tool_loop(
         &calls("remember_fact", 7, true),
         "remember_fact",
-        &next
+        &next,
+        false
     ));
     assert!(same_tool_loop(
         &calls("remember_fact", 15, true),
         "remember_fact",
-        &next
+        &next,
+        false
     ));
     // Versatile and research tools start at 16.
     assert!(!same_tool_loop(
         &calls("read_file", 14, true),
         "read_file",
-        &next
+        &next,
+        false
     ));
     assert!(same_tool_loop(
         &calls("read_file", 15, true),
         "read_file",
-        &next
+        &next,
+        false
     ));
     // computer_use is bounded at 40.
     assert!(!same_tool_loop(
         &calls("computer_use", 38, false),
         "computer_use",
-        &same
+        &same,
+        false
     ));
     assert!(same_tool_loop(
         &calls("computer_use", 39, false),
         "computer_use",
-        &same
+        &same,
+        false
     ));
     // Another tool breaks the streak.
     let mut mixed = calls("remember_fact", 7, false);
     mixed.push(("system_info".to_string(), same.clone()));
-    assert!(!same_tool_loop(&mixed, "remember_fact", &same));
+    assert!(!same_tool_loop(&mixed, "remember_fact", &same, false));
+    // A read-only streak of distinct calls (paging) is progress at any
+    // length; an exact repeat in it still counts toward the limit.
+    assert!(!same_tool_loop(
+        &calls("read_file", 40, true),
+        "read_file",
+        &next,
+        true
+    ));
+    let mut paging = calls("read_file", 15, true);
+    paging.push(("read_file".to_string(), serde_json::json!({ "i": 3 })));
+    assert!(same_tool_loop(&paging, "read_file", &next, true));
 }
 
 #[test]

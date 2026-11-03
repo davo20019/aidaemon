@@ -45,7 +45,16 @@ impl sdk::Hook for LedgerStop {
 /// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for versatile and
 /// research tools, 40 for `computer_use`; diverse arguments get the higher
 /// limit as a bonus, not a bypass.
-pub(super) fn same_tool_loop(previous: &[(String, Value)], tool: &str, arguments: &Value) -> bool {
+/// `read_only` is the tool's typed annotation: a read-only streak in which
+/// every call has different arguments (paging through files, distinct
+/// lookups) observes something new each time, so it is progress, not a
+/// loop; budgets, the turn cap and the stuck detector bound it.
+pub(super) fn same_tool_loop(
+    previous: &[(String, Value)],
+    tool: &str,
+    arguments: &Value,
+    read_only: bool,
+) -> bool {
     let mut streak: Vec<&Value> = previous
         .iter()
         .rev()
@@ -81,6 +90,9 @@ pub(super) fn same_tool_loop(previous: &[(String, Value)], tool: &str, arguments
             unique.push(args);
         }
     }
+    if read_only && tool != "computer_use" && unique.len() == total {
+        return false;
+    }
     let diverse = unique.len() * 2 > total;
     let diverse_limit = if computer_use {
         40
@@ -101,13 +113,18 @@ impl sdk::Hook for SameToolLimit {
         &self,
         ctx: &sdk::HookContext<'_>,
         call: &sdk::ToolCall,
-        _tool: &sdk::ToolInfo,
+        tool: &sdk::ToolInfo,
     ) -> sdk::ToolDecision {
         let previous: Vec<(String, Value)> = ctx
             .run_receipts()
             .map(|receipt| (receipt.tool.clone(), receipt.arguments.clone()))
             .collect();
-        if !same_tool_loop(&previous, &call.name, &call.arguments) {
+        if !same_tool_loop(
+            &previous,
+            &call.name,
+            &call.arguments,
+            tool.annotations.read_only,
+        ) {
             return sdk::ToolDecision::Allow;
         }
         warn!(tool = %call.name, "SDK engine: same tool called too many consecutive times");

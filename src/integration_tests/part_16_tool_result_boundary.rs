@@ -80,9 +80,9 @@ async fn test_sdk_untrusted_tool_output_reaches_model_wrapped() {
 #[tokio::test]
 async fn test_sdk_oversized_tool_result_is_capped_for_model() {
     let line = "row 0123456789 abcdefghijklmnopqrstuvwxyz\n";
-    // Above the 4,000-char per-result cap, far below the context budget, so
+    // Above the 16,000-char per-result cap, far below the context budget, so
     // only the per-result cap can trim it.
-    let dump = line.repeat(300);
+    let dump = line.repeat(1_000);
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("big_dump", "{}"),
         MockProvider::text_response("Summarized."),
@@ -111,7 +111,7 @@ async fn test_sdk_oversized_tool_result_is_capped_for_model() {
         .find(|content| content.contains("row 0123456789"))
         .expect("the model saw the big_dump result");
     assert!(
-        dumped.chars().count() < 8_000,
+        dumped.chars().count() < 20_000,
         "a {}-char result must be capped; the model saw {} chars",
         dump.chars().count(),
         dumped.chars().count()

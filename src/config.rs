@@ -3429,13 +3429,15 @@ pub struct ContextWindowConfig {
     /// Enable context window management (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default total model context budget used by history fitting (default: 48000).
+    /// Default total model context budget used by history fitting (default:
+    /// 128000, which every current hosted model's window covers; set
+    /// `model_budgets` for a smaller local model).
     #[serde(default = "default_context_budget")]
     pub default_budget: usize,
     /// Per-model token budgets (model name → budget). Overrides default_budget.
     #[serde(default)]
     pub model_budgets: HashMap<String, usize>,
-    /// Maximum characters for tool results before truncation (default: 4000).
+    /// Maximum characters for tool results before truncation (default: 16000).
     #[serde(default = "default_tool_result_chars")]
     pub max_tool_result_chars: usize,
     /// Per-model tool result character caps (model name → max chars).
@@ -3526,10 +3528,10 @@ impl ContextWindowConfig {
 }
 
 fn default_context_budget() -> usize {
-    48000
+    128_000
 }
 fn default_tool_result_chars() -> usize {
-    4000
+    16_000
 }
 fn default_summary_window() -> usize {
     6
