@@ -3401,11 +3401,17 @@ impl Agent {
         {
             Ok(super::tool_execution_phase::MandateGateDecision::NotApplicable) => Ok(None),
             Ok(super::tool_execution_phase::MandateGateDecision::Allow { grant }) => Ok(grant),
-            Ok(super::tool_execution_phase::MandateGateDecision::Deny { reason }) => Err(format!(
-                "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). \
-                 Record a current ACT, choose a permitted action, WAIT, or ASK the owner.",
-                request.name
-            )),
+            Ok(super::tool_execution_phase::MandateGateDecision::Deny { reason }) => {
+                let is_task_lead = self
+                    .mandate_execution
+                    .as_ref()
+                    .is_none_or(|fence| fence.worker_task_id == fence.root_task_id);
+                Err(format!(
+                    "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). {}",
+                    request.name,
+                    crate::mandates::mandate_denial_next_step(&reason, is_task_lead)
+                ))
+            }
             Err(error) => Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
         }
     }
