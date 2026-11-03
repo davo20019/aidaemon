@@ -1,6 +1,5 @@
 mod execution_io;
 mod project_dir;
-mod reflection;
 mod run;
 mod run_helpers;
 
@@ -9,7 +8,6 @@ pub(in crate::agent) use project_dir::{
     maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
     project_instruction_targets_for_tool_call,
 };
-pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::{
     mandate_gate_for_tool_call, parse_checklist_from_result, MandateGateDecision,
 };

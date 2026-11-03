@@ -531,44 +531,8 @@ impl Agent {
         let unhandled_error_emitter = emitter.clone();
         let unhandled_error_task_id = task_id.clone();
         let loop_result = tracing::Instrument::instrument(async move {
-        let iteration_limits = match &self.limits.iteration_config {
-            IterationLimitConfig::Unlimited => super::loop_state::IterationLimitSettings {
-                hard_cap: Some(HARD_ITERATION_CAP),
-                soft_threshold: None,
-                soft_warn_at: None,
-            },
-            IterationLimitConfig::Soft { threshold, warn_at } => {
-                super::loop_state::IterationLimitSettings {
-                    hard_cap: Some(HARD_ITERATION_CAP),
-                    soft_threshold: Some(*threshold),
-                    soft_warn_at: Some(*warn_at),
-                }
-            }
-            IterationLimitConfig::Hard { initial: _, cap } => {
-                super::loop_state::IterationLimitSettings {
-                    hard_cap: Some(*cap),
-                    soft_threshold: None,
-                    soft_warn_at: None,
-                }
-            }
-        };
-        let mut turn_state = super::loop_state::TurnState {
-            stall: super::loop_state::StallTracker::with_recent_capacity(RECENT_CALLS_WINDOW),
-            failures: super::loop_state::FailureLedger::default(),
-            recovery: super::loop_state::RecoveryState::default(),
-            budget: super::loop_state::BudgetTracker::new(
-                self.limits.task_token_budget,
-                self.limits.daily_token_budget,
-                iteration_limits,
-            ),
-            evidence: super::loop_state::EvidenceLedger::default(),
-            reflection: super::loop_state::ReflectionState::default(),
-            directives: super::loop_state::PendingDirectives::default(),
-            counters: super::loop_state::LoopCounters::default(),
-            read_files: super::loop_state::ReadFileObservationTracker::default(),
-            harness_eval: None,
-            eval: None,
-        };
+        // System directives for the run's first model call.
+        let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         // Bootstrap finalized the immutable relationship, contract, memory policy,
         // and prompt context before this execution loop was constructed.
         let task_plan = bootstrap_task_plan;
@@ -801,7 +765,7 @@ impl Agent {
                 .iter()
                 .map(crate::agent::inquiry::describe_requirement)
                 .collect();
-            turn_state.directives.push_system_message(
+            pending_system_messages.push(
                 SystemDirective::ToolUseForbiddenByRequest { outstanding_needs },
             );
         } else {
@@ -899,7 +863,7 @@ impl Agent {
                 .iter()
                 .map(crate::agent::inquiry::describe_requirement)
                 .collect();
-            turn_state.directives.push_system_message(
+            pending_system_messages.push(
                 SystemDirective::InquiryEvidenceRequired {
                     outstanding_needs,
                     candidate_tools,
@@ -915,14 +879,6 @@ impl Agent {
         harness_eval.record_completion_contract(&turn_context.completion_contract);
         if self.harness_eval_enabled() {
             self.install_harness_eval(harness_eval).await;
-        }
-        let harness_eval_handle = if self.harness_eval_enabled() {
-            Some(self.harness_eval_handle())
-        } else {
-            None
-        };
-        if let Some(handle) = harness_eval_handle {
-            turn_state.attach_harness_eval(handle);
         }
 
         let (execution_budget_tier, execution_budget_route, execution_budget) =
@@ -1002,13 +958,6 @@ impl Agent {
             let step_count = linear_steps.len();
             execution_state.install_linear_intent_plan(1, linear_steps);
 
-            if !plan.success_criteria.is_empty() {
-                turn_state
-                    .evidence
-                    .validation_state_mut()
-                    .set_plan(1, &plan.success_criteria);
-            }
-
             execution_state.promote_budget_for_plan(step_count);
             info!(
                 session_id,
@@ -1025,7 +974,7 @@ impl Agent {
             .and_then(|question| question.mandate_id.as_ref())
             .filter(|mandate_id| !mandate_id.is_empty())
         {
-            turn_state.directives.push_system_message(
+            pending_system_messages.push(
                 SystemDirective::MandateOwnerInputInspectionRequired {
                     mandate_id: mandate_id.clone(),
                 },
@@ -1034,10 +983,6 @@ impl Agent {
         // Dialogue carryover is resolved once by the typed relationship lane.
         // The selected antecedent controls context projection; response words
         // such as challenges or pronouns do not install a second hidden edge.
-        // Best-effort project directory hint (seeded from user text, refined by tool calls).
-        if let Some(known_project_dir) = turn_context.primary_project_scope.clone() {
-            turn_state.evidence.set_known_project_dir(known_project_dir);
-        }
 
         // Resolve goal_id once for per-goal token budget enforcement.
         // Executors currently carry only task_id, so we may need to lookup goal_id via task.
@@ -1072,7 +1017,6 @@ impl Agent {
             None
         };
         if is_scheduled_goal {
-            turn_state.budget.disable_iteration_limits();
             if let Some(registry) = self.goal_token_registry.as_ref() {
                 if let Some(goal_id) = resolved_goal_id.as_deref() {
                     if is_root_scheduled_run {
@@ -1151,13 +1095,6 @@ impl Agent {
                     }
                 }
             }
-            if let Some(per_check_budget) =
-                scheduled_goal_budget_per_check.and_then(|v| u64::try_from(v).ok())
-            {
-                turn_state
-                    .budget
-                    .raise_effective_task_budget_to(per_check_budget);
-            }
         }
         let _effective_task_timeout = if is_scheduled_goal {
             None
@@ -1175,7 +1112,6 @@ impl Agent {
             // archived turns (new-request isolation, shared-channel redaction,
             // summary cursor, task boundary), the volatile tail, pending
             // directives and the current user message with its media.
-            let message_build_directives = turn_state.directives.for_message_build_phase();
             let MessageBuildData {
                 messages: prefix,
                 tool_defs: offered_tool_defs,
@@ -1201,7 +1137,7 @@ impl Agent {
                         .map(|summary| summary.last_message_id.as_str()),
                     tool_defs: &tool_defs,
                     policy_bundle: &policy_bundle,
-                    pending_system_messages: message_build_directives.pending_system_messages,
+                    pending_system_messages: &mut pending_system_messages,
                     empty_response_retry_pending: false,
                     redact_archived_shared_context: user_role != UserRole::Owner
                         && matches!(

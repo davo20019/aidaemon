@@ -6,9 +6,6 @@ mod scoring;
 pub use accumulator::{HarnessEvalAccumulator, HarnessEvalSeed};
 pub use scoring::HarnessEvalConfig;
 
-pub(in crate::agent) type HarnessEvalHandle =
-    std::sync::Arc<tokio::sync::RwLock<Option<HarnessEvalAccumulator>>>;
-
 impl From<&crate::config::DiagnosticsHarnessEvalConfig> for HarnessEvalConfig {
     fn from(cfg: &crate::config::DiagnosticsHarnessEvalConfig) -> Self {
         Self {

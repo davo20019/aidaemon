@@ -22,4 +22,3 @@ pub(super) use phase_impl::{
     maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
     project_instruction_targets_for_tool_call,
 };
-pub(super) use phase_impl::{PendingReflectionRecovery, ToolErrorEntry};

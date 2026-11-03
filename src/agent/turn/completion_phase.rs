@@ -2,80 +2,6 @@
 
 use super::*;
 
-/// Decide whether ordinary conversational memory maintenance may run after a
-/// completed turn. Mandate workers have their own bounded, typed continuity;
-/// allowing either background path here would both leak mandate content into
-/// global owner memory and make unmetered provider calls outside the durable
-/// per-run token lease.
-///
-/// Worker sessions (specialists, sub-agents, background jobs) keep their
-/// session-local summaries but never extract owner facts: their "user" turn
-/// is a delegated brief, so every scheduled run would re-learn its own
-/// instructions as durable memory. Consolidation and retention already treat
-/// these sessions as memory-isolated.
-/// After a completed turn: progressive fact extraction and incremental
-/// summary maintenance on the fast model, unless the turn's memory policy,
-/// a mandate run or a memory-isolated session rules them out.
-// Only the legacy completion phase calls these; they go when it does.
-#[allow(clippy::too_many_arguments, dead_code)]
-pub(in crate::agent) fn spawn_post_turn_memory(
-    agent: &Agent,
-    llm_provider: Arc<dyn ModelProvider>,
-    llm_router: Option<&Router>,
-    model: &str,
-    task_id: &str,
-    session_id: &str,
-    user_text: &str,
-    reply: &str,
-    channel_ctx: &ChannelContext,
-    user_role: UserRole,
-    memory_persistence_allowed: bool,
-) {
-    let fast_model = llm_router
-        .map(|router| router.select(crate::router::Tier::Fast).to_string())
-        .unwrap_or_else(|| model.to_string());
-    let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
-        agent.mandate_execution.is_some(),
-        agent.depth > 0 || crate::events::is_memory_isolated_worker_session(session_id),
-        memory_persistence_allowed,
-        agent.context_window_config.progressive_facts,
-        crate::memory::context_window::should_extract_facts(user_text),
-        agent.context_window_config.enabled,
-    );
-    if spawn_progressive_facts {
-        crate::memory::context_window::spawn_progressive_extraction(
-            llm_provider.clone(),
-            fast_model.clone(),
-            agent.state.clone(),
-            agent.event_store.clone(),
-            task_id.to_string(),
-            user_text.to_string(),
-            reply.to_string(),
-            channel_ctx.channel_id.clone(),
-            channel_ctx.visibility,
-            user_role,
-        );
-    }
-    if spawn_summary_maintenance {
-        let summary_token_threshold = agent
-            .context_window_config
-            .summarize_token_threshold_for(&fast_model);
-        let summary_recent_tokens = agent
-            .context_window_config
-            .summary_recent_tokens_for(&fast_model);
-        crate::memory::context_window::spawn_incremental_summarization(
-            llm_provider,
-            fast_model,
-            agent.state.clone(),
-            agent.event_store.clone(),
-            session_id.to_string(),
-            summary_token_threshold,
-            summary_recent_tokens,
-            user_role,
-        );
-    }
-}
-
 /// Learn from a finished task in the background.
 pub(in crate::agent) fn spawn_learning(
     state: Arc<dyn crate::traits::StateStore>,
@@ -88,6 +14,17 @@ pub(in crate::agent) fn spawn_learning(
     });
 }
 
+/// Decide whether ordinary conversational memory maintenance may run after a
+/// completed turn. Mandate workers have their own bounded, typed continuity;
+/// allowing either background path here would both leak mandate content into
+/// global owner memory and make unmetered provider calls outside the durable
+/// per-run token lease.
+///
+/// Worker sessions (specialists, sub-agents, background jobs) keep their
+/// session-local summaries but never extract owner facts: their "user" turn
+/// is a delegated brief, so every scheduled run would re-learn its own
+/// instructions as durable memory. Consolidation and retention already treat
+/// these sessions as memory-isolated.
 pub(in crate::agent) fn post_completion_memory_plan(
     mandate_execution: bool,
     memory_isolated_session: bool,

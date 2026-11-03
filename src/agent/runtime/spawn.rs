@@ -1525,7 +1525,7 @@ impl Agent {
     /// - TaskLead: Management + Universal + cli_agent (if available) +
     ///   ManageGoalTasksTool + SpawnAgentTool
     /// - Executor: Action + Universal + ReportBlockerTool, NO SpawnAgentTool
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child(
         &self,
         mission: &str,

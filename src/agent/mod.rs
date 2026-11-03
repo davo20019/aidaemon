@@ -41,16 +41,12 @@ pub use crate::types::StatusUpdate;
 use crate::traits::Task;
 
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
-const RECENT_CALLS_WINDOW: usize = 12;
 /// If the same tool NAME is called this many consecutive iterations (even with
 /// different arguments), treat it as a loop.  This catches the case where the
 /// LLM keeps calling e.g. `terminal` with varied commands without progress.
 /// Set high enough to allow complex multi-step investigations from mobile,
 /// and to leave room for follow-up work after cli_agent returns.
 const MAX_CONSECUTIVE_SAME_TOOL: usize = 8;
-/// Hard iteration cap even in "unlimited" mode — prevents runaway resource
-/// consumption if stall detection is bypassed (e.g. alternating tool names).
-const HARD_ITERATION_CAP: usize = 200;
 /// The adjacent prior assistant answer is recent transcript, not generic
 /// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
 /// genuinely oversized answers use deterministic head/tail compaction.
@@ -88,21 +84,14 @@ mod policy_signals;
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
 use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
-#[path = "turn/evidence_state.rs"]
-mod evidence_state;
-pub(in crate::agent) use evidence_state::EvidenceState;
 #[path = "turn/validation_state.rs"]
 mod validation_state;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
     persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
     ExecutorStepResult, PartialResult, StepValidationOutcome, TaskValidationOutcome,
-    ValidationState,
 };
-#[allow(unused_imports)]
-pub(in crate::agent) use validation_state::{
-    ApprovalState, LoopRepetitionReason, ValidationFailure, ValidationOutcome,
-};
+pub(in crate::agent) use validation_state::ApprovalState;
 #[path = "turn/execution_state.rs"]
 mod execution_state;
 #[cfg(test)]
@@ -125,9 +114,6 @@ mod post_task;
 #[path = "runtime/task_outcome.rs"]
 mod task_outcome;
 use post_task::LearningContext;
-#[allow(dead_code, unused_imports)]
-#[path = "turn/state/mod.rs"]
-mod loop_state;
 
 #[cfg(feature = "computer_use")]
 mod computer_use;
@@ -459,6 +445,9 @@ struct AgentLimits {
     max_response_chars: usize,
     timeout_secs: u64,
     max_facts: usize,
+    /// `state.daily_token_budget`. Not enforced on the SDK path yet (the legacy
+    /// stopping phase did); see `crates/aidaemon-core/PLAN.md`, Phase 7.
+    #[allow(dead_code)]
     daily_token_budget: Option<u64>,
     llm_call_timeout: Option<Duration>,
     task_timeout: Option<Duration>,
@@ -681,10 +670,6 @@ impl Agent {
             stt: self.stt_config.clone(),
             model: model.to_string(),
         }
-    }
-
-    pub(in crate::agent) fn harness_eval_handle(&self) -> crate::agent::eval::HarnessEvalHandle {
-        Arc::clone(&self.harness_eval)
     }
 
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
