@@ -1196,6 +1196,18 @@ pub trait MandateStore: Send + Sync {
         Ok(None)
     }
 
+    /// Tool-call ids of the run's successful structured receipts that may
+    /// back a decision or measurement (newest first, at most `limit`): the
+    /// same receipts `evidence_receipt_ids` accepts, minus the mandate
+    /// protocol's own control tools.
+    async fn current_run_evidence_receipt_ids(
+        &self,
+        _goal_run_id: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn list_mandate_decisions(
         &self,
         _mandate_id: &str,

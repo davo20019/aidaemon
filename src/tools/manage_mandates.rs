@@ -50,7 +50,7 @@ const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
-const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Identifiers of successful tool receipts from this run only: either the tool_call_id you issued (e.g. call_...) or the result_id shown in that result's receipt footer (e.g. sha256:...). Receipts from other runs, failed calls, or invented IDs are rejected.";
+const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
 const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
 const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
 const PRIORITY_FIELD_DESCRIPTION: &str = "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.";
@@ -157,6 +157,23 @@ impl ManageMandatesTool {
             || args._session_id.as_deref().is_some_and(|session| {
                 session.starts_with("specialist:") || session.starts_with("sub-")
             })
+    }
+
+    /// The receipts the model cited, or, when it cited none, the run's own
+    /// successful observations. The runtime already knows which reads
+    /// happened; copying their identifiers is bookkeeping, not judgment.
+    async fn cited_or_current_run_evidence(
+        &self,
+        cited: Option<&[String]>,
+        goal_run_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let cited = clean_strings(cited);
+        if !cited.is_empty() {
+            return Ok(cited);
+        }
+        self.state
+            .current_run_evidence_receipt_ids(goal_run_id, MAX_EVIDENCE_RECEIPTS)
+            .await
     }
 
     fn is_private_owner_control(args: &ManageMandatesArgs) -> bool {
@@ -1817,7 +1834,9 @@ impl ManageMandatesTool {
         let value_micros = args
             .measurement_value_micros
             .ok_or_else(|| anyhow::anyhow!("measurement_value_micros is required"))?;
-        let receipts = clean_strings(args.evidence_receipt_ids.as_deref());
+        let receipts = self
+            .cited_or_current_run_evidence(args.evidence_receipt_ids.as_deref(), goal_run_id)
+            .await?;
         let observed_at = args
             .measurement_observed_at
             .clone()
@@ -1940,7 +1959,9 @@ impl ManageMandatesTool {
         if !observations.is_empty() {
             decision.belief_snapshot = Some(serde_json::to_string(&observations)?);
         }
-        decision.evidence_receipt_ids = clean_strings(args.evidence_receipt_ids.as_deref());
+        decision.evidence_receipt_ids = self
+            .cited_or_current_run_evidence(args.evidence_receipt_ids.as_deref(), pinned_run_id)
+            .await?;
         validate_bounded_strings(
             &decision.evidence_receipt_ids,
             "evidence_receipt_ids",
@@ -3810,6 +3831,280 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A started review run for a bounded mandate with one action slot, its
+    /// claimed root attempt, and the root task id receipts are filed under.
+    struct ReviewRun {
+        // Holds the temp database alive for the test's duration.
+        _harness: crate::testing::TestHarness,
+        state: Arc<crate::state::SqliteStateStore>,
+        mandate: Mandate,
+        goal_id: String,
+        run_id: String,
+        attempt_id: String,
+        root_task_id: String,
+    }
+
+    async fn review_run(control: bool) -> ReviewRun {
+        use crate::traits::{Goal, Task};
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = Goal::new_continuous("Post one note about Acme", "owner-session", None, None);
+        let authority = MandateAuthority::from_operation_scopes(
+            true,
+            vec![
+                MandateOperationScope {
+                    tool: "http_request".to_string(),
+                    operation: crate::traits::ToolCallOperation::Get,
+                    kind: crate::traits::MandateOperationKind::Observation,
+                    target_prefixes: vec!["https://api.example.test/feed".to_string()],
+                    allowed_query_params: Vec::new(),
+                    mutation_effects: Vec::new(),
+                },
+                MandateOperationScope {
+                    tool: "http_request".to_string(),
+                    operation: crate::traits::ToolCallOperation::Post,
+                    kind: crate::traits::MandateOperationKind::Mutation,
+                    target_prefixes: vec!["https://api.example.test/notes".to_string()],
+                    allowed_query_params: Vec::new(),
+                    mutation_effects: vec![
+                        "remote_mutation".to_string(),
+                        "external_delivery".to_string(),
+                    ],
+                },
+            ],
+            1,
+            4,
+            900,
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Post one note about Acme",
+            "owner-session",
+            authority,
+            600,
+            3_600,
+            600,
+        );
+        mandate.success_criteria = vec!["The note is grounded in the Acme feed".to_string()];
+        if control {
+            mandate.objective_control = Some(crate::traits::MandateObjectiveControl {
+                schema_version: crate::traits::MandateObjectiveControl::SCHEMA_VERSION,
+                metric_name: "notes posted".to_string(),
+                unit: "note".to_string(),
+                baseline_micros: 0,
+                target_micros: 1_000_000,
+                direction: crate::traits::ObjectiveMetricDirection::AtLeast,
+                measurement_source: "metric_source:acme-notes".to_string(),
+                measurement_cadence_secs: 600,
+                experiment_cohort: "acme".to_string(),
+                experiment_window_secs: 3_600,
+                minimum_effect_micros: 1_000_000,
+                max_stagnant_measurements: 3,
+                run_failure_budget: 3,
+                baseline_observed_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let leased = state
+            .claim_due_mandates(1, "receipt-attach-test", 300)
+            .await
+            .unwrap()
+            .pop()
+            .expect("one due mandate");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let root_task = Task {
+            id: root_task_id.clone(),
+            goal_id: goal.id.clone(),
+            description: "Review the Acme feed".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let run = state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased.review_lease_token.as_deref().unwrap(),
+                &run_id,
+                &root_task,
+            )
+            .await
+            .unwrap();
+        let attempt = state
+            .claim_task_with_lease(&root_task_id, "task-lead", None, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        ReviewRun {
+            _harness: harness,
+            state,
+            mandate: leased,
+            goal_id: goal.id,
+            run_id: run.id,
+            attempt_id: attempt.id,
+            root_task_id,
+        }
+    }
+
+    /// File one succeeded structured receipt for `tool` under the run.
+    async fn file_receipt(run: &ReviewRun, call_id: &str, tool: &str) {
+        let receipt = crate::events::ToolReceiptV1::from_metadata(
+            &crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                semantics: crate::traits::ToolCallSemantics::observation(),
+                ..Default::default()
+            },
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        let result = crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: call_id.to_string(),
+            name: tool.to_string(),
+            result: "ok".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(run.root_task_id.clone()),
+            annotations: vec![],
+            turn_id: None,
+            attachments: vec![],
+            receipt: Some(receipt),
+        };
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES ('specialist:task_lead:synthetic', 'tool_result', ?, ?, ?, ?)",
+        )
+        .bind(serde_json::to_string(&result).unwrap())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&run.root_task_id)
+        .bind(tool)
+        .execute(&run.state.pool())
+        .await
+        .unwrap();
+    }
+
+    fn lead_args(run: &ReviewRun, fields: Value) -> String {
+        let mut args = json!({
+            "mandate_id": run.mandate.id,
+            "_goal_id": run.goal_id,
+            "_goal_run_id": run.run_id,
+            "_task_attempt_id": run.attempt_id,
+            "_session_id": "specialist:task_lead:synthetic",
+            "_channel_visibility": "internal"
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args.to_string()
+    }
+
+    fn act_fields(run: &ReviewRun) -> Value {
+        json!({
+            "action": "record_decision",
+            "outcome": "act",
+            "rationale": "The feed shows a fresh Acme release worth one note",
+            "observations": ["The Acme feed lists release 2.0 today"],
+            "evidence_receipt_ids": [],
+            "intention": "Post one grounded note about Acme release 2.0",
+            "value_criterion": run.mandate.success_criteria[0],
+            "expected_benefit": "Readers learn about the release the day it ships",
+            "risk": "Low: one factual note grounded in the feed",
+            "invalidation_criteria": "Do not post if the release left the feed"
+        })
+    }
+
+    fn tool_for(run: &ReviewRun) -> ManageMandatesTool {
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        ManageMandatesTool::new(run.state.clone(), ApprovalBroker::new(approval_tx))
+    }
+
+    #[tokio::test]
+    async fn record_decision_attaches_current_run_receipts_when_none_cited() {
+        let run = review_run(false).await;
+        file_receipt(&run, "call_read_acme_feed", "http_request").await;
+        file_receipt(&run, "call_create_task", "manage_goal_tasks").await;
+        let result = tool_for(&run)
+            .call(&lead_args(&run, act_fields(&run)))
+            .await
+            .unwrap();
+        assert!(result.contains("ACT committed"), "{result}");
+        let decision = run
+            .state
+            .get_mandate_decision_for_run(&run.run_id)
+            .await
+            .unwrap()
+            .expect("durable decision");
+        assert_eq!(
+            decision.evidence_receipt_ids,
+            vec!["call_read_acme_feed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn act_without_any_current_run_observation_is_still_rejected() {
+        let run = review_run(false).await;
+        file_receipt(&run, "call_create_task", "manage_goal_tasks").await;
+        let error = tool_for(&run)
+            .call(&lead_args(&run, act_fields(&run)))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ACT requires at least one current-run sourced observation"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_measurement_attaches_current_run_receipts_when_none_cited() {
+        let run = review_run(true).await;
+        file_receipt(&run, "call_read_acme_feed", "http_request").await;
+        let result = tool_for(&run)
+            .call(&lead_args(
+                &run,
+                json!({
+                    "action": "record_measurement",
+                    "measurement_value_micros": 0,
+                    "measurement_confidence_bps": 10_000,
+                    "measurement_observed_at": chrono::Utc::now().to_rfc3339(),
+                    "evidence_receipt_ids": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(result.contains("Objective measurement"), "{result}");
+        let ids: String = sqlx::query_scalar(
+            "SELECT evidence_receipt_ids_json FROM mandate_objective_measurements
+             WHERE mandate_id = ?",
+        )
+        .bind(&run.mandate.id)
+        .fetch_one(&run.state.pool())
+        .await
+        .unwrap();
+        assert_eq!(ids, r#"["call_read_acme_feed"]"#);
     }
 
     #[test]

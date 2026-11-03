@@ -3503,6 +3503,45 @@ impl MandateStore for SqliteStateStore {
         row.as_ref().map(decision_from_row).transpose()
     }
 
+    async fn current_run_evidence_receipt_ids(
+        &self,
+        goal_run_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        // The predicate of `validate_current_run_receipt_refs`, so every id
+        // returned here passes that check.
+        let excluded = crate::mandates::MANDATE_PROTOCOL_TOOLS
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT json_extract(e.data, '$.tool_call_id')
+             FROM events e
+             JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+             WHERE e.event_type = 'tool_result'
+               AND t.goal_run_id = ?
+               AND json_extract(e.data, '$.receipt.schema_version') = ?
+               AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
+               AND json_extract(e.data, '$.receipt.outcome_evidence')
+                   IN ('tool_reported', 'structured_metadata')
+               AND json_extract(e.data, '$.tool_call_id') IS NOT NULL
+               AND json_extract(e.data, '$.name') NOT IN ({excluded})
+             ORDER BY e.id DESC
+             LIMIT ?"
+        );
+        let mut statement = sqlx::query_scalar::<_, String>(&query)
+            .bind(goal_run_id)
+            .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION));
+        for tool in crate::mandates::MANDATE_PROTOCOL_TOOLS {
+            statement = statement.bind(*tool);
+        }
+        Ok(statement
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     async fn list_mandate_decisions(
         &self,
         mandate_id: &str,

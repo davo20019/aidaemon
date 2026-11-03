@@ -8,6 +8,16 @@ use serde_json::Value;
 
 use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
 
+/// The mandate protocol's own control tools. Their receipts record
+/// bookkeeping, never an observation of the world, so they are never cited as
+/// decision or measurement evidence.
+pub const MANDATE_PROTOCOL_TOOLS: &[&str] = &[
+    "manage_mandates",
+    "manage_goal_tasks",
+    "track_requirements",
+    "report_blocker",
+];
+
 pub(crate) fn is_non_delegable_tool(tool_name: &str) -> bool {
     tool_name.starts_with("mcp__") || MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
 }
