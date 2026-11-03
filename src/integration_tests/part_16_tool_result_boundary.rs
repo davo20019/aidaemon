@@ -402,10 +402,10 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
     );
 }
 
-/// The task-lead half of an ACT review on SDK turns: observe, commit an ACT
-/// citing that observation's receipt, create the one executor task, and
-/// answer, without mutating anything itself. The executor half is
-/// `natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedule`.
+/// A whole ACT review on SDK turns. The task lead observes, commits an ACT
+/// citing that observation's receipt, creates the one executor task, and
+/// answers without mutating anything itself; the executor then claims that
+/// task under the model-made ACT and performs the one mutation it grants.
 #[tokio::test]
 async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -500,6 +500,16 @@ async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
         MockProvider::tool_call_response("manage_mandates", &act_args),
         MockProvider::tool_call_response("manage_goal_tasks", &delegate_args),
         MockProvider::text_response("ACT committed; the executor task will post the note."),
+        MockProvider::tool_call_response(
+            "http_request",
+            &json!({
+                "method": "POST",
+                "url": post_url,
+                "body": "{\"text\":\"Acme shipped release 2.0 today\"}"
+            })
+            .to_string(),
+        ),
+        MockProvider::text_response("Posted the one grounded note."),
     ]);
     let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
     harness
@@ -628,6 +638,59 @@ async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
         .await
         .unwrap()
         .is_empty());
+
+    // The executor half, under the ACT the model committed above.
+    let executor_task_id = executor_tasks[0].id.clone();
+    let executor_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_mandate_task_from_attempt(
+            &executor_task_id,
+            "test-executor",
+            &mandate.id,
+            mandate.version,
+            &goal_run_id,
+            &root_attempt.id,
+            7_200,
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the executor claims the task its lead created");
+    harness.agent.set_test_mandate_execution(
+        &mandate.id,
+        mandate.version,
+        mandate.authority.clone(),
+        &mandate.goal_id,
+        &root_task_id,
+        &root_attempt.id,
+        &executor_attempt,
+    );
+    let executor_reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.agent.handle_message(
+            "specialist:mandate-executor",
+            "Execute the current committed intention.",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        ),
+    )
+    .await
+    .expect("the executor should not hang")
+    .unwrap();
+    assert_eq!(executor_reply, "Posted the one grounded note.");
+    assert_eq!(server_posts.load(Ordering::SeqCst), 1, "the executor posted once");
+    assert_eq!(server_gets.load(Ordering::SeqCst), 1, "the executor never observed");
+    let attempts = harness
+        .state
+        .list_mandate_mutation_attempts_for_run(&goal_run_id)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(
+        attempts[0].status,
+        crate::traits::MandateMutationAttemptStatus::Succeeded
+    );
 }
 
 /// Stand-in for the GUI tool's pin registry effects: `gui_click` pins a model
