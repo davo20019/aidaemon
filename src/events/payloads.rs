@@ -870,9 +870,6 @@ pub struct PolicyMetricsData {
     pub context_mismatch_preflight_drop_total: u64,
     pub followup_mode_overrides_total: u64,
     pub cross_scope_blocked_total: u64,
-    pub route_drift_alert_total: u64,
-    pub route_drift_failsafe_activation_total: u64,
-    pub route_failsafe_active_turn_total: u64,
     pub tokens_failed_tasks_total: u64,
     pub est_input_token_samples: u64,
     pub est_input_tokens_total: u64,
@@ -1336,7 +1333,6 @@ pub struct RoutingEvalPayload {
     pub tools_required_predicted: bool,
     pub tools_actually_used: bool,
     pub direct_return_attempted: bool,
-    pub route_drift_failsafe: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills_activated: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

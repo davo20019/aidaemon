@@ -143,7 +143,7 @@ pub(super) async fn emit_bootstrap_direct_reply(
             followup_mode: None,
             config: agent.harness_eval_config.clone(),
         });
-        harness_eval.record_bootstrap("bootstrap_direct_return", vec![], None, false);
+        harness_eval.record_bootstrap("bootstrap_direct_return", vec![], None);
         agent.install_harness_eval(harness_eval).await;
     }
 

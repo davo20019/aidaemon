@@ -3366,7 +3366,6 @@ impl EventStore {
                 tools_required_predicted: tool_calls_count > 0,
                 tools_actually_used: tool_calls_count > 0,
                 direct_return_attempted: false,
-                route_drift_failsafe: true,
                 skills_activated: Vec::new(),
                 policy_profile: None,
                 model_escalated: false,

@@ -1,6 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::agent) enum SystemDirective {
-    RouteFailsafeActive,
     /// The current owner turn is structurally bound to an unresolved mandate
     /// ASK. Mandate-local model text must be inspected before any explanation
     /// or administrative response is produced.
@@ -106,7 +105,6 @@ pub(in crate::agent) enum SystemDirective {
 impl SystemDirective {
     pub(in crate::agent) fn render(&self) -> String {
         match self {
-            Self::RouteFailsafeActive => "[SYSTEM] Route fail-safe is active for this session. Use explicit tools/results, avoid direct-return shortcuts, and prioritize concrete execution evidence.".to_string(),
             Self::MandateOwnerInputInspectionRequired { mandate_id } => format!(
                 "[SYSTEM] This owner turn is structurally bound to unresolved mandate {mandate_id}. \
                  Before answering, call manage_mandates with action=\"get\" and \
@@ -284,13 +282,6 @@ mod tests {
         assert!(with_notify.contains("completion notifications are enabled"));
         assert!(without_notify.contains("moved to the background"));
         assert!(!without_notify.contains("results will be sent automatically"));
-    }
-
-    #[test]
-    fn route_failsafe_render_is_stable() {
-        assert!(SystemDirective::RouteFailsafeActive
-            .render()
-            .contains("Route fail-safe is active"));
     }
 
     #[test]

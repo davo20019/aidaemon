@@ -1290,18 +1290,6 @@ Rules: no invented event IDs; confidence 0..1.",
             "- cross_scope_blocked_total: {}\n",
             metrics.cross_scope_blocked_total
         ));
-        out.push_str(&format!(
-            "- route_drift_alert_total: {}\n",
-            metrics.route_drift_alert_total
-        ));
-        out.push_str(&format!(
-            "- route_drift_failsafe_activation_total: {}\n",
-            metrics.route_drift_failsafe_activation_total
-        ));
-        out.push_str(&format!(
-            "- route_failsafe_active_turn_total: {}\n",
-            metrics.route_failsafe_active_turn_total
-        ));
 
         if total_guard_interventions >= CONTEXT_SCOPE_ALERT_THRESHOLD {
             out.push_str(&format!(

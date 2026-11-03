@@ -111,8 +111,6 @@ pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
     select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
 };
-#[path = "policy/heuristic_telemetry.rs"]
-pub(crate) mod heuristic_telemetry;
 #[path = "loop/loop_utils.rs"]
 mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
@@ -246,7 +244,7 @@ pub(in crate::agent) use eval::{HarnessEvalAccumulator, HarnessEvalConfig, Harne
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
-// Policy runtime metrics, route-drift monitor, and bounded autotuning.
+// Policy runtime metrics and bounded autotuning.
 // Implementation lives in `policy_metrics.rs` (Phase 5 decoupling).
 #[path = "policy_metrics.rs"]
 mod policy_metrics;
@@ -257,18 +255,11 @@ pub use policy_metrics::{
 // `PolicyAutotuneSnapshot` is part of the public surface but currently has no
 // in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).
 pub(in crate::agent) use policy_metrics::record_failed_task_tokens;
-#[cfg(test)]
-pub(crate) use policy_metrics::set_route_failsafe_for_session_for_test;
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
 pub(in crate::agent) use policy_metrics::{
-    provider_kind_metric_label, record_llm_payload_invalid_metric,
-    route_failsafe_active_for_session, POLICY_METRICS,
+    provider_kind_metric_label, record_llm_payload_invalid_metric, POLICY_METRICS,
 };
-// `observe_route_reason_for_drift` / `RouteDriftSignal` are wired but currently
-// unreferenced in-tree (the legacy definitions carried `#[allow(dead_code)]`).
-#[allow(unused_imports)]
-pub(in crate::agent) use policy_metrics::{observe_route_reason_for_drift, RouteDriftSignal};
 
 // Free-function helpers (status, resume, project-scope cues, untrusted-reference
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
@@ -383,14 +374,6 @@ pub struct Agent {
     /// Models that recently returned 402 billing errors. Maps model name → failure time.
     /// Shared across parent/child agents. Entries expire after BILLING_FAIL_CACHE_TTL.
     billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
-    /// Models that ignored a forced `tool_choice=required` call (returned text
-    /// with zero tool calls). Some serving stacks (llama.cpp + Gemma) don't
-    /// enforce `required` and can degenerate into a repetition loop until the
-    /// token limit when it is requested. Once flagged, the deferred/no-tool
-    /// recovery stops forcing `required` for that model and relies on the
-    /// substantive-text acceptance path instead. Shared across parent/child
-    /// agents; in-memory only (re-learned after restart).
-    required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Weak self-reference for background task spawning.
     /// Set after Arc creation via `set_self_ref()`.
     self_ref: RwLock<Option<Weak<Agent>>>,
@@ -472,9 +455,7 @@ pub(in crate::agent) use system_directives::SystemDirective;
 struct AgentLimits {
     max_depth: usize,
     iteration_config: IterationLimitConfig,
-    #[allow(dead_code)]
     max_iterations: usize,
-    #[allow(dead_code)]
     max_iterations_cap: usize,
     max_response_chars: usize,
     timeout_secs: u64,
@@ -783,7 +764,6 @@ impl Agent {
     }
 
     /// Maximum agentic loop iterations per invocation.
-    #[allow(dead_code)]
     pub fn max_iterations(&self) -> usize {
         self.limits.max_iterations
     }

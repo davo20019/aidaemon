@@ -48,7 +48,6 @@ pub(in crate::agent) struct BootstrapData {
     pub policy_bundle: PolicyBundle,
     pub llm_router: Option<Router>,
     pub model: String,
-    pub route_failsafe_active: bool,
     /// Canonical per-turn scope/follow-up/contract snapshot. Bootstrap resolves
     /// it before prompt construction so scoped project instructions and the
     /// execution loop use the exact same project decision.

@@ -474,7 +474,6 @@ impl Agent {
             mut policy_bundle,
             llm_router,
             mut model,
-            route_failsafe_active,
             turn_context,
             mut project_instruction_tracker,
             core_prompt_bytes,
@@ -1016,11 +1015,6 @@ impl Agent {
             );
         }
 
-        if route_failsafe_active {
-            turn_state
-                .directives
-                .push_system_message(SystemDirective::RouteFailsafeActive);
-        }
         if let Some(mandate_id) = dialogue_state
             .as_ref()
             .and_then(|state| state.last_closed_question.as_ref())

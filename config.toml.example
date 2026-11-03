@@ -440,7 +440,6 @@ health_port = 8080
 #   scale 3x — while small/local models (gemma, llama, qwen, ...) keep the
 #   full supervision scaffolding. Hard safety caps (iteration/token/wall-clock,
 #   repetition guards, anti-fabrication checks) apply on every tier.
-#   Gate fires are logged under the `heuristic_telemetry` tracing target.
 #
 #   The auto list matches known frontier families only. If you run a capable
 #   open model it doesn't recognize (e.g. kimi-k2.5, large qwen/deepseek

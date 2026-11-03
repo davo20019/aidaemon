@@ -56,7 +56,6 @@ pub struct RoutingSnapshot {
     pub tools_required_predicted: bool,
     pub tools_actually_used: bool,
     pub direct_return_attempted: bool,
-    pub route_drift_failsafe: bool,
     pub skills_activated: Vec<String>,
     pub policy_profile: Option<String>,
     pub model_escalated: bool,
@@ -130,7 +129,6 @@ pub struct HarnessEvalAccumulator {
     tools_actually_used: bool,
     direct_return_attempted: bool,
     direct_return_succeeded: bool,
-    route_drift_failsafe: bool,
     skills_activated: Vec<String>,
     policy_profile: Option<String>,
     model_escalated: bool,
@@ -164,7 +162,6 @@ impl HarnessEvalAccumulator {
             tools_actually_used: false,
             direct_return_attempted: false,
             direct_return_succeeded: false,
-            route_drift_failsafe: false,
             skills_activated: Vec::new(),
             policy_profile: None,
             model_escalated: false,
@@ -206,13 +203,11 @@ impl HarnessEvalAccumulator {
         orchestration_route: impl Into<String>,
         skills_activated: Vec<String>,
         policy_profile: Option<ModelProfile>,
-        route_failsafe_active: bool,
     ) {
         self.orchestration_route = orchestration_route.into();
         self.skills_activated = skills_activated;
         self.policy_profile = policy_profile.map(model_profile_label);
         self.model_profile = policy_profile;
-        self.route_drift_failsafe = route_failsafe_active;
     }
 
     pub fn record_direct_return(&mut self, attempted: bool, succeeded: bool) {
@@ -329,7 +324,6 @@ impl HarnessEvalAccumulator {
             tools_required_predicted: acc.tools_required_predicted,
             tools_actually_used: acc.tools_actually_used,
             direct_return_attempted: acc.direct_return_attempted,
-            route_drift_failsafe: acc.route_drift_failsafe,
             skills_activated: acc.skills_activated.clone(),
             policy_profile: acc.policy_profile.clone(),
             model_escalated: acc.model_escalated,
@@ -379,7 +373,6 @@ impl HarnessEvalAccumulator {
                 tools_required_predicted: routing.tools_required_predicted,
                 tools_actually_used: routing.tools_actually_used,
                 direct_return_attempted: routing.direct_return_attempted,
-                route_drift_failsafe: routing.route_drift_failsafe,
                 skills_activated: routing.skills_activated,
                 policy_profile: routing.policy_profile,
                 model_escalated: routing.model_escalated,
@@ -505,7 +498,6 @@ mod tests {
                 tools_required_predicted: false,
                 tools_actually_used: tool_calls > 0,
                 direct_return_attempted: false,
-                route_drift_failsafe: false,
                 skills_activated: Vec::new(),
                 policy_profile: None,
                 model_escalated: false,

@@ -714,7 +714,6 @@ async fn build_isolated_mandate_bootstrap(
         "isolated_mandate_continue",
         Vec::new(),
         Some(ModelProfile::Strong),
-        false,
     );
 
     let learning_ctx = LearningContext {
@@ -771,7 +770,6 @@ async fn build_isolated_mandate_bootstrap(
         policy_bundle,
         llm_router: None,
         model,
-        route_failsafe_active: false,
         turn_context,
         project_instruction_tracker,
         core_prompt_bytes,
@@ -1128,7 +1126,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     Agent::sort_tool_definitions_by_name(&mut base_tool_defs);
     Agent::sort_tool_definitions_by_name(&mut tool_defs);
 
-    let mut policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
+    let policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
     if !tool_defs.is_empty() {
         let shadow_filtered = agent.filter_tool_definitions_for_policy(
             &tool_defs,
@@ -1211,42 +1209,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             "Selected model for task"
         );
     }
-    let mut model = selected_model.clone();
-    let route_failsafe_active = route_failsafe_active_for_session(session_id);
-    if route_failsafe_active && !autonomous_bootstrap {
-        // Guided models may still use the drift fail-safe to recover capacity.
-        if !matches!(policy_bundle.policy.model_profile, ModelProfile::Strong) {
-            policy_bundle.policy = ExecutionPolicy::for_profile(ModelProfile::Strong);
-            policy_bundle
-                .policy
-                .escalation_reasons
-                .push("route_drift_failsafe".to_string());
-        }
-        if let Some(ref router) = llm_router {
-            model = router.select_for_profile(ModelProfile::Strong).to_string();
-        }
-        if !tool_defs.is_empty() && !autonomous_bootstrap {
-            tool_defs = agent.filter_tool_definitions_for_policy(
-                &base_tool_defs,
-                &available_capabilities,
-                &policy_bundle.policy,
-                policy_bundle.risk_score,
-                false,
-            );
-        }
-        warn!(
-            session_id,
-            model = %model,
-            profile = ?policy_bundle.policy.model_profile,
-            "Route drift fail-safe active: forcing strong routing policy"
-        );
-    } else if route_failsafe_active {
-        info!(
-            session_id,
-            model = %model,
-            "Route drift fail-safe observed without overriding autonomous model selection"
-        );
-    }
+    let model = selected_model.clone();
 
     // Compile task relationship and capability policy before any optional
     // memory access. The same assessment artifact is handed to the main loop;
@@ -1726,7 +1689,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         "default_continue",
         active_skill_names.clone(),
         Some(policy_bundle.policy.model_profile),
-        route_failsafe_active,
     );
 
     let data = BootstrapData {
@@ -1747,7 +1709,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         policy_bundle,
         llm_router,
         model,
-        route_failsafe_active,
         turn_context,
         project_instruction_tracker,
         core_prompt_bytes,
@@ -1861,7 +1822,6 @@ mod mandate_bootstrap_isolation_tests {
         assert!(data.session_summary.is_none());
         assert!(data.project_instruction_tracker.is_none());
         assert!(data.llm_router.is_none());
-        assert!(!data.route_failsafe_active);
         assert!(data.turn_context.assessment_recent_messages.is_empty());
         assert!(data.turn_context.primary_project_scope.is_none());
         assert_eq!(

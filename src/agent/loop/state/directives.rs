@@ -217,7 +217,7 @@ mod tests {
     fn pushes_and_takes_system_directives() {
         let mut state = PendingDirectives::default();
 
-        state.push_system_message(SystemDirective::RouteFailsafeActive);
+        state.push_system_message(SystemDirective::FreshConversationContext);
         state.push_system_message(SystemDirective::MandateDecisionCommitRequired);
 
         assert_eq!(state.system_message_count(), 2);

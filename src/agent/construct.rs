@@ -219,17 +219,6 @@ impl Agent {
             plan_store: RwLock::new(None),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            // Seed the in-memory ignore-set from config so a fresh start never
-            // forces `tool_choice=required` on a known-bad model. Persisted
-            // runtime-learned entries are merged in later via
-            // `load_required_tool_choice_ignored()` (async, post-construction).
-            required_tool_choice_ignored_models: Arc::new(tokio::sync::RwLock::new(
-                policy_config
-                    .required_tool_choice_ignored_models
-                    .iter()
-                    .cloned()
-                    .collect(),
-            )),
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
@@ -399,7 +388,6 @@ impl Agent {
         hub: Option<Weak<dyn OutboundRouter>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
         billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
-        required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
@@ -468,7 +456,6 @@ impl Agent {
             plan_store: RwLock::new(None),
             schedule_approved_sessions,
             billing_failed_models,
-            required_tool_choice_ignored_models,
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,

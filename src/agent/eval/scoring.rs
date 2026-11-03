@@ -67,9 +67,6 @@ pub fn compute_routing_accuracy(routing: &RoutingSnapshot) -> f32 {
     if !routing.tools_required_predicted && routing.tools_actually_used {
         score -= 0.35;
     }
-    if routing.route_drift_failsafe {
-        score -= 0.2;
-    }
     if routing.model_escalated {
         score -= 0.1;
     }
@@ -267,7 +264,6 @@ mod tests {
             tools_required_predicted: false,
             tools_actually_used: false,
             direct_return_attempted: false,
-            route_drift_failsafe: false,
             skills_activated: vec![],
             policy_profile: Some("balanced".to_string()),
             model_escalated: false,

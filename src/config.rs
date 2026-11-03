@@ -3848,20 +3848,6 @@ pub struct PolicyConfig {
     pub pre_execution_supervision: bool,
     #[serde(default)]
     pub write_consistency: WriteConsistencyConfig,
-    /// Models that ignore a forced `tool_choice=required` (return text with
-    /// zero tool calls). For these the daemon never forces `required` during
-    /// deferred/no-tool recovery — forcing only burns tokens, and on some
-    /// stacks (llama.cpp + Gemma) degenerates into a ~8k-token repetition loop
-    /// until the token limit. Matched by exact model name. Runtime-learned
-    /// entries are added to (and persisted alongside) this seed list.
-    #[serde(default = "default_required_tool_choice_ignored_models")]
-    pub required_tool_choice_ignored_models: Vec<String>,
-}
-
-/// Known-bad models that ignore forced `tool_choice=required`. Seeded so a
-/// fresh config never re-arms the witnessed `gemma-4-26b` meltdown on restart.
-fn default_required_tool_choice_ignored_models() -> Vec<String> {
-    vec!["gemma-4-26b".to_string()]
 }
 
 impl Default for PolicyConfig {
@@ -3879,7 +3865,6 @@ impl Default for PolicyConfig {
             trust_tier: default_trust_tier(),
             pre_execution_supervision: default_pre_execution_supervision(),
             write_consistency: WriteConsistencyConfig::default(),
-            required_tool_choice_ignored_models: default_required_tool_choice_ignored_models(),
         }
     }
 }
@@ -4232,15 +4217,18 @@ mod tests {
     use crate::testing::KeychainIsolation;
     use once_cell::sync::Lazy;
 
+    /// A config written before a policy key was retired must still parse:
+    /// `PolicyConfig` tolerates unknown keys rather than failing startup.
     #[test]
-    fn test_required_tool_choice_ignored_models_default_includes_gemma() {
-        let cfg = PolicyConfig::default();
-        assert!(
-            cfg.required_tool_choice_ignored_models
-                .iter()
-                .any(|m| m == "gemma-4-26b"),
-            "default PolicyConfig must seed the known-bad gemma-4-26b model"
-        );
+    fn policy_config_ignores_retired_keys() {
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+policy_enforce = false
+required_tool_choice_ignored_models = ["gemma-4-26b"]
+"#,
+        )
+        .expect("retired policy key must not break config parsing");
+        assert!(!cfg.policy_enforce);
     }
 
     #[test]

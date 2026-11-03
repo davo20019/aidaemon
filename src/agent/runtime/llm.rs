@@ -292,50 +292,6 @@ impl Agent {
     /// After this window the model is attempted again (credits may have been added).
     const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
-    /// Settings KV key under which the runtime-learned set of models that
-    /// ignore forced `tool_choice=required` is persisted (JSON array).
-    const REQUIRED_TOOL_CHOICE_IGNORED_KEY: &'static str = "required_tool_choice_ignored_models";
-
-    /// Test-only: clear the in-memory ignore-set so a subsequent
-    /// `load_required_tool_choice_ignored()` exercises the persisted-KV path.
-    #[cfg(test)]
-    pub(crate) async fn clear_required_tool_choice_ignored_in_memory(&self) {
-        self.required_tool_choice_ignored_models
-            .write()
-            .await
-            .clear();
-    }
-
-    /// Merge any persisted runtime-learned ignore-set entries into the
-    /// in-memory set (which was already seeded from config at construction).
-    /// Call once at startup, after the Agent is built. Best-effort.
-    pub(crate) async fn load_required_tool_choice_ignored(&self) {
-        let raw = match self
-            .state
-            .get_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY)
-            .await
-        {
-            Ok(Some(raw)) => raw,
-            Ok(None) => return,
-            Err(e) => {
-                warn!(error = %e, "Failed to load required_tool_choice_ignored_models");
-                return;
-            }
-        };
-
-        match serde_json::from_str::<Vec<String>>(&raw) {
-            Ok(persisted) => {
-                let mut set = self.required_tool_choice_ignored_models.write().await;
-                for m in persisted {
-                    set.insert(m);
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to parse persisted required_tool_choice_ignored_models");
-            }
-        }
-    }
-
     /// Attempt an LLM call with error-classified recovery:
     /// - RateLimit → exponential backoff retries, then cascade fallback
     /// - BadRequest/ServerError with vision blocks → text-only strip retry once

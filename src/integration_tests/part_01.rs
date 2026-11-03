@@ -937,41 +937,6 @@ async fn test_plain_text_draft_is_not_retried_from_wording() {
 }
 
 #[tokio::test]
-async fn test_route_failsafe_does_not_create_obligation_from_draft_wording() {
-    let session_id = "route_failsafe_plain_text_draft";
-    crate::agent::set_route_failsafe_for_session_for_test(session_id, true);
-
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("Let me draft a strong tweet for you."),
-        MockProvider::text_response(
-            "Been heads-down building. What should I share a behind-the-scenes update about next?",
-        ),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let response = harness
-        .agent
-        .handle_message(
-            session_id,
-            "can you post a tweet about your new stuff and make it engaging",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    crate::agent::set_route_failsafe_for_session_for_test(session_id, false);
-
-    assert_eq!(response, "Let me draft a strong tweet for you.");
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(call_log.len(), 1);
-    assert!(!call_log[0].tools.is_empty());
-}
-
-#[tokio::test]
 async fn test_inferred_text_only_turn_does_not_override_model_tool_decision() {
     let temp_path = std::env::temp_dir().join(format!(
         "aidaemon-text-only-drift-{}.txt",
