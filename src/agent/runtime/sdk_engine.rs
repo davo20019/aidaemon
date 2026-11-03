@@ -2030,7 +2030,7 @@ impl Agent {
             }
             MandateDecisionCommitState::Missing => {
                 let demand = StopDemand::MandateDecisionCommit;
-                let used = scope.mandate_commit_retries.load(Ordering::Relaxed) as u32;
+                let used = scope.mandate_commit_retries.load(Ordering::Relaxed);
                 match self.sdk_stop_demand_verdict(scope, demand, used).await {
                     StopDemandVerdict::Demand => {
                         scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
@@ -2092,7 +2092,9 @@ impl Agent {
             &authority,
             &visible_tools,
             |name| find(name).map(|tool| tool.capabilities().read_only),
-            |name, arguments| find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments)),
+            |name, arguments| {
+                find(name).is_some_and(|tool| tool.owner_control_plane_call(arguments))
+            },
         );
         self.emit_decision_point(
             scope.emitter,

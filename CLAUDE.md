@@ -278,7 +278,12 @@ demand more work?" decision: authority gates admission, expectations are
 verified by receipts, and only a *reachable* expectation may ask for another
 pass. It is authoritative: the completion phase asks for more work only on a
 `reachable` verdict (`ledger_expectations_required`), and records every
-verdict as a `ledger_closeout` decision point. `CompletionContract::authority()`
+verdict as a `ledger_closeout` decision point. The SDK engine's other
+stop-time asks (mandate decision commit, GUI click verification, reply
+repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against
+the same authority and visible tools, each with a budget, and recorded as
+`stop_demand` decision points; a new stop-time ask is a new `StopDemand`,
+not a new check. `CompletionContract::authority()`
 is the only contract view a gate may read; `expectations()` is verified by
 receipts, never enforced directly. Do not add a gate anywhere else.
 

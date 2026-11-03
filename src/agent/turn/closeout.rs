@@ -124,6 +124,186 @@ pub(in crate::agent) fn obligation_admissible(
     visible_tools.iter().any(|tool| admits(tool))
 }
 
+/// A bounded extra pass requested at stop time by something other than the
+/// ledger's expectations. These share the ledger's rule: the loop may ask for
+/// more only when something admissible could satisfy the request, and only
+/// within the demand's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::agent) enum StopDemand {
+    /// A mandate task lead must commit its decision with `manage_mandates
+    /// record_decision`; its prose is never the decision.
+    MandateDecisionCommit,
+    /// The run's last GUI coordinate click is unverified; an observation by
+    /// the GUI tool that made the click confirms it.
+    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
+    GuiClickVerification,
+    /// The final reply cannot ship (empty, internal markers, pasted tool
+    /// output); a rewrite needs no tool.
+    ReplyRepair,
+}
+
+/// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
+pub(in crate::agent) const MANDATE_DECISION_TOOL: &str = "manage_mandates";
+pub(in crate::agent) const MANDATE_DECISION_CALL: &str = r#"{"action":"record_decision"}"#;
+
+impl StopDemand {
+    /// The decision-point condition each verdict is recorded under.
+    pub(in crate::agent) fn condition(self) -> &'static str {
+        match self {
+            Self::MandateDecisionCommit => "mandate_decision_commit_missing",
+            Self::GuiClickVerification => "gui_coordinate_click_unverified",
+            Self::ReplyRepair => "final_reply_defect",
+        }
+    }
+
+    /// How many times one run may ask for this demand.
+    pub(in crate::agent) fn budget(self) -> u32 {
+        match self {
+            Self::MandateDecisionCommit | Self::ReplyRepair => 1,
+            Self::GuiClickVerification => 3,
+        }
+    }
+}
+
+/// The arbiter's answer for one stop demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::agent) enum StopDemandVerdict {
+    /// Ask the model for one more pass.
+    Demand,
+    /// This run already used the demand's budget.
+    Exhausted,
+    /// Nothing admissible could satisfy it, so asking would only spend a
+    /// model call on a refusal.
+    Unreachable,
+}
+
+impl StopDemandVerdict {
+    pub(in crate::agent) fn as_str(self) -> &'static str {
+        match self {
+            Self::Demand => "demand",
+            Self::Exhausted => "exhausted",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// Whether the loop may ask for `demand`, after `used` earlier asks this run.
+/// `control_plane_call(tool, arguments)` answers whether a tool kept only as
+/// an owner control-plane tool admits that exact call, as the call gate asks.
+pub(in crate::agent) fn stop_demand_verdict(
+    demand: StopDemand,
+    used: u32,
+    authority: &ClosingAuthority<'_>,
+    visible_tools: &[&str],
+    read_only: impl Fn(&str) -> Option<bool>,
+    control_plane_call: impl Fn(&str, &str) -> bool,
+) -> StopDemandVerdict {
+    let reachable = match demand {
+        StopDemand::MandateDecisionCommit => {
+            let tool = MANDATE_DECISION_TOOL;
+            visible_tools.contains(&tool)
+                && authority.admits_tool(tool, read_only(tool))
+                && (!authority.admits_only_as_control_plane(tool)
+                    || control_plane_call(tool, MANDATE_DECISION_CALL))
+        }
+        // The click came from a tool this run could call, and observing is
+        // read-only, so only a request that forbids tools outright blocks it.
+        StopDemand::GuiClickVerification => !authority.forbids_tool_use,
+        StopDemand::ReplyRepair => true,
+    };
+    if !reachable {
+        StopDemandVerdict::Unreachable
+    } else if used >= demand.budget() {
+        StopDemandVerdict::Exhausted
+    } else {
+        StopDemandVerdict::Demand
+    }
+}
+
+#[cfg(test)]
+mod stop_demand_tests {
+    use super::*;
+
+    fn authority<'a>(allowed: &'a [String], control_plane: &'a [String]) -> ClosingAuthority<'a> {
+        ClosingAuthority {
+            forbids_tool_use: false,
+            forbids_mutation: false,
+            allowed_tool_names: allowed,
+            forbidden_tool_scopes: &[],
+            owner_control_plane_tools: control_plane,
+        }
+    }
+
+    /// The commit demand is made only when the exact `record_decision` call
+    /// would be admitted; a tool kept only for the owner's control-plane
+    /// actions does not admit it, so asking would spend the retry on a refusal.
+    #[test]
+    fn mandate_commit_is_demanded_only_when_record_decision_is_admitted() {
+        let visible = ["manage_mandates", "http_request"];
+        let read_only = |_: &str| Some(false);
+        let real_rule = |tool: &str, arguments: &str| {
+            tool == MANDATE_DECISION_TOOL && !arguments.contains("record_decision")
+        };
+        let demand = StopDemand::MandateDecisionCommit;
+
+        let open = authority(&[], &[]);
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &open, &visible, read_only, real_rule),
+            StopDemandVerdict::Demand
+        );
+        assert_eq!(
+            stop_demand_verdict(demand, 1, &open, &visible, read_only, real_rule),
+            StopDemandVerdict::Exhausted
+        );
+
+        let allowed = vec!["http_request".to_string()];
+        let control_plane = vec![MANDATE_DECISION_TOOL.to_string()];
+        let narrowed = authority(&allowed, &control_plane);
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &narrowed, &visible, read_only, real_rule),
+            StopDemandVerdict::Unreachable
+        );
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &open, &["http_request"], read_only, real_rule),
+            StopDemandVerdict::Unreachable,
+            "an unregistered decision tool cannot be demanded"
+        );
+    }
+
+    #[test]
+    fn tool_free_and_gui_demands_follow_only_their_budgets_and_tool_use() {
+        let open = authority(&[], &[]);
+        let none = |_: &str| None;
+        let never = |_: &str, _: &str| false;
+        let reply = StopDemand::ReplyRepair;
+        assert_eq!(
+            stop_demand_verdict(reply, 0, &open, &[], none, never),
+            StopDemandVerdict::Demand
+        );
+        assert_eq!(
+            stop_demand_verdict(reply, 1, &open, &[], none, never),
+            StopDemandVerdict::Exhausted
+        );
+        let gui = StopDemand::GuiClickVerification;
+        assert_eq!(
+            stop_demand_verdict(gui, 2, &open, &[], none, never),
+            StopDemandVerdict::Demand
+        );
+        assert_eq!(
+            stop_demand_verdict(gui, 3, &open, &[], none, never),
+            StopDemandVerdict::Exhausted
+        );
+        let forbidden = ClosingAuthority {
+            forbids_tool_use: true,
+            ..authority(&[], &[])
+        };
+        assert_eq!(
+            stop_demand_verdict(gui, 0, &forbidden, &[], none, never),
+            StopDemandVerdict::Unreachable
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

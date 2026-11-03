@@ -113,13 +113,6 @@ pub(in crate::agent) enum MandateDecisionCommitState {
     Invalid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::agent) enum MandateDecisionCompletionAction {
-    Allow,
-    Retry,
-    Reject,
-}
-
 pub(in crate::agent) async fn mandate_decision_commit_state(
     agent: &Agent,
 ) -> anyhow::Result<MandateDecisionCommitState> {
@@ -143,24 +136,6 @@ pub(in crate::agent) async fn mandate_decision_commit_state(
         Ok(MandateDecisionCommitState::Committed)
     } else {
         Ok(MandateDecisionCommitState::Invalid)
-    }
-}
-
-pub(in crate::agent) fn mandate_decision_completion_action(
-    state: MandateDecisionCommitState,
-    retries_used: usize,
-    decision_tool_available: bool,
-) -> MandateDecisionCompletionAction {
-    match state {
-        MandateDecisionCommitState::NotApplicable | MandateDecisionCommitState::Committed => {
-            MandateDecisionCompletionAction::Allow
-        }
-        MandateDecisionCommitState::Missing if retries_used == 0 && decision_tool_available => {
-            MandateDecisionCompletionAction::Retry
-        }
-        MandateDecisionCommitState::Missing | MandateDecisionCommitState::Invalid => {
-            MandateDecisionCompletionAction::Reject
-        }
     }
 }
 
@@ -190,26 +165,6 @@ mod gate_telemetry_tests {
         assert_eq!(
             post_completion_memory_plan(false, true, true, true, true, true),
             (false, true)
-        );
-    }
-
-    #[test]
-    fn mandate_decision_completion_retries_once_then_rejects_prose() {
-        assert_eq!(
-            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 0, true),
-            MandateDecisionCompletionAction::Retry
-        );
-        assert_eq!(
-            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 1, true),
-            MandateDecisionCompletionAction::Reject
-        );
-        assert_eq!(
-            mandate_decision_completion_action(MandateDecisionCommitState::Missing, 0, false),
-            MandateDecisionCompletionAction::Reject
-        );
-        assert_eq!(
-            mandate_decision_completion_action(MandateDecisionCommitState::Committed, 1, true),
-            MandateDecisionCompletionAction::Allow
         );
     }
 
