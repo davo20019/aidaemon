@@ -49,7 +49,6 @@ pub struct DashboardState {
     pub started_at: Instant,
     pub dashboard_token: String,
     pub token_created_at: Instant,
-    pub daily_token_budget: Option<u64>,
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub heartbeat_telemetry: Option<Arc<HeartbeatTelemetry>>,
     pub oauth_gateway: Option<OAuthGateway>,
@@ -289,7 +288,6 @@ async fn api_status(State(state): State<DashboardState>) -> Json<serde_json::Val
         },
         "uptime_secs": uptime,
         "version": env!("CARGO_PKG_VERSION"),
-        "daily_token_budget": state.daily_token_budget,
     }))
 }
 

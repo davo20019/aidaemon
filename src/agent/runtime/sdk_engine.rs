@@ -112,6 +112,12 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
     if engine.kind.is_some() {
         warn!("[agent.engine] kind is ignored: the SDK kernel is the only agent loop");
     }
+    if config.state.daily_token_budget.is_some() {
+        warn!(
+            "[state] daily_token_budget is ignored: no global daily token cap is enforced; \
+             use per-goal daily budgets, subagents.task_token_budget or a provider spend limit"
+        );
+    }
     let mut model_override = engine
         .model
         .clone()
@@ -676,6 +682,16 @@ impl Agent {
             None => None,
         };
         let budget_goal_for_daily = budget_goal.as_ref().map(|goal| goal.goal_id.clone());
+        let scheduled_budget_per_check = match budget_goal.as_ref().filter(|goal| goal.scheduled) {
+            Some(goal) => self
+                .state
+                .get_goal(&goal.goal_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|goal| goal.budget_per_check),
+            None => None,
+        };
         let scope = TurnScope {
             session_id,
             user_text,
@@ -707,7 +723,10 @@ impl Agent {
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             task_tokens: AtomicU64::new(0),
-            task_budget: AtomicU64::new(self.limits.task_token_budget.unwrap_or(0)),
+            task_budget: AtomicU64::new(task_token_budget(
+                self.limits.task_token_budget,
+                scheduled_budget_per_check,
+            )),
             task_budget_extensions: std::sync::atomic::AtomicUsize::new(0),
             succeeded_calls: std::sync::atomic::AtomicUsize::new(0),
             succeeded_operations: std::sync::Mutex::new(HashSet::new()),

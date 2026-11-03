@@ -390,36 +390,6 @@ async fn test_task_budget_auto_extends_on_short_productive_run() {
     assert_eq!(response, "Short task completed.");
 }
 
-#[tokio::test]
-async fn test_global_daily_budget_auto_extends_on_short_productive_run() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
-        MockProvider::text_response("Daily budget task completed."),
-    ]);
-
-    let mut harness = setup_test_agent(provider).await.unwrap();
-    harness.agent.set_test_executor_mode();
-    harness.agent.set_test_daily_token_budget(Some(60));
-
-    let response = harness
-        .agent
-        .handle_message(
-            "daily_budget_test",
-            "Run a short multi-step check against the daily budget",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "Daily budget task completed.");
-}
-
 /// Task token budget stops execution when progress is not productive (stalling).
 /// Script: same tool with same args → stall detection → is_productive=false → stops.
 #[tokio::test]

@@ -52,7 +52,6 @@ pub(crate) struct AgentConstruction {
     pub max_response_chars: usize,
     pub timeout_secs: u64,
     pub max_facts: usize,
-    pub daily_token_budget: Option<u64>,
     pub iteration_config: IterationLimitConfig,
     pub task_timeout_secs: Option<u64>,
     pub task_token_budget: Option<u64>,
@@ -115,7 +114,6 @@ impl Agent {
             max_response_chars,
             timeout_secs,
             max_facts,
-            daily_token_budget,
             iteration_config,
             task_timeout_secs,
             task_token_budget,
@@ -199,7 +197,6 @@ impl Agent {
                 max_response_chars,
                 timeout_secs,
                 max_facts,
-                daily_token_budget,
                 llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
                 task_timeout: task_timeout_secs.map(Duration::from_secs),
                 task_token_budget,
@@ -294,11 +291,6 @@ impl Agent {
     #[cfg(test)]
     pub fn set_test_execution_budget_override(&mut self, budget: Option<ExecutionBudget>) {
         self.execution_budget_override = budget;
-    }
-
-    #[cfg(test)]
-    pub fn set_test_daily_token_budget(&mut self, budget: Option<u64>) {
-        self.limits.daily_token_budget = budget;
     }
 
     #[cfg(test)]
@@ -436,7 +428,6 @@ impl Agent {
                 max_response_chars,
                 timeout_secs,
                 max_facts,
-                daily_token_budget: None,
                 llm_call_timeout,
                 task_timeout,
                 task_token_budget,

@@ -1640,9 +1640,9 @@ pub struct StateConfig {
     /// remain in the database but are not included in the prompt.
     #[serde(default = "default_max_facts")]
     pub max_facts: usize,
-    /// Optional daily token budget. When set, cumulative daily usage is checked
-    /// before additional LLM work; productive runs may auto-extend temporarily,
-    /// otherwise further calls are rejected. Resets at midnight UTC.
+    /// Ignored: a global daily token cap is not enforced (logged once at
+    /// startup). Kept so older configs still parse. Per-goal daily budgets and
+    /// the per-task token budget still apply; cap total spend at the provider.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
     /// Retention policies for automatic cleanup of old data.

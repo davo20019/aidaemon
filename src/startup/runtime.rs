@@ -646,7 +646,6 @@ pub(crate) fn spawn_dashboard_or_health_server(
                     started_at: std::time::Instant::now(),
                     dashboard_token: dashboard_token_info.token,
                     token_created_at: dashboard_token_info.created_at,
-                    daily_token_budget: config.state.daily_token_budget,
                     health_store,
                     heartbeat_telemetry,
                     oauth_gateway,

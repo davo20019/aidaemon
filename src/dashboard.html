@@ -186,7 +186,6 @@ async function fetchStatus() {
       ['Smart', d.models.smart],
       ['Uptime', fmtDuration(d.uptime_secs)],
     ];
-    if (d.daily_token_budget) items.push(['Daily Budget', fmtNum(d.daily_token_budget) + ' tokens']);
     for (const [k, v] of items) html += '<dt>' + esc(k) + '</dt><dd>' + esc(String(v)) + '</dd>';
     document.getElementById('status-dl').innerHTML = html;
   } catch {}

@@ -168,13 +168,12 @@ adapters, tested against local mock servers.
       exempt); the SDK engine leaves `sdk::Limits::timeout` unset, so
       nothing enforces it. Set it in `sdk_engine.rs` where the limits are
       built.
-- [ ] Global daily token budget: the legacy stopping phase enforced
-      `state.daily_token_budget`; the SDK engine does not read it
-      (`AgentLimits::daily_token_budget` is kept, marked unenforced).
-- [ ] Scheduled goals: the legacy loop raised the task token budget to the
-      goal's `budget_per_check`; the SDK engine charges scheduled runs
-      against `limits.task_token_budget` as is (matters only when a task
-      budget is configured below the per-check budget).
+- [x] Global daily token budget: dropped. `[state] daily_token_budget` is
+      accepted and ignored (logged once); a daily cap has to count every
+      model call, so it belongs at the provider, not in the turn loop.
+- [x] Scheduled goals: a scheduled run with a `budget_per_check` is bounded
+      by that run budget alone; the task budget no longer stacks on top
+      (`sdk_engine/budgets.rs`, `task_token_budget`).
 - [ ] Whole-branch review, then live N-of-M runs on goals and mandates.
 
 ## Parallel track: fixes found in the daemon

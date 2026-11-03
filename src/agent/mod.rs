@@ -86,12 +86,12 @@ use policy_signals::is_short_user_correction;
 use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
 #[path = "turn/validation_state.rs"]
 mod validation_state;
+pub(in crate::agent) use validation_state::ApprovalState;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
     persist_executor_handoff_context, persist_executor_result_context, ExecutorHandoff,
     ExecutorStepResult, PartialResult, StepValidationOutcome, TaskValidationOutcome,
 };
-pub(in crate::agent) use validation_state::ApprovalState;
 #[path = "turn/execution_state.rs"]
 mod execution_state;
 #[cfg(test)]
@@ -445,10 +445,6 @@ struct AgentLimits {
     max_response_chars: usize,
     timeout_secs: u64,
     max_facts: usize,
-    /// `state.daily_token_budget`. Not enforced on the SDK path yet (the legacy
-    /// stopping phase did); see `crates/aidaemon-core/PLAN.md`, Phase 7.
-    #[allow(dead_code)]
-    daily_token_budget: Option<u64>,
     llm_call_timeout: Option<Duration>,
     task_timeout: Option<Duration>,
     task_token_budget: Option<u64>,

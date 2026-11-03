@@ -17,6 +17,17 @@ pub(super) fn task_budget_warning_due(used: u64, budget: u64, already_sent: bool
     budget > 0 && !already_sent && used >= budget.saturating_mul(80) / 100 && used < budget
 }
 
+/// The run's task token budget (0 means none). A scheduled run with a
+/// per-check budget is bounded by that run budget (with its own extension
+/// and alert), so the task budget does not stack on top of it. Without one,
+/// the configured task budget applies.
+pub(super) fn task_token_budget(configured: Option<u64>, scheduled_per_check: Option<i64>) -> u64 {
+    match scheduled_per_check.filter(|budget| *budget > 0) {
+        Some(_) => 0,
+        None => configured.unwrap_or(0),
+    }
+}
+
 impl Agent {
     /// Charge a model call to the task, goal-daily and scheduled-run
     /// budgets. When one is used up, it extends once more if receipts show

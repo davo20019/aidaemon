@@ -1,3 +1,4 @@
+use super::budgets::task_token_budget;
 use super::model_call::*;
 use super::outcome::*;
 use super::tool_calls::*;
@@ -1350,4 +1351,19 @@ async fn closeout_sees_only_offered_memory_tools() {
     assert!(foreign.contains(&"manage_memories"));
     assert!(!foreign.contains(&"manage_people"));
     assert!(closeout_visible_tools(tools, UserRole::Public, &[]).is_empty());
+}
+
+#[test]
+fn a_scheduled_run_keeps_its_per_check_budget() {
+    // Interactive turns use the configured task budget as is.
+    assert_eq!(task_token_budget(Some(500_000), None), 500_000);
+    assert_eq!(task_token_budget(None, None), 0);
+    // A scheduled run with a per-check budget is bounded by that run budget
+    // alone, whether it is larger or smaller than the task budget.
+    assert_eq!(task_token_budget(Some(500_000), Some(800_000)), 0);
+    assert_eq!(task_token_budget(Some(500_000), Some(100_000)), 0);
+    assert_eq!(task_token_budget(None, Some(800_000)), 0);
+    // Without a usable per-check budget the task budget still applies.
+    assert_eq!(task_token_budget(Some(500_000), Some(0)), 500_000);
+    assert_eq!(task_token_budget(Some(500_000), Some(-1)), 500_000);
 }

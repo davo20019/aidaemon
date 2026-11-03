@@ -181,7 +181,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         max_response_chars: config.subagents.max_response_chars,
         timeout_secs: config.subagents.timeout_secs,
         max_facts: config.state.max_facts,
-        daily_token_budget: config.state.daily_token_budget,
         iteration_config: config.subagents.effective_iteration_limit(),
         task_timeout_secs: config.subagents.task_timeout_secs,
         task_token_budget: config.subagents.task_token_budget,
