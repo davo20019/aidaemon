@@ -3193,7 +3193,12 @@ impl MandateStore for SqliteStateStore {
         } else {
             None
         };
-        if mandate.objective_control.is_some()
+        // The measured control loop belongs to autopilot. A bounded
+        // mandate's objective control is advisory: recorded measurements are
+        // kept, but a decision never waits on one or on its stagnation window.
+        let control_loop = mandate.autonomy_mode.is_autopilot();
+        if control_loop
+            && mandate.objective_control.is_some()
             && !runtime_fallback
             && matches!(
                 decision.outcome,
@@ -3205,7 +3210,7 @@ impl MandateStore for SqliteStateStore {
                 "controlled mandate decisions require a receipt-backed metric measurement from the current run"
             );
         }
-        if decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
+        if control_loop && decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
             if let Some(control) = mandate.objective_control.as_ref() {
                 // Only credible readings form the no-progress window. A
                 // zero-confidence reading means the metric could not be read
@@ -6651,6 +6656,47 @@ mod tests {
         assert_eq!(history[0].outcome, MandateDecisionOutcome::Wait);
     }
 
+    /// A bounded mandate's objective control is advisory: its decisions do
+    /// not wait on a measurement. Autopilot keeps the measured control loop.
+    #[tokio::test]
+    async fn bounded_mandate_with_objective_control_decides_without_a_measurement() {
+        for (mode, gated) in [
+            (MandateAutonomyMode::Bounded, false),
+            (MandateAutonomyMode::Autopilot, true),
+        ] {
+            let (store, _database) = test_store().await;
+            let (goal, mut mandate) = controller("owner-session", 1);
+            mandate.autonomy_mode = mode;
+            mandate.objective_control = Some(objective_control());
+            let run = claim_and_start_run(&store, &goal, &mandate).await;
+            let wait = MandateDecisionCycle::new(
+                &mandate.id,
+                &run.id,
+                MandateDecisionOutcome::Wait,
+                "Nothing new is worth acting on yet",
+                mandate.version,
+            );
+            let result = store.record_mandate_decision(&wait, None, None).await;
+            if gated {
+                let error = result.expect_err("autopilot decisions need a measurement");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("receipt-backed metric measurement"),
+                    "{error}"
+                );
+            } else {
+                result.expect("a bounded mandate decides without a measurement");
+                let stored = store
+                    .get_mandate_decision_for_run(&run.id)
+                    .await
+                    .unwrap()
+                    .expect("decision stored");
+                assert_eq!(stored.outcome, MandateDecisionOutcome::Wait);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn act_for_value_contract_requires_exact_owner_criterion_and_full_judgment() {
         let (store, _database) = test_store().await;
@@ -7019,6 +7065,8 @@ mod tests {
     async fn runtime_fallback_wait_bypasses_semantic_gates_and_finalizes_as_deliberator_failure() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
+        // The measured control loop (gate, stagnation) is autopilot's.
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
         mandate.objective_control = Some(objective_control());
         let run = claim_and_start_run(&store, &goal, &mandate).await;
 
@@ -7697,6 +7745,8 @@ mod tests {
     async fn credible_flat_measurements_still_reject_wait_as_stagnant() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
+        // The measured control loop (gate, stagnation) is autopilot's.
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
         mandate.objective_control = Some(objective_control());
         let run = claim_and_start_run(&store, &goal, &mandate).await;
         for hours_ago in 2..=4 {
@@ -7778,6 +7828,8 @@ mod tests {
     async fn stagnant_passive_wait_refusal_names_admissible_outcomes() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
+        // The measured control loop (gate, stagnation) is autopilot's.
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
         mandate.objective_control = Some(objective_control());
         // Mutation authority exists but the rolling window allows none now.
         mandate.authority.max_mutating_actions_per_rolling_24h = 1;
