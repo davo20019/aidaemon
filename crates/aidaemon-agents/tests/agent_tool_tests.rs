@@ -28,6 +28,7 @@ fn echo_tool() -> impl Tool {
 
 fn child_builder(provider: Arc<ScriptedProvider>) -> AgentBuilder {
     Agent::builder("researcher")
+        .allow_unguarded()
         .model("test-model")
         .instructions("You research things.")
         .provider(provider)
@@ -35,6 +36,7 @@ fn child_builder(provider: Arc<ScriptedProvider>) -> AgentBuilder {
 
 fn parent(provider: Arc<ScriptedProvider>, tool: AgentTool) -> Agent {
     Agent::builder("orchestrator")
+        .allow_unguarded()
         .model("test-model")
         .provider(provider)
         .tool(tool)
@@ -144,6 +146,7 @@ async fn parent_token_budget_covers_child_spend() {
     let parent_provider =
         Arc::new(ScriptedProvider::new([]).then_repeat(tool_calls([delegate("", "again")])));
     let agent = Agent::builder("orchestrator")
+        .allow_unguarded()
         .model("m")
         .provider(parent_provider)
         .tool(tool)
@@ -418,6 +421,7 @@ async fn fork_mode_passes_a_caller_supplied_transcript_summary() {
         text("done"),
     ]));
     let agent = Agent::builder("orchestrator")
+        .allow_unguarded()
         .model("m")
         .provider(parent_provider)
         .hook(tap)

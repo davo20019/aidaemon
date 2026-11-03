@@ -5,6 +5,7 @@ use crate::message::{Message, ToolCall};
 use crate::outcome::RunOutcome;
 use crate::provider::{ModelRequest, Usage};
 use crate::receipt::Receipt;
+use crate::safeguard::Safeguard;
 use crate::state::RunId;
 use crate::stuck::StuckSignal;
 use crate::tool::{ToolInfo, ToolOutput};
@@ -82,6 +83,13 @@ pub enum StuckDecision {
 /// cannot argue its way past them.
 #[async_trait]
 pub trait Hook: Send + Sync {
+    /// The safeguards this hook enforces. [`crate::AgentBuilder::build`]
+    /// requires every [`Safeguard::REQUIRED`] one to be covered by a hook
+    /// or an attestation.
+    fn safeguards(&self) -> &'static [Safeguard] {
+        &[]
+    }
+
     /// Edit the request before it is sent: trim context, inject memory,
     /// change the model or tool choice.
     async fn before_model(&self, _ctx: &HookContext<'_>, _request: &mut ModelRequest) {}

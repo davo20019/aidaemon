@@ -174,6 +174,7 @@ pub(crate) mod tests {
     ) -> Arc<RecordingWrites> {
         let writes = Arc::new(RecordingWrites::default());
         let agent = sdk::Agent::builder("test")
+            .allow_unguarded()
             .model("scripted")
             .provider(provider)
             .hook(ContinueOnce::default())

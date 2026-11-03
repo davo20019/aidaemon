@@ -29,7 +29,9 @@
 //!     .model("claude-sonnet-5-5")
 //!     .instructions("You maintain this repository. Verify changes with tests.")
 //!     .provider(providers::Anthropic::builder().api_key("<key>").build()?)
-//!     .hook(policies::ApprovalPolicy::new(policies::ApprovalMode::DestructiveOnly));
+//!     .hook(policies::ApprovalPolicy::new(policies::ApprovalMode::DestructiveOnly))
+//!     .hook(policies::ScopeGuard::new([workspace.root()]))
+//!     .hook(policies::UntrustedOutput::default());
 //! for tool in tools::default_tools(workspace) {
 //!     builder = builder.tool_arc(tool);
 //! }

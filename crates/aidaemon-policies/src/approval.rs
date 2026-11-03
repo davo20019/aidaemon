@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use aidaemon_core::{Hook, HookContext, ToolCall, ToolDecision, ToolInfo};
+use aidaemon_core::{Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
 
 use crate::shell::{catastrophic_reason, command_segments, segment_matches_prefix};
@@ -157,6 +157,10 @@ impl ApprovalPolicy {
 
 #[async_trait]
 impl Hook for ApprovalPolicy {
+    fn safeguards(&self) -> &'static [Safeguard] {
+        &[Safeguard::Authority]
+    }
+
     async fn before_tool(
         &self,
         _ctx: &HookContext<'_>,

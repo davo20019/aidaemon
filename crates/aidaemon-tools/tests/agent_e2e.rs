@@ -36,6 +36,7 @@ async fn agent_edits_then_verifies_with_read() {
     ]);
 
     let mut builder = Agent::builder("e2e-editor")
+        .allow_unguarded()
         .model("scripted")
         .provider(provider);
     for tool in default_tools(workspace) {

@@ -297,6 +297,7 @@ mod tests {
         ]);
         let state = tool.state().clone();
         let agent = Agent::builder("checklist-test")
+            .allow_unguarded()
             .model("scripted")
             .provider(provider)
             .tool(tool)

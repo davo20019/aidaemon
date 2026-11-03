@@ -11,7 +11,8 @@ use crate::message::Message;
 use crate::outcome::RunOutcome;
 use crate::provider::{Provider, ToolSpec};
 use crate::run_loop::Driver;
-use crate::state::RunState;
+use crate::safeguard::Safeguard;
+use crate::state::{RunState, RUN_STATE_SCHEMA};
 use crate::store::RunStore;
 use crate::stuck::StuckConfig;
 use crate::tool::Tool;
@@ -150,6 +151,12 @@ impl Agent {
     }
 
     fn check_owner(&self, state: &RunState) -> Result<(), CoreError> {
+        if state.schema > RUN_STATE_SCHEMA {
+            return Err(CoreError::UnsupportedRunState {
+                found: state.schema,
+                supported: RUN_STATE_SCHEMA,
+            });
+        }
         if state.agent_id != self.inner.id {
             return Err(CoreError::AgentMismatch {
                 expected: self.inner.id.clone(),
@@ -160,7 +167,9 @@ impl Agent {
     }
 }
 
-/// Builder for [`Agent`]. Only `provider` and `model` are required.
+/// Builder for [`Agent`]. `provider` and `model` are required, and an agent
+/// with tools must cover every [`Safeguard::REQUIRED`] safeguard (see
+/// [`AgentBuilder::attest`] and [`AgentBuilder::allow_unguarded`]).
 pub struct AgentBuilder {
     id: String,
     model: Option<String>,
@@ -168,6 +177,8 @@ pub struct AgentBuilder {
     provider: Option<Arc<dyn Provider>>,
     tools: Vec<Arc<dyn Tool>>,
     hooks: Vec<Arc<dyn Hook>>,
+    attested: Vec<Safeguard>,
+    unguarded: bool,
     limits: Limits,
     stuck: StuckConfig,
     stop_conditions: Vec<Arc<dyn StopCondition>>,
@@ -185,6 +196,8 @@ impl AgentBuilder {
             provider: None,
             tools: Vec::new(),
             hooks: Vec::new(),
+            attested: Vec::new(),
+            unguarded: false,
             limits: Limits::default(),
             stuck: StuckConfig::default(),
             stop_conditions: Vec::new(),
@@ -227,6 +240,21 @@ impl AgentBuilder {
 
     pub fn hook_arc(mut self, hook: Arc<dyn Hook>) -> Self {
         self.hooks.push(hook);
+        self
+    }
+
+    /// Declare that `safeguard` is enforced outside the hooks, for example
+    /// by the application's own tool adapter. This is a statement the
+    /// composition root makes on purpose, so it is reviewable in one place.
+    pub fn attest(mut self, safeguard: Safeguard) -> Self {
+        self.attested.push(safeguard);
+        self
+    }
+
+    /// Build without the [`Safeguard::REQUIRED`] check: for tests, demos
+    /// and tools that only touch data the agent fully controls.
+    pub fn allow_unguarded(mut self) -> Self {
+        self.unguarded = true;
         self
     }
 
@@ -278,6 +306,18 @@ impl AgentBuilder {
                 return Err(BuildError::DuplicateTool(spec.name));
             }
             specs.push(spec);
+        }
+        if !specs.is_empty() && !self.unguarded {
+            for required in Safeguard::REQUIRED {
+                let covered = self.attested.contains(&required)
+                    || self
+                        .hooks
+                        .iter()
+                        .any(|h| h.safeguards().contains(&required));
+                if !covered {
+                    return Err(BuildError::MissingSafeguard(required));
+                }
+            }
         }
 
         Ok(Agent {

@@ -44,7 +44,7 @@ pub use redact::Redactor;
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{catastrophic_reason, command_segments};
 pub use tracing_sink::TracingSink;
-pub use untrusted::UntrustedOutput;
+pub use untrusted::{wrap_untrusted, UntrustedOutput, UNTRUSTED_PREFIX, UNTRUSTED_SUFFIX};
 
 use aidaemon_core::{Message, Role};
 

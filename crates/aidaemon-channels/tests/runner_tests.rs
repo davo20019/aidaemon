@@ -149,6 +149,7 @@ impl Setup {
     fn start(self) -> Running {
         let router = EventRouter::new();
         let agent = Agent::builder("assistant")
+            .allow_unguarded()
             .provider(self.provider.clone())
             .model("synthetic-model")
             .instructions("You help Alice Rivera.")
@@ -843,6 +844,7 @@ async fn failing_channels_restart_with_backoff_but_auth_errors_stop_them() {
 #[test]
 fn builder_rejects_bad_setups() {
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .provider(ScriptedProvider::new(vec![]))
         .model("synthetic-model")
         .build()

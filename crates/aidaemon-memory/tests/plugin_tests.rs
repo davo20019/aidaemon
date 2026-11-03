@@ -90,6 +90,7 @@ async fn custom_store_and_embedder_swap_in() {
     assert_eq!(snippets, vec!["family daughters: Mia and Zoe".to_string()]);
 
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([call("c1", "recall", json!({"query": "work"}))]),

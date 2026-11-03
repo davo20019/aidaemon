@@ -8,9 +8,9 @@ use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
     Agent, CoreError, Event, FnTool, Hook, HookContext, Image, InvocationStage, LimitKind, Limits,
     MemoryStore, Message, ProviderError, Receipt, ReceiptStatus, Resolution, Retry, Role,
-    RunSnapshot, RunState, RunStatus, RunStore, StopDecision, StuckConfig, StuckDecision,
-    StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput,
-    ToolResult, ToolSpec,
+    RunSnapshot, RunState, RunStatus, RunStore, Safeguard, StopDecision, StuckConfig,
+    StuckDecision, StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision,
+    ToolInfo, ToolOutput, ToolResult, ToolSpec, RUN_STATE_SCHEMA,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -66,6 +66,7 @@ fn counting(name: &'static str, annotations: ToolAnnotations) -> (CountingTool, 
 
 fn base(provider: ScriptedProvider) -> aidaemon_core::AgentBuilder {
     Agent::builder("test-agent")
+        .allow_unguarded()
         .model("scripted")
         .instructions("You are a test agent.")
         .provider(provider)
@@ -91,6 +92,7 @@ fn tool_messages(state: &RunState) -> Vec<(String, String)> {
 async fn completes_when_the_model_answers_without_tools() {
     let provider = Arc::new(ScriptedProvider::new([text("hello")]));
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .instructions("be brief")
         .provider(provider.clone())
@@ -472,6 +474,7 @@ async fn before_model_hook_can_edit_the_request() {
     }
     let provider = Arc::new(ScriptedProvider::new([text("ok")]));
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(provider.clone())
         .hook(AddNote)
@@ -643,6 +646,7 @@ async fn resume_rules_are_enforced() {
 
     // Another agent id cannot pick up this state.
     let other = Agent::builder("other-agent")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([]))
         .build()
@@ -908,6 +912,7 @@ async fn retry_layer_recovers_from_transient_errors() {
         Ok(text("finally")),
     ]);
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(Retry::new(flaky).base_delay(Duration::from_millis(1)))
         .build()
@@ -1005,10 +1010,11 @@ async fn tools_get_trusted_context_separately_from_arguments() {
 #[test]
 fn builder_rejects_bad_configuration() {
     use aidaemon_core::BuildError;
-    let missing_provider = Agent::builder("a").model("m").build();
+    let missing_provider = Agent::builder("a").allow_unguarded().model("m").build();
     assert!(matches!(missing_provider, Err(BuildError::MissingProvider)));
 
     let dup = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([]))
         .tool(echo_tool())
@@ -1017,6 +1023,7 @@ fn builder_rejects_bad_configuration() {
     assert!(matches!(dup, Err(BuildError::DuplicateTool(name)) if name == "echo"));
 
     let bad_name = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([]))
         .tool(FnTool::new(
@@ -1026,6 +1033,81 @@ fn builder_rejects_bad_configuration() {
         ))
         .build();
     assert!(matches!(bad_name, Err(BuildError::InvalidToolName(_))));
+}
+
+struct Guards(&'static [Safeguard]);
+
+#[async_trait]
+impl Hook for Guards {
+    fn safeguards(&self) -> &'static [Safeguard] {
+        self.0
+    }
+}
+
+#[test]
+fn an_agent_with_tools_must_cover_every_safeguard() {
+    use aidaemon_core::BuildError;
+    let base = || {
+        Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([]))
+    };
+
+    let bare = base().tool(echo_tool()).build();
+    assert!(matches!(
+        bare,
+        Err(BuildError::MissingSafeguard(Safeguard::Authority))
+    ));
+
+    // One safeguard short: the error names the uncovered one.
+    let partial = base()
+        .tool(echo_tool())
+        .hook(Guards(&[Safeguard::Authority]))
+        .attest(Safeguard::Scope)
+        .build();
+    assert!(matches!(
+        partial,
+        Err(BuildError::MissingSafeguard(Safeguard::UntrustedOutput))
+    ));
+
+    // Hooks and attestations combine.
+    assert!(base()
+        .tool(echo_tool())
+        .hook(Guards(&[Safeguard::Authority, Safeguard::UntrustedOutput]))
+        .attest(Safeguard::Scope)
+        .build()
+        .is_ok());
+
+    // No tools, nothing to guard; an explicit opt-out also builds.
+    assert!(base().build().is_ok());
+    assert!(base().tool(echo_tool()).allow_unguarded().build().is_ok());
+}
+
+#[tokio::test]
+async fn run_state_carries_its_schema_and_newer_state_is_refused() {
+    let agent = Agent::builder("a")
+        .model("m")
+        .provider(ScriptedProvider::new([text("done")]))
+        .build()
+        .unwrap();
+    let state = RunState::new("a", "s", "hi");
+    assert_eq!(state.schema(), RUN_STATE_SCHEMA);
+
+    // State saved before the field existed reads as the first schema.
+    let mut json = serde_json::to_value(&state).unwrap();
+    json.as_object_mut().unwrap().remove("schema");
+    let legacy: RunState = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(legacy.schema(), 1);
+
+    json["schema"] = json!(RUN_STATE_SCHEMA + 1);
+    let newer: RunState = serde_json::from_value(json).unwrap();
+    let err = agent
+        .run_from(newer, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::UnsupportedRunState { found, .. } if found == RUN_STATE_SCHEMA + 1)
+    );
 }
 
 // ---------- regressions ----------
@@ -1212,6 +1294,7 @@ async fn wall_clock_budget_bounds_a_hanging_model_call() {
     }
 
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(Hanging)
         .limits(Limits {
@@ -1444,6 +1527,7 @@ async fn images_reach_the_model_from_the_user_and_from_tools() {
         },
     );
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(provider.clone())
         .tool(snap)

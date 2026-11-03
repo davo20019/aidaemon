@@ -35,7 +35,7 @@
 //!     .api_key(std::env::var("ANTHROPIC_API_KEY")?)
 //!     .build()?;
 //!
-//! let agent = Agent::builder("helper")
+//! let agent = Agent::builder("helper").allow_unguarded()
 //!     .model("claude-sonnet-4-5")
 //!     .instructions("You are a concise assistant.")
 //!     .provider(Retry::new(claude))

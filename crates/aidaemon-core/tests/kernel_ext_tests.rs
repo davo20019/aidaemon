@@ -19,6 +19,7 @@ async fn streamed_text_arrives_as_deltas_before_the_response() {
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let sink = events.clone();
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(StreamingProvider(ScriptedProvider::new([text(
             "hello brave world",
@@ -48,6 +49,7 @@ async fn retry_layer_retries_a_stream_that_fails_before_any_output() {
         Ok(text("recovered")),
     ]);
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(Retry::new(StreamingProvider(flaky)).base_delay(Duration::from_millis(1)))
         .build()
@@ -105,6 +107,7 @@ impl Hook for ScopeToDocs {
 async fn tool_usage_counts_toward_the_run_and_hooks_see_access() {
     let seen: Arc<Mutex<Vec<AccessManifest>>> = Arc::default();
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([
@@ -166,6 +169,7 @@ async fn crash_then_recover(idempotent: bool) -> (aidaemon_core::RunOutcome, usi
     let rid = run_id.clone();
     let build = |provider: ScriptedProvider| {
         Agent::builder("worker")
+            .allow_unguarded()
             .model("m")
             .provider(provider)
             .tool(HangsOnce {
@@ -269,6 +273,7 @@ async fn injected_messages_carry_a_typed_origin_and_errors_are_flagged() {
         |_args: Value| async move { Ok(ToolOutput::error("no matches for pattern")) },
     );
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([call("c1", "grep", json!({}))]),
@@ -324,6 +329,7 @@ async fn a_tool_timeout_hint_overrides_the_default() {
         }
     }
     let agent = Agent::builder("a")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([call("c1", "patient", json!({}))]),

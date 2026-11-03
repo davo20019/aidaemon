@@ -24,6 +24,7 @@ mod outcome;
 mod provider;
 mod receipt;
 mod run_loop;
+mod safeguard;
 mod state;
 mod store;
 mod stuck;
@@ -46,7 +47,8 @@ pub use provider::{
     ToolChoice, ToolSpec, Usage,
 };
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
-pub use state::{InFlight, Interruption, Pending, RunId, RunState};
+pub use safeguard::Safeguard;
+pub use state::{InFlight, Interruption, Pending, RunId, RunState, RUN_STATE_SCHEMA};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{

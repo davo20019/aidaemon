@@ -188,6 +188,7 @@ async fn concurrent_appends_get_unique_gap_free_sequence_numbers() {
 async fn state_round_trips_exactly_and_upserts() {
     let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
     let agent = Agent::builder("worker")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([call("c1", "echo", json!({"text": "hi"}))]),
@@ -226,6 +227,7 @@ async fn session_queries_and_interrupted_runs() {
     let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
     let build = |provider: ScriptedProvider| {
         Agent::builder("ops")
+            .allow_unguarded()
             .model("m")
             .provider(provider)
             .tool(deploy_tool())
@@ -319,6 +321,7 @@ async fn crashed_run_is_found_after_reopen_and_finished() {
         let store = Arc::new(SqliteStore::open(db_path(&dir)).await.unwrap());
         let sink = seen.clone();
         let agent = Agent::builder("worker")
+            .allow_unguarded()
             .model("m")
             .provider(ScriptedProvider::new([tool_calls([call(
                 "c1",
@@ -349,6 +352,7 @@ async fn crashed_run_is_found_after_reopen_and_finished() {
     assert_eq!(state.session_id, "s-crash");
 
     let agent = Agent::builder("worker")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([text("report handled")]))
         .tool(HangsOnce {

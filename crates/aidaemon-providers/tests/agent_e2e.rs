@@ -58,6 +58,7 @@ async fn openai_agent_tool_round_trip() {
         .build()
         .unwrap();
     let agent = Agent::builder("order-bot")
+        .allow_unguarded()
         .model("test-model")
         .instructions("You answer order questions.")
         .provider(Retry::new(provider).base_delay(Duration::from_millis(5)))
@@ -156,6 +157,7 @@ async fn anthropic_agent_tool_round_trip() {
         .build()
         .unwrap();
     let agent = Agent::builder("order-bot")
+        .allow_unguarded()
         .model("claude-test")
         .instructions("You answer order questions.")
         .provider(provider)

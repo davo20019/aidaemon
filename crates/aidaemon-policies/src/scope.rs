@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use aidaemon_core::{Hook, HookContext, ToolCall, ToolDecision, ToolInfo};
+use aidaemon_core::{Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
 
 /// What to do with a call whose access manifest is empty (undeclared).
@@ -227,6 +227,10 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
 
 #[async_trait]
 impl Hook for ScopeGuard {
+    fn safeguards(&self) -> &'static [Safeguard] {
+        &[Safeguard::Scope]
+    }
+
     async fn before_tool(
         &self,
         _ctx: &HookContext<'_>,

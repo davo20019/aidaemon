@@ -114,6 +114,7 @@ impl AgentFactory for ExampleFactory {
         provider: Arc<dyn Provider>,
     ) -> Result<Agent, FactoryError> {
         let mut builder = Agent::builder("example-agent")
+            .allow_unguarded()
             .model("example-model")
             .provider(provider);
         for tool in example_tools() {

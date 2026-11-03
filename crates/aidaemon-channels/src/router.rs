@@ -8,7 +8,7 @@
 //!
 //! ```ignore
 //! let router = EventRouter::new();
-//! let agent = Agent::builder("assistant")
+//! let agent = Agent::builder("assistant").allow_unguarded()
 //!     .provider(provider)
 //!     .model("model-name")
 //!     .event_sink(router.clone())      // 1. the agent emits into the router

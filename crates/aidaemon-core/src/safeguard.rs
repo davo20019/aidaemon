@@ -1,0 +1,40 @@
+/// A safety property every agent with tools must have before it can run.
+///
+/// The kernel does not implement these: a hook declares the ones it provides
+/// through [`crate::Hook::safeguards`], or the composition root attests one
+/// that something else enforces (for example its own tool adapter) with
+/// [`crate::AgentBuilder::attest`]. [`crate::AgentBuilder::build`] refuses an
+/// agent with tools that leaves any of them uncovered, so forgetting to wire
+/// a policy is a build error instead of a silent hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Safeguard {
+    /// Someone with the right to decide approves calls that act on the
+    /// world (destructive, external, or outside the task's grant).
+    Authority,
+    /// Calls stay inside the paths and resources the task was granted.
+    Scope,
+    /// Output from tools the agent does not control (web pages, MCP
+    /// servers, third-party APIs) reaches the model marked as data, not
+    /// instructions.
+    UntrustedOutput,
+}
+
+impl Safeguard {
+    /// Every safeguard an agent with tools must cover.
+    pub const REQUIRED: [Safeguard; 3] = [
+        Safeguard::Authority,
+        Safeguard::Scope,
+        Safeguard::UntrustedOutput,
+    ];
+}
+
+impl std::fmt::Display for Safeguard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Safeguard::Authority => "authority",
+            Safeguard::Scope => "scope",
+            Safeguard::UntrustedOutput => "untrusted output",
+        })
+    }
+}

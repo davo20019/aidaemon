@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! let router = EventRouter::new();
-//! let agent = Agent::builder("assistant")
+//! let agent = Agent::builder("assistant").allow_unguarded()
 //!     .provider(provider)
 //!     .model("model-name")
 //!     .hook(my_approval_hook)          // returns ToolDecision::Interrupt for risky tools

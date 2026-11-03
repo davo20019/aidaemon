@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use aidaemon_sdk::policies::{
     ApprovalMode, ApprovalPolicy, ContextWindow, ProjectInstructions, ReceiptCompletionCheck,
-    Redactor, Requirement,
+    Redactor, Requirement, ScopeGuard, UntrustedOutput,
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
@@ -60,7 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .hook(ProjectInstructions::discover(workspace.root())?)
         .hook(ContextWindow::new(120_000))
         .hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))
+        .hook(ScopeGuard::new([workspace.root()]))
         .hook(Redactor::default())
+        .hook(UntrustedOutput::default())
         .hook(ReceiptCompletionCheck::new([
             Requirement::RequireNoUnresolvedFailures,
         ]))

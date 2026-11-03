@@ -294,6 +294,7 @@ async fn memory_writer_does_not_block_or_alter_the_run() {
     let memory = memory_with(Some(FactExtractor::new(extraction, "small")), None);
     let writer = Arc::new(MemoryWriter::new(memory.clone()));
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([text("Booked a window seat.")]))
         .hook_arc(writer.clone())
@@ -334,6 +335,7 @@ async fn memory_writer_failures_never_reach_the_run() {
     let memory = memory_with(Some(FactExtractor::new(failing, "m")), None);
     let writer = Arc::new(MemoryWriter::new(memory));
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([text("done")]))
         .hook_arc(writer.clone())
@@ -377,6 +379,7 @@ async fn memory_writer_extracts_once_per_completed_run_only() {
     // Registered BEFORE a hook that rejects the first answer: the writer must
     // still wait for the run to actually finish.
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             text("draft"),
@@ -403,6 +406,7 @@ async fn memory_writer_extracts_once_per_completed_run_only() {
 
     // A failed run writes nothing.
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::with_results([Err(ProviderError::Auth(
             "bad key".into(),
@@ -432,6 +436,7 @@ async fn ingest_run_extracts_and_summarizes() {
         Some(EpisodeSummarizer::new(summarize, "m")),
     );
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([text("Porto is lovely.")]))
         .build()
@@ -477,6 +482,7 @@ async fn remember_and_recall_tools_work_inside_an_agent_run() {
         text("Your favorite color is teal."),
     ]));
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(provider.clone())
         .tool(RememberTool::new(memory.clone()))
@@ -559,6 +565,7 @@ async fn memory_recall_injects_into_requests_never_into_state() {
 
     let provider = Arc::new(ScriptedProvider::new([text("They are Mia and Zoe.")]));
     let agent = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .instructions("You are helpful.")
         .provider(provider.clone())

@@ -52,7 +52,7 @@
 //! let live: Arc<dyn Provider> = my_live_provider();
 //!
 //! let factory = FnFactory::new(|scenario: &Scenario, provider: Arc<dyn Provider>| {
-//!     let builder = Agent::builder("my-agent")
+//!     let builder = Agent::builder("my-agent").allow_unguarded()
 //!         .model("my-model")
 //!         .provider(provider);
 //!     // Add your tools and hooks here, then apply the scenario's

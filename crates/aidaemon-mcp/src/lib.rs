@@ -14,7 +14,7 @@
 //!     Vec::<(String, String)>::new(),
 //! )
 //! .await?;
-//! let mut builder = aidaemon_core::Agent::builder("assistant");
+//! let mut builder = aidaemon_core::Agent::builder("assistant").allow_unguarded();
 //! for tool in server.tools() {
 //!     builder = builder.tool_arc(tool); // named `fs__read_file`, ...
 //! }

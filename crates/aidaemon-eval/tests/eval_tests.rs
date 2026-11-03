@@ -326,7 +326,10 @@ async fn factory_errors_are_failures_and_configure_applies_limits() {
 
     // A closure factory that applies the scenario's limits.
     let factory = FnFactory::new(|s: &Scenario, p: Arc<dyn Provider>| {
-        let mut b = Agent::builder("fn").model("m").provider(p);
+        let mut b = Agent::builder("fn")
+            .allow_unguarded()
+            .model("m")
+            .provider(p);
         for t in example_tools() {
             b = b.tool_arc(t);
         }

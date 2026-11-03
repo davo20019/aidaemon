@@ -297,6 +297,7 @@ async fn shutdown_stops_the_server() {
 async fn agent_calls_mcp_tools_end_to_end() {
     let server = spawn().await;
     let mut builder = Agent::builder("assistant")
+        .allow_unguarded()
         .model("m")
         .provider(ScriptedProvider::new([
             tool_calls([

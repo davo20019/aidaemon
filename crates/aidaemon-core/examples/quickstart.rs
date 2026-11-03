@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(MemoryStore::new());
     let agent = Agent::builder("file-tidier")
+        .allow_unguarded()
         .model("scripted-model")
         .instructions("You tidy up notes folders. Explain what you changed.")
         .provider(model)

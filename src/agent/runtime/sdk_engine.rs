@@ -3462,7 +3462,14 @@ impl Agent {
         // hook denial) never reach the daemon dispatcher; the event sink hands
         // their receipts over so the run ledger records them too.
         let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
+        // Every tool call goes through the daemon dispatcher, which enforces
+        // the kernel's required safeguards itself: the request/mandate
+        // authority gate, `sdk_scope_check` against the task's filesystem
+        // grant, and `fit_tool_result_for_model` wrapping untrusted output.
         let mut builder = sdk::Agent::builder("aidaemon")
+            .attest(sdk::Safeguard::Authority)
+            .attest(sdk::Safeguard::Scope)
+            .attest(sdk::Safeguard::UntrustedOutput)
             .model(model.clone())
             .provider(DaemonProvider {
                 calls: calls_tx.clone(),

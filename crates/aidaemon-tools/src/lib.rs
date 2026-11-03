@@ -26,7 +26,7 @@
 //! # fn demo(provider: impl aidaemon_core::Provider + 'static) -> Result<(), Box<dyn std::error::Error>> {
 //! let workspace = Workspace::new("./my-project")?;
 //! let (checklist, gate) = Checklist::with_gate();
-//! let mut builder = aidaemon_core::Agent::builder("coder")
+//! let mut builder = aidaemon_core::Agent::builder("coder").allow_unguarded()
 //!     .model("some-model")
 //!     .provider(provider)
 //!     .tool(checklist)

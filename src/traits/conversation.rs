@@ -6,8 +6,8 @@ use std::borrow::Cow;
 const APPENDED_DIAGNOSTIC_MARKER: &str = "\n\n[DIAGNOSTIC]";
 const APPENDED_TOOL_STATS_MARKER: &str = "\n\n[TOOL STATS]";
 const APPENDED_SYSTEM_MARKER: &str = "\n\n[SYSTEM]";
-const UNTRUSTED_EXTERNAL_DATA_PREFIX: &str = "[UNTRUSTED EXTERNAL DATA";
-const UNTRUSTED_EXTERNAL_DATA_SUFFIX: &str = "[END UNTRUSTED EXTERNAL DATA]";
+const UNTRUSTED_EXTERNAL_DATA_PREFIX: &str = aidaemon_policies::UNTRUSTED_PREFIX;
+const UNTRUSTED_EXTERNAL_DATA_SUFFIX: &str = aidaemon_policies::UNTRUSTED_SUFFIX;
 
 /// Structured annotations attached to rendered conversation content.
 ///

@@ -102,6 +102,25 @@ jobs:
           -p aidaemon-channel-discord
           --all-targets --all-features -- -D warnings
 
+  core-api:
+    name: Core public API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned together: cargo-public-api reads rustdoc JSON, whose format
+      # changes between nightlies. Bump both deliberately.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-01
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api@0.52.0
+
+      - name: Diff aidaemon-core public API against the snapshot
+        run: scripts/check-core-api.sh
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

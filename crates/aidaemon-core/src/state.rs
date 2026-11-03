@@ -8,6 +8,16 @@ use crate::provider::Usage;
 use crate::receipt::Receipt;
 use crate::stuck::StuckState;
 
+/// Version of the [`RunState`] serialization format this kernel writes and
+/// can resume. State saved before the field existed reads as version 1.
+/// Bump it when a change would make older saved state resume wrongly, and
+/// teach `resume` to migrate or refuse the old version.
+pub const RUN_STATE_SCHEMA: u32 = 1;
+
+fn first_schema() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(Uuid);
@@ -67,6 +77,9 @@ pub struct InFlight {
 /// `agent_id`, never by position or display name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
+    /// See [`RUN_STATE_SCHEMA`]; read it with [`RunState::schema`].
+    #[serde(default = "first_schema")]
+    pub(crate) schema: u32,
     pub run_id: RunId,
     pub agent_id: String,
     pub session_id: String,
@@ -102,6 +115,7 @@ impl RunState {
     /// `input` is text or a user [`Message`] (for example one with images).
     pub fn new(agent_id: &str, session_id: &str, input: impl Into<Message>) -> Self {
         Self {
+            schema: RUN_STATE_SCHEMA,
             run_id: RunId::new(),
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
@@ -134,6 +148,11 @@ impl RunState {
         self.in_flight = None;
         self.stuck.reset();
         self
+    }
+
+    /// The serialization format version this state was written with.
+    pub fn schema(&self) -> u32 {
+        self.schema
     }
 
     /// Receipts produced by the current run (not earlier runs in the session).
