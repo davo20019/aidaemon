@@ -2489,18 +2489,22 @@ impl MandateRunNotification {
                     humanize_reason(reason.as_str()),
                 )
             }
-            MandateRunNotificationKind::ReviewFailed { reason }
-                if matches!(
-                    reason,
-                    MandateFinalizationRejectReason::DecisionMissing
-                        | MandateFinalizationRejectReason::DeliberatorFailed
-                ) =>
-            {
-                format!(
-                    "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
-                    humanize_reason(reason.as_str()),
-                )
-            }
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DecisionMissing,
+            } => format!(
+                "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
+                humanize_reason(MandateFinalizationRejectReason::DecisionMissing.as_str()),
+            ),
+            // The deliberator may fail after committing an ACT and starting an
+            // executor, so this notice claims neither "nothing decided" nor
+            // "nothing done"; an unconfirmed external change takes the
+            // reconciliation path instead.
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed,
+            } => format!(
+                "{label}: a review failed before it finished ({}). Ask me what it got to if you want the details. It's still active and will retry automatically. {reference}",
+                humanize_reason(MandateFinalizationRejectReason::DeliberatorFailed.as_str()),
+            ),
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
                 "{label}: a review could not be verified ({}), so nothing was done. {reference}",
                 humanize_reason(reason.as_str()),
@@ -2552,9 +2556,29 @@ mod tests {
             "2026-08-11T12:00:00Z",
         );
         let message = notice.message();
-        assert!(message.contains("Nothing was done"));
+        // A deliberator can fail after committing an ACT and starting an
+        // executor, so its notice claims neither "decided nothing" nor
+        // "nothing was done".
+        assert!(!message.contains("decided anything"), "{message}");
+        assert!(!message.contains("Nothing was done"), "{message}");
         assert!(message.contains("still active"));
         assert!(message.contains("retry automatically"));
+
+        let missing = MandateRunNotification::new(
+            "08012d3d-synthetic",
+            1,
+            "goal-synthetic",
+            "566978b6-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DecisionMissing,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        )
+        .message();
+        assert!(missing.contains("before it decided anything"), "{missing}");
+        assert!(missing.contains("Nothing was done"), "{missing}");
     }
 
     #[test]
