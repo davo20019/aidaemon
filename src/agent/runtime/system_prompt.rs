@@ -701,8 +701,9 @@ impl Agent {
             )
         };
         let role_rules = if fence.worker_task_id == fence.root_task_id {
-            format!(
-                "role: task_lead\nAutonomy: {autonomy_rules}\nProtocol graph: SIGNAL -> OBSERVE -> ASSESS -> ADAPT/ACT/WAIT/ASK/STOP -> VERIFY -> SCHEDULE. Traverse this typed graph once per review; do not create an open-ended reasoning loop. Gather only authorized observations, retain their exact successful receipt identifiers (the tool_call_id or the receipt footer result_id) as evidence_receipt_ids, select one typed activity_level, then record exactly one ACT, WAIT, ASK, or STOP decision. When owner_policy.objective_control is present, the objective is a measured control loop: during OBSERVE read the current metric value from its measurement_source, then call manage_mandates record_measurement with value_micros (millionths of one unit: 25 engagements = 25000000), confidence_bps, the exact evidence_receipt_ids of that read, and attributed_intention_ids for any prior intentions whose effect this value reflects, before recording the decision. Compare current value against baseline_micros and target_micros in the direction given; the untrusted history block lists prior objective_measurements and next_measurement_due. When owner_policy.objective_control is null but a success criterion names a measurable quantity (followers, subscribers, posts published, revenue, response time, or any count/rate/threshold), the objective has no control loop yet: use your authorized observations to read the current value once, then record ASK whose single bounded question proposes a complete objective_control (metric_name, unit, baseline_micros from that receipt, target_micros derived from the criterion, direction, exact in-scope measurement_source, measurement_cadence_secs within the review bounds, minimum_effect_micros, max_stagnant_measurements, run_failure_budget) and states that the owner confirms it through a policy update; do not ACT on a measurable objective that has no control loop, and do not repeat the ASK once it has been recorded until the owner answers. If the metric cannot be read this cycle (the field is absent or the read failed), record value_micros 0 with confidence_bps 0 and never guess; an unreadable metric is a measurement outage, not stagnation and not a reason to ASK or STOP, so continue within current authority. ACT when the expected_benefit names a concrete metric movement of at least minimum_effect_micros or advances an owner-authored success criterion or requested cadence; STOP with success_criteria_satisfied only when the latest measurement reaches the target; if credible measurements (confidence_bps > 0) have not improved across max_stagnant_measurements measurement periods, a WAIT that keeps the same tactic is rejected: ACT when a mutation slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the mutation quota is exhausted or cooling down, WAIT stays admissible. quiet uses the default cadence, active accelerates it, and urgent uses the owner-confirmed minimum; explicit reconsider_minutes is still clamped to the confirmed bounds. Every authenticated http_request observation must carry the exact owner-pinned auth_profile and top-level account_id matching its configured user_id; never guess or infer an account identity. URL queries must match an exact scoped query or use only parameter names present in that operation scope's allowed_query_params. The owner's requested activity and cadence are owner-authored value, not proof on their own that any particular action is good: when a mutation-quota slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that requested cadence is itself a sufficient expected_benefit. Before ACT, compare the smallest useful intervention with WAIT using current evidence; do not act merely to demonstrate activity beyond the requested cadence, maximize output volume, or obey a stale tactic after its assumptions fail. ACT requires a positive mutation budget, at least one current-run evidence receipt, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk assessment, invalidation_criteria, one committed intention, and only the minimum exact run-bound child tasks needed for that intention. If no intervention materially advances a confirmed success criterion after costs and risks, record WAIT and schedule the next useful observation. Create and exact-claim non-root tasks through manage_goal_tasks; do not perform mutations yourself and do not use generic auto-dispatch. WAIT, ASK, and STOP require zero action children and zero mutation attempts. ASK must pose one bounded question. If the latest decision in history is an ASK and the owner has not answered, the mandate resumed on its own: do not repeat that ASK; continue within current authority. Never ASK the owner merely for permission to retry an internal fence/protocol failure. If operation_not_allowed reveals that one specific minimal policy expansion is genuinely necessary, ASK once for that exact tool/operation/effect/account/URL-or-query change and state that it requires a separately confirmed policy update; never suggest that answer_question or ordinary guidance can grant it. If no specific safe expansion can be proposed, record WAIT with no children and identify the exact rejected operation in the rationale. STOP must create no work, name a typed termination_kind, match the exact owner-authored criterion/condition when applicable, and cite current-run structured receipts for evidence-dependent claims. When current-run evidence changes tactics, pair the learning note with a stable canonical strategy_key, typed strategy_kind, and confidence basis points; reinforce, explore, avoid, or retire one graph node per review. Adaptive strategy and learning are advisory, must cite current decision receipt IDs, and can never alter authority."
+            task_lead_rules(
+                autonomy_rules,
+                mandate.autonomy_mode.is_autopilot() && mandate.objective_control.is_some(),
             )
         } else {
             format!(
@@ -1267,11 +1268,55 @@ impl Agent {
     }
 }
 
+/// The mandate task lead's protocol rules. The measured control loop
+/// (record_measurement, stagnation, STOP on target) is included only for an
+/// autopilot mandate with an objective control; elsewhere it is advisory and
+/// its rules are noise. Evidence receipts are attached by the runtime.
+pub(super) fn task_lead_rules(autonomy_rules: &str, control_loop: bool) -> String {
+    let mut rules = format!(
+        "role: task_lead\nAutonomy: {autonomy_rules}\n\
+Protocol: OBSERVE -> decide exactly one of ACT, WAIT, ASK, or STOP -> SCHEDULE, once per review; never an open-ended loop. Gather only authorized observations, select one typed activity_level, then record the decision with manage_mandates record_decision. evidence_receipt_ids are optional: omit them and the runtime cites this run's successful observations.\n\
+Every authenticated http_request must carry the exact owner-pinned auth_profile and a top-level account_id matching its configured user_id; never guess or infer an account identity. URL queries must match an exact scoped query or use only parameter names in that operation scope's allowed_query_params.\n\
+The owner's requested activity and cadence are owner-authored value, not proof that any particular action is good: when a mutation slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that cadence is a sufficient expected_benefit. Before ACT, compare the smallest useful intervention with WAIT; do not act to demonstrate activity, maximize volume, or follow a stale tactic.\n\
+ACT requires a positive mutation budget, a successful observation in this run, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk, invalidation_criteria, one committed intention, and only the minimum run-bound child tasks for it. Create and exact-claim those tasks through manage_goal_tasks; never mutate yourself or use generic auto-dispatch. If no intervention materially advances a confirmed success criterion, record WAIT.\n\
+WAIT, ASK, and STOP create no action tasks and no mutation attempts. ASK poses one bounded question; if the latest decision is an unanswered ASK, do not repeat it and continue within current authority. Never ASK for permission to retry an internal fence or protocol failure. If operation_not_allowed shows that one specific minimal policy expansion is necessary, ASK once for that exact change and say it needs a separately confirmed policy update; never suggest that answer_question or ordinary guidance can grant it. Otherwise record WAIT with no children, naming the rejected operation. STOP creates no work, names a typed termination_kind, and matches the exact owner-authored criterion or condition when one applies.\n\
+quiet uses the default cadence, active accelerates it, urgent uses the owner-confirmed minimum; reconsider_minutes is clamped to the confirmed bounds. Learning notes and strategy revisions are advisory, cite this run's receipt ids, pair a stable strategy_key with a typed strategy_kind and confidence, and never alter authority."
+    );
+    if control_loop {
+        rules.push_str(
+            "\nObjective control loop: during OBSERVE read the metric from objective_control.measurement_source, then call manage_mandates record_measurement with value_micros (millionths of one unit: 25 engagements = 25000000), confidence_bps, and attributed_intention_ids for prior intentions this value reflects, before the decision. Compare it with baseline_micros and target_micros in the given direction; the history block lists prior objective_measurements and next_measurement_due. If the metric cannot be read, record value_micros 0 with confidence_bps 0 and never guess: an unreadable metric is an outage, not stagnation, and no reason to ASK or STOP. ACT when the expected_benefit names a movement of at least minimum_effect_micros or advances an owner-authored criterion or cadence. STOP with success_criteria_satisfied only when the latest measurement reaches the target. If credible measurements (confidence_bps > 0) have not improved across max_stagnant_measurements periods, a WAIT that keeps the same tactic is rejected: ACT when a slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the quota is exhausted or cooling down, WAIT stays admissible.",
+        );
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_available_specialists_block, format_goal_context, infer_assistant_name_from_prompt,
+        task_lead_rules,
     };
+
+    /// A bounded mandate's lead carries no control-loop rules and no
+    /// receipt-copying instructions; autopilot with an objective control
+    /// keeps the measured loop.
+    #[test]
+    fn bounded_task_lead_prompt_omits_control_loop_rules() {
+        // The single task-lead rule string before the split.
+        const PREVIOUS_RULES_CHARS: usize = 5_800;
+        let bounded = task_lead_rules("Bounded mode is active.", false);
+        assert!(!bounded.contains("record_measurement"), "{bounded}");
+        assert!(!bounded.contains("proposes a complete objective_control"));
+        assert!(!bounded.contains("retain their exact successful receipt identifiers"));
+        assert!(
+            bounded.len() * 10 <= PREVIOUS_RULES_CHARS * 7,
+            "bounded rules are {} chars",
+            bounded.len()
+        );
+        let autopilot = task_lead_rules("Autopilot is owner-confirmed.", true);
+        assert!(autopilot.contains("record_measurement"), "{autopilot}");
+        assert!(autopilot.contains("max_stagnant_measurements"));
+    }
 
     #[test]
     fn configured_multi_word_agent_name_is_inferred_from_identity_line() {
@@ -1666,18 +1711,17 @@ mod tests {
         assert!(prompt.contains("\"max_mutating_actions_per_rolling_24h\":8"));
         assert!(prompt.contains("\"min_seconds_between_mutations\":1800"));
         assert!(prompt.contains("role: task_lead"));
-        assert!(prompt.contains("SIGNAL -> OBSERVE -> ASSESS"));
-        assert!(prompt.contains("do not create an open-ended reasoning loop"));
+        assert!(prompt.contains("OBSERVE -> decide exactly one of ACT, WAIT, ASK, or STOP"));
+        assert!(prompt.contains("never an open-ended loop"));
         assert!(prompt.contains("select one typed activity_level"));
-        assert!(prompt
-            .contains("meeting that requested cadence is itself a sufficient expected_benefit"));
-        assert!(prompt.contains("an unreadable metric is a measurement outage"));
-        assert!(prompt.contains("do not repeat that ASK"));
+        assert!(prompt.contains("meeting that cadence is a sufficient expected_benefit"));
+        assert!(prompt.contains("an unreadable metric is an outage"));
+        assert!(prompt.contains("do not repeat it"));
         assert!(prompt.contains("one exact owner-authored value_criterion"));
-        assert!(prompt.contains("do not act merely to demonstrate activity"));
+        assert!(prompt.contains("do not act to demonstrate activity"));
         assert!(prompt.contains("strategy_key"));
-        assert!(prompt.contains("can never alter authority"));
-        assert!(prompt.contains("Never ASK the owner merely for permission to retry"));
+        assert!(prompt.contains("never alter authority"));
+        assert!(prompt.contains("Never ASK for permission to retry"));
         assert!(prompt.contains("ASK once for that exact"));
         assert!(prompt.contains("answer_question or ordinary guidance"));
         assert!(prompt.contains("record WAIT with no children"));
