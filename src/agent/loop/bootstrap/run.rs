@@ -119,19 +119,25 @@ fn build_tool_filter_gate_telemetry(
     )
 }
 
-/// A request assessment's tool narrowing leaves the owner's control-plane
-/// tools in place (see `Tool::owner_control_plane`). It never applies when the
-/// request forbids tool use, and it adds only tools the turn already offers.
+/// A request assessment's tool narrowing keeps the owner's control-plane
+/// tools offered (see `Tool::owner_control_plane`), recorded apart from the
+/// assessor's allowlist so the per-call gate admits only their gated calls.
+/// Never when the request forbids tool use, never for a forbidden scope, and
+/// only tools the turn already offers. Each entry is a name and its scope.
 fn admit_owner_control_plane(
     contract: &mut crate::agent::CompletionContract,
-    owner_control_plane_tools: &[String],
+    owner_control_plane_tools: &[(String, Option<crate::traits::ToolSemanticScope>)],
 ) {
     if contract.forbids_tool_use || contract.allowed_tool_names.is_empty() {
         return;
     }
-    for name in owner_control_plane_tools {
-        if !contract.allowed_tool_names.contains(name) {
-            contract.allowed_tool_names.push(name.clone());
+    for (name, scope) in owner_control_plane_tools {
+        let forbidden = scope.is_some_and(|scope| contract.forbidden_tool_scopes.contains(&scope));
+        if !forbidden
+            && !contract.allowed_tool_names.contains(name)
+            && !contract.owner_control_plane_tools.contains(name)
+        {
+            contract.owner_control_plane_tools.push(name.clone());
         }
     }
 }
@@ -154,7 +160,7 @@ async fn finalize_turn_assessment(
     plan: Option<&super::task_planning::TaskPlan>,
     available_tool_names: &[String],
     available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
-    owner_control_plane_tools: &[String],
+    owner_control_plane_tools: &[(String, Option<crate::traits::ToolSemanticScope>)],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
     task_assessment_attempted: bool,
     assessment_decision_type: crate::events::DecisionType,
@@ -582,6 +588,7 @@ async fn finalize_turn_assessment(
                         "evidence_requirements": turn_context.completion_contract.evidence_requirements,
                         "required_invocations": effective_required_invocations,
                         "allowed_tool_names": turn_context.completion_contract.allowed_tool_names,
+                        "owner_control_plane_tools": turn_context.completion_contract.owner_control_plane_tools,
                         "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
                         "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
                         "response_contract": turn_context.completion_contract.response_contract.as_ref().map(|contract| json!({
@@ -1459,8 +1466,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .tools
             .iter()
             .filter(|tool| tool.owner_control_plane())
-            .map(|tool| tool.name().to_string())
-            .filter(|name| available_tool_names.contains(name))
+            .filter(|tool| available_tool_names.iter().any(|name| name == tool.name()))
+            .map(|tool| {
+                let scope = tool
+                    .semantic_affordances()
+                    .map(|affordances| affordances.scope)
+                    .or_else(|| {
+                        crate::agent::tool_execution_phase::fallback_tool_semantic_scope(
+                            tool.name(),
+                        )
+                    });
+                (tool.name().to_string(), scope)
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()

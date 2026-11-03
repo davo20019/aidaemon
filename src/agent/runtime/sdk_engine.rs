@@ -1401,9 +1401,16 @@ impl Agent {
                             | crate::traits::ToolCallEffect::Administrative
                     ) && !call_semantics.mutates_state())
             });
-        let admitted =
-            super::closeout::ClosingAuthority::from_authority(scope.contract.authority())
-                .admits_tool(&request.name, read_only);
+        let closing = super::closeout::ClosingAuthority::from_authority(scope.contract.authority());
+        // A control-plane tool kept outside the assessed allowlist admits
+        // only the calls the tool itself declares gated or read-only.
+        let admitted = closing.admits_tool(&request.name, read_only)
+            && (!closing.admits_only_as_control_plane(&request.name)
+                || self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name() == request.name)
+                    .is_some_and(|tool| tool.owner_control_plane_call(arguments)));
         // A matched skill that references untrusted external content keeps
         // the legacy block on tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools

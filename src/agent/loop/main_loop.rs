@@ -762,13 +762,13 @@ impl Agent {
                 .allowed_tool_names
                 .is_empty()
             {
-                let allowed_tool_names = &turn_context.completion_contract.allowed_tool_names;
+                let authority = turn_context.completion_contract.authority();
                 tool_defs.retain(|definition| {
                     definition
                         .get("function")
                         .and_then(|function| function.get("name"))
                         .and_then(serde_json::Value::as_str)
-                        .is_some_and(|name| allowed_tool_names.iter().any(|allowed| allowed == name))
+                        .is_some_and(|name| authority.offers_tool_name(name))
                 });
             }
             if !turn_context
@@ -865,13 +865,13 @@ impl Agent {
             .allowed_tool_names
             .is_empty()
         {
-            let allowed = &turn_context.completion_contract.allowed_tool_names;
+            let authority = turn_context.completion_contract.authority();
             tool_defs.retain(|definition| {
                 definition
                     .get("function")
                     .and_then(|function| function.get("name"))
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| allowed.iter().any(|candidate| candidate == name))
+                    .is_some_and(|name| authority.offers_tool_name(name))
             });
         }
         if !turn_context

@@ -1899,11 +1899,18 @@ pub trait Tool: Send + Sync {
         ToolCapabilities::default()
     }
 
-    /// The tool only manages the owner's own durable policy (mandates), and
-    /// every committing action is already owner-gated: a private owner
-    /// channel plus confirmation. A request assessment that narrows a turn's
-    /// tools leaves such a tool to the owner in a private chat.
+    /// The tool only manages the owner's own durable policy (mandates). A
+    /// request assessment that narrows a turn's tools still offers it to the
+    /// owner in a private chat, but only calls `owner_control_plane_call`
+    /// accepts are admitted there.
     fn owner_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Whether this exact call is safe on a turn whose assessment did not
+    /// name the tool: read-only, or committing only through an explicit
+    /// owner confirmation. Decided from the tool's own schema enum.
+    fn owner_control_plane_call(&self, _arguments: &str) -> bool {
         false
     }
 

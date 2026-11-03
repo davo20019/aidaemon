@@ -18,6 +18,7 @@ pub(in crate::agent) struct ClosingAuthority<'a> {
     pub forbids_mutation: bool,
     pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [ToolSemanticScope],
+    pub owner_control_plane_tools: &'a [String],
 }
 
 impl<'a> ClosingAuthority<'a> {
@@ -27,7 +28,20 @@ impl<'a> ClosingAuthority<'a> {
             forbids_mutation: authority.forbids_mutation,
             allowed_tool_names: authority.allowed_tool_names,
             forbidden_tool_scopes: authority.forbidden_tool_scopes,
+            owner_control_plane_tools: authority.owner_control_plane_tools,
         }
+    }
+
+    /// The tool is admitted only because the runtime kept it as an owner
+    /// control-plane tool; the caller must also check the exact call
+    /// (`Tool::owner_control_plane_call`).
+    pub(in crate::agent) fn admits_only_as_control_plane(&self, tool: &str) -> bool {
+        !self.allowed_tool_names.is_empty()
+            && !self.allowed_tool_names.iter().any(|name| name == tool)
+            && self
+                .owner_control_plane_tools
+                .iter()
+                .any(|name| name == tool)
     }
 
     /// Whether Authority admits invoking `tool` at all. `read_only` is the
@@ -39,7 +53,11 @@ impl<'a> ClosingAuthority<'a> {
             return false;
         }
         let explicitly_allowed = self.allowed_tool_names.iter().any(|name| name == tool);
-        if !self.allowed_tool_names.is_empty() && !explicitly_allowed {
+        let control_plane = self
+            .owner_control_plane_tools
+            .iter()
+            .any(|name| name == tool);
+        if !self.allowed_tool_names.is_empty() && !explicitly_allowed && !control_plane {
             return false;
         }
         // Exact beats broad: a tool the request named explicitly is admitted
@@ -145,6 +163,7 @@ mod tests {
             forbids_mutation,
             allowed_tool_names: &[],
             forbidden_tool_scopes: forbidden,
+            owner_control_plane_tools: &[],
         }
     }
 
@@ -191,6 +210,7 @@ mod tests {
             forbids_mutation: false,
             allowed_tool_names: &allowed,
             forbidden_tool_scopes: &[ToolSemanticScope::LocalWorkspace],
+            owner_control_plane_tools: &[],
         };
         assert!(obligation_admissible(
             &obligation,

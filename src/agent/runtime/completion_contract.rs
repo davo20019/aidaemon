@@ -83,6 +83,21 @@ pub(crate) struct RequestAuthority<'a> {
     pub forbids_tool_use: bool,
     pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
+    pub owner_control_plane_tools: &'a [String],
+}
+
+impl RequestAuthority<'_> {
+    /// Whether the name-level boundary offers `tool`: no allowlist, an
+    /// allowlisted name, or an owner control-plane tool the runtime kept
+    /// (whose calls the per-call gate narrows further).
+    pub(crate) fn offers_tool_name(&self, tool: &str) -> bool {
+        self.allowed_tool_names.is_empty()
+            || self.allowed_tool_names.iter().any(|name| name == tool)
+            || self
+                .owner_control_plane_tools
+                .iter()
+                .any(|name| name == tool)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -106,6 +121,10 @@ pub(super) struct CompletionContract {
     pub forbids_tool_use: bool,
     /// Explicit allow-only tool boundary. Empty means no name-level allowlist.
     pub allowed_tool_names: Vec<String>,
+    /// Owner control-plane tools the runtime keeps outside a narrowed
+    /// allowlist (owner, private channel, scope not forbidden). Never an
+    /// assessor output; only their gated calls are admitted.
+    pub owner_control_plane_tools: Vec<String>,
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
     pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
@@ -147,6 +166,7 @@ impl CompletionContract {
             forbids_tool_use: self.forbids_tool_use,
             allowed_tool_names: &self.allowed_tool_names,
             forbidden_tool_scopes: &self.forbidden_tool_scopes,
+            owner_control_plane_tools: &self.owner_control_plane_tools,
         }
     }
 
@@ -264,6 +284,7 @@ pub(super) fn completion_contract_from_persisted(
         forbids_mutation: contract.forbids_mutation,
         forbids_tool_use: contract.forbids_tool_use,
         allowed_tool_names: contract.allowed_tool_names.clone(),
+        owner_control_plane_tools: Vec::new(),
         forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
         dispatch_stop_rules: contract.dispatch_stop_rules.clone(),
         required_response_fields: contract.required_response_fields.clone(),
@@ -729,6 +750,7 @@ pub(super) fn install_semantic_completion_contract(
         forbids_mutation: false,
         forbids_tool_use: false,
         allowed_tool_names: Vec::new(),
+        owner_control_plane_tools: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
         dispatch_stop_rules: Vec::new(),
         required_response_fields: Vec::new(),
@@ -2573,6 +2595,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         forbids_mutation,
         forbids_tool_use: false,
         allowed_tool_names: Vec::new(),
+        owner_control_plane_tools: Vec::new(),
         forbidden_tool_scopes: Vec::new(),
         dispatch_stop_rules: Vec::new(),
         required_response_fields: Vec::new(),
@@ -2610,6 +2633,7 @@ mod tests {
             forbids_mutation: true,
             forbids_tool_use: false,
             allowed_tool_names: Vec::new(),
+            owner_control_plane_tools: Vec::new(),
             forbidden_tool_scopes: Vec::new(),
             dispatch_stop_rules: Vec::new(),
             required_response_fields: Vec::new(),

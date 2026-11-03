@@ -2473,6 +2473,22 @@ impl Tool for ManageMandatesTool {
         true
     }
 
+    fn owner_control_plane_call(&self, arguments: &str) -> bool {
+        // Read-only actions, plus create and update, which commit only after
+        // the owner confirms through the approval broker. Transitions (pause,
+        // resume, cancel, answer_question, resolve_reconciliation) take
+        // effect without a confirmation and are not admitted here.
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| args.get("action")?.as_str().map(str::to_string))
+            .is_some_and(|action| {
+                matches!(
+                    action.as_str(),
+                    "draft" | "create" | "update" | "list" | "get" | "list_intentions"
+                )
+            })
+    }
+
     fn description(&self) -> &str {
         "Draft, create, inspect, and govern owner-confirmed ongoing mandates."
     }

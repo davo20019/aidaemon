@@ -775,3 +775,109 @@ async fn test_owner_mandate_control_survives_assessment_tool_narrowing() {
         );
     }
 }
+
+/// Assessment JSON narrowing the turn to `system_info`, optionally also
+/// forbidding the given tool scopes.
+fn narrowed_assessment(forbidden_scopes: serde_json::Value) -> crate::traits::ProviderResponse {
+    let base = MockProvider::semantic_task_assessment(
+        "answer",
+        false,
+        false,
+        &[],
+        "new_request",
+        "none",
+    );
+    let mut assessment: serde_json::Value =
+        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+    assessment["schema_version"] = 10.into();
+    assessment["contract"]["tool_scope"] = "restricted".into();
+    assessment["contract"]["allowed_tool_names"] = json!(["system_info"]);
+    assessment["contract"]["forbidden_tool_scopes"] = forbidden_scopes;
+    MockProvider::text_response(&assessment.to_string())
+}
+
+/// A re-admitted control tool runs only its confirmation-gated or read-only
+/// actions: an unconfirmed transition such as `cancel` stays refused on a
+/// turn the assessment narrowed, while `list` runs.
+#[tokio::test]
+async fn test_owner_control_plane_admits_only_gated_actions() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "manage_mandates",
+            &json!({"action": "cancel", "mandate_id": "synthetic-mandate-1"}).to_string(),
+        ),
+        MockProvider::tool_call_response("manage_mandates", &json!({"action": "list"}).to_string()),
+        MockProvider::text_response("You have no mandates."),
+    ])
+    .with_task_assessments(vec![narrowed_assessment(json!([]))]);
+    let harness = setup_test_agent_with_mandates(provider).await.unwrap();
+    harness
+        .agent
+        .handle_message(
+            "owner-chat",
+            "Which mandates do I have?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let results = harness
+        .agent
+        .event_store()
+        .query_events_by_types("owner-chat", &[crate::events::EventType::ToolResult], 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+        .filter(|result| result.name == "manage_mandates")
+        .map(|result| result.result)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let refused = results.iter().filter(|r| r.contains("[AUTHORITY BLOCKED]")).count();
+    assert_eq!(refused, 1, "only the cancel is refused: {results:?}");
+}
+
+/// A request that forbids the goal-state scope keeps the control tool out of
+/// both the offered tools and the per-call gate.
+#[tokio::test]
+async fn test_owner_control_plane_respects_forbidden_scopes() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("manage_mandates", &json!({"action": "list"}).to_string()),
+        MockProvider::text_response("Done."),
+    ])
+    .with_task_assessments(vec![narrowed_assessment(json!(["goal_state"]))]);
+    let harness = setup_test_agent_with_mandates(provider).await.unwrap();
+    harness
+        .agent
+        .handle_message(
+            "owner-chat",
+            "Which mandates do I have?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let calls = harness.provider.call_log.lock().await;
+    let offered = calls
+        .iter()
+        .flat_map(|call| call.tools.iter())
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .any(|name| name == "manage_mandates");
+    assert!(!offered, "the forbidden-scope tool was offered");
+    drop(calls);
+    let ran = harness
+        .agent
+        .event_store()
+        .query_events_by_types("owner-chat", &[crate::events::EventType::ToolResult], 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+        .filter(|result| result.name == "manage_mandates")
+        .all(|result| result.result.contains("BLOCKED") || !result.success);
+    assert!(ran, "a call to the forbidden-scope tool was admitted");
+}
