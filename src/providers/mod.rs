@@ -62,3 +62,12 @@ pub(crate) fn build_http_client(timeout: Duration) -> Result<Client, String> {
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
+
+/// A system message that arrives after the conversation started, for a
+/// provider with no mid-conversation system role: it rides in a user turn,
+/// delimited so the model reads it as harness context rather than the
+/// user's words. Hoisting it into the top-level system field instead would
+/// rewrite the cached prefix of every request and lose its position.
+pub(crate) fn in_place_system_text(text: &str) -> String {
+    format!("<system-reminder>\n{text}\n</system-reminder>")
+}

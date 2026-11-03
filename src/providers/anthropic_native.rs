@@ -96,6 +96,20 @@ impl AnthropicNativeProvider {
         for msg in messages {
             let role = msg["role"].as_str().unwrap_or("user");
             match role {
+                "system" if !anthropic_msgs.is_empty() => {
+                    // A system message after the conversation started (a
+                    // per-turn context tail, a mid-run directive) stays in
+                    // place. Folding it into the top-level system prompt
+                    // would rewrite the cached prefix of every request and
+                    // move it out of order.
+                    let text = msg["content"].as_str().unwrap_or("");
+                    if !text.is_empty() {
+                        anthropic_msgs.push(json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": super::in_place_system_text(text)}],
+                        }));
+                    }
+                }
                 "system" => {
                     let text = msg["content"].as_str().unwrap_or("").to_string();
                     if let Some(ref mut existing) = system_prompt {
@@ -951,6 +965,29 @@ mod tests {
         assert_eq!(content[0]["type"], "tool_result");
         assert_eq!(content[0]["tool_use_id"], "call_abc");
         assert_eq!(content[0]["content"], "tool output here");
+    }
+
+    #[test]
+    fn later_system_messages_stay_in_place() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "system", "content": "Core."}),
+            json!({"role": "user", "content": "Earlier turn"}),
+            json!({"role": "assistant", "content": "Reply"}),
+            json!({"role": "system", "content": "Task tail."}),
+            json!({"role": "user", "content": "Now"}),
+        ];
+        let (system, msgs) = p.convert_messages(&messages);
+        assert_eq!(system.as_deref(), Some("Core."));
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // The tail joins the next user turn, ahead of the user's words.
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0]["text"],
+            "<system-reminder>\nTask tail.\n</system-reminder>"
+        );
+        assert_eq!(blocks[1]["text"], "Now");
     }
 
     #[test]

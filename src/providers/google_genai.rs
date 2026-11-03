@@ -228,12 +228,29 @@ impl GoogleGenAiProvider {
     /// Convert OpenAI-format messages to Gemini "contents" + "system_instruction"
     fn convert_messages(&self, messages: &[Value]) -> (Option<Value>, Vec<Value>) {
         let mut system_instruction: Option<Value> = None;
-        let mut contents = Vec::new();
+        let mut contents: Vec<Value> = Vec::new();
 
         for msg in messages {
             let role = msg["role"].as_str().unwrap_or("user");
 
             match role {
+                "system" if !contents.is_empty() => {
+                    // A system message after the conversation started stays
+                    // in place (see `in_place_system_text`), joined to an
+                    // adjacent user turn when there is one.
+                    let text = msg["content"].as_str().unwrap_or("");
+                    if !text.is_empty() {
+                        let part = json!({"text": super::in_place_system_text(text)});
+                        match contents.last_mut() {
+                            Some(last) if last["role"] == "user" => {
+                                if let Some(parts) = last["parts"].as_array_mut() {
+                                    parts.push(part);
+                                }
+                            }
+                            _ => contents.push(json!({"role": "user", "parts": [part]})),
+                        }
+                    }
+                }
                 "system" => {
                     // Gemini supports top-level system_instruction (for 1.5+ models)
                     // If multiple system messages exist, we concatenate them (or just take the last one, but concatenation is safer)
@@ -898,6 +915,29 @@ impl GoogleGenAiProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn later_system_messages_stay_in_place() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "system", "content": "Core."}),
+            json!({"role": "user", "content": "Earlier turn"}),
+            json!({"role": "assistant", "content": "Reply"}),
+            json!({"role": "system", "content": "Task tail."}),
+            json!({"role": "user", "content": "Now"}),
+        ];
+        let (system, contents) = p.convert_messages(&messages);
+        assert_eq!(system.unwrap()["parts"][0]["text"], "Core.");
+        let roles: Vec<&str> = contents
+            .iter()
+            .map(|c| c["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "model", "user", "user"]);
+        assert_eq!(
+            contents[2]["parts"][0]["text"],
+            "<system-reminder>\nTask tail.\n</system-reminder>"
+        );
+    }
 
     fn provider() -> GoogleGenAiProvider {
         let client = Client::builder()
