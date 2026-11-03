@@ -155,3 +155,37 @@ async fn test_sdk_mid_turn_message_from_another_sender_stays_queued() {
     drop(log);
     assert_eq!(registry.queue_len(session).await, 1);
 }
+
+#[tokio::test]
+async fn test_sdk_context_overflow_records_the_window_and_retries() {
+    // A model name of its own: the learned window is process-wide.
+    let model = "gpt-6-synthetic-overflow-retry";
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Answered after the retry.",
+    )])
+    .with_leading_errors(vec![
+        r#"{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#,
+    ]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![], None)
+        .await
+        .unwrap();
+    harness.agent.set_test_model(model).await;
+    let before = crate::config::ContextWindowConfig::default().context_budget_for(model);
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "tg_context_overflow",
+            "Summarize the plan",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(reply.contains("Answered after the retry."), "{reply}");
+    let after = crate::config::ContextWindowConfig::default().context_budget_for(model);
+    assert!(after < before, "the rejection lowered the budget: {before} -> {after}");
+}

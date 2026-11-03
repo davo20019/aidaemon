@@ -385,6 +385,16 @@ impl Agent {
                     "LLM call failed: {}",
                     provider_err
                 );
+                // Too long for this model's window: retrying the same input
+                // cannot succeed. Record the window and hand the error back so
+                // the caller can shrink the request.
+                if let Some(stated) = crate::providers::context_overflow(&provider_err.to_string())
+                {
+                    let attempted =
+                        crate::memory::context_window::estimate_multimodal_message_tokens(messages);
+                    crate::config::record_context_overflow(model, stated, attempted);
+                    return Err(provider_err.into());
+                }
                 let recovery_route =
                     provider_err.recovery_route(options.single_attempt_fail_closed);
                 if recovery_route == ProviderRecoveryRoute::Fail {

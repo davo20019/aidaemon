@@ -53,6 +53,9 @@ pub struct MockProvider {
     reject_non_default_options: bool,
     strict_responses: bool,
     exhausted_response_calls: Mutex<u32>,
+    /// Errors returned, in order, by the next main-loop calls before any
+    /// scripted response is used.
+    leading_errors: Mutex<Vec<String>>,
     /// When true (default), assessment/re-planner LLM calls are silently
     /// intercepted with an empty response (causing generate_task_plan()
     /// to return None). Preserves existing test behavior — no plan
@@ -72,6 +75,7 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
         }
     }
@@ -87,6 +91,7 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
         }
     }
@@ -105,12 +110,21 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
         }
     }
 
     /// Reject unexpected execution-model calls instead of inventing a reply.
     /// Assessment lanes remain independently scripted via with_task_assessments.
+    /// Fail the next main-loop calls with these provider errors (as a 400)
+    /// before the scripted responses start.
+    pub fn with_leading_errors(self, errors: Vec<&str>) -> Self {
+        *self.leading_errors.try_lock().expect("fresh mock") =
+            errors.into_iter().map(str::to_string).collect();
+        self
+    }
+
     pub fn with_strict_responses(mut self) -> Self {
         self.strict_responses = true;
         self
@@ -421,6 +435,14 @@ impl ModelProvider for MockProvider {
         };
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
+        }
+
+        {
+            let mut errors = self.leading_errors.lock().await;
+            if !errors.is_empty() {
+                let error = errors.remove(0);
+                return Err(ProviderError::from_status(400, &error).into());
+            }
         }
 
         // Return next scripted response, or a default

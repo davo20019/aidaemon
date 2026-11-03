@@ -3508,13 +3508,16 @@ impl ContextWindowConfig {
     }
 
     /// The model's total context budget: an explicit `model_budgets` entry,
-    /// else the model family's known window, else `default_budget`.
+    /// else the model family's known window (or `default_budget`), lowered
+    /// to what the provider reported if it rejected a request as too long.
     pub fn context_budget_for(&self, model: &str) -> usize {
-        self.model_budgets
-            .get(model)
-            .copied()
-            .or_else(|| known_context_budget(model))
-            .unwrap_or(self.default_budget)
+        if let Some(budget) = self.model_budgets.get(model) {
+            return *budget;
+        }
+        let assumed = known_context_budget(model).unwrap_or(self.default_budget);
+        // A window the provider itself reported (it rejected a request as
+        // too long) overrides the assumption when smaller.
+        learned_context_budget(model).map_or(assumed, |learned| learned.min(assumed))
     }
 
     /// Token-pressure high-water mark, clamped for small model windows.
@@ -3549,6 +3552,41 @@ const KNOWN_CONTEXT_WINDOWS: &[(&str, usize)] = &[
     ("gemini-", 1_000_000),
     ("grok-4", 256_000),
 ];
+
+/// Budgets learned this process from providers rejecting a request as too
+/// long, by model.
+fn learned_context_budgets() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    static LEARNED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    LEARNED.get_or_init(Default::default)
+}
+
+fn learned_context_budget(model: &str) -> Option<usize> {
+    learned_context_budgets()
+        .lock()
+        .ok()
+        .and_then(|learned| learned.get(model).copied())
+}
+
+/// Record that `model` rejected a request of about `attempted_tokens` as
+/// too long. The budget becomes 85% of the window the error stated, or 75%
+/// of the attempt when it stated none; it only ever shrinks.
+pub(crate) fn record_context_overflow(
+    model: &str,
+    stated_window: Option<usize>,
+    attempted_tokens: usize,
+) -> usize {
+    let budget = stated_window
+        .map(|window| window / 100 * 85)
+        .unwrap_or(attempted_tokens / 4 * 3)
+        .max(4_000);
+    let mut learned = learned_context_budgets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = learned.entry(model.to_string()).or_insert(budget);
+    *entry = (*entry).min(budget);
+    *entry
+}
 
 /// The budget for a model family listed in [`KNOWN_CONTEXT_WINDOWS`].
 pub(crate) fn known_context_budget(model: &str) -> Option<usize> {
@@ -4288,6 +4326,19 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         );
         config.model_budgets.insert("gpt-6-sol".to_string(), 50_000);
         assert_eq!(config.context_budget_for("gpt-6-sol"), 50_000);
+    }
+
+    #[test]
+    fn a_reported_overflow_lowers_the_budget_and_never_raises_it() {
+        let config = ContextWindowConfig::default();
+        let model = "gpt-6-synthetic-overflow";
+        assert_eq!(config.context_budget_for(model), 231_200);
+        // No stated window: three quarters of the rejected attempt.
+        assert_eq!(record_context_overflow(model, None, 200_000), 150_000);
+        assert_eq!(config.context_budget_for(model), 150_000);
+        // A larger stated window cannot raise it back.
+        assert_eq!(record_context_overflow(model, Some(400_000), 0), 150_000);
+        assert_eq!(config.context_budget_for(model), 150_000);
     }
 
     #[test]

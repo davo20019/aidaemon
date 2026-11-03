@@ -14,6 +14,9 @@ pub(super) const STREAMING_MAX_MODEL_CALL: Duration = Duration::from_secs(600);
 /// regains control, not so it ends.
 pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
 
+/// Retries after a context-overflow rejection, each with a smaller budget.
+pub(super) const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 2;
+
 /// Heads a user message taken into a running turn.
 pub(super) const STEERING_MARKER: &str =
     "[The user sent this while you were working. Take it into account from here on.]";
@@ -113,6 +116,17 @@ impl Agent {
     pub(super) async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
         let reply = loop {
             let reply = self.sdk_model_call(scope, &call.request).await;
+            // The provider rejected the request as too long: its window is
+            // now recorded, so the retry compacts the run to fit.
+            if reply.is_err()
+                && scope.context_overflowed.swap(false, Ordering::Relaxed)
+                && scope
+                    .context_overflow_retries
+                    .fetch_add(1, Ordering::Relaxed)
+                    < MAX_CONTEXT_OVERFLOW_RETRIES
+            {
+                continue;
+            }
             // Only a timed-out call comes back Transient here: the provider
             // stack has already retried everything else it can.
             let Err(sdk::ProviderError::Transient(_)) = &reply else {
@@ -451,6 +465,23 @@ impl Agent {
                 );
                 if error.is::<ModelCallTimedOut>() {
                     return Err(sdk::ProviderError::Transient(error.to_string()));
+                }
+                if let Some(stated) = crate::providers::context_overflow(&error.to_string()) {
+                    let budget = crate::config::record_context_overflow(
+                        &request.model,
+                        stated,
+                        est_input_tokens,
+                    );
+                    warn!(
+                        task_id = scope.task_id,
+                        model = %request.model,
+                        est_input_tokens,
+                        ?stated,
+                        budget,
+                        "SDK engine: the model's context window is smaller than assumed; \
+                         recorded it and retrying with the run compacted"
+                    );
+                    scope.context_overflowed.store(true, Ordering::Relaxed);
                 }
                 return Err(sdk::ProviderError::Other(error.to_string()));
             }

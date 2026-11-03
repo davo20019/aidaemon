@@ -385,6 +385,10 @@ struct TurnScope<'a> {
     budget_warning_sent: AtomicBool,
     /// Timed-out model calls retried in this run.
     model_call_timeouts: std::sync::atomic::AtomicU32,
+    /// The latest model call was rejected as too long for the model's
+    /// window (now recorded); the call is retried once compacted.
+    context_overflowed: AtomicBool,
+    context_overflow_retries: std::sync::atomic::AtomicU32,
     /// `send_file` dedupe keys that already succeeded in this task.
     sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
@@ -739,6 +743,8 @@ impl Agent {
             gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
+            context_overflowed: AtomicBool::new(false),
+            context_overflow_retries: std::sync::atomic::AtomicU32::new(0),
             task_tokens: AtomicU64::new(0),
             task_budget: AtomicU64::new(task_token_budget(
                 self.limits.task_token_budget,
