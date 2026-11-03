@@ -1141,7 +1141,6 @@ async fn build_base_tool(
                 .with_confinement(config.terminal.confinement)
                 .with_event_store(event_store)
                 .with_state(state)
-                .with_self_correction(config.self_correction.clone())
                 .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
             BuiltBaseTool {

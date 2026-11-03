@@ -1189,16 +1189,6 @@ impl Agent {
             None
         };
 
-        // Correction-execution context for this turn. `Some` ONLY when this agent
-        // is running under a deliberately-dispatched remediation goal id (see
-        // `correction_dispatch::dispatch_correction_remediation` +
-        // `Agent::correction_context_for_current_goal`). `None` for every normal,
-        // user-initiated turn — preserving the prior hardcoded `correction: None`
-        // behavior byte-for-byte on non-remediation paths. Fetched once here and
-        // cloned into each iteration's `ToolExecutionCtx` so the P2.4 per-call
-        // sandbox gate fires on the remediation task-lead and all its executors.
-        let _correction_context = self.correction_context_for_current_goal().await;
-
         // On the SDK engine the kernel runs the iteration loop; every per-turn
         // setup above (assessment, contract, harness eval, budgets, pending
         // directives) is shared with the legacy loop.

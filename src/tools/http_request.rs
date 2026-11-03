@@ -1391,12 +1391,11 @@ impl HttpRequestTool {
     /// Returns the formatted output string, the HTTP status code (if one was
     /// observed), and truncation info (if the response body was truncated).
     ///
-    /// All three booleans are Rust-side control-plane flags and must never be
-    /// derived from tool arguments or model output. `correction_preapproved`
-    /// and `mandate_preapproved` identify independent, exact-call authority
-    /// sources that can bypass the redundant approval prompt after safety
-    /// checks. Correction preapproval applies only outside mandate execution;
-    /// mandate preapproval applies only when `mandate_execution` is also true.
+    /// Both booleans are Rust-side control-plane flags and must never be
+    /// derived from tool arguments or model output. `mandate_preapproved`
+    /// identifies an exact-call authority source that can bypass the redundant
+    /// approval prompt after safety checks; it applies only when
+    /// `mandate_execution` is also true.
     /// Mandate execution disables redirects and automatic OAuth replay so
     /// execution cannot leave or repeat the exact action covered by the
     /// action-bound mandate grant.
@@ -1426,7 +1425,6 @@ impl HttpRequestTool {
     async fn execute(
         &self,
         arguments: &str,
-        correction_preapproved: bool,
         mandate_preapproved: bool,
         mandate_execution: bool,
     ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
@@ -1654,10 +1652,9 @@ impl HttpRequestTool {
         // Step 8: Classify risk and request approval.
         //
         // Approval is skipped when:
-        //   a) correction_preapproved && !mandate_execution, OR
-        //   b) mandate_execution && mandate_preapproved (Rust-side exact grant), OR
-        //   c) an ordinary (non-mandate) request is session-approved, OR
-        //   d) an ordinary request has trusted scheduled-task context.
+        //   a) mandate_execution && mandate_preapproved (Rust-side exact grant), OR
+        //   b) an ordinary (non-mandate) request is session-approved, OR
+        //   c) an ordinary request has trusted scheduled-task context.
         let risk = if method_override_headers.is_empty() && authority_override_headers.is_empty() {
             Self::classify_risk(&method, body.is_some_and(|value| !value.is_empty()))
         } else {
@@ -1673,9 +1670,8 @@ impl HttpRequestTool {
         );
 
         // Authority paths are deliberately disjoint. Once the common
-        // dispatcher marks a call as mandate execution, correction authority
-        // cannot stand in for the mandate's exact action grant.
-        let correction_grant_preapproved = correction_preapproved && !mandate_execution;
+        // dispatcher marks a call as mandate execution, only the mandate's
+        // exact action grant can skip the prompt.
         let mandate_grant_preapproved = mandate_execution && mandate_preapproved;
         let session_approved = if mandate_execution {
             false
@@ -1683,8 +1679,7 @@ impl HttpRequestTool {
             self.is_session_approved(session_id, &approval_key).await
         };
         let trusted_for_approval = is_trusted_session && !mandate_execution;
-        if !correction_grant_preapproved
-            && !mandate_grant_preapproved
+        if !mandate_grant_preapproved
             && Self::requires_runtime_approval(risk, session_approved, trusted_for_approval)
         {
             let mut desc = format!("{} {}", method, url);
@@ -2122,7 +2117,7 @@ impl Tool for HttpRequestTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments, false, false, false)
+        self.execute(arguments, false, false)
             .await
             .map(|(output, _, _)| output)
     }
@@ -2133,8 +2128,7 @@ impl Tool for HttpRequestTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, http_status, truncation) =
-            self.execute(arguments, false, false, false).await?;
+        let (output, http_status, truncation) = self.execute(arguments, false, false).await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -2228,7 +2222,6 @@ impl Tool for HttpRequestTool {
         let (output, http_status, truncation) = self
             .execute(
                 arguments,
-                exec_ctx.correction_preapproved,
                 exec_ctx.mandate_preapproved,
                 exec_ctx.mandate_execution,
             )
@@ -3165,16 +3158,6 @@ mod tests {
                 },
                 true,
             ),
-            (
-                "correction-cannot-substitute-for-mandate-grant",
-                ToolExecutionContext {
-                    correction_preapproved: true,
-                    mandate_preapproved: false,
-                    mandate_execution: true,
-                    mutation_forbidden: false,
-                },
-                false,
-            ),
         ];
 
         for (case, exec_ctx, trusted_session_argument) in cases {
@@ -3388,7 +3371,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved: true,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3426,7 +3408,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3472,7 +3453,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3566,7 +3546,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3611,7 +3590,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     // The dispatcher issued an exact grant for this
                     // authenticated observation, including its stable account.
                     mandate_preapproved: true,
@@ -3679,7 +3657,6 @@ mod tests {
                 &arguments,
                 None,
                 ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved: true,
                     mandate_execution: true,
                     mutation_forbidden: false,

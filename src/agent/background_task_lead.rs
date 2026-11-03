@@ -1114,14 +1114,9 @@ pub fn spawn_background_task_lead(
     initial_surface_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        // Teardown handles for the self-correction bridge (3c P3b.3). The body
-        // below has many early `return`s, so the existing logic is wrapped in an
-        // inner future; whichever way it exits, we clear any correction-execution
-        // context registered for this goal id afterward. For non-remediation
-        // goals this is a cheap no-op (the key was never registered); for
-        // dispatched remediations it tears the context down on completion
-        // (success OR error) instead of leaking until bounded FIFO eviction.
-        let teardown_agent = agent.clone();
+        // Teardown handles. The body below has many early `return`s, so the
+        // existing logic is wrapped in an inner future; whichever way it exits,
+        // the scheduled-run teardown below runs afterward.
         let teardown_goal_id = goal.id.clone();
         let teardown_state = state.clone();
         let teardown_goal_token_registry = goal_token_registry.clone();
@@ -3254,16 +3249,6 @@ pub fn spawn_background_task_lead(
                 );
             }
         }
-
-        // Self-correction bridge teardown (3c P3b.3): clear any correction-
-        // execution context registered under this goal id. Idempotent — for the
-        // overwhelming majority of (non-remediation) goals the key was never
-        // registered, so this is a no-op; for a dispatched remediation it removes
-        // the context now that the task lead (and its executors) have finished,
-        // so contexts don't linger until bounded FIFO eviction.
-        teardown_agent
-            .clear_correction_context(&teardown_goal_id)
-            .await;
     });
 }
 

@@ -4732,52 +4732,6 @@ async fn reopening_store_closes_inactive_legacy_continuous_runs() {
 }
 
 #[tokio::test]
-async fn self_correction_attempts_table_exists_after_migration() {
-    let (store, _file) = setup_test_store().await;
-    // sqlite_master lists user tables; the migration runs on store open.
-    let name: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='self_correction_attempts'",
-    )
-    .fetch_optional(&store.pool())
-    .await
-    .unwrap();
-    assert_eq!(name.as_deref(), Some("self_correction_attempts"));
-}
-
-#[tokio::test]
-async fn record_and_get_self_correction_attempts_round_trip() {
-    let (store, _file) = setup_test_store().await;
-    let a1 = crate::traits::SelfCorrectionAttempt {
-        id: 0,
-        subject_id: "task-7".to_string(),
-        subject_kind: crate::traits::SelfCorrectionSubjectKind::Task
-            .as_str()
-            .to_string(),
-        approach_signature: "terminal:du -ah ~".to_string(),
-        attempt_index: 1,
-        status: crate::traits::attempt_status::FAILED.to_string(),
-        blocked_reason: None,
-        evidence_ref: Some("activity-42".to_string()),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    store.record_self_correction_attempt(&a1).await.unwrap();
-
-    let got = store.get_self_correction_attempts("task-7").await.unwrap();
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].subject_id, "task-7");
-    assert_eq!(got[0].approach_signature, "terminal:du -ah ~");
-    assert_eq!(got[0].status, "failed");
-    assert_eq!(got[0].attempt_index, 1);
-
-    // A different subject is isolated.
-    assert!(store
-        .get_self_correction_attempts("task-other")
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
 async fn completing_a_task_refreshes_goal_last_useful_action() {
     let (store, _tmp) = setup_test_store().await;
 

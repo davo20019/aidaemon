@@ -3060,28 +3060,6 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
 
-    let _ = sqlx::query(
-        "CREATE TABLE IF NOT EXISTS self_correction_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id TEXT NOT NULL,
-            subject_kind TEXT NOT NULL,
-            approach_signature TEXT NOT NULL,
-            attempt_index INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            blocked_reason TEXT,
-            evidence_ref TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-    )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_sc_attempts_subject \
-         ON self_correction_attempts(subject_id, created_at)",
-    )
-    .execute(pool)
-    .await;
-
     // Canonical long-term memory. Domain tables remain authoritative during
     // the rolling migration; these tables are durable projections with explicit
     // provenance, validity, and replaceable search indexes.

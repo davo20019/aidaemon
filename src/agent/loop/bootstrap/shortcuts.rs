@@ -47,8 +47,6 @@ pub(super) async fn maybe_handle_stop_command(
                 trusted: channel_ctx.trusted,
                 user_role,
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,

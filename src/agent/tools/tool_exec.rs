@@ -124,14 +124,6 @@ pub(super) struct ToolExecCtx<'a> {
     /// Present only after `ChannelContext::active_workspace_grant` validated
     /// the exact guest/workspace/channel/sender binding.
     pub workspace_grant: Option<&'a WorkspaceGrant>,
-    /// Set by the correction gate when this specific tool call has already
-    /// been classified as allowed for unattended execution.
-    /// False on all normal (non-correction) paths.
-    pub correction_preapproved: bool,
-    /// When true, the `_trusted_session` enrichment flag must NOT be injected
-    /// into tool args (the correction sandbox overrides trusted-session semantics).
-    /// False on all normal paths.
-    pub suppress_trusted_session: bool,
     /// Exact action-bound authority for a call made under an autonomous
     /// mandate. It is issued by the execution loop and never model-visible.
     pub mandate_authority: Option<&'a crate::traits::MandateAuthorityGrant>,
@@ -633,12 +625,10 @@ impl Agent {
         let under_mandate = self
             .validate_mandate_dispatch(name, arguments, ctx, false)
             .await?;
-        // Trust suppression: when the correction gate sets suppress_trusted_session,
-        // we must NOT inject `_trusted_session` even if ChannelContext.trusted is true
-        // or scheduled provenance would ordinarily authorize it.  Setting ctx.trusted=false
-        // alone is insufficient because the OR below would still pick up scheduled
-        // provenance; the entire expression must short-circuit to false.
-        let trusted = if ctx.suppress_trusted_session || under_mandate {
+        // A mandate-authorized call must NOT inject `_trusted_session` even if
+        // ChannelContext.trusted is true or scheduled provenance would ordinarily
+        // authorize it; the entire expression short-circuits to false.
+        let trusted = if under_mandate {
             false
         } else {
             ctx.trusted
@@ -831,9 +821,6 @@ impl Agent {
                 false
             };
             let exec_ctx = crate::traits::ToolExecutionContext {
-                // Workspace-grant builtins are outside the correction approval
-                // bypass; preserve the existing boundary between authority paths.
-                correction_preapproved: false,
                 mandate_preapproved,
                 mandate_execution: under_mandate,
                 mutation_forbidden: ctx.mutation_forbidden,
@@ -886,7 +873,6 @@ impl Agent {
                     false
                 };
                 let exec_ctx = crate::traits::ToolExecutionContext {
-                    correction_preapproved: ctx.correction_preapproved,
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
@@ -922,8 +908,7 @@ impl Agent {
         }
 
         // Search MCP registry for dynamically registered tools.
-        // MCP adapters remain outside the correction approval bypass. A mandate
-        // bit can reach one only after the same exact-grant revalidation used
+        // A mandate bit can reach an MCP adapter only after the same exact-grant revalidation used
         // for builtins (MCP tools are non-delegable under the v1 policy).
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
@@ -939,7 +924,6 @@ impl Agent {
                     false
                 };
                 let exec_ctx = crate::traits::ToolExecutionContext {
-                    correction_preapproved: false,
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
@@ -1062,10 +1046,6 @@ mod unset_argument_tests {
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]
 mod tool_watchdog_tests;
-
-#[cfg(test)]
-#[path = "correction_preapproval_tests.rs"]
-mod correction_preapproval_tests;
 
 #[cfg(test)]
 mod scoped_workspace_tests {

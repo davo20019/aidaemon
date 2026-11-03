@@ -1369,8 +1369,6 @@ impl Agent {
             trusted: scope.channel_ctx.trusted,
             user_role: scope.user_role,
             workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
-            correction_preapproved: false,
-            suppress_trusted_session: false,
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
             mutation_forbidden: scope.contract.authority().forbids_mutation,

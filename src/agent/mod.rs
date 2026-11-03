@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,48 +39,6 @@ pub use crate::types::StatusUpdate;
 // agent namespace via `use super::*` (e.g. `runtime/goal_failure_tests.rs`).
 #[cfg(test)]
 use crate::traits::Task;
-
-type CorrectionContext = Arc<crate::agent::correction_execution::CorrectionExecutionContext>;
-
-#[derive(Default)]
-struct CorrectionContextRegistry {
-    contexts: HashMap<String, CorrectionContext>,
-    insertion_order: VecDeque<String>,
-}
-
-impl CorrectionContextRegistry {
-    fn insert(&mut self, goal_id: String, ctx: CorrectionContext) {
-        if !self.contexts.contains_key(&goal_id) {
-            self.insertion_order.push_back(goal_id.clone());
-        }
-        self.contexts.insert(goal_id, ctx);
-        self.evict_oldest_until_bounded();
-    }
-
-    fn get(&self, goal_id: &str) -> Option<CorrectionContext> {
-        self.contexts.get(goal_id).cloned()
-    }
-
-    fn remove(&mut self, goal_id: &str) {
-        self.contexts.remove(goal_id);
-        self.insertion_order.retain(|existing| existing != goal_id);
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.contexts.len()
-    }
-
-    fn evict_oldest_until_bounded(&mut self) {
-        while self.contexts.len() > MAX_CORRECTION_CONTEXTS {
-            if let Some(stale) = self.insertion_order.pop_front() {
-                self.contexts.remove(&stale);
-            } else {
-                break;
-            }
-        }
-    }
-}
 
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 const RECENT_CALLS_WINDOW: usize = 12;
@@ -507,39 +465,7 @@ pub struct Agent {
     harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
     /// Harness eval scoring configuration.
     harness_eval_config: HarnessEvalConfig,
-    /// Per-remediation correction-execution contexts, keyed by the synthetic
-    /// remediation **goal id** (a fresh UUID minted in
-    /// `correction_dispatch::dispatch_correction_remediation`). Shared across the
-    /// whole agent hierarchy (parent → child task-lead → executors) via `Arc`,
-    /// so every loop running under a given remediation goal id can read the same
-    /// `Arc<CorrectionExecutionContext>` and thread it into its
-    /// `ToolExecutionCtx.correction`.
-    ///
-    /// Safety / non-stickiness:
-    /// - The key is a globally-unique UUID associated with exactly ONE
-    ///   deliberately-dispatched remediation goal. No user turn, no other goal,
-    ///   and no other session ever carries that `goal_id`, so the per-call
-    ///   correction gate can only ever fire for the remediation task it was
-    ///   dispatched for — every other turn reads `None`.
-    /// - Reads CLONE the `Arc` (they do not remove it) so the gate fires on the
-    ///   remediation task-lead AND all of its executors (which inherit the same
-    ///   `goal_id`). This is NOT a session-global or sticky flag: it is scoped
-    ///   to a single unique goal id.
-    /// - The map is bounded (oldest entries evicted on insert) so a fire-and-forget
-    ///   background spawn that never reports completion cannot leak unboundedly.
-    correction_contexts: Arc<tokio::sync::RwLock<CorrectionContextRegistry>>,
 }
-
-/// Maximum number of in-flight remediation correction contexts retained in
-/// `Agent::correction_contexts`. Remediations are rare and short-lived; this cap
-/// only guards against an unbounded leak if a background spawn never tears its
-/// entry down. When exceeded, the oldest-inserted entry is evicted.
-///
-/// Consumed by `register_correction_context`, which is exercised by the dispatch
-/// path / tests; tolerated as dead in plain (non-test) lib builds until the live
-/// reaper caller lands in a later 3c task.
-#[allow(dead_code)]
-const MAX_CORRECTION_CONTEXTS: usize = 64;
 
 pub(in crate::agent) use system_directives::SystemDirective;
 
@@ -595,12 +521,6 @@ pub(crate) use goal_dispatch::{
 #[path = "background_task_lead.rs"]
 mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
-
-pub mod correction_dispatch;
-pub mod correction_execution;
-pub mod correction_intent;
-pub mod correction_sandbox;
-pub mod self_correction;
 
 // `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
 #[path = "construct.rs"]
@@ -767,76 +687,11 @@ impl Agent {
         self.context_window_config.summary_recent_tokens = recent_tokens;
     }
 
-    /// Register a correction-execution context for a remediation goal id.
-    ///
-    /// Called by `correction_dispatch::dispatch_correction_remediation` BEFORE
-    /// spawning the remediation task lead, so that the spawned hierarchy's agent
-    /// loops can thread `Some(ctx)` into their `ToolExecutionCtx.correction` (see
-    /// `correction_contexts` field docs for the safety/non-stickiness invariant).
-    ///
-    /// The map is bounded by [`MAX_CORRECTION_CONTEXTS`]; if inserting would
-    /// exceed the cap, the oldest-inserted entry is evicted first (FIFO) so a
-    /// fire-and-forget background spawn that never tears its entry down cannot
-    /// leak unboundedly.
-    ///
-    /// Exercised by the dispatch path and its tests; tolerated as dead in plain
-    /// (non-test) lib builds until the live caller lands in a later 3c task.
-    #[allow(dead_code)]
-    pub(crate) async fn register_correction_context(
-        &self,
-        goal_id: &str,
-        ctx: Arc<crate::agent::correction_execution::CorrectionExecutionContext>,
-    ) {
-        self.correction_contexts
-            .write()
-            .await
-            .insert(goal_id.to_string(), ctx);
-    }
-
-    /// Read (clone) the correction-execution context for this agent's current
-    /// goal id, if one was registered.
-    ///
-    /// This is a PEEK (it does not remove the entry) so the same context is
-    /// visible to the remediation task-lead AND every executor it spawns (they
-    /// all inherit the same `goal_id`). Returns `None` for `goal_id == None` and
-    /// for any goal id with no registered context — i.e. every normal,
-    /// user-initiated turn. Used at the `ToolExecutionCtx` construction site in
-    /// `main_loop.rs`.
-    pub(crate) async fn correction_context_for_current_goal(
-        &self,
-    ) -> Option<Arc<crate::agent::correction_execution::CorrectionExecutionContext>> {
-        let goal_id = self.goal_id.as_deref()?;
-        self.correction_contexts.read().await.get(goal_id)
-    }
-
-    /// Remove the correction-execution context for a remediation goal id once the
-    /// remediation task has finished. Idempotent. Called by the dispatch's
-    /// teardown so completed remediations do not linger in the bounded map.
-    ///
-    /// Tolerated as dead until the live teardown caller lands in a later 3c task.
-    #[allow(dead_code)]
-    pub(crate) async fn clear_correction_context(&self, goal_id: &str) {
-        self.correction_contexts.write().await.remove(goal_id);
-    }
-
-    /// Test-only: number of registered correction contexts.
+    /// Shared `EventStore` handle. Returns a borrow of the `Arc`; clone it if
+    /// an owned handle is needed.
     #[cfg(test)]
-    pub(crate) async fn correction_context_count(&self) -> usize {
-        self.correction_contexts.read().await.len()
-    }
-
-    /// Shared `EventStore` handle. Used by the idle-reaper → correction bridge
-    /// (`TerminalTool`) to fetch recent conversation history for subject
-    /// reconstruction. Returns a borrow of the `Arc`; clone it if an owned
-    /// handle is needed.
     pub(crate) fn event_store(&self) -> &Arc<EventStore> {
         &self.event_store
-    }
-
-    /// Shared `StateStore` handle. Used by the idle-reaper → correction bridge
-    /// to hand the dispatch path an owned `Arc<dyn StateStore>`.
-    pub(crate) fn state_arc(&self) -> Arc<dyn StateStore> {
-        self.state.clone()
     }
 
     pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {

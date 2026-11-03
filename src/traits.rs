@@ -14,7 +14,6 @@ mod mandates;
 mod memory;
 mod people;
 mod provider;
-mod self_correction;
 mod tools;
 mod trigger_event;
 
@@ -80,8 +79,6 @@ pub use provider::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
     ToolChoiceMode,
 };
-#[allow(unused_imports)]
-pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
     semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,

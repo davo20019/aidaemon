@@ -1033,7 +1033,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
     let workspace_grant = channel_ctx.active_workspace_grant(user_role);
     let tools_allowed_for_user = user_role == UserRole::Owner || workspace_grant.is_some();
-    let correction_mode = agent.correction_context_for_current_goal().await.is_some();
 
     let mut available_capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
     let mut base_tool_defs: Vec<Value> = Vec::new();
@@ -1112,28 +1111,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                     "filtered",
                 ));
             }
-        }
-
-        if correction_mode {
-            let before = defs.len();
-            defs.retain(|definition| {
-                Agent::tool_name_from_definition(definition).is_some_and(
-                    crate::agent::correction_sandbox::tool_may_be_offered_during_correction,
-                )
-            });
-            caps.retain(|name, _| {
-                crate::agent::correction_sandbox::tool_may_be_offered_during_correction(name)
-            });
-            tool_filter_stages.push(GateFilterStage::new(
-                "correction_sandbox_roster",
-                before,
-                defs.len(),
-                if before == defs.len() {
-                    "passed"
-                } else {
-                    "filtered"
-                },
-            ));
         }
 
         available_capabilities = caps;

@@ -1718,15 +1718,9 @@ fn default_semantics_from_identity(
 /// Do NOT add fields here that duplicate information already in the enriched args.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolExecutionContext {
-    /// When true, the correction sandbox has already classified this exact tool
-    /// call as safe for unattended execution. Tools that honor this (currently
-    /// `terminal` and `http_request`) may skip their redundant approval prompt.
-    /// Hard blocks, command-safety checks, scope, and all other validations run.
-    pub correction_preapproved: bool,
     /// True only after the final common dispatcher revalidated an exact,
-    /// action-bound `MandateAuthorityGrant` for this mutating call. This is
-    /// deliberately separate from correction preapproval so tools can honor
-    /// owner-delegated autonomy without conflating the two authority sources.
+    /// action-bound `MandateAuthorityGrant` for this mutating call, so tools
+    /// can honor owner-delegated autonomy.
     pub mandate_preapproved: bool,
     /// True only when the common dispatcher resolved this call to an active
     /// autonomous mandate. Network adapters use this control-plane bit to keep
@@ -1860,13 +1854,12 @@ pub trait Tool: Send + Sync {
         Ok(ToolCallOutcome::from_output(output))
     }
 
-    /// Context-aware execution path used by the agent loop for correction-gate calls.
+    /// Context-aware execution path used by the agent loop.
     ///
     /// The default implementation discards `exec_ctx` and delegates to
     /// `call_with_status_outcome`, so existing tools are completely unaffected.
-    /// Tools that support correction preapproval (`terminal`, `http_request`) override
-    /// this method and inspect `exec_ctx.correction_preapproved` to decide whether to
-    /// skip the user-approval prompt.
+    /// Tools that honor dispatcher-owned authority (`terminal`, `http_request`)
+    /// override this method and inspect `exec_ctx` (e.g. `mandate_preapproved`).
     ///
     /// **Security invariant:** `exec_ctx` is a Rust-side control-plane value — it must
     /// never be serialized, logged at info level, or reflected back into tool args.

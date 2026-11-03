@@ -15,7 +15,6 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::SelfCorrectionConfig;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
     DecisionType, DiagnosticSeverity, EventStore, EventType,
@@ -933,13 +932,6 @@ pub struct TerminalTool {
     inbox_dir: PathBuf,
     /// Allowed outbox directories for harness-side file delivery validation.
     outbox_dirs: Vec<PathBuf>,
-    /// Self-correction bridge config. Consulted by the idle-reaper: when a hung
-    /// background command is stopped, this config decides whether an autonomous
-    /// remediation task is dispatched (live), shadow-logged, or skipped
-    /// (disabled / unsafe scope). Defaults to the safe-off
-    /// [`SelfCorrectionConfig::default`] unless wired via
-    /// [`TerminalTool::with_self_correction`].
-    self_correction: SelfCorrectionConfig,
     /// Configured model runtime used to assess novel shell commands by their
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
@@ -1321,143 +1313,6 @@ fn is_broad_scan_root(path: &str) -> bool {
         }
     }
     false
-}
-
-/// Expand a leading `~` / `$HOME` in a shell path operand to the absolute home
-/// directory. Returns `None` if `HOME` is unset. UTF-8-safe (operates on
-/// `char`/`str` boundaries, never raw byte indices).
-fn expand_home_in_operand(operand: &str, home: &str) -> Option<String> {
-    if home.is_empty() {
-        return None;
-    }
-    let home = home.trim_end_matches('/');
-    if operand == "~" || operand == "$HOME" {
-        return Some(home.to_string());
-    }
-    if let Some(rest) = operand.strip_prefix("~/") {
-        return Some(format!("{home}/{rest}"));
-    }
-    if let Some(rest) = operand.strip_prefix("$HOME/") {
-        return Some(format!("{home}/{rest}"));
-    }
-    None
-}
-
-/// Derive the read-only remediation scope (working_dir) from the FAILED
-/// command's actual target, rather than always using the daemon cwd.
-///
-/// Semantics (3c scope relax):
-/// - A target over home (`~`, `$HOME`, the home path, or a glob beneath it,
-///   e.g. `du ~/*`, `find ~ …`) → the home directory.
-/// - A target over `/` (e.g. `du /`, `find / …`) → `/`.
-/// - A specific bounded dir (e.g. a path under home/projects) → that dir,
-///   canonicalized when it exists.
-/// - Indeterminate (no path operand) → the daemon cwd fallback (canonicalized),
-///   as before.
-///
-/// The safety for broad scopes lives in the sandbox's read-only allowlist +
-/// sensitive-file guards, not in this derived working_dir. UTF-8-safe: parsing
-/// goes through `shell_words` + `str` ops, no raw byte slicing.
-fn derive_correction_scope_from_command(command: &str) -> std::path::PathBuf {
-    let fallback = || TerminalTool::correction_working_dir();
-
-    let backend = active_execution_backend();
-    let home = Some(
-        backend
-            .home_hint()
-            .as_str()
-            .trim_end_matches('/')
-            .to_string(),
-    );
-
-    // Walk every chained segment; take the first segment that has a usable path
-    // operand, preferring the broadest scope it implies.
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
-        let Ok(tokens) = shell_words::split(&segment) else {
-            continue;
-        };
-        // Skip the leading tool name; inspect its operands.
-        for tok in tokens.iter().skip(1) {
-            if tok.starts_with('-') {
-                continue; // flag, not a path
-            }
-
-            // Broad root: `/`, `~`, `$HOME`, the home path, or a glob over them.
-            if is_broad_scan_root(tok) {
-                if tok.trim() == "/" {
-                    return std::path::PathBuf::from("/");
-                }
-                // `~`, `$HOME`, or the literal home path → home dir.
-                if let Some(h) = &home {
-                    let p = std::path::PathBuf::from(h);
-                    return if backend.kind() == BackendKind::Local {
-                        std::fs::canonicalize(&p).unwrap_or(p)
-                    } else {
-                        p
-                    };
-                }
-                return fallback();
-            }
-
-            // A glob/path beneath home (e.g. `~/*`, `$HOME/*`, `<home>/*`).
-            // Strip a trailing glob component so `~/*` resolves to home itself.
-            let expanded = home
-                .as_deref()
-                .and_then(|home| expand_home_in_operand(tok, home))
-                .unwrap_or_else(|| tok.to_string());
-            let scope = scope_dir_from_path_operand(&expanded, home.as_deref());
-            if let Some(dir) = scope {
-                let p = std::path::PathBuf::from(&dir);
-                return if backend.kind() == BackendKind::Local {
-                    std::fs::canonicalize(&p).unwrap_or(p)
-                } else {
-                    p
-                };
-            }
-        }
-    }
-
-    fallback()
-}
-
-/// Reduce a (home-expanded) path operand to the directory scope it targets.
-/// A trailing glob segment (e.g. `*`, `foo*`) is dropped so `<home>/*` →
-/// `<home>`. Returns `None` for operands that carry no usable absolute path.
-fn scope_dir_from_path_operand(expanded: &str, home: Option<&str>) -> Option<String> {
-    let trimmed = expanded.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Drop a trailing glob component so `/home/u/*` → `/home/u`.
-    let without_glob = if let Some(idx) = trimmed.rfind('/') {
-        let (parent, last) = trimmed.split_at(idx); // last starts with '/'
-        let last = &last[1..];
-        if last.contains('*') || last.contains('?') || last == "." {
-            parent
-        } else {
-            trimmed
-        }
-    } else if trimmed.contains('*') || trimmed.contains('?') {
-        // Bare glob with no slash and not home-rooted → indeterminate.
-        return None;
-    } else {
-        trimmed
-    };
-
-    let candidate = without_glob.trim_end_matches('/');
-    let candidate = if candidate.is_empty() { "/" } else { candidate };
-
-    // Only absolute paths are usable scopes. If the operand collapsed to the
-    // home dir, return that; otherwise require an absolute path.
-    if let Some(h) = home {
-        if candidate == h {
-            return Some(h.to_string());
-        }
-    }
-    if std::path::Path::new(candidate).is_absolute() {
-        return Some(candidate.to_string());
-    }
-    None
 }
 
 /// Detect an unbounded whole-disk/whole-home scan in a single shell segment.
@@ -3666,7 +3521,6 @@ impl TerminalTool {
             plan_store: OnceLock::new(),
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
-            self_correction: SelfCorrectionConfig::default(),
             command_risk_runtime: OnceLock::new(),
         }
     }
@@ -3678,15 +3532,6 @@ impl TerminalTool {
     pub fn with_delivery_dirs(mut self, inbox_dir: PathBuf, outbox_dirs: Vec<PathBuf>) -> Self {
         self.inbox_dir = inbox_dir;
         self.outbox_dirs = outbox_dirs;
-        self
-    }
-
-    /// Wire the self-correction config so the idle-reaper can dispatch
-    /// autonomous remediation when it stops a hung background command. Without
-    /// this, `self_correction` is the safe-off default and the reaper only ever
-    /// sends the existing user notification.
-    pub fn with_self_correction(mut self, config: SelfCorrectionConfig) -> Self {
-        self.self_correction = config;
         self
     }
 
@@ -4466,150 +4311,6 @@ impl TerminalTool {
         }
     }
 
-    /// Determine the bounded `working_dir` handed to the correction bridge for a
-    /// reaped background command, then canonicalize it.
-    ///
-    /// We do NOT know the actual project scope of a reaped command — terminal
-    /// commands run via `sh -c` inheriting the daemon's cwd, and neither
-    /// `RunningProcess` nor the owning task/goal record a project directory. The
-    /// honest "working_dir we have" is therefore the daemon's current working
-    /// directory. Per the bridge contract we pass it through unchanged in spirit
-    /// (no `$HOME` substitution to force a dispatch) and rely on the bridge's
-    /// `is_unsafe_correction_working_dir` gate to REFUSE when that turns out to be
-    /// `/`, `$HOME`, or unbounded — the correct safe outcome.
-    ///
-    /// Canonicalization is done HERE because the bridge guard does not canonicalize:
-    /// resolving `.`/`..`/symlinks before the guard sees the path is what lets the
-    /// equality checks (`== "/"`, `== $HOME`) fire reliably. If canonicalization
-    /// fails (path missing), we fall back to the raw cwd so the guard still runs.
-    fn correction_working_dir() -> std::path::PathBuf {
-        let backend = active_execution_backend();
-        if backend.kind() != BackendKind::Local {
-            return std::path::PathBuf::from(backend.workspace_root().as_str());
-        }
-        let raw = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        std::fs::canonicalize(&raw).unwrap_or(raw)
-    }
-
-    /// Attempt autonomous remediation for a just-reaped hung background command.
-    ///
-    /// Returns `true` only when a remediation task was actually dispatched (live
-    /// mode, safe scope, factory accepted) — in which case the caller sends a
-    /// quieter "retrying a different way" note instead of the alarming "stopped,
-    /// no results" message. Returns `false` for every other outcome
-    /// (correction disabled, no agent wired, unsafe scope, shadow mode, factory
-    /// refused, or any error), in which case the caller MUST send the existing
-    /// user notification — byte-identical to today.
-    ///
-    /// This is best-effort and self-contained: any failure to remediate one
-    /// reaped process is swallowed here so it can never break reaping of others.
-    async fn try_dispatch_idle_reap_remediation(
-        &self,
-        command: &str,
-        session_id: &str,
-        owner_task_id: Option<&str>,
-        idle_secs: u64,
-    ) -> bool {
-        use crate::agent::correction_dispatch::{
-            decide_correction_bridge_action, dispatch_correction_remediation,
-            CorrectionBridgeAction,
-        };
-        use crate::agent::correction_intent::reconstruct_subject_context;
-        use crate::traits::SelfCorrectionSubjectKind;
-
-        // Fast exit when the bridge is off — keeps behavior byte-identical and
-        // avoids upgrading the agent Weak / touching the event store needlessly.
-        if !self.self_correction.enabled {
-            return false;
-        }
-
-        // 1. Reach the agent (and through it the event store + state). No agent
-        //    wired (e.g. unit tests that build TerminalTool directly) → skip
-        //    remediation, keep the existing notification.
-        let Some(agent) = self.agent.get().and_then(|w| w.upgrade()) else {
-            return false;
-        };
-
-        // 2. Working_dir for the retry, derived from the FAILED command's actual
-        //    target scope (home / `/` / a bounded dir; canonicalized). The gate
-        //    refuses only genuinely-invalid scopes — broad read-only scopes are
-        //    allowed and protected by the sandbox's read-only + sensitive-file
-        //    guards.
-        let working_dir = derive_correction_scope_from_command(command);
-
-        // 3. Recent history for subject reconstruction (best-effort; an empty
-        //    history just yields the generic original-request fallback).
-        let history = agent
-            .event_store()
-            .get_conversation_history(session_id, 50)
-            .await
-            .unwrap_or_default();
-
-        // Subject id: prefer the owning task id, fall back to the session id.
-        let subject_id = owner_task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or(session_id);
-
-        let subject = reconstruct_subject_context(
-            &history,
-            session_id,
-            subject_id,
-            SelfCorrectionSubjectKind::BackgroundCommand,
-            working_dir.clone(),
-            command,
-        );
-
-        // 4. Decide. Disabled was handled above; Disabled/UnsafeScope/Shadowed
-        //    all fall through to the existing notification (return false).
-        match decide_correction_bridge_action(&self.self_correction, &subject, command, idle_secs) {
-            CorrectionBridgeAction::Disabled | CorrectionBridgeAction::UnsafeScope => false,
-            CorrectionBridgeAction::Shadowed { .. } => {
-                info!(
-                    reconstructed_request = %subject.original_request,
-                    working_dir = %working_dir.display(),
-                    command = %truncate_str(command, 160),
-                    idle_secs,
-                    "SHADOW: would dispatch correction remediation"
-                );
-                false
-            }
-            CorrectionBridgeAction::Dispatch { remediation_prompt } => {
-                let state = agent.state_arc();
-                let hub = self.hub.get().cloned();
-                match dispatch_correction_remediation(
-                    agent,
-                    state,
-                    hub,
-                    &self.self_correction,
-                    subject,
-                    remediation_prompt,
-                )
-                .await
-                {
-                    Ok(Some(goal_id)) => {
-                        info!(
-                            %goal_id,
-                            working_dir = %working_dir.display(),
-                            command = %truncate_str(command, 160),
-                            idle_secs,
-                            "Dispatched autonomous remediation for idle-reaped command"
-                        );
-                        true
-                    }
-                    Ok(None) => {
-                        // Factory refused (kill-switch / no-bypass) — fall back to
-                        // the existing notification.
-                        false
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Correction remediation dispatch failed; falling back to notification");
-                        false
-                    }
-                }
-            }
-        }
-    }
-
     /// Stop disowned background processes that have gone idle (no new output for
     /// `idle_threshold`). Driven by the heartbeat so there is a single, observable
     /// owner for this resource-leak class — the per-process notifier only delivers
@@ -4951,12 +4652,9 @@ impl TerminalTool {
             let session_id = proc.notify_session_id.clone();
             let goal_id = proc.notify_goal_id.clone();
             let command_summary = truncate_str(&proc.command, 160);
-            // Full command + owning task id are captured here because `proc` is
-            // moved into `terminate_running_process` below; the correction bridge
-            // needs the untruncated command and the task scope.
-            let proc_command = proc.command.clone();
+            // Captured here because `proc` is moved into
+            // `terminate_running_process` below.
             let declared_write_paths = proc.declared_write_paths.clone();
-            let owner_task_id = proc.owner_task_id.clone();
             // For the stall path, idle_secs = time since last progress. For the
             // max-runtime path, the meaningful number is total runtime.
             let idle_secs = proc.last_progress_at.elapsed().as_secs();
@@ -4981,40 +4679,14 @@ impl TerminalTool {
             // Close the loop with the user: the screenshot's failure was the bot
             // silently waiting forever. Tell them it was stopped and why.
             if !session_id.is_empty() {
-                // Self-correction bridge: when enabled+safe+live, dispatch an
-                // autonomous remediation instead of the alarming "stopped, no
-                // results" message. Best-effort and per-process — a failure to
-                // remediate this one process never breaks reaping of the others
-                // (all error paths inside return `false`, falling back to the
-                // existing notification). When correction is off/unsafe/shadow,
-                // this is a no-op and the message below is byte-identical to
-                // today.
-                // The elapsed figure handed to the correction bridge: time-since-
-                // progress for a stall, total runtime for the max-runtime backstop.
-                let reason_secs = match reason {
-                    ReapReason::Stalled => idle_secs,
-                    ReapReason::MaxRuntime => runtime_secs,
-                };
-                let remediating = self
-                    .try_dispatch_idle_reap_remediation(
-                        &proc_command,
-                        &session_id,
-                        owner_task_id.as_deref(),
-                        reason_secs,
-                    )
-                    .await;
-
                 // Task 6: honest closeout for an unfulfilled deliverable. If this
                 // command was structured to produce an explicit output file
                 // (attributable) but the file never appeared and nothing was
                 // delivered for this session, say so plainly instead of the generic
                 // whole-disk-scan guidance — that command was not a scan, it was
-                // supposed to hand back a file. Skipped when remediation is running
-                // (it will follow up) or when nothing is attributable (servers,
-                // watchers, scans → unchanged behavior).
-                let unfulfilled_deliverable: Option<String> = if remediating {
-                    None
-                } else {
+                // supposed to hand back a file. Skipped when nothing is
+                // attributable (servers, watchers, scans → unchanged behavior).
+                let unfulfilled_deliverable: Option<String> = {
                     let command_end = std::time::SystemTime::now();
                     let command_start = command_end
                         .checked_sub(Duration::from_secs(runtime_secs))
@@ -5081,23 +4753,6 @@ impl TerminalTool {
                             humanize_elapsed(runtime_secs),
                             command_summary,
                             filename
-                        ),
-                    }
-                } else if remediating {
-                    match reason {
-                        ReapReason::Stalled => format!(
-                            "⚠️ That background command stopped making progress \
-                             (no CPU/disk activity for {}): `{}`. I'm retrying this a \
-                             different way — I'll follow up with the result.",
-                            humanize_elapsed(idle_secs),
-                            command_summary
-                        ),
-                        ReapReason::MaxRuntime => format!(
-                            "⚠️ That background command ran for over {} without finishing: \
-                             `{}`. I'm retrying this a different way — I'll follow up with \
-                             the result.",
-                            humanize_elapsed(runtime_secs),
-                            command_summary
                         ),
                     }
                 } else {
@@ -6698,22 +6353,15 @@ impl TerminalTool {
 
     /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.
     ///
-    /// `correction_preapproved` is a Rust-side control-plane flag set by the
-    /// correction gate — it is NEVER derived from tool arguments, model output, or
-    /// any JSON field.  When true (and action=="run"), the user-approval prompt is
-    /// bypassed after all hard blocks and command-safety checks have passed.
-    ///
     /// Approval ordering for action="run":
     ///   1. Hard blocks (dangerous irreversible commands)  → always enforced
     ///   2. Safety soft-blocks (heredoc, python -c, etc.) → always enforced
     ///   3. Daemonization block / daemonization approval   → always enforced
-    ///   4. `correction_preapproved`                       → skips prompt if true
-    ///   5. `_untrusted_source` / `_trusted_session` / allowlists / normal prompt
+    ///   4. `_untrusted_source` / `_trusted_session` / allowlists / normal prompt
     async fn execute_terminal(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        correction_preapproved: bool,
         mutation_forbidden: bool,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
@@ -6971,14 +6619,13 @@ impl TerminalTool {
                 //
                 // Ordering (enforced here; do not reorder):
                 //   1. daemonization_approved  → never re-prompt after daemonization gate
-                //   2. correction_preapproved  → dispatcher-owned one-shot bypass (Rust side only)
-                //   3. _untrusted_source       → external triggers always re-prompt
-                //   4. detach && !is_allowed   → novel detached commands re-prompt
-                //   5. _trusted_session        → scheduled tasks skip prompt
-                //   6. explicit allowlist      → prior owner grant
-                //   7. protected credential path → non-downgradable approval floor
-                //   8. semantic model          → approve only dangerous effects
-                //   9. classifier failure      → fail closed to approval
+                //   2. _untrusted_source       → external triggers always re-prompt
+                //   3. detach && !is_allowed   → novel detached commands re-prompt
+                //   4. _trusted_session        → scheduled tasks skip prompt
+                //   5. explicit allowlist      → prior owner grant
+                //   6. protected credential path → non-downgradable approval floor
+                //   7. semantic model          → approve only dangerous effects
+                //   8. classifier failure      → fail closed to approval
                 let is_allowed = self.is_allowed(command).await;
                 let confined = run_is_confined(self.confinement);
                 // On the host the process already has the user's environment,
@@ -7005,13 +6652,6 @@ impl TerminalTool {
                     info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
                     true
                 } else if daemonization_approved {
-                    false
-                } else if correction_preapproved {
-                    // Dispatcher classified this call as safe; skip the user prompt.
-                    // _untrusted_source is intentionally overridden here: the correction
-                    // gate is only active for trigger sessions, so if we reach this
-                    // branch, the gate has already confirmed safety.
-                    info!(command = %command, "Auto-approved: correction gate preapproval");
                     false
                 } else if args._untrusted_source {
                     // External triggers always need approval regardless of mode
@@ -8007,8 +7647,7 @@ impl Tool for TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, false, false)
-            .await
+        self.execute_terminal(arguments, status_tx, false).await
     }
 
     async fn call_with_execution_context(
@@ -8017,27 +7656,8 @@ impl Tool for TerminalTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        // Correction preapproval is only honored for action="run".  For check/kill/trust_all,
-        // the normal path (no preapproval) is used because:
-        //   - check/kill have no user-approval gate to bypass.
-        //   - trust_all must never be silently executed by the correction gate.
-        let correction_preapproved = if exec_ctx.correction_preapproved {
-            // Peek at the action field without fully parsing the args yet.
-            let action = serde_json::from_str::<serde_json::Value>(arguments)
-                .ok()
-                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "run".to_string());
-            action == "run" || action.is_empty()
-        } else {
-            false
-        };
-        self.execute_terminal(
-            arguments,
-            status_tx,
-            correction_preapproved,
-            exec_ctx.mutation_forbidden,
-        )
-        .await
+        self.execute_terminal(arguments, status_tx, exec_ctx.mutation_forbidden)
+            .await
     }
 
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
@@ -9551,7 +9171,7 @@ mod tests {
             "_user_role": "Owner"
         });
         let outcome = tool
-            .execute_terminal(&args.to_string(), None, false, false)
+            .execute_terminal(&args.to_string(), None, false)
             .await
             .expect("typed outcome, not a transport error");
         let failure = outcome
@@ -10616,81 +10236,6 @@ mod tests {
         assert!(!is_broad_scan_root("."));
     }
 
-    // ── correction-scope derivation (3c) ──
-
-    #[test]
-    fn derive_correction_scope_home_targets() {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .map(|h| std::fs::canonicalize(&h).unwrap_or(h))
-            .expect("HOME set in test env");
-
-        // `du -sh ~/* | sort` — glob over home → home dir.
-        assert_eq!(
-            derive_correction_scope_from_command("du -sh ~/* | sort"),
-            home,
-            "du over ~/* should derive the home dir"
-        );
-        // `find ~ -type f` — root is home itself.
-        assert_eq!(
-            derive_correction_scope_from_command("find ~ -type f"),
-            home,
-            "find ~ should derive the home dir"
-        );
-        // `du ~` — bare home.
-        assert_eq!(
-            derive_correction_scope_from_command("du ~"),
-            home,
-            "du ~ should derive the home dir"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_root_target() {
-        assert_eq!(
-            derive_correction_scope_from_command("find / -type f"),
-            std::path::PathBuf::from("/"),
-            "find / should derive /"
-        );
-        assert_eq!(
-            derive_correction_scope_from_command("du /"),
-            std::path::PathBuf::from("/"),
-            "du / should derive /"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_bounded_dir() {
-        // A specific bounded dir under home → that dir (expanded + canonicalized
-        // if it exists, else the expanded path).
-        let home = std::env::var("HOME").expect("HOME set");
-        let target = format!("{}/projects", home.trim_end_matches('/'));
-        let expected =
-            std::fs::canonicalize(&target).unwrap_or_else(|_| std::path::PathBuf::from(&target));
-        assert_eq!(
-            derive_correction_scope_from_command(&format!("du -sh {target}/foo")),
-            std::fs::canonicalize(format!("{target}/foo"))
-                .unwrap_or_else(|_| std::path::PathBuf::from(format!("{target}/foo"))),
-            "du of a specific bounded dir should derive that dir"
-        );
-        // Sanity: the bounded dir is not the broad home scope.
-        assert_ne!(
-            expected,
-            std::path::PathBuf::from("/"),
-            "bounded dir must not collapse to /"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_no_path_falls_back_to_cwd() {
-        let cwd = TerminalTool::correction_working_dir();
-        assert_eq!(
-            derive_correction_scope_from_command("echo hi"),
-            cwd,
-            "a command with no path operand should fall back to the daemon cwd"
-        );
-    }
-
     #[test]
     fn detect_unbounded_disk_scan_flags_the_incident_commands() {
         // The exact commands seen grinding for minutes on the live daemon.
@@ -11625,117 +11170,6 @@ mod tests {
         assert!(
             saw_notice,
             "expected a user-facing notice that the hung command was stopped"
-        );
-    }
-
-    /// The correction-bridge working_dir helper returns an absolute, canonical
-    /// path (so `.`/`..`/symlinks are resolved before the bridge's
-    /// `is_unsafe_correction_working_dir` guard — which does NOT canonicalize —
-    /// sees it). Canonicalization is what makes the `== "/"` / `== $HOME`
-    /// equality checks fire reliably.
-    #[test]
-    fn test_correction_working_dir_is_canonical_absolute() {
-        let dir = TerminalTool::correction_working_dir();
-        assert!(
-            dir.is_absolute(),
-            "correction working_dir must be absolute, got {dir:?}"
-        );
-        // Canonicalizing an already-canonical path is a fixed point.
-        if let Ok(canon) = std::fs::canonicalize(&dir) {
-            assert_eq!(
-                canon, dir,
-                "correction working_dir must already be canonical"
-            );
-        }
-    }
-
-    /// Self-correction bridge: when correction is ENABLED but no agent is wired
-    /// (the bridge can't reach the event store / dispatch path), the idle-reaper
-    /// must fall back to the EXISTING user notification and dispatch nothing.
-    /// This is the safety floor: a misconfigured/half-wired bridge degrades to
-    /// today's behavior rather than silently swallowing the notice.
-    #[tokio::test]
-    async fn test_idle_reap_correction_enabled_no_agent_falls_back_to_notice() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        let pool = state.pool();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-
-        // Correction ENABLED + bypass + live (shadow off) — but NO agent wired.
-        let live_cfg = SelfCorrectionConfig {
-            enabled: true,
-            correction_bypass_enabled: true,
-            max_attempts: 3,
-            shadow_mode: false,
-        };
-        let tool = TerminalTool::new(
-            vec!["*".to_string()],
-            approval_tx,
-            1,
-            4000,
-            PermissionMode::Yolo,
-            pool,
-        )
-        .await
-        .with_state(state.clone() as Arc<dyn StateStore>)
-        .with_self_correction(live_cfg);
-
-        // Direct unit check of the bridge entry point: no agent → no dispatch.
-        let dispatched = tool
-            .try_dispatch_idle_reap_remediation(
-                "find / -type f -size +100M",
-                "sess_reap_noagent",
-                None,
-                300,
-            )
-            .await;
-        assert!(!dispatched, "no agent wired must NOT dispatch remediation");
-
-        // End-to-end: reap a hung process and confirm the EXISTING notice fires.
-        let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap_noagent","_user_role":"Owner"}"#,
-            )
-            .await
-            .unwrap();
-        assert!(response.contains("Moved to background (pid="));
-
-        let mut reaped = 0;
-        for _ in 0..40 {
-            reaped = tool
-                .reap_stale_background_processes(Duration::from_millis(1))
-                .await;
-            if reaped > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(reaped, 1, "expected the hung process to be reaped");
-
-        // The EXISTING "I stopped a background command" notice must still fire —
-        // NOT the quieter "retrying a different way" remediation note.
-        let mut saw_stopped_notice = false;
-        for _ in 0..20 {
-            let pending = state.get_pending_notifications(50).await.unwrap();
-            if pending.iter().any(|entry| {
-                entry.session_id == "sess_reap_noagent"
-                    && entry.message.contains("I stopped a background command")
-            }) {
-                saw_stopped_notice = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            saw_stopped_notice,
-            "enabled-but-no-agent must fall back to the existing stopped-command notice"
         );
     }
 
@@ -12819,166 +12253,12 @@ mod tests {
         (tool, approval_rx)
     }
 
-    /// correction_preapproved=true bypasses the `_untrusted_source` prompt for
-    /// a safe `action="run"` command.
-    ///
-    /// Without preapproval, `_untrusted_source=true` forces an approval request
-    /// which blocks until the channel is answered.  With preapproval the command
-    /// must run without hitting the approval channel.
+    /// The dispatcher-owned execution-context path must not weaken approval:
+    /// a `run` with `_untrusted_source=true` still reaches the approval channel.
     #[tokio::test]
-    async fn correction_preapproval_bypasses_untrusted_source_for_run() {
-        // Close the approval receiver so any approval attempt errors immediately.
-        // If the preapproval gate works, the tool should NOT attempt approval and
-        // should succeed with the command output.
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_url = format!("sqlite:{}", db_file.path().display());
-        let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        drop(approval_rx); // <-- closed; any approval attempt would error
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
-        std::mem::forget(db_file);
-
-        // args include _untrusted_source=true which would normally force approval.
-        let args = r#"{"action":"run","command":"echo preapproved-ok","_untrusted_source":true,"_session_id":"s1","_user_role":"Owner"}"#;
-
-        let exec_ctx = ToolExecutionContext {
-            correction_preapproved: true,
-            ..Default::default()
-        };
-
-        let result = tool
-            .call_with_execution_context(args, None, exec_ctx)
-            .await
-            .expect("preapproved run should succeed without approval");
-
-        assert!(
-            result.output.contains("preapproved-ok"),
-            "preapproved run should execute the command, got: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("Could not get approval"),
-            "preapproved run must not have hit the approval gate, got: {}",
-            result.output
-        );
-    }
-
-    /// correction_preapproved=true does NOT bypass approval for non-run actions.
-    ///
-    /// `trust_all` must require an explicit owner interaction even when
-    /// correction_preapproved is set — it cannot be silently executed by the
-    /// correction gate.
-    #[tokio::test]
-    async fn correction_preapproval_does_not_bypass_non_run_actions() {
-        // trust_all doesn't use the approval channel — it just returns output.
-        // Test that trust_all still behaves correctly (runs, not blocked) when
-        // preapproved, but also that check/kill don't crash without pid.
-        // The key invariant: non-run actions go through the normal path.
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_url = format!("sqlite:{}", db_file.path().display());
-        let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
-        std::mem::forget(db_file);
-
-        let exec_ctx = ToolExecutionContext {
-            correction_preapproved: true,
-            ..Default::default()
-        };
-
-        // "check" with no pid should return an error (normal path), not be silently
-        // auto-approved or crash.  correction_preapproved must not turn this into
-        // a run action.
-        let check_result = tool
-            .call_with_execution_context(
-                r#"{"action":"check","_session_id":"s1","_user_role":"Owner"}"#,
-                None,
-                exec_ctx,
-            )
-            .await;
-
-        // Should be Err (pid required) or contain an error message — never a panic
-        // and never treated as "run".
-        match check_result {
-            Err(e) => assert!(
-                e.to_string().contains("pid"),
-                "check without pid should fail with pid-related error, got: {}",
-                e
-            ),
-            Ok(outcome) => assert!(
-                outcome.output.contains("pid") || outcome.output.contains("required"),
-                "check without pid output should mention pid, got: {}",
-                outcome.output
-            ),
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // P2.5-C: next ordinary unsafe command still prompts after a preapproved call
-    //
-    // After a correction-preapproved call succeeds, the next call with
-    // correction_preapproved=false and _untrusted_source=true must still reach
-    // the approval channel.  We prove this by:
-    //   1. Making a preapproved call (approval_rx has a closed receiver — no
-    //      approval request should arrive).
-    //   2. Dropping that tool and creating a fresh tool with an open approval
-    //      channel.
-    //   3. Calling with correction_preapproved=false + _untrusted_source=true.
-    //   4. Asserting that an approval request IS received on the channel.
-    //
-    // The freshness of the tool is intentional: TerminalTool's session_approved
-    // HashSet is per-instance.  The structural invariant is that correction_
-    // preapproved never touches session_approved (see terminal.rs:2853 — the
-    // `else if correction_preapproved` branch does NOT call add_session_prefix
-    // or add_prefix; it only sets needs_approval=false and logs).  Therefore
-    // even on the same instance, no residue would pollute session_approved.
-    //
-    // Using a fresh instance makes the "still prompts" proof self-contained and
-    // independent of any cross-call state.
-    // ─────────────────────────────────────────────────────────────────────────
-    #[tokio::test]
-    async fn test_next_ordinary_unsafe_command_still_prompts() {
-        // --- Part 1: correction-preapproved call on a tool with a closed receiver ---
-        // We intentionally close the approval_rx; if the preapproval gate works,
-        // no approval request is sent and the command executes.
-        {
-            let db_file = tempfile::NamedTempFile::new().unwrap();
-            let db_url = format!("sqlite:{}", db_file.path().display());
-            let pool = SqlitePool::connect(&db_url).await.unwrap();
-            let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-            drop(approval_rx); // closed — any approval attempt would error
-            let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-            let tool =
-                TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool)
-                    .await;
-            std::mem::forget(db_file);
-
-            let exec_ctx = ToolExecutionContext {
-                correction_preapproved: true,
-                ..Default::default()
-            };
-            let result = tool
-                .call_with_execution_context(
-                    r#"{"action":"run","command":"echo p25-preapproved","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
-                    None,
-                    exec_ctx,
-                )
-                .await
-                .expect("preapproved run must succeed without hitting closed approval channel");
-            assert!(
-                result.output.contains("p25-preapproved"),
-                "preapproved call must execute the command, got: {}",
-                result.output
-            );
-        } // tool dropped; any session_approved state is dropped with it
-
-        // --- Part 2: ordinary (non-preapproved) call must reach the approval channel ---
-        // Fresh tool with an OPEN approval channel.  We answer on a background task
-        // so the call can complete; we then verify the request was received.
+    async fn untrusted_source_run_via_execution_context_still_prompts() {
+        // Tool with an OPEN approval channel. We answer on a background task so
+        // the call can complete; we then verify the request was received.
         let (tool, mut approval_rx) = make_tool_with_open_approval_channel().await;
 
         // Answer the approval request from a background task so the tool call
@@ -12990,17 +12270,13 @@ mod tests {
             }
         });
 
-        // This call has correction_preapproved=false and _untrusted_source=true.
         // The untrusted-source branch forces needs_approval=true, so an approval
         // request MUST be sent to the channel.
         let result = tool
             .call_with_execution_context(
                 r#"{"action":"run","command":"echo ordinary-unsafe","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
                 None,
-                ToolExecutionContext {
-                    correction_preapproved: false,
-                    ..Default::default()
-                },
+                ToolExecutionContext::default(),
             )
             .await
             .expect("call should complete (denied, not error)");

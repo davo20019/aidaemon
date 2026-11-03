@@ -404,10 +404,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub people: PeopleConfig,
     #[serde(default)]
-    // Used by subsequent plan tasks (3b P2+) that wire correction gate controllers.
-    #[allow(dead_code)]
-    pub self_correction: SelfCorrectionConfig,
-    #[serde(default)]
     pub oauth: OAuthConfig,
     #[serde(default)]
     pub http_auth: HashMap<String, HttpAuthProfile>,
@@ -1689,9 +1685,6 @@ pub struct RetentionConfig {
     /// Delete net-negative error solutions older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub error_solutions_days: u32,
-    /// Delete self-correction attempt rows older than N days (default: 30).
-    #[serde(default = "default_retention_30")]
-    pub self_correction_attempts_days: u32,
 }
 
 impl Default for RetentionConfig {
@@ -1706,7 +1699,6 @@ impl Default for RetentionConfig {
             goals_days: 180,
             procedures_days: 180,
             error_solutions_days: 90,
-            self_correction_attempts_days: 30,
         }
     }
 }
@@ -3275,38 +3267,6 @@ pub struct OAuthProviderConfig {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-}
-
-/// Self-correction gate configuration.
-///
-/// Controls whether the agent is allowed to retry failed outputs through
-/// a correction loop. All flags default to `false` (safe-off) so existing
-/// deployments are unaffected until explicitly opted in.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
-pub struct SelfCorrectionConfig {
-    /// Master switch. When `false` the correction loop is skipped entirely.
-    pub enabled: bool,
-    /// Allow the correction gate to be bypassed for trusted sessions.
-    pub correction_bypass_enabled: bool,
-    /// Maximum number of correction attempts per task (default: 3).
-    pub max_attempts: usize,
-    /// Shadow-first activation. When `true` (default) the correction bridge
-    /// reconstructs intent, builds the context, and runs the gate but LOGS the
-    /// would-be remediation instead of executing/dispatching it. Full autonomous
-    /// execution requires a deliberate flip to `false` after observing shadow logs.
-    pub shadow_mode: bool,
-}
-
-impl Default for SelfCorrectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            correction_bypass_enabled: false,
-            max_attempts: 3,
-            shadow_mode: true,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -5466,58 +5426,10 @@ session_isolation = "incognito"
     }
 
     #[test]
-    fn test_self_correction_config_defaults_are_safe() {
-        let cfg = SelfCorrectionConfig::default();
-        assert!(!cfg.enabled, "enabled must default to false (safe-off)");
-        assert!(
-            !cfg.correction_bypass_enabled,
-            "correction_bypass_enabled must default to false (safe-off)"
-        );
-        assert_eq!(cfg.max_attempts, 3, "max_attempts must default to 3");
-        assert!(
-            cfg.shadow_mode,
-            "shadow_mode must default to true (shadow-first activation)"
-        );
-
-        // A config without [self_correction] section must still load and use defaults.
-        let toml = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-"#;
-        let app: AppConfig =
-            toml::from_str(toml).expect("parse app config without self_correction");
-        assert!(!app.self_correction.enabled);
-        assert!(!app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 3);
-        assert!(app.self_correction.shadow_mode);
-
-        // shadow_mode = false parses (the deliberate full-autonomy flip).
-        let toml_live = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-
-[self_correction]
-enabled = true
-correction_bypass_enabled = true
-shadow_mode = false
-"#;
-        let app_live: AppConfig =
-            toml::from_str(toml_live).expect("parse app config with shadow_mode=false");
-        assert!(app_live.self_correction.enabled);
-        assert!(app_live.self_correction.correction_bypass_enabled);
-        assert!(!app_live.self_correction.shadow_mode);
-    }
-
-    #[test]
-    fn test_self_correction_config_parses_enabled_flags() {
+    fn config_with_removed_correction_sections_still_parses() {
+        // The self-correction feature was removed. An existing config.toml that
+        // still carries its `[self_correction]` section or the retention key for
+        // its attempts table must keep loading; the keys are simply ignored.
         let toml = r#"
 [provider]
 kind = "openai_compatible"
@@ -5530,10 +5442,13 @@ primary = "gpt-4o"
 enabled = true
 correction_bypass_enabled = true
 max_attempts = 5
+shadow_mode = false
+
+[state.retention]
+self_correction_attempts_days = 30
 "#;
-        let app: AppConfig = toml::from_str(toml).expect("parse app config with self_correction");
-        assert!(app.self_correction.enabled);
-        assert!(app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 5);
+        let app: AppConfig =
+            toml::from_str(toml).expect("config with removed sections must still parse");
+        assert_eq!(app.state.retention.error_solutions_days, 90);
     }
 }

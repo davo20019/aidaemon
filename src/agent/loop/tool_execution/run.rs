@@ -1,7 +1,7 @@
 use crate::agent::*;
 use crate::traits::ToolCallSemantics;
 
-// ── Correction gate (P2.4) ───────────────────────────────────────────────────
+// ── Mandate gate ─────────────────────────────────────────────────────────────
 
 pub(in crate::agent) enum MandateGateDecision {
     NotApplicable,
@@ -162,22 +162,6 @@ pub(in crate::agent) async fn mandate_gate_for_tool_call(
         | crate::mandates::MandateCallClass::RecordDecision
         | crate::mandates::MandateCallClass::RecordMeasurement => unreachable!(),
     }
-}
-
-// ── P2.4 tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod correction_gate_tests {
-
-    // ── helpers ────────────────────────────────────────────────────────────
-
-    // ── Test 1: blocked write_file returns BlockedToolResult ──────────────
-
-    // ── Test 2: allowed terminal with bypass → Execute + preapproved=true ──
-
-    // ── Test 3: give-up on budget exhaustion ──────────────────────────────
-
-    // ── Test 4: prefetch disabled in correction mode ──────────────────────
 }
 
 /// Extract the rendered checklist from a track_requirements tool result of the
