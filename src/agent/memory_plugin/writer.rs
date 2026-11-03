@@ -65,7 +65,7 @@ impl sdk::Hook for DaemonMemoryWriter {
             turn.verdict
                 .final_reply(outcome, &learning.tool_calls, turn.channel_ctx.visibility);
         if status == TaskStatus::Completed {
-            let (extract, summarize) = crate::agent::completion_phase::post_completion_memory_plan(
+            let (extract, summarize) = crate::agent::post_turn::post_completion_memory_plan(
                 turn.mandate,
                 turn.memory_isolated(),
                 turn.memory_persistence_allowed,

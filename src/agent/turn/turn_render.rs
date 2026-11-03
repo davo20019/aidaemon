@@ -4,7 +4,7 @@
 //!
 //! `render_turn(turn_messages, mode, renderer_version) -> Vec<Value>` is the
 //! single pure renderer. **Current** mode = full append-only conversion (the
-//! same `&Message → Value` logic that `message_build_phase.rs` performs
+//! same `&Message → Value` logic that `message_build.rs` performs
 //! inline, including the orphan-`tool_calls` filter and the
 //! `tool_call_id`/`name` mapping). **Archived** mode = the single permanent
 //! survivorship form (user text full; last-substantive assistant truncated;
@@ -115,7 +115,7 @@ pub(crate) fn render_turn(
 /// BOTH `render_current` (drops matching assistant text) and `render_archived`
 /// (excludes from winning-assistant selection, uses the terminal placeholder)
 /// call this so the lists cannot drift. This is the list previously inlined in
-/// `message_build_phase.rs`'s `&Message → Value` conversion.
+/// `message_build.rs`'s `&Message → Value` conversion.
 pub(crate) fn is_failure_boilerplate(content: &str) -> bool {
     let t = content.trim_start();
     t.starts_with("I wasn't able to process that request.")
@@ -316,7 +316,7 @@ fn should_encode_tool_observation_image(
 
 /// **Current** mode: append-only, full content. Single source of truth for the
 /// `&Message → Value` conversion (Task 7 deletes the inline copy in
-/// `message_build_phase.rs` and routes through here).
+/// `message_build.rs` and routes through here).
 fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
     let mut vision_skipped = false;

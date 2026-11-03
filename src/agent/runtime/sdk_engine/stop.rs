@@ -89,7 +89,7 @@ pub(super) struct StopFacts {
     pub(super) unrecovered_failure: bool,
 }
 
-/// The legacy completion gate (`completion_phase.rs`), read from receipts:
+/// The legacy completion gate (`post_turn.rs`), read from receipts:
 /// contract expectations are demanded only while nothing has completed; the
 /// executor's own open checklist items are demanded again whenever completed
 /// work changed since the last demand; nothing is demanded after a terminal
@@ -204,7 +204,7 @@ impl Agent {
         scope: &TurnScope<'_>,
     ) -> sdk::StopDecision {
         use crate::agent::closeout::{StopDemand, StopDemandVerdict};
-        use crate::agent::completion_phase::{
+        use crate::agent::mandate_run::{
             mandate_decision_commit_state, MandateDecisionCommitState,
         };
         let state = match mandate_decision_commit_state(self).await {

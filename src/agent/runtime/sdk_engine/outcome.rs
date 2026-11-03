@@ -231,7 +231,7 @@ impl TurnVerdict {
                 sdk::RunStatus::ProviderFailed { .. } | sdk::RunStatus::LimitReached { .. },
                 Some(ack),
             ) => (
-                crate::agent::tool_execution_phase::user_facing_external_action_ack(&ack),
+                crate::agent::tool_execution::user_facing_external_action_ack(&ack),
                 TaskStatus::Completed,
                 TaskOutcome::Succeeded,
             ),

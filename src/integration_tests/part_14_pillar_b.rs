@@ -8,7 +8,7 @@
 // Seam.  These tests assert on the converted message SEQUENCE element-wise (not
 // on serialized JSON request bodies). The seam is `MockProvider.call_log` — each
 // `MockChatCall.messages` is exactly the `Vec<Value>` the agent handed the
-// provider for that LLM call, i.e. the output of `message_build_phase`. The
+// provider for that LLM call, i.e. the output of `message_build`. The
 // OpenAI-compatible adapter is a faithful passthrough of this sequence (count /
 // order / roles preserved inline — proven element-wise in
 // `providers::openai_compatible` Pillar A tests
@@ -335,7 +335,7 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
 /// first model response triggers the retry rebuild, which rewrites the
 /// current-turn region and emits `Prefix mutation reason=empty_response_retry`.
 /// The build path's mutator attribution is unit-proven in
-/// `message_build_phase` tests; here we confirm the full loop still drives a
+/// `message_build` tests; here we confirm the full loop still drives a
 /// mutator path (the empty-response retry) and recovers, exercising the same
 /// build seam end-to-end. The element-wise stable-region extension within a task
 /// is asserted via call_log: the second (retry) call's stable prefix is not

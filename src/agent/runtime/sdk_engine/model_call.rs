@@ -159,7 +159,7 @@ impl Agent {
                 // provider failure.
                 if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
                     if let Some(summary) =
-                        crate::agent::llm_phase::recover_mandate_capacity_as_wait(self).await
+                        crate::agent::mandate_run::recover_mandate_capacity_as_wait(self).await
                     {
                         info!(
                             task_id = scope.task_id,
@@ -218,7 +218,7 @@ impl Agent {
                     }
                 }
                 Err(_) => {
-                    crate::agent::llm_phase::exhaust_mandate_run_token_lease_after_ambiguous_call(
+                    crate::agent::mandate_run::exhaust_mandate_run_token_lease_after_ambiguous_call(
                         self,
                         Some(lease),
                         scope.session_id,
@@ -406,8 +406,8 @@ impl Agent {
         &self,
         options: &mut crate::traits::ChatOptions,
         est_input_tokens: u32,
-    ) -> Result<Option<crate::agent::llm_phase::MandateRunTokenLease>, sdk::ProviderError> {
-        use crate::agent::llm_phase::{
+    ) -> Result<Option<crate::agent::mandate_run::MandateRunTokenLease>, sdk::ProviderError> {
+        use crate::agent::mandate_run::{
             acquire_mandate_run_token_lease, mandate_output_token_ceiling,
             release_mandate_run_token_lease_without_dispatch, MandateRunTokenAdmission,
         };

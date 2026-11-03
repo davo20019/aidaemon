@@ -780,7 +780,7 @@ async fn build_isolated_mandate_bootstrap(
     })))
 }
 
-pub(in crate::agent) async fn run_bootstrap_phase(
+pub(in crate::agent) async fn run_bootstrap(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &BootstrapCtx<'_>,
 ) -> anyhow::Result<BootstrapOutcome> {
@@ -920,7 +920,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // TaskStart emit). It is stashed so every subsequent message written
     // during this turn (assistant replies, tool results) is auto-stamped
     // with the same turn_id by `append_message_canonical`. This lets
-    // boundary detection in `message_build_phase` group the turn without
+    // boundary detection in `message_build` group the turn without
     // inferring from message content — historically a source of bugs when
     // the same text is sent twice or arrives out of order.
     let user_msg = Message {
@@ -1121,7 +1121,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // Pillar A Task 6: canonicalize the roster to name-sorted order at the
     // bootstrap boundary so all later retain/filter/widen ops begin from a
     // stable order. The authoritative final sort happens on `effective_tool_defs`
-    // in message_build_phase, but starting canonical keeps intermediate ordering
+    // in message_build, but starting canonical keeps intermediate ordering
     // deterministic.
     Agent::sort_tool_definitions_by_name(&mut base_tool_defs);
     Agent::sort_tool_definitions_by_name(&mut tool_defs);
@@ -1412,9 +1412,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                     .semantic_affordances()
                     .map(|affordances| affordances.scope)
                     .or_else(|| {
-                        crate::agent::tool_execution_phase::fallback_tool_semantic_scope(
-                            tool.name(),
-                        )
+                        crate::agent::tool_execution::fallback_tool_semantic_scope(tool.name())
                     });
                 (tool.name().to_string(), scope)
             })
@@ -1669,7 +1667,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .await;
 
     // Pillar B (Task 7): historical conversation retention is now owned
-    // entirely by the turn-anchored fetch in `message_build_phase`
+    // entirely by the turn-anchored fetch in `message_build`
     // (`get_turns_from_anchor`). The old `load_initial_history` + pinned/recent
     // split is removed — the whole-turn anchor is the single retention
     // mechanism, so this bootstrap no longer pre-loads or pins history.
@@ -1774,7 +1772,7 @@ mod mandate_bootstrap_isolation_tests {
         user_text: &str,
     ) -> Box<BootstrapData> {
         let services = crate::agent::services::AgentServices::new(agent);
-        match run_bootstrap_phase(
+        match run_bootstrap(
             &services,
             &BootstrapCtx {
                 session_id,

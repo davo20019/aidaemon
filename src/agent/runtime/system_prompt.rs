@@ -474,7 +474,7 @@ impl Agent {
             None
         };
 
-        // Mirrors the transcript rule in `message_build_phase`: top-level chat
+        // Mirrors the transcript rule in `message_build`: top-level chat
         // keeps recent dialogue across a new-request boundary, so say how to
         // read it.
         let new_request_dialogue_note = if mandate_context || self.depth > 0 {

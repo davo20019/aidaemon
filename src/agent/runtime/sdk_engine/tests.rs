@@ -988,7 +988,7 @@ async fn live_tool_results_carry_the_receipt_footer() {
 /// spilled results, not another session's, and gains no write there.
 #[test]
 fn scoped_runs_read_their_own_spilled_results_only() {
-    use crate::agent::tool_execution_phase::{access_manifest_scope_check, ScopeCheck};
+    use crate::agent::tool_execution::{access_manifest_scope_check, ScopeCheck};
     use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
     let hint = |kind, value: String| ToolTargetHint::new(kind, value).unwrap();
     let task = ToolCallAccessManifest {

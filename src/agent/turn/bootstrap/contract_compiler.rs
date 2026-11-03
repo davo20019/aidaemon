@@ -790,7 +790,7 @@ fn compile_authority(
     // one requested tool is inadmissible.
     authority.forbidden_tool_scopes.retain(|scope| {
         !signals.allowed_tool_names.iter().any(|tool| {
-            crate::agent::tool_execution_phase::fallback_tool_semantic_scope(tool) == Some(*scope)
+            crate::agent::tool_execution::fallback_tool_semantic_scope(tool) == Some(*scope)
         })
     });
     authority

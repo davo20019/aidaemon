@@ -323,7 +323,7 @@ impl MemoryWrites for DaemonMemoryInner {
     }
 
     fn learn(&self, learning: crate::agent::post_task::LearningContext) {
-        crate::agent::completion_phase::spawn_learning(self.state.clone(), learning);
+        crate::agent::post_turn::spawn_learning(self.state.clone(), learning);
     }
 }
 

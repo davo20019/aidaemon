@@ -42,40 +42,6 @@ pub(in crate::agent) fn post_completion_memory_plan(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::agent) enum MandateDecisionCommitState {
-    NotApplicable,
-    Missing,
-    Committed,
-    Invalid,
-}
-
-pub(in crate::agent) async fn mandate_decision_commit_state(
-    agent: &Agent,
-) -> anyhow::Result<MandateDecisionCommitState> {
-    let Some(fence) = agent.mandate_execution.as_ref() else {
-        return Ok(MandateDecisionCommitState::NotApplicable);
-    };
-    if fence.worker_task_id != fence.root_task_id {
-        return Ok(MandateDecisionCommitState::NotApplicable);
-    }
-    let Some(decision) = agent
-        .state
-        .get_mandate_decision_for_run(&fence.goal_run_id)
-        .await?
-    else {
-        return Ok(MandateDecisionCommitState::Missing);
-    };
-    if decision.goal_run_id == fence.goal_run_id
-        && decision.mandate_id == fence.mandate_id
-        && decision.mandate_version == fence.mandate_version
-    {
-        Ok(MandateDecisionCommitState::Committed)
-    } else {
-        Ok(MandateDecisionCommitState::Invalid)
-    }
-}
-
 #[cfg(test)]
 mod gate_telemetry_tests {
     use super::*;

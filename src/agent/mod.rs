@@ -118,16 +118,14 @@ use post_task::LearningContext;
 #[cfg(feature = "computer_use")]
 mod computer_use;
 
-#[path = "turn/bootstrap_phase.rs"]
-mod bootstrap_phase;
+#[path = "turn/bootstrap/mod.rs"]
+mod bootstrap;
 #[path = "turn/closeout.rs"]
 mod closeout;
 #[path = "turn/completion_checks.rs"]
 mod completion_checks;
 #[path = "runtime/completion_contract.rs"]
 mod completion_contract;
-#[path = "turn/completion_phase.rs"]
-mod completion_phase;
 #[path = "runtime/core_prompt.rs"]
 mod core_prompt;
 #[path = "runtime/deferred_retry.rs"]
@@ -145,6 +143,8 @@ pub(crate) mod memory_plugin;
 mod notes;
 #[path = "runtime/parent_delivery.rs"]
 mod parent_delivery;
+#[path = "turn/post_turn.rs"]
+mod post_turn;
 #[path = "runtime/project_scope.rs"]
 mod project_scope;
 #[path = "runtime/sdk_engine.rs"]
@@ -185,12 +185,12 @@ mod hand_holding_telemetry;
 mod inquiry;
 #[path = "runtime/llm.rs"]
 mod llm;
-#[path = "turn/llm_phase.rs"]
-mod llm_phase;
 #[path = "turn/main_loop.rs"]
 mod main_loop;
-#[path = "turn/message_build_phase.rs"]
-mod message_build_phase;
+#[path = "turn/mandate_run.rs"]
+mod mandate_run;
+#[path = "turn/message_build.rs"]
+mod message_build;
 #[path = "runtime/models.rs"]
 mod models;
 #[path = "turn/prefix_fingerprint.rs"]
@@ -202,8 +202,6 @@ mod runtime_ports;
 mod sliding_window;
 #[path = "runtime/spawn.rs"]
 mod spawn;
-#[path = "turn/stopping_helpers.rs"]
-mod stopping_helpers;
 pub(crate) mod stt;
 #[path = "turn/system_directives.rs"]
 mod system_directives;
@@ -213,8 +211,8 @@ mod system_prompt;
 mod tool_defs;
 #[path = "tools/tool_exec.rs"]
 mod tool_exec;
-#[path = "turn/tool_execution_phase.rs"]
-mod tool_execution_phase;
+#[path = "turn/tool_execution/mod.rs"]
+mod tool_execution;
 #[path = "turn/tool_result_notices.rs"]
 mod tool_result_notices;
 #[path = "turn/turn_eviction.rs"]
@@ -266,7 +264,7 @@ pub(in crate::agent) use agent_helpers::{
 
 /// Phase 0 per-session window-boundary memory: `session_id` →
 /// (last `keep_from` index, last oldest-kept persisted message id). Used by
-/// `message_build_phase` to emit an explicit boundary-movement event.
+/// `message_build` to emit an explicit boundary-movement event.
 type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
 
 /// Pillar A per-session core-prompt cache: `session_id` → last rendered
@@ -383,7 +381,7 @@ pub struct Agent {
     /// Per-session conversation turn IDs. Populated at the start of each
     /// `handle_message_impl` and read by `append_message_canonical` so every
     /// message written during a turn is stamped with the same `turn_id`.
-    /// `message_build_phase` uses this stamp to find the current-task
+    /// `message_build` uses this stamp to find the current-task
     /// boundary without inferring from message content.
     current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     /// DEPRECATED (Pillar B Task 7): retired. This tracked the legacy
@@ -771,7 +769,7 @@ impl Agent {
     /// sub-agents, triggers, and tests pass `None`.
     #[cfg(test)]
     fn sanitize_final_reply_markers(reply: &str) -> String {
-        // NOTE: The primary sanitization pass already runs in completion_phase.rs.
+        // NOTE: The primary sanitization pass already runs in post_turn.rs.
         // This second pass is a lightweight safety net that only strips control
         // markers that the model may echo verbatim.  We intentionally do NOT
         // call the full `sanitize_user_facing_reply` again — double sanitization

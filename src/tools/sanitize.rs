@@ -55,7 +55,7 @@ static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
         Regex::new(r"(?i)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
         // Internal sliding-window placeholder for orphaned tool-call-only
-        // assistant turns (see agent/turn/message_build_phase.rs and
+        // assistant turns (see agent/turn/message_build.rs and
         // sliding_window.rs). It lives only inside the model's context and must
         // never reach the user; models occasionally regurgitate it verbatim,
         // especially when many identical placeholders accumulate in context.

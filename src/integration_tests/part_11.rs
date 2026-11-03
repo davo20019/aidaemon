@@ -1832,7 +1832,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///
 /// MockProvider call order:
 ///   1) First LLM call → denial text (no tool call)
-///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Caro"]}`
+///   2) Classifier call inside post_turn → `{"intent":"relational","entities":["Caro"]}`
 ///   3) Second LLM call (with directive injected) → corrected answer
 #[cfg(any())]
 #[tokio::test]
@@ -1845,7 +1845,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
     let provider = MockProvider::with_responses(vec![
         // Call 1: First LLM call — model denies knowledge without searching.
         MockProvider::text_response(denial),
-        // Call 2: Classifier call inside completion_phase — consumed by
+        // Call 2: Classifier call inside post_turn — consumed by
         // classify_relational_intent; returns relational intent with "Caro".
         MockProvider::text_response(classifier_json),
         // Call 3: Second LLM call — model has the UnsearchedEntityDenial directive
@@ -2010,7 +2010,7 @@ async fn test_owner_relationship_denial_is_blocked_then_corrected() {
 /// MockProvider call order:
 ///   1) First LLM call → tool call to "find_coworker" (returns "Juan is a coworker")
 ///   2) Second LLM call → grounded partial reply (entity present in evidence)
-///   3) Classifier call inside completion_phase → {"intent":"relational","entities":["Juan"]}
+///   3) Classifier call inside post_turn → {"intent":"relational","entities":["Juan"]}
 ///      (consumed because the pre-filter fires; find_unsearched_denials then returns
 ///      empty since Juan IS in evidence → gate does NOT fire ContinueLoop)
 ///   Total: 3 calls, but no denial directive is injected (gate short-circuits after

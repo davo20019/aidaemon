@@ -4,7 +4,7 @@
 //! with compact summaries in old conversation pairs, preserving context while
 //! reducing token count.
 
-// Used by message_build_phase.rs for age-based tool result summarization.
+// Used by message_build.rs for age-based tool result summarization.
 
 use serde_json::Value;
 

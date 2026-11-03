@@ -1,5 +1,5 @@
-use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
+use super::bootstrap::{BootstrapCtx, BootstrapData, BootstrapOutcome};
+use super::message_build::{MessageBuildCtx, MessageBuildData};
 use super::*;
 use crate::events::TaskOutcome;
 
@@ -252,7 +252,7 @@ fn assimilate_continuation_receipt(
     );
     let raw_arguments = serde_json::to_string(&evidence.call.arguments).ok()?;
     let mut metadata = receipt.to_metadata();
-    super::tool_execution_phase::complete_tool_result_semantics(
+    super::tool_execution::complete_tool_result_semantics(
         &evidence.result.name,
         &raw_arguments,
         &receipt.semantics,
@@ -271,7 +271,7 @@ fn assimilate_continuation_receipt(
     }
 
     let matched_contract = semantics.observes_state()
-        && super::tool_execution_phase::observation_matches_completion_contract(
+        && super::tool_execution::observation_matches_completion_contract(
             contract,
             semantics,
             &raw_arguments,
@@ -279,7 +279,7 @@ fn assimilate_continuation_receipt(
             &metadata,
         );
     let mut matched_requirement_indices = if semantics.observes_state() {
-        super::tool_execution_phase::matching_evidence_requirement_indices(
+        super::tool_execution::matching_evidence_requirement_indices(
             contract,
             &evidence.call.name,
             semantics,
@@ -328,7 +328,7 @@ fn assimilate_continuation_receipt(
         }
     }
     if semantics.observes_state() {
-        for index in super::tool_execution_phase::accumulate_evidence_requirement_marker_matches(
+        for index in super::tool_execution::accumulate_evidence_requirement_marker_matches(
             contract,
             progress,
             semantics,
@@ -351,7 +351,7 @@ fn assimilate_continuation_receipt(
             .evidence_requirements
             .get(*index)
             .is_some_and(|requirement| {
-                super::tool_execution_phase::evidence_requirement_accepts_nonstandard_outcome(
+                super::tool_execution::evidence_requirement_accepts_nonstandard_outcome(
                     requirement,
                     &metadata,
                 )
@@ -359,7 +359,7 @@ fn assimilate_continuation_receipt(
     });
     let can_verify = (reportable || expected_nonstandard_outcome)
         && semantics.observes_state()
-        && super::tool_execution_phase::tool_result_or_metadata_contains_verifiable_evidence(
+        && super::tool_execution::tool_result_or_metadata_contains_verifiable_evidence(
             semantics,
             &evidence.result.result,
             &metadata,
@@ -392,7 +392,7 @@ fn task_assessment_conversation_context(
     session_summary: Option<&str>,
     recent_messages: &[Value],
 ) -> Option<String> {
-    super::bootstrap_phase::task_planning::task_assessment_conversation_context(
+    super::bootstrap::task_planning::task_assessment_conversation_context(
         followup_mode,
         session_summary,
         recent_messages,
@@ -410,7 +410,7 @@ impl Agent {
                 tool.semantic_affordances()
                     .map(|affordances| affordances.scope)
             })
-            .or_else(|| super::tool_execution_phase::fallback_tool_semantic_scope(name))
+            .or_else(|| super::tool_execution::fallback_tool_semantic_scope(name))
     }
 
     /// Run the agentic loop for a user message in the given session.
@@ -443,7 +443,7 @@ impl Agent {
         info!(session_id, "handle_message_impl: starting bootstrap phase");
         let services = super::services::AgentServices::new(self);
 
-        let bootstrap_outcome = super::bootstrap_phase::run_bootstrap_phase(
+        let bootstrap_outcome = super::bootstrap::run_bootstrap(
             &services,
             &BootstrapCtx {
                 session_id,
@@ -1117,7 +1117,7 @@ impl Agent {
                 tool_defs: offered_tool_defs,
                 projected_source_message_ids,
                 projected_source_turn_ids,
-            } = super::message_build_phase::run_message_build_phase(
+            } = super::message_build::build_turn_messages(
                 &services,
                 &mut MessageBuildCtx {
                     session_id,
@@ -1493,7 +1493,7 @@ mod offered_tool_tests {
         };
         retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
             "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
-            other => super::super::tool_execution_phase::fallback_tool_semantic_scope(other),
+            other => super::super::tool_execution::fallback_tool_semantic_scope(other),
         });
         assert_eq!(names(&defs), ["http_request", "custom_remote", "read_file"]);
 
@@ -1509,7 +1509,7 @@ mod offered_tool_tests {
         };
         retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
             "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
-            other => super::super::tool_execution_phase::fallback_tool_semantic_scope(other),
+            other => super::super::tool_execution::fallback_tool_semantic_scope(other),
         });
         assert_eq!(names(&defs), ["read_file"]);
     }

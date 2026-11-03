@@ -1082,7 +1082,7 @@ impl Agent {
     // Pillar B (Task 7): `load_initial_history` and `load_recent_history` were
     // removed. Historical conversation retention is now owned entirely by the
     // turn-anchored fetch (`EventStore::get_turns_from_anchor`) in
-    // `message_build_phase`; the legacy "load N recent events then age-collapse"
+    // `message_build`; the legacy "load N recent events then age-collapse"
     // path no longer exists.
 }
 

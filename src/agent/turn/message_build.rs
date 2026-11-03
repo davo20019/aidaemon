@@ -462,7 +462,7 @@ fn build_execution_checkpoint_message(
     Some(lines.join("\n"))
 }
 
-pub(super) async fn run_message_build_phase(
+pub(super) async fn build_turn_messages(
     services: &super::services::AgentServices<'_>,
     ctx: &mut MessageBuildCtx<'_>,
 ) -> anyhow::Result<MessageBuildData> {
@@ -2171,7 +2171,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2241,7 +2241,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        let first = run_message_build_phase(
+        let first = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut first_ctx,
         )
@@ -2268,7 +2268,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        let second = run_message_build_phase(
+        let second = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut second_ctx,
         )
@@ -2369,7 +2369,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2448,7 +2448,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2619,7 +2619,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2750,7 +2750,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2881,7 +2881,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -2961,7 +2961,7 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -3085,7 +3085,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        let built1 = run_message_build_phase(
+        let built1 = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx1,
         )
@@ -3112,7 +3112,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        let built2 = run_message_build_phase(
+        let built2 = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx2,
         )
@@ -3182,7 +3182,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        let built = run_message_build_phase(
+        let built = build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )
@@ -3249,7 +3249,7 @@ mod tests {
             redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
-        run_message_build_phase(
+        build_turn_messages(
             &crate::agent::services::AgentServices::new(&harness.agent),
             &mut ctx,
         )

@@ -25,7 +25,7 @@ pub(super) fn build_tool_output_completion_reply(
     // banner (observed live: an `ls -R` of the whole resume tree, NDA
     // filenames included, shipped after a perfect send_file).
     if artifact_delivered {
-        return Some(super::stopping_helpers::send_file_completion_reply().to_string());
+        return Some(send_file_completion_reply().to_string());
     }
     // Strip the untrusted-data wrapper tags before embedding: a reply that
     // carries the raw markers gets its whole block gutted by the user-facing
@@ -157,6 +157,10 @@ fn structured_json_value(tool_output: &str) -> Option<serde_json::Value> {
 /// Detect when the LLM parrots our internal recovery format with trivial content.
 /// e.g., "Here is the latest tool output:\n\n(no output)" — the model saw a
 /// previous recovery message in the conversation history and repeated it verbatim.
+fn send_file_completion_reply() -> &'static str {
+    "I've sent the requested file. If you want any changes or another file, tell me exactly what to send."
+}
+
 #[cfg(test)]
 pub(super) fn looks_like_recovery_message_with_trivial_content(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();

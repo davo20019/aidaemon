@@ -53,12 +53,12 @@ pub(super) fn anchor_call_to_project_dir(
     let arguments = serde_json::to_string(&request.arguments).ok()?;
     let mut known = scope.known_project_dir.lock().ok()?;
     if let Some(explicit) =
-        crate::agent::tool_execution_phase::project_dir_from_tool_args(&request.name, &arguments)
+        crate::agent::tool_execution::project_dir_from_tool_args(&request.name, &arguments)
     {
         *known = Some(explicit);
     }
     let (updated, injected) =
-        crate::agent::tool_execution_phase::maybe_inject_project_dir_into_tool_args(
+        crate::agent::tool_execution::maybe_inject_project_dir_into_tool_args(
             &request.name,
             &arguments,
             known.as_deref(),
@@ -79,7 +79,7 @@ pub(super) fn attenuate_sdk_read_roots(scope: &TurnScope<'_>, request: &mut Tool
         .lock()
         .ok()
         .and_then(|known| known.clone());
-    let stripped = crate::agent::tool_execution_phase::attenuate_unauthorized_read_roots(
+    let stripped = crate::agent::tool_execution::attenuate_unauthorized_read_roots(
         &mut request.arguments,
         scope.task_access.as_ref(),
         &scope.authorized_scopes,
@@ -120,7 +120,7 @@ pub(super) fn bind_receipt_to_contract(
     metadata: &crate::traits::ToolCallMetadata,
     status: crate::traits::ToolOutcomeStatus,
 ) -> Vec<String> {
-    use crate::agent::tool_execution_phase as evidence;
+    use crate::agent::tool_execution as evidence;
     let semantics = &metadata.semantics;
     if metadata.invocation_stage.performed_io()
         && semantics.mutates_state()
@@ -232,7 +232,7 @@ impl Agent {
         scope: &TurnScope<'_>,
         tool_name: &str,
         arguments: &str,
-    ) -> Option<crate::agent::tool_execution_phase::ScopeCheck> {
+    ) -> Option<crate::agent::tool_execution::ScopeCheck> {
         let tool = self.tools.iter().find(|tool| tool.name() == tool_name)?;
         let mut manifest = tool
             .prepare_invocation(arguments)
@@ -247,7 +247,7 @@ impl Agent {
             .lock()
             .ok()
             .and_then(|known| known.clone());
-        crate::agent::tool_execution_phase::access_manifest_scope_check(
+        crate::agent::tool_execution::access_manifest_scope_check(
             tool_name,
             &manifest,
             scope.task_access.as_ref(),
@@ -286,10 +286,7 @@ impl Agent {
         // authorize goes to the tool's approval prompt.
         let scope_check = self.sdk_scope_check(scope, &request.name, arguments);
         let scope_escalation = match &scope_check {
-            Some(crate::agent::tool_execution_phase::ScopeCheck::Escalatable {
-                reason,
-                escalation,
-            }) => {
+            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { reason, escalation }) => {
                 info!(
                     tool = %request.name,
                     reads = ?escalation.read_paths,
@@ -357,16 +354,14 @@ impl Agent {
             && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
         let gate = if untrusted_block {
             Err((
-                crate::agent::tool_execution_phase::blocked_for_untrusted_external_reference_message(
+                crate::agent::tool_execution::blocked_for_untrusted_external_reference_message(
                     &request.name,
                     &scope.untrusted_reference_skills,
                 ),
                 "untrusted_external_reference_blocked",
             ))
-        } else if let (
-            true,
-            Some(crate::agent::tool_execution_phase::ScopeCheck::Rejected(reason)),
-        ) = (admitted, &scope_check)
+        } else if let (true, Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason))) =
+            (admitted, &scope_check)
         {
             Err((
                 crate::agent::ToolResultNotice::ScopeLockBlockedResult {
@@ -459,7 +454,7 @@ impl Agent {
         // the task and the canonical arguments: a repeat reuses the durable
         // receipt instead of performing the effect twice.
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
-        let preflight = crate::agent::tool_execution_phase::durable_replay_preflight(
+        let preflight = crate::agent::tool_execution::durable_replay_preflight(
             self,
             scope.session_id,
             &request.name,
@@ -505,7 +500,7 @@ impl Agent {
                 // An executed call keeps the semantics it was admitted with
                 // (an observation stays an observation even when it returns a
                 // negative result), as in the legacy tool phase.
-                crate::agent::tool_execution_phase::complete_tool_result_semantics(
+                crate::agent::tool_execution::complete_tool_result_semantics(
                     &request.name,
                     arguments,
                     &call_semantics,
@@ -604,7 +599,7 @@ impl Agent {
                 // model reports it. Work the daemon pushed to the background
                 // is the handoff unless the assessed task shape keeps
                 // independent inline work going.
-                if crate::agent::tool_execution_phase::tool_result_indicates_background_detach(
+                if crate::agent::tool_execution::tool_result_indicates_background_detach(
                     &request.name,
                     &output,
                     &outcome.metadata,
@@ -622,7 +617,7 @@ impl Agent {
                                 scope.user_text,
                             )
                         } else {
-                            crate::agent::tool_execution_phase::build_background_detach_ack(
+                            crate::agent::tool_execution::build_background_detach_ack(
                                 &request.name,
                                 &output,
                                 &outcome.metadata,
@@ -659,7 +654,7 @@ impl Agent {
                     && self.mandate_execution.is_some()
                 {
                     if let Some(summary) =
-                        crate::agent::llm_phase::committed_non_action_mandate_summary(self).await
+                        crate::agent::mandate_run::committed_non_action_mandate_summary(self).await
                     {
                         scope.end_with(summary, TaskOutcome::Succeeded);
                     }
@@ -702,7 +697,7 @@ impl Agent {
                     metadata.receipt_kind = prepared.receipt_kind;
                     metadata.access_manifest = Some(prepared.access_manifest);
                 }
-                crate::agent::tool_execution_phase::complete_tool_result_semantics(
+                crate::agent::tool_execution::complete_tool_result_semantics(
                     &request.name,
                     arguments,
                     &call_semantics,
@@ -781,14 +776,14 @@ impl Agent {
         }
         if let Some(status_tx) = &scope.status_tx {
             let update = if request.name == "track_requirements" {
-                crate::agent::tool_execution_phase::parse_checklist_from_result(&output)
+                crate::agent::tool_execution::parse_checklist_from_result(&output)
                     .map(|text| StatusUpdate::Checklist { text })
             } else {
                 let source = if matches!(request.name.as_str(), "manage_memories" | "manage_people")
                 {
                     crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
                 } else {
-                    crate::agent::tool_execution_phase::summarize_completed_tool_result(&output)
+                    crate::agent::tool_execution::summarize_completed_tool_result(&output)
                 };
                 let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
                     &request.name,
@@ -814,13 +809,9 @@ impl Agent {
         if external_mutation {
             if let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
                 *ack = (!failed
-                    && crate::agent::tool_execution_phase::should_build_external_action_ack(
-                        &output,
-                    ))
+                    && crate::agent::tool_execution::should_build_external_action_ack(&output))
                 .then(|| {
-                    crate::agent::tool_execution_phase::build_external_action_completion_ack(
-                        &output,
-                    )
+                    crate::agent::tool_execution::build_external_action_completion_ack(&output)
                 });
             }
         }
@@ -1007,7 +998,7 @@ impl Agent {
         scope: &TurnScope<'_>,
         request: &ToolRequest,
         arguments: &str,
-        preflight: &crate::agent::tool_execution_phase::DurableReplayPreflight,
+        preflight: &crate::agent::tool_execution::DurableReplayPreflight,
     ) -> Option<sdk::ToolOutput> {
         let call = crate::traits::ToolCall {
             id: request.call_id.clone(),
@@ -1141,7 +1132,7 @@ impl Agent {
             return None;
         }
         let tracker = scope.instruction_tracker.as_ref()?;
-        let targets = crate::agent::tool_execution_phase::project_instruction_targets_for_tool_call(
+        let targets = crate::agent::tool_execution::project_instruction_targets_for_tool_call(
             &request.name,
             arguments,
             semantics,
@@ -1239,7 +1230,7 @@ impl Agent {
         let semantics = self
             .semantics_for_exact_tool_call(&request.name, arguments)
             .await;
-        match crate::agent::tool_execution_phase::mandate_gate_for_tool_call(
+        match crate::agent::tool_execution::mandate_gate_for_tool_call(
             self,
             &goal_id,
             &request.call_id,
@@ -1249,11 +1240,9 @@ impl Agent {
         )
         .await
         {
-            Ok(crate::agent::tool_execution_phase::MandateGateDecision::NotApplicable) => Ok(None),
-            Ok(crate::agent::tool_execution_phase::MandateGateDecision::Allow { grant }) => {
-                Ok(grant)
-            }
-            Ok(crate::agent::tool_execution_phase::MandateGateDecision::Deny { reason }) => {
+            Ok(crate::agent::tool_execution::MandateGateDecision::NotApplicable) => Ok(None),
+            Ok(crate::agent::tool_execution::MandateGateDecision::Allow { grant }) => Ok(grant),
+            Ok(crate::agent::tool_execution::MandateGateDecision::Deny { reason }) => {
                 let is_task_lead = self
                     .mandate_execution
                     .as_ref()

@@ -64,9 +64,7 @@ impl<'a> ClosingAuthority<'a> {
         // even when a scope-level prohibition would otherwise cover it (the
         // same rule as an exact write path beating a directory root).
         if !explicitly_allowed {
-            if let Some(scope) =
-                crate::agent::tool_execution_phase::fallback_tool_semantic_scope(tool)
-            {
+            if let Some(scope) = crate::agent::tool_execution::fallback_tool_semantic_scope(tool) {
                 if self.forbidden_tool_scopes.contains(&scope) {
                     return false;
                 }
