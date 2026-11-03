@@ -391,12 +391,19 @@ cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
 cargo run --bin db_probe --features encryption -- --token-hours 24
 cargo run --bin db_probe --features encryption -- --fabrication-audit --eval-hours 72
 cargo run --bin db_probe --features encryption -- --gate-outcomes --eval-hours 168
+cargo run --bin db_probe --features encryption -- --cache-reuse --eval-hours 72
 ```
 
 `--fabrication-audit` is a post-hoc trace check: it flags tasks whose final
 assistant reply claims a side-effecting action (posted/ran/deployed/wrote a
 file, etc.) while the task made zero tool calls — a candidate fabricated
 completion. It verifies outcomes rather than predicting tool-need up front.
+
+`--cache-reuse` (with `--eval-hours N`) reports prompt-cache reuse of agent
+turns by model, first call versus later calls of a run. Later calls resend an
+append-only transcript, so low reuse there means something rewrote the prefix
+(or the provider routed the call to a cold cache); check it before and after
+any change to message assembly or provider request building.
 
 `--gate-outcomes` (with `--eval-hours N`) measures gates by what happened after
 they intervened: each gate decision point or tool refusal is grouped by gate and
