@@ -334,8 +334,18 @@ pub(super) fn prefix_with_notes(prefix: &[Value], notes: &[String]) -> Vec<Value
     out
 }
 
+#[cfg(test)]
 pub(super) fn fit_run(prefix: &[Value], run: &[sdk::Message], budget_tokens: usize) -> Vec<Value> {
-    let run_values = to_daemon_messages_from(run);
+    fit_run_values(prefix, to_daemon_messages_from(run), budget_tokens)
+}
+
+/// [`fit_run`] over a run already in the daemon wire format (after
+/// compaction).
+pub(super) fn fit_run_values(
+    prefix: &[Value],
+    run_values: Vec<Value>,
+    budget_tokens: usize,
+) -> Vec<Value> {
     let prefix_tokens = estimate_multimodal_message_tokens(prefix);
     let run_tokens = estimate_multimodal_message_tokens(&run_values);
     let mut out = prefix.to_vec();
@@ -394,6 +404,11 @@ pub(super) fn values_to_sdk(values: &[Value]) -> Vec<sdk::Message> {
             Some(message)
         })
         .collect()
+}
+
+/// A wire message's text, image parts left out.
+pub(super) fn message_text(message: &Value) -> String {
+    split_content(message.get("content")).0
 }
 
 fn split_content(content: Option<&Value>) -> (String, Vec<sdk::Image>) {

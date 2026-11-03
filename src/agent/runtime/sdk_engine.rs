@@ -50,8 +50,9 @@ use uuid::Uuid;
 use super::agent_helpers::touch_heartbeat;
 use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
 use super::sdk_provider::{
-    fit_run, from_provider_response, prefix_with_notes, split_injected_notes, to_chat_options,
-    to_daemon_tools, values_to_sdk, DaemonProvider, ModelCall,
+    fit_run_values, from_provider_response, message_text, prefix_with_notes, split_injected_notes,
+    to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk, DaemonProvider,
+    ModelCall,
 };
 use super::tool_exec::ToolExecCtx;
 use super::Agent;
@@ -63,6 +64,8 @@ use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 #[path = "sdk_engine/budgets.rs"]
 mod budgets;
+#[path = "sdk_engine/compaction.rs"]
+mod compaction;
 #[path = "sdk_engine/hooks.rs"]
 mod hooks;
 #[path = "sdk_engine/model_call.rs"]
@@ -389,6 +392,8 @@ struct TurnScope<'a> {
         Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
     /// System context added during the run, sent after the projected prefix.
     extra_system: std::sync::Mutex<Vec<String>>,
+    /// The run's summarized older rounds, once it outgrew the context.
+    compaction: std::sync::Mutex<Option<compaction::RunCompaction>>,
     /// Set when a call moved work to the background with completion
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
@@ -722,6 +727,7 @@ impl Agent {
             projected_source_turn_ids,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
+            compaction: std::sync::Mutex::new(None),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "computer_use")]

@@ -576,7 +576,7 @@ fn byte_index_before_last_chars(s: &str, char_count: usize) -> usize {
     byte_index_after_chars(s, total.saturating_sub(char_count))
 }
 
-fn compact_summary_input(content: &str, max_chars: usize) -> String {
+pub(crate) fn compact_summary_input(content: &str, max_chars: usize) -> String {
     let count = content.chars().count();
     if count <= max_chars {
         return content.to_string();

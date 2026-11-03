@@ -172,7 +172,20 @@ impl Agent {
             .unwrap_or_default();
         let mut prefix = prefix_with_notes(&scope.prefix, &notes);
         prefix.extend(extra);
-        let messages = fit_run(&prefix, run, budget);
+        // An oversized run is compacted (older rounds summarized) before
+        // quota fitting, which stays as the fallback.
+        let prefix_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&prefix);
+        let run = self
+            .sdk_compacted_run(
+                scope,
+                &request.model,
+                prefix_tokens,
+                &to_daemon_messages_from(run),
+                budget,
+            )
+            .await;
+        let messages = fit_run_values(&prefix, run, budget);
         let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
         // A reasoning model that spent its whole output budget thinking was
         // usually on a hard step: give it more output room first, and lower
