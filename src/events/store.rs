@@ -2693,8 +2693,11 @@ impl EventStore {
 
     /// Reconcile stale TaskStart events that never received a matching TaskEnd.
     ///
-    /// This emits synthetic failed TaskEnd events so UI/DB task state self-heals
-    /// even when an agent process died outside channel watchdog loops.
+    /// This emits synthetic interrupted TaskEnd events so UI/DB task state
+    /// self-heals even when an agent process died outside channel watchdog
+    /// loops. A silent task stopped without a semantic terminal result, which is
+    /// `Interrupted`, not `Failed`: counting it as a failure let these synthetic
+    /// rows dominate the failure rate.
     pub async fn reconcile_stale_task_starts(
         &self,
         stale_after_secs: i64,
@@ -2783,7 +2786,7 @@ impl EventStore {
                     .await
                     .unwrap_or_default(),
             );
-            let outcome = crate::events::TaskOutcome::Failed;
+            let outcome = crate::events::TaskOutcome::Partial;
             let harness_eval = Some(Self::supervisor_harness_snapshot(
                 &task_id,
                 None,
@@ -2807,13 +2810,13 @@ impl EventStore {
                 EventType::TaskEnd,
                 serde_json::to_value(TaskEndData {
                     task_id: task_id.clone(),
-                    status: TaskStatus::Failed,
+                    status: TaskStatus::Interrupted,
                     outcome: Some(outcome),
                     duration_secs,
                     iterations,
                     tool_calls_count,
                     error: Some(format!(
-                        "Auto-failed by watchdog after {} minute(s) without task_end",
+                        "Interrupted by watchdog after {} minute(s) without activity",
                         stale_after_mins
                     )),
                     summary: Some("Recovered stale in-flight task".to_string()),
@@ -5669,7 +5672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_stale_task_starts_appends_failed_task_end() {
+    async fn reconcile_stale_task_starts_appends_interrupted_task_end() {
         let (store, _db_file) = setup_store().await;
         let now = Utc::now();
 
@@ -5742,7 +5745,8 @@ mod tests {
         let stale_end = stale_events[1]
             .parse_data::<TaskEndData>()
             .expect("parse stale task_end");
-        assert_eq!(stale_end.status, TaskStatus::Failed);
+        assert_eq!(stale_end.status, TaskStatus::Interrupted);
+        assert_eq!(stale_end.outcome, Some(crate::events::TaskOutcome::Partial));
         assert!(stale_end.efficiency.is_some());
         assert!(stale_end.harness_eval.is_some());
         assert!(stale_end.completion_proof.is_some());
@@ -5750,7 +5754,7 @@ mod tests {
             stale_end
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("Auto-failed by watchdog")),
+                .is_some_and(|e| e.contains("Interrupted by watchdog")),
             "synthetic task_end should include watchdog reason"
         );
 
