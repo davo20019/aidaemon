@@ -806,7 +806,7 @@ pub struct AgentConfig {
     /// Optional Markdown persona file. Relative paths resolve next to config.toml.
     #[serde(default)]
     pub persona_file: Option<PathBuf>,
-    /// Which loop runs agent turns. Defaults to the legacy loop.
+    /// `[agent.engine]` settings for the SDK kernel that runs agent turns.
     #[serde(default)]
     pub engine: AgentEngineConfig,
 }

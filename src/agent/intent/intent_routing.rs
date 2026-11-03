@@ -22,15 +22,9 @@ pub(super) enum ConnectedContentMode {
 }
 
 impl ConnectedContentMode {
+    #[cfg(test)]
     pub(super) fn is_authoring_only(self) -> bool {
-        #[cfg(test)]
-        {
-            return matches!(self, Self::DraftOnly);
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
+        matches!(self, Self::DraftOnly)
     }
 
     #[cfg(test)]

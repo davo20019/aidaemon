@@ -178,7 +178,6 @@ pub(in crate::agent) use completion_contract::persistable_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
-pub(in crate::agent) use history::ExecutionRequirement;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::ForbiddenMutationAction;
 pub(in crate::agent) use history::TurnContext;

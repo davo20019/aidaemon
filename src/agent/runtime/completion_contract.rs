@@ -531,29 +531,6 @@ pub(super) fn inherit_request_constraints(
     current
 }
 
-/// Authoritative, finalized per-turn assessment of whether completing the
-/// request requires execution.
-///
-/// The finalized typed contract is folded into one value. Downstream routing
-/// and recovery code must consume
-/// [`Self::requires_execution`] instead of independently recalculating whether
-/// tools are needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ExecutionRequirement {
-    requires_execution: bool,
-}
-
-impl ExecutionRequirement {
-    pub(super) fn from_finalized_contract(contract: &CompletionContract) -> Self {
-        let mutation_contract =
-            contract.expects_mutation && !contract.connected_content_mode.is_authoring_only();
-        let observation_contract = contract.requires_observation;
-        let requires_execution = mutation_contract || observation_contract;
-
-        Self { requires_execution }
-    }
-}
-
 /// Map a planner-supplied task-kind string to the enum. Unknown values map
 /// to None so a hallucinated kind never overrides the keyword inference.
 pub(super) fn parse_planned_task_kind(value: &str) -> Option<CompletionTaskKind> {

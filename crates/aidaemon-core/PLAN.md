@@ -13,11 +13,11 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 
 | Item | State |
 |---|---|
-| Branch | `ccr-986102ee-12nt48` (branched from `master` at `4a36e32`) |
+| Branch | `ccr-695cf12a-023uky` (carries the earlier `ccr-986102ee-12nt48` work) |
 | Crates | `aidaemon-core` plus 13 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
 | Tests | all passing across the 14 crates (incl. conformance kits); clippy and fmt clean |
 | CI | Lint and tests for every SDK crate run in `ci.yml`. macOS job never gets a runner (see "Known issues") |
-| PR | #13 was closed without merging; the branch was kept. Open a new PR only when asked |
+| PR | #14 (draft). #13 was closed without merging |
 | Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
 
 ### What exists
@@ -134,7 +134,7 @@ adapters, tested against local mock servers.
 - [x] Draft publishing plan in `crates/PUBLISHING.md`.
 - [ ] Owner decision on publishing (names, 0.1.0, release automation).
 
-### Phase 7: the daemon runs on the SDK (in progress, behind a flag)
+### Phase 7: the daemon runs on the SDK (done except packaging)
 - [x] Engine switch: build with `--features sdk-engine` and set
       `[agent.engine] kind = "sdk"`. Every turn that reaches
       `handle_message_impl` (channels, continuations, goal task leads,
@@ -151,15 +151,24 @@ adapters, tested against local mock servers.
       and status updates working. Fixed on the way: top-level schema
       combinators rejected by Anthropic; `truncate_with_anchor` dropping the
       newest message (shared with the legacy loop).
-- [ ] Not yet on the SDK path: attachments (paths only), `/model` and the
-      daemon's provider router/fallbacks (Anthropic only), ToolCall events
-      and receipts (ToolResult is recorded), intent gating and completion
-      contracts (deliberately off). Scheduled goals not yet observed live.
-- [ ] Close the remaining gaps and replace the old loop. Owner decision
-      (2026-10-31): no side-by-side comparison; once the test suite passes on
+- [x] Ported to the SDK path: media, `/model` and the daemon's provider
+      router/fallbacks, ToolCall events and receipts, the assessor contract
+      and authority lane (parity plan Tasks 1-7 and packages P1-P8).
+- [x] Close the remaining gaps and replace the old loop: the SDK kernel is
+      the only agent loop (`2c138cd`); the legacy loop and its dead code are
+      deleted (`2ae738d`). The `[agent.engine] kind` setting is ignored.
+      Owner decision (2026-10-31): no side-by-side comparison; once the test suite passes on
       the SDK engine, the old loop is deleted. Task-by-task breakdown with
-      tests: `plans/2026-10-31-sdk-engine-parity.md` (this directory). Tick
-      the tasks there; tick this line when its Task 8 lands.
+      tests: `plans/2026-10-31-sdk-engine-parity.md` (this directory). All
+      tasks there are ticked except Task 8 Step 4.
+- [ ] `cargo package` for the daemon: blocked on the owner's decision on
+      how `aidaemon-core` ships (publish it, or fold it into the main crate).
+- [ ] Task wall-clock timeout: the legacy loop stopped a task after
+      `subagents.task_timeout_secs` (default 30 min, scheduled goals
+      exempt); the SDK engine leaves `sdk::Limits::timeout` unset, so
+      nothing enforces it. Set it in `sdk_engine.rs` where the limits are
+      built.
+- [ ] Whole-branch review, then live N-of-M runs on goals and mandates.
 
 ## Parallel track: fixes found in the daemon
 
@@ -201,8 +210,8 @@ Independent of the SDK; each is a small PR against `master`.
 ## How to resume
 
 ```bash
-git fetch origin ccr-986102ee-12nt48
-git checkout ccr-986102ee-12nt48
+git fetch origin ccr-695cf12a-023uky
+git checkout ccr-695cf12a-023uky
 git config user.name "David Loor M."
 git config user.email "davo20019@gmail.com"
 cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools \
@@ -214,6 +223,6 @@ ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example coding_agent -- <dir> 
 
 Prompt to start a new session:
 
-> Continue the aidaemon SDK work. Check out branch `ccr-986102ee-12nt48`,
+> Continue the aidaemon SDK work. Check out branch `ccr-695cf12a-023uky`,
 > read `crates/aidaemon-core/PLAN.md` and `DESIGN.md`, then work on the
 > step marked "Next up". Commit as David Loor M. with no Claude attribution.

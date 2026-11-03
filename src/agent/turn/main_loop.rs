@@ -531,11 +531,6 @@ impl Agent {
         let unhandled_error_emitter = emitter.clone();
         let unhandled_error_task_id = task_id.clone();
         let loop_result = tracing::Instrument::instrument(async move {
-        let _last_progress_summary = Instant::now();
-        let _approach_pivots_used: usize = 0;
-        const MAX_BUDGET_EXTENSIONS: usize = 3;
-        const HARD_TOKEN_CAP: i64 = 2_000_000;
-
         let iteration_limits = match &self.limits.iteration_config {
             IterationLimitConfig::Unlimited => super::loop_state::IterationLimitSettings {
                 hard_cap: Some(HARD_ITERATION_CAP),
@@ -930,9 +925,6 @@ impl Agent {
             turn_state.attach_harness_eval(handle);
         }
 
-        let _execution_requirement =
-            ExecutionRequirement::from_finalized_contract(&turn_context.completion_contract);
-
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
         #[cfg(test)]
@@ -1172,35 +1164,14 @@ impl Agent {
         } else {
             self.limits.task_timeout
         };
-        let _max_budget_extensions = if is_scheduled_goal {
-            SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS
-        } else {
-            MAX_BUDGET_EXTENSIONS
-        };
-        let _hard_token_cap = if is_scheduled_goal {
-            SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP
-        } else {
-            HARD_TOKEN_CAP
-        };
-        // Runtime-only override for goal daily budget extensions.
-        // Shared via GoalTokenRegistry so task-leads/executors for the same goal
-        // can inherit the same temporary budget without persisting it to SQLite.
-        let _effective_goal_daily_budget: Option<i64> = if let (Some(goal_id), Some(registry)) = (
-            resolved_goal_id.as_deref(),
-            self.goal_token_registry.as_ref(),
-        ) {
-            registry.get_effective_daily_budget(goal_id).await
-        } else {
-            None
-        };
-
-        // On the SDK engine the kernel runs the iteration loop; every per-turn
-        // setup above (assessment, contract, harness eval, budgets, pending
-        // directives) is shared with the legacy loop.
+        // The kernel runs the iteration loop from the per-turn setup above
+        // (assessment, contract, harness eval, budgets, pending directives).
+        // Budget extensions, hard token caps and the goal's effective daily
+        // budget are enforced inside the SDK engine.
         {
             let engine = self.sdk_engine.clone();
-            // The run starts from the transcript the legacy message builder
-            // projects for a first iteration: core prompt, the request's
+            // The run starts from the transcript the message builder projects
+            // for a first iteration: core prompt, the request's
             // archived turns (new-request isolation, shared-channel redaction,
             // summary cursor, task boundary), the volatile tail, pending
             // directives and the current user message with its media.
