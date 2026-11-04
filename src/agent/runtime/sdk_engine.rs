@@ -1005,6 +1005,7 @@ impl Agent {
                 .as_ref()
                 .is_ok_and(|outcome| outcome.state.untrusted_seen);
         if tainted {
+            self.read_untrusted.store(true, Ordering::SeqCst);
             if let Err(error) = crate::agent::untrusted::record_tainted_turn(
                 self.state.as_ref(),
                 session_id,

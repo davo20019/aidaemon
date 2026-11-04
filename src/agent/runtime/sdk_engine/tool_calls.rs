@@ -1006,6 +1006,10 @@ impl Agent {
             .unwrap_or_default();
         // The first untrusted read records the turn as tainted at once, so a
         // run that never finishes still taints later turns that see it.
+        if trust == sdk::SourceTrust::Untrusted {
+            self.read_untrusted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if trust == sdk::SourceTrust::Untrusted
             && !scope
                 .untrusted_seen

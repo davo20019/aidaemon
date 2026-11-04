@@ -398,6 +398,10 @@ pub struct Agent {
     /// `message_build` uses this stamp to find the current-task
     /// boundary without inferring from message content.
     current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Some turn of this agent read (or started with) untrusted content.
+    /// Kept in memory so a taint that could not be recorded still counts
+    /// when a parent reads this child's result.
+    read_untrusted: Arc<std::sync::atomic::AtomicBool>,
     /// DEPRECATED (Pillar B Task 7): retired. This tracked the legacy
     /// sliding-window `keep_from` boundary; the boundary signal is now the
     /// turn-anchor (`turn_anchors`). The age-ladder/sliding-window block that

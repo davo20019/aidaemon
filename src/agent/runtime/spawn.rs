@@ -13,6 +13,21 @@ struct TaskLeadSpec {
     input_text: String,
 }
 
+/// Who authored a child's result: `Untrusted` when the child read (or
+/// started with) untrusted content, by its in-memory flag or by its own
+/// record of tainted turns (its session is fresh per spawn). An unreadable
+/// record counts as tainted, and so does a taint the child saw but could not
+/// record.
+fn child_result_trust(
+    read_untrusted: bool,
+    record: anyhow::Result<Vec<String>>,
+) -> aidaemon_core::SourceTrust {
+    match record {
+        Ok(turns) if turns.is_empty() && !read_untrusted => aidaemon_core::SourceTrust::Trusted,
+        _ => aidaemon_core::SourceTrust::Untrusted,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SpawnChildResult {
     pub response: String,
@@ -2391,6 +2406,7 @@ impl Agent {
             )
             .await;
         let child_session_for_events = child_session.clone();
+        let child_read_untrusted = child.read_untrusted.clone();
 
         // Run the child agent on its OWN tokio task instead of awaiting it
         // inline. An inline `.await` nests the child's (very large) agent-loop
@@ -2605,17 +2621,11 @@ impl Agent {
             }
         }
 
-        // The child's own record of turns that read untrusted content (its
-        // session is fresh per spawn); an unreadable record counts as read.
-        let trust = match crate::agent::untrusted::tainted_turns(
-            self.state.as_ref(),
-            &child_session_for_events,
-        )
-        .await
-        {
-            Ok(turns) if turns.is_empty() => aidaemon_core::SourceTrust::Trusted,
-            _ => aidaemon_core::SourceTrust::Untrusted,
-        };
+        let trust = child_result_trust(
+            child_read_untrusted.load(std::sync::atomic::Ordering::SeqCst),
+            crate::agent::untrusted::tainted_turns(self.state.as_ref(), &child_session_for_events)
+                .await,
+        );
         result.map(|response| SpawnChildResult {
             response,
             outcome: child_outcome,
@@ -2885,6 +2895,23 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    /// A child that saw untrusted content but could not record it, or
+    /// whose record cannot be read, returns an untrusted result.
+    #[test]
+    fn a_childs_unrecorded_or_unreadable_taint_fails_closed() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        assert_eq!(super::child_result_trust(false, Ok(Vec::new())), Trusted);
+        assert_eq!(super::child_result_trust(true, Ok(Vec::new())), Untrusted);
+        assert_eq!(
+            super::child_result_trust(false, Ok(vec!["turn-a".to_string()])),
+            Untrusted
+        );
+        assert_eq!(
+            super::child_result_trust(false, Err(anyhow::anyhow!("unreadable"))),
+            Untrusted
+        );
+    }
+
     use super::{
         bounded_completed_task_results_context, is_sqlite_busy, task_references_parent_context,
         Agent,
