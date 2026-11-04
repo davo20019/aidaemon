@@ -9674,6 +9674,27 @@ mod tests {
             assert!(ann("rm $TARGET", Some(&project)).egress);
             assert!(ann("ls | xargs rm", Some(&project)).egress);
             assert!(ann("find . -exec rm {} ;", Some(&project)).egress);
+            // The shell deletes somewhere the call's directory does not say.
+            for undeterminable in [
+                "cd .. && rm -rf sibling",
+                "pushd .. && rm -rf sibling",
+                "(cd .. && rm -rf sibling)",
+                "find -L / -delete",
+                "find -delete",
+                "rm -rf {build,../../victim}",
+                "rm -rf *",
+                "rm -rf build/?",
+                "rm -rf ~/x",
+            ] {
+                assert!(
+                    ann(undeterminable, Some(&project)).egress,
+                    "{undeterminable} must be egress"
+                );
+            }
+            assert!(!ann("rm -rf build", Some(&project)).egress);
+            assert!(!ann("find ./target -name '*.o' -delete", Some(&project)).egress);
+            // An absolute target stays judgeable after a directory change.
+            assert!(!ann(&format!("cd /tmp && rm -rf {project}/build"), None).egress);
         }
     }
 

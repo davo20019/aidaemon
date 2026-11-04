@@ -410,14 +410,22 @@ pub(crate) fn command_effects(command: &str) -> CommandEffects {
 }
 
 /// Paths named by every deleting command, or `None` when any cannot be
-/// read: a target with a variable, substitution or `find` placeholder, a
-/// deleting command with no target (arguments arriving through a pipe),
-/// or `git clean` (its targets are whatever is untracked).
+/// determined: a target with shell expansion (variables, substitutions,
+/// globs, braces, `~`) or a `find` placeholder, a deleting command with no
+/// target (arguments arriving through a pipe), `find` without explicit
+/// start paths, `git clean` (its targets are whatever is untracked), or a
+/// relative target in a command that changes directory (`cd`, `pushd`,
+/// `popd`), since the shell then deletes relative to somewhere else.
 fn delete_targets(command: &str) -> Option<Vec<String>> {
-    let unreadable =
-        |target: &str| target.is_empty() || target == "{}" || target.contains(['$', '`', '\\']);
-    let mut targets = Vec::new();
-    for tokens in expanded_commands(command) {
+    let unreadable = |target: &str| {
+        target.is_empty() || target.contains(['$', '`', '\\', '{', '}', '*', '?', '[', '~'])
+    };
+    let commands = expanded_commands(command);
+    let changes_directory = commands
+        .iter()
+        .any(|tokens| matches!(basename(&tokens[0]), "cd" | "pushd" | "popd"));
+    let mut targets: Vec<String> = Vec::new();
+    for tokens in &commands {
         let program = basename(&tokens[0]);
         let args = &tokens[1..];
         let named: Vec<&String> = if DELETE_PROGRAMS.contains(&program) {
@@ -435,23 +443,24 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
                 })
                 .collect()
         } else if program == "find" && args.iter().any(|arg| arg == "-delete") {
-            let starts: Vec<&String> = args
-                .iter()
-                .take_while(|arg| !arg.starts_with(['-', '(', '!']))
-                .collect();
-            if starts.is_empty() {
-                if !targets.iter().any(|target| target == ".") {
-                    targets.push(".".to_string());
-                }
-                continue;
+            // Start paths come first; a leading option (`-L`, `-H`, `-O3`,
+            // `-D x`, BSD `-f path`) makes them unreadable here, and none at
+            // all means the shell's own directory.
+            if args.first().is_none_or(|arg| arg.starts_with('-')) {
+                return None;
             }
-            starts
+            args.iter()
+                .take_while(|arg| !arg.starts_with(['-', '(', '!']))
+                .collect()
         } else if program == "git" && args.iter().any(|arg| arg == "clean") {
             return None;
         } else {
             continue;
         };
         if named.is_empty() || named.iter().any(|target| unreadable(target)) {
+            return None;
+        }
+        if changes_directory && named.iter().any(|target| !target.starts_with('/')) {
             return None;
         }
         for target in named {
@@ -958,11 +967,16 @@ mod tests {
             command_effects("rm -rf -- -odd build && find out -delete").delete_targets,
             Some(vec!["-odd".into(), "build".into(), "out".into()])
         );
-        assert_eq!(
-            command_effects("find -delete").delete_targets,
-            Some(vec![".".into()])
-        );
-        for unknown in ["rm \"$X\"", "git clean -fd", "xargs rm", "rm `ls`"] {
+        for unknown in [
+            "rm \"$X\"",
+            "git clean -fd",
+            "xargs rm",
+            "rm `ls`",
+            "find -delete",
+            "find -L / -delete",
+            "rm -rf {a,b}",
+            "cd x && rm y",
+        ] {
             assert_eq!(command_effects(unknown).delete_targets, None, "{unknown}");
         }
         // Observations still refuse file redirects.
