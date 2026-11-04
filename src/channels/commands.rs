@@ -260,11 +260,14 @@ impl CommandContext {
         match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
             Ok(until) => match requested {
                 SessionMode::ReadOnly => format!(
-                    "Read-only for this chat until {}. aidaemon can look but not change anything. Send /mode full to end it early.",
+                    "Read-only for this chat until {}, starting with your next message. aidaemon can look but not change anything. Send /mode full to end it early.",
                     clock(until)
                 ),
                 SessionMode::Unrestricted => {
-                    format!("Unrestricted for this chat until {}.", clock(until))
+                    format!(
+                        "Unrestricted for this chat until {}, starting with your next message.",
+                        clock(until)
+                    )
                 }
                 SessionMode::Full => "Back to full access.".to_string(),
             },
@@ -1129,7 +1132,7 @@ mod mode_command_tests {
             "{reply}"
         );
         assert!(reply.ends_with(
-            ". aidaemon can look but not change anything. Send /mode full to end it early."
+            ", starting with your next message. aidaemon can look but not change anything. Send /mode full to end it early."
         ));
         let shown = ctx
             .dispatch("/mode", "", session, UserRole::Owner)
@@ -1160,6 +1163,10 @@ mod mode_command_tests {
             .unwrap();
         assert!(
             unrestricted.starts_with("Unrestricted for this chat until "),
+            "{unrestricted}"
+        );
+        assert!(
+            unrestricted.ends_with(", starting with your next message."),
             "{unrestricted}"
         );
     }
