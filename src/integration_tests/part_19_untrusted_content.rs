@@ -601,4 +601,3 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
-
