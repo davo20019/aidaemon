@@ -484,6 +484,16 @@ impl Tool for SearchHistoryTool {
         })
     }
 
+    /// Retained messages include other people's (group chats, guests) and
+    /// assistant turns that echoed pages: someone else's words.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             // `repair` mutates only a disposable local projection; the normal

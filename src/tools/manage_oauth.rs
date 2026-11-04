@@ -1476,7 +1476,7 @@ mod tests {
         write_minimal_config(config_file.path());
         let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         assert_eq!(
-            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots(&[])),
+            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots::new(&[])),
             aidaemon_core::SourceTrust::Trusted
         );
     }

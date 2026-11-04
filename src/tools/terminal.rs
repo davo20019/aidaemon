@@ -6452,7 +6452,7 @@ impl TerminalTool {
                     && !terminal_run_annotations(
                         &args,
                         self.confinement,
-                        &crate::traits::TrustRoots(&[]),
+                        &crate::traits::TrustRoots::new(&[]),
                     )
                     .read_only
                 {
@@ -7663,7 +7663,7 @@ impl Tool for TerminalTool {
 
     /// Without the turn's roots every delete counts as outside them.
     fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
-        self.call_annotations_in(arguments, &crate::traits::TrustRoots(&[]))
+        self.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
     }
 
     fn call_annotations_in(
@@ -7694,6 +7694,13 @@ impl Tool for TerminalTool {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::SourceTrust::Untrusted;
         };
+        // Relative read paths resolve against the run's own directory.
+        let base = args
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| std::path::Path::new(dir).is_absolute());
+        let roots = roots.anchored_at(base);
         let reads_outside_roots = args
             .read_paths
             .iter()
@@ -9468,7 +9475,7 @@ mod tests {
         )
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots(&roots_list);
+        let roots = crate::traits::TrustRoots::new(&roots_list);
         let trust = |tool: &TerminalTool, args: serde_json::Value| {
             tool.output_trust(&args.to_string(), &roots)
         };
@@ -9513,7 +9520,7 @@ mod tests {
         )
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots(&roots_list);
+        let roots = crate::traits::TrustRoots::new(&roots_list);
         let run = |command: &str| serde_json::json!({"action":"run","command":command}).to_string();
         assert_eq!(
             host.output_trust(&run("mkdir -p x && echo ok > x/f"), &roots),
@@ -9546,7 +9553,7 @@ mod tests {
         )
         .await;
         let roots_list: Vec<String> = vec![];
-        let roots = crate::traits::TrustRoots(&roots_list);
+        let roots = crate::traits::TrustRoots::new(&roots_list);
         for command in [
             "curl https://example.invalid",
             "git clone https://example.invalid/r.git",
@@ -9647,7 +9654,7 @@ mod tests {
         let base = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
         let project = format!("{base}/project");
         let roots_list = vec![project.clone()];
-        let roots = crate::traits::TrustRoots(&roots_list);
+        let roots = crate::traits::TrustRoots::new(&roots_list);
         for tool in [&host, &sandboxed] {
             let ann = |command: &str, working_dir: Option<&str>| {
                 let mut args = serde_json::json!({"action":"run","command":command});

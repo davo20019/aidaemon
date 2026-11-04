@@ -543,6 +543,15 @@ impl Tool for GoalTraceTool {
         goal_trace_schema()
     }
 
+    /// Goal traces replay past tool results and messages, whoever wrote them.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,

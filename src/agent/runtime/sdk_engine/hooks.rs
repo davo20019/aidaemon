@@ -194,7 +194,7 @@ impl sdk::Tool for BridgedTool {
     fn annotations_for(&self, arguments: &Value) -> sdk::ToolAnnotations {
         self.tool.call_annotations_in(
             &arguments.to_string(),
-            &crate::traits::TrustRoots(&self.trust_roots),
+            &crate::traits::TrustRoots::new(&self.trust_roots),
         )
     }
 

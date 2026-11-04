@@ -2054,19 +2054,53 @@ pub fn default_call_annotations(
 }
 
 /// The owner's trusted file roots for one turn. A path is trusted only when
-/// it is absolute, normalizes without escaping, and equals a root or sits
-/// below it.
-pub struct TrustRoots<'a>(pub &'a [String]);
+/// it normalizes without escaping and equals a root or sits below it. A
+/// relative path resolves against `cwd` (where the file tools resolve it);
+/// without one it is never trusted.
+pub struct TrustRoots<'a> {
+    roots: &'a [String],
+    cwd: Option<&'a str>,
+}
 
-impl TrustRoots<'_> {
+impl<'a> TrustRoots<'a> {
+    pub fn new(roots: &'a [String]) -> Self {
+        Self { roots, cwd: None }
+    }
+
+    /// Resolve relative paths against `cwd` (an absolute directory).
+    pub fn with_cwd(mut self, cwd: Option<&'a str>) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
+    /// The same roots with relative paths resolved against `cwd` instead
+    /// (a call that runs in its own directory).
+    pub fn anchored_at<'b>(&'b self, cwd: Option<&'b str>) -> TrustRoots<'b> {
+        TrustRoots {
+            roots: self.roots,
+            cwd,
+        }
+    }
+
     pub fn contains(&self, path: &str) -> bool {
-        let Some(path) = normalize_absolute(path) else {
+        let resolved = match self.cwd {
+            Some(cwd) if !is_absolute_or_home(path) => {
+                format!("{}/{}", cwd.trim_end_matches('/'), path.trim())
+            }
+            _ => path.to_string(),
+        };
+        let Some(path) = normalize_absolute(&resolved) else {
             return false;
         };
-        self.0
+        self.roots
             .iter()
             .any(|root| normalize_absolute(root).is_some_and(|root| path.starts_with(&root)))
     }
+}
+
+fn is_absolute_or_home(path: &str) -> bool {
+    let path = path.trim();
+    path.starts_with('~') || std::path::Path::new(path).is_absolute()
 }
 
 /// Expand `~`, then normalize lexically. `None` for a relative path or one
@@ -2153,13 +2187,20 @@ mod tests {
     #[test]
     fn trust_roots_contains_only_descendants() {
         let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
-        let roots = TrustRoots(&roots);
+        let roots = TrustRoots::new(&roots);
         assert!(roots.contains("/tmp/aidaemon-test/ws"));
         assert!(roots.contains("/tmp/aidaemon-test/ws/a.txt"));
         assert!(!roots.contains("/tmp/aidaemon-test/ws2/a.txt"));
         assert!(!roots.contains("/tmp/aidaemon-test/ws/../x"));
+        assert!(!roots.contains("src/lib.rs"), "relative with no cwd");
+        let list = vec!["/tmp/aidaemon-test/ws".to_string()];
+        let anchored = TrustRoots::new(&list).with_cwd(Some("/tmp/aidaemon-test/ws"));
+        assert!(anchored.contains("src/lib.rs"));
+        assert!(anchored.contains("./src/../Cargo.toml"));
+        assert!(!anchored.contains("../other/a.txt"));
+        assert!(!anchored.contains("/etc/hosts"));
         assert!(!roots.contains("a.txt"));
-        assert!(!TrustRoots(&[]).contains("/tmp/aidaemon-test/ws/a.txt"));
+        assert!(!TrustRoots::new(&[]).contains("/tmp/aidaemon-test/ws/a.txt"));
     }
 
     struct AlwaysAvailableTool;

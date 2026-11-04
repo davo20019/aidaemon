@@ -1749,7 +1749,7 @@ async fn tools_declare_their_source_class() {
     use crate::traits::{Tool as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
     let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
-    let roots = TrustRoots(&roots);
+    let roots = TrustRoots::new(&roots);
     let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
     let http = crate::tools::HttpRequestTool::new(
@@ -1793,6 +1793,109 @@ async fn tools_declare_their_source_class() {
     );
     let send = crate::tools::SendFileTool::new(media_tx, &[], "/tmp/aidaemon-test/inbox");
     assert_eq!(send.output_trust("{}", &roots), Trusted);
+}
+
+/// The owner's own files read by relative path are trusted: relative paths
+/// resolve against the turn's working directory, which is always a root.
+#[test]
+fn relative_reads_under_the_working_directory_are_trusted() {
+    use crate::traits::{Tool as _, TrustRoots};
+    use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+    let cwd = "/tmp/aidaemon-test/ws";
+    let roots = super::turn_trust_roots(&[], Some(cwd), None, None, None);
+    assert_eq!(
+        roots,
+        vec![cwd.to_string()],
+        "no project scope: the cwd alone"
+    );
+    let roots = TrustRoots::new(&roots).with_cwd(Some(cwd));
+    let read = crate::tools::ReadFileTool;
+    assert_eq!(
+        read.output_trust(r#"{"path":"src/lib.rs"}"#, &roots),
+        Trusted
+    );
+    assert_eq!(
+        read.output_trust(r#"{"path":"../other/x"}"#, &roots),
+        Untrusted
+    );
+    let search = crate::tools::SearchFilesTool;
+    assert_eq!(search.output_trust(r#"{"pattern":"x"}"#, &roots), Trusted);
+    assert_eq!(
+        search.output_trust(r#"{"pattern":"x","path":"src"}"#, &roots),
+        Trusted
+    );
+    // Too broad to trust as a whole.
+    assert!(super::turn_trust_roots(&[], Some("/"), None, None, None).is_empty());
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy().into_owned();
+        assert!(super::turn_trust_roots(&[], Some(&home), None, None, None).is_empty());
+    }
+}
+
+/// Whole path: a relative read of the owner's own file in a turn with no
+/// project scope leaves the turn clean, so a later send runs unchecked.
+#[tokio::test]
+async fn a_relative_read_of_an_owner_file_does_not_taint_the_turn() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("read_file", r#"{"path":"Cargo.toml"}"#),
+            MockProvider::tool_call_response("send_probe", SEND_CALL),
+            MockProvider::text_response("Sent."),
+        ]),
+        vec![
+            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(SendProbe(sent.clone())),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(owner_request(
+            "Read Cargo.toml and send Jordan Lee the crate name.",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert!(!harness
+        .provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .any(is_verifier_call));
+}
+
+/// History and traces replay other people's messages and past tool
+/// output; skill resources are files a skill's author wrote.
+#[tokio::test]
+async fn history_traces_and_skill_resources_are_untrusted() {
+    use crate::traits::{Tool as _, TrustRoots};
+    use aidaemon_core::SourceTrust::Untrusted;
+    let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+        .await
+        .unwrap();
+    let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+    let roots = TrustRoots::new(&roots).with_cwd(Some("/tmp/aidaemon-test/ws"));
+    let history = crate::tools::SearchHistoryTool::new(harness.state.clone(), 30);
+    assert_eq!(history.output_trust(r#"{"query":"x"}"#, &roots), Untrusted);
+    let tool_trace = crate::tools::ToolTraceTool::new(harness.state.clone());
+    assert_eq!(tool_trace.output_trust("{}", &roots), Untrusted);
+    let goal_trace = crate::tools::GoalTraceTool::new(harness.state.clone());
+    assert_eq!(goal_trace.output_trust("{}", &roots), Untrusted);
+    let skills = crate::tools::SkillResourcesTool::new(
+        std::path::PathBuf::from("/tmp/aidaemon-test/ws/skills"),
+        Arc::new(crate::skills::resources::FileSystemResolver::new()),
+    );
+    assert_eq!(
+        skills.output_trust(r#"{"skill_name":"x","action":"read"}"#, &roots),
+        Untrusted
+    );
 }
 
 #[tokio::test]

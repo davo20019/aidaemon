@@ -55,6 +55,16 @@ impl Tool for SkillResourcesTool {
         })
     }
 
+    /// A skill's bundled files are its author's; a skill's declared source
+    /// is a field of the skill's own file, so it cannot vouch for itself.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,

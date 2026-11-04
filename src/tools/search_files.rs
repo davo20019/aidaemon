@@ -81,7 +81,17 @@ impl Tool for SearchFilesTool {
         arguments: &str,
         roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
-        super::fs_utils::file_output_trust(arguments, &["path"], roots)
+        // A search with no `path` runs in the working directory.
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let path = match args.as_ref().map(|args| args.get("path")) {
+            Some(None) | Some(Some(Value::Null)) => Some("."),
+            Some(Some(value)) => value.as_str(),
+            None => None,
+        };
+        match path {
+            Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        }
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {

@@ -1341,7 +1341,7 @@ mod tests {
         let tool = test_tool(config_file.path().to_path_buf(), profiles)
             .await
             .unwrap();
-        let roots = crate::traits::TrustRoots(&[]);
+        let roots = crate::traits::TrustRoots::new(&[]);
         assert_eq!(
             tool.output_trust(r#"{"action":"list"}"#, &roots),
             aidaemon_core::SourceTrust::Trusted

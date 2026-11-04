@@ -171,14 +171,19 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
 }
 
 /// The owner's trusted file roots for one turn: configured roots, the
-/// project scope and directory, and the write targets the task may touch.
-fn turn_trust_roots(
+/// working directory relative paths resolve against, the project scope and
+/// directory, and the write targets the task may touch. A working directory
+/// that is the filesystem root or the home directory is not a root: it
+/// would trust every file the owner has.
+pub(in crate::agent) fn turn_trust_roots(
     configured: &[String],
+    cwd: Option<&str>,
     project_scope: Option<&str>,
     known_project_dir: Option<&str>,
     task_access: Option<&crate::traits::ToolCallAccessManifest>,
 ) -> Vec<String> {
     let mut roots: Vec<String> = configured.to_vec();
+    roots.extend(cwd.filter(|cwd| is_narrow_root(cwd)).map(str::to_string));
     roots.extend(project_scope.map(str::to_string));
     roots.extend(known_project_dir.map(str::to_string));
     if let Some(access) = task_access {
@@ -192,6 +197,24 @@ fn turn_trust_roots(
     roots.retain(|root| !root.trim().is_empty());
     roots.dedup();
     roots
+}
+
+/// A directory narrower than the whole filesystem or the home directory.
+fn is_narrow_root(dir: &str) -> bool {
+    let dir = std::path::Path::new(dir.trim());
+    if !dir.is_absolute() || dir.parent().is_none() {
+        return false;
+    }
+    dirs::home_dir().is_none_or(|home| dir != home)
+}
+
+/// Where the file tools resolve a relative path: the execution backend's
+/// workspace (the daemon's working directory on the local backend).
+pub(in crate::agent) fn turn_cwd() -> String {
+    crate::execution::active_execution_backend()
+        .workspace_root()
+        .as_str()
+        .to_string()
 }
 
 /// Everything the SDK run asks of the daemon, served on the turn's own task.
@@ -389,9 +412,12 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// The chat's live `/readonly` ceiling, read by the hook per call and by
     /// the dispatcher's `mutation_forbidden`.
     pub(in crate::agent) ceiling: Arc<crate::agent::authority::SessionModeCeiling>,
-    /// The owner's trusted file roots: configured roots, the project scope
-    /// and directory, and the task's write grants.
+    /// The owner's trusted file roots: configured roots, the working
+    /// directory, the project scope and directory, and the task's write
+    /// grants.
     trust_roots: Vec<String>,
+    /// Where relative file paths resolve (see `turn_cwd`).
+    cwd: String,
     /// A dispatched call returned untrusted content this turn.
     untrusted_seen: AtomicBool,
     /// The root request egress is judged against (a child's is its root's),
@@ -592,8 +618,10 @@ impl Agent {
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
+        let cwd = turn_cwd();
         let trust_roots = turn_trust_roots(
             &self.sdk_engine.trusted_roots,
+            Some(&cwd),
             project_scope.as_deref(),
             known_project_dir.as_deref(),
             authority.task_access.as_ref(),
@@ -861,6 +889,7 @@ impl Agent {
             authority: &authority,
             ceiling: ceiling.clone(),
             trust_roots,
+            cwd,
             untrusted_seen: AtomicBool::new(starts_tainted),
             origin_request,
             origin_trusted,

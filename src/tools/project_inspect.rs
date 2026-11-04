@@ -67,7 +67,17 @@ impl Tool for ProjectInspectTool {
         arguments: &str,
         roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
-        super::fs_utils::file_output_trust(arguments, &["path"], roots)
+        // Exactly the paths the call inspects (`.` when it names none):
+        // trusted only when every one is inside the trusted roots.
+        let inspected = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| parse_project_paths(&args).ok());
+        match inspected {
+            Some(paths) if paths.iter().all(|path| roots.contains(path)) => {
+                aidaemon_core::SourceTrust::Trusted
+            }
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        }
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -475,6 +485,35 @@ fn get_directory_structure(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every inspected path decides: one outside the trusted roots makes
+    /// the whole output someone else's.
+    #[test]
+    fn output_trust_checks_every_path() {
+        use aidaemon_core::SourceTrust;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let trust =
+            |args: serde_json::Value| ProjectInspectTool.output_trust(&args.to_string(), &roots);
+        assert_eq!(
+            trust(
+                serde_json::json!({"paths": ["/tmp/aidaemon-test/project/a", "/tmp/aidaemon-test/project/b"]})
+            ),
+            SourceTrust::Trusted
+        );
+        assert_eq!(
+            trust(
+                serde_json::json!({"paths": ["/tmp/aidaemon-test/project/a", "/tmp/aidaemon-other/b"]})
+            ),
+            SourceTrust::Untrusted
+        );
+        assert_eq!(
+            trust(
+                serde_json::json!({"path": "/tmp/aidaemon-test/project", "paths": ["/tmp/aidaemon-other/b"]})
+            ),
+            SourceTrust::Untrusted
+        );
+    }
     use super::*;
     use proptest::prelude::*;
 
