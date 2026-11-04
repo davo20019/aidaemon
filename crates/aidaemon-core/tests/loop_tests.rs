@@ -360,6 +360,53 @@ async fn mutating_calls_run_one_at_a_time() {
     assert_eq!(peak.load(Ordering::SeqCst), 1);
 }
 
+/// Worst case WRITE, but every call is declared read-only per call.
+struct RelaxedWriter {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for RelaxedWriter {
+    fn spec(&self) -> ToolSpec {
+        spec("relaxed", "mixed tool", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::WRITE
+    }
+    fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+#[tokio::test]
+async fn per_call_read_only_does_not_make_calls_concurrent() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let agent = base(ScriptedProvider::new([
+        tool_calls((0..2).map(|i| call(&format!("c{i}"), "relaxed", json!({})))),
+        text("done"),
+    ]))
+    .tool(RelaxedWriter {
+        active: active.clone(),
+        peak: peak.clone(),
+    })
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    // Authority and the receipt still see the per-call value.
+    assert!(out.receipts().iter().all(|r| r.read_only));
+}
+
 // ---------- hooks ----------
 
 struct DenyDestructive;

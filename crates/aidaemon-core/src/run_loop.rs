@@ -323,6 +323,10 @@ impl<'a> Driver<'a> {
                 continue;
             }
             let annotations = tool.annotations_for(&call.arguments);
+            // Authority and receipts use the per-call value; concurrent
+            // scheduling uses only the tool's worst case, since a per-call
+            // relaxation is a statement about authority, not isolation.
+            let may_run_concurrently = tool.annotations().read_only;
             let info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
@@ -342,7 +346,7 @@ impl<'a> Driver<'a> {
             };
 
             match verdict {
-                Verdict::Allow if annotations.read_only => {
+                Verdict::Allow if may_run_concurrently => {
                     group.push(Approved { call, annotations });
                 }
                 Verdict::Allow => {

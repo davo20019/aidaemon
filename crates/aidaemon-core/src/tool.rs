@@ -234,8 +234,9 @@ pub trait Tool: Send + Sync {
     ///
     /// [`Tool::annotations`] should be the worst-case (most restrictive)
     /// value for the tool; this may only relax it for a specific call. The
-    /// result is trusted as given by authority checks and by read-only
-    /// concurrency, so it must be correct for those arguments.
+    /// result is trusted as given by authority checks (and recorded in the
+    /// receipt), so it must be correct for those arguments. Concurrent
+    /// scheduling always uses [`Tool::annotations`], never this value.
     fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
         self.annotations()
     }
