@@ -483,3 +483,98 @@ async fn readonly_blocks_writes_then_full_restores() {
     assert!(restored.is_file(), "a write runs again after /mode full");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn readonly_parent_child_cannot_write() {
+    let dir = authority_test_dir();
+    let target = dir.join("child.txt");
+    let session = "tg_authority_readonly_child";
+    // The child (a fresh specialist session) tries to write, then finishes.
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": target, "content": "child"}).to_string(),
+        ),
+        MockProvider::text_response("Child done."),
+    ]);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    let state = Arc::clone(&harness.state);
+    let provider = Arc::clone(&harness.provider);
+    let agent = Arc::new(harness.agent);
+    let commands = crate::channels::commands::CommandContext {
+        agent: agent.clone(),
+        state: state.clone(),
+        task_registry: Arc::new(crate::tasks::TaskRegistry::new(10)),
+        config_path: std::path::PathBuf::new(),
+    };
+    commands
+        .dispatch("/readonly", "", session, UserRole::Owner)
+        .await
+        .unwrap();
+
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 60)
+        .with_state(state as Arc<dyn crate::traits::StateStore>);
+    let spawn_result = crate::traits::Tool::call(
+        &spawn_tool,
+        &json!({
+            "mission": "Write a note",
+            "task": "Write the note file.",
+            "specialist": "code",
+            "_session_id": session,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let _ = (&provider, &spawn_result);
+    assert!(!target.exists(), "a child of a read-only parent cannot write");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
+    use aidaemon_core::Authority;
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::new(),
+        vec![],
+        None,
+    )
+    .await
+    .unwrap();
+    let session = "tg_authority_child_unit";
+    let ctx = ChannelContext::private("telegram");
+    let state = Arc::clone(&harness.state);
+    let agent = harness.agent;
+
+    // No mode, nothing inherited: an owner's child is full.
+    assert_eq!(
+        agent.authority_for_child(Some(session), UserRole::Owner, &ctx).await,
+        Authority::full()
+    );
+    // The originating chat is read-only: the child is read-only.
+    crate::agent::authority::set_session_mode(
+        state.as_ref(),
+        session,
+        crate::agent::authority::SessionMode::ReadOnly,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        agent.authority_for_child(Some(session), UserRole::Owner, &ctx).await,
+        Authority::read_only()
+    );
+    // A grandchild inherits the narrowing even where the chat mode is gone.
+    let mut child = agent;
+    child.set_test_inherited_authority(Authority::read_only());
+    assert_eq!(
+        child
+            .authority_for_child(Some("tg_other_session"), UserRole::Owner, &ctx)
+            .await,
+        Authority::read_only()
+    );
+}

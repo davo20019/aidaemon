@@ -741,7 +741,7 @@ impl Agent {
             chrono::Utc::now(),
         )
         .await;
-        let resolved_authority =
+        let mut resolved_authority =
             crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
                 user_role,
                 owner_default: self.sdk_engine.owner_default,
@@ -749,6 +749,10 @@ impl Agent {
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 bound_workspace: turn_context.bound_workspace.as_deref(),
             });
+        // A spawned child is never wider than its parent's turn.
+        if let Some(parent) = &self.inherited_authority {
+            resolved_authority.authority = parent.narrow(&resolved_authority.authority);
+        }
         retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
         let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(
             &turn_context.completion_contract.evidence_requirements,

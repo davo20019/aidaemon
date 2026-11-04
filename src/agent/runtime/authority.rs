@@ -30,7 +30,7 @@ fn session_mode_key(session_id: &str) -> String {
 /// default, so it clears the setting (stored as an empty value, which reads as
 /// no mode) instead of recording an expiry.
 pub(crate) async fn set_session_mode(
-    state: &dyn crate::traits::StateStore,
+    state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
     mode: SessionMode,
     now: chrono::DateTime<chrono::Utc>,
@@ -49,36 +49,54 @@ pub(crate) async fn set_session_mode(
     Ok(expires_at)
 }
 
-/// The session mode in force at `now`, with its expiry. Expired, cleared or
-/// unreadable entries read as no mode (the configured default applies).
+/// The session mode in force at `now`, with its expiry (`None` expiry for a
+/// fail-closed read). A cleared (empty) or valid-but-expired entry is no mode.
+/// A read error or an entry that cannot be understood reads as read-only: a
+/// narrowing the owner chose must never be lost to a storage fault.
 pub(crate) async fn session_mode_with_expiry(
-    state: &dyn crate::traits::StateStore,
+    state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<(SessionMode, chrono::DateTime<chrono::Utc>)> {
-    let raw = state
-        .get_setting(&session_mode_key(session_id))
-        .await
-        .ok()
-        .flatten()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let expires_at = chrono::DateTime::parse_from_rfc3339(value["expires_at"].as_str()?)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    if expires_at <= now {
-        return None;
-    }
-    let mode = match value["mode"].as_str()? {
-        "read_only" => SessionMode::ReadOnly,
-        "unrestricted" => SessionMode::Unrestricted,
-        "full" => SessionMode::Full,
-        _ => return None,
+) -> Option<(SessionMode, Option<chrono::DateTime<chrono::Utc>>)> {
+    let fail_closed = || Some((SessionMode::ReadOnly, None));
+    let raw = match state.get_setting(&session_mode_key(session_id)).await {
+        Ok(Some(raw)) if raw.is_empty() => return None,
+        Ok(Some(raw)) => raw,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(session_id, %error, "Could not read the session mode; treating the chat as read-only");
+            return fail_closed();
+        }
     };
-    Some((mode, expires_at))
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            let expires_at = chrono::DateTime::parse_from_rfc3339(value["expires_at"].as_str()?)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            let mode = match value["mode"].as_str()? {
+                "read_only" => SessionMode::ReadOnly,
+                "unrestricted" => SessionMode::Unrestricted,
+                "full" => SessionMode::Full,
+                _ => return None,
+            };
+            Some((mode, expires_at))
+        });
+    match parsed {
+        Some((_, expires_at)) if expires_at <= now => None,
+        Some((mode, expires_at)) => Some((mode, Some(expires_at))),
+        None => {
+            tracing::warn!(
+                session_id,
+                "Unreadable session mode value; treating the chat as read-only"
+            );
+            fail_closed()
+        }
+    }
 }
 
 pub(crate) async fn session_mode(
-    state: &dyn crate::traits::StateStore,
+    state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<SessionMode> {
@@ -221,6 +239,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_mode(&store, "s", t).await, None);
+    }
+
+    #[tokio::test]
+    async fn session_mode_corrupt_value_reads_read_only() {
+        use crate::traits::store_prelude::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(&dir.path().join("a.db")).await;
+        let t = chrono::Utc::now();
+        for corrupt in [
+            "not json",
+            r#"{"mode":"read_only","expires_at":"yesterday"}"#,
+            r#"{"mode":"god","expires_at":"2999-01-01T00:00:00Z"}"#,
+            r#"{"mode":"read_only"}"#,
+        ] {
+            store
+                .set_setting("authority_mode:corrupt", corrupt)
+                .await
+                .unwrap();
+            assert_eq!(
+                session_mode(&store, "corrupt", t).await,
+                Some(SessionMode::ReadOnly),
+                "{corrupt}"
+            );
+        }
+        // Cleared (empty) and expired-but-valid entries are no mode.
+        store
+            .set_setting("authority_mode:corrupt", "")
+            .await
+            .unwrap();
+        assert_eq!(session_mode(&store, "corrupt", t).await, None);
+    }
+
+    #[tokio::test]
+    async fn session_mode_read_error_reads_read_only() {
+        struct FailingSettings;
+        #[async_trait::async_trait]
+        impl crate::traits::SettingsStore for FailingSettings {
+            async fn get_setting(&self, _key: &str) -> anyhow::Result<Option<String>> {
+                anyhow::bail!("synthetic settings failure")
+            }
+        }
+        assert_eq!(
+            session_mode(&FailingSettings, "s", chrono::Utc::now()).await,
+            Some(SessionMode::ReadOnly)
+        );
     }
 
     #[tokio::test]

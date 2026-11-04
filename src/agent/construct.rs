@@ -223,6 +223,7 @@ impl Agent {
             path_aliases,
             inherited_project_scope,
             approval_session_id: None,
+            inherited_authority: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -303,6 +304,11 @@ impl Agent {
     #[allow(dead_code)]
     pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
         self.limits.task_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_inherited_authority(&mut self, authority: aidaemon_core::Authority) {
+        self.inherited_authority = Some(authority);
     }
 
     #[cfg(test)]
@@ -455,6 +461,7 @@ impl Agent {
             path_aliases,
             inherited_project_scope,
             approval_session_id,
+            inherited_authority: None,
             root_tools,
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

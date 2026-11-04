@@ -237,14 +237,17 @@ impl CommandContext {
         let clock = |at: chrono::DateTime<Utc>| {
             at.with_timezone(&chrono::Local).format("%H:%M").to_string()
         };
+        let until_suffix = |until: Option<chrono::DateTime<Utc>>| {
+            until.map_or_else(String::new, |at| format!(" until {}", clock(at)))
+        };
         let requested = match args.trim().to_ascii_lowercase().as_str() {
             "" => {
                 return match session_mode_with_expiry(self.state.as_ref(), session_id, now).await {
                     Some((SessionMode::ReadOnly, until)) => {
-                        format!("Mode: read-only until {}.", clock(until))
+                        format!("Mode: read-only{}.", until_suffix(until))
                     }
                     Some((SessionMode::Unrestricted, until)) => {
-                        format!("Mode: unrestricted until {}.", clock(until))
+                        format!("Mode: unrestricted{}.", until_suffix(until))
                     }
                     Some((SessionMode::Full, _)) | None => "Mode: full.".to_string(),
                 };
@@ -265,7 +268,10 @@ impl CommandContext {
                 }
                 SessionMode::Full => "Back to full access.".to_string(),
             },
-            Err(error) => format!("Could not change the mode: {error}"),
+            Err(error) => {
+                tracing::warn!(session_id, %error, "Could not change the session mode");
+                "Couldn't change the mode right now.".to_string()
+            }
         }
     }
 

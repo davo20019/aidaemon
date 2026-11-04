@@ -1417,6 +1417,7 @@ impl Agent {
         approval_session_id: Option<String>,
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
+        inherited_authority: aidaemon_core::Authority,
     ) -> Arc<Agent> {
         let spawn_tool = if add_spawn_tool {
             Some(Arc::new(
@@ -1501,6 +1502,7 @@ impl Agent {
             self.stt_config.clone(),
             self.harness_eval_config.clone(),
         );
+        child.inherited_authority = Some(inherited_authority);
         child.sdk_engine = self.sdk_engine.clone();
         child.memory = self.memory.clone();
         child.transcript_writes = self.transcript_writes.clone();
@@ -1997,6 +1999,42 @@ impl Agent {
 
     /// Internal helper to create and run a child agent.
     #[allow(clippy::too_many_arguments)]
+    /// The most a child spawned by this agent may do: the parent turn's
+    /// authority, re-resolved from the same explicit facts (including the
+    /// owner's session mode on the originating chat), narrowed by whatever this
+    /// agent itself inherited. A child is never wider than its parent.
+    pub(crate) async fn authority_for_child(
+        &self,
+        parent_session: Option<&str>,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+    ) -> aidaemon_core::Authority {
+        let session_mode = match parent_session {
+            Some(parent_session) => {
+                crate::agent::authority::session_mode(
+                    self.state.as_ref(),
+                    parent_session,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            None => None,
+        };
+        let resolved =
+            crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
+                user_role,
+                owner_default: self.sdk_engine.owner_default,
+                session_mode,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                bound_workspace: None,
+            });
+        match self.inherited_authority.as_ref() {
+            Some(inherited) => inherited.narrow(&resolved.authority),
+            None => resolved.authority,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_child_inner(
         &self,
         tools: &[Arc<dyn Tool>],
@@ -2274,6 +2312,13 @@ impl Agent {
         } else {
             None
         };
+        let parent_authority = self
+            .authority_for_child(
+                effective_approval_session_id.as_deref(),
+                user_role,
+                &channel_ctx,
+            )
+            .await;
         let child = self
             .create_child_agent(
                 scoped_tools,
@@ -2291,6 +2336,7 @@ impl Agent {
                 effective_approval_session_id,
                 max_iterations_override,
                 timeout_secs_override,
+                parent_authority,
             )
             .await;
         let child_session_for_events = child_session.clone();
