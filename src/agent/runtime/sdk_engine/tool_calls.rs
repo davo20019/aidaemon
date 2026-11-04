@@ -381,7 +381,10 @@ impl Agent {
             workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
-            mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly,
+            mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly
+                || sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref())
+                    .await
+                    .is_some(),
             scope_escalation: scope_escalation.as_ref(),
         };
         let started = Instant::now();

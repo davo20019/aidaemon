@@ -291,6 +291,7 @@ pub fn aidaemon_core::Authority::read_only() -> Self
 pub struct aidaemon_core::AuthorityHook
 impl aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::new(aidaemon_core::Authority) -> Self
+pub fn aidaemon_core::AuthorityHook::with_ceiling(self, alloc::sync::Arc<dyn aidaemon_core::AuthorityCeiling>) -> Self
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::AuthorityHook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
@@ -299,6 +300,8 @@ pub fn aidaemon_core::AuthorityHook::on_run_end<'life0, 'life1, 'life2, 'life3, 
 pub fn aidaemon_core::AuthorityHook::on_stop<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::StopDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::StuckSignal) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::StuckDecision>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
+impl core::fmt::Debug for aidaemon_core::AuthorityHook
+pub fn aidaemon_core::AuthorityHook::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self
@@ -543,6 +546,8 @@ pub fn aidaemon_core::Usage::billable_tokens(&self) -> u64
 pub const aidaemon_core::HARD_TURN_CAP: u32
 pub const aidaemon_core::RUN_STATE_SCHEMA: u32
 pub const aidaemon_core::UNTRUSTED_EGRESS_INTERRUPT: &str
+pub trait aidaemon_core::AuthorityCeiling: core::marker::Send + core::marker::Sync
+pub fn aidaemon_core::AuthorityCeiling::ceiling<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::Authority>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub trait aidaemon_core::EventSink: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::EventSink::emit(&self, aidaemon_core::RunId, &aidaemon_core::Event)
 impl<F> aidaemon_core::EventSink for F where F: core::ops::function::Fn(aidaemon_core::RunId, &aidaemon_core::Event) + core::marker::Send + core::marker::Sync

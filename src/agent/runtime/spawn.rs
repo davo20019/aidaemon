@@ -2032,6 +2032,14 @@ impl Agent {
         }
     }
 
+    /// The chat whose `/readonly` narrows this turn while it runs. A turn
+    /// answers to its own session; a child should answer to the chat that
+    /// started the work. TODO(Task 7): return the parent's `mode_session`
+    /// from `InheritedAuthority` for a child.
+    pub(crate) fn mode_session_for(&self, session_id: &str) -> String {
+        session_id.to_string()
+    }
+
     /// Internal helper to create and run a child agent.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_child_inner(

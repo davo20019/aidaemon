@@ -4,6 +4,7 @@
 //! with [`Authority::narrow`], which can only shrink it.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -87,15 +88,43 @@ impl Authority {
 /// declares [`Safeguard::Authority`] so the agent builder accepts it. It
 /// never prompts: a composition root that wants approvals for some calls adds
 /// its own hook.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthorityHook {
     authority: Authority,
+    ceiling: Option<Arc<dyn AuthorityCeiling>>,
 }
 
 impl AuthorityHook {
     pub fn new(authority: Authority) -> Self {
-        Self { authority }
+        Self {
+            authority,
+            ceiling: None,
+        }
     }
+
+    /// Read `ceiling` on every call and judge with the narrower of this
+    /// hook's authority and the ceiling's. A ceiling can narrow a running
+    /// turn; it can never widen it.
+    pub fn with_ceiling(mut self, ceiling: Arc<dyn AuthorityCeiling>) -> Self {
+        self.ceiling = Some(ceiling);
+        self
+    }
+}
+
+impl std::fmt::Debug for AuthorityHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorityHook")
+            .field("authority", &self.authority)
+            .field("ceiling", &self.ceiling.is_some())
+            .finish()
+    }
+}
+
+/// A limit on what a run may do that can tighten while the run is in flight,
+/// read before every call. `None` means no extra limit right now.
+#[async_trait]
+pub trait AuthorityCeiling: Send + Sync {
+    async fn ceiling(&self) -> Option<Authority>;
 }
 
 #[async_trait]
@@ -110,7 +139,12 @@ impl Hook for AuthorityHook {
         call: &ToolCall,
         tool: &ToolInfo,
     ) -> ToolDecision {
-        match self.authority.permits(&call.name, tool.annotations) {
+        let narrowed = match &self.ceiling {
+            Some(ceiling) => ceiling.ceiling().await.map(|c| self.authority.narrow(&c)),
+            None => None,
+        };
+        let judged = narrowed.as_ref().unwrap_or(&self.authority);
+        match judged.permits(&call.name, tool.annotations) {
             Ok(()) => ToolDecision::Allow,
             Err(reason) => ToolDecision::Deny {
                 reason: format!(
@@ -202,6 +236,94 @@ mod tests {
         };
         assert!(a.permits("terminal", ToolAnnotations::READ_ONLY).is_err());
         assert!(a.permits("read_file", ToolAnnotations::READ_ONLY).is_ok());
+    }
+
+    struct FlagCeiling(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl AuthorityCeiling for FlagCeiling {
+        async fn ceiling(&self) -> Option<Authority> {
+            self.0
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(Authority::read_only)
+        }
+    }
+
+    fn writer_tool() -> impl Tool {
+        FnTool::new(
+            spec("write_file", "writes", &[]),
+            ToolAnnotations::WRITE,
+            |_: Value| async { Ok(ToolOutput::text("wrote")) },
+        )
+    }
+
+    #[tokio::test]
+    async fn ceiling_narrows_mid_run() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let flag = flag.clone();
+            FnTool::new(
+                spec("flip", "flips the ceiling", &[]),
+                ToolAnnotations::READ_ONLY,
+                move |_: Value| {
+                    let flag = flag.clone();
+                    async move {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(ToolOutput::text("flipped"))
+                    }
+                },
+            )
+        };
+        let agent = Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "write_file", json!({}))]),
+                tool_calls([call("c2", "flip", json!({}))]),
+                tool_calls([call("c3", "write_file", json!({}))]),
+                text("done"),
+            ]))
+            .tool(writer_tool())
+            .tool(flipper)
+            .hook(
+                AuthorityHook::new(Authority::full())
+                    .with_ceiling(std::sync::Arc::new(FlagCeiling(flag))),
+            )
+            .attest(Safeguard::Scope)
+            .attest(Safeguard::UntrustedOutput)
+            .build()
+            .unwrap();
+        let out = agent.run("s", "go").await.unwrap();
+        let r = out.receipts();
+        assert_eq!(r[0].status, ReceiptStatus::Succeeded);
+        assert_eq!(r[2].status, ReceiptStatus::Denied);
+    }
+
+    struct FullCeiling;
+    #[async_trait]
+    impl AuthorityCeiling for FullCeiling {
+        async fn ceiling(&self) -> Option<Authority> {
+            Some(Authority::full())
+        }
+    }
+
+    #[tokio::test]
+    async fn ceiling_never_widens() {
+        let agent = Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "write_file", json!({}))]),
+                text("done"),
+            ]))
+            .tool(writer_tool())
+            .hook(
+                AuthorityHook::new(Authority::read_only())
+                    .with_ceiling(std::sync::Arc::new(FullCeiling)),
+            )
+            .attest(Safeguard::Scope)
+            .attest(Safeguard::UntrustedOutput)
+            .build()
+            .unwrap();
+        let out = agent.run("s", "go").await.unwrap();
+        assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
     }
 
     #[tokio::test]

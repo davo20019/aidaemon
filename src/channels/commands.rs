@@ -6,6 +6,7 @@ use chrono::Utc;
 
 use super::formatting::format_number;
 use crate::config::AppConfig;
+use crate::duration_format::{compact_chrono_duration, ZeroUnitStyle};
 use crate::runtime_ports::ChannelAgentRuntime;
 use crate::tasks::{TaskRegistry, TaskStatus};
 use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
@@ -234,20 +235,22 @@ impl CommandContext {
             return NOT_OWNER.to_string();
         }
         let now = Utc::now();
-        let clock = |at: chrono::DateTime<Utc>| {
-            at.with_timezone(&chrono::Local).format("%H:%M").to_string()
-        };
-        let until_suffix = |until: Option<chrono::DateTime<Utc>>| {
-            until.map_or_else(String::new, |at| format!(" until {}", clock(at)))
+        let left_suffix = |until: Option<chrono::DateTime<Utc>>| {
+            until.map_or_else(String::new, |at| {
+                format!(
+                    " (about {} left)",
+                    compact_chrono_duration(at - now, ZeroUnitStyle::Trim)
+                )
+            })
         };
         let requested = match args.trim().to_ascii_lowercase().as_str() {
             "" => {
                 return match session_mode_with_expiry(self.state.as_ref(), session_id, now).await {
                     Some((SessionMode::ReadOnly, until)) => {
-                        format!("Mode: read-only{}.", until_suffix(until))
+                        format!("Mode: read-only{}.", left_suffix(until))
                     }
                     Some((SessionMode::Unrestricted, until)) => {
-                        format!("Mode: unrestricted{}.", until_suffix(until))
+                        format!("Mode: unrestricted{}.", left_suffix(until))
                     }
                     Some((SessionMode::Full, _)) | None => "Mode: full.".to_string(),
                 };
@@ -258,18 +261,10 @@ impl CommandContext {
             _ => return USAGE.to_string(),
         };
         match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
-            Ok(until) => match requested {
-                SessionMode::ReadOnly => format!(
-                    "Read-only for this chat until {}, starting with your next message. aidaemon can look but not change anything. Send /mode full to end it early.",
-                    clock(until)
-                ),
-                SessionMode::Unrestricted => {
-                    format!(
-                        "Unrestricted for this chat until {}, starting with your next message.",
-                        clock(until)
-                    )
-                }
-                SessionMode::Full => "Back to full access.".to_string(),
+            Ok(_) => match requested {
+                SessionMode::ReadOnly => "Read-only for this chat for the next 4 hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early.".to_string(),
+                SessionMode::Unrestricted => "Unrestricted for this chat for the next 4 hours, starting with your next message.".to_string(),
+                SessionMode::Full => "Back to full access from your next message.".to_string(),
             },
             Err(error) => {
                 tracing::warn!(session_id, %error, "Could not change the session mode");
@@ -1090,6 +1085,22 @@ mod mode_command_tests {
     use super::*;
     use crate::traits::store_prelude::*;
 
+    /// No host-local `HH:MM` clock time appears in a reply.
+    fn assert_no_clock_time(reply: &str) {
+        let bytes = reply.as_bytes();
+        for i in 0..bytes.len().saturating_sub(4) {
+            let w = &bytes[i..i + 5];
+            assert!(
+                !(w[0].is_ascii_digit()
+                    && w[1].is_ascii_digit()
+                    && w[2] == b':'
+                    && w[3].is_ascii_digit()
+                    && w[4].is_ascii_digit()),
+                "clock time in {reply:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn mode_commands_owner_only() {
         let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
@@ -1127,18 +1138,17 @@ mod mode_command_tests {
             .dispatch("/readonly", "", session, UserRole::Owner)
             .await
             .unwrap();
-        assert!(
-            reply.starts_with("Read-only for this chat until "),
-            "{reply}"
+        assert_eq!(
+            reply,
+            "Read-only for this chat for the next 4 hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."
         );
-        assert!(reply.ends_with(
-            ", starting with your next message. aidaemon can look but not change anything. Send /mode full to end it early."
-        ));
         let shown = ctx
             .dispatch("/mode", "", session, UserRole::Owner)
             .await
             .unwrap();
-        assert!(shown.starts_with("Mode: read-only until "), "{shown}");
+        assert!(shown.starts_with("Mode: read-only (about "), "{shown}");
+        assert!(shown.ends_with(" left)."), "{shown}");
+        assert_no_clock_time(&shown);
         assert_eq!(
             ctx.dispatch("/mode", "bogus", session, UserRole::Owner)
                 .await
@@ -1149,7 +1159,7 @@ mod mode_command_tests {
             ctx.dispatch("/mode", "full", session, UserRole::Owner)
                 .await
                 .as_deref(),
-            Some("Back to full access.")
+            Some("Back to full access from your next message.")
         );
         assert_eq!(
             ctx.dispatch("/mode", "", session, UserRole::Owner)
@@ -1161,13 +1171,15 @@ mod mode_command_tests {
             .dispatch("/mode", "unrestricted", session, UserRole::Owner)
             .await
             .unwrap();
-        assert!(
-            unrestricted.starts_with("Unrestricted for this chat until "),
-            "{unrestricted}"
+        assert_eq!(
+            unrestricted,
+            "Unrestricted for this chat for the next 4 hours, starting with your next message."
         );
-        assert!(
-            unrestricted.ends_with(", starting with your next message."),
-            "{unrestricted}"
-        );
+        let shown = ctx
+            .dispatch("/mode", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(shown.starts_with("Mode: unrestricted (about "), "{shown}");
+        assert_no_clock_time(&shown);
     }
 }

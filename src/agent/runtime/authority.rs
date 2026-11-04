@@ -105,6 +105,38 @@ pub(crate) async fn session_mode(
         .map(|(mode, _)| mode)
 }
 
+/// The ceiling a running turn (or child) reads before every call: read-only
+/// iff the chat it answers to is in `/readonly` right now. It reads the live
+/// setting (fail-closed on a read error), so `/readonly` sent mid-run narrows
+/// the work already running; leaving the mode never widens a turn, because the
+/// turn's own authority was fixed at its start.
+pub(crate) struct SessionModeCeiling {
+    state: std::sync::Arc<dyn crate::traits::StateStore>,
+    mode_session: String,
+}
+
+impl SessionModeCeiling {
+    pub(crate) fn new(
+        state: std::sync::Arc<dyn crate::traits::StateStore>,
+        mode_session: impl Into<String>,
+    ) -> Self {
+        Self {
+            state,
+            mode_session: mode_session.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl aidaemon_core::AuthorityCeiling for SessionModeCeiling {
+    async fn ceiling(&self) -> Option<aidaemon_core::Authority> {
+        match session_mode(self.state.as_ref(), &self.mode_session, chrono::Utc::now()).await {
+            Some(SessionMode::ReadOnly) => Some(aidaemon_core::Authority::read_only()),
+            _ => None,
+        }
+    }
+}
+
 /// The explicit facts authority is resolved from.
 pub(in crate::agent) struct AuthorityFacts<'a> {
     pub user_role: UserRole,

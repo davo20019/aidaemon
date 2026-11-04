@@ -420,7 +420,10 @@ async fn readonly_blocks_writes_then_full_restores() {
         .dispatch("/readonly", "", session, UserRole::Owner)
         .await
         .unwrap();
-    assert!(reply.starts_with("Read-only for this chat until "), "{reply}");
+    assert!(
+        reply.starts_with("Read-only for this chat for the next 4 hours, starting now"),
+        "{reply}"
+    );
 
     turn("Write a file.").await;
     assert!(!blocked.exists(), "a write is refused in read-only mode");
@@ -503,7 +506,7 @@ async fn readonly_blocks_writes_then_full_restores() {
             .dispatch("/mode", "full", session, UserRole::Owner)
             .await
             .as_deref(),
-        Some("Back to full access.")
+        Some("Back to full access from your next message.")
     );
     turn("Write a file again.").await;
     assert!(restored.is_file(), "a write runs again after /mode full");
@@ -781,4 +784,151 @@ async fn assessment_off_skips_the_model_call() {
         .await
         .is_empty());
     let _ = std::fs::remove_dir_all(target.parent().unwrap());
+}
+
+/// Read-only test tool that, when it runs, makes the chat read-only the way a
+/// `/readonly` sent while the turn is running would.
+struct ModeFlipProbe {
+    state: Arc<std::sync::OnceLock<Arc<dyn crate::traits::StateStore>>>,
+    session: String,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for ModeFlipProbe {
+    fn name(&self) -> &str {
+        "mode_flip_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Test probe: switches the chat to read-only while the turn runs."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "mode_flip_probe",
+            "description": "Test probe: switches the chat to read-only while the turn runs.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        let state = self.state.get().expect("state wired");
+        crate::agent::authority::set_session_mode(
+            state.as_ref(),
+            &self.session,
+            crate::agent::authority::SessionMode::ReadOnly,
+            chrono::Utc::now(),
+        )
+        .await?;
+        Ok("mode flipped".to_string())
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// `/readonly` sent mid-run narrows the running turn: a write after the flip
+/// is refused by the kernel hook.
+#[tokio::test]
+async fn readonly_mid_run_blocks_the_next_write() {
+    let dir = authority_test_dir();
+    let target = dir.join("a.txt");
+    let session = "tg_authority_readonly_mid_run";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("mode_flip_probe", "{}"),
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": target, "content": "no"}).to_string(),
+        ),
+        MockProvider::text_response("I could not write the file."),
+    ]);
+    let state_cell = Arc::new(std::sync::OnceLock::new());
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(ModeFlipProbe {
+            state: state_cell.clone(),
+            session: session.to_string(),
+        }),
+    ];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+    let _ = state_cell.set(state);
+
+    harness
+        .agent
+        .handle_message(
+            session,
+            "Look around, then write a file.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let results = authority_tool_results(&harness).await;
+    assert!(!target.exists(), "the write after /readonly must not run");
+    assert!(
+        results
+            .iter()
+            .any(|r| r.contains("[AUTHORITY BLOCKED] `write_file`")),
+        "the hook refuses the write after the flip; saw {results:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A child builds its ceiling on the chat that started the work, so `/readonly`
+/// on that chat narrows the running child. Unit-level: Task 7 supplies the
+/// parent session through `InheritedAuthority`; until then the child's
+/// `mode_session` seam returns its own session, so the ceiling is built here
+/// for an explicit parent session.
+#[tokio::test]
+async fn readonly_reaches_a_running_child_through_its_parent_chat() {
+    use aidaemon_core::AuthorityCeiling;
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(MockProvider::new(), vec![], None)
+        .await
+        .unwrap();
+    let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+    let parent = "tg_authority_ceiling_parent";
+    let ceiling = crate::agent::authority::SessionModeCeiling::new(state.clone(), parent);
+    assert_eq!(ceiling.ceiling().await, None);
+
+    crate::agent::authority::set_session_mode(
+        state.as_ref(),
+        parent,
+        crate::agent::authority::SessionMode::ReadOnly,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ceiling.ceiling().await,
+        Some(aidaemon_core::Authority::read_only())
+    );
+
+    // /mode full lifts it for the next call of this ceiling object; running
+    // turns only ever narrow, but the ceiling itself is a live read.
+    crate::agent::authority::set_session_mode(
+        state.as_ref(),
+        parent,
+        crate::agent::authority::SessionMode::Full,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ceiling.ceiling().await, None);
+
+    // Seam: until Task 7 a turn's mode session is its own session.
+    assert_eq!(
+        harness.agent.mode_session_for("tg_authority_seam"),
+        "tg_authority_seam"
+    );
 }

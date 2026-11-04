@@ -38,7 +38,7 @@ pub mod conformance;
 pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
-pub use authority::{AccessLevel, Authority, AuthorityHook};
+pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};

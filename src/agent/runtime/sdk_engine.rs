@@ -386,6 +386,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
     authority: &'a crate::agent::authority::ResolvedAuthority,
+    /// The chat's live `/readonly` ceiling, read by the hook per call and by
+    /// the dispatcher's `mutation_forbidden`.
+    pub(in crate::agent) ceiling: Arc<crate::agent::authority::SessionModeCeiling>,
     /// The owner's trusted file roots: configured roots, the project scope
     /// and directory, and the task's write grants.
     trust_roots: Vec<String>,
@@ -603,8 +606,17 @@ impl Agent {
         // below). The daemon dispatcher still enforces Scope itself:
         // `sdk_scope_check` against the turn's filesystem grant (Scope moves
         // to the kernel in Phase 3).
+        // `/readonly` sent while this turn runs narrows it: the hook and the
+        // dispatcher both read the chat's live mode (Task 7 points a child at
+        // its parent's chat through `mode_session_for`).
+        let ceiling = Arc::new(crate::agent::authority::SessionModeCeiling::new(
+            self.state.clone(),
+            self.mode_session_for(session_id),
+        ));
         let mut builder = sdk::Agent::builder("aidaemon")
-            .hook(sdk::AuthorityHook::new(authority.authority.clone()))
+            .hook(
+                sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone()),
+            )
             .attest(sdk::Safeguard::Scope)
             .model(model.clone())
             .provider(DaemonProvider {
@@ -826,6 +838,7 @@ impl Agent {
             known_project_dir: std::sync::Mutex::new(known_project_dir),
             project_scope,
             authority: &authority,
+            ceiling: ceiling.clone(),
             trust_roots,
             untrusted_seen: AtomicBool::new(starts_tainted),
             authorized_scopes,
