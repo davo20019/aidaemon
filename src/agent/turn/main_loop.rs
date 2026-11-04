@@ -883,7 +883,10 @@ impl Agent {
                 .followup_mode
                 .map(|mode| mode.as_str().to_string()),
         );
-        harness_eval.record_completion_contract(&turn_context.completion_contract);
+        harness_eval.record_completion_contract(
+            &turn_context.completion_contract,
+            resolved_authority.authority.level == aidaemon_core::AccessLevel::ReadOnly,
+        );
         if self.harness_eval_enabled() {
             self.install_harness_eval(harness_eval).await;
         }

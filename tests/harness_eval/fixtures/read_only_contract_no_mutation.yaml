@@ -12,7 +12,9 @@ mock_responses:
   - text: The current operating system details are in the observed system information. I did not modify anything.
 expect:
   tools_required_predicted: false
-  forbids_mutation: true
+  # Scoring forbids mutation by the resolved authority, not the assessed
+  # contract: an owner turn is not read-only unless /readonly set it.
+  forbids_mutation: false
   tools_in_order:
     - system_info
   tools_not_used:

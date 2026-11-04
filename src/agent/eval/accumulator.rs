@@ -229,9 +229,16 @@ impl HarnessEvalAccumulator {
         self.progress.budget_extensions = self.progress.budget_extensions.saturating_add(1);
     }
 
-    pub fn record_completion_contract(&mut self, contract: &CompletionContract) {
+    /// Record the turn's contract. Whether mutation is forbidden comes from
+    /// the resolved authority (`mutation_forbidden` = read-only level), never
+    /// from the assessed contract, which is only a hint.
+    pub fn record_completion_contract(
+        &mut self,
+        contract: &CompletionContract,
+        mutation_forbidden: bool,
+    ) {
         self.contract.expects_mutation = contract.expects_mutation;
-        self.contract.forbids_mutation = contract.forbids_mutation;
+        self.contract.forbids_mutation = mutation_forbidden;
         self.contract.requires_observation = contract.requires_observation;
         self.contract.verification_required = contract.explicit_verification_requested
             || contract.requires_reverification_after_mutation;
@@ -590,5 +597,52 @@ mod tests {
         assert_eq!(snap.progress.tool_calls_attempted, 3);
         assert_eq!(snap.progress.tool_calls_succeeded, 3);
         assert!(snap.routing.tools_actually_used);
+    }
+
+    fn seed() -> HarnessEvalSeed {
+        HarnessEvalSeed {
+            task_id: "task".to_string(),
+            turn_id: None,
+            depth: 0,
+            parent_task_id: None,
+            goal_id: None,
+            durable_task_id: None,
+            completion_task_kind: "conversational".to_string(),
+            followup_mode: None,
+            config: HarnessEvalConfig::default(),
+        }
+    }
+
+    /// Scoring treats mutation as forbidden by the resolved authority, not by
+    /// the assessed contract: an owner write under an assessed read-only
+    /// contract is not a violation.
+    #[test]
+    fn owner_mutation_under_assessed_read_only_contract_is_not_penalized() {
+        let contract = CompletionContract {
+            forbids_mutation: true,
+            ..Default::default()
+        };
+        let mut acc = HarnessEvalAccumulator::new(seed());
+        acc.record_completion_contract(&contract, false);
+        acc.contract.mutation_count = 1;
+        let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
+        assert!(!snap.quality.contract.forbids_mutation);
+        assert!(snap.scores.contract_fulfillment > 0.0);
+    }
+
+    /// A `/readonly` turn forbids mutation even when the assessed contract
+    /// expected one, so its authority denial scores as a forbidden attempt.
+    #[test]
+    fn readonly_authority_denial_scores_as_forbidden_mutation() {
+        let contract = CompletionContract {
+            expects_mutation: true,
+            ..Default::default()
+        };
+        let mut acc = HarnessEvalAccumulator::new(seed());
+        acc.record_completion_contract(&contract, true);
+        acc.record_forbidden_mutation_attempt();
+        let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
+        assert!(snap.quality.contract.forbids_mutation);
+        assert_eq!(snap.scores.contract_fulfillment, 0.0);
     }
 }
