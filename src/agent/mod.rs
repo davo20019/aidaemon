@@ -119,7 +119,7 @@ use post_task::LearningContext;
 mod computer_use;
 
 #[path = "runtime/authority.rs"]
-mod authority;
+pub(crate) mod authority;
 #[path = "turn/bootstrap/mod.rs"]
 mod bootstrap;
 #[path = "turn/closeout.rs"]

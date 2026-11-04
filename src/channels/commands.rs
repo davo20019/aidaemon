@@ -161,6 +161,18 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
             category: CommandCategory::Core,
         },
         CommandDef {
+            name: "readonly",
+            description: "Make this chat read-only for 4 hours",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "mode",
+            description: "Show or change this chat's access mode",
+            usage: Some("/mode [full|unrestricted|readonly]"),
+            category: CommandCategory::Core,
+        },
+        CommandDef {
             name: "rollback",
             description: "Preview or confirm a checkpoint rollback",
             usage: Some("/rollback [checkpoint-id|confirm TOKEN]"),
@@ -201,8 +213,59 @@ impl CommandContext {
             "/cost" => Some(self.handle_cost().await),
             "/context" => Some(self.handle_context(session_id, user_role).await),
             "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
+            "/readonly" => Some(self.handle_readonly(session_id, user_role).await),
+            "/mode" => Some(self.handle_mode(args, session_id, user_role).await),
             "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
+        }
+    }
+
+    async fn handle_readonly(&self, session_id: &str, user_role: UserRole) -> String {
+        self.handle_mode("readonly", session_id, user_role).await
+    }
+
+    /// `/mode [full|unrestricted|readonly]`: the owner narrows or restores this
+    /// chat's tool authority. Explicit command syntax, persisted with an expiry.
+    async fn handle_mode(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
+        use crate::agent::authority::{session_mode_with_expiry, set_session_mode, SessionMode};
+        const NOT_OWNER: &str = "Only the owner can change the mode.";
+        const USAGE: &str = "Usage: /mode [full|unrestricted|readonly]";
+        if user_role != UserRole::Owner {
+            return NOT_OWNER.to_string();
+        }
+        let now = Utc::now();
+        let clock = |at: chrono::DateTime<Utc>| {
+            at.with_timezone(&chrono::Local).format("%H:%M").to_string()
+        };
+        let requested = match args.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                return match session_mode_with_expiry(self.state.as_ref(), session_id, now).await {
+                    Some((SessionMode::ReadOnly, until)) => {
+                        format!("Mode: read-only until {}.", clock(until))
+                    }
+                    Some((SessionMode::Unrestricted, until)) => {
+                        format!("Mode: unrestricted until {}.", clock(until))
+                    }
+                    Some((SessionMode::Full, _)) | None => "Mode: full.".to_string(),
+                };
+            }
+            "full" => SessionMode::Full,
+            "unrestricted" => SessionMode::Unrestricted,
+            "readonly" | "read-only" | "read_only" => SessionMode::ReadOnly,
+            _ => return USAGE.to_string(),
+        };
+        match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
+            Ok(until) => match requested {
+                SessionMode::ReadOnly => format!(
+                    "Read-only for this chat until {}. aidaemon can look but not change anything. Send /mode full to end it early.",
+                    clock(until)
+                ),
+                SessionMode::Unrestricted => {
+                    format!("Unrestricted for this chat until {}.", clock(until))
+                }
+                SessionMode::Full => "Back to full access.".to_string(),
+            },
+            Err(error) => format!("Could not change the mode: {error}"),
         }
     }
 
@@ -1011,4 +1074,87 @@ fn work_usage() -> String {
      /work project <id>\n\
      /work project create <name>"
         .to_string()
+}
+
+#[cfg(test)]
+mod mode_command_tests {
+    use super::*;
+    use crate::traits::store_prelude::*;
+
+    #[tokio::test]
+    async fn mode_commands_owner_only() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state = Arc::clone(&harness.state);
+        let ctx = CommandContext {
+            agent: Arc::new(harness.agent),
+            state: state.clone(),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            config_path: PathBuf::new(),
+        };
+        let session = "telegram:synthetic-user-1";
+        for role in [UserRole::Guest, UserRole::Public] {
+            for (cmd, args) in [
+                ("/readonly", ""),
+                ("/mode", "readonly"),
+                ("/mode", "unrestricted"),
+            ] {
+                assert_eq!(
+                    ctx.dispatch(cmd, args, session, role).await.as_deref(),
+                    Some("Only the owner can change the mode.")
+                );
+            }
+        }
+        assert_eq!(
+            state
+                .get_setting(&format!("authority_mode:{session}"))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let reply = ctx
+            .dispatch("/readonly", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(
+            reply.starts_with("Read-only for this chat until "),
+            "{reply}"
+        );
+        assert!(reply.ends_with(
+            ". aidaemon can look but not change anything. Send /mode full to end it early."
+        ));
+        let shown = ctx
+            .dispatch("/mode", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(shown.starts_with("Mode: read-only until "), "{shown}");
+        assert_eq!(
+            ctx.dispatch("/mode", "bogus", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Usage: /mode [full|unrestricted|readonly]")
+        );
+        assert_eq!(
+            ctx.dispatch("/mode", "full", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Back to full access.")
+        );
+        assert_eq!(
+            ctx.dispatch("/mode", "", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Mode: full.")
+        );
+        let unrestricted = ctx
+            .dispatch("/mode", "unrestricted", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(
+            unrestricted.starts_with("Unrestricted for this chat until "),
+            "{unrestricted}"
+        );
+    }
 }

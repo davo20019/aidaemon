@@ -361,3 +361,125 @@ async fn mandate_allowed_tools_still_restrict() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn readonly_blocks_writes_then_full_restores() {
+    let dir = authority_test_dir();
+    let blocked = dir.join("blocked.txt");
+    let restored = dir.join("restored.txt");
+    std::fs::write(dir.join("listing_marker.txt"), "x").unwrap();
+    let session = "tg_authority_readonly";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": blocked, "content": "no"}).to_string(),
+        ),
+        MockProvider::text_response("I could not write the file."),
+        MockProvider::tool_call_response(
+            "terminal",
+            &json!({"command": format!("ls {}", dir.display())}).to_string(),
+        ),
+        MockProvider::text_response("Listed the directory."),
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": restored, "content": "yes"}).to_string(),
+        ),
+        MockProvider::text_response("Wrote the file."),
+    ]);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(provider, vec![tool])
+        .await
+        .unwrap();
+    let state = Arc::clone(&harness.state);
+    let provider = Arc::clone(&harness.provider);
+    let agent = Arc::new(harness.agent);
+    let commands = crate::channels::commands::CommandContext {
+        agent: agent.clone(),
+        state: state.clone(),
+        task_registry: Arc::new(crate::tasks::TaskRegistry::new(10)),
+        config_path: std::path::PathBuf::new(),
+    };
+    let turn = |text: &'static str| {
+        let agent = agent.clone();
+        async move {
+            agent
+                .handle_message(
+                    session,
+                    text,
+                    None,
+                    UserRole::Owner,
+                    ChannelContext::private("telegram"),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    let reply = commands
+        .dispatch("/readonly", "", session, UserRole::Owner)
+        .await
+        .unwrap();
+    assert!(reply.starts_with("Read-only for this chat until "), "{reply}");
+
+    turn("Write a file.").await;
+    assert!(!blocked.exists(), "a write is refused in read-only mode");
+    turn("List the directory.").await;
+
+    let results = {
+        let log = provider.call_log.lock().await;
+        let mut seen = Vec::new();
+        for call in log.iter() {
+            for message in call.messages.iter().filter(|m| m["role"] == "tool") {
+                if let Some(content) = message["content"].as_str() {
+                    if !seen.iter().any(|s: &String| s == content) {
+                        seen.push(content.to_string());
+                    }
+                }
+            }
+        }
+        seen
+    };
+    assert!(
+        results.iter().any(|r| r.contains("[AUTHORITY BLOCKED]")),
+        "the write was refused by the authority gate; saw {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.contains("listing_marker.txt")),
+        "terminal ls ran; saw {results:?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|r| r.contains("[AUTHORITY BLOCKED]") && r.contains("terminal")),
+        "terminal ls is not refused; saw {results:?}"
+    );
+
+    // The denial is part of the run's record: a blocked, pre-dispatch tool
+    // result for the write.
+    let events = agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::ToolResult], 20)
+        .await
+        .unwrap();
+    assert!(
+        events.iter().any(|event| event.data["name"] == "write_file"
+            && event.data["result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("[AUTHORITY BLOCKED]"))
+            && event.data["success"] == false),
+        "the authority denial is recorded in the run; saw {:?}",
+        events.iter().map(|e| e.data.clone()).collect::<Vec<_>>()
+    );
+
+    assert_eq!(
+        commands
+            .dispatch("/mode", "full", session, UserRole::Owner)
+            .await
+            .as_deref(),
+        Some("Back to full access.")
+    );
+    turn("Write a file again.").await;
+    assert!(restored.is_file(), "a write runs again after /mode full");
+    let _ = std::fs::remove_dir_all(dir);
+}

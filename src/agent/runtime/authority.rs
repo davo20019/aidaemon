@@ -11,13 +11,80 @@ use crate::config::OwnerLevel;
 use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
 use crate::types::{UserRole, WorkspaceAccessLevel, WorkspaceGrant};
 
-/// A session narrowing the owner chose with an explicit command.
-#[allow(dead_code)] // Task 6 adds the `/readonly` and `/mode` commands.
+/// A session mode the owner chose with an explicit command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::agent) enum SessionMode {
+pub(crate) enum SessionMode {
     ReadOnly,
     Full,
     Unrestricted,
+}
+
+/// How long a `/readonly` or `/mode unrestricted` lasts.
+const SESSION_MODE_TTL_HOURS: i64 = 4;
+
+fn session_mode_key(session_id: &str) -> String {
+    format!("authority_mode:{session_id}")
+}
+
+/// Persist the owner's session mode and return when it expires. `Full` is the
+/// default, so it clears the setting (stored as an empty value, which reads as
+/// no mode) instead of recording an expiry.
+pub(crate) async fn set_session_mode(
+    state: &dyn crate::traits::StateStore,
+    session_id: &str,
+    mode: SessionMode,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let expires_at = now + chrono::Duration::hours(SESSION_MODE_TTL_HOURS);
+    let key = session_mode_key(session_id);
+    let value = match mode {
+        SessionMode::Full => String::new(),
+        SessionMode::ReadOnly | SessionMode::Unrestricted => serde_json::json!({
+            "mode": if mode == SessionMode::ReadOnly { "read_only" } else { "unrestricted" },
+            "expires_at": expires_at.to_rfc3339(),
+        })
+        .to_string(),
+    };
+    state.set_setting(&key, &value).await?;
+    Ok(expires_at)
+}
+
+/// The session mode in force at `now`, with its expiry. Expired, cleared or
+/// unreadable entries read as no mode (the configured default applies).
+pub(crate) async fn session_mode_with_expiry(
+    state: &dyn crate::traits::StateStore,
+    session_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(SessionMode, chrono::DateTime<chrono::Utc>)> {
+    let raw = state
+        .get_setting(&session_mode_key(session_id))
+        .await
+        .ok()
+        .flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(value["expires_at"].as_str()?)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    if expires_at <= now {
+        return None;
+    }
+    let mode = match value["mode"].as_str()? {
+        "read_only" => SessionMode::ReadOnly,
+        "unrestricted" => SessionMode::Unrestricted,
+        "full" => SessionMode::Full,
+        _ => return None,
+    };
+    Some((mode, expires_at))
+}
+
+pub(crate) async fn session_mode(
+    state: &dyn crate::traits::StateStore,
+    session_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<SessionMode> {
+    session_mode_with_expiry(state, session_id, now)
+        .await
+        .map(|(mode, _)| mode)
 }
 
 /// The explicit facts authority is resolved from.
@@ -109,6 +176,70 @@ fn bound_workspace_access(workspace: &str) -> Option<ToolCallAccessManifest> {
 mod tests {
     use super::*;
     use aidaemon_core::Authority;
+
+    async fn temp_store(path: &std::path::Path) -> crate::state::SqliteStateStore {
+        let embedding = std::sync::Arc::new(
+            crate::memory::embeddings::EmbeddingService::new().expect("embedding service"),
+        );
+        crate::state::SqliteStateStore::new(path.to_str().unwrap(), 100, None, embedding)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_mode_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(&dir.path().join("a.db")).await;
+        let t = chrono::Utc::now();
+        let expires = set_session_mode(&store, "synthetic-session", SessionMode::ReadOnly, t)
+            .await
+            .unwrap();
+        assert_eq!(expires, t + chrono::Duration::hours(4));
+        let before = t + chrono::Duration::minutes(3 * 60 + 59);
+        let after = t + chrono::Duration::minutes(4 * 60 + 1);
+        assert_eq!(
+            session_mode(&store, "synthetic-session", before).await,
+            Some(SessionMode::ReadOnly)
+        );
+        assert_eq!(session_mode(&store, "synthetic-session", after).await, None);
+        assert_eq!(session_mode(&store, "other-session", t).await, None);
+    }
+
+    #[tokio::test]
+    async fn session_mode_full_clears_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(&dir.path().join("a.db")).await;
+        let t = chrono::Utc::now();
+        set_session_mode(&store, "s", SessionMode::Unrestricted, t)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_mode(&store, "s", t).await,
+            Some(SessionMode::Unrestricted)
+        );
+        set_session_mode(&store, "s", SessionMode::Full, t)
+            .await
+            .unwrap();
+        assert_eq!(session_mode(&store, "s", t).await, None);
+    }
+
+    #[tokio::test]
+    async fn session_mode_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.db");
+        let t = chrono::Utc::now();
+        {
+            let store = temp_store(&path).await;
+            set_session_mode(&store, "synthetic-session", SessionMode::ReadOnly, t)
+                .await
+                .unwrap();
+        }
+        let reopened = temp_store(&path).await;
+        assert_eq!(
+            session_mode(&reopened, "synthetic-session", t).await,
+            Some(SessionMode::ReadOnly)
+        );
+    }
 
     fn facts(role: UserRole) -> AuthorityFacts<'static> {
         AuthorityFacts {

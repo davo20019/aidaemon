@@ -735,11 +735,17 @@ impl Agent {
         // Tool authority comes from explicit facts, never from the request
         // assessment: resolved once here, offered as its tool set, enforced
         // per call by the kernel's `AuthorityHook`.
+        let session_mode = crate::agent::authority::session_mode(
+            self.state.as_ref(),
+            session_id,
+            chrono::Utc::now(),
+        )
+        .await;
         let resolved_authority =
             crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
                 user_role,
                 owner_default: self.sdk_engine.owner_default,
-                session_mode: None,
+                session_mode,
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 bound_workspace: turn_context.bound_workspace.as_deref(),
             });
