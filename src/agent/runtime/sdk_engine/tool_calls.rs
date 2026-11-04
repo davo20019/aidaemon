@@ -328,11 +328,7 @@ impl Agent {
             .find(|tool| tool.name() == request.name)
             .map(|tool| {
                 tool.capabilities().read_only
-                    || (matches!(
-                        call_semantics.effect,
-                        crate::traits::ToolCallEffect::Observation
-                            | crate::traits::ToolCallEffect::Administrative
-                    ) && !call_semantics.mutates_state())
+                    || super::hooks::semantics_are_read_only(&call_semantics)
             });
         let closing =
             crate::agent::closeout::ClosingAuthority::from_authority(scope.contract.authority());

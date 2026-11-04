@@ -1541,3 +1541,64 @@ fn directives_stay_where_they_were_raised() {
     assert_eq!(&resent[..4], &sent[..4]);
     assert!(interleave_directives(run.clone(), &[]) == run);
 }
+
+#[tokio::test]
+async fn bridged_terminal_ls_is_read_only_rm_is_not() {
+    use crate::traits::Tool as _;
+    use aidaemon_core::Tool as _;
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+        .await
+        .unwrap();
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+    let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await,
+    );
+    let (calls, _rx) = mpsc::channel(1);
+    let bridged = BridgedTool {
+        spec: tool_spec(terminal.as_ref()),
+        tool: terminal,
+        goal_actions_only: false,
+        calls,
+    };
+    // The worst case for the whole tool is a write.
+    assert!(!bridged.annotations().read_only);
+    let read_only = |args: serde_json::Value| bridged.annotations_for(&args).read_only;
+    let run = |command: &str| serde_json::json!({"action": "run", "command": command});
+    let run_writing = |command: &str| {
+        serde_json::json!({
+            "action": "run",
+            "command": command,
+            "write_paths": ["/tmp/aidaemon-test"],
+        })
+    };
+    assert!(read_only(run("ls /tmp")));
+    assert!(!read_only(run_writing("rm -rf /tmp/aidaemon-test/x")));
+    // A chained or redirected command that declares what it writes is not
+    // read-only.
+    assert!(!read_only(run_writing(
+        "ls /tmp; rm -rf /tmp/aidaemon-test/x"
+    )));
+    assert!(!read_only(run_writing(
+        "cat /tmp/aidaemon-test/a > /tmp/aidaemon-test/b"
+    )));
+    // Process control that is not a run is a mutation.
+    assert!(!read_only(serde_json::json!({"action": "kill"})));
+    // KNOWN GAP (reported, not patched here): `terminal_call_semantics` types a
+    // run by its declared write_paths/write_roots, not by the command text, so
+    // these WITHOUT write_paths are currently classified read-only:
+    //   "rm -rf /tmp/aidaemon-test/x"
+    //   "ls /tmp; rm -rf /tmp/aidaemon-test/x"
+    //   "ls /tmp && rm -rf /tmp/aidaemon-test/x"
+    //   "cat /tmp/aidaemon-test/a > /tmp/aidaemon-test/b"
+    //   "ls /tmp | xargs rm"
+    // (the native sandbox still blocks undeclared writes).
+}

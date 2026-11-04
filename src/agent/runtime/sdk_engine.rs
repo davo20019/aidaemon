@@ -597,7 +597,7 @@ impl Agent {
                     };
                 builder = builder.tool(BridgedTool {
                     spec,
-                    read_only: tool.capabilities().read_only,
+                    tool: tool.clone(),
                     goal_actions_only,
                     calls: calls_tx.clone(),
                 });
