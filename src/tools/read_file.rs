@@ -126,6 +126,17 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// `.env.example` style templates hold placeholders, not secrets.
+fn is_env_template(path: &std::path::Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            ".env.example" | ".env.sample" | ".env.template"
+        )
+    })
+}
+
 impl ReadFileTool {
     async fn read_outcome(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
@@ -166,6 +177,12 @@ impl ReadFileTool {
 
         let backend = active_execution_backend();
         let path = backend.resolve_path(path_str).await?;
+        let local_path = std::path::Path::new(path.as_str());
+        if fs_utils::is_sensitive_path(local_path) && !is_env_template(local_path) {
+            return Ok(ToolCallOutcome::contract_rejection(format!(
+                "read_file does not open credential or secret files ({path_str}). Ask the owner to share what is needed."
+            )));
+        }
         let metadata = backend
             .metadata(&path)
             .await
@@ -733,6 +750,56 @@ mod tests {
         assert_eq!(schema["name"], "read_file");
         assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["path"].is_object());
+    }
+
+    async fn read_in_tempdir(name: &str, body: &str) -> anyhow::Result<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(name);
+        std::fs::write(&file, body).unwrap();
+        let args = json!({"path": file.to_str().unwrap()}).to_string();
+        ReadFileTool.call(&args).await
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_ssh_private_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let key = ssh.join("id_ed25519");
+        std::fs::write(&key, "synthetic-private-key-material\n").unwrap();
+        let args = json!({"path": key.to_str().unwrap()}).to_string();
+        let out = ReadFileTool.call(&args).await;
+        let text = match out {
+            Ok(text) => text,
+            Err(error) => error.to_string(),
+        };
+        assert!(text.contains("read_file does not open credential or secret files"));
+        assert!(!text.contains("synthetic-private-key-material"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_dotenv() {
+        let text = match read_in_tempdir(".env", "API_TOKEN=synthetic-token\n").await {
+            Ok(text) => text,
+            Err(error) => error.to_string(),
+        };
+        assert!(text.contains("read_file does not open credential or secret files"));
+        assert!(text.contains("Ask the owner to share what is needed."));
+        assert!(!text.contains("synthetic-token"));
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_env_example() {
+        for name in [".env.example", ".env.sample", ".env.template"] {
+            let text = read_in_tempdir(name, "API_TOKEN=changeme\n").await.unwrap();
+            assert!(text.contains("API_TOKEN=changeme"), "{name}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_regular_source() {
+        let text = read_in_tempdir("main.rs", "fn main() {}\n").await.unwrap();
+        assert!(text.contains("fn main() {}"));
     }
 
     #[tokio::test]
