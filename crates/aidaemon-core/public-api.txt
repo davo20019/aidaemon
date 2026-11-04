@@ -10,6 +10,7 @@ pub const aidaemon_core::conformance::provider_checks::TOOL_CALL_IDS: &str
 pub const aidaemon_core::conformance::provider_checks::TOOL_CALL_SHAPE: &str
 pub const aidaemon_core::conformance::provider_checks::USAGE_CONSISTENT: &str
 pub mod aidaemon_core::conformance::tool_checks
+pub const aidaemon_core::conformance::tool_checks::ANNOTATIONS_FOR_ONLY_RELAXES: &str
 pub const aidaemon_core::conformance::tool_checks::DESCRIPTION_NON_EMPTY: &str
 pub const aidaemon_core::conformance::tool_checks::NAME_FORMAT: &str
 pub const aidaemon_core::conformance::tool_checks::PARAMETERS_CLOSED: &str

@@ -407,6 +407,79 @@ async fn per_call_read_only_does_not_make_calls_concurrent() {
     assert!(out.receipts().iter().all(|r| r.read_only));
 }
 
+/// Worst case WRITE; a call with `{"op":"write"}` stays WRITE, `{"op":"read"}` is read-only.
+struct OpTool;
+#[async_trait]
+impl Tool for OpTool {
+    fn spec(&self) -> ToolSpec {
+        spec("optool", "read or write", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::WRITE
+    }
+    fn annotations_for(&self, arguments: &Value) -> ToolAnnotations {
+        if arguments["op"] == "read" {
+            ToolAnnotations::READ_ONLY
+        } else {
+            ToolAnnotations::WRITE
+        }
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// Denies any call whose per-call annotations are not read-only; rewrites
+/// `read` into `write` first via a preceding hook.
+struct RequireReadOnly;
+#[async_trait]
+impl Hook for RequireReadOnly {
+    async fn before_tool(
+        &self,
+        _: &HookContext<'_>,
+        _: &ToolCall,
+        tool: &ToolInfo,
+    ) -> ToolDecision {
+        if tool.annotations.read_only {
+            ToolDecision::Allow
+        } else {
+            ToolDecision::Deny {
+                reason: "not read-only".into(),
+            }
+        }
+    }
+}
+
+struct ReadToWrite;
+#[async_trait]
+impl Hook for ReadToWrite {
+    async fn before_tool(&self, _: &HookContext<'_>, _: &ToolCall, _: &ToolInfo) -> ToolDecision {
+        ToolDecision::Rewrite {
+            arguments: json!({"op": "write"}),
+        }
+    }
+}
+
+#[tokio::test]
+async fn rewrite_recomputes_annotations() {
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "optool", json!({"op": "read"}))]),
+        text("done"),
+    ]))
+    .tool(OpTool)
+    .hook(ReadToWrite)
+    .hook(RequireReadOnly)
+    .build()
+    .unwrap();
+    let out = agent.run("s", "go").await.unwrap();
+    let r = &out.receipts()[0];
+    assert_eq!(r.status, ReceiptStatus::Denied);
+    assert!(
+        !r.read_only,
+        "the receipt records the rewritten call's annotations"
+    );
+}
+
 // ---------- hooks ----------
 
 struct DenyDestructive;

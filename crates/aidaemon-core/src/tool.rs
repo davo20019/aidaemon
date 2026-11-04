@@ -268,6 +268,9 @@ pub trait Tool: Send + Sync {
     /// result is trusted as given by authority checks (and recorded in the
     /// receipt), so it must be correct for those arguments. Concurrent
     /// scheduling always uses [`Tool::annotations`], never this value.
+    /// Crash-recovery replay uses this per-call `idempotent`: a call
+    /// declared idempotent for its arguments is re-run, not marked
+    /// indeterminate.
     fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
         self.annotations()
     }

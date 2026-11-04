@@ -194,7 +194,7 @@ mod tests {
         for a in samples() {
             for b in samples() {
                 let n = a.narrow(&b);
-                assert!(n.level <= a.level.min(b.level));
+                assert_eq!(n.level, a.level.min(b.level));
                 assert!(within(&n.tools, &a.tools), "{a:?} {b:?}");
                 assert!(within(&n.tools, &b.tools), "{a:?} {b:?}");
             }
@@ -347,6 +347,11 @@ mod tests {
             .unwrap();
         let out = agent.run("s", "go").await.unwrap();
         assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
+        let reason = out.receipts()[0].reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("[AUTHORITY BLOCKED] `write_file`"),
+            "{reason}"
+        );
     }
 
     struct Mixed;
@@ -389,7 +394,15 @@ mod tests {
             .unwrap();
         let out = agent.run("s", "go").await.unwrap();
         let r = out.receipts();
-        assert_ne!(r[0].status, ReceiptStatus::Denied);
+        assert_eq!(r[0].status, ReceiptStatus::Succeeded);
         assert_eq!(r[1].status, ReceiptStatus::Denied);
+    }
+
+    #[test]
+    fn an_empty_tool_set_permits_nothing() {
+        assert_eq!(
+            Authority::no_tools().permits("read_file", ToolAnnotations::READ_ONLY),
+            Err("tool not available".to_string())
+        );
     }
 }

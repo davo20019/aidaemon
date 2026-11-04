@@ -250,6 +250,79 @@ async fn idempotent_call_in_flight_is_rerun() {
     assert!(out.receipts().iter().all(|r| r.succeeded()));
 }
 
+/// Worst case non-idempotent, but a call with `{"op":"read"}` is idempotent.
+struct PerCallIdempotent {
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for PerCallIdempotent {
+    fn spec(&self) -> ToolSpec {
+        spec("probe", "idempotent only per call", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::WRITE
+    }
+    fn annotations_for(&self, arguments: &Value) -> ToolAnnotations {
+        if arguments["op"] == "read" {
+            ToolAnnotations {
+                idempotent: true,
+                ..ToolAnnotations::WRITE
+            }
+        } else {
+            self.annotations()
+        }
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::future::pending::<()>().await;
+        }
+        Ok(ToolOutput::text("probe ran"))
+    }
+}
+
+#[tokio::test]
+async fn recovery_reruns_a_per_call_idempotent_call() {
+    let store = Arc::new(MemoryStore::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let run_id: Arc<Mutex<Option<RunId>>> = Arc::default();
+    let rid = run_id.clone();
+    let build = |provider: ScriptedProvider| {
+        Agent::builder("worker")
+            .allow_unguarded()
+            .model("m")
+            .provider(provider)
+            .tool(PerCallIdempotent {
+                calls: calls.clone(),
+            })
+            .store(store.clone())
+    };
+    let first = build(ScriptedProvider::new([tool_calls([call(
+        "c1",
+        "probe",
+        json!({"op": "read"}),
+    )])]))
+    .event_sink(move |id, _e: &Event| {
+        rid.lock().unwrap().get_or_insert(id);
+    })
+    .build()
+    .unwrap();
+    let crashed = tokio::time::timeout(Duration::from_millis(200), first.run("s", "go")).await;
+    assert!(crashed.is_err(), "the first run must not finish");
+
+    let id = run_id.lock().unwrap().unwrap();
+    let saved = store.load_state(id).await.unwrap().expect("checkpoint");
+    let second = build(ScriptedProvider::new([text("done")]))
+        .build()
+        .unwrap();
+    let out = second
+        .run_from(saved, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "re-run, not indeterminate");
+    assert!(out.receipts().iter().all(|r| r.succeeded()));
+}
+
 // ---------- typed message origins, error flags, timeout hints, with_limits ----------
 
 #[tokio::test]

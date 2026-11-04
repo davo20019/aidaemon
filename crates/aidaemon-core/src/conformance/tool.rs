@@ -34,6 +34,11 @@ pub mod tool_checks {
     /// A tool annotated `read_only` is not also `destructive`; the two are
     /// contradictory and break scheduling and approval policies.
     pub const READ_ONLY_NOT_DESTRUCTIVE: &str = "tool.read_only_not_destructive";
+    /// `annotations_for` on the sample call only relaxes the tool-wide
+    /// `annotations()`: it never reports a call as read-only, non-destructive
+    /// or non-egress when the worst case is not. Authority checks trust the
+    /// per-call value, so a tightening one would hide a stricter worst case.
+    pub const ANNOTATIONS_FOR_ONLY_RELAXES: &str = "tool.annotations_for_only_relaxes";
     /// `spec()` and `annotations()` return identical values on repeated
     /// calls, so the cacheable request prefix stays stable.
     pub const SPEC_STABLE: &str = "tool.spec_stable";
@@ -206,6 +211,30 @@ pub fn check_tool_with(tool: &dyn Tool, options: ToolKitOptions) -> ConformanceR
             Err("annotated both read_only and destructive".into())
         } else {
             Ok(())
+        },
+    );
+
+    let per_call = tool.annotations_for(&sample);
+    let mut tightened = Vec::new();
+    if annotations.read_only && !per_call.read_only {
+        tightened.push("read_only");
+    }
+    if !annotations.destructive && per_call.destructive {
+        tightened.push("destructive");
+    }
+    if !annotations.egress && per_call.egress {
+        tightened.push("egress");
+    }
+    report.record(
+        ANNOTATIONS_FOR_ONLY_RELAXES,
+        if tightened.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "annotations_for({sample}) is stricter than annotations() on: {}; \
+                 annotations() must be the worst case",
+                tightened.join(", ")
+            ))
         },
     );
 
@@ -436,7 +465,7 @@ mod tests {
             ToolAnnotations::READ_ONLY,
         ));
         report.assert_all_passed();
-        assert_eq!(report.passed.len(), 10);
+        assert_eq!(report.passed.len(), 11);
     }
 
     #[test]
@@ -465,6 +494,37 @@ mod tests {
             assert!(report.failure(check).is_some(), "{check}: {report}");
         }
         assert!(report.passed_check(tool_checks::VALIDATE_REJECTS_MISSING_REQUIRED));
+    }
+
+    #[test]
+    fn a_per_call_value_that_tightens_the_worst_case_is_reported() {
+        struct Tightens;
+        #[async_trait::async_trait]
+        impl Tool for Tightens {
+            fn spec(&self) -> ToolSpec {
+                spec("tightens", "Tightens per call", &[])
+            }
+            fn annotations(&self) -> ToolAnnotations {
+                ToolAnnotations::READ_ONLY
+            }
+            fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
+                ToolAnnotations::DESTRUCTIVE
+            }
+            async fn call(
+                &self,
+                _args: Value,
+                _ctx: &crate::tool::ToolContext,
+            ) -> crate::tool::ToolResult {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+        let report = check_tool(&Tightens);
+        let failure = report
+            .failure(tool_checks::ANNOTATIONS_FOR_ONLY_RELAXES)
+            .expect("tightening is reported");
+        assert!(failure.contains("read_only"), "{failure}");
+        assert!(failure.contains("destructive"), "{failure}");
+        assert!(failure.contains("egress"), "{failure}");
     }
 
     #[test]

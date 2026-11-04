@@ -329,7 +329,7 @@ impl<'a> Driver<'a> {
             // scheduling uses only the tool's worst case, since a per-call
             // relaxation is a statement about authority, not isolation.
             let may_run_concurrently = tool.annotations().read_only;
-            let info = ToolInfo {
+            let mut info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
             };
@@ -358,12 +358,14 @@ impl<'a> Driver<'a> {
                 // An approval settles only the hook that interrupted: the
                 // hooks after it still judge the call.
                 Some(Resolution::Approve) => {
-                    self.decide(&mut call, info, resume_after.map_or(0, |i| i + 1))
+                    self.decide(&mut call, &mut info, resume_after.map_or(0, |i| i + 1))
                         .await
                 }
                 Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
-                None => self.decide(&mut call, info, 0).await,
+                None => self.decide(&mut call, &mut info, 0).await,
             };
+            // A hook may have rewritten the call; judge and record what runs.
+            let annotations = info.annotations;
 
             match verdict {
                 Verdict::Allow if may_run_concurrently => {
@@ -461,10 +463,10 @@ impl<'a> Driver<'a> {
 
     /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
     /// arguments re-validated) before the next hook sees the call.
-    async fn decide(&self, call: &mut ToolCall, mut info: ToolInfo, from: usize) -> Verdict {
+    async fn decide(&self, call: &mut ToolCall, info: &mut ToolInfo, from: usize) -> Verdict {
         let ctx = self.ctx();
         for (hook_index, hook) in self.agent.hooks.iter().enumerate().skip(from) {
-            match hook.before_tool(&ctx, call, &info).await {
+            match hook.before_tool(&ctx, call, info).await {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
                 ToolDecision::Interrupt { reason } => {
@@ -478,6 +480,9 @@ impl<'a> Driver<'a> {
                                 "a hook rewrote the arguments into an invalid call: {reason}"
                             ));
                         }
+                        // The rewritten call is a different call: its
+                        // effect and access are those of the new arguments.
+                        info.annotations = tool.annotations_for(&call.arguments);
                         info.access = tool.access(&call.arguments);
                     }
                 }
@@ -773,11 +778,12 @@ impl<'a> Driver<'a> {
             if !started || in_flight.done.contains(&call.id) {
                 continue;
             }
+            // Replay safety is a property of this call's arguments.
             let idempotent = self
                 .agent
                 .tools
                 .get(&call.name)
-                .map(|tool| tool.annotations().idempotent)
+                .map(|tool| tool.annotations_for(&call.arguments).idempotent)
                 .unwrap_or(false);
             if idempotent {
                 reran.push(call.id.clone());
