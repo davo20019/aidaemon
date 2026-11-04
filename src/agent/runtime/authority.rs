@@ -120,7 +120,6 @@ pub(in crate::agent) struct ResolvedAuthority {
     /// Level and tool set, enforced per call by the kernel hook.
     pub authority: aidaemon_core::Authority,
     /// The owner's level (`None` for guests and the public).
-    #[allow(dead_code)] // Read by the untrusted-content rule (Phase 2).
     pub owner_level: Option<OwnerLevel>,
     /// Filesystem confinement the scope check applies (`None`: none beyond
     /// the turn's ordinary scope lock and a guest's workspace grant).

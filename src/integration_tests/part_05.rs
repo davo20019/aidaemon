@@ -788,6 +788,15 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             })
         }
 
+        // Like the real `send_file`: its result is the daemon's own words.
+        fn output_trust(
+            &self,
+            _arguments: &str,
+            _roots: &crate::traits::TrustRoots<'_>,
+        ) -> aidaemon_core::SourceTrust {
+            aidaemon_core::SourceTrust::Trusted
+        }
+
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
@@ -915,6 +924,15 @@ async fn test_repeated_send_file_executes_once() {
                     "required": ["file_path"]
                 }
             })
+        }
+
+        // Like the real `send_file`: its result is the daemon's own words.
+        fn output_trust(
+            &self,
+            _arguments: &str,
+            _roots: &crate::traits::TrustRoots<'_>,
+        ) -> aidaemon_core::SourceTrust {
+            aidaemon_core::SourceTrust::Trusted
         }
 
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
@@ -1253,6 +1271,15 @@ impl crate::traits::Tool for FailingExternalActionTool {
     }
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::mutation()
+    }
+    // Its failure text is its own, not a third party's: the recovery pass,
+    // not the untrusted-content rule, is under test.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
     }
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         anyhow::bail!("synthetic external action failure")

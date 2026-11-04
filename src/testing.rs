@@ -130,6 +130,12 @@ impl MockProvider {
         self
     }
 
+    /// Script the next turn after an earlier one finished; until then an
+    /// empty script answers with the default text.
+    pub async fn push_responses(&self, responses: Vec<ProviderResponse>) {
+        self.responses.lock().await.extend(responses);
+    }
+
     /// Check after a run as provider errors may be recovered by the agent loop.
     pub async fn assert_response_script_not_exhausted(&self) -> anyhow::Result<()> {
         let unexpected = *self.exhausted_response_calls.lock().await;

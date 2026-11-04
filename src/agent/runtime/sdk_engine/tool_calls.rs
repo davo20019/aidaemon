@@ -307,6 +307,43 @@ impl Agent {
         .await;
     }
 
+    /// An unrestricted owner's egress after untrusted content runs without
+    /// a check (the kernel only marks it); every such call is recorded.
+    async fn record_unrestricted_egress(
+        &self,
+        scope: &TurnScope<'_>,
+        tool_name: &str,
+        arguments: &str,
+    ) {
+        if scope.authority.owner_level != Some(crate::config::OwnerLevel::Unrestricted)
+            || !scope
+                .untrusted_seen
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let egress = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .is_some_and(|tool| tool.call_annotations(arguments).egress);
+        if !egress {
+            return;
+        }
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            0,
+            crate::events::DecisionType::GateTelemetry,
+            "unrestricted owner: egress after untrusted content ran unchecked",
+            serde_json::json!({
+                "condition": "untrusted_egress_unrestricted",
+                "tool": tool_name,
+            }),
+        )
+        .await;
+    }
+
     /// Run one call and record it: a `ToolCall` event, then the tool message with a typed receipt, so the run ledger
     /// sees every operation while the run is still going.
     pub(super) async fn run_sdk_tool_call(
@@ -469,6 +506,8 @@ impl Agent {
         {
             return output;
         }
+        self.record_unrestricted_egress(scope, &request.name, arguments)
+            .await;
         let mut call_data = crate::events::ToolCallData::from_tool_call(
             request.call_id.clone(),
             request.name.clone(),

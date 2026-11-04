@@ -332,12 +332,12 @@ impl TurnScope<'_> {
 }
 
 /// Everything a dispatched call needs from the turn.
-struct TurnScope<'a> {
-    session_id: &'a str,
+pub(in crate::agent) struct TurnScope<'a> {
+    pub(in crate::agent) session_id: &'a str,
     /// The user's message for this turn.
     user_text: &'a str,
-    task_id: &'a str,
-    emitter: &'a EventEmitter,
+    pub(in crate::agent) task_id: &'a str,
+    pub(in crate::agent) emitter: &'a EventEmitter,
     /// The projected starting transcript, sent byte-for-byte on every call.
     prefix: Vec<Value>,
     /// Kernel messages that stand for `prefix`; later ones are this run's.
@@ -482,15 +482,17 @@ impl Agent {
             .semantics_for_exact_tool_call(&call.name, &call.arguments)
             .await;
         let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
-            // Two deny hooks run on SDK turns: the authority hook, whose
-            // refusals carry its fixed marker, and the same-tool limit.
+            // Deny hooks and resolutions on SDK turns: the authority hook,
+            // whose refusals carry its fixed marker, the untrusted-content
+            // verifier (its own marker), and the same-tool limit.
             let authority_denial = reason.starts_with("[AUTHORITY BLOCKED]");
+            let untrusted_denial = reason.starts_with(crate::agent::untrusted::UNTRUSTED_BLOCKED);
             if authority_denial {
                 if !receipt.read_only {
                     self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
                         .await;
                 }
-            } else {
+            } else if !untrusted_denial {
                 self.with_harness_eval(|eval| eval.record_repetition_guard())
                     .await;
             }
@@ -503,6 +505,8 @@ impl Agent {
                 reason,
                 if authority_denial {
                     "authority_hook_denied"
+                } else if untrusted_denial {
+                    "untrusted_egress_denied"
                 } else {
                     "kernel_hook_denied"
                 },
@@ -594,16 +598,14 @@ impl Agent {
         // hook denial) never reach the daemon dispatcher; the event sink hands
         // their receipts over so the run ledger records them too.
         let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
-        // The turn's resolved authority is enforced by the kernel hook. The
-        // daemon dispatcher still enforces the other two required safeguards
-        // itself: `sdk_scope_check` against the turn's filesystem grant
-        // (Scope moves to the kernel in Phase 3) and
-        // `fit_tool_result_for_model` wrapping untrusted output
-        // (UntrustedOutput moves in Phase 2).
+        // The turn's resolved authority is enforced by the kernel hook, and
+        // the untrusted-content rule by `UntrustedHook` (registered last,
+        // below). The daemon dispatcher still enforces Scope itself:
+        // `sdk_scope_check` against the turn's filesystem grant (Scope moves
+        // to the kernel in Phase 3).
         let mut builder = sdk::Agent::builder("aidaemon")
             .hook(sdk::AuthorityHook::new(authority.authority.clone()))
             .attest(sdk::Safeguard::Scope)
-            .attest(sdk::Safeguard::UntrustedOutput)
             .model(model.clone())
             .provider(DaemonProvider {
                 calls: calls_tx.clone(),
@@ -700,6 +702,12 @@ impl Agent {
                 builder = builder.tool_arc(tool);
             }
         }
+        // Last, so it only interrupts calls every other hook already allows
+        // (an approval still passes the hooks after it).
+        builder = builder.hook(sdk::UntrustedHook::new(
+            crate::agent::untrusted::untrusted_mode(authority.owner_level),
+            aidaemon_policies::wrap_untrusted,
+        ));
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
@@ -745,6 +753,26 @@ impl Agent {
         let projected = values_to_sdk(&prefix);
         if !projected.is_empty() {
             state.messages = projected;
+        }
+        // A turn whose input is someone else's, or whose transcript still
+        // holds a turn that read untrusted content, starts tainted.
+        let tainted_turns = crate::agent::untrusted::tainted_turns(self.state.as_ref(), session_id)
+            .await
+            .inspect_err(|error| {
+                warn!(session_id, %error, "Could not read tainted turns; the turn starts tainted");
+            })
+            .ok();
+        let starts_tainted =
+            crate::agent::untrusted::starts_tainted(&crate::agent::untrusted::TaintFacts {
+                user_role,
+                visibility: channel_ctx.visibility,
+                session_id,
+                projected_turn_ids: &projected_source_turn_ids,
+                tainted_turns: tainted_turns.as_deref(),
+                inherited: false,
+            });
+        if starts_tainted {
+            state = state.with_untrusted_context();
         }
         let prefix_len = state.messages.len();
 
@@ -799,7 +827,7 @@ impl Agent {
             project_scope,
             authority: &authority,
             trust_roots,
-            untrusted_seen: AtomicBool::new(false),
+            untrusted_seen: AtomicBool::new(starts_tainted),
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,
@@ -860,7 +888,14 @@ impl Agent {
             .as_ref()
             .map(|token| token.child_token())
             .unwrap_or_default();
-        let run = sdk_agent.run_from(state, cancel);
+        // Egress the untrusted-content rule interrupts is settled by a clean
+        // check that sees only this request and the proposed call.
+        let verifier = crate::agent::untrusted::UntrustedVerifier {
+            agent: self,
+            scope: &scope,
+            origin_request: user_text,
+        };
+        let run = sdk_agent.run_resolving(state, cancel, &verifier);
         tokio::pin!(run);
         let mut in_flight = FuturesUnordered::new();
         // Ledger writes for kernel notices run apart from the run's own calls:
@@ -895,6 +930,23 @@ impl Agent {
             ledger_writes.push(self.record_kernel_notice(&scope, notice).boxed());
         }
         while ledger_writes.next().await.is_some() {}
+        // A turn that read untrusted content taints later turns that still
+        // see it.
+        let tainted = scope.untrusted_seen.load(Ordering::SeqCst)
+            || outcome
+                .as_ref()
+                .is_ok_and(|outcome| outcome.state.untrusted_seen);
+        if tainted {
+            if let Err(error) = crate::agent::untrusted::record_tainted_turn(
+                self.state.as_ref(),
+                session_id,
+                &turn_id,
+            )
+            .await
+            {
+                warn!(session_id, %error, "Could not record a tainted turn");
+            }
+        }
 
         let (reply, status, task_outcome, error) = match outcome {
             Ok(outcome) => {

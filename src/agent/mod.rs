@@ -158,6 +158,8 @@ pub(crate) mod specialists;
 mod tool_result_fit;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
+#[path = "runtime/untrusted.rs"]
+pub(crate) mod untrusted;
 pub(crate) use parent_delivery::ParentDeliveryKind;
 #[path = "turn/services.rs"]
 mod services;

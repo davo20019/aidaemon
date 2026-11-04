@@ -312,6 +312,27 @@ The assessor's contract is an expectations hint and, with `task_assessment =
 assessment call), a logged comparison. `CompletionContract::authority()` is no
 longer a gate.
 
+## Untrusted Content Rule
+
+After a run reads content someone other than the owner wrote (web pages,
+trigger input, other people's messages, MCP results, files outside the trusted
+roots), its egress calls are interrupted by the kernel's `UntrustedHook` and
+run only if a clean, tool-less verifier
+(`src/agent/runtime/untrusted.rs`) that sees just the original request and the
+proposed call finds them consistent. Owner level `unrestricted` records these
+calls instead of checking them.
+
+- Source trust is typed per adapter: each tool declares `output_trust` from
+  its capabilities and arguments. `sanitize.rs::is_trusted_tool` only decides
+  wrapping, never trust.
+- Egress is the `ToolAnnotations.egress` bit, derived per call from typed
+  mutation effects (`call_annotations`).
+- A turn starts tainted from explicit facts only (`starts_tainted`): role,
+  channel visibility, trigger session, a tainted turn still in the projected
+  prefix, or a tainted parent.
+- Never key trust, egress or taint on tool names or on request/content
+  wording.
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the
