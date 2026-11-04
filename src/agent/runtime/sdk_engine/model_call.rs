@@ -17,9 +17,13 @@ pub(super) const MAX_MODEL_CALL_TIMEOUT_RETRIES: u32 = 2;
 /// Retries after a context-overflow rejection, each with a smaller budget.
 pub(super) const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 2;
 
-/// Heads a user message taken into a running turn.
+/// Heads a user message taken into a running turn. It joins the request
+/// the turn serves rather than replacing it: several questions sent back to
+/// back all arrive this way, and each still needs its answer.
 pub(super) const STEERING_MARKER: &str =
-    "[The user sent this while you were working. Take it into account from here on.]";
+    "[The user sent this while you were working. It adds to the current request: \
+     still answer or finish everything they asked before it, unless this message \
+     changes or cancels that.]";
 
 /// The output ceiling a thinking cutoff raises to.
 pub(super) const MAX_RAISED_OUTPUT_TOKENS: u32 = 32_768;
