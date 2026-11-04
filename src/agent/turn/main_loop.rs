@@ -25,6 +25,42 @@ struct RequiredContextProjection {
     truncated: bool,
 }
 
+/// The scope-check fallback for a turn without a resolved task manifest: the
+/// request's text-derived project scopes (else the channel workspace root),
+/// widened by every filesystem target the assessor's manifest admitted, so it
+/// is never narrower than that manifest used as `task_access` was. An exact
+/// `Path` becomes a grant that covers only that path.
+fn owner_fallback_scopes(
+    authorized_project_scopes: &[String],
+    workspace_root: Option<String>,
+    filesystem_access: Option<&crate::traits::ToolCallAccessManifest>,
+) -> Vec<String> {
+    let mut scopes = if authorized_project_scopes.is_empty() {
+        workspace_root.into_iter().collect::<Vec<_>>()
+    } else {
+        authorized_project_scopes.to_vec()
+    };
+    if let Some(access) = filesystem_access {
+        for target in access
+            .read_targets
+            .iter()
+            .chain(access.write_targets.iter())
+            .filter(|target| {
+                matches!(
+                    target.kind,
+                    crate::traits::ToolTargetHintKind::ProjectScope
+                        | crate::traits::ToolTargetHintKind::Path
+                )
+            })
+        {
+            if !scopes.contains(&target.value) {
+                scopes.push(target.value.clone());
+            }
+        }
+    }
+    scopes
+}
+
 /// Keep only the tool definitions the turn's authority admits by name (all
 /// of them when it names no tool set).
 fn retain_authorized_tool_definitions(
@@ -1166,32 +1202,13 @@ impl Agent {
                 authority: resolved_authority,
                 projected_source_message_ids,
                 projected_source_turn_ids,
-                authorized_scopes: {
-                    let mut scopes = if turn_context.authorized_project_scopes.is_empty() {
-                        channel_ctx
-                            .active_workspace_grant(user_role)
-                            .map(|grant| grant.project_root.clone())
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                    } else {
-                        turn_context.authorized_project_scopes.clone()
-                    };
-                    if let Some(access) = turn_context.filesystem_access.as_ref() {
-                        for target in access
-                            .read_targets
-                            .iter()
-                            .chain(access.write_targets.iter())
-                            .filter(|target| {
-                                target.kind == crate::traits::ToolTargetHintKind::ProjectScope
-                            })
-                        {
-                            if !scopes.contains(&target.value) {
-                                scopes.push(target.value.clone());
-                            }
-                        }
-                    }
-                    scopes
-                },
+                authorized_scopes: owner_fallback_scopes(
+                    &turn_context.authorized_project_scopes,
+                    channel_ctx
+                        .active_workspace_grant(user_role)
+                        .map(|grant| grant.project_root.clone()),
+                    turn_context.filesystem_access.as_ref(),
+                ),
             };
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(
@@ -1464,6 +1481,58 @@ mod offered_tool_tests {
         let mut none = defs;
         retain_authorized_tool_definitions(&mut none, &aidaemon_core::Authority::no_tools());
         assert!(none.is_empty());
+    }
+    /// The owner fallback is never narrower than the assessor manifest base
+    /// used as `task_access`: an exact assessed write path stays admitted.
+    #[test]
+    fn owner_scope_lock_keeps_assessed_exact_paths() {
+        use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+        let root = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let proj = format!("{root}/proj");
+        let out = format!("{root}/out.txt");
+        let assessed = ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![
+                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, &proj).unwrap()
+            ],
+            write_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, &out).unwrap()],
+            adapter_read_targets: Vec::new(),
+        };
+        let scopes = owner_fallback_scopes(&[proj.clone()], None, Some(&assessed));
+        let call = ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: Vec::new(),
+            write_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, &out).unwrap()],
+            adapter_read_targets: Vec::new(),
+        };
+        assert_eq!(
+            crate::agent::tool_execution::access_manifest_scope_check(
+                "write_file",
+                &call,
+                None,
+                &scopes,
+                None
+            ),
+            None,
+            "assessed exact write path must stay admitted"
+        );
+        // Still a lock: a sibling outside every assessed target is refused.
+        let sibling = ToolCallAccessManifest {
+            write_targets: vec![ToolTargetHint::new(
+                ToolTargetHintKind::Path,
+                format!("{root}/other.txt"),
+            )
+            .unwrap()],
+            ..call
+        };
+        assert!(crate::agent::tool_execution::access_manifest_scope_check(
+            "write_file",
+            &sibling,
+            None,
+            &scopes,
+            None
+        )
+        .is_some());
     }
 }
 
