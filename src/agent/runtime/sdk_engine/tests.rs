@@ -2056,6 +2056,66 @@ async fn consistent_egress_after_untrusted_read_runs_once() {
     assert_eq!(decisions[0]["consistent"], true);
 }
 
+/// `/readonly` sent while the verifier is deciding stops the call it then
+/// approves: an approved call resumes past the kernel's authority check,
+/// so the dispatcher reads the session's mode again.
+#[tokio::test]
+async fn readonly_during_verification_stops_the_approved_call() {
+    use crate::agent::authority::{set_session_mode, SessionMode};
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let (harness, sent) = untrusted_harness_with(MockProvider::with_delayed_responses(
+        vec![
+            MockProvider::tool_call_response("page_probe", PAGE_CALL),
+            MockProvider::tool_call_response("send_probe", SEND_CALL),
+            MockProvider::text_response(
+                r#"{"consistent":true,"reason":"the owner asked to send it"}"#,
+            ),
+            MockProvider::text_response("Nothing was sent."),
+        ],
+        vec![Duration::ZERO, Duration::ZERO, Duration::from_millis(1500)],
+    ))
+    .await;
+    let provider = harness.provider.clone();
+    let state = harness.state.clone();
+    let flip = tokio::spawn(async move {
+        loop {
+            if provider.call_log.lock().await.iter().any(is_verifier_call) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        set_session_mode(
+            state.as_ref(),
+            "telegram:synthetic-user-1",
+            SessionMode::ReadOnly,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    });
+    harness
+        .agent
+        .handle_inbound_message(owner_request(
+            "Read https://example.invalid/page and send Jordan Lee a summary.",
+        ))
+        .await
+        .unwrap();
+    flip.await.unwrap();
+
+    assert_eq!(sent.load(Ordering::SeqCst), 0, "the send must not run");
+    let decisions = gate_decisions(&harness, "untrusted_egress_verified").await;
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0]["consistent"], true);
+    let results = tool_results_seen(&harness).await;
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains("[AUTHORITY BLOCKED] `send_probe`")),
+        "{results:?}"
+    );
+}
+
 /// Review focus 2: a verifier that cannot answer denies the call, and the
 /// run still finishes.
 #[tokio::test]

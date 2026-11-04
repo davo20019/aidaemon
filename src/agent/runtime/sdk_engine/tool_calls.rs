@@ -397,6 +397,8 @@ impl Agent {
         // A child spawned by this call inherits what this turn has now.
         let turn_authority =
             (request.name == "spawn_agent").then(|| self.turn_authority_for_children(scope));
+        // The session's mode as of now (`/readonly` can arrive mid-turn).
+        let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
         let mut ctx = ToolExecCtx {
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
@@ -410,9 +412,7 @@ impl Agent {
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
             mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly
-                || sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref())
-                    .await
-                    .is_some(),
+                || ceiling.is_some(),
             scope_escalation: scope_escalation.as_ref(),
             turn_authority: turn_authority.as_ref(),
         };
@@ -422,14 +422,35 @@ impl Agent {
             .await;
         // The turn's resolved authority (level and tool set) was enforced
         // by the kernel's `AuthorityHook` before this call reached the
-        // dispatcher. Here: the untrusted-reference block, the filesystem
-        // scope check, then for mandate runs the per-call mandate authority
-        // gate, which issues the bounded grant or refuses the call.
+        // dispatcher. Here: the session's mode as of now, the
+        // untrusted-reference block, the filesystem scope check, then for
+        // mandate runs the per-call mandate authority gate, which issues the
+        // bounded grant or refuses the call.
+        // A call approved after an interruption resumes past the kernel's
+        // authority check, so the mode is judged again for every call.
+        let ceiling_denial = ceiling.as_ref().and_then(|ceiling| {
+            let annotations = self
+                .tools
+                .iter()
+                .find(|tool| tool.name() == request.name)
+                .map(|tool| tool.call_annotations(arguments))
+                .unwrap_or_default();
+            ceiling.permits(&request.name, annotations).err()
+        });
         // A matched skill that references untrusted external content blocks
         // the tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools
             && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
-        let gate = if untrusted_block {
+        let gate = if let Some(reason) = ceiling_denial {
+            Err((
+                format!(
+                    "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
+                     Use a permitted tool or report the limitation.",
+                    request.name
+                ),
+                "session_mode_ceiling",
+            ))
+        } else if untrusted_block {
             Err((
                 crate::agent::tool_execution::blocked_for_untrusted_external_reference_message(
                     &request.name,
