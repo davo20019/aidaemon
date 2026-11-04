@@ -160,13 +160,19 @@ pub(super) struct CompletionContract {
 
 impl CompletionContract {
     /// The fail-closed authority half of this contract.
+    ///
+    /// The assessor's `allowed_tool_names` is a planning hint, not a limit: a
+    /// pre-run model sample must never hide or refuse a tool (it once hid
+    /// `manage_mandates` for a mandate request). The field stays on the
+    /// contract for persistence and logging, but this view exposes no
+    /// name-level allowlist (and so no control-plane carve-out either).
     pub(crate) fn authority(&self) -> RequestAuthority<'_> {
         RequestAuthority {
             forbids_mutation: self.forbids_mutation,
             forbids_tool_use: self.forbids_tool_use,
-            allowed_tool_names: &self.allowed_tool_names,
+            allowed_tool_names: &[],
             forbidden_tool_scopes: &self.forbidden_tool_scopes,
-            owner_control_plane_tools: &self.owner_control_plane_tools,
+            owner_control_plane_tools: &[],
         }
     }
 
@@ -2594,6 +2600,19 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assessed_allowlist_neither_hides_nor_refuses_tools() {
+        let contract = CompletionContract {
+            allowed_tool_names: vec!["http_request".to_string()],
+            ..CompletionContract::default()
+        };
+        assert!(contract.authority().offers_tool_name("manage_mandates"));
+        assert!(
+            crate::agent::closeout::ClosingAuthority::from_authority(contract.authority())
+                .admits_tool("manage_mandates", Some(false))
+        );
+    }
 
     #[test]
     fn semantic_contract_replaces_advisory_obligations_but_keeps_exact_targets() {

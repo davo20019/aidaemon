@@ -779,14 +779,14 @@ async fn test_sdk_unverified_gui_click_blocks_the_success_claim() {
     );
 }
 
-/// An assessment that narrows the turn's tools must not hide the owner's own
-/// mandate control in a private chat: every committing mandate action is
-/// already owner-gated and confirmed. A shared channel gets no exemption.
+/// An assessment's tool allowlist is a hint: it must not hide the owner's own
+/// mandate control, in any channel (the gate on committing actions is the
+/// per-call confirmation, not the assessor).
 #[tokio::test]
-async fn test_owner_mandate_control_survives_assessment_tool_narrowing() {
-    for (visibility, expect_control) in [
-        (crate::types::ChannelVisibility::Private, true),
-        (crate::types::ChannelVisibility::PrivateGroup, false),
+async fn test_assessed_allowlist_does_not_hide_mandate_control() {
+    for visibility in [
+        crate::types::ChannelVisibility::Private,
+        crate::types::ChannelVisibility::PrivateGroup,
     ] {
         let base = MockProvider::semantic_task_assessment(
             "answer",
@@ -830,9 +830,8 @@ async fn test_owner_mandate_control_survives_assessment_tool_narrowing() {
             .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
         assert!(offered.contains(&"system_info".to_string()), "{offered:?}");
-        assert_eq!(
+        assert!(
             offered.contains(&"manage_mandates".to_string()),
-            expect_control,
             "{visibility:?}: {offered:?}"
         );
     }
@@ -856,49 +855,6 @@ fn narrowed_assessment(forbidden_scopes: serde_json::Value) -> crate::traits::Pr
     assessment["contract"]["allowed_tool_names"] = json!(["system_info"]);
     assessment["contract"]["forbidden_tool_scopes"] = forbidden_scopes;
     MockProvider::text_response(&assessment.to_string())
-}
-
-/// A re-admitted control tool runs only its confirmation-gated or read-only
-/// actions: an unconfirmed transition such as `cancel` stays refused on a
-/// turn the assessment narrowed, while `list` runs.
-#[tokio::test]
-async fn test_owner_control_plane_admits_only_gated_actions() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response(
-            "manage_mandates",
-            &json!({"action": "cancel", "mandate_id": "synthetic-mandate-1"}).to_string(),
-        ),
-        MockProvider::tool_call_response("manage_mandates", &json!({"action": "list"}).to_string()),
-        MockProvider::text_response("You have no mandates."),
-    ])
-    .with_task_assessments(vec![narrowed_assessment(json!([]))]);
-    let harness = setup_test_agent_with_mandates(provider).await.unwrap();
-    harness
-        .agent
-        .handle_message(
-            "owner-chat",
-            "Which mandates do I have?",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    let results = harness
-        .agent
-        .event_store()
-        .query_events_by_types("owner-chat", &[crate::events::EventType::ToolResult], 20)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
-        .filter(|result| result.name == "manage_mandates")
-        .map(|result| result.result)
-        .collect::<Vec<_>>();
-    assert_eq!(results.len(), 2, "{results:?}");
-    let refused = results.iter().filter(|r| r.contains("[AUTHORITY BLOCKED]")).count();
-    assert_eq!(refused, 1, "only the cancel is refused: {results:?}");
 }
 
 /// A request that forbids the goal-state scope keeps the control tool out of

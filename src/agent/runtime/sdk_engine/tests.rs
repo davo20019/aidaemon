@@ -764,7 +764,7 @@ async fn sdk_engine_records_the_assessed_task_contract() {
 }
 
 #[tokio::test]
-async fn sdk_engine_refuses_tools_outside_the_contract_authority() {
+async fn sdk_engine_does_not_refuse_tools_outside_the_assessed_allowlist() {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
     use crate::traits::store_prelude::*;
@@ -783,8 +783,8 @@ async fn sdk_engine_refuses_tools_outside_the_contract_authority() {
         .unwrap();
     let facts = harness.state.get_facts(None).await.unwrap();
     assert!(
-        !facts.iter().any(|fact| fact.value.contains("teal")),
-        "a tool outside the contract authority ran"
+        facts.iter().any(|fact| fact.value.contains("teal")),
+        "the assessed allowlist is a hint and must not refuse a tool"
     );
     let dispatched = task_events(&harness, &reply.task_id)
         .await
@@ -797,7 +797,7 @@ async fn sdk_engine_refuses_tools_outside_the_contract_authority() {
             })
         })
         .count();
-    assert_eq!(dispatched, 0);
+    assert_eq!(dispatched, 1);
     assert_eq!(reply.text, "I could not save it.");
 }
 
