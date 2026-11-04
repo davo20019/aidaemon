@@ -66,11 +66,6 @@ pub(in crate::agent) enum SystemDirective {
         outstanding_needs: Vec<String>,
         candidate_tools: Vec<String>,
     },
-    /// The validated request explicitly prohibits every tool call. Any live
-    /// evidence needs remain descriptive limitations, not loop obligations.
-    ToolUseForbiddenByRequest {
-        outstanding_needs: Vec<String>,
-    },
     DuplicateSendFileAlreadySent,
     BackgroundHandoff {
         notifications_active: bool,
@@ -228,19 +223,6 @@ impl SystemDirective {
                      Advisory memory cannot prove canonical history; current state cannot prove attribution or cause. \
                      Continue until every material need has compatible evidence, or report the exact unresolved need as unknown/partial after the available in-scope sources are exhausted.",
                     needs, candidates
-                )
-            }
-            Self::ToolUseForbiddenByRequest { outstanding_needs } => {
-                let limitation = if outstanding_needs.is_empty() {
-                    "No live evidence is required for this conceptual response.".to_string()
-                } else {
-                    format!(
-                        "The following claims would require evidence that cannot be retrieved under this constraint: {}.",
-                        outstanding_needs.join("; ")
-                    )
-                };
-                format!(
-                    "[SYSTEM] The current user explicitly prohibited tool use. No tools are available for this turn and you MUST NOT request or simulate one. Answer directly from the supplied conversation/context. {limitation} If a requested current fact cannot be established, say exactly that live evidence would be required; do not enter a verification loop or return generic blocked boilerplate."
                 )
             }
             Self::DuplicateSendFileAlreadySent => "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only.".to_string(),

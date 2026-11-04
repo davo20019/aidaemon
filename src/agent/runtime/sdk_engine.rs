@@ -101,6 +101,9 @@ pub(crate) struct SdkEngineSettings {
     /// daemon's own selection.
     pub(crate) model_override: Option<String>,
     pub(crate) max_turns: u32,
+    /// `[authority] owner_default`: the owner's level when no session mode
+    /// sets one.
+    pub(crate) owner_default: crate::config::OwnerLevel,
 }
 
 impl Default for SdkEngineSettings {
@@ -108,6 +111,7 @@ impl Default for SdkEngineSettings {
         Self {
             model_override: None,
             max_turns: DEFAULT_MAX_TURNS,
+            owner_default: crate::config::OwnerLevel::default(),
         }
     }
 }
@@ -150,6 +154,7 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
     let settings = SdkEngineSettings {
         model_override,
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
+        owner_default: config.authority.owner_default,
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
     settings
@@ -204,10 +209,11 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) known_project_dir: Option<String>,
     /// The single-project scope lock, passed to tools as `_project_scope`.
     pub(in crate::agent) project_scope: Option<String>,
-    /// The request's filesystem capabilities, and the directories it
-    /// authorizes: the controller-side scope check judges each call's access
-    /// manifest against them.
-    pub(in crate::agent) task_access: Option<crate::traits::ToolCallAccessManifest>,
+    /// What this turn may do, resolved from explicit facts: the kernel's
+    /// `AuthorityHook` enforces its level and tool set, and the
+    /// controller-side scope check judges each call's access manifest
+    /// against its `task_access`, else the directories the turn authorizes.
+    pub(in crate::agent) authority: crate::agent::authority::ResolvedAuthority,
     pub(in crate::agent) authorized_scopes: Vec<String>,
     /// Persisted message and turn ids whose content reached the projected
     /// prefix, recorded on every model call's telemetry.
@@ -344,8 +350,8 @@ struct TurnScope<'a> {
     known_project_dir: std::sync::Mutex<Option<String>>,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
-    /// See `SdkTurnSetup::task_access`.
-    task_access: Option<crate::traits::ToolCallAccessManifest>,
+    /// See `SdkTurnSetup::authority`.
+    authority: &'a crate::agent::authority::ResolvedAuthority,
     authorized_scopes: Vec<String>,
     /// See `SdkTurnSetup::projected_source_message_ids`.
     projected_source_message_ids: Vec<String>,
@@ -437,9 +443,18 @@ impl Agent {
             .semantics_for_exact_tool_call(&call.name, &call.arguments)
             .await;
         let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
-            // The same-tool limit is the only deny hook on SDK turns.
-            self.with_harness_eval(|eval| eval.record_repetition_guard())
-                .await;
+            // Two deny hooks run on SDK turns: the authority hook, whose
+            // refusals carry its fixed marker, and the same-tool limit.
+            let authority_denial = reason.starts_with("[AUTHORITY BLOCKED]");
+            if authority_denial {
+                if !receipt.read_only {
+                    self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
+                        .await;
+                }
+            } else {
+                self.with_harness_eval(|eval| eval.record_repetition_guard())
+                    .await;
+            }
             self.persist_pre_dispatch_policy_denial(
                 scope.emitter,
                 scope.session_id,
@@ -447,7 +462,11 @@ impl Agent {
                 &call,
                 &call.arguments,
                 reason,
-                "kernel_hook_denied",
+                if authority_denial {
+                    "authority_hook_denied"
+                } else {
+                    "kernel_hook_denied"
+                },
                 semantics,
                 None,
             )
@@ -515,7 +534,7 @@ impl Agent {
             memory_recall_allowed,
             known_project_dir,
             project_scope,
-            task_access,
+            authority,
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,
@@ -536,12 +555,14 @@ impl Agent {
         // hook denial) never reach the daemon dispatcher; the event sink hands
         // their receipts over so the run ledger records them too.
         let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
-        // Every tool call goes through the daemon dispatcher, which enforces
-        // the kernel's required safeguards itself: the request/mandate
-        // authority gate, `sdk_scope_check` against the task's filesystem
-        // grant, and `fit_tool_result_for_model` wrapping untrusted output.
+        // The turn's resolved authority is enforced by the kernel hook. The
+        // daemon dispatcher still enforces the other two required safeguards
+        // itself: `sdk_scope_check` against the turn's filesystem grant
+        // (Scope moves to the kernel in Phase 3) and
+        // `fit_tool_result_for_model` wrapping untrusted output
+        // (UntrustedOutput moves in Phase 2).
         let mut builder = sdk::Agent::builder("aidaemon")
-            .attest(sdk::Safeguard::Authority)
+            .hook(sdk::AuthorityHook::new(authority.authority.clone()))
             .attest(sdk::Safeguard::Scope)
             .attest(sdk::Safeguard::UntrustedOutput)
             .model(model.clone())
@@ -731,7 +752,7 @@ impl Agent {
             continue_inline_after_background,
             known_project_dir: std::sync::Mutex::new(known_project_dir),
             project_scope,
-            task_access,
+            authority: &authority,
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,

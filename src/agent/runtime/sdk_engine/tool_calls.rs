@@ -81,7 +81,7 @@ pub(super) fn attenuate_sdk_read_roots(scope: &TurnScope<'_>, request: &mut Tool
         .and_then(|known| known.clone());
     let stripped = crate::agent::tool_execution::attenuate_unauthorized_read_roots(
         &mut request.arguments,
-        scope.task_access.as_ref(),
+        scope.authority.task_access.as_ref(),
         &scope.authorized_scopes,
         known.as_deref(),
     );
@@ -249,7 +249,7 @@ impl Agent {
         crate::agent::tool_execution::access_manifest_scope_check(
             tool_name,
             &manifest,
-            scope.task_access.as_ref(),
+            scope.authority.task_access.as_ref(),
             &scope.authorized_scopes,
             known.as_deref(),
         )
@@ -306,41 +306,18 @@ impl Agent {
             workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
             mandate_authority: None,
             tool_call_id: Some(&request.call_id),
-            mutation_forbidden: scope.contract.authority().forbids_mutation,
+            mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly,
             scope_escalation: scope_escalation.as_ref(),
         };
         let started = Instant::now();
         let call_semantics = self
             .semantics_for_exact_tool_call(&request.name, arguments)
             .await;
-        // The contract's authority lane (forbidden tool use or mutation,
-        // allowed tools, forbidden scopes), then for mandate runs the
-        // per-call mandate authority gate, which issues the bounded grant or
-        // refuses the call.
-        // Judged per call: a mixed tool such as `terminal` is not read-only
-        // as a whole, but a call its adapter types as a pure observation is
-        // (the tool still enforces `mutation_forbidden` itself). Run
-        // bookkeeping typed administrative (the checklist, a blocker report)
-        // changes no user state, so it is not a mutation either.
-        let read_only = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
-            .map(|tool| {
-                tool.capabilities().read_only
-                    || super::hooks::semantics_are_read_only(&call_semantics)
-            });
-        let closing =
-            crate::agent::closeout::ClosingAuthority::from_authority(scope.contract.authority());
-        // A control-plane tool kept outside the assessed allowlist admits
-        // only the calls the tool itself declares gated or read-only.
-        let admitted = closing.admits_tool(&request.name, read_only)
-            && (!closing.admits_only_as_control_plane(&request.name)
-                || self
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name() == request.name)
-                    .is_some_and(|tool| tool.owner_control_plane_call(arguments)));
+        // The turn's resolved authority (level and tool set) was enforced
+        // by the kernel's `AuthorityHook` before this call reached the
+        // dispatcher. Here: the untrusted-reference block, the filesystem
+        // scope check, then for mandate runs the per-call mandate authority
+        // gate, which issues the bounded grant or refuses the call.
         // A matched skill that references untrusted external content blocks
         // the tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools
@@ -353,8 +330,8 @@ impl Agent {
                 ),
                 "untrusted_external_reference_blocked",
             ))
-        } else if let (true, Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason))) =
-            (admitted, &scope_check)
+        } else if let Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason)) =
+            &scope_check
         {
             Err((
                 crate::agent::ToolResultNotice::ScopeLockBlockedResult {
@@ -364,27 +341,14 @@ impl Agent {
                 .render(),
                 "controller_scope_contract_rejected",
             ))
-        } else if admitted {
+        } else {
             self.sdk_mandate_gate(&ctx, request, arguments)
                 .await
                 .map_err(|refusal| (refusal, "mandate_authority"))
-        } else {
-            Err((
-                format!(
-                    "[AUTHORITY BLOCKED] `{}` is outside what this request allows. Use a \
-                     permitted tool or report the limitation.",
-                    request.name
-                ),
-                "request_authority",
-            ))
         };
         let grant = match gate {
             Ok(grant) => grant,
             Err((refusal, reason_code)) => {
-                if reason_code == "request_authority" && read_only != Some(true) {
-                    self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
-                        .await;
-                }
                 info!(
                     session_id = scope.session_id,
                     task_id = scope.task_id,

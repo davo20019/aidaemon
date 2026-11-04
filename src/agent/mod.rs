@@ -118,6 +118,8 @@ use post_task::LearningContext;
 #[cfg(feature = "computer_use")]
 mod computer_use;
 
+#[path = "runtime/authority.rs"]
+mod authority;
 #[path = "turn/bootstrap/mod.rs"]
 mod bootstrap;
 #[path = "turn/closeout.rs"]

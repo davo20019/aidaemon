@@ -417,6 +417,25 @@ pub struct AppConfig {
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub authority: AuthorityConfig,
+}
+
+/// How much the owner may do by default. Both levels act the same at the
+/// tool gate for now; `unrestricted` will turn off the untrusted-content rule.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerLevel {
+    #[default]
+    Full,
+    Unrestricted,
+}
+
+/// `[authority]`: the explicit facts tool authority is resolved from.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthorityConfig {
+    #[serde(default)]
+    pub owner_default: OwnerLevel,
 }
 
 /// Which long-term memory agent turns use.
@@ -4407,6 +4426,29 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         )
         .unwrap();
         assert!(!config.cli_agents.enabled);
+    }
+
+    #[test]
+    fn authority_owner_default_parses_and_defaults_to_full() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Full);
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+
+            [authority]
+            owner_default = "unrestricted"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Unrestricted);
     }
 
     #[test]

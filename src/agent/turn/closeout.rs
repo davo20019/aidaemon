@@ -3,8 +3,9 @@
 //! is proven. This module owns the admissibility predicate the ledger
 //! arbiter (`RunAggregate::closeout`) is parameterized with.
 //!
-//! Authority (forbids, allowed tools, forbidden scopes) is fail-closed and
-//! contract-owned. Expectations (obligations) are proposals: they may ask the
+//! Authority is the turn's resolved authority (`agent::authority`, see
+//! `ClosingAuthority::from_resolved`), never the assessed contract.
+//! Expectations (obligations) are proposals: they may ask the
 //! loop for more work only when a tool admissible under Authority could
 //! satisfy them. Nothing here reads request wording.
 
@@ -21,7 +22,28 @@ pub(in crate::agent) struct ClosingAuthority<'a> {
     pub owner_control_plane_tools: &'a [String],
 }
 
+impl ClosingAuthority<'static> {
+    /// The turn's resolved authority: read-only forbids mutation, an empty
+    /// tool set forbids tool use. Offered tools were already filtered to the
+    /// authority's tool set, so no allowlist or scope applies here.
+    pub(in crate::agent) fn from_resolved(authority: &aidaemon_core::Authority) -> Self {
+        Self {
+            forbids_tool_use: authority
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.is_empty()),
+            forbids_mutation: authority.level == aidaemon_core::AccessLevel::ReadOnly,
+            allowed_tool_names: &[],
+            forbidden_tool_scopes: &[],
+            owner_control_plane_tools: &[],
+        }
+    }
+}
+
 impl<'a> ClosingAuthority<'a> {
+    /// The assessed contract's authority view. No longer enforced; kept for
+    /// shadow comparison against the resolved authority.
+    #[allow(dead_code)]
     pub(in crate::agent) fn from_authority(authority: RequestAuthority<'a>) -> Self {
         Self {
             forbids_tool_use: authority.forbids_tool_use,
@@ -221,6 +243,24 @@ pub(in crate::agent) fn stop_demand_verdict(
 #[cfg(test)]
 mod stop_demand_tests {
     use super::*;
+
+    /// The resolved authority's level and tool set become the closing view:
+    /// read-only forbids mutation, an empty set forbids tools, nothing else.
+    #[test]
+    fn closing_authority_from_resolved_reads_level_and_tool_set() {
+        let full = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full());
+        assert!(!full.forbids_mutation && !full.forbids_tool_use);
+        assert!(full.admits_tool("write_file", Some(false)));
+
+        let read_only = ClosingAuthority::from_resolved(&aidaemon_core::Authority::read_only());
+        assert!(read_only.forbids_mutation && !read_only.forbids_tool_use);
+        assert!(!read_only.admits_tool("write_file", Some(false)));
+        assert!(read_only.admits_tool("read_file", Some(true)));
+
+        let none = ClosingAuthority::from_resolved(&aidaemon_core::Authority::no_tools());
+        assert!(none.forbids_tool_use);
+        assert!(!none.admits_tool("read_file", Some(true)));
+    }
 
     fn authority<'a>(allowed: &'a [String], control_plane: &'a [String]) -> ClosingAuthority<'a> {
         ClosingAuthority {

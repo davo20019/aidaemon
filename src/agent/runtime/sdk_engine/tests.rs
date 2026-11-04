@@ -846,85 +846,42 @@ impl crate::traits::Tool for ShellProbe {
     }
 }
 
-/// A read-only request must not lose a mixed tool such as `terminal`:
-/// the authority lane judges the exact call.
-#[tokio::test]
-async fn read_only_contract_admits_observing_calls_of_a_mixed_tool() {
-    use crate::runtime_ports::AgentIngress;
-    use crate::testing::MockProvider;
-    let base =
-        MockProvider::semantic_task_assessment("answer", false, true, &[], "new_request", "none");
-    let mut assessment: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["schema_version"] = 10.into();
-    assessment["contract"]["mutation_scope"] = "read_only".into();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("shell_probe", r#"{"write":false}"#),
-        MockProvider::tool_call_response("shell_probe", r#"{"write":true}"#),
-        MockProvider::text_response("acme.md is the markdown file."),
-    ])
-    .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(ShellProbe(calls.clone()))],
-        None,
-    )
-    .await
-    .unwrap();
-    let reply = harness
-        .agent
-        .handle_inbound_message(owner_request("Which file in the folder is markdown?"))
-        .await
-        .unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the observing call runs; the writing call is refused"
+/// A read-only authority must not lose a mixed tool such as `terminal`:
+/// the authority hook judges the exact call. Observing and administrative
+/// (run bookkeeping) calls pass; a writing call is refused. Read-only now
+/// comes from an explicit session mode, not the assessment, so this is
+/// checked on the bridged tool's per-call annotations, which are what the
+/// kernel hands `AuthorityHook`.
+#[test]
+fn read_only_authority_admits_observing_and_administrative_calls_of_a_mixed_tool() {
+    use aidaemon_core::Tool as _;
+    let probe: Arc<dyn crate::traits::Tool> =
+        Arc::new(ShellProbe(Arc::new(std::sync::atomic::AtomicUsize::new(0))));
+    let (calls, _rx) = mpsc::channel(1);
+    let bridged = BridgedTool {
+        spec: tool_spec(probe.as_ref()),
+        tool: probe,
+        goal_actions_only: false,
+        calls,
+    };
+    let authority = sdk::Authority::read_only();
+    let permits = |arguments: serde_json::Value| {
+        authority
+            .permits("shell_probe", bridged.annotations_for(&arguments))
+            .is_ok()
+    };
+    assert!(permits(serde_json::json!({"write": false})), "observation");
+    assert!(
+        permits(serde_json::json!({"admin": true})),
+        "administrative"
     );
-    assert_eq!(reply.text, "acme.md is the markdown file.");
-}
-
-/// Run bookkeeping (`track_requirements`, `report_blocker`) is typed
-/// administrative: it changes no user state, so a read-only request
-/// still admits it while a writing call stays refused.
-#[tokio::test]
-async fn read_only_contract_admits_administrative_calls() {
-    use crate::runtime_ports::AgentIngress;
-    use crate::testing::MockProvider;
-    let base =
-        MockProvider::semantic_task_assessment("answer", false, true, &[], "new_request", "none");
-    let mut assessment: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["schema_version"] = 10.into();
-    assessment["contract"]["mutation_scope"] = "read_only".into();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("shell_probe", r#"{"admin":true}"#),
-        MockProvider::tool_call_response("shell_probe", r#"{"write":true}"#),
-        MockProvider::text_response("Checklist recorded; nothing written."),
-    ])
-    .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(ShellProbe(calls.clone()))],
-        None,
-    )
-    .await
-    .unwrap();
-    let reply = harness
-        .agent
-        .handle_inbound_message(owner_request(
-            "Plan the review of Acme notes; change nothing.",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the administrative call runs; the writing call is refused"
-    );
-    assert_eq!(reply.text, "Checklist recorded; nothing written.");
+    assert!(!permits(serde_json::json!({"write": true})), "mutation");
+    assert!(sdk::Authority::full()
+        .permits(
+            "shell_probe",
+            bridged.annotations_for(&serde_json::json!({"write": true}))
+        )
+        .is_ok());
 }
 
 /// The model cites receipts (mandate `evidence_receipt_ids`) by the

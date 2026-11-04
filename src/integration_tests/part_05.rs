@@ -1362,13 +1362,15 @@ async fn test_failed_mutation_gets_recovery_pass_before_report() {
 }
 
 /// A pre-dispatch denial the contract itself asked for (`non_success_terminal`
-/// receipt, read-only contract) is the terminal evidence. The completion gate
-/// must let the model's typed recovery reply through instead of demanding an
-/// evidence-seeking pass that can never succeed.
+/// receipt; here the scope check refusing a write to protected host data) is
+/// the terminal evidence. The completion gate must let the model's typed
+/// recovery reply through instead of demanding an evidence-seeking pass that
+/// can never succeed.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let target = workspace.path().join("denied.txt").to_string_lossy().to_string();
+    let target = "/etc/aidaemon-synthetic-denied.txt".to_string();
     let cwd = workspace.path().to_string_lossy().to_string();
 
     let base = MockProvider::semantic_task_assessment(
@@ -1381,7 +1383,6 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     );
     let mut assessment: serde_json::Value =
         serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["contract"]["mutation_scope"] = serde_json::json!("read_only");
     assessment["contract"]["evidence_requirements"] = serde_json::json!([{
         "summary": "Complete the exact requested machine invocation",
         "acceptable_scopes": ["local_workspace"],
@@ -1446,7 +1447,7 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
 
     assert!(
         !std::path::Path::new(&target).exists(),
-        "the read-only contract must block the write"
+        "the scope check must block the write"
     );
     assert!(
         response.contains(marker),

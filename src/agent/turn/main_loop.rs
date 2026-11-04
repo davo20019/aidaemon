@@ -25,34 +25,21 @@ struct RequiredContextProjection {
     truncated: bool,
 }
 
-/// Keep only the tool definitions the request's authority offers. A tool the
-/// request names exactly is offered even when its scope is forbidden, the same
-/// "exact beats broad" rule `ClosingAuthority::admits_tool` applies at call
-/// time and at closeout; without it the list hid tools both of those admit, so
-/// closeout could demand work through a tool the model never saw. `scope_of`
-/// resolves a tool's declared scope before the name-based fallback.
-fn retain_offered_tool_definitions(
+/// Keep only the tool definitions the turn's authority admits by name (all
+/// of them when it names no tool set).
+fn retain_authorized_tool_definitions(
     tool_defs: &mut Vec<serde_json::Value>,
-    authority: &crate::agent::completion_contract::RequestAuthority<'_>,
-    scope_of: impl Fn(&str) -> Option<crate::traits::ToolSemanticScope>,
+    authority: &aidaemon_core::Authority,
 ) {
+    let Some(tools) = authority.tools.as_ref() else {
+        return;
+    };
     tool_defs.retain(|definition| {
-        let Some(name) = definition
+        definition
             .get("function")
             .and_then(|function| function.get("name"))
             .and_then(serde_json::Value::as_str)
-        else {
-            return false;
-        };
-        if !authority.offers_tool_name(name) {
-            return false;
-        }
-        let explicitly_allowed = authority
-            .allowed_tool_names
-            .iter()
-            .any(|allowed| allowed == name);
-        explicitly_allowed
-            || scope_of(name).is_none_or(|scope| !authority.forbidden_tool_scopes.contains(&scope))
+            .is_some_and(|name| tools.contains(name))
     });
 }
 
@@ -401,18 +388,6 @@ fn task_assessment_conversation_context(
 
 // impl-Agent justification: handle_message_impl drives the turn lifecycle and owns TurnState construction.
 impl Agent {
-    /// A registered tool's declared scope, else the name-based fallback.
-    fn offered_tool_semantic_scope(&self, name: &str) -> Option<crate::traits::ToolSemanticScope> {
-        self.tools
-            .iter()
-            .find(|tool| tool.name() == name && tool.is_available())
-            .and_then(|tool| {
-                tool.semantic_affordances()
-                    .map(|affordances| affordances.scope)
-            })
-            .or_else(|| super::tool_execution::fallback_tool_semantic_scope(name))
-    }
-
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
     /// `heartbeat` is an optional atomic timestamp updated on each activity point.
@@ -757,24 +732,18 @@ impl Agent {
             )
             .await;
         }
-        if turn_context.completion_contract.forbids_tool_use {
-            tool_defs.clear();
-            let outstanding_needs = turn_context
-                .completion_contract
-                .evidence_requirements
-                .iter()
-                .map(crate::agent::inquiry::describe_requirement)
-                .collect();
-            pending_system_messages.push(
-                SystemDirective::ToolUseForbiddenByRequest { outstanding_needs },
-            );
-        } else {
-            retain_offered_tool_definitions(
-                &mut tool_defs,
-                &turn_context.completion_contract.authority(),
-                |name| self.offered_tool_semantic_scope(name),
-            );
-        }
+        // Tool authority comes from explicit facts, never from the request
+        // assessment: resolved once here, offered as its tool set, enforced
+        // per call by the kernel's `AuthorityHook`.
+        let resolved_authority =
+            crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
+                user_role,
+                owner_default: self.sdk_engine.owner_default,
+                session_mode: None,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                bound_workspace: turn_context.bound_workspace.as_deref(),
+            });
+        retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
         let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(
             &turn_context.completion_contract.evidence_requirements,
         );
@@ -829,21 +798,10 @@ impl Agent {
             )
             .await;
         }
-        // Policy filtering may rebuild definitions from `base_tool_defs`.
-        // Reapply the task's hard capability boundary afterward so an
-        // uncertainty-driven policy refresh cannot widen an allow-only or
-        // denied-scope contract.
-        if turn_context.completion_contract.forbids_tool_use {
-            tool_defs.clear();
-        } else {
-            retain_offered_tool_definitions(
-                &mut tool_defs,
-                &turn_context.completion_contract.authority(),
-                |name| self.offered_tool_semantic_scope(name),
-            );
-        }
-        if !turn_context.completion_contract.forbids_tool_use
-            && !turn_context
+        // Policy filtering may rebuild definitions from `base_tool_defs`;
+        // reapply the authority's tool set so it cannot widen it.
+        retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
+        if !turn_context
             .completion_contract
             .evidence_requirements
             .is_empty()
@@ -1192,7 +1150,7 @@ impl Agent {
                 project_scope: (!turn_context.allow_multi_project_scope)
                     .then(|| turn_context.primary_project_scope.clone())
                     .flatten(),
-                task_access: turn_context.filesystem_access.clone(),
+                authority: resolved_authority,
                 projected_source_message_ids,
                 projected_source_turn_ids,
                 authorized_scopes: {
@@ -1461,7 +1419,6 @@ mod characterization_tests;
 #[cfg(test)]
 mod offered_tool_tests {
     use super::*;
-    use crate::traits::ToolSemanticScope;
 
     fn names(defs: &[Value]) -> Vec<&str> {
         defs.iter()
@@ -1469,49 +1426,31 @@ mod offered_tool_tests {
             .collect()
     }
 
-    /// An exactly named tool beats a forbidden scope in the offered list, as
-    /// it does at the call gate and at closeout; other tools in that scope,
-    /// including one whose scope only its declaration knows, stay hidden.
+    /// The offered list follows the resolved authority's tool set: every
+    /// tool when it names none, only the named ones otherwise, none for an
+    /// empty set.
     #[test]
-    fn exactly_named_tool_is_offered_despite_a_forbidden_scope() {
-        let mut defs: Vec<Value> = ["http_request", "web_fetch", "custom_remote", "read_file"]
+    fn offered_tools_follow_the_resolved_authority_tool_set() {
+        let defs: Vec<Value> = ["http_request", "read_file", "write_file"]
             .iter()
             .map(|name| json!({"function": {"name": name}}))
             .collect();
-        let allowed = vec![
-            "http_request".to_string(),
-            "custom_remote".to_string(),
-            "read_file".to_string(),
-        ];
-        let forbidden = vec![ToolSemanticScope::ExternalRemote];
-        let authority = crate::agent::completion_contract::RequestAuthority {
-            forbids_mutation: false,
-            forbids_tool_use: false,
-            allowed_tool_names: &allowed,
-            forbidden_tool_scopes: &forbidden,
-            owner_control_plane_tools: &[],
-        };
-        retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
-            "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
-            other => super::super::tool_execution::fallback_tool_semantic_scope(other),
-        });
-        assert_eq!(names(&defs), ["http_request", "custom_remote", "read_file"]);
 
-        // Without an allowlist nothing is exact, so the scope rule hides both
-        // remote tools, the declared-only one included.
-        let mut defs: Vec<Value> = ["http_request", "custom_remote", "read_file"]
-            .iter()
-            .map(|name| json!({"function": {"name": name}}))
-            .collect();
-        let authority = crate::agent::completion_contract::RequestAuthority {
-            allowed_tool_names: &[],
-            ..authority
+        let mut all = defs.clone();
+        retain_authorized_tool_definitions(&mut all, &aidaemon_core::Authority::read_only());
+        assert_eq!(names(&all), ["http_request", "read_file", "write_file"]);
+
+        let mut some = defs.clone();
+        let authority = aidaemon_core::Authority {
+            level: aidaemon_core::AccessLevel::Write,
+            tools: Some(["read_file".to_string()].into_iter().collect()),
         };
-        retain_offered_tool_definitions(&mut defs, &authority, |name| match name {
-            "custom_remote" => Some(ToolSemanticScope::ExternalRemote),
-            other => super::super::tool_execution::fallback_tool_semantic_scope(other),
-        });
-        assert_eq!(names(&defs), ["read_file"]);
+        retain_authorized_tool_definitions(&mut some, &authority);
+        assert_eq!(names(&some), ["read_file"]);
+
+        let mut none = defs;
+        retain_authorized_tool_definitions(&mut none, &aidaemon_core::Authority::no_tools());
+        assert!(none.is_empty());
     }
 }
 

@@ -74,30 +74,15 @@ pub(super) fn parse_planned_forbidden_action(value: &str) -> Option<ForbiddenMut
     }
 }
 
-/// The fail-closed half of a compiled contract: what the run may NOT do.
-/// Consumed at admission and by the closeout arbiter's admissibility check.
-/// A gate that decides whether more work may be demanded must not read
-/// anything outside this view except the receipt ledger.
+/// The assessed contract's view of what the run may NOT do. No gate enforces
+/// it any more: tool authority is resolved from explicit facts
+/// (`agent::authority`) and the closeout arbiter reads that.
 pub(crate) struct RequestAuthority<'a> {
     pub forbids_mutation: bool,
     pub forbids_tool_use: bool,
     pub allowed_tool_names: &'a [String],
     pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
     pub owner_control_plane_tools: &'a [String],
-}
-
-impl RequestAuthority<'_> {
-    /// Whether the name-level boundary offers `tool`: no allowlist, an
-    /// allowlisted name, or an owner control-plane tool the runtime kept
-    /// (whose calls the per-call gate narrows further).
-    pub(crate) fn offers_tool_name(&self, tool: &str) -> bool {
-        self.allowed_tool_names.is_empty()
-            || self.allowed_tool_names.iter().any(|name| name == tool)
-            || self
-                .owner_control_plane_tools
-                .iter()
-                .any(|name| name == tool)
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,6 +151,10 @@ impl CompletionContract {
     /// `manage_mandates` for a mandate request). The field stays on the
     /// contract for persistence and logging, but this view exposes no
     /// name-level allowlist (and so no control-plane carve-out either).
+    ///
+    /// No longer enforced: tool authority is resolved from explicit facts
+    /// (`agent::authority`). Kept for shadow comparison with it.
+    #[allow(dead_code)]
     pub(crate) fn authority(&self) -> RequestAuthority<'_> {
         RequestAuthority {
             forbids_mutation: self.forbids_mutation,
@@ -2607,7 +2596,6 @@ mod tests {
             allowed_tool_names: vec!["http_request".to_string()],
             ..CompletionContract::default()
         };
-        assert!(contract.authority().offers_tool_name("manage_mandates"));
         assert!(
             crate::agent::closeout::ClosingAuthority::from_authority(contract.authority())
                 .admits_tool("manage_mandates", Some(false))
