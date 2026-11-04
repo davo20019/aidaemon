@@ -231,6 +231,11 @@ pub trait Tool: Send + Sync {
     /// Annotations for one call. Tools whose effect depends on the arguments
     /// (a shell running `ls` versus `rm`) override this; the default is the
     /// tool-wide [`Tool::annotations`].
+    ///
+    /// [`Tool::annotations`] should be the worst-case (most restrictive)
+    /// value for the tool; this may only relax it for a specific call. The
+    /// result is trusted as given by authority checks and by read-only
+    /// concurrency, so it must be correct for those arguments.
     fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
         self.annotations()
     }

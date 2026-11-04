@@ -9,8 +9,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Safeguard {
-    /// Someone with the right to decide approves calls that act on the
-    /// world (destructive, external, or outside the task's grant).
+    /// Every call stays within the authority explicitly granted by whoever
+    /// owns the agent (owner configuration, role, grants, modes). That grant
+    /// may be full by the owner's choice; approval prompts are one way to
+    /// enforce a narrower grant, not a requirement.
     Authority,
     /// Calls stay inside the paths and resources the task was granted.
     Scope,

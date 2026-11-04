@@ -83,8 +83,10 @@ impl Authority {
     }
 }
 
-/// Enforces an [`Authority`] on every call, and declares
-/// [`Safeguard::Authority`] so the agent builder accepts it.
+/// Enforces the granted [`Authority`] (level and tool set) on every call, and
+/// declares [`Safeguard::Authority`] so the agent builder accepts it. It
+/// never prompts: a composition root that wants approvals for some calls adds
+/// its own hook.
 #[derive(Debug, Clone)]
 pub struct AuthorityHook {
     authority: Authority,
