@@ -283,17 +283,16 @@ pub(in crate::agent) fn access_manifest_scope_check(
     let outside = |candidate: &ToolTargetHint, grants: &[ToolTargetHint]| {
         grants.is_empty() || !covered_by(candidate, grants)
     };
-    // A write-only manifest still implies the ability to observe what the
-    // task may write: a request authorized only to create `/tmp/x/result.txt`
-    // must be able to read it back. When the producer declared explicit read
-    // grants, those remain the exact read authority and a write directory
-    // stays a write-only dropbox. Writes are always checked against write
-    // grants only.
-    let read_authorities = if read_grants.is_empty() {
-        write_grants.clone()
-    } else {
-        read_grants.clone()
-    };
+    // A write grant always implies read-back: a task authorized to create
+    // `/tmp/x/result.txt` must be able to observe it, whether or not the
+    // producer also declared explicit read grants. Read authority is the
+    // union of both; writes are checked against write grants only.
+    let mut read_authorities = read_grants.clone();
+    for grant in &write_grants {
+        if !read_authorities.contains(grant) {
+            read_authorities.push(grant.clone());
+        }
+    }
     let invalid_reads = call
         .read_targets
         .iter()
@@ -1934,7 +1933,7 @@ mod tests {
         );
 
         let read_escape = crate::traits::ToolCallAccessManifest {
-            read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/secret")],
+            read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/elsewhere/secret")],
             ..call
         };
         assert!(access_manifest_scope_violation(
@@ -2076,7 +2075,7 @@ mod tests {
             access_manifest_scope_violation("terminal", &read_back, Some(&task), &[], None)
                 .is_none()
         );
-        // With explicit read grants the write directory stays write-only.
+        // Explicit read grants do not remove the write-implies-read-back grant.
         let explicit_reads = crate::traits::ToolCallAccessManifest {
             read_targets: vec![ToolTargetHint::new(
                 ToolTargetHintKind::Path,
@@ -2092,7 +2091,7 @@ mod tests {
             &[],
             None
         )
-        .is_some());
+        .is_none());
         // The implication is one-way: a read grant never authorizes a write.
         let read_only_task = crate::traits::ToolCallAccessManifest {
             execution_cwd: None,
@@ -2114,6 +2113,45 @@ mod tests {
             None
         )
         .is_some());
+    }
+
+    #[test]
+    fn explicit_read_grants_still_cover_paths_the_task_may_write() {
+        use crate::agent::tool_execution::{access_manifest_scope_check, ScopeCheck};
+        let hint = |kind, value: &str| ToolTargetHint::new(kind, value).expect("target");
+        let task = crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(
+                ToolTargetHintKind::Path,
+                "/tmp/aidaemon-test/data/prices.csv",
+            )],
+            write_targets: vec![hint(
+                ToolTargetHintKind::Path,
+                "/tmp/aidaemon-test/data/avg.txt",
+            )],
+            ..Default::default()
+        };
+        let call = |path: &str| crate::traits::ToolCallAccessManifest {
+            read_targets: vec![hint(ToolTargetHintKind::Path, path)],
+            ..Default::default()
+        };
+        assert!(access_manifest_scope_check(
+            "read_file",
+            &call("/tmp/aidaemon-test/data/avg.txt"),
+            Some(&task),
+            &[],
+            None
+        )
+        .is_none());
+        assert!(matches!(
+            access_manifest_scope_check(
+                "read_file",
+                &call("/tmp/aidaemon-test/data/other.txt"),
+                Some(&task),
+                &[],
+                None
+            ),
+            Some(ScopeCheck::Rejected(_))
+        ));
     }
 
     #[test]
@@ -2141,11 +2179,13 @@ mod tests {
         });
         let stripped =
             attenuate_unauthorized_read_roots(&mut arguments, Some(&task), &[], Some("/tmp"));
+        // The write root is itself readable (write implies read-back), so only
+        // the broader `/tmp` root is stripped.
+        assert_eq!(stripped, vec!["/tmp".to_string()]);
         assert_eq!(
-            stripped,
-            vec!["/tmp".to_string(), "/tmp/synthetic-out".to_string()]
+            arguments["read_roots"],
+            serde_json::json!(["/tmp/synthetic-out"])
         );
-        assert_eq!(arguments["read_roots"], serde_json::json!([]));
         // Exact reads and write roots are untouched: the capability check
         // still evaluates them.
         assert_eq!(
