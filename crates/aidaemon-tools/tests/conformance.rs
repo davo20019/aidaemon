@@ -32,8 +32,8 @@ fn bundled_tools_pass_the_tool_kit() {
         all.merge(report);
     }
     all.assert_all_passed();
-    // 8 tool instances x 10 checks each.
-    assert_eq!(all.passed.len(), tools.len() * 10, "{all}");
+    // Every tool instance runs all 11 checks of the tool kit.
+    assert_eq!(all.passed.len(), tools.len() * 11, "{all}");
 }
 
 #[test]
