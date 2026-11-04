@@ -22,3 +22,4 @@ include!("integration_tests/live_status_surface.rs");
 include!("integration_tests/live_sdk_turns.rs");
 include!("integration_tests/part_17_mid_turn_steering.rs");
 include!("integration_tests/part_18_explicit_authority.rs");
+include!("integration_tests/part_19_untrusted_content.rs");
