@@ -587,6 +587,46 @@ pub(super) fn classify_tool_result_failure_with_args(
     classify_http_status(hinted_status)
 }
 
+/// Whether a command tool call runs a test runner, judged by the parsed
+/// program and subcommand of each shell invocation (nested `sh -c` included),
+/// never by a substring of the arguments: `curl …/latest` is not a test run.
+fn invokes_test_runner(args_json: &str) -> bool {
+    let Some(command) = extract_command_from_args(args_json) else {
+        return false;
+    };
+    crate::tools::command_risk::structural_shell_invocations(&command)
+        .iter()
+        .any(|invocation| {
+            let program = std::path::Path::new(&invocation.program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&invocation.program);
+            let args: Vec<&str> = invocation.arguments.iter().map(String::as_str).collect();
+            let subcommand = args.iter().find(|arg| !arg.starts_with('-')).copied();
+            match program {
+                "pytest" | "py.test" | "jest" | "vitest" | "mocha" | "rspec" | "phpunit"
+                | "tox" | "nox" | "ctest" | "bats" | "cargo-nextest" => true,
+                "cargo" => matches!(subcommand, Some("test" | "nextest")),
+                "go" | "bun" | "deno" | "dotnet" | "mvn" | "gradle" | "gradlew" | "swift"
+                | "mix" | "zig" => subcommand == Some("test"),
+                "npm" | "yarn" | "pnpm" => match subcommand {
+                    Some("test" | "t") => true,
+                    Some("run") => args
+                        .iter()
+                        .skip_while(|arg| **arg != "run")
+                        .nth(1)
+                        .is_some_and(|script| script.split(':').next() == Some("test")),
+                    _ => false,
+                },
+                "make" => args.iter().any(|arg| arg.split(':').next() == Some("test")),
+                "python" | "python3" => args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-m" && matches!(pair[1], "pytest" | "unittest")),
+                _ => false,
+            }
+        })
+}
+
 pub(super) fn classify_tool_result_failure_with_context(
     tool_name: &str,
     result_text: &str,
@@ -646,22 +686,7 @@ pub(super) fn classify_tool_result_failure_with_context(
                 // Test runners exit non-zero when tests fail — that's expected
                 // informational output, not a tool failure.  Let the LLM read
                 // and interpret the test results instead of entering a repair loop.
-                let is_test_runner = tool_arguments.is_some_and(|args| {
-                    let lower = args.to_ascii_lowercase();
-                    lower.contains("test")
-                        || lower.contains("pytest")
-                        || lower.contains("jest")
-                        || lower.contains("mocha")
-                        || lower.contains("rspec")
-                        || lower.contains("cargo test")
-                        || lower.contains("go test")
-                        || lower.contains("phpunit")
-                        || lower.contains("unittest")
-                        || lower.contains("npm run test")
-                        || lower.contains("yarn test")
-                        || lower.contains("make test")
-                });
-                if !is_test_runner {
+                if !tool_arguments.is_some_and(invokes_test_runner) {
                     return Some(ToolFailureClass::Semantic);
                 }
                 // Test runner with failures: not an error, let LLM interpret
@@ -1111,6 +1136,50 @@ mod tool_error_detection_tests {
         );
         assert!(!status.satisfies_requested_condition());
         assert!(!status.is_failure());
+    }
+
+    #[test]
+    fn test_runner_is_recognized_by_command_structure() {
+        for command in [
+            "pytest -q",
+            "cd app && npm run test:unit",
+            "bash -c 'python3 -m pytest tests/'",
+            "cargo nextest run",
+            "make test",
+            "yarn test --watch=false",
+        ] {
+            assert!(
+                super::invokes_test_runner(&serde_json::json!({ "command": command }).to_string()),
+                "{command} runs tests"
+            );
+        }
+        for command in [
+            "curl -fsS https://example.com/releases/latest",
+            "cat contest_results.txt",
+            "grep -r test src/",
+            "ls tests/",
+            "npm run build",
+        ] {
+            assert!(
+                !super::invokes_test_runner(&serde_json::json!({ "command": command }).to_string()),
+                "{command} does not run tests"
+            );
+        }
+    }
+
+    #[test]
+    fn failing_command_mentioning_test_in_an_argument_is_a_failure() {
+        let metadata = crate::traits::ToolCallMetadata {
+            exit_code: Some(22),
+            ..Default::default()
+        };
+        let status = super::classify_tool_outcome_status(
+            "terminal",
+            "curl: (22) The requested URL returned error: 404",
+            Some(r#"{"command":"curl -fsS https://example.com/releases/latest"}"#),
+            Some(&metadata),
+        );
+        assert!(status.is_failure(), "got {status:?}");
     }
 
     #[test]
