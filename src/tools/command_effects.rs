@@ -156,11 +156,160 @@ pub(crate) fn fetches_network(command: &str) -> bool {
     })
 }
 
-/// Whether writing `path` can plant git configuration (a `.git` component,
-/// `.gitattributes`, or `.gitmodules`). A structural path fact.
+/// Whether writing `path` can plant git configuration. A structural path
+/// fact, deliberately over-reporting:
+/// - a `.git`, `.gitattributes` or `.gitmodules` component, or a `.gitconfig`
+///   file name, compared ASCII-case-insensitively (APFS and NTFS fold case)
+///   after stripping trailing dots and spaces (Windows drops them);
+/// - global and system configuration: `~/.config/git/**`,
+///   `$XDG_CONFIG_HOME/git/**`, `/etc/gitconfig`, and any `.config/git`
+///   component pair (relative paths may resolve under the home directory).
+///
+/// `~`, `$HOME` and `${HOME}` prefixes are expanded and `.`/`..` are
+/// normalized lexically before the global checks.
 pub(crate) fn is_git_config_path(path: &str) -> bool {
+    let raw = path_components(path);
+    if raw.iter().any(|part| is_repo_config_component(part)) {
+        return true;
+    }
+    let expanded = expand_home(path);
+    let normalized = normalize_components(&path_components(&expanded));
+    if normalized.iter().any(|part| is_repo_config_component(part))
+        || normalized.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case(".config") && pair[1].eq_ignore_ascii_case("git")
+        })
+    {
+        return true;
+    }
+    let absolute = expanded.starts_with('/') || expanded.starts_with('\\');
+    if absolute
+        && normalized.len() == 2
+        && normalized[0].eq_ignore_ascii_case("etc")
+        && normalized[1].eq_ignore_ascii_case("gitconfig")
+    {
+        return true;
+    }
+    let under = |base: std::path::PathBuf| {
+        let base = normalize_components(&path_components(&base.to_string_lossy()));
+        absolute
+            && !base.is_empty()
+            && normalized.len() > base.len()
+            && normalized
+                .iter()
+                .zip(&base)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    if dirs::home_dir().is_some_and(|home| under(home.join(".config").join("git"))) {
+        return true;
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .is_some_and(|xdg| under(std::path::PathBuf::from(xdg).join("git")))
+}
+
+/// Components of `path` with Windows-insignificant trailing dots and spaces
+/// removed (`.` and `..` are kept as-is).
+fn path_components(path: &str) -> Vec<String> {
     path.split(['/', '\\'])
-        .any(|part| matches!(part, ".git" | ".gitattributes" | ".gitmodules"))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part == "." || part == ".." {
+                part.to_string()
+            } else {
+                part.trim_end_matches(['.', ' ']).to_string()
+            }
+        })
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn normalize_components(parts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        match part.as_str() {
+            "." => {}
+            ".." => {
+                if out.last().is_some_and(|last| last != "..") {
+                    out.pop();
+                } else {
+                    out.push(part.clone());
+                }
+            }
+            _ => out.push(part.clone()),
+        }
+    }
+    out
+}
+
+fn is_repo_config_component(part: &str) -> bool {
+    [".git", ".gitattributes", ".gitmodules", ".gitconfig"]
+        .iter()
+        .any(|name| part.eq_ignore_ascii_case(name))
+}
+
+fn expand_home(path: &str) -> String {
+    let rest = ["~", "$HOME", "${HOME}"].iter().find_map(|prefix| {
+        path.strip_prefix(prefix)
+            .filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+    });
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => format!("{}{rest}", home.to_string_lossy()),
+        _ => path.to_string(),
+    }
+}
+
+/// Whether the directory `root` (home-expanded, resolved against `base` when
+/// relative) holds a `.git` entry directly inside it, so a write anywhere
+/// under it can plant repository configuration.
+pub(crate) fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
+    let root = root.trim();
+    if root.is_empty() {
+        return false;
+    }
+    let mut path = std::path::PathBuf::from(expand_home(root));
+    if path.is_relative() {
+        if let Some(base) = base.map(str::trim).filter(|base| !base.is_empty()) {
+            path = std::path::PathBuf::from(expand_home(base)).join(path);
+        }
+    }
+    path.join(".git").exists()
+}
+
+/// Whether any shell word of `command` (including redirect targets,
+/// `--opt=value` operands, substitution bodies and nested `sh -c` scripts)
+/// names a git configuration path per `is_git_config_path`.
+pub(crate) fn command_names_git_config_path(command: &str) -> bool {
+    names_git_config(command, 0)
+}
+
+fn names_git_config(command: &str, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let scanned = scan(command);
+    for segment in &scanned.segments {
+        let words = shell_words::split(segment)
+            .unwrap_or_else(|_| segment.split_whitespace().map(str::to_string).collect());
+        for word in words {
+            let target = word.trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, '>' | '<' | '&' | '|')
+            });
+            let operand = word.split_once('=').map(|(_, value)| value);
+            if [Some(word.as_str()), Some(target), operand]
+                .into_iter()
+                .flatten()
+                .any(|candidate| !candidate.is_empty() && is_git_config_path(candidate))
+            {
+                return true;
+            }
+            if word.contains(char::is_whitespace) && names_git_config(&word, depth + 1) {
+                return true;
+            }
+        }
+    }
+    substitution_bodies(command)
+        .iter()
+        .any(|body| names_git_config(body, depth + 1))
 }
 
 pub(crate) fn command_effects(command: &str) -> CommandEffects {
@@ -778,6 +927,63 @@ mod tests {
             "/repo/gitattributes",
         ] {
             assert!(!is_git_config_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn git_config_path_detection_is_case_insensitive_and_global() {
+        for path in [
+            ".GIT/config",
+            "repo/.Git/config",
+            "repo/.GITATTRIBUTES",
+            "repo/.GITMODULES",
+            "repo/.git./config",
+            "repo/.git /config",
+            "./repo/x/../.git/config",
+            "~/.gitconfig",
+            "$HOME/.gitconfig",
+            "${HOME}/.gitconfig",
+            "~/.config/git/attributes",
+            "~/.config/git/config",
+            "~/.config/../.config/git/ignore",
+            "/etc/gitconfig",
+            "/etc/./gitconfig",
+            "/srv/user/.GITCONFIG",
+        ] {
+            assert!(is_git_config_path(path), "{path}");
+        }
+        if let Some(home) = dirs::home_dir() {
+            let absolute = home.join(".config").join("git").join("attributes");
+            assert!(is_git_config_path(&absolute.to_string_lossy()));
+        }
+        // `.gitignore` and `.github` are ordinary project files.
+        for path in [
+            "repo/src/git.rs",
+            "repo/.github/workflows/x.yml",
+            "repo/.gitignore",
+            "repo/.GITHUB/x.yml",
+            "/etc/gitconfig.d/x",
+            "repo/config/git.toml",
+        ] {
+            assert!(!is_git_config_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn command_words_naming_git_config_are_detected() {
+        for command in [
+            "cp x ~/.gitconfig",
+            "echo x > ~/.gitconfig",
+            "echo x >>.git/config",
+            "git config --file=$HOME/.gitconfig a.b c",
+            "sh -c 'cp x .GIT/hooks/pre-commit'",
+            "echo \"$(cp x /etc/gitconfig)\"",
+            "cp x \"repo/.gitattributes\"",
+        ] {
+            assert!(command_names_git_config_path(command), "{command}");
+        }
+        for command in ["cp x y", "cat .gitignore", "ls .github", "git status"] {
+            assert!(!command_names_git_config_path(command), "{command}");
         }
     }
 

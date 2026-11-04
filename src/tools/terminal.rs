@@ -7310,12 +7310,20 @@ fn terminal_run_annotations(
         .chain(args.write_roots.iter())
         .any(|path| !path.trim().is_empty());
     let read_only = !has_write_targets && !args.network && effects.observation_only;
-    // Writing into git configuration changes what later git commands run.
+    // Writing into git configuration changes what later git commands run:
+    // a declared target that is git configuration, a declared root holding a
+    // repository, or a command word naming git configuration.
     let plants_git_config = args
         .write_paths
         .iter()
         .chain(args.write_roots.iter())
-        .any(|path| crate::tools::command_effects::is_git_config_path(path));
+        .any(|path| crate::tools::command_effects::is_git_config_path(path))
+        || args.write_roots.iter().any(|root| {
+            crate::tools::command_effects::root_holds_repository(root, args.working_dir.as_deref())
+        })
+        // An observation-only command cannot write by construction.
+        || (!effects.observation_only
+            && crate::tools::command_effects::command_names_git_config_path(text));
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
@@ -9545,6 +9553,83 @@ mod tests {
             "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/x"]
         }));
         assert!(!plain.egress);
+    }
+
+    #[tokio::test]
+    async fn terminal_write_root_containing_a_repo_is_egress() {
+        let dir = std::env::temp_dir()
+            .join("aidaemon-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        let repo = dir.join("repo");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |command: &str, root: &std::path::Path| {
+            tool.call_annotations(
+                &serde_json::json!({
+                    "action":"run","command":command,
+                    "write_roots":[root.to_string_lossy()]
+                })
+                .to_string(),
+            )
+        };
+        let planted = ann("cp x .git/config", &repo);
+        assert!(planted.egress && !planted.read_only);
+        // The command never names `.git`; the root itself holds a repository.
+        let copied = ann("cp -R payload/. .", &repo);
+        assert!(copied.egress && !copied.read_only);
+        let ordinary = ann("cp -R payload/. .", &plain);
+        assert!(!ordinary.egress);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_command_naming_git_config_is_egress() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |args: serde_json::Value| tool.call_annotations(&args.to_string());
+        let global = ann(serde_json::json!({"action":"run","command":"cp x ~/.gitconfig"}));
+        assert!(global.egress && !global.read_only);
+        let declared = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["~/.config/git/attributes"]
+        }));
+        assert!(declared.egress);
+        let cased = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.GIT/config"]
+        }));
+        assert!(cased.egress);
+        let plain = ann(serde_json::json!({"action":"run","command":"cp x y"}));
+        assert!(!plain.egress);
+        let reading = ann(serde_json::json!({"action":"run","command":"cat .git/config"}));
+        assert!(reading.read_only && !reading.egress);
     }
 
     #[tokio::test]
