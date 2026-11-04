@@ -1199,7 +1199,7 @@ impl Agent {
                         .and_then(|access| access.execution_cwd.clone())
                         .or_else(|| turn_context.primary_project_scope.clone())
                 },
-                bound_workspace: turn_context.bound_workspace.clone(),
+                explicit_workspace: turn_context.explicit_workspace().map(str::to_string),
                 project_scope: (!turn_context.allow_multi_project_scope)
                     .then(|| turn_context.primary_project_scope.clone())
                     .flatten(),

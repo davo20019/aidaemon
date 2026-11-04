@@ -525,6 +525,17 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
 /// written by `scheduled_goal_runs bind_workspace` or an earlier recovery).
 /// Typed durable state: it must be an existing absolute directory. This
 /// binding outranks anything inferred from mission or request text.
+/// Where a turn's workspace binding came from. Only an `Explicit` binding
+/// (the goal's `bind_workspace` action, written to `goal.context`) vouches
+/// for the files under it; an `Inferred` one (a scope a parent handed down,
+/// one resolved from mission or request text, an attempt workspace) still
+/// steers where tools run but is never a trusted root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceBindingOrigin {
+    Explicit,
+    Inferred,
+}
+
 pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
     typed_workspace_binding(value.get("project_scope")?.as_str())

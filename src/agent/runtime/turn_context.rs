@@ -44,6 +44,9 @@ pub(super) struct TurnContext {
     /// reference in the request and is the filesystem authority boundary the
     /// compiled access manifest may attenuate within but never relocate.
     pub bound_workspace: Option<String>,
+    /// Where `bound_workspace` came from: only an explicit binding is a
+    /// trusted root (`explicit_workspace`).
+    pub bound_workspace_origin: Option<super::project_scope::WorkspaceBindingOrigin>,
     pub primary_project_scope: Option<String>,
     /// Exact path authorities named by the current request (or inherited from
     /// its structurally-linked open request). Unlike `primary_project_scope`,
@@ -69,6 +72,17 @@ pub(super) struct TurnContext {
     /// from a completed antecedent whose durable safety constraints alone may
     /// carry into a related turn.
     pub inherited_outstanding_obligations: bool,
+}
+
+impl TurnContext {
+    /// The workspace binding that vouches for its files: the bound
+    /// workspace, only when it was bound explicitly.
+    pub(in crate::agent) fn explicit_workspace(&self) -> Option<&str> {
+        (self.bound_workspace_origin
+            == Some(super::project_scope::WorkspaceBindingOrigin::Explicit))
+        .then_some(self.bound_workspace.as_deref())
+        .flatten()
+    }
 }
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
@@ -459,9 +473,16 @@ impl Agent {
         } else {
             None
         };
-        let bound_workspace = bound_goal_scope.or_else(|| {
-            super::project_scope::typed_workspace_binding(self.inherited_project_scope.as_deref())
-        });
+        use super::project_scope::WorkspaceBindingOrigin;
+        let (bound_workspace, bound_workspace_origin) = match bound_goal_scope {
+            Some(scope) => (Some(scope), Some(WorkspaceBindingOrigin::Explicit)),
+            None => match super::project_scope::typed_workspace_binding(
+                self.inherited_project_scope.as_deref(),
+            ) {
+                Some(scope) => (Some(scope), Some(WorkspaceBindingOrigin::Inferred)),
+                None => (None, None),
+            },
+        };
         let workspace_anchor = bound_workspace.as_deref().map(std::path::Path::new);
 
         // For the current user message, only extract explicit filesystem paths
@@ -607,6 +628,7 @@ impl Agent {
             ),
             visible_antecedent_user_message_id: None,
             bound_workspace,
+            bound_workspace_origin,
             primary_project_scope,
             authorized_project_scopes,
             filesystem_access: None,
@@ -1396,6 +1418,11 @@ mod tests {
             "typed goal workspace binding must be the authoritative scope"
         );
         assert_eq!(
+            turn_context.explicit_workspace(),
+            Some(workspace_path.as_str()),
+            "a goal's bind_workspace binding is explicit"
+        );
+        assert_eq!(
             turn_context.authorized_project_scopes,
             vec![workspace_path.clone()],
             "text-extracted paths outside the binding are not authorized"
@@ -1512,6 +1539,11 @@ mod tests {
                 turn_context.bound_workspace.as_deref(),
                 Some(workspace_path.as_str()),
                 "{handoff}"
+            );
+            assert_eq!(
+                turn_context.explicit_workspace(),
+                None,
+                "a workspace a parent handed down is inferred: {handoff}"
             );
             assert_eq!(
                 turn_context.primary_project_scope.as_deref(),

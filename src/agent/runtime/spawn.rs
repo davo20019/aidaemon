@@ -2036,10 +2036,14 @@ impl Agent {
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
         user_role: UserRole,
         channel_ctx: &ChannelContext,
+        goal_id: Option<&str>,
     ) -> crate::agent::authority::InheritedAuthority {
         match parent_authority {
             Some(parent) => parent,
-            None => self.authority_for_child(user_role, channel_ctx).await,
+            None => {
+                self.authority_for_child(user_role, channel_ctx, goal_id)
+                    .await
+            }
         }
     }
 
@@ -2055,8 +2059,42 @@ impl Agent {
         &self,
         user_role: UserRole,
         channel_ctx: &ChannelContext,
+        goal_id: Option<&str>,
     ) -> crate::agent::authority::InheritedAuthority {
         let inherited = self.inherited_authority.as_ref();
+        // Inside a chain the child receives what the chain trusted. A root
+        // dispatch computes its roots from explicit sources only: owner
+        // config, the execution workspace, and the goal's own
+        // `bind_workspace` binding (never the dispatch scope, which may be
+        // inferred from the mission).
+        let trusted_roots = match inherited {
+            Some(inherited) => inherited.trusted_roots.clone(),
+            None => {
+                let goal_binding = match goal_id {
+                    Some(goal_id) => {
+                        self.state
+                            .get_goal(goal_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|goal| {
+                                super::project_scope::bound_workspace_from_goal_context(
+                                    goal.context.as_deref(),
+                                )
+                            })
+                    }
+                    None => None,
+                };
+                let configured = self.configured_trust_roots();
+                let cwd = super::sdk_engine::turn_cwd();
+                super::sdk_engine::turn_trust_roots(super::sdk_engine::TrustRootSources {
+                    configured: &configured,
+                    cwd: Some(&cwd),
+                    bound_workspace: goal_binding.as_deref(),
+                    ..Default::default()
+                })
+            }
+        };
         let mode_session = inherited.and_then(|inherited| inherited.mode_session.clone());
         let session_mode = match mode_session.as_deref() {
             Some(mode_session) => {
@@ -2090,7 +2128,7 @@ impl Agent {
             origin_request: inherited.and_then(|inherited| inherited.origin_request.clone()),
             // Without a parent constraint the child's own facts decide.
             origin_trusted: inherited.is_none_or(|inherited| inherited.origin_trusted),
-            trusted_roots: inherited.and_then(|inherited| inherited.trusted_roots.clone()),
+            trusted_roots,
         }
     }
 
@@ -2384,7 +2422,12 @@ impl Agent {
             None
         };
         let parent_authority = self
-            .inherited_for_child(parent_authority, user_role, &channel_ctx)
+            .inherited_for_child(
+                parent_authority,
+                user_role,
+                &channel_ctx,
+                goal_id.as_deref(),
+            )
             .await;
         let child = self
             .create_child_agent(

@@ -372,7 +372,7 @@ impl Agent {
                     .collect(),
             ),
             origin_trusted: scope.origin_trusted,
-            trusted_roots: Some(scope.trust_roots.clone()),
+            trusted_roots: scope.trust_roots.clone(),
         }
     }
 

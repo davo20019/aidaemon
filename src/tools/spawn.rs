@@ -1102,7 +1102,7 @@ mod tests {
             untrusted_context: true,
             origin_request: Some("Summarize the synthetic notes.".to_string()),
             origin_trusted: true,
-            trusted_roots: None,
+            trusted_roots: Vec::new(),
         };
         let json = serde_json::json!({
             "mission": "test",

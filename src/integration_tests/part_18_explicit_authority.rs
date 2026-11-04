@@ -673,7 +673,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
 
     // Goal dispatch from the root ignores the chat's /readonly.
     let dispatched = agent
-        .authority_for_child(UserRole::Owner, &ctx)
+        .authority_for_child(UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(dispatched.authority, Authority::full());
     assert_eq!(dispatched.mode_session, None);
@@ -690,7 +690,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         untrusted_context: false,
         origin_request: None,
         origin_trusted: true,
-        trusted_roots: None,
+        trusted_roots: Vec::new(),
     });
     assert_eq!(child.mode_session_for("sub_agent_synthetic_unit"), session);
     let ceiling = crate::agent::authority::SessionModeCeiling::new(
@@ -709,10 +709,10 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         untrusted_context: false,
         origin_request: None,
         origin_trusted: true,
-        trusted_roots: None,
+        trusted_roots: Vec::new(),
     });
     let grandchild = child
-        .authority_for_child(UserRole::Owner, &ctx)
+        .authority_for_child(UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(grandchild.authority, Authority::read_only());
     assert_eq!(grandchild.mode_session.as_deref(), Some(session));
@@ -1051,7 +1051,7 @@ async fn readonly_reaches_a_running_child_through_its_parent_chat() {
             untrusted_context: false,
             origin_request: Some("Write the child note.".to_string()),
             origin_trusted: true,
-            trusted_roots: None,
+            trusted_roots: Vec::new(),
         });
     assert_eq!(harness.agent.mode_session_for(child_session), parent);
     let ceiling = crate::agent::authority::SessionModeCeiling::new(
@@ -1220,14 +1220,14 @@ async fn spawn_uses_the_parent_turns_authority_not_a_re_resolution() {
     assert_eq!(
         harness
             .agent
-            .inherited_for_child(None, UserRole::Owner, &ctx)
+            .inherited_for_child(None, UserRole::Owner, &ctx, None)
             .await
             .authority,
         Authority::full()
     );
     let child = harness
         .agent
-        .inherited_for_child(Some(parent.clone()), UserRole::Owner, &ctx)
+        .inherited_for_child(Some(parent.clone()), UserRole::Owner, &ctx, None)
         .await;
     assert_eq!(child, parent);
     assert_eq!(child.authority, Authority::read_only());
@@ -1264,6 +1264,7 @@ async fn a_model_cannot_spoof_parent_authority() {
             Some(parent),
             UserRole::Owner,
             &ChannelContext::private("telegram"),
+            None,
         )
         .await;
     assert_eq!(child.authority, Authority::read_only());
@@ -1436,5 +1437,70 @@ async fn replayed_call_is_not_counted_as_would_refuse() {
             .count(),
         1,
         "{points:?}"
+    );
+}
+
+/// The real spawn path hands the child the parent turn's trusted roots, and
+/// a folder the parent's request named (handed down as the child's
+/// `_project_scope`) is not among them.
+#[tokio::test]
+async fn the_created_child_receives_the_parent_turns_trusted_roots() {
+    let named = tempfile::tempdir().unwrap();
+    let named_dir = named.path().join("notes");
+    std::fs::create_dir_all(&named_dir).unwrap();
+    let request = format!(
+        "Have a helper summarize {}/today.md for {}.",
+        named_dir.display(),
+        uuid::Uuid::new_v4()
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "spawn_agent",
+            &json!({"mission": "Summarize", "task": "Summarize the notes."}).to_string(),
+        ),
+        MockProvider::text_response("Child summary."),
+        MockProvider::text_response("Delegated."),
+    ]);
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> =
+        vec![Arc::new(OfferedSpawnAgent(spawn_tool.clone()))];
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
+
+    agent
+        .handle_message(
+            "tg_authority_child_roots",
+            &request,
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let created: Vec<_> = crate::agent::authority::CREATED_CHILD_INHERITANCE
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|inherited| inherited.origin_request.as_deref() == Some(request.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(created.len(), 1, "one child carries this turn's request");
+    let roots = &created[0].trusted_roots;
+    let cwd = crate::execution::active_execution_backend()
+        .workspace_root()
+        .as_str()
+        .to_string();
+    assert!(roots.contains(&cwd), "{roots:?}");
+    let within = crate::traits::TrustRoots::new(roots);
+    assert!(
+        !within.contains(&named_dir.join("today.md").to_string_lossy()),
+        "{roots:?}"
     );
 }

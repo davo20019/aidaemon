@@ -91,6 +91,33 @@ fn bound_project_scope_from_context(context: Option<&str>) -> Option<String> {
     super::project_scope::bound_workspace_from_goal_context(context)
 }
 
+/// A scope an earlier recovery carried without a binding behind it
+/// (`context.inferred_project_scope`): it steers where the run works, and is
+/// never read as a binding.
+fn inferred_project_scope_from_context(context: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
+    super::project_scope::typed_workspace_binding(value.get("inferred_project_scope")?.as_str())
+}
+
+/// The context of a terminal-recovery task. The run's binding stays under
+/// `project_scope`, which the next dispatch reads as a binding; a dispatch
+/// scope with no binding behind it goes under `inferred_project_scope`.
+fn recovery_task_context(
+    goal_run_id: Option<&str>,
+    bound_scope: Option<&str>,
+    dispatch_scope: Option<&str>,
+    prior_report: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "recovery_for_run": goal_run_id,
+        "terminal_recovery": true,
+        "project_scope": bound_scope,
+        "inferred_project_scope": dispatch_scope.filter(|scope| Some(*scope) != bound_scope),
+        "prior_report": prior_report.map(|report| report.chars().take(2000).collect::<String>()),
+    })
+    .to_string()
+}
+
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
     let mut scopes = Vec::new();
     super::project_scope::extract_explicit_path_scopes_from_text(
@@ -1185,8 +1212,15 @@ pub fn spawn_background_task_lead(
                 } else {
                     None
                 };
-            let dispatch_project_scope =
-                bound_project_scope_from_context(trigger_task_context.as_deref()).or_else(|| {
+            // Only a binding is saved back as one: a scope inferred from the
+            // mission (or carried by an earlier recovery) steers where the
+            // run works but is never promoted to `project_scope`.
+            let bound_dispatch_scope =
+                bound_project_scope_from_context(trigger_task_context.as_deref());
+            let dispatch_project_scope = bound_dispatch_scope
+                .clone()
+                .or_else(|| inferred_project_scope_from_context(trigger_task_context.as_deref()))
+                .or_else(|| {
                     resolve_dispatch_project_scope(
                         &mission,
                         &effective_alias_roots(&agent.path_aliases.projects),
@@ -2780,17 +2814,12 @@ pub fn spawn_background_task_lead(
                     parallel_group: None,
                     depends_on: None,
                     agent_id: None,
-                    context: Some(
-                        serde_json::json!({
-                            "recovery_for_run": goal_run_id.as_deref(),
-                            "terminal_recovery": true,
-                            "project_scope": dispatch_project_scope.as_deref(),
-                            "prior_report": task_lead_response.as_deref().map(|report| {
-                                report.chars().take(2000).collect::<String>()
-                            }),
-                        })
-                        .to_string(),
-                    ),
+                    context: Some(recovery_task_context(
+                        goal_run_id.as_deref(),
+                        bound_dispatch_scope.as_deref(),
+                        dispatch_project_scope.as_deref(),
+                        task_lead_response.as_deref(),
+                    )),
                     result: None,
                     error: None,
                     blocker: None,
@@ -4198,6 +4227,25 @@ mod tests {
         assert_eq!(bound_project_scope_from_context(Some(&relative)), None);
         assert_eq!(bound_project_scope_from_context(Some("not json")), None);
         assert_eq!(bound_project_scope_from_context(None), None);
+    }
+
+    #[test]
+    fn recovery_does_not_promote_an_inferred_scope_to_a_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let inferred = dir.path().to_string_lossy().into_owned();
+        let context = recovery_task_context(Some("run-1"), None, Some(&inferred), Some("report"));
+        assert_eq!(bound_project_scope_from_context(Some(&context)), None);
+        assert_eq!(
+            inferred_project_scope_from_context(Some(&context)),
+            Some(inferred.clone())
+        );
+        // A real binding is carried as one.
+        let context = recovery_task_context(None, Some(&inferred), Some(&inferred), None);
+        assert_eq!(
+            bound_project_scope_from_context(Some(&context)),
+            Some(inferred.clone())
+        );
+        assert_eq!(inferred_project_scope_from_context(Some(&context)), None);
     }
 
     #[test]

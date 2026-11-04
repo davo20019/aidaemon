@@ -1878,11 +1878,13 @@ fn read_trust(roots: &[String], path: &std::path::Path) -> aidaemon_core::Source
     crate::tools::ReadFileTool.output_trust(&args, &TrustRoots::new(roots))
 }
 
-/// Trusted roots come only from explicit grants. Every source is listed
-/// here without `..`: a new field (say, a scope inferred from the request)
-/// fails to compile until this test, and the rule, are revisited.
+/// The list of trust-root sources is closed: every field is named here
+/// without `..`, so adding a source fails to compile until this test and
+/// the explicit-only rule are revisited. It checks the struct's fields, not
+/// what callers pass into them; `TurnContext::explicit_workspace` (tested in
+/// turn_context.rs) and the goal-dispatch tests below guard the values.
 #[test]
-fn trust_roots_have_no_inferred_source() {
+fn trust_root_sources_are_a_closed_list() {
     let super::TrustRootSources {
         configured: _,
         cwd: _,
@@ -1986,9 +1988,8 @@ fn broad_grants_are_not_trusted_roots() {
     }
 }
 
-/// A child trusts only what its parent turn trusted: a workspace the parent
-/// handed down from an inferred scope (the child's `bound_workspace`) adds
-/// nothing the parent lacked; one inside the parent's roots stays.
+/// A child receives its parent turn's roots and trusts nothing outside them:
+/// a source of its own outside the parent's adds nothing; one inside stays.
 #[test]
 fn a_child_never_gains_trusted_roots_its_parent_lacked() {
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
@@ -2007,7 +2008,13 @@ fn a_child_never_gains_trusted_roots_its_parent_lacked() {
         parent_roots: Some(&parent),
         ..Default::default()
     });
-    assert_eq!(roots, vec!["/tmp/aidaemon-test/ws/sub".to_string()]);
+    assert_eq!(
+        roots,
+        vec![
+            "/tmp/aidaemon-test/ws".to_string(),
+            "/tmp/aidaemon-test/ws/sub".to_string()
+        ]
+    );
     let inside = std::path::Path::new("/tmp/aidaemon-test/ws/sub/x.md");
     assert_eq!(read_trust(&roots, inside), Trusted);
     // A parent that trusted nothing hands down nothing.
@@ -2933,7 +2940,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             untrusted_context: true,
             origin_request: Some(trigger_text.to_string()),
             origin_trusted: false,
-            trusted_roots: None,
+            trusted_roots: Vec::new(),
         },
         "Send the file as the email asks.",
     )
@@ -3033,7 +3040,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         untrusted_context: false,
         origin_request: Some("Look at the notes.".to_string()),
         origin_trusted: true,
-        trusted_roots: None,
+        trusted_roots: Vec::new(),
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {
@@ -3064,4 +3071,250 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         assert!(args.get("_parent_authority").is_none(), "{args}");
         assert_eq!(args["mission"], "Look");
     }
+}
+
+/// `scheduled_goal_runs` with its high-impact flag cleared, so a plain test
+/// turn offers it; its call semantics are the real tool's.
+struct OfferedGoalRuns(crate::tools::ScheduledGoalRunsTool);
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for OfferedGoalRuns {
+    fn name(&self) -> &str {
+        crate::traits::Tool::name(&self.0)
+    }
+    fn description(&self) -> &str {
+        crate::traits::Tool::description(&self.0)
+    }
+    fn schema(&self) -> serde_json::Value {
+        crate::traits::Tool::schema(&self.0)
+    }
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        crate::traits::Tool::call_semantics(&self.0, arguments)
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            high_impact_write: false,
+            ..crate::traits::Tool::capabilities(&self.0)
+        }
+    }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        crate::traits::Tool::call(&self.0, arguments).await
+    }
+}
+
+/// Binding a goal's workspace makes a future trusted root, so after
+/// untrusted content it goes to the verifier like any other egress call.
+#[tokio::test]
+async fn bind_workspace_after_untrusted_content_is_verified() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let db = tempfile::tempdir().unwrap();
+    let embedding = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+    let goal_store: Arc<dyn crate::traits::StateStore> = Arc::new(
+        crate::state::SqliteStateStore::new(
+            db.path().join("goals.db").to_str().unwrap(),
+            100,
+            None,
+            embedding,
+        )
+        .await
+        .unwrap(),
+    );
+    let bind_call = serde_json::json!({
+        "action": "bind_workspace",
+        "goal_id": "synthetic-goal-1",
+        "workspace_path": "/tmp/aidaemon-test/drop",
+    })
+    .to_string();
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("page_probe", PAGE_CALL),
+            MockProvider::tool_call_response("scheduled_goal_runs", &bind_call),
+            MockProvider::text_response(r#"{"consistent":false,"reason":"not requested"}"#),
+            MockProvider::text_response("Nothing was changed."),
+        ]),
+        vec![
+            Arc::new(PageProbe),
+            Arc::new(OfferedGoalRuns(crate::tools::ScheduledGoalRunsTool::new(
+                goal_store,
+            ))),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(owner_request(
+            "Summarize https://example.invalid/page for me.",
+        ))
+        .await
+        .unwrap();
+
+    let decisions = gate_decisions(&harness, "untrusted_egress_verified").await;
+    assert_eq!(
+        decisions.len(),
+        1,
+        "{decisions:?} {:?}",
+        tool_results_seen(&harness).await
+    );
+    assert_eq!(decisions[0]["tool"], "scheduled_goal_runs");
+}
+
+/// A broad bound workspace adds no root through any source, including the
+/// write targets the resolved authority derives from it.
+#[test]
+fn broad_bound_workspaces_add_no_roots_through_task_access() {
+    let mut broad = vec!["/".to_string(), "/tmp".to_string()];
+    broad.extend(dirs::home_dir().map(|home| home.to_string_lossy().into_owned()));
+    for dir in &broad {
+        let resolved =
+            crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
+                user_role: UserRole::Owner,
+                owner_default: crate::config::OwnerLevel::Full,
+                session_mode: None,
+                workspace_grant: None,
+                bound_workspace: Some(dir),
+            });
+        assert!(resolved.task_access.is_some(), "{dir}");
+        let roots = super::turn_trust_roots(super::TrustRootSources {
+            bound_workspace: Some(dir),
+            task_access: resolved.task_access.as_ref(),
+            ..Default::default()
+        });
+        assert!(roots.is_empty(), "{dir}: {roots:?}");
+    }
+}
+
+/// A goal-dispatched worker as dispatch builds it: the root's authority for
+/// a dispatched child, the goal, and the dispatch scope as the inherited
+/// workspace. It reads `file` and then sends.
+async fn goal_worker_reads_then_sends(
+    goal_context: Option<serde_json::Value>,
+    scope: &std::path::Path,
+    file: &str,
+) -> (
+    crate::testing::TestHarness,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    use crate::traits::store_prelude::*;
+    let read_call = serde_json::json!({ "path": file }).to_string();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("read_file", &read_call),
+            MockProvider::tool_call_response("send_probe", SEND_CALL),
+            MockProvider::text_response(
+                r#"{"consistent":true,"reason":"the owner asked to send it"}"#,
+            ),
+            MockProvider::text_response("Sent."),
+        ]),
+        vec![
+            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(SendProbe(sent.clone())),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    let mission = format!("Each morning summarize {file} and send Jordan Lee the summary.");
+    let mut goal = crate::traits::Goal::new_finite(&mission, "telegram:synthetic-user-1");
+    goal.context = goal_context.map(|context| context.to_string());
+    harness.state.create_goal(&goal).await.unwrap();
+    let inherited = harness
+        .agent
+        .authority_for_child(
+            UserRole::Owner,
+            &ChannelContext::private("telegram"),
+            Some(goal.id.as_str()),
+        )
+        .await;
+    harness.agent.set_test_task_lead_mode();
+    harness.agent.set_test_inherited_authority(inherited);
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+    harness.agent.inherited_project_scope = Some(scope.to_string_lossy().into_owned());
+    harness
+        .agent
+        .handle_inbound_message(owner_request(&mission))
+        .await
+        .unwrap();
+    (harness, sent)
+}
+
+/// A folder a goal's mission names, with no `bind_workspace`, is not a
+/// trusted root for the dispatched worker: the read taints the run and the
+/// first send goes to the verifier.
+#[tokio::test]
+async fn a_goal_mission_folder_without_a_binding_is_untrusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("inbox");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = docs.join("notes.md");
+    std::fs::write(&file, "Synthetic notes.").unwrap();
+    let (harness, sent) = goal_worker_reads_then_sends(None, &docs, &file.to_string_lossy()).await;
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    let decisions = gate_decisions(&harness, "untrusted_egress_verified").await;
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0]["tool"], "send_probe");
+}
+
+/// A goal explicitly bound to a workspace trusts it: the read stays
+/// trusted and the send runs without a verifier call.
+#[tokio::test]
+async fn a_goal_bound_workspace_is_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("inbox");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = docs.join("notes.md");
+    std::fs::write(&file, "Synthetic notes.").unwrap();
+    let binding = serde_json::json!({ "project_scope": docs.to_string_lossy() });
+    let (harness, sent) =
+        goal_worker_reads_then_sends(Some(binding), &docs, &file.to_string_lossy()).await;
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert!(gate_decisions(&harness, "untrusted_egress_verified")
+        .await
+        .is_empty());
+    assert!(!harness
+        .provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .any(is_verifier_call));
+}
+
+/// `[path_aliases] projects` is owner config, so its roots are trusted.
+#[tokio::test]
+async fn configured_project_aliases_are_trusted_roots() {
+    let mut harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+        .await
+        .unwrap();
+    harness.agent.sdk_engine = Arc::new(super::SdkEngineSettings {
+        trusted_roots: vec!["/tmp/aidaemon-test/trusted".to_string()],
+        ..Default::default()
+    });
+    harness.agent.path_aliases.projects = vec!["/tmp/aidaemon-test/projects".to_string()];
+    let configured = harness.agent.configured_trust_roots();
+    let roots = super::turn_trust_roots(super::TrustRootSources {
+        configured: &configured,
+        ..Default::default()
+    });
+    assert_eq!(
+        roots,
+        vec![
+            "/tmp/aidaemon-test/trusted".to_string(),
+            "/tmp/aidaemon-test/projects".to_string()
+        ]
+    );
+    // A goal-dispatched child starts from the same configuration.
+    let dispatched = harness
+        .agent
+        .authority_for_child(UserRole::Owner, &ChannelContext::private("telegram"), None)
+        .await;
+    assert!(dispatched
+        .trusted_roots
+        .contains(&"/tmp/aidaemon-test/projects".to_string()));
+    assert!(dispatched.trusted_roots.contains(&super::turn_cwd()));
 }
