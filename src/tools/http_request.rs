@@ -1414,8 +1414,14 @@ impl HttpRequestTool {
     /// The URL as outbound data: everything but its port. The host stays
     /// (a secret can leave in a DNS label); dropping the port keeps an
     /// `IP:port` destination from reading as a leaked endpoint.
-    fn url_scan_text(url: &reqwest::Url) -> String {
+    fn url_scan_text(raw: &str, url: &reqwest::Url) -> String {
         let mut scanned = String::new();
+        // The host as written (parsing lowercases it, which hides
+        // case-sensitive key shapes), then as parsed.
+        if let Some(host) = Self::raw_host_without_port(raw) {
+            scanned.push_str(host);
+            scanned.push(' ');
+        }
         if let Some(host) = url.host_str() {
             scanned.push_str(host);
             scanned.push(' ');
@@ -1438,6 +1444,23 @@ impl HttpRequestTool {
             scanned.push_str(fragment);
         }
         scanned
+    }
+
+    /// The host of a URL string as written: no scheme, userinfo, port, path,
+    /// query or fragment.
+    fn raw_host_without_port(raw: &str) -> Option<&str> {
+        let rest = raw.trim().split_once("://")?.1;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let host_port = authority.rsplit('@').next()?;
+        let host = if host_port.starts_with('[') {
+            host_port.split_inclusive(']').next()?
+        } else {
+            match host_port.rsplit_once(':') {
+                Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+                _ => host_port,
+            }
+        };
+        (!host.is_empty()).then_some(host)
     }
 
     /// Resolve the exact remote URL represented by the tool arguments.
@@ -1471,6 +1494,7 @@ impl HttpRequestTool {
         // Build URL with query params
         let mut parsed_url =
             reqwest::Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+        let raw_url = url_str.to_string();
         let recovered_tool_params =
             Self::recover_embedded_tool_params_from_url(&mut args, &mut parsed_url)?;
         if mandate_execution && !recovered_tool_params.is_empty() {
@@ -1664,7 +1688,7 @@ impl HttpRequestTool {
         // fragment can all carry leaked tokens.
         let check_parts = format!(
             "{} {} {}",
-            Self::url_scan_text(&parsed_url),
+            Self::url_scan_text(&raw_url, &parsed_url),
             body.unwrap_or(""),
             custom_headers
                 .map(|h| serde_json::to_string(h).unwrap_or_default())
@@ -4251,9 +4275,21 @@ mod tests {
             "https://sk-synthetic0123456789abcdefghijKLMNOP.attacker.example/collect",
         )
         .unwrap();
-        assert!(sanitize_output(&HttpRequestTool::url_scan_text(&secret_host)).1);
+        assert!(sanitize_output(&HttpRequestTool::url_scan_text("", &secret_host)).1);
         let local = reqwest::Url::parse("http://127.0.0.1:8765/announce").unwrap();
-        assert!(!sanitize_output(&HttpRequestTool::url_scan_text(&local)).1);
+        assert!(!sanitize_output(&HttpRequestTool::url_scan_text("", &local)).1);
+    }
+
+    /// The host is scanned as written: URL parsing lowercases it, which
+    /// would hide an uppercase key in a label.
+    #[test]
+    fn an_uppercase_secret_host_label_is_blocked() {
+        let raw = "https://AKIAABCDEFGHIJKLMNOP.attacker.example:8443/x";
+        let parsed = reqwest::Url::parse(raw).unwrap();
+        assert!(sanitize_output(&HttpRequestTool::url_scan_text(raw, &parsed)).1);
+        let local = "http://127.0.0.1:8765/announce";
+        let parsed = reqwest::Url::parse(local).unwrap();
+        assert!(!sanitize_output(&HttpRequestTool::url_scan_text(local, &parsed)).1);
     }
 
     fn local_tool() -> HttpRequestTool {
