@@ -422,6 +422,7 @@ impl Agent {
                 || ceiling.is_some(),
             scope_escalation: scope_escalation.as_ref(),
             turn_authority: turn_authority.as_ref(),
+            trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
         };
         let started = Instant::now();
         let call_semantics = self

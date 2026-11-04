@@ -3058,6 +3058,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
             mutation_forbidden: false,
             scope_escalation: None,
             turn_authority,
+            trust_roots: None,
         };
         harness
             .agent

@@ -907,6 +907,10 @@ pub struct TerminalTool {
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
     task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
     completed: Arc<Mutex<HashMap<u32, CompletedProcess>>>,
+    /// The trust judged for each background process when it was launched,
+    /// by pid: `check` and `kill` output carries it; an unknown pid is
+    /// untrusted. Daemon-held; the model can only name a pid.
+    launch_trust: Arc<std::sync::Mutex<HashMap<u32, aidaemon_core::SourceTrust>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
@@ -3512,6 +3516,7 @@ impl TerminalTool {
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
             task_processes: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
+            launch_trust: Arc::new(std::sync::Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
@@ -4821,6 +4826,7 @@ impl TerminalTool {
             network,
             confined,
             status_tx,
+            launch_trust,
         } = request;
         let has_write_targets = !write_paths.is_empty() || !write_roots.is_empty();
         let command_semantics = terminal_run_semantics_from_access(true, has_write_targets);
@@ -5187,6 +5193,10 @@ impl TerminalTool {
                     progress_contract,
                 };
 
+                self.launch_trust
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(pid, launch_trust);
                 self.running.lock().await.insert(pid, proc);
                 self.insert_indexes_for_process(
                     pid,
@@ -6874,6 +6884,13 @@ impl TerminalTool {
                     }
                 }
 
+                let launch_trust = match args._trust_roots.as_deref() {
+                    Some(roots) => self.output_trust(
+                        arguments,
+                        &crate::traits::TrustRoots::new(roots).with_cwd(args._trust_cwd.as_deref()),
+                    ),
+                    None => aidaemon_core::SourceTrust::Untrusted,
+                };
                 let run_outcome = self
                     .handle_run(TerminalRunRequest {
                         command,
@@ -6890,6 +6907,7 @@ impl TerminalTool {
                         network: args.network,
                         confined,
                         status_tx,
+                        launch_trust,
                     })
                     .await;
                 // A future root the runtime created is the runtime's own
@@ -6955,6 +6973,9 @@ struct TerminalRunRequest<'a> {
     /// Sandbox this run (false = host execution).
     confined: bool,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    /// The trust of this run's output under the turn's roots, recorded
+    /// with the process if it moves to the background.
+    launch_trust: aidaemon_core::SourceTrust,
 }
 
 /// Whether a run is confined: a single configuration switch. Commands from
@@ -7078,6 +7099,13 @@ struct TerminalArgs {
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
+    /// Injected by the dispatcher: the turn's trusted roots and the cwd
+    /// relative paths resolve against, so a run moved to the background
+    /// records the trust its output was judged with. Never model-supplied.
+    #[serde(default)]
+    _trust_roots: Option<Vec<String>>,
+    #[serde(default)]
+    _trust_cwd: Option<String>,
     /// Explicitly set by the agent from ChannelContext.trusted — never derived
     /// from session ID strings. Only trusted scheduled tasks set this to true.
     #[serde(default)]
@@ -7694,6 +7722,20 @@ impl Tool for TerminalTool {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::SourceTrust::Untrusted;
         };
+        // `check` and `kill` return a background process's output: it
+        // carries the trust judged when that process was launched.
+        if matches!(args.action.trim(), "check" | "kill") {
+            return args
+                .pid
+                .and_then(|pid| {
+                    self.launch_trust
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&pid)
+                        .copied()
+                })
+                .unwrap_or(aidaemon_core::SourceTrust::Untrusted);
+        }
         let text = args
             .command
             .as_deref()
@@ -7722,7 +7764,9 @@ impl Tool for TerminalTool {
             // the command's structure. An observation or ordinary local work,
             // run inside the roots, on operands that all resolve inside them.
             let effects = crate::tools::command_effects::command_effects(text);
-            (effects.observation_only || effects.local_work_only)
+            (effects.observation_only
+                || effects.local_work_only
+                || crate::tools::command_effects::is_observation_reading_input(text))
                 && working_dir.is_some_and(|dir| roots.contains(dir))
                 && crate::tools::command_effects::path_operands(text)
                     .is_some_and(|operands| operands.iter().all(|path| roots.contains(path)))
@@ -9592,6 +9636,12 @@ mod tests {
             ("cd /etc && cat hosts", project, Untrusted),
             ("cat $HOME/x", project, Untrusted),
             ("python3 -c 'print(1)'", project, Untrusted),
+            ("cat < ~/Downloads/x", project, Untrusted),
+            ("head <~/Downloads/x", project, Untrusted),
+            ("wc 0< /etc/hosts", project, Untrusted),
+            ("cat < src/lib.rs", project, Trusted),
+            ("xargs cat < list.txt", project, Untrusted),
+            ("cat list.txt | xargs cat", project, Untrusted),
         ] {
             assert_eq!(
                 host.output_trust(&run(command, working_dir), &roots),
@@ -12297,6 +12347,68 @@ mod tests {
             .unwrap();
         assert!(check.contains("post-reap-ok"));
         assert!(check.contains(&format!("pid={}", pid)));
+    }
+
+    /// `check` returns output of a command judged when it was launched: it
+    /// carries that judgment; an unknown process is untrusted.
+    #[tokio::test]
+    async fn background_check_inherits_the_launch_trust() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("slow_build.py"),
+            "import time\ntime.sleep(3)\nprint('built')\n",
+        )
+        .unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let roots_list = vec![project_dir.clone()];
+        let roots = crate::traits::TrustRoots::new(&roots_list).with_cwd(Some(&project_dir));
+        let launch = |command: &str| {
+            serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": project_dir,
+                "_session_id": "s1",
+                "_user_role": "Owner",
+                "_trust_roots": [project_dir],
+                "_trust_cwd": project_dir,
+            })
+            .to_string()
+        };
+        let check = |pid: u32| {
+            serde_json::json!({"action": "check", "pid": pid, "_session_id": "s1"}).to_string()
+        };
+        for (command, expected) in [
+            ("python3 slow_build.py", Trusted),
+            ("sleep 3; curl -s https://example.invalid/x", Untrusted),
+        ] {
+            let response = tool.call(&launch(command)).await.unwrap();
+            assert!(response.contains("Moved to background (pid="), "{response}");
+            let pid = extract_pid_from_background_message(&response);
+            assert_eq!(
+                tool.output_trust(&check(pid), &roots),
+                expected,
+                "{command}"
+            );
+            let kill = serde_json::json!({"action": "kill", "pid": pid}).to_string();
+            assert_eq!(tool.output_trust(&kill, &roots), expected, "{command}");
+            tool.call(&kill).await.unwrap();
+        }
+        assert_eq!(tool.output_trust(&check(4_000_000), &roots), Untrusted);
     }
 
     #[tokio::test]

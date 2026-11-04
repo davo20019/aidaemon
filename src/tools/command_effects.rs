@@ -493,8 +493,24 @@ pub(crate) fn path_operands(command: &str) -> Option<Vec<String>> {
     };
     let commands = expanded_commands(command);
     let mut operands: Vec<String> = Vec::new();
+    // Input-redirect targets are read like any operand.
+    for line in command.replace("\\\n", " ").split('\n') {
+        for target in scan(line).input_targets {
+            if unreadable(&target) || target.contains(['"', '\'']) {
+                return None;
+            }
+            if !operands.contains(&target) {
+                operands.push(target);
+            }
+        }
+    }
     for tokens in &commands {
-        if matches!(basename(&tokens[0]), "cd" | "pushd" | "popd") {
+        // `cd` moves where relative operands resolve; `xargs` and `parallel`
+        // take their operands from stdin, which no argument names.
+        if matches!(
+            basename(&tokens[0]),
+            "cd" | "pushd" | "popd" | "xargs" | "parallel"
+        ) {
             return None;
         }
         let mut options_done = false;
@@ -533,7 +549,9 @@ fn is_local_work_only(command: &str) -> bool {
     // A script's lines are commands like `;`-separated ones.
     for line in command.replace("\\\n", " ").split('\n') {
         let scanned = scan(line);
-        if scanned.unsafe_syntax {
+        // Local work never reads stdin from a file: an interpreter fed a
+        // file this way runs code no argument names.
+        if scanned.unsafe_syntax || !scanned.input_targets.is_empty() {
             return false;
         }
         for segment in &scanned.segments {
@@ -649,6 +667,10 @@ struct Scan {
     unsafe_syntax: bool,
     /// Output redirected into a file (not `/dev/null` or a descriptor).
     writes_file: bool,
+    /// Targets of plain input redirects (`< file`, `<file`, `0< file`),
+    /// as written. A here-doc, here-string or process substitution is
+    /// unsafe syntax instead.
+    input_targets: Vec<String>,
 }
 
 fn redirect_target(chars: &[char], mut j: usize) -> String {
@@ -667,6 +689,7 @@ fn scan(command: &str) -> Scan {
     let mut cur = String::new();
     let mut unsafe_syntax = false;
     let mut writes_file = false;
+    let mut input_targets = Vec::new();
     let (mut in_single, mut in_double) = (false, false);
     let mut i = 0;
     while i < chars.len() {
@@ -723,10 +746,11 @@ fn scan(command: &str) -> Scan {
             '&' if next == Some('>') => cur.push(c),
             '&' => segments.push(std::mem::take(&mut cur)),
             '<' => {
-                if matches!(next, Some('<') | Some('(') | Some('>'))
-                    || redirect_target(&chars, i + 1) != "/dev/null"
-                {
+                let target = redirect_target(&chars, i + 1);
+                if matches!(next, Some('<') | Some('(') | Some('>')) || target.is_empty() {
                     unsafe_syntax = true;
+                } else if target != "/dev/null" {
+                    input_targets.push(target);
                 }
                 cur.push(c);
             }
@@ -763,6 +787,7 @@ fn scan(command: &str) -> Scan {
         segments,
         unsafe_syntax,
         writes_file,
+        input_targets,
     }
 }
 
@@ -790,8 +815,21 @@ fn strip_redirections(tokens: Vec<String>) -> Vec<String> {
 }
 
 fn is_observation_only(command: &str) -> bool {
+    is_observation(command, false)
+}
+
+/// An observation whose observers may also read plain input redirects
+/// (`cat < file`). For judging where output came from, with the redirect
+/// targets checked as operands (`path_operands`); the authority view
+/// (`CommandEffects::observation_only`) stays the stricter shape.
+pub(crate) fn is_observation_reading_input(command: &str) -> bool {
+    is_observation(command, true)
+}
+
+fn is_observation(command: &str, allow_input_redirects: bool) -> bool {
     let scanned = scan(command);
-    if scanned.unsafe_syntax
+    if (!allow_input_redirects && !scanned.input_targets.is_empty())
+        || scanned.unsafe_syntax
         || scanned.writes_file
         || command.contains("/dev/tcp/")
         || command.contains("/dev/udp/")

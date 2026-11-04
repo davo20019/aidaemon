@@ -144,6 +144,10 @@ pub(super) struct ToolExecCtx<'a> {
     /// `spawn_agent` as `_parent_authority` so a child inherits what this
     /// turn had rather than a re-resolution at spawn time.
     pub turn_authority: Option<&'a crate::agent::authority::InheritedAuthority>,
+    /// The turn's trusted roots and the cwd relative paths resolve against,
+    /// handed to `terminal` as `_trust_roots`/`_trust_cwd` so a run moved to
+    /// the background records the trust its launch was judged with.
+    pub trust_roots: Option<(&'a [String], &'a str)>,
 }
 
 async fn scoped_workspace_arguments(
@@ -728,6 +732,12 @@ impl Agent {
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
+                if name == "terminal" {
+                    if let Some((roots, cwd)) = ctx.trust_roots {
+                        map.insert("_trust_roots".to_string(), json!(roots));
+                        map.insert("_trust_cwd".to_string(), json!(cwd));
+                    }
+                }
                 if name == "spawn_agent" {
                     if let Some(turn_authority) = ctx.turn_authority {
                         map.insert(

@@ -582,6 +582,7 @@ mod tests {
             mutation_forbidden: false,
             scope_escalation: None,
             turn_authority: None,
+            trust_roots: None,
         };
         let error = harness
             .agent
