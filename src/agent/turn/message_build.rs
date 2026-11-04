@@ -2510,8 +2510,8 @@ mod tests {
             session,
             "turn-location",
             "Where do I live?",
-            Some(("manage_memories", "location candidate: Fairfax")),
-            "You live in Fairfax, VA.",
+            Some(("manage_memories", "location candidate: Springfield")),
+            "You live in Springfield, VA.",
             "completed",
         )
         .await;

@@ -1225,7 +1225,7 @@ mod tests {
             "event: response.output_item.done\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Paris\"}]}}\n\n",
             "event: response.output_item.done\n",
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Quito\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Lisbon\\\"}\"}}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-terra\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":5}}}\n\n",
         );
@@ -1409,7 +1409,7 @@ mod tests {
         })];
         let messages = vec![json!({
             "role": "user",
-            "content": "Use the get_weather tool to check the weather in Quito."
+            "content": "Use the get_weather tool to check the weather in Lisbon."
         })];
 
         let response = provider
@@ -1439,7 +1439,7 @@ mod tests {
         }
         let provider = OpenAiChatGptProvider::new(None).unwrap();
         let messages = vec![
-            json!({"role": "user", "content": "What is the weather in Quito?"}),
+            json!({"role": "user", "content": "What is the weather in Lisbon?"}),
             json!({
                 "role": "assistant",
                 "content": "",
@@ -1448,7 +1448,7 @@ mod tests {
                     "type": "function",
                     "function": {
                         "name": "get_weather",
-                        "arguments": "{\"city\":\"Quito\"}"
+                        "arguments": "{\"city\":\"Lisbon\"}"
                     }
                 }]
             }),

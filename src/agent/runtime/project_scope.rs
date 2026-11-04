@@ -728,7 +728,7 @@ mod tests {
     fn project_scope_extraction_ignores_history_for_new_tasks() {
         let history = vec![msg(
             "assistant",
-            "Found symlink: /Users/davidloor/.openclaw and other directories.",
+            "Found symlink: /Users/jordan/.openclaw and other directories.",
         )];
         let current = "Find all Rust files in the aidaemon project that contain async fn.";
         let scopes = extract_project_scopes_from_history(&history, current, 4, false, &[]);
@@ -902,24 +902,24 @@ mod tests {
     }
     #[test]
     fn explicit_scope_wins_over_inherited_scope_when_present() {
-        let extracted = Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string());
+        let extracted = Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string());
         let resolved = resolve_primary_project_scope(
             extracted,
-            Some("/Users/davidloor/Library/Logs/aidaemon"),
+            Some("/Users/jordan/Library/Logs/aidaemon"),
             false,
             true,
         );
         assert_eq!(
             resolved,
-            Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string())
+            Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string())
         );
     }
     #[test]
     fn inherited_project_scope_yields_to_explicit_scope_for_multi_project_requests() {
-        let extracted = Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string());
+        let extracted = Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string());
         let resolved = resolve_primary_project_scope(
             extracted.clone(),
-            Some("/Users/davidloor/Library/Logs/aidaemon"),
+            Some("/Users/jordan/Library/Logs/aidaemon"),
             true,
             true,
         );
@@ -929,7 +929,7 @@ mod tests {
     fn inherited_project_scope_is_ignored_when_turn_is_not_local_project_work() {
         let resolved = resolve_primary_project_scope(
             None,
-            Some("/Users/davidloor/projects/fairfax-va-site"),
+            Some("/Users/jordan/projects/springfield-il-site"),
             false,
             false,
         );
@@ -939,7 +939,7 @@ mod tests {
     fn project_scope_extraction_ignores_assistant_paths_for_non_local_followup() {
         let history = vec![msg(
             "assistant",
-            "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+            "I am currently locked to /Users/jordan/projects/springfield-il-site.",
         )];
 
         let scopes = extract_project_scopes_from_history(
@@ -1093,14 +1093,15 @@ mod tests {
     fn project_scope_extraction_rejects_plain_word_nickname_without_local_scope_cues() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let scopes = extract_project_scopes_from_history(
             &[],
-            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            "Find recruiting studies in Springfield, Illinois and summarize them.",
             4,
             false,
             &alias_roots,
@@ -1116,14 +1117,15 @@ mod tests {
     fn project_scope_words_do_not_turn_plain_nicknames_into_hard_scope() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let scopes = extract_project_scopes_from_history(
             &[],
-            "Check the Fairfax project for broken links.",
+            "Check the Springfield project for broken links.",
             4,
             false,
             &alias_roots,

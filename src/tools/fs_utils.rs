@@ -1194,12 +1194,12 @@ mod tests {
     fn test_resolve_contextual_project_nickname_in_explicit_roots_prefers_alias_roots() {
         let dir = tempfile::tempdir().unwrap();
         let alias_root = dir.path().join("projects");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").unwrap();
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n").unwrap();
 
         let resolved = resolve_contextual_project_nickname_in_explicit_roots(
-            "fairfax",
+            "springfield",
             &[alias_root.to_string_lossy().to_string()],
         )
         .expect("resolved");

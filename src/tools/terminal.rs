@@ -11893,7 +11893,7 @@ mod tests {
         assert!(is_short_complete_output("42"));
         assert!(is_short_complete_output("207"));
         assert!(is_short_complete_output(
-            "/Users/davidloor/projects/resume/google"
+            "/Users/jordan/projects/resume/google"
         ));
         assert!(is_short_complete_output("Build complete"));
         assert!(is_short_complete_output("a\nb\nc")); // 3 lines, tiny

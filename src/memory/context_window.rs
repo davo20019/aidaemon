@@ -1240,22 +1240,6 @@ pub fn spawn_progressive_extraction(
         {
             return;
         }
-        // Yield to in-flight agent work (this spawn is detached, so waiting
-        // here means "run after the turn finishes", never a deadlock). LLM
-        // pipeline jobs interleaving with agent tasks evict their llama.cpp
-        // KV prefix and steal compute — measured 5x budget inflation on a
-        // goal run (2026-07-03). Capped: after 10 min we run regardless.
-        if !crate::agent::activity_gate::wait_until_agent_idle(
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        {
-            tracing::info!(
-                "Progressive extraction proceeding despite agent activity (10 min wait cap)"
-            );
-        }
-
         match extract_inline_facts(
             &provider,
             &fast_model,
@@ -1473,17 +1457,6 @@ pub fn spawn_incremental_summarization(
 
     tokio::spawn(async move {
         loop {
-            // Yield to in-flight agent work — same rationale and cap as the
-            // extraction spawn above.
-            if !crate::agent::activity_gate::wait_until_agent_idle(
-                std::time::Duration::from_secs(600),
-                std::time::Duration::from_secs(1),
-            )
-            .await
-            {
-                tracing::info!("Summarization proceeding despite agent activity (10 min wait cap)");
-            }
-
             match refresh_incremental_summarization(
                 provider.clone(),
                 &fast_model,
@@ -1931,15 +1904,15 @@ mod tests {
         assert!(!identity_fact_lacks_user_evidence(
             "user",
             "name",
-            "David Loor",
-            "Hi, my name is David Loor and I live in Quito"
+            "Jordan Lee",
+            "Hi, my name is Jordan Lee and I live in Lisbon"
         ));
         // Case-insensitive match.
         assert!(!identity_fact_lacks_user_evidence(
             "user",
             "Name",
-            "david loor",
-            "I'm David Loor"
+            "jordan lee",
+            "I'm Jordan Lee"
         ));
     }
 

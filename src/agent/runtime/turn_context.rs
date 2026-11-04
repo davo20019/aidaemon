@@ -1840,7 +1840,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "user",
-                "Please work in /Users/davidloor/projects/fairfax-va-site and inspect the logs.",
+                "Please work in /Users/jordan/projects/springfield-il-site and inspect the logs.",
             ))
             .await
             .expect("append old local user");
@@ -1848,7 +1848,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "assistant",
-                "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+                "I am currently locked to /Users/jordan/projects/springfield-il-site.",
             ))
             .await
             .expect("append old local assistant");
@@ -1856,7 +1856,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "user",
-                "Find melanoma clinical trials recruiting near Fairfax, Virginia.",
+                "Find melanoma clinical trials recruiting near Springfield, Illinois.",
             ))
             .await
             .expect("append external user");
@@ -1864,7 +1864,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "assistant",
-                "I found 10 recruiting trials near Fairfax, VA with male participants.",
+                "I found 10 recruiting trials near Springfield, VA with male participants.",
             ))
             .await
             .expect("append external assistant");

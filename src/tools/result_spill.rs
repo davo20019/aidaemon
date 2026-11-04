@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn json_result_spills_full_body_and_preview_points_to_file() {
         let dir = tempfile::tempdir().unwrap();
-        // Synthetic clinical-trial-style payload; "Fairfax" sits deep enough to be
+        // Synthetic clinical-trial-style payload; "Springfield" sits deep enough to be
         // dropped by head+tail compression but must survive in the spilled file.
         let mut locations = String::new();
         for i in 0..200 {
@@ -480,7 +480,7 @@ mod tests {
             ));
         }
         let full = format!(
-            "{{\"locations\":[{}{{\"city\":\"Fairfax\",\"facility\":\"Synthetic Cancer Center\"}}]}}",
+            "{{\"locations\":[{}{{\"city\":\"Springfield\",\"facility\":\"Synthetic Cancer Center\"}}]}}",
             locations
         );
 
@@ -512,9 +512,9 @@ mod tests {
         assert!(preview.contains(&path.to_string_lossy().into_owned()));
         // The full body — including the would-be-dropped middle — is on disk.
         let on_disk = std::fs::read_to_string(path).unwrap();
-        assert!(on_disk.contains("Fairfax"));
+        assert!(on_disk.contains("Springfield"));
         // ...but NOT in the bounded preview.
-        assert!(!preview.contains("Fairfax"));
+        assert!(!preview.contains("Springfield"));
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
              items: array(2 item(s))\n\
              \n\
              {{\n\
-               \"locations\": [{}{{\"city\":\"Fairfax\",\"facility\":\"Synthetic Cancer Center\"}}]\n\
+               \"locations\": [{}{{\"city\":\"Springfield\",\"facility\":\"Synthetic Cancer Center\"}}]\n\
              }}\n\
              [END UNTRUSTED EXTERNAL DATA]",
             locations
@@ -644,10 +644,10 @@ mod tests {
             "wrapped output must be stored as .txt"
         );
 
-        // Full body preserved on disk (including "Fairfax" which is deep in the payload).
+        // Full body preserved on disk (including "Springfield" which is deep in the payload).
         let on_disk = std::fs::read_to_string(path).unwrap();
         assert!(
-            on_disk.contains("Fairfax"),
+            on_disk.contains("Springfield"),
             "full body must be written to disk"
         );
 

@@ -101,7 +101,7 @@ async fn test_semantic_followup_uses_dialogue_state_projection() {
 
 #[tokio::test]
 async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() {
-    let location_answer = "You live in Fairfax, VA.";
+    let location_answer = "You live in Springfield, VA.";
     let job_prep_answer = format!(
         "We've mainly been working on your 2026 AI job preparation and interview briefing. {}\n\nSource artifact: /tmp/synthetic-ai-job-prep/briefing.md",
         "Detailed preparation context covering agent systems, production reliability, evaluated projects, RAG, MLOps, system design, technical interviews, behavioral interviews, market updates, and application tracking. ".repeat(8)

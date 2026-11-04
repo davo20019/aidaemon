@@ -73,14 +73,14 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
             "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.",
         ),
         MockProvider::text_response(
-            "I checked the live ClinicalTrials.gov results. The first matching study in Fairfax, Virginia is Example Skin Trial.",
+            "I checked the live ClinicalTrials.gov results. The first matching study in Springfield, Illinois is Example Skin Trial.",
         ),
     ]);
 
     let http_tool: Arc<dyn crate::traits::Tool> = Arc::new(MockTool::new(
         "http_request",
         "Make HTTP requests",
-        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Fairfax\",\"state\":\"Virginia\"}]}",
+        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Springfield\",\"state\":\"Virginia\"}]}",
     ));
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         provider,
@@ -94,7 +94,7 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
         .agent
         .handle_message(
             "http_retry_session",
-            "Search for clinical trials for skin cancer near Fairfax Virginia for a man.",
+            "Search for clinical trials for skin cancer near Springfield Virginia for a man.",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -1645,7 +1645,7 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
 #[tokio::test]
 async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
     let fabricated = "Here is the full squad:\n\
-         • Denis Segovia (LDU Quito)\n\
+         • Denis Segovia (LDU Lisbon)\n\
          • Alex Granda (Emelec)\n\
          • Yholen Pichenda (Independiente)\n\
          • Jackson Falconi (Barcelona SC)\n\

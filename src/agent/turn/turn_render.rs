@@ -448,19 +448,15 @@ fn render_archived(
     let result_ids = tool_result_ids(turn_messages);
 
     // Pre-scan: index of the LAST substantive assistant record — non-empty
-    // trimmed content that is NOT failure boilerplate and NOT identity-critical
-    // (identity messages are handled by the verbatim override, not as the
-    // "winning" assistant).
+    // trimmed content that is NOT failure boilerplate.
     let last_substantive_assistant = turn_messages
         .iter()
         .enumerate()
         .filter(|(_, m)| {
             m.role == "assistant"
-                && m.content.as_deref().is_some_and(|c| {
-                    !c.trim().is_empty()
-                        && !is_failure_boilerplate(c)
-                        && !text_relates_to_critical_identity(c)
-                })
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty() && !is_failure_boilerplate(c))
         })
         .map(|(i, _)| i)
         .next_back();
@@ -483,12 +479,16 @@ fn render_archived(
     let mut out: Vec<Value> = Vec::with_capacity(turn_messages.len());
 
     for (idx, m) in turn_messages.iter().enumerate() {
-        // Identity override (precedence): emit verbatim in original position,
-        // exempt from truncation/drop/summarization — but exactly ONCE (this
-        // REPLACES the normal transform for that message).
-        if m.content
-            .as_deref()
-            .is_some_and(text_relates_to_critical_identity)
+        // Identity override (precedence): the user's own identity statements
+        // are emitted verbatim in original position, exempt from
+        // truncation/drop/summarization — but exactly ONCE (this REPLACES the
+        // normal transform for that message). Assistant text is never
+        // exempted: an assistant "I am …" is not identity evidence, and the
+        // pinned values come from typed facts.
+        if m.role == "user"
+            && m.content
+                .as_deref()
+                .is_some_and(text_relates_to_critical_identity)
         {
             let mut obj = json!({
                 "role": m.role,
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn archived_preserves_identity_critical_verbatim() {
-        let turn = vec![user("my name is David Loor"), assistant("noted")];
+        let turn = vec![user("my name is Jordan Lee"), assistant("noted")];
         let out = render_turn(
             &turn,
             RenderMode::Archived {
@@ -870,7 +870,7 @@ mod tests {
         );
         assert!(serde_json::to_string(&out)
             .unwrap()
-            .contains("my name is David Loor"));
+            .contains("my name is Jordan Lee"));
     }
 
     #[test]
@@ -966,10 +966,10 @@ mod tests {
 
     #[test]
     fn archived_identity_message_emitted_once_not_duplicated() {
-        // Identity-critical assistant that is NOT the last non-empty assistant.
+        // Identity-critical user message followed by assistant replies.
         let turn = vec![
-            user("hi"),
-            assistant("my name is David Loor"),
+            user("my name is Jordan Lee"),
+            assistant("noted"),
             assistant("ok done"),
         ];
         let out = render_turn(
@@ -982,14 +982,38 @@ mod tests {
         );
         let joined = serde_json::to_string(&out).unwrap();
         assert!(
-            joined.contains("my name is David Loor"),
+            joined.contains("my name is Jordan Lee"),
             "identity survives verbatim"
         );
         assert_eq!(
-            joined.matches("my name is David Loor").count(),
+            joined.matches("my name is Jordan Lee").count(),
             1,
             "emitted once, not duplicated"
         );
+    }
+
+    #[test]
+    fn archived_assistant_first_person_reply_stays_the_winning_reply() {
+        // An assistant reply that happens to say "I am …" (or mention a son)
+        // is an ordinary reply: it is still the turn's winning answer, so the
+        // archive keeps it instead of a "no reply" placeholder.
+        let turn = vec![
+            user("is the deploy finished?"),
+            assistant("I am done: the deploy finished and your son's site is live."),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let assistants: Vec<&Value> = out.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(assistants.len(), 1, "{out:?}");
+        assert!(assistants[0]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("the deploy finished")));
     }
 
     #[test]

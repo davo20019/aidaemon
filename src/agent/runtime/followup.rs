@@ -959,8 +959,8 @@ mod tests {
     #[test]
     fn imperative_request_after_clarifying_question_is_new_task() {
         // Live 2026-07-12: "Send me my Microsoft resume" right after the
-        // assistant's makpar clarifying question got bound as the ANSWER to
-        // that question, so the new turn carried "Assistant asked: …makpar…"
+        // assistant's acme clarifying question got bound as the ANSWER to
+        // that question, so the new turn carried "Assistant asked: …acme…"
         // and the model hunted the wrong resume. A self-contained imperative
         // that names its own object is a new request, not an answer.
         let current = "Send me my Microsoft resume";
