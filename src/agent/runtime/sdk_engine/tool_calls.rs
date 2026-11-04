@@ -269,6 +269,41 @@ impl Agent {
         let _ = request.reply.send(Ok(output));
     }
 
+    /// Shadow comparison: record when the assessor's own authority view would
+    /// have refused a call the explicit authority admitted. Never blocks or
+    /// alters the call.
+    async fn record_assessor_would_refuse(
+        &self,
+        scope: &TurnScope<'_>,
+        tool_name: &str,
+        arguments: &str,
+    ) {
+        let read_only = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .map(|tool| super::hooks::call_is_read_only(tool.as_ref(), arguments));
+        let assessed = crate::agent::closeout::ClosingAuthority::from_authority(
+            scope.contract.authority_as_assessed(),
+        );
+        let Some(reason) = assessed.refusal_reason(tool_name, read_only) else {
+            return;
+        };
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            0,
+            crate::events::DecisionType::GateTelemetry,
+            "assessor would have refused this call",
+            serde_json::json!({
+                "condition": "assessor_would_refuse",
+                "tool": tool_name,
+                "reason": reason,
+            }),
+        )
+        .await;
+    }
+
     /// Run one call and record it: a `ToolCall` event, then the tool message with a typed receipt, so the run ledger
     /// sees every operation while the run is still going.
     pub(super) async fn run_sdk_tool_call(
@@ -385,6 +420,10 @@ impl Agent {
             }
         };
         ctx.mandate_authority = grant.as_ref();
+        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
+            self.record_assessor_would_refuse(scope, &request.name, arguments)
+                .await;
+        }
 
         // Before a call enters a deeper subtree, newly applicable nested
         // project instructions are loaded and the call is deliberately not

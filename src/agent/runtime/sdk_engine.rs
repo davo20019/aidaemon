@@ -104,6 +104,9 @@ pub(crate) struct SdkEngineSettings {
     /// `[authority] owner_default`: the owner's level when no session mode
     /// sets one.
     pub(crate) owner_default: crate::config::OwnerLevel,
+    /// `[agent] task_assessment`: whether the pre-run assessment runs
+    /// (`off` skips it) and whether would-refuse comparisons are recorded.
+    pub(crate) task_assessment: crate::config::TaskAssessmentSetting,
 }
 
 impl Default for SdkEngineSettings {
@@ -112,6 +115,7 @@ impl Default for SdkEngineSettings {
             model_override: None,
             max_turns: DEFAULT_MAX_TURNS,
             owner_default: crate::config::OwnerLevel::default(),
+            task_assessment: crate::config::TaskAssessmentSetting::default(),
         }
     }
 }
@@ -155,6 +159,7 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         model_override,
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
         owner_default: config.authority.owner_default,
+        task_assessment: config.agent.task_assessment,
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
     settings
@@ -325,8 +330,8 @@ struct TurnScope<'a> {
     /// The engine model, for vision gating of tool-observed images.
     model: &'a str,
     turn_id: &'a str,
-    /// The assessed contract: its authority is enforced, its expectations
-    /// are credited from receipts.
+    /// The assessed contract: its expectations are credited from receipts;
+    /// its authority view is only compared in shadow logging.
     contract: &'a crate::agent::completion_contract::CompletionContract,
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
     /// Shared with the memory writer, which learns from it at run end.

@@ -51,9 +51,8 @@ impl ClosingAuthority<'static> {
 }
 
 impl<'a> ClosingAuthority<'a> {
-    /// The assessed contract's authority view. No longer enforced; kept for
-    /// shadow comparison against the resolved authority.
-    #[allow(dead_code)]
+    /// The assessed contract's authority view. No longer enforced; used for
+    /// `assessor_would_refuse` shadow logging.
     pub(in crate::agent) fn from_authority(authority: RequestAuthority<'a>) -> Self {
         Self {
             forbids_tool_use: authority.forbids_tool_use,
@@ -81,8 +80,18 @@ impl<'a> ClosingAuthority<'a> {
     /// stay admissible so a custom tool is never declared unavailable
     /// prematurely).
     pub(in crate::agent) fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
+        self.refusal_reason(tool, read_only).is_none()
+    }
+
+    /// The first check that refuses `tool`, in evaluation order, or `None`
+    /// when Authority admits it.
+    pub(in crate::agent) fn refusal_reason(
+        &self,
+        tool: &str,
+        read_only: Option<bool>,
+    ) -> Option<&'static str> {
         if self.forbids_tool_use {
-            return false;
+            return Some("forbids_tool_use");
         }
         let explicitly_allowed = self.allowed_tool_names.iter().any(|name| name == tool);
         let control_plane = self
@@ -90,7 +99,7 @@ impl<'a> ClosingAuthority<'a> {
             .iter()
             .any(|name| name == tool);
         if !self.allowed_tool_names.is_empty() && !explicitly_allowed && !control_plane {
-            return false;
+            return Some("allowlist");
         }
         // Exact beats broad: a tool the request named explicitly is admitted
         // even when a scope-level prohibition would otherwise cover it (the
@@ -98,14 +107,14 @@ impl<'a> ClosingAuthority<'a> {
         if !explicitly_allowed {
             if let Some(scope) = crate::agent::tool_execution::fallback_tool_semantic_scope(tool) {
                 if self.forbidden_tool_scopes.contains(&scope) {
-                    return false;
+                    return Some("forbidden_scope");
                 }
             }
         }
         if self.forbids_mutation && read_only == Some(false) {
-            return false;
+            return Some("forbids_mutation");
         }
-        true
+        None
     }
 }
 

@@ -943,6 +943,7 @@ const GATE_INTERVENTION_CODES: &[&str] = &[
     "negative_completion_contract",
     "verification_pending",
     "scheduled_run_budget_pressure",
+    "assessor_would_refuse",
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]

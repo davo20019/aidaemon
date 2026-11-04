@@ -153,7 +153,7 @@ impl CompletionContract {
     /// name-level allowlist (and so no control-plane carve-out either).
     ///
     /// No longer enforced: tool authority is resolved from explicit facts
-    /// (`agent::authority`). Kept for shadow comparison with it.
+    /// (`agent::authority`). Not read by any gate.
     #[allow(dead_code)]
     pub(crate) fn authority(&self) -> RequestAuthority<'_> {
         RequestAuthority {
@@ -162,6 +162,18 @@ impl CompletionContract {
             allowed_tool_names: &[],
             forbidden_tool_scopes: &self.forbidden_tool_scopes,
             owner_control_plane_tools: &[],
+        }
+    }
+
+    /// The full assessed authority view, allowlist included. Used only for
+    /// `assessor_would_refuse` shadow logging; never a gate.
+    pub(crate) fn authority_as_assessed(&self) -> RequestAuthority<'_> {
+        RequestAuthority {
+            forbids_mutation: self.forbids_mutation,
+            forbids_tool_use: self.forbids_tool_use,
+            allowed_tool_names: &self.allowed_tool_names,
+            forbidden_tool_scopes: &self.forbidden_tool_scopes,
+            owner_control_plane_tools: &self.owner_control_plane_tools,
         }
     }
 

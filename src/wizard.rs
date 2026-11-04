@@ -816,6 +816,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
             name: candidate,
             persona_file: None,
             engine: Default::default(),
+            task_assessment: Default::default(),
         };
         match candidate_config.validated_name() {
             Ok(name) => break name,

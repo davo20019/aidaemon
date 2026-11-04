@@ -155,6 +155,11 @@ impl MockProvider {
         Ok(())
     }
 
+    /// Scripted task-assessment responses nobody requested.
+    pub async fn unconsumed_task_assessments(&self) -> usize {
+        self.task_assessment_responses.lock().await.len()
+    }
+
     /// Simulate a provider/model that rejects advanced per-call options.
     /// Useful for testing compatibility fallback paths.
     pub fn rejecting_non_default_options(mut self) -> Self {

@@ -578,3 +578,117 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         Authority::read_only()
     );
 }
+
+/// The `assessor_would_refuse` decision points recorded for a session.
+async fn assessor_would_refuse_points(
+    harness: &crate::testing::TestHarness,
+    session_id: &str,
+) -> Vec<serde_json::Value> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point'",
+    )
+    .bind(session_id)
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .filter(|data| data["code"] == "assessor_would_refuse")
+        .collect()
+}
+
+async fn run_owner_write_with_assessment(
+    session_id: &str,
+    setting: crate::config::TaskAssessmentSetting,
+) -> (crate::testing::TestHarness, std::path::PathBuf) {
+    let dir = authority_test_dir();
+    let target = dir.join("a.txt");
+    let base =
+        MockProvider::semantic_task_assessment("action", true, false, &[], "new_request", "none");
+    let mut assessment: serde_json::Value =
+        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+    assessment["contract"]["mutation_scope"] = json!("read_only");
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": target, "content": "hello"}).to_string(),
+        ),
+        MockProvider::text_response("Wrote the file."),
+    ])
+    .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .set_sdk_engine(crate::agent::sdk_engine::SdkEngineSettings {
+            task_assessment: setting,
+            ..Default::default()
+        });
+    harness
+        .agent
+        .handle_message(
+            session_id,
+            &format!("Write hello to {}", target.display()),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+    (harness, target)
+}
+
+#[tokio::test]
+async fn shadow_records_would_refuse_without_blocking() {
+    let (harness, target) = run_owner_write_with_assessment(
+        "tg_authority_shadow",
+        crate::config::TaskAssessmentSetting::Shadow,
+    )
+    .await;
+    assert!(target.is_file(), "shadow logging must not block the write");
+    let points = assessor_would_refuse_points(&harness, "tg_authority_shadow").await;
+    assert!(
+        points.iter().any(|data| {
+            data["metadata"]["reason"] == "forbids_mutation"
+                && data["metadata"]["tool"] == "write_file"
+        }),
+        "expected a forbids_mutation would-refuse point, got {points:?}"
+    );
+    let _ = std::fs::remove_dir_all(target.parent().unwrap());
+}
+
+#[tokio::test]
+async fn on_does_not_record_would_refuse() {
+    let (harness, target) = run_owner_write_with_assessment(
+        "tg_authority_on",
+        crate::config::TaskAssessmentSetting::On,
+    )
+    .await;
+    assert!(target.is_file());
+    assert!(assessor_would_refuse_points(&harness, "tg_authority_on")
+        .await
+        .is_empty());
+    let _ = std::fs::remove_dir_all(target.parent().unwrap());
+}
+
+#[tokio::test]
+async fn assessment_off_skips_the_model_call() {
+    let (harness, target) = run_owner_write_with_assessment(
+        "tg_authority_off",
+        crate::config::TaskAssessmentSetting::Off,
+    )
+    .await;
+    assert_eq!(
+        harness.provider.unconsumed_task_assessments().await,
+        1,
+        "the task-assessment request must not be made"
+    );
+    assert!(target.is_file(), "the turn still completes its work");
+    assert!(assessor_would_refuse_points(&harness, "tg_authority_off")
+        .await
+        .is_empty());
+    let _ = std::fs::remove_dir_all(target.parent().unwrap());
+}

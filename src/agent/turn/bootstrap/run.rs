@@ -1302,6 +1302,10 @@ pub(in crate::agent) async fn run_bootstrap(
         session_id,
         task_id: &task_id,
     });
+    // `task_assessment = "off"`: the contract model call is skipped like an
+    // unavailable assessment, while the dialogue-relationship lane still runs.
+    let assessment_disabled =
+        agent.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Off;
     let (task_plan, task_assessment_attempted, relationship_fallback) =
         if let Some(reason) = planner_skip_reason {
             agent
@@ -1320,35 +1324,58 @@ pub(in crate::agent) async fn run_bootstrap(
                 .await;
             (None, false, None)
         } else {
-            agent
-                .emit_decision_point(
-                    &emitter,
-                    &task_id,
-                    0,
-                    assessment_decision_type,
-                    "Task assessment attempted".to_string(),
-                    crate::agent::hand_holding_telemetry::planner_result_metadata(
-                        "attempted",
-                        planner_model,
-                        planner_trust_tier,
-                        crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
-                        None,
-                    ),
-                )
-                .await;
+            if assessment_disabled {
+                agent
+                    .emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        assessment_decision_type,
+                        "Task assessment skipped".to_string(),
+                        crate::agent::hand_holding_telemetry::planner_skip_metadata(
+                            "assessment_disabled_by_config",
+                            &model,
+                            planner_trust_tier,
+                        ),
+                    )
+                    .await;
+            } else {
+                agent
+                    .emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        assessment_decision_type,
+                        "Task assessment attempted".to_string(),
+                        crate::agent::hand_holding_telemetry::planner_result_metadata(
+                            "attempted",
+                            planner_model,
+                            planner_trust_tier,
+                            crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
+                            None,
+                        ),
+                    )
+                    .await;
+            }
             // Contract and dialogue relationship are independent read-only
             // producers. Run them concurrently under their own deadlines so a
             // slow contract model cannot delay the lightweight relationship lane.
             // Contract authority and obligations belong to the current request
             // only. Prior conversation is visible exclusively to the relationship
             // producer; carryover must cross its typed antecedent/adoption edge.
-            let contract_future = super::task_planning::generate_task_plan(
-                llm_provider.clone(),
-                &planner_models,
-                user_text,
-                assessment_mode,
-                planner_telemetry,
-            );
+            let contract_future = async {
+                if assessment_disabled {
+                    return None;
+                }
+                super::task_planning::generate_task_plan(
+                    llm_provider.clone(),
+                    &planner_models,
+                    user_text,
+                    assessment_mode,
+                    planner_telemetry,
+                )
+                .await
+            };
             let relationship_future = async {
                 // Ingress already reduced an unresolved request to a typed
                 // follow-up/clarification edge. Do not make that persisted
@@ -1378,7 +1405,7 @@ pub(in crate::agent) async fn run_bootstrap(
                 }
             };
             let (task_plan, relationship) = tokio::join!(contract_future, relationship_future);
-            (task_plan, true, relationship)
+            (task_plan, !assessment_disabled, relationship)
         };
     let available_tool_names = tool_defs
         .iter()

@@ -274,7 +274,7 @@ all succeeded or were credited closes as `succeeded` with
 
 The ledger-first arbiter (`RunAggregate::closeout`, admissibility in
 `src/agent/turn/closeout.rs`) is the intended home for any new "may the loop
-demand more work?" decision: authority gates admission, expectations are
+demand more work?" decision: the explicit Authority gates admission, expectations are
 verified by receipts, and only a *reachable* expectation may ask for another
 pass. It is authoritative: the completion phase asks for more work only on a
 `reachable` verdict (`ledger_expectations_required`), and records every
@@ -283,9 +283,11 @@ stop-time asks (mandate decision commit, GUI click verification, reply
 repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against
 the same authority and visible tools, each with a budget, and recorded as
 `stop_demand` decision points; a new stop-time ask is a new `StopDemand`,
-not a new check. `CompletionContract::authority()`
-is the only contract view a gate may read; `expectations()` is verified by
-receipts, never enforced directly. Do not add a gate anywhere else.
+not a new check. Tool authority is
+never read from the assessed contract: `CompletionContract::authority()` is no
+longer a gate, and `authority_as_assessed()` exists only for `assessor_would_refuse`
+shadow logging. `expectations()` is verified by receipts, never enforced
+directly. Do not add a gate anywhere else.
 
 Do not add new obligation classes, cardinality features, stop-trigger kinds,
 or response-projection rules to make a single live test pass. If a live
@@ -301,7 +303,12 @@ checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
 model's own typed statement of what it will do, so open reachable checklist
 items are demanded even after other work completed and a run that ends with
 one open is `partial`, not evidence-closed. Only receipts close either kind;
-the assessor keeps the authority lane (forbids, allowed tools, scopes).
+authority comes only from the explicit `Authority` (role, workspace grant,
+goal workspace, session mode, config) enforced by the kernel `AuthorityHook`.
+The assessor's contract is an expectations hint and, with `task_assessment =
+"shadow"` (the default; `on` behaves the same without recording, `off` skips the
+assessment call), a logged comparison. `CompletionContract::authority()` is no
+longer a gate.
 
 ## Test & Fixture Data Hygiene
 
@@ -406,7 +413,9 @@ append-only transcript, so low reuse there means something rewrote the prefix
 any change to message assembly or provider request building.
 
 `--gate-outcomes` (with `--eval-hours N`) measures gates by what happened after
-they intervened: each gate decision point or tool refusal is grouped by gate and
+they intervened (while `task_assessment = "shadow"`, `assessor_would_refuse`
+rows appear there too: calls the assessor's authority view would have refused,
+which ran anyway): each gate decision point or tool refusal is grouped by gate and
 its task labelled with the goal run's terminal status (else its `task_end`
 status). Check it before calling a gate "too strict" or "working".
 
