@@ -424,6 +424,32 @@ async fn readonly_blocks_writes_then_full_restores() {
 
     turn("Write a file.").await;
     assert!(!blocked.exists(), "a write is refused in read-only mode");
+    // The run that was refused its only requested write is not recorded as
+    // credited work: it closes at the authority boundary (proof basis
+    // `policy_denial`), and its eval scores the forbidden attempt.
+    let denied_end = agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::TaskEnd], 5)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end for the refused write");
+    assert_eq!(
+        denied_end
+            .completion_proof
+            .as_ref()
+            .and_then(|proof| proof.proof_basis),
+        Some(crate::events::TaskProofBasis::PolicyDenial),
+        "the refused write closes at the authority boundary, not as credited work; \
+         status={:?} outcome={:?}",
+        denied_end.status,
+        denied_end.effective_outcome()
+    );
+    let eval = denied_end.harness_eval.as_ref().expect("harness eval");
+    assert!(eval.quality.contract.forbids_mutation);
+    assert_eq!(eval.quality.contract.forbidden_mutation_attempts, 1);
+    assert_eq!(eval.scores.contract_fulfillment, 0.0);
     turn("List the directory.").await;
 
     let results = {
@@ -484,26 +510,74 @@ async fn readonly_blocks_writes_then_full_restores() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The real `spawn_agent`, offered on a cheap-profile test turn: the policy
+/// filter prunes high-impact writers there, so this reports
+/// `high_impact_write: false`. It stays a mutation (`read_only: false`), which
+/// is what the authority gate judges.
+struct OfferedSpawnAgent(Arc<crate::tools::spawn::SpawnAgentTool>);
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for OfferedSpawnAgent {
+    fn name(&self) -> &str {
+        crate::traits::Tool::name(self.0.as_ref())
+    }
+
+    fn description(&self) -> &str {
+        crate::traits::Tool::description(self.0.as_ref())
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        crate::traits::Tool::schema(self.0.as_ref())
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        crate::traits::Tool::call(self.0.as_ref(), arguments).await
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            high_impact_write: false,
+            ..crate::traits::Tool::capabilities(self.0.as_ref())
+        }
+    }
+}
+
+/// A read-only parent cannot get a write done through a child: `spawn_agent`
+/// is itself a mutation, so the authority gate refuses the delegation before
+/// any child exists. (That a child is never wider than its parent is pinned
+/// by `child_authority_is_the_narrower_of_parent_mode_and_inherited`.)
 #[tokio::test]
 async fn readonly_parent_child_cannot_write() {
     let dir = authority_test_dir();
     let target = dir.join("child.txt");
     let session = "tg_authority_readonly_child";
-    // The child (a fresh specialist session) tries to write, then finishes.
+    // The parent tries to delegate the write; a child would then write.
     let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "spawn_agent",
+            &json!({"mission": "Write a note", "task": "Write the note file."}).to_string(),
+        ),
+        MockProvider::text_response("I could not delegate the write."),
         MockProvider::tool_call_response(
             "write_file",
             &json!({"path": target, "content": "child"}).to_string(),
         ),
         MockProvider::text_response("Child done."),
     ]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
+    ];
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
         .await
         .unwrap();
+    harness.agent.set_test_orchestrator_mode();
     let state = Arc::clone(&harness.state);
     let provider = Arc::clone(&harness.provider);
     let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
     let commands = crate::channels::commands::CommandContext {
         agent: agent.clone(),
         state: state.clone(),
@@ -515,23 +589,39 @@ async fn readonly_parent_child_cannot_write() {
         .await
         .unwrap();
 
-    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
-    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 60)
-        .with_state(state as Arc<dyn crate::traits::StateStore>);
-    let spawn_result = crate::traits::Tool::call(
-        &spawn_tool,
-        &json!({
-            "mission": "Write a note",
-            "task": "Write the note file.",
-            "specialist": "code",
-            "_session_id": session,
-        })
-        .to_string(),
-    )
-    .await;
+    agent
+        .handle_message(
+            session,
+            "Have a specialist write the note file.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
 
-    let _ = (&provider, &spawn_result);
-    assert!(!target.exists(), "a child of a read-only parent cannot write");
+    let results = {
+        let log = provider.call_log.lock().await;
+        let mut seen = Vec::new();
+        for call in log.iter() {
+            for message in call.messages.iter().filter(|m| m["role"] == "tool") {
+                if let Some(content) = message["content"].as_str() {
+                    if !seen.iter().any(|s: &String| s == content) {
+                        seen.push(content.to_string());
+                    }
+                }
+            }
+        }
+        seen
+    };
+    assert!(
+        results
+            .iter()
+            .any(|r| r.contains("[AUTHORITY BLOCKED] `spawn_agent`")),
+        "spawn_agent is refused by the authority gate under read-only; saw {results:?}"
+    );
+    assert!(!target.exists(), "a read-only parent cannot write through a child");
     let _ = std::fs::remove_dir_all(dir);
 }
 

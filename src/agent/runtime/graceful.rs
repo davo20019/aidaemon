@@ -904,6 +904,15 @@ impl Agent {
             {
                 crate::events::RunTerminalDecision::SucceededByEvidence
             }
+            // Without a contract (assessment off or unavailable) a run whose
+            // only terminal receipts are typed policy denials closed at the
+            // same authority boundary a contracted run does: record it so,
+            // never as uncredited plain success.
+            crate::events::RunTerminalDecision::Unspecified
+                if run_aggregate.terminal_policy_denial() =>
+            {
+                crate::events::RunTerminalDecision::ClosedByPolicyDenial
+            }
             decision => decision,
         };
         let effective_outcome = match (effective_status, terminal_decision) {
