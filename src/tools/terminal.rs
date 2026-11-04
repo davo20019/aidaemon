@@ -7310,11 +7310,18 @@ fn terminal_run_annotations(
         .chain(args.write_roots.iter())
         .any(|path| !path.trim().is_empty());
     let read_only = !has_write_targets && !args.network && effects.observation_only;
+    // Writing into git configuration changes what later git commands run.
+    let plants_git_config = args
+        .write_paths
+        .iter()
+        .chain(args.write_roots.iter())
+        .any(|path| crate::tools::command_effects::is_git_config_path(path));
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
         idempotent: read_only,
-        egress: args.network
+        egress: plants_git_config
+            || args.network
             || effects.deletes
             || crate::tools::command_effects::fetches_network(text)
             || (!run_is_confined(confinement) && !effects.observation_only),
@@ -9335,7 +9342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_terminal_backstop_blocks_undeclared_rm() {
+    async fn readonly_terminal_backstop_blocks_an_undeclared_redirect_write() {
         let dir = std::env::temp_dir()
             .join("aidaemon-test")
             .join(uuid::Uuid::new_v4().to_string());
@@ -9506,6 +9513,38 @@ mod tests {
             let ann = host.call_annotations(&args);
             assert!(ann.egress && !ann.read_only, "{command}");
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_writes_into_git_config_are_egress() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |args: serde_json::Value| tool.call_annotations(&args.to_string());
+        let config = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.git/config"]
+        }));
+        assert!(config.egress && !config.read_only);
+        let root = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_roots":["/tmp/aidaemon-test/r/.git"]
+        }));
+        assert!(root.egress);
+        let plain = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/x"]
+        }));
+        assert!(!plain.egress);
     }
 
     #[tokio::test]

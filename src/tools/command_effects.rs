@@ -127,7 +127,7 @@ const NETWORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
 /// Whether any command (behind wrappers, groupings, substitutions and
 /// `sh -c`) is a known network-reaching executable or subcommand.
 pub(crate) fn fetches_network(command: &str) -> bool {
-    if command.contains("/dev/tcp/") || command.contains("/dev/udp/") {
+    if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return true;
     }
     expanded_commands(command).iter().any(|tokens| {
@@ -156,14 +156,24 @@ pub(crate) fn fetches_network(command: &str) -> bool {
     })
 }
 
+/// Whether writing `path` can plant git configuration (a `.git` component,
+/// `.gitattributes`, or `.gitmodules`). A structural path fact.
+pub(crate) fn is_git_config_path(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|part| matches!(part, ".git" | ".gitattributes" | ".gitmodules"))
+}
+
 pub(crate) fn command_effects(command: &str) -> CommandEffects {
-    let deletes = expanded_commands(command).iter().any(|tokens| {
-        let program = basename(&tokens[0]);
-        let args = &tokens[1..];
-        DELETE_PROGRAMS.contains(&program)
-            || (program == "find" && args.iter().any(|arg| arg == "-delete"))
-            || (program == "git" && args.iter().any(|arg| arg == "clean"))
-    });
+    // ANSI-C quoting (`$'..'`) escapes quotes in a way the scan cannot
+    // follow, so a command may hide behind it: over-report.
+    let deletes = command.contains("$'")
+        || expanded_commands(command).iter().any(|tokens| {
+            let program = basename(&tokens[0]);
+            let args = &tokens[1..];
+            DELETE_PROGRAMS.contains(&program)
+                || (program == "find" && args.iter().any(|arg| arg == "-delete"))
+                || (program == "git" && args.iter().any(|arg| arg == "clean"))
+        });
     CommandEffects {
         observation_only: is_observation_only(command),
         deletes,
@@ -244,7 +254,7 @@ fn scan(command: &str) -> Scan {
                 unsafe_syntax = true;
                 cur.push(c);
             }
-            '$' if next == Some('(') => {
+            '$' if next == Some('(') || (next == Some('\'') && !in_double) => {
                 unsafe_syntax = true;
                 cur.push(c);
             }
@@ -371,6 +381,28 @@ fn is_observation_only(command: &str) -> bool {
     any
 }
 
+/// `tree` is observation-only with only these read-only flags; `-o FILE` and
+/// `-R` write files and anything unknown is rejected.
+fn tree_args_ok(args: &[String]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if matches!(arg.as_str(), "-L" | "-I" | "-P") {
+            if iter.next().is_none() {
+                return false;
+            }
+        } else if let Some(long) = arg.strip_prefix("--") {
+            if !matches!(long, "noreport" | "dirsfirst") {
+                return false;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-') {
+            if cluster.is_empty() || !cluster.chars().all(|c| "adfshDCn".contains(c)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.chars().any(|c| letters.contains(&c))
 }
@@ -392,8 +424,14 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
                 || a.starts_with("--output")
                 || short_cluster_has(a, &['o'])
         }),
-        "tree" => !any(&|a| a == "-o"),
-        "uniq" => args.iter().filter(|arg| !arg.starts_with('-')).count() < 2,
+        // A bare `-` is a positional (stdin), so `uniq - out` writes `out`.
+        "uniq" => {
+            args.iter()
+                .filter(|arg| !arg.starts_with('-') || arg.as_str() == "-")
+                .count()
+                < 2
+        }
+        "tree" => tree_args_ok(args),
         "date" => args.is_empty() || (args.len() == 1 && args[0].starts_with('+')),
         "hostname" => args.is_empty(),
         "file" => !any(&|a| {
@@ -402,9 +440,10 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
         "git" => {
             let mut index = 0;
             while let Some(arg) = args.get(index).filter(|arg| arg.starts_with('-')) {
-                if arg == "-C" {
-                    index += 2;
-                    continue;
+                // The classifier has no roots, so it cannot vouch for a
+                // redirected repository.
+                if arg == "-C" || arg.starts_with("--git-dir") || arg.starts_with("--work-tree") {
+                    return false;
                 }
                 if arg == "-c" || arg.starts_with("--config-env") || arg.starts_with("--exec-path")
                 {
@@ -547,8 +586,9 @@ mod tests {
             "git branch --list",
             "git branch",
             "find . -name '*.rs'",
-            "git -C d status",
             "date +%Y",
+            "tree -a -L 2",
+            "uniq -c f",
             "date",
             "/usr/bin/ls",
             "rg -n foo src",
@@ -622,6 +662,18 @@ mod tests {
             "/tmp/evil/ls",
             "./ls",
             "echo a #b",
+            "echo $'\\'' > out \\'",
+            "echo $'a\\'' ; rm -rf x ; echo \\'",
+            "echo $'a\\'' ; curl example.invalid ; echo \\'",
+            "uniq - out",
+            "uniq -c - out",
+            "tree -ao out",
+            "tree -R",
+            "tree --weird",
+            "git -C d status",
+            "git --git-dir=d status",
+            "git --git-dir d status",
+            "git --work-tree=d status",
         ] {
             assert!(
                 !command_effects(mutating).observation_only,
@@ -693,6 +745,39 @@ mod tests {
             "yarn test",
         ] {
             assert!(!fetches_network(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn ansi_c_quoting_over_reports_effects() {
+        for hidden in [
+            "echo $'a\\'' ; rm -rf x ; echo \\'",
+            "echo $'a\\'' ; curl example.invalid ; echo \\'",
+        ] {
+            assert!(command_effects(hidden).deletes, "{hidden}");
+            assert!(fetches_network(hidden), "{hidden}");
+        }
+    }
+
+    #[test]
+    fn git_config_paths_are_structural() {
+        for path in [
+            "/repo/.git/config",
+            ".git/hooks/pre-commit",
+            "a/.git",
+            "/repo/sub/.gitattributes",
+            ".gitmodules",
+            "C:\\repo\\.git\\config",
+        ] {
+            assert!(is_git_config_path(path), "{path}");
+        }
+        for path in [
+            "/repo/.github/x.yml",
+            "/repo/src/git.rs",
+            "a/.gitignore",
+            "/repo/gitattributes",
+        ] {
+            assert!(!is_git_config_path(path), "{path}");
         }
     }
 

@@ -89,6 +89,20 @@ impl Tool for WriteFileTool {
             .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        let semantics = self.call_semantics(arguments);
+        let mut annotations =
+            crate::traits::default_call_annotations(self.capabilities(), &semantics);
+        // A write that can plant git configuration changes what later
+        // "read-only" git commands execute: treat it as a configuration change.
+        let plants_git_config = semantics
+            .target_hints
+            .iter()
+            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
+        annotations.egress |= plants_git_config;
+        annotations
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         // Parameter aliasing: models often use "file_path" or "file" instead of "path"
@@ -336,6 +350,17 @@ mod durable_replay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_config_targets_are_configuration_egress() {
+        let tool = WriteFileTool;
+        let ann = |path: &str| tool.call_annotations(&json!({"path": path}).to_string());
+        let config = ann("/tmp/aidaemon-test/repo/.git/config");
+        assert!(config.egress && !config.read_only);
+        assert!(ann("/tmp/aidaemon-test/repo/.gitattributes").egress);
+        let plain = ann("/tmp/aidaemon-test/repo/src/lib.rs");
+        assert!(!plain.egress && !plain.read_only);
+    }
 
     #[test]
     fn test_schema_has_required_fields() {
