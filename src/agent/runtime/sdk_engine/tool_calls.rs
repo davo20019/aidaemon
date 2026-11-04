@@ -420,10 +420,6 @@ impl Agent {
             }
         };
         ctx.mandate_authority = grant.as_ref();
-        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
-            self.record_assessor_would_refuse(scope, &request.name, arguments)
-                .await;
-        }
 
         // Before a call enters a deeper subtree, newly applicable nested
         // project instructions are loaded and the call is deliberately not
@@ -445,6 +441,12 @@ impl Agent {
             if already_sent {
                 return self.sdk_suppress_duplicate_send(scope, request).await;
             }
+        }
+        // Shadow comparison, once per executed call (after deferral and
+        // duplicate suppression so a retried call is not counted twice).
+        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
+            self.record_assessor_would_refuse(scope, &request.name, arguments)
+                .await;
         }
         // Calls with side effects carry an idempotency key, bound to
         // the task and the canonical arguments: a repeat reuses the durable

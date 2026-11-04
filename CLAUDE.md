@@ -266,8 +266,10 @@ coverage for a genuinely separate request or an explicit user constraint.
 The completion contract (`RunAggregate` obligations, cardinalities, evidence
 scopes, dispatch-stop rules, response contracts) is an LLM-proposed description
 of the work, produced by a small model several times per turn. It is a planning
-hint and a fail-closed safety boundary, not the arbiter of whether work
-happened. Observed receipts are the ground truth: a run whose terminal receipts
+hint (and, while `task_assessment = "shadow"`, a logged comparison), not the
+arbiter of whether work happened and not a source of tool authority: that comes
+only from the explicit `Authority` enforced by the kernel `AuthorityHook`, and
+a no-tools contract may only reduce what the loop demands. Observed receipts are the ground truth: a run whose terminal receipts
 all succeeded or were credited closes as `succeeded` with
 `proof_basis=evidence` even when the contract could not credit it
 (`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
