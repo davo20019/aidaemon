@@ -18,7 +18,9 @@ pub enum Safeguard {
     Scope,
     /// Output from tools the agent does not control (web pages, MCP
     /// servers, third-party APIs) reaches the model marked as data, not
-    /// instructions.
+    /// instructions, and calls with egress made after reading it are
+    /// verified by a clean check or, by the owner's explicit choice,
+    /// recorded.
     UntrustedOutput,
 }
 

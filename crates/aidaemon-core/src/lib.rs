@@ -30,13 +30,14 @@ mod state;
 mod store;
 mod stuck;
 mod tool;
+mod untrusted;
 
 #[cfg(feature = "testing")]
 pub mod conformance;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use agent::{Agent, AgentBuilder, Resolution};
+pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
 pub use authority::{AccessLevel, Authority, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
@@ -56,6 +57,10 @@ pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
     AccessManifest, FnTool, SourceTrust, Tool, ToolAnnotations, ToolContext, ToolError, ToolInfo,
     ToolOutput, ToolResult,
+};
+
+pub use untrusted::{
+    is_untrusted_egress, UntrustedHook, UntrustedMode, UNTRUSTED_EGRESS_INTERRUPT,
 };
 
 /// Re-exported so tools can observe cancellation without adding the dependency.

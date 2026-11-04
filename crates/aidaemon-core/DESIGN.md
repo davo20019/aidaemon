@@ -149,6 +149,15 @@ in it may run twice (see "Idempotent replay" below).
   for tools with their own timeout argument.
 - **Derived agents.** `Agent::with_limits` and `Agent::with_hook` give a
   child agent its own budget or policies without rebuilding it.
+- **Untrusted content.** Tools declare who authored their output
+  (`Tool::source_trust`) and whether a call acts outside the workspace
+  (`ToolAnnotations::egress`); the run records taint in
+  `RunState::untrusted_seen`. `UntrustedHook` marks untrusted output as data
+  and, in `Enforce` mode, interrupts egress calls made after taint.
+  `Agent::run_resolving` settles such interruptions through an
+  `InterruptResolver` (a clean-check verifier, an approval UI), approving the
+  exact call it was shown or denying it with a reason. `MarkOnly` runs the
+  call and leaves `after_untrusted` on its receipt.
 
 ## Images
 

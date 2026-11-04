@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{BuildError, CoreError};
@@ -8,14 +9,21 @@ use crate::event::EventSink;
 use crate::hook::Hook;
 use crate::limits::{Limits, StopCondition};
 use crate::message::Message;
-use crate::outcome::RunOutcome;
+use crate::outcome::{RunOutcome, RunStatus};
 use crate::provider::{Provider, ToolSpec};
 use crate::run_loop::Driver;
 use crate::safeguard::Safeguard;
-use crate::state::{RunState, RUN_STATE_SCHEMA};
+use crate::state::{Interruption, RunState, RUN_STATE_SCHEMA};
 use crate::store::RunStore;
 use crate::stuck::StuckConfig;
 use crate::tool::Tool;
+
+/// Settles interruptions inside [`Agent::run_resolving`]: a clean-check
+/// verifier, an approval UI, a policy. `None` leaves the run interrupted.
+#[async_trait]
+pub trait InterruptResolver: Send + Sync {
+    async fn resolve(&self, state: &RunState, interruption: &Interruption) -> Option<Resolution>;
+}
 
 /// How to settle the call an interrupted run is waiting on.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +130,29 @@ impl Agent {
             return Err(CoreError::PendingInterruption);
         }
         Driver::new(&self.inner, state, cancel).drive(None).await
+    }
+
+    /// Like [`Agent::run_from`], but settles each interruption with
+    /// `resolver` and continues, until the run ends or the resolver returns
+    /// `None` (the interrupted outcome is then returned as is).
+    pub async fn run_resolving(
+        &self,
+        state: RunState,
+        cancel: CancellationToken,
+        resolver: &dyn InterruptResolver,
+    ) -> Result<RunOutcome, CoreError> {
+        let mut outcome = self.run_from(state, cancel.clone()).await?;
+        loop {
+            let RunStatus::Interrupted { interruption } = &outcome.status else {
+                return Ok(outcome);
+            };
+            let Some(resolution) = resolver.resolve(&outcome.state, interruption).await else {
+                return Ok(outcome);
+            };
+            outcome = self
+                .resume_with_cancel(outcome.state, resolution, cancel.clone())
+                .await?;
+        }
     }
 
     /// Settle the interruption in `state` and keep going. `state` may come
