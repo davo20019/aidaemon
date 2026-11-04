@@ -373,6 +373,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_file_refuses_daemon_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[provider]\nname = \"synthetic\"\n").unwrap();
+        let args = json!({"path": config.to_str().unwrap(), "content": "x = 1"}).to_string();
+        let err = WriteFileTool.call(&args).await.unwrap_err().to_string();
+        assert!(err.contains("sensitive"), "got: {err}");
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("synthetic"));
+
+        let notes = dir.path().join("notes.toml");
+        let args = json!({"path": notes.to_str().unwrap(), "content": "x = 1"}).to_string();
+        WriteFileTool.call(&args).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_write_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("new_file.txt");

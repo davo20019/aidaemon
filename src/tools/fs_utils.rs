@@ -58,7 +58,26 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
     ".htpasswd",
     ".git-credentials",
     "secrets",
+    // The daemon's own config; the owner changes it through `manage_config`.
+    "config.toml",
 ];
+
+/// Env files named by the daemon's own environment variables
+/// (`AIDAEMON_ENV_FILE`, `AIDAEMON_RUNTIME_ENV_FILE`), wherever they live.
+fn is_configured_env_file(path: &Path) -> bool {
+    ["AIDAEMON_ENV_FILE", "AIDAEMON_RUNTIME_ENV_FILE"]
+        .iter()
+        .filter_map(|key| std::env::var_os(key))
+        .filter(|value| !value.is_empty())
+        .any(|value| {
+            let configured = Path::new(&value);
+            configured == path
+                || matches!(
+                    (configured.canonicalize(), path.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        })
+}
 
 /// Files/directories that strongly indicate a project/workspace root.
 pub const PROJECT_ROOT_MARKERS: &[&str] = &[
@@ -810,7 +829,7 @@ pub fn is_sensitive_path(path: &Path) -> bool {
                     .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(pat))
         }
     });
-    if pattern_match {
+    if pattern_match || is_configured_env_file(path) {
         return true;
     }
 
