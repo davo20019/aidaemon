@@ -894,64 +894,12 @@ impl Agent {
         } else {
             status
         };
-        // At task end there is no loop left to make progress: a `Pending`
-        // ledger whose terminal receipts all succeeded or were credited is
-        // closed by evidence (the still-open obligations are descriptions the
-        // contract could not bind to the work that demonstrably happened).
-        let terminal_decision = match run_aggregate.terminal_decision() {
-            crate::events::RunTerminalDecision::Pending
-                if effective_status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
-            {
-                crate::events::RunTerminalDecision::SucceededByEvidence
-            }
-            // Without a contract (assessment off or unavailable) a run whose
-            // only terminal receipts are typed policy denials closed at the
-            // same authority boundary a contracted run does: record it so,
-            // never as uncredited plain success.
-            crate::events::RunTerminalDecision::Unspecified
-                if run_aggregate.terminal_policy_denial() =>
-            {
-                crate::events::RunTerminalDecision::ClosedByPolicyDenial
-            }
-            decision => decision,
-        };
-        let effective_outcome = match (effective_status, terminal_decision) {
-            (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
-            (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
-                crate::events::TaskOutcome::Partial
-            }
-            (
-                _,
-                crate::events::RunTerminalDecision::Succeeded
-                | crate::events::RunTerminalDecision::SucceededByEvidence
-                | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
-            ) => crate::events::TaskOutcome::Succeeded,
-            (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
-            (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
-            // The contract's work is still owed and nothing ran at all: there
-            // is no progress to call partial.
-            (_, crate::events::RunTerminalDecision::Pending)
-                if outcome == crate::events::TaskOutcome::Succeeded
-                    && run_aggregate.operations.is_empty() =>
-            {
-                crate::events::TaskOutcome::Failed
-            }
-            (_, crate::events::RunTerminalDecision::Pending)
-                if outcome == crate::events::TaskOutcome::Succeeded =>
-            {
-                crate::events::TaskOutcome::Partial
-            }
-            (_, crate::events::RunTerminalDecision::Pending) => outcome,
-            // No contract to judge by: receipts are the only proof, and a run
-            // whose operations all failed accomplished nothing, whether it
-            // ended on a reply or was stopped.
-            (_, crate::events::RunTerminalDecision::Unspecified)
-                if run_aggregate.only_failed_operations() =>
-            {
-                crate::events::TaskOutcome::Failed
-            }
-            (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
-        };
+        let (terminal_decision, effective_outcome) = task_end_decision_and_outcome(
+            &run_aggregate,
+            effective_status,
+            outcome,
+            background_in_flight,
+        );
         let durable_tool_calls_count = self
             .event_store
             .task_event_count(
@@ -1362,6 +1310,84 @@ pub(in crate::agent) async fn emit_decision_point_event(
         .await;
 }
 
+/// The run's terminal decision and semantic outcome at task end, from the
+/// replayed aggregate, the effective transport status, and the outcome the
+/// exit path proposed.
+fn task_end_decision_and_outcome(
+    run_aggregate: &crate::events::RunAggregate,
+    effective_status: TaskStatus,
+    outcome: crate::events::TaskOutcome,
+    background_in_flight: bool,
+) -> (
+    crate::events::RunTerminalDecision,
+    crate::events::TaskOutcome,
+) {
+    // At task end there is no loop left to make progress: a `Pending`
+    // ledger whose terminal receipts all succeeded or were credited is
+    // closed by evidence (the still-open obligations are descriptions the
+    // contract could not bind to the work that demonstrably happened).
+    let terminal_decision = match run_aggregate.terminal_decision() {
+        crate::events::RunTerminalDecision::Pending
+            if effective_status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
+        {
+            crate::events::RunTerminalDecision::SucceededByEvidence
+        }
+        // `Unspecified` means no expectations were declared (no assessed
+        // contract and no executor checklist) or none bound to an obligation.
+        // Such a run whose only receipts are typed policy denials, and which
+        // would otherwise close as uncredited plain success, closed at the
+        // authority boundary: record that proof basis. Any other run (failed,
+        // interrupted, cancelled, or proposed failed/partial) keeps its own
+        // outcome; a denial never turns it into success.
+        crate::events::RunTerminalDecision::Unspecified
+            if effective_status == TaskStatus::Completed
+                && outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.terminal_policy_denial() =>
+        {
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        }
+        decision => decision,
+    };
+    let effective_outcome = match (effective_status, terminal_decision) {
+        (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+        (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
+            crate::events::TaskOutcome::Partial
+        }
+        (
+            _,
+            crate::events::RunTerminalDecision::Succeeded
+            | crate::events::RunTerminalDecision::SucceededByEvidence
+            | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
+        ) => crate::events::TaskOutcome::Succeeded,
+        (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
+        (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
+        // The contract's work is still owed and nothing ran at all: there
+        // is no progress to call partial.
+        (_, crate::events::RunTerminalDecision::Pending)
+            if outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.operations.is_empty() =>
+        {
+            crate::events::TaskOutcome::Failed
+        }
+        (_, crate::events::RunTerminalDecision::Pending)
+            if outcome == crate::events::TaskOutcome::Succeeded =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
+        (_, crate::events::RunTerminalDecision::Pending) => outcome,
+        // No contract to judge by: receipts are the only proof, and a run
+        // whose operations all failed accomplished nothing, whether it
+        // ended on a reply or was stopped.
+        (_, crate::events::RunTerminalDecision::Unspecified)
+            if run_aggregate.only_failed_operations() =>
+        {
+            crate::events::TaskOutcome::Failed
+        }
+        (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
+    };
+    (terminal_decision, effective_outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1550,5 +1576,77 @@ mod tests {
             "slack:U018EAFV5QR",
             "aidaemon_coding_bot:301753035"
         ));
+    }
+
+    /// A run with no contract whose only operation was a typed policy
+    /// denial (nothing dispatched).
+    fn denial_only_aggregate() -> crate::events::RunAggregate {
+        let mut aggregate = crate::events::RunAggregate::new("task-denied");
+        let operation = serde_json::from_value(serde_json::json!({
+            "operation_id": "op-denied",
+            "tool_name": "write_file",
+            "policy_denied": true,
+            "mutating": true
+        }))
+        .expect("operation");
+        aggregate
+            .operations
+            .insert("op-denied".to_string(), operation);
+        assert!(aggregate.terminal_policy_denial());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            crate::events::RunTerminalDecision::Unspecified
+        );
+        aggregate
+    }
+
+    #[test]
+    fn policy_denial_closes_an_uncredited_success_at_the_boundary() {
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &denial_only_aggregate(),
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(
+            decision,
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn policy_denial_does_not_turn_a_failed_run_into_success() {
+        let aggregate = denial_only_aggregate();
+        for (status, proposed) in [
+            (TaskStatus::Failed, crate::events::TaskOutcome::Failed),
+            (TaskStatus::Completed, crate::events::TaskOutcome::Failed),
+            (TaskStatus::Completed, crate::events::TaskOutcome::Partial),
+            (TaskStatus::Interrupted, crate::events::TaskOutcome::Partial),
+        ] {
+            let (decision, outcome) =
+                task_end_decision_and_outcome(&aggregate, status, proposed, false);
+            assert_eq!(
+                decision,
+                crate::events::RunTerminalDecision::Unspecified,
+                "{status:?}/{proposed:?}"
+            );
+            assert_eq!(outcome, proposed, "{status:?}/{proposed:?}");
+        }
+    }
+
+    #[test]
+    fn policy_denial_does_not_close_a_cancelled_run() {
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &denial_only_aggregate(),
+            TaskStatus::Cancelled,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_ne!(
+            decision,
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Failed);
     }
 }
