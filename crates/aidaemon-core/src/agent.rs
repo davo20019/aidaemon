@@ -159,10 +159,7 @@ impl Agent {
             .without_run_end()
             .drive(None)
             .await?;
-        loop {
-            let RunStatus::Interrupted { interruption } = &outcome.status else {
-                break;
-            };
+        while let RunStatus::Interrupted { interruption } = &outcome.status {
             let Some(resolution) = resolver.resolve(&outcome.state, interruption).await else {
                 break;
             };
