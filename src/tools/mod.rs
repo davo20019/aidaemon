@@ -88,6 +88,7 @@ pub use manage_skills::ManageSkillsTool;
 pub use report_blocker::ReportBlockerTool;
 pub use skill_resources::SkillResourcesTool;
 pub use use_skill::UseSkillTool;
+pub(crate) mod command_effects;
 pub mod command_patterns;
 pub mod command_risk;
 pub mod daemon_guard;

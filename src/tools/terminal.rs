@@ -6448,37 +6448,10 @@ impl TerminalTool {
 
                 let command_semantics =
                     terminal_run_semantics_from_access(true, !declared_write_paths.is_empty());
-                let mut precomputed_semantic_assessment = None;
                 if mutation_forbidden
-                    && (command_semantics.mutates_state()
-                        || command_semantics.effect == crate::traits::ToolCallEffect::Unknown)
+                    && !terminal_run_annotations(&args, self.confinement).read_only
                 {
-                    if command_semantics.mutates_state() {
-                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
-                    }
-                    let Some(runtime) = self.command_risk_runtime.get() else {
-                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: this command's effects are ambiguous and semantic assessment is unavailable.").with_semantics(command_semantics));
-                    };
-                    match assess_command(
-                        runtime,
-                        command,
-                        &self.backend,
-                        &args._session_id,
-                        self.state.as_ref(),
-                        self.event_store.clone(),
-                    )
-                    .await
-                    {
-                        Ok(semantic) if semantic.observation_only => {
-                            precomputed_semantic_assessment = Some(semantic);
-                        }
-                        Ok(_) => {
-                            return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: semantic effect assessment did not prove that every command effect is observational.").with_semantics(command_semantics));
-                        }
-                        Err(error) => {
-                            return Ok(ToolCallOutcome::blocked(format!("Blocked by the explicit read-only contract: semantic effect assessment failed closed ({error}).")).with_semantics(command_semantics));
-                        }
-                    }
+                    return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command is not proven observation-only. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                 }
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
@@ -6693,10 +6666,6 @@ impl TerminalTool {
                 } else if let Some(reason) = deterministic_approval_floor {
                     approval_warnings.push(reason);
                     true
-                } else if let Some(semantic) = precomputed_semantic_assessment {
-                    approval_risk = semantic.risk_level;
-                    approval_warnings = semantic.warnings;
-                    semantic.requires_approval
                 } else if let Some(runtime) = self.command_risk_runtime.get() {
                     match assess_command(
                         runtime,
@@ -7321,6 +7290,36 @@ fn terminal_run_semantics_from_access(
     ToolCallSemantics::default()
 }
 
+/// Authority view of a `run`: typed from the command's structure, not from
+/// the declared write targets alone (the ledger view,
+/// `terminal_call_semantics`, deliberately stays separate).
+fn terminal_run_annotations(
+    args: &TerminalArgs,
+    confinement: crate::types::TerminalConfinement,
+) -> aidaemon_core::ToolAnnotations {
+    let text = match (args.command.as_deref(), args.script.as_deref()) {
+        (Some(command), None) => command,
+        (None, Some(script)) => script,
+        // Neither or both is an invalid run; never read-only.
+        _ => "",
+    };
+    let effects = crate::tools::command_effects::command_effects(text);
+    let has_write_targets = args
+        .write_paths
+        .iter()
+        .chain(args.write_roots.iter())
+        .any(|path| !path.trim().is_empty());
+    let read_only = !has_write_targets && !args.network && effects.observation_only;
+    aidaemon_core::ToolAnnotations {
+        read_only,
+        destructive: effects.deletes,
+        idempotent: read_only,
+        egress: args.network
+            || effects.deletes
+            || (!run_is_confined(confinement) && !effects.observation_only),
+    }
+}
+
 fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
     let args = serde_json::from_str::<Value>(arguments).ok();
     let action = args
@@ -7612,6 +7611,42 @@ impl Tool for TerminalTool {
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         terminal_call_semantics(arguments)
+    }
+
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+            return aidaemon_core::ToolAnnotations::WRITE;
+        };
+        match args.action.trim().to_ascii_lowercase().as_str() {
+            "check" => aidaemon_core::ToolAnnotations::READ_ONLY,
+            "kill" => aidaemon_core::ToolAnnotations::WRITE,
+            // Changes a standing rule.
+            "trust_all" => aidaemon_core::ToolAnnotations {
+                egress: true,
+                ..aidaemon_core::ToolAnnotations::WRITE
+            },
+            _ => terminal_run_annotations(&args, self.confinement),
+        }
+    }
+
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+            return aidaemon_core::SourceTrust::Untrusted;
+        };
+        let reads_outside_roots = args
+            .read_paths
+            .iter()
+            .chain(args.read_roots.iter())
+            .any(|path| !roots.contains(path));
+        if args.network || !run_is_confined(self.confinement) || reads_outside_roots {
+            aidaemon_core::SourceTrust::Untrusted
+        } else {
+            aidaemon_core::SourceTrust::Trusted
+        }
     }
 
     fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
@@ -9288,7 +9323,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_contract_allows_semantically_proven_novel_observation() {
+    async fn readonly_terminal_backstop_blocks_undeclared_rm() {
+        let dir = std::env::temp_dir()
+            .join("aidaemon-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("x");
+        std::fs::write(&target, "keep").unwrap();
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("rm -rf {}", target.display()),
+            "_session_id": "telegram:synthetic-owner",
+            "_user_role": "Owner"
+        })
+        .to_string();
+        let outcome = tool
+            .call_with_execution_context(
+                &args,
+                None,
+                ToolExecutionContext {
+                    mutation_forbidden: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("typed blocked outcome");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
+        assert!(target.exists(), "the file must survive the blocked rm");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_trust_follows_network_and_roots() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let sandboxed = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool.clone(),
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots(&roots_list);
+        let trust = |tool: &TerminalTool, args: serde_json::Value| {
+            tool.output_trust(&args.to_string(), &roots)
+        };
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"ls","network":true})
+            ),
+            SourceTrust::Untrusted
+        );
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"cat f","read_paths":["/tmp/aidaemon-other/f"]})
+            ),
+            SourceTrust::Untrusted
+        );
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"cat f","read_paths":["/tmp/aidaemon-test/project/f"]})
+            ),
+            SourceTrust::Trusted
+        );
+        assert_eq!(
+            trust(&host, serde_json::json!({"action":"run","command":"ls"})),
+            SourceTrust::Untrusted
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_contract_blocks_commands_outside_the_observation_table() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
@@ -9321,13 +9464,19 @@ mod tests {
                 },
             )
             .await
-            .expect("read-only observation executes");
-        assert!(outcome.output.contains("1\n2\n3"), "{}", outcome.output);
+            .expect("typed blocked outcome");
+        // An unlisted executable is not proven observation-only, whatever a
+        // model-based assessment would say; no assessment is requested.
         assert_eq!(
             outcome.metadata.outcome_status,
-            Some(ToolOutcomeStatus::Succeeded)
+            Some(ToolOutcomeStatus::Blocked)
         );
-        assert_eq!(provider.call_count().await, 1);
+        assert!(
+            outcome.output.contains("read-only contract"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(provider.call_count().await, 0);
     }
 
     #[tokio::test]
@@ -9362,7 +9511,7 @@ mod tests {
                 &args,
                 None,
                 ToolExecutionContext {
-                    mutation_forbidden: true,
+                    mutation_forbidden: false,
                     ..Default::default()
                 },
             )

@@ -612,6 +612,16 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
     harness.agent.set_sdk_engine(SdkEngineSettings::default());
 
     let session_id = "executor_declared_checklist";
+    // Host terminal runs are untrusted egress; this test is about checklist
+    // demands, not the untrusted-content rule, so it runs marking-only.
+    crate::agent::authority::set_session_mode(
+        harness.state.as_ref(),
+        session_id,
+        crate::agent::authority::SessionMode::Unrestricted,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     let response = harness
         .agent
         .handle_message(
@@ -1548,15 +1558,24 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     )));
     // Process control that is not a run is a mutation.
     assert!(!read_only(serde_json::json!({"action": "kill"})));
-    // KNOWN GAP (reported, not patched here): `terminal_call_semantics` types a
-    // run by its declared write_paths/write_roots, not by the command text, so
-    // these WITHOUT write_paths are currently classified read-only:
-    //   "rm -rf /tmp/aidaemon-test/x"
-    //   "ls /tmp; rm -rf /tmp/aidaemon-test/x"
-    //   "ls /tmp && rm -rf /tmp/aidaemon-test/x"
-    //   "cat /tmp/aidaemon-test/a > /tmp/aidaemon-test/b"
-    //   "ls /tmp | xargs rm"
-    // (the native sandbox still blocks undeclared writes).
+    // Authority typing comes from the command's structure, not from declared
+    // write targets, so undeclared mutations are not read-only either.
+    for command in [
+        "rm -rf /tmp/aidaemon-test/x",
+        "ls /tmp; rm -rf /tmp/aidaemon-test/x",
+        "ls /tmp && rm -rf /tmp/aidaemon-test/x",
+        "cat /tmp/aidaemon-test/a > /tmp/aidaemon-test/b",
+        "ls /tmp | xargs rm",
+    ] {
+        assert!(!read_only(run(command)), "{command}");
+    }
+    let rm = bridged.annotations_for(&run("rm -rf /tmp/aidaemon-test/x"));
+    assert!(rm.egress && rm.destructive && !rm.read_only);
+    let ls = bridged.annotations_for(&run("ls /tmp"));
+    assert!(ls.read_only && !ls.egress);
+    let networked =
+        bridged.annotations_for(&serde_json::json!({"action":"run","command":"ls","network":true}));
+    assert!(!networked.read_only && networked.egress);
 }
 
 #[tokio::test]
