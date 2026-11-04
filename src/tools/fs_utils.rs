@@ -67,7 +67,7 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
 fn is_configured_env_file(path: &Path) -> bool {
     ["AIDAEMON_ENV_FILE", "AIDAEMON_RUNTIME_ENV_FILE"]
         .iter()
-        .filter_map(|key| std::env::var_os(key))
+        .filter_map(std::env::var_os)
         .filter(|value| !value.is_empty())
         .any(|value| {
             let configured = Path::new(&value);
