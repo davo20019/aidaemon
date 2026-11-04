@@ -1240,10 +1240,26 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        // `bind_workspace` writes the goal's workspace binding, a trusted
+        // root for every later run: a configuration change, so egress after
+        // untrusted content.
+        let binds_workspace = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("action")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .is_some_and(|action| action == "bind_workspace");
         semantics_for_exact_read_actions(
             arguments,
             &["overview", "run_history", "last_failure", "unblock_hints"],
-            ToolMutationEffects::NONE,
+            if binds_workspace {
+                ToolMutationEffects::CONFIGURATION
+            } else {
+                ToolMutationEffects::NONE
+            },
         )
     }
 
