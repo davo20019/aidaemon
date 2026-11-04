@@ -179,6 +179,16 @@ pub(crate) struct InheritedAuthority {
     pub origin_trusted: bool,
 }
 
+/// The most of the root request a child inherits (and the verifier is
+/// shown at most 4000 characters of arguments anyway).
+pub(crate) const INHERITED_REQUEST_CHARS: usize = 4000;
+
+/// Every `InheritedAuthority` a child agent was created with (test-only
+/// capture of the real spawn path).
+#[cfg(test)]
+pub(crate) static CREATED_CHILD_INHERITANCE: std::sync::Mutex<Vec<InheritedAuthority>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// A child's own resolution narrowed by what its parent turn had: the
 /// narrower authority, the lower owner level (a guest parent's `None` stays
 /// `None`), and the parent's workspace confinement when it had one.

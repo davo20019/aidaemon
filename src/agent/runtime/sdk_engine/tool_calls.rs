@@ -358,7 +358,13 @@ impl Agent {
             task_access: scope.authority.task_access.clone(),
             mode_session: Some(self.mode_session_for(scope.session_id)),
             untrusted_context: scope.untrusted_seen.load(Ordering::SeqCst),
-            origin_request: Some(scope.origin_request.to_string()),
+            origin_request: Some(
+                scope
+                    .origin_request
+                    .chars()
+                    .take(crate::agent::authority::INHERITED_REQUEST_CHARS)
+                    .collect(),
+            ),
             origin_trusted: scope.origin_trusted,
         }
     }

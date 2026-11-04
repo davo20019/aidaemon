@@ -1502,6 +1502,11 @@ impl Agent {
             self.stt_config.clone(),
             self.harness_eval_config.clone(),
         );
+        #[cfg(test)]
+        crate::agent::authority::CREATED_CHILD_INHERITANCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(inherited_authority.clone());
         child.inherited_authority = Some(inherited_authority);
         child.sdk_engine = self.sdk_engine.clone();
         child.memory = self.memory.clone();
@@ -2011,35 +2016,35 @@ impl Agent {
     pub(crate) async fn inherited_for_child(
         &self,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
-        parent_session: Option<&str>,
         user_role: UserRole,
         channel_ctx: &ChannelContext,
     ) -> crate::agent::authority::InheritedAuthority {
         match parent_authority {
             Some(parent) => parent,
-            None => {
-                self.authority_for_child(parent_session, user_role, channel_ctx)
-                    .await
-            }
+            None => self.authority_for_child(user_role, channel_ctx).await,
         }
     }
 
-    /// The fallback for a spawn without the parent turn's authority: the
-    /// authority re-resolved from the same explicit facts (including the
-    /// owner's session mode on the originating chat), narrowed by whatever
-    /// this agent itself inherited, answering to the originating chat. A
-    /// child is never wider than its parent.
+    /// The fallback for a spawn without the parent turn's authority (goal and
+    /// mandate dispatch): the authority re-resolved from explicit facts,
+    /// narrowed by whatever this agent itself inherited. A root agent's
+    /// dispatch answers to its own session, never to the creating chat's
+    /// `/readonly` (goal runs are not stopped by a chat mode); inside an
+    /// inheritance chain the chat the chain answers to, its live mode, the
+    /// taint and the root request carry on. A child is never wider than its
+    /// parent.
     pub(crate) async fn authority_for_child(
         &self,
-        parent_session: Option<&str>,
         user_role: UserRole,
         channel_ctx: &ChannelContext,
     ) -> crate::agent::authority::InheritedAuthority {
-        let session_mode = match parent_session {
-            Some(parent_session) => {
+        let inherited = self.inherited_authority.as_ref();
+        let mode_session = inherited.and_then(|inherited| inherited.mode_session.clone());
+        let session_mode = match mode_session.as_deref() {
+            Some(mode_session) => {
                 crate::agent::authority::session_mode(
                     self.state.as_ref(),
-                    parent_session,
+                    mode_session,
                     chrono::Utc::now(),
                 )
                 .await
@@ -2054,7 +2059,6 @@ impl Agent {
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 bound_workspace: None,
             });
-        let inherited = self.inherited_authority.as_ref();
         let resolved = match inherited {
             Some(inherited) => crate::agent::authority::narrow_for_child(inherited, resolved),
             None => resolved,
@@ -2063,9 +2067,7 @@ impl Agent {
             authority: resolved.authority,
             owner_level: resolved.owner_level,
             task_access: resolved.task_access,
-            mode_session: inherited
-                .and_then(|inherited| inherited.mode_session.clone())
-                .or_else(|| parent_session.map(str::to_string)),
+            mode_session,
             untrusted_context: inherited.is_some_and(|inherited| inherited.untrusted_context),
             origin_request: inherited.and_then(|inherited| inherited.origin_request.clone()),
             // Without a parent constraint the child's own facts decide.
@@ -2363,12 +2365,7 @@ impl Agent {
             None
         };
         let parent_authority = self
-            .inherited_for_child(
-                parent_authority,
-                effective_approval_session_id.as_deref(),
-                user_role,
-                &channel_ctx,
-            )
+            .inherited_for_child(parent_authority, user_role, &channel_ctx)
             .await;
         let child = self
             .create_child_agent(
