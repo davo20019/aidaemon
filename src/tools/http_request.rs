@@ -1411,6 +1411,29 @@ impl HttpRequestTool {
         }
     }
 
+    /// The URL as outbound data: everything but its host and port.
+    fn url_without_host_port(url: &reqwest::Url) -> String {
+        let mut scanned = String::new();
+        if !url.username().is_empty() {
+            scanned.push_str(url.username());
+            if let Some(password) = url.password() {
+                scanned.push(':');
+                scanned.push_str(password);
+            }
+            scanned.push('@');
+        }
+        scanned.push_str(url.path());
+        if let Some(query) = url.query() {
+            scanned.push('?');
+            scanned.push_str(query);
+        }
+        if let Some(fragment) = url.fragment() {
+            scanned.push('#');
+            scanned.push_str(fragment);
+        }
+        scanned
+    }
+
     /// Resolve the exact remote URL represented by the tool arguments.
     /// Authorization, audit semantics, and adapter execution all call this
     /// same canonicalization path so structured query parameters cannot create
@@ -1629,10 +1652,13 @@ impl HttpRequestTool {
             .map(|s| s.to_string())
             .or_else(|| body.map(|b| Self::detect_content_type(b).to_string()));
 
-        // Step 7: Scan for secrets in outbound data
+        // Step 7: Scan for secrets in outbound data. The URL's host and port
+        // are where the request goes, not data it carries (an IP:port would
+        // otherwise read as a leaked endpoint); its userinfo, path, query and
+        // fragment can carry leaked tokens, so they are scanned.
         let check_parts = format!(
             "{} {} {}",
-            url,
+            Self::url_without_host_port(&parsed_url),
             body.unwrap_or(""),
             custom_headers
                 .map(|h| serde_json::to_string(h).unwrap_or_default())
@@ -4209,6 +4235,59 @@ mod tests {
             serde_json::from_str::<Value>(&text).is_ok(),
             "raw body must be valid JSON"
         );
+    }
+
+    fn local_tool() -> HttpRequestTool {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        )
+    }
+
+    /// The URL's own host:port is not a leaked secret: a POST to a local
+    /// port reaches the server.
+    #[tokio::test]
+    async fn post_to_a_local_ip_port_is_not_blocked_as_a_secret() {
+        let (url, count, server) = spawn_counting_status_server("200 OK").await;
+        let url = url
+            .replace("localhost", "127.0.0.1")
+            .replace("/resource", "/announce");
+        let args = serde_json::json!({
+            "method": "POST",
+            "url": url,
+            "body": r#"{"text":"hi"}"#,
+            "_trusted_session": true,
+        })
+        .to_string();
+        let result = local_tool().call(&args).await.unwrap();
+        server.abort();
+        assert!(!result.contains("Request blocked"), "{result}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A secret in the URL's query still blocks the request.
+    #[tokio::test]
+    async fn a_secret_in_the_url_query_is_still_blocked() {
+        let (url, count, server) = spawn_counting_status_server("200 OK").await;
+        let url = format!(
+            "{}?api_key=sk-synthetic0123456789abcdefghijKLMNOP",
+            url.replace("localhost", "127.0.0.1")
+        );
+        let args = serde_json::json!({
+            "method": "POST",
+            "url": url,
+            "body": r#"{"text":"hi"}"#,
+            "_trusted_session": true,
+        })
+        .to_string();
+        let result = local_tool().call(&args).await.unwrap();
+        server.abort();
+        assert!(
+            result.contains("outbound data appears to contain secrets"),
+            "{result}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     // Live network test — hits the real, free, open clinicaltrials.gov v2 API.
