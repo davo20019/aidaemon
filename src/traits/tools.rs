@@ -1986,6 +1986,17 @@ pub trait Tool: Send + Sync {
         default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
     }
 
+    /// `call_annotations` judged against the turn's trusted roots, for
+    /// effects whose class depends on where they land (a delete inside the
+    /// owner's roots is not egress). The default ignores the roots.
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        self.call_annotations(arguments)
+    }
+
     /// Who authored what this exact call returns. The default is
     /// `Untrusted` iff the tool reaches outside the machine
     /// (`external_side_effect`); local tools override with the owner's

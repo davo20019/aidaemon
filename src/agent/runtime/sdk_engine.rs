@@ -592,6 +592,12 @@ impl Agent {
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
+        let trust_roots = turn_trust_roots(
+            &self.sdk_engine.trusted_roots,
+            project_scope.as_deref(),
+            known_project_dir.as_deref(),
+            authority.task_access.as_ref(),
+        );
         let turn_id = self
             .current_turn_ids
             .read()
@@ -655,6 +661,7 @@ impl Agent {
         // contract filtering already applied), with the daemon memory tools
         // only while the active plugin owns them; `manage_memories` keeps
         // its goal actions under any plugin.
+        let bridge_roots = Arc::new(trust_roots.clone());
         if user_role != UserRole::Public {
             for tool in self
                 .tools
@@ -681,6 +688,7 @@ impl Agent {
                     tool: tool.clone(),
                     goal_actions_only,
                     calls: calls_tx.clone(),
+                    trust_roots: bridge_roots.clone(),
                 });
             }
         }
@@ -822,12 +830,6 @@ impl Agent {
                 .and_then(|goal| goal.budget_per_check),
             None => None,
         };
-        let trust_roots = turn_trust_roots(
-            &self.sdk_engine.trusted_roots,
-            project_scope.as_deref(),
-            known_project_dir.as_deref(),
-            authority.task_access.as_ref(),
-        );
         // A child judges egress against its root's request, which is the
         // owner's only if every turn up to the root was.
         let inherited = self.inherited_authority.as_ref();

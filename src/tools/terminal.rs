@@ -6449,7 +6449,12 @@ impl TerminalTool {
                 let command_semantics =
                     terminal_run_semantics_from_access(true, !declared_write_paths.is_empty());
                 if mutation_forbidden
-                    && !terminal_run_annotations(&args, self.confinement).read_only
+                    && !terminal_run_annotations(
+                        &args,
+                        self.confinement,
+                        &crate::traits::TrustRoots(&[]),
+                    )
+                    .read_only
                 {
                     return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command is not proven observation-only. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                 }
@@ -7296,6 +7301,7 @@ fn terminal_run_semantics_from_access(
 fn terminal_run_annotations(
     args: &TerminalArgs,
     confinement: crate::types::TerminalConfinement,
+    roots: &crate::traits::TrustRoots<'_>,
 ) -> aidaemon_core::ToolAnnotations {
     let text = match (args.command.as_deref(), args.script.as_deref()) {
         (Some(command), None) => command,
@@ -7324,15 +7330,41 @@ fn terminal_run_annotations(
         // An observation-only command cannot write by construction.
         || (!effects.observation_only
             && crate::tools::command_effects::command_names_git_config_path(text));
+    // A delete is egress unless every target is inside the trusted roots.
+    // Relative targets resolve against the call's own absolute working
+    // directory; without one (the dispatcher may still pick it) they are
+    // unknown.
+    let base = args
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| std::path::Path::new(dir).is_absolute());
+    let deletes_outside_roots = effects.deletes
+        && effects.delete_targets.as_ref().is_none_or(|targets| {
+            targets.is_empty()
+                || targets.iter().any(|target| {
+                    let resolved =
+                        if std::path::Path::new(target).is_absolute() || target.starts_with('~') {
+                            Some(target.clone())
+                        } else {
+                            base.map(|base| format!("{}/{target}", base.trim_end_matches('/')))
+                        };
+                    resolved.is_none_or(|path| !roots.contains(&path))
+                })
+        });
+    // On the host every program can reach the network; only observations
+    // and ordinary local work (builds, tests, local git) are not egress.
+    let host_beyond_local_work =
+        !run_is_confined(confinement) && !effects.observation_only && !effects.local_work_only;
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
         idempotent: read_only,
         egress: plants_git_config
             || args.network
-            || effects.deletes
+            || deletes_outside_roots
             || crate::tools::command_effects::fetches_network(text)
-            || (!run_is_confined(confinement) && !effects.observation_only),
+            || host_beyond_local_work,
     }
 }
 
@@ -7629,7 +7661,16 @@ impl Tool for TerminalTool {
         terminal_call_semantics(arguments)
     }
 
+    /// Without the turn's roots every delete counts as outside them.
     fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        self.call_annotations_in(arguments, &crate::traits::TrustRoots(&[]))
+    }
+
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::ToolAnnotations::WRITE;
         };
@@ -7641,7 +7682,7 @@ impl Tool for TerminalTool {
                 egress: true,
                 ..aidaemon_core::ToolAnnotations::WRITE
             },
-            _ => terminal_run_annotations(&args, self.confinement),
+            _ => terminal_run_annotations(&args, self.confinement, roots),
         }
     }
 
@@ -9520,6 +9561,112 @@ mod tests {
             );
             let ann = host.call_annotations(&args);
             assert!(ann.egress && !ann.read_only, "{command}");
+        }
+    }
+
+    async fn host_and_sandboxed_terminals() -> (TerminalTool, TerminalTool) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool.clone(),
+        )
+        .await;
+        let sandboxed = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        (host, sandboxed)
+    }
+
+    /// Ordinary local work on the host (builds, tests, local git, file
+    /// shuffling) is not egress; programs outside the local-work table,
+    /// inline interpreters and remote git are.
+    #[tokio::test]
+    async fn host_local_work_is_not_egress() {
+        let (host, _) = host_and_sandboxed_terminals().await;
+        let ann = |command: &str| {
+            host.call_annotations(
+                &serde_json::json!({"action":"run","command":command}).to_string(),
+            )
+        };
+        for local in [
+            "cargo test",
+            "cargo +nightly build --release",
+            "cargo test 2>&1 | tail -n 50",
+            "git add -A && git commit -m x",
+            "mkdir -p build && cp a build/",
+            "npm run build",
+            "python3 scripts/check.py --fast",
+            "go test ./...",
+            "make -j4 && ls build",
+        ] {
+            let annotations = ann(local);
+            assert!(!annotations.egress, "{local} is local work");
+            assert!(!annotations.read_only, "{local} still mutates");
+        }
+        for egress in [
+            "python3 -c \"print(1)\"",
+            "python3 -m http.server",
+            "node -e \"fetch(1)\"",
+            "curl https://example.invalid",
+            "git push",
+            "git -c core.sshCommand=x status",
+            "git fetch origin",
+            "cargo install ripgrep",
+            "npm publish",
+            "bash build.sh",
+            "./target/debug/app",
+            "RUSTC_WRAPPER=x cargo build",
+            "cargo build < /dev/tcp/example.invalid/80",
+            "echo $(curl example.invalid) > f",
+            "timeout 60 cargo test",
+        ] {
+            assert!(ann(egress).egress, "{egress} is egress on the host");
+        }
+    }
+
+    /// A delete is egress only when a target is outside the trusted roots or
+    /// cannot be determined, on the host and in the sandbox alike.
+    #[tokio::test]
+    async fn deletes_inside_the_trusted_roots_are_not_egress() {
+        let (host, sandboxed) = host_and_sandboxed_terminals().await;
+        let base = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let project = format!("{base}/project");
+        let roots_list = vec![project.clone()];
+        let roots = crate::traits::TrustRoots(&roots_list);
+        for tool in [&host, &sandboxed] {
+            let ann = |command: &str, working_dir: Option<&str>| {
+                let mut args = serde_json::json!({"action":"run","command":command});
+                if let Some(dir) = working_dir {
+                    args["working_dir"] = serde_json::json!(dir);
+                }
+                tool.call_annotations_in(&args.to_string(), &roots)
+            };
+            let inside = ann("rm src/old.rs", Some(&project));
+            assert!(!inside.egress && inside.destructive, "{inside:?}");
+            assert!(!ann(&format!("rm -rf {project}/build"), None).egress);
+            assert!(!ann("find build -name '*.o' -delete", Some(&project)).egress);
+            assert!(ann(&format!("rm -rf {base}/outside"), Some(&project)).egress);
+            assert!(ann("rm -rf ../outside", Some(&project)).egress);
+            // No absolute working directory: a relative target is unknown.
+            assert!(ann("rm src/old.rs", None).egress);
+            assert!(ann("rm $TARGET", Some(&project)).egress);
+            assert!(ann("ls | xargs rm", Some(&project)).egress);
+            assert!(ann("find . -exec rm {} ;", Some(&project)).egress);
         }
     }
 

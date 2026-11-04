@@ -915,6 +915,7 @@ fn read_only_authority_admits_observing_and_administrative_calls_of_a_mixed_tool
         tool: probe,
         goal_actions_only: false,
         calls,
+        trust_roots: Arc::new(Vec::new()),
     };
     let authority = sdk::Authority::read_only();
     let permits = |arguments: serde_json::Value| {
@@ -1636,6 +1637,7 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
         tool: terminal,
         goal_actions_only: false,
         calls,
+        trust_roots: Arc::new(Vec::new()),
     };
     // The worst case for the whole tool is a write.
     assert!(!bridged.annotations().read_only);
@@ -1818,6 +1820,7 @@ async fn bridged_tool_annotations_follow_call_annotations() {
         tool,
         goal_actions_only: false,
         calls: calls.clone(),
+        trust_roots: Arc::new(Vec::new()),
     };
     let send = bridge(Arc::new(crate::tools::SendFileTool::new(
         media_tx,

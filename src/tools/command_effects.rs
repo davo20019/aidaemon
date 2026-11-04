@@ -10,13 +10,22 @@
 
 use crate::tools::command_risk::structural_shell_invocations;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandEffects {
     /// Every executable is a known observer used in a known observing shape.
     pub observation_only: bool,
     /// Some command removes files (`rm`, `find -delete`, `git clean`, ...),
     /// including behind wrappers and groupings.
     pub deletes: bool,
+    /// Every command is ordinary local work: an exact `LOCAL_WORK` program
+    /// in an allowed shape, or an observation. Fail closed like
+    /// `observation_only`, except that output redirection into files and
+    /// newline-separated scripts are allowed.
+    pub local_work_only: bool,
+    /// The paths deleting commands name, as written. `None` when a delete
+    /// target cannot be read structurally (variables, substitutions, piped
+    /// arguments, `git clean`).
+    pub delete_targets: Option<Vec<String>>,
 }
 
 /// Executables whose invocation only reads or prints, matched on the bare
@@ -40,6 +49,71 @@ const SYSTEM_BIN_DIRS: &[&str] = &[
 ];
 
 const DELETE_PROGRAMS: &[&str] = &["rm", "rmdir", "unlink", "shred"];
+
+/// Ordinary local work on the owner's machine, matched on the bare name:
+/// builds, tests, local version control and file shuffling. Programs with a
+/// subcommand list are local work only for those subcommands; the rest take
+/// any arguments. `cd` changes only the shell's own directory. Deleting
+/// programs are listed because where they point is judged separately.
+const LOCAL_WORK_PROGRAMS: &[&str] = &[
+    "make",
+    "cmake",
+    "ninja",
+    "pytest",
+    "rustc",
+    "xcodebuild",
+    "mkdir",
+    "touch",
+    "cp",
+    "mv",
+    "ln",
+    "chmod",
+    "cd",
+    "rm",
+    "rmdir",
+    "unlink",
+];
+
+const LOCAL_WORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    (
+        "cargo",
+        &[
+            "build", "check", "test", "clippy", "fmt", "run", "bench", "doc", "tree", "metadata",
+        ],
+    ),
+    (
+        "git",
+        &[
+            "add",
+            "commit",
+            "status",
+            "diff",
+            "log",
+            "show",
+            "branch",
+            "switch",
+            "checkout",
+            "restore",
+            "stash",
+            "merge",
+            "rebase",
+            "reset",
+            "tag",
+            "rm",
+            "mv",
+            "init",
+            "worktree",
+            "rev-parse",
+            "ls-files",
+            "blame",
+        ],
+    ),
+    ("npm", &["test", "run", "build", "lint"]),
+    ("pnpm", &["test", "run", "build", "lint"]),
+    ("yarn", &["test", "run", "build", "lint"]),
+    ("go", &["build", "test", "vet", "fmt", "run"]),
+    ("swift", &["build", "test"]),
+];
 
 const FIND_MUTATING_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
@@ -326,6 +400,134 @@ pub(crate) fn command_effects(command: &str) -> CommandEffects {
     CommandEffects {
         observation_only: is_observation_only(command),
         deletes,
+        local_work_only: is_local_work_only(command),
+        delete_targets: if command.contains("$'") {
+            None
+        } else {
+            delete_targets(command)
+        },
+    }
+}
+
+/// Paths named by every deleting command, or `None` when any cannot be
+/// read: a target with a variable, substitution or `find` placeholder, a
+/// deleting command with no target (arguments arriving through a pipe),
+/// or `git clean` (its targets are whatever is untracked).
+fn delete_targets(command: &str) -> Option<Vec<String>> {
+    let unreadable =
+        |target: &str| target.is_empty() || target == "{}" || target.contains(['$', '`', '\\']);
+    let mut targets = Vec::new();
+    for tokens in expanded_commands(command) {
+        let program = basename(&tokens[0]);
+        let args = &tokens[1..];
+        let named: Vec<&String> = if DELETE_PROGRAMS.contains(&program) {
+            let mut options_done = false;
+            args.iter()
+                .filter(|arg| {
+                    if options_done {
+                        return true;
+                    }
+                    if arg.as_str() == "--" {
+                        options_done = true;
+                        return false;
+                    }
+                    !arg.starts_with('-')
+                })
+                .collect()
+        } else if program == "find" && args.iter().any(|arg| arg == "-delete") {
+            let starts: Vec<&String> = args
+                .iter()
+                .take_while(|arg| !arg.starts_with(['-', '(', '!']))
+                .collect();
+            if starts.is_empty() {
+                if !targets.iter().any(|target| target == ".") {
+                    targets.push(".".to_string());
+                }
+                continue;
+            }
+            starts
+        } else if program == "git" && args.iter().any(|arg| arg == "clean") {
+            return None;
+        } else {
+            continue;
+        };
+        if named.is_empty() || named.iter().any(|target| unreadable(target)) {
+            return None;
+        }
+        for target in named {
+            if !targets.contains(target) {
+                targets.push(target.clone());
+            }
+        }
+    }
+    Some(targets)
+}
+
+fn is_local_work_only(command: &str) -> bool {
+    if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
+        return false;
+    }
+    let mut any = false;
+    // A script's lines are commands like `;`-separated ones.
+    for line in command.replace("\\\n", " ").split('\n') {
+        let scanned = scan(line);
+        if scanned.unsafe_syntax {
+            return false;
+        }
+        for segment in &scanned.segments {
+            if segment.trim().is_empty() {
+                continue;
+            }
+            let Ok(tokens) = shell_words::split(segment) else {
+                return false;
+            };
+            let tokens = strip_redirections(tokens);
+            let Some(program) = tokens.first() else {
+                return false;
+            };
+            if is_env_assignment(program) {
+                return false;
+            }
+            let path_ok = !program.contains('/')
+                || program
+                    .rsplit_once('/')
+                    .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
+            if !path_ok || !local_work_args_ok(basename(program), &tokens[1..]) {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
+}
+
+fn local_work_args_ok(program: &str, args: &[String]) -> bool {
+    if let Some((_, subcommands)) = LOCAL_WORK_SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == program)
+    {
+        // A toolchain selector may precede cargo's subcommand; any other
+        // leading option (git's `-c`, `-C`) is not local work.
+        let rest = match program {
+            "cargo" => args
+                .iter()
+                .skip_while(|arg| arg.starts_with('+'))
+                .collect::<Vec<_>>(),
+            _ => args.iter().collect(),
+        };
+        return rest
+            .first()
+            .is_some_and(|subcommand| subcommands.contains(&subcommand.as_str()));
+    }
+    match program {
+        // A script path, never inline code (`-c`, `-e`) or a module (`-m`).
+        "python" | "python3" | "node" => args.first().is_some_and(|arg| !arg.starts_with('-')),
+        "find" => !args
+            .iter()
+            .any(|arg| arg != "-delete" && FIND_MUTATING_FLAGS.contains(&arg.as_str())),
+        _ if LOCAL_WORK_PROGRAMS.contains(&program) => true,
+        _ if OBSERVATION_PROGRAMS.contains(&program) => observation_args_ok(program, args),
+        _ => false,
     }
 }
 
@@ -349,6 +551,8 @@ struct Scan {
     /// input redirects other than `/dev/null`, heredocs, substitutions,
     /// process substitution, comments, newlines, unclosed quotes.
     unsafe_syntax: bool,
+    /// Output redirected into a file (not `/dev/null` or a descriptor).
+    writes_file: bool,
 }
 
 fn redirect_target(chars: &[char], mut j: usize) -> String {
@@ -366,6 +570,7 @@ fn scan(command: &str) -> Scan {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut unsafe_syntax = false;
+    let mut writes_file = false;
     let (mut in_single, mut in_double) = (false, false);
     let mut i = 0;
     while i < chars.len() {
@@ -441,8 +646,10 @@ fn scan(command: &str) -> Scan {
                         .is_some_and(|d| d.is_ascii_digit() || *d == '-');
                     j += 1;
                 }
-                if next == Some('(') || (!dup && redirect_target(&chars, j) != "/dev/null") {
+                if next == Some('(') {
                     unsafe_syntax = true;
+                } else if !dup && redirect_target(&chars, j) != "/dev/null" {
+                    writes_file = true;
                 }
                 cur.extend(&chars[i..j]);
                 i = j;
@@ -459,6 +666,7 @@ fn scan(command: &str) -> Scan {
     Scan {
         segments,
         unsafe_syntax,
+        writes_file,
     }
 }
 
@@ -487,7 +695,11 @@ fn strip_redirections(tokens: Vec<String>) -> Vec<String> {
 
 fn is_observation_only(command: &str) -> bool {
     let scanned = scan(command);
-    if scanned.unsafe_syntax || command.contains("/dev/tcp/") || command.contains("/dev/udp/") {
+    if scanned.unsafe_syntax
+        || scanned.writes_file
+        || command.contains("/dev/tcp/")
+        || command.contains("/dev/udp/")
+    {
         return false;
     }
     let mut any = false;
@@ -721,6 +933,41 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_work_and_delete_targets_are_typed_by_structure() {
+        for local in [
+            "cargo test > out.log 2>&1",
+            "cargo fmt\ncargo test",
+            "cd /tmp/aidaemon-test/p && git status",
+            "rm -f a.o b.o",
+        ] {
+            assert!(command_effects(local).local_work_only, "{local}");
+        }
+        for other in [
+            "cargo test < input.txt",
+            "git -C /tmp/aidaemon-test/p commit -m x",
+            "npm install",
+            "sh -c 'cargo test'",
+            "cargo test # done",
+            "tee out.log",
+        ] {
+            assert!(!command_effects(other).local_work_only, "{other}");
+        }
+        assert_eq!(
+            command_effects("rm -rf -- -odd build && find out -delete").delete_targets,
+            Some(vec!["-odd".into(), "build".into(), "out".into()])
+        );
+        assert_eq!(
+            command_effects("find -delete").delete_targets,
+            Some(vec![".".into()])
+        );
+        for unknown in ["rm \"$X\"", "git clean -fd", "xargs rm", "rm `ls`"] {
+            assert_eq!(command_effects(unknown).delete_targets, None, "{unknown}");
+        }
+        // Observations still refuse file redirects.
+        assert!(!command_effects("ls > out").observation_only);
+    }
 
     #[test]
     fn command_effects_types_observation_by_structure() {

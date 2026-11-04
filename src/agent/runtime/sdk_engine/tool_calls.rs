@@ -326,7 +326,10 @@ impl Agent {
             .tools
             .iter()
             .find(|tool| tool.name() == tool_name)
-            .is_some_and(|tool| tool.call_annotations(arguments).egress);
+            .is_some_and(|tool| {
+                tool.call_annotations_in(arguments, &crate::traits::TrustRoots(&scope.trust_roots))
+                    .egress
+            });
         if !egress {
             return;
         }
@@ -433,7 +436,12 @@ impl Agent {
                 .tools
                 .iter()
                 .find(|tool| tool.name() == request.name)
-                .map(|tool| tool.call_annotations(arguments))
+                .map(|tool| {
+                    tool.call_annotations_in(
+                        arguments,
+                        &crate::traits::TrustRoots(&scope.trust_roots),
+                    )
+                })
                 .unwrap_or_default();
             ceiling.permits(&request.name, annotations).err()
         });

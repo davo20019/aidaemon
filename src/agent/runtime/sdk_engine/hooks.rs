@@ -164,6 +164,8 @@ pub(super) struct BridgedTool {
     /// `manage_memories` offered with only its goal actions.
     pub(super) goal_actions_only: bool,
     pub(super) calls: mpsc::Sender<DaemonCall>,
+    /// The turn's trusted roots: where an effect lands can decide its class.
+    pub(super) trust_roots: Arc<Vec<String>>,
 }
 
 #[async_trait]
@@ -190,7 +192,10 @@ impl sdk::Tool for BridgedTool {
     /// Judged per call: a mixed tool such as `terminal` reads for `ls` and
     /// writes for `rm`.
     fn annotations_for(&self, arguments: &Value) -> sdk::ToolAnnotations {
-        self.tool.call_annotations(&arguments.to_string())
+        self.tool.call_annotations_in(
+            &arguments.to_string(),
+            &crate::traits::TrustRoots(&self.trust_roots),
+        )
     }
 
     /// Fallback only: the dispatcher stamps each result with the exact
