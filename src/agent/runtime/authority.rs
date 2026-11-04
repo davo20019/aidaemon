@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(child.owner_level, None);
     }
 
-    /// Review focus 5: `/mode unrestricted` on a shared chat never relaxes a
+    /// `/mode unrestricted` on a shared chat never relaxes a
     /// guest turn there, or a child spawned from it.
     #[tokio::test]
     async fn unrestricted_never_reaches_a_guest_or_its_child() {

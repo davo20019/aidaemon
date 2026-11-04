@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use aidaemon_core::{Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec};
+use aidaemon_core::{
+    SourceTrust, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -74,6 +76,11 @@ impl Tool for RememberTool {
             idempotent: true,
             egress: false,
         }
+    }
+
+    /// The owner's own memory store answers.
+    fn source_trust(&self, _arguments: &Value) -> SourceTrust {
+        SourceTrust::Trusted
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult {
@@ -154,6 +161,11 @@ impl Tool for RecallTool {
 
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations::READ_ONLY
+    }
+
+    /// Facts from the owner's own memory store.
+    fn source_trust(&self, _arguments: &Value) -> SourceTrust {
+        SourceTrust::Trusted
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult {

@@ -316,7 +316,9 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
 /// Ask a clean model whether performing exactly this call is consistent with
 /// and needed for the owner's request. One tool-less, single-attempt call on
 /// the primary model; a timeout, error or unreadable reply is
-/// `could not verify` (not consistent).
+/// `could not verify` (not consistent). A cancelled turn stops waiting and
+/// the call is refused as `cancelled`.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn verify_untrusted_call(
     runtime: &SharedLlmRuntime,
     telemetry: Option<VerifierTelemetry<'_>>,
@@ -325,6 +327,7 @@ pub(in crate::agent) async fn verify_untrusted_call(
     tool: &str,
     description: &str,
     arguments: &Value,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> VerifierVerdict {
     let messages = verifier_messages(origin_request, origin_trusted, tool, description, arguments);
     let snapshot = runtime.snapshot();
@@ -342,12 +345,20 @@ pub(in crate::agent) async fn verify_untrusted_call(
         ..ChatOptions::default()
     };
     let started = Instant::now();
-    let outcome = match tokio::time::timeout(
+    let call = tokio::time::timeout(
         VERIFIER_TIMEOUT,
         provider.chat_with_options(&model, &messages, &[], &options),
-    )
-    .await
-    {
+    );
+    let answer = tokio::select! {
+        answer = call => answer,
+        _ = cancel.cancelled() => {
+            return VerifierVerdict {
+                consistent: false,
+                reason: "cancelled".to_string(),
+            };
+        }
+    };
+    let outcome = match answer {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => {
             warn!(tool, %error, "Untrusted call verifier failed");
@@ -403,12 +414,14 @@ pub(in crate::agent) async fn verify_untrusted_call(
 pub(in crate::agent) struct UntrustedVerifier<'a> {
     pub agent: &'a Agent,
     pub scope: &'a TurnScope<'a>,
-    /// The request egress is judged against (Task 7: a child inherits its
-    /// root's request and this flag).
+    /// The request egress is judged against (a child inherits its root's
+    /// request and this flag).
     pub origin_request: &'a str,
     /// `origin_request` was written by the owner (see
     /// [`origin_is_owner_authored`]); otherwise it is shown as untrusted data.
     pub origin_trusted: bool,
+    /// The turn's cancellation: a cancelled turn stops waiting for the check.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait]
@@ -441,6 +454,7 @@ impl sdk::InterruptResolver for UntrustedVerifier<'_> {
             tool,
             &description,
             &interruption.call.arguments,
+            &self.cancel,
         )
         .await;
         self.agent
@@ -474,6 +488,50 @@ pub(in crate::agent) const UNTRUSTED_BLOCKED: &str = "[UNTRUSTED BLOCKED]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn cancelled while the verifier is deciding stops waiting at
+    /// once and the call is refused.
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_waiting_for_the_verifier() {
+        use crate::testing::MockProvider;
+        let harness = crate::testing::setup_test_agent(MockProvider::with_delayed_responses(
+            vec![MockProvider::text_response(
+                r#"{"consistent":true,"reason":"asked"}"#,
+            )],
+            vec![Duration::from_secs(60)],
+        ))
+        .await
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let verdict = verify_untrusted_call(
+            &harness.agent.llm_runtime,
+            None,
+            "Send Jordan Lee the summary.",
+            true,
+            "send_probe",
+            "Sends a synthetic message.",
+            &json!({"to": "jordan@example.invalid"}),
+            &cancel,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returns promptly"
+        );
+        assert_eq!(
+            verdict,
+            VerifierVerdict {
+                consistent: false,
+                reason: "cancelled".to_string(),
+            }
+        );
+    }
 
     fn owner_private<'a>(projected: &'a [String], tainted: Option<&'a [String]>) -> TaintFacts<'a> {
         TaintFacts {

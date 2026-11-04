@@ -422,7 +422,8 @@ pub struct AppConfig {
 }
 
 /// How much the owner may do by default. Both levels act the same at the
-/// tool gate for now; `unrestricted` will turn off the untrusted-content rule.
+/// tool gate; `unrestricted` records, instead of checking, outward actions
+/// taken after the turn read untrusted content.
 /// Ordered `Full < Unrestricted`: a child takes the lower of its parent's
 /// and its own.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -440,7 +441,7 @@ pub struct AuthorityConfig {
     pub owner_default: OwnerLevel,
     /// Absolute directories whose files are the owner's own: reading them
     /// does not mark the run as having seen untrusted content. The turn's
-    /// project scope is always trusted in addition.
+    /// working directory and project scope are always trusted in addition.
     #[serde(default)]
     pub trusted_roots: Vec<String>,
 }

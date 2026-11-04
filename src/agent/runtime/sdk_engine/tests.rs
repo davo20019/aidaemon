@@ -2128,7 +2128,7 @@ async fn untrusted_page_then_send_is_verified_and_denied() {
     assert_eq!(decisions[0]["tool"], "send_probe");
 }
 
-/// Review focus 3: an approved egress call runs exactly once.
+/// An approved egress call runs exactly once.
 #[tokio::test]
 async fn consistent_egress_after_untrusted_read_runs_once() {
     use crate::runtime_ports::AgentIngress;
@@ -2222,7 +2222,7 @@ async fn readonly_during_verification_stops_the_approved_call() {
     );
 }
 
-/// Review focus 2: a verifier that cannot answer denies the call, and the
+/// A verifier that cannot answer denies the call, and the
 /// run still finishes.
 #[tokio::test]
 async fn verifier_failure_denies_and_the_run_finishes() {
@@ -2409,7 +2409,7 @@ async fn a_trigger_turn_has_no_owner_request_for_the_verifier() {
     assert!(open < at && at < close, "{user}");
 }
 
-/// Review focus 2: a verifier provider error denies the call, is recorded
+/// A verifier provider error denies the call, is recorded
 /// as a failed model call, and the run finishes.
 #[tokio::test]
 async fn verifier_provider_error_denies_and_the_run_finishes() {

@@ -156,6 +156,42 @@ unsafe rather than offered for rollback. The external object store is
 owner-readable and contains plaintext copies of eligible source files; use
 retention and size limits appropriate for the machine.
 
+### Authority and untrusted content
+
+Pages, emails, other people's messages and files outside your own folders can
+contain text written to steer an AI agent. aidaemon tracks this. Once a turn
+has read content someone else wrote, any outward action it then tries (sending
+a message or email, posting, calling a remote API with your credentials,
+deleting outside your folders, changing configuration, running an unknown
+program on the host) is first checked by a separate model call that sees only
+your request and the proposed action, never the content that was read. If the
+action is not something your request asked for, it is refused and the agent
+is told why. Reading, editing files in your workspace and ordinary local work
+such as builds, tests and local git commits are not checked. Results from
+helper agents carry the same mark, and a chat stays marked while the turn that
+read the content is still in its context.
+
+```toml
+[authority]
+owner_default = "full"   # full | unrestricted
+# Your own folders: reading files here does not count as untrusted content.
+# The working directory and the current project are always included.
+trusted_roots = ["/absolute/path/to/your/projects"]
+```
+
+With `owner_default = "full"` (the default) the check above applies to your
+own turns too. `unrestricted` skips the check on the owner's turns and only
+records each outward action taken after untrusted content; guests' turns are
+always checked.
+
+Chat commands (owner only) change one chat for four hours:
+
+- `/readonly` makes the chat read-only, including work already running and
+  the helper agents it started: aidaemon can look but not change anything.
+- `/mode full | unrestricted | readonly` switches the chat's mode; `/mode` on
+  its own shows the current one. `/mode full` ends a read-only or unrestricted
+  period early.
+
 ### Customize your agent
 
 The setup wizard asks what your agent should be called, what role it should serve, and how it should communicate. It writes those choices to an editable `persona.md` next to `config.toml`.

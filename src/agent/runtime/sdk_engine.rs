@@ -642,11 +642,10 @@ impl Agent {
         // The turn's resolved authority is enforced by the kernel hook, and
         // the untrusted-content rule by `UntrustedHook` (registered last,
         // below). The daemon dispatcher still enforces Scope itself:
-        // `sdk_scope_check` against the turn's filesystem grant (Scope moves
-        // to the kernel in Phase 3).
+        // `sdk_scope_check` against the turn's filesystem grant.
         // `/readonly` sent while this turn runs narrows it: the hook and the
-        // dispatcher both read the chat's live mode (Task 7 points a child at
-        // its parent's chat through `mode_session_for`).
+        // dispatcher both read the chat's live mode (a child reads its
+        // parent's chat through `mode_session_for`).
         let ceiling = Arc::new(crate::agent::authority::SessionModeCeiling::new(
             self.state.clone(),
             self.mode_session_for(session_id),
@@ -960,6 +959,7 @@ impl Agent {
             scope: &scope,
             origin_request,
             origin_trusted,
+            cancel: cancel.clone(),
         };
         let run = sdk_agent.run_resolving(state, cancel, &verifier);
         tokio::pin!(run);

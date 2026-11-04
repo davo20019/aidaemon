@@ -66,5 +66,22 @@ fn memory_tools_pass_the_tool_kit() {
     all.merge(check_tool(&RememberTool::new(memory.clone())));
     all.merge(check_tool(&RecallTool::new(memory)));
     all.assert_all_passed();
-    assert_eq!(all.passed.len(), 20, "{all}");
+    assert_eq!(all.passed.len(), 22, "{all}");
+}
+
+/// The owner's own memory store is not someone else's content: reading or
+/// writing it does not taint a run.
+#[test]
+fn memory_tools_return_trusted_output() {
+    use aidaemon_core::{SourceTrust, Tool};
+    let memory = Memory::new(InMemoryMemoryStore::new(), HashEmbedder::default());
+    let args = serde_json::json!({});
+    assert_eq!(
+        RememberTool::new(memory.clone()).source_trust(&args),
+        SourceTrust::Trusted
+    );
+    assert_eq!(
+        RecallTool::new(memory).source_trust(&args),
+        SourceTrust::Trusted
+    );
 }
