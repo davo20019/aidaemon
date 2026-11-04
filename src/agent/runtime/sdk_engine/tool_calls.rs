@@ -263,9 +263,12 @@ impl Agent {
         let injected_dir = anchor_call_to_project_dir(scope, &mut request);
         attenuate_sdk_read_roots(scope, &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
-        let output = self
+        let mut output = self
             .run_sdk_tool_call(scope, &request, &arguments, injected_dir.as_deref())
             .await;
+        // Refusals, deferrals, replays and suppressed duplicates are the
+        // daemon's own words: trusted.
+        output.trust.get_or_insert(sdk::SourceTrust::Trusted);
         let _ = request.reply.send(Ok(output));
     }
 
@@ -282,7 +285,7 @@ impl Agent {
             .tools
             .iter()
             .find(|tool| tool.name() == tool_name)
-            .map(|tool| super::hooks::call_is_read_only(tool.as_ref(), arguments));
+            .map(|tool| tool.call_annotations(arguments).read_only);
         let assessed = crate::agent::closeout::ClosingAuthority::from_authority(
             scope.contract.authority_as_assessed(),
         );
@@ -878,10 +881,26 @@ impl Agent {
             duration_ms,
             "SDK engine tool call"
         );
+        // Who authored what this call returned: only executed calls carry
+        // the tool's own class; every other output is the daemon's.
+        let trust = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == request.name)
+            .map(|tool| {
+                tool.output_trust(arguments, &crate::traits::TrustRoots(&scope.trust_roots))
+            })
+            .unwrap_or_default();
+        if trust == sdk::SourceTrust::Untrusted {
+            scope
+                .untrusted_seen
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         sdk::ToolOutput {
             is_error: failed,
             ..sdk::ToolOutput::text(model_view).with_images(images)
         }
+        .with_trust(trust)
     }
 
     /// Record an assistant message that calls tools before the calls run, so

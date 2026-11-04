@@ -432,10 +432,15 @@ pub enum OwnerLevel {
 }
 
 /// `[authority]`: the explicit facts tool authority is resolved from.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct AuthorityConfig {
     #[serde(default)]
     pub owner_default: OwnerLevel,
+    /// Absolute directories whose files are the owner's own: reading them
+    /// does not mark the run as having seen untrusted content. The turn's
+    /// project scope is always trusted in addition.
+    #[serde(default)]
+    pub trusted_roots: Vec<String>,
 }
 
 /// Which long-term memory agent turns use.

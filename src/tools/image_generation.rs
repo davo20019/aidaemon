@@ -804,6 +804,14 @@ impl Tool for GenerateImageTool {
         }
     }
 
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
             .with_verification_mode(ToolVerificationMode::ResultContent)

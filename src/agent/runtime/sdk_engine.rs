@@ -107,6 +107,9 @@ pub(crate) struct SdkEngineSettings {
     /// `[agent] task_assessment`: whether the pre-run assessment runs
     /// (`off` skips it) and whether would-refuse comparisons are recorded.
     pub(crate) task_assessment: crate::config::TaskAssessmentSetting,
+    /// `[authority] trusted_roots`: directories whose files are the owner's
+    /// own, so reading them is not untrusted content.
+    pub(crate) trusted_roots: Vec<String>,
 }
 
 impl Default for SdkEngineSettings {
@@ -116,6 +119,7 @@ impl Default for SdkEngineSettings {
             max_turns: DEFAULT_MAX_TURNS,
             owner_default: crate::config::OwnerLevel::default(),
             task_assessment: crate::config::TaskAssessmentSetting::default(),
+            trusted_roots: Vec::new(),
         }
     }
 }
@@ -160,9 +164,34 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
         owner_default: config.authority.owner_default,
         task_assessment: config.agent.task_assessment,
+        trusted_roots: config.authority.trusted_roots.clone(),
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
     settings
+}
+
+/// The owner's trusted file roots for one turn: configured roots, the
+/// project scope and directory, and the write targets the task may touch.
+fn turn_trust_roots(
+    configured: &[String],
+    project_scope: Option<&str>,
+    known_project_dir: Option<&str>,
+    task_access: Option<&crate::traits::ToolCallAccessManifest>,
+) -> Vec<String> {
+    let mut roots: Vec<String> = configured.to_vec();
+    roots.extend(project_scope.map(str::to_string));
+    roots.extend(known_project_dir.map(str::to_string));
+    if let Some(access) = task_access {
+        roots.extend(
+            access
+                .write_targets
+                .iter()
+                .map(|target| target.value.clone()),
+        );
+    }
+    roots.retain(|root| !root.trim().is_empty());
+    roots.dedup();
+    roots
 }
 
 /// Everything the SDK run asks of the daemon, served on the turn's own task.
@@ -357,6 +386,11 @@ struct TurnScope<'a> {
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
     authority: &'a crate::agent::authority::ResolvedAuthority,
+    /// The owner's trusted file roots: configured roots, the project scope
+    /// and directory, and the task's write grants.
+    trust_roots: Vec<String>,
+    /// A dispatched call returned untrusted content this turn.
+    untrusted_seen: AtomicBool,
     authorized_scopes: Vec<String>,
     /// See `SdkTurnSetup::projected_source_message_ids`.
     projected_source_message_ids: Vec<String>,
@@ -738,6 +772,12 @@ impl Agent {
                 .and_then(|goal| goal.budget_per_check),
             None => None,
         };
+        let trust_roots = turn_trust_roots(
+            &self.sdk_engine.trusted_roots,
+            project_scope.as_deref(),
+            known_project_dir.as_deref(),
+            authority.task_access.as_ref(),
+        );
         let scope = TurnScope {
             session_id,
             user_text,
@@ -758,6 +798,8 @@ impl Agent {
             known_project_dir: std::sync::Mutex::new(known_project_dir),
             project_scope,
             authority: &authority,
+            trust_roots,
+            untrusted_seen: AtomicBool::new(false),
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,

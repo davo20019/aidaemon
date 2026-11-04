@@ -1481,3 +1481,22 @@ mod tests {
         assert!(!unanchored.starts_with(&workspace));
     }
 }
+
+/// Output trust of a file read: the owner's own files (inside the trusted
+/// roots) are `Trusted`; anything else, or a call that names no absolute
+/// path, is someone else's content.
+pub fn file_output_trust(
+    arguments: &str,
+    keys: &[&str],
+    roots: &crate::traits::TrustRoots<'_>,
+) -> aidaemon_core::SourceTrust {
+    let args = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let path = args.as_ref().and_then(|args| {
+        keys.iter()
+            .find_map(|key| args.get(*key).and_then(|value| value.as_str()))
+    });
+    match path {
+        Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+        _ => aidaemon_core::SourceTrust::Untrusted,
+    }
+}

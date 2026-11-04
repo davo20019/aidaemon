@@ -156,23 +156,6 @@ impl sdk::Hook for SameToolLimit {
     }
 }
 
-/// Whether one exact call of `tool` is read-only: the tool is read-only as a
-/// whole, or its adapter types the call as a pure observation (or run
-/// bookkeeping, which changes no user state) with no mutation effects. The
-/// tool still enforces `mutation_forbidden` itself.
-pub(super) fn call_is_read_only(tool: &dyn crate::traits::Tool, arguments: &str) -> bool {
-    tool.capabilities().read_only || semantics_are_read_only(&tool.call_semantics(arguments))
-}
-
-/// The per-call half of [`call_is_read_only`], for callers that already hold
-/// the call's semantics.
-pub(super) fn semantics_are_read_only(semantics: &crate::traits::ToolCallSemantics) -> bool {
-    matches!(
-        semantics.effect,
-        crate::traits::ToolCallEffect::Observation | crate::traits::ToolCallEffect::Administrative
-    ) && !semantics.mutates_state()
-}
-
 /// A daemon tool as the SDK sees it. It only forwards the call; the daemon
 /// dispatcher executes it on the turn's own task.
 pub(super) struct BridgedTool {
@@ -190,23 +173,30 @@ impl sdk::Tool for BridgedTool {
     }
 
     /// Worst case for the tool as a whole: only a tool that is read-only
-    /// for every call says so.
+    /// for every call says so; any other may be destructive and egress.
     fn annotations(&self) -> sdk::ToolAnnotations {
         if self.tool.capabilities().read_only {
             sdk::ToolAnnotations::READ_ONLY
         } else {
-            sdk::ToolAnnotations::WRITE
+            sdk::ToolAnnotations {
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                egress: true,
+            }
         }
     }
 
     /// Judged per call: a mixed tool such as `terminal` reads for `ls` and
     /// writes for `rm`.
     fn annotations_for(&self, arguments: &Value) -> sdk::ToolAnnotations {
-        if call_is_read_only(self.tool.as_ref(), &arguments.to_string()) {
-            sdk::ToolAnnotations::READ_ONLY
-        } else {
-            sdk::ToolAnnotations::WRITE
-        }
+        self.tool.call_annotations(&arguments.to_string())
+    }
+
+    /// Fallback only: the dispatcher stamps each result with the exact
+    /// call's trust (`Tool::output_trust`).
+    fn source_trust(&self, _arguments: &Value) -> sdk::SourceTrust {
+        sdk::SourceTrust::Untrusted
     }
 
     /// Daemon tools check their own arguments (some accept aliases for

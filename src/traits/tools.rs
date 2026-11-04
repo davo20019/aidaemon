@@ -1973,6 +1973,30 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
+    /// Authority annotations for this exact call: read-only, destructive,
+    /// idempotent, and whether it sends data or acts outside the owner's
+    /// machine and workspace (`egress`). Derived from the call's typed
+    /// semantics, never from the tool's name.
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
+    }
+
+    /// Who authored what this exact call returns. The default is
+    /// `Untrusted` iff the tool reaches outside the machine
+    /// (`external_side_effect`); local tools override with the owner's
+    /// trusted roots.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        if self.capabilities().external_side_effect {
+            aidaemon_core::SourceTrust::Untrusted
+        } else {
+            aidaemon_core::SourceTrust::Trusted
+        }
+    }
+
     /// Whether this tool is currently operational.
     ///
     /// Default: true. Override for tools with dynamic backends that may be
@@ -1980,6 +2004,77 @@ pub trait Tool: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
+}
+
+/// Effects that send data or act outside the owner's machine and workspace,
+/// or cannot be undone. A call with any of these is egress.
+pub const EGRESS_EFFECTS: ToolMutationEffects = ToolMutationEffects::EXTERNAL_DELIVERY
+    .union(ToolMutationEffects::REMOTE_MUTATION)
+    .union(ToolMutationEffects::REMOTE_DEPLOY)
+    .union(ToolMutationEffects::DESTRUCTIVE)
+    .union(ToolMutationEffects::CONFIGURATION);
+
+/// Per-call authority annotations from a tool's capabilities and the call's
+/// typed semantics.
+pub fn default_call_annotations(
+    cap: ToolCapabilities,
+    semantics: &ToolCallSemantics,
+) -> aidaemon_core::ToolAnnotations {
+    let read_only = cap.read_only
+        || (matches!(
+            semantics.effect,
+            ToolCallEffect::Observation | ToolCallEffect::Administrative
+        ) && !semantics.mutates_state());
+    let effects = semantics.mutation_effects;
+    let egress = !read_only
+        && (effects.intersects(EGRESS_EFFECTS)
+            || (cap.external_side_effect && !effects.has_specific_effects()));
+    aidaemon_core::ToolAnnotations {
+        read_only,
+        destructive: !read_only && effects.intersects(ToolMutationEffects::DESTRUCTIVE),
+        idempotent: read_only,
+        egress,
+    }
+}
+
+/// The owner's trusted file roots for one turn. A path is trusted only when
+/// it is absolute, normalizes without escaping, and equals a root or sits
+/// below it.
+pub struct TrustRoots<'a>(pub &'a [String]);
+
+impl TrustRoots<'_> {
+    pub fn contains(&self, path: &str) -> bool {
+        let Some(path) = normalize_absolute(path) else {
+            return false;
+        };
+        self.0
+            .iter()
+            .any(|root| normalize_absolute(root).is_some_and(|root| path.starts_with(&root)))
+    }
+}
+
+/// Expand `~`, then normalize lexically. `None` for a relative path or one
+/// whose `..` climbs above the root.
+fn normalize_absolute(path: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    let expanded = shellexpand::tilde(path.trim()).into_owned();
+    let path = std::path::Path::new(&expanded);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized)
 }
 
 /// Validated, canonical tool input. This is the boundary object shared by
@@ -1997,6 +2092,59 @@ pub struct PreparedToolInvocation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn caps(external: bool) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: external,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    #[test]
+    fn default_call_annotations_types_egress_from_effects() {
+        let ann = |semantics: ToolCallSemantics, external: bool| {
+            default_call_annotations(caps(external), &semantics)
+        };
+        let delivery = ann(
+            ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY),
+            false,
+        );
+        assert!(delivery.egress && !delivery.read_only);
+        let local = ann(
+            ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+            true,
+        );
+        assert!(!local.egress && !local.read_only);
+        let config = ann(
+            ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
+            false,
+        );
+        assert!(config.egress);
+        let destructive = ann(
+            ToolCallSemantics::mutation_with(ToolMutationEffects::DESTRUCTIVE),
+            false,
+        );
+        assert!(destructive.egress && destructive.destructive);
+        let observed = ann(ToolCallSemantics::observation(), true);
+        assert!(observed.read_only && !observed.egress && observed.idempotent);
+        assert!(ann(ToolCallSemantics::mutation(), true).egress);
+        assert!(!ann(ToolCallSemantics::mutation(), false).egress);
+    }
+
+    #[test]
+    fn trust_roots_contains_only_descendants() {
+        let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+        let roots = TrustRoots(&roots);
+        assert!(roots.contains("/tmp/aidaemon-test/ws"));
+        assert!(roots.contains("/tmp/aidaemon-test/ws/a.txt"));
+        assert!(!roots.contains("/tmp/aidaemon-test/ws2/a.txt"));
+        assert!(!roots.contains("/tmp/aidaemon-test/ws/../x"));
+        assert!(!roots.contains("a.txt"));
+        assert!(!TrustRoots(&[]).contains("/tmp/aidaemon-test/ws/a.txt"));
+    }
 
     struct AlwaysAvailableTool;
 

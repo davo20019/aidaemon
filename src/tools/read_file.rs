@@ -83,6 +83,18 @@ impl Tool for ReadFileTool {
         }
     }
 
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        super::fs_utils::file_output_trust(
+            arguments,
+            &["path", "file_path", "file", "filename"],
+            roots,
+        )
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let path = serde_json::from_str::<Value>(arguments)
             .ok()

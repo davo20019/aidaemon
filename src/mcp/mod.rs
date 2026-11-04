@@ -145,6 +145,14 @@ impl Tool for McpTool {
         self.capabilities
     }
 
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         if self.capabilities.read_only {
             return ToolCallSemantics::observation()

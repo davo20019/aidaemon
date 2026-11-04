@@ -62,6 +62,14 @@ impl Tool for ProjectInspectTool {
         }
     }
 
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        super::fs_utils::file_output_trust(arguments, &["path"], roots)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args = serde_json::from_str::<Value>(arguments).ok();
         let mut semantics = ToolCallSemantics::observation()

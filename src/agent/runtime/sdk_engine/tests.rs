@@ -1501,7 +1501,6 @@ fn directives_stay_where_they_were_raised() {
 
 #[tokio::test]
 async fn bridged_terminal_ls_is_read_only_rm_is_not() {
-    use crate::traits::Tool as _;
     use aidaemon_core::Tool as _;
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
@@ -1600,4 +1599,96 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
         &next,
         read_only.contains("terminal")
     ));
+}
+
+#[tokio::test]
+async fn tools_declare_their_source_class() {
+    use crate::traits::{Tool as _, TrustRoots};
+    use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+    let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+    let roots = TrustRoots(&roots);
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+    let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+    let http = crate::tools::HttpRequestTool::new(
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        crate::tools::ApprovalBroker::new(approval_tx),
+    );
+    let mcp = crate::mcp::McpTool::new(
+        "synthetic_mcp_tool".to_string(),
+        serde_json::json!({"name": "synthetic_mcp_tool", "description": "x", "parameters": {}}),
+        Arc::new(crate::mcp::McpClient::idle_for_test()),
+        crate::traits::ToolCapabilities::default(),
+    );
+    let search_config: crate::config::SearchConfig = Default::default();
+    let url = r#"{"url":"https://example.invalid"}"#;
+    assert_eq!(
+        crate::tools::WebFetchTool::new().output_trust(url, &roots),
+        Untrusted
+    );
+    assert_eq!(
+        crate::tools::WebSearchTool::new(&search_config).output_trust(r#"{"query":"x"}"#, &roots),
+        Untrusted
+    );
+    assert_eq!(http.output_trust(url, &roots), Untrusted);
+    assert_eq!(mcp.output_trust("{}", &roots), Untrusted);
+    let read = crate::tools::ReadFileTool;
+    assert_eq!(
+        read.output_trust(r#"{"path":"/tmp/aidaemon-test/other/x"}"#, &roots),
+        Untrusted
+    );
+    assert_eq!(
+        read.output_trust(r#"{"path":"/tmp/aidaemon-test/ws/x"}"#, &roots),
+        Trusted
+    );
+    assert_eq!(
+        read.output_trust(r#"{"file_path":"/tmp/aidaemon-test/ws/x"}"#, &roots),
+        Trusted
+    );
+    assert_eq!(
+        crate::tools::WriteFileTool.output_trust("{}", &roots),
+        Trusted
+    );
+    let send = crate::tools::SendFileTool::new(media_tx, &[], "/tmp/aidaemon-test/inbox");
+    assert_eq!(send.output_trust("{}", &roots), Trusted);
+}
+
+#[tokio::test]
+async fn http_request_with_owner_credentials_is_egress_even_for_get() {
+    use crate::traits::Tool as _;
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+    let http = crate::tools::HttpRequestTool::new(
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        crate::tools::ApprovalBroker::new(approval_tx),
+    );
+    let with_auth =
+        r#"{"method":"GET","url":"https://example.invalid","auth_profile":"synthetic"}"#;
+    let without = r#"{"method":"GET","url":"https://example.invalid"}"#;
+    assert!(http.call_annotations(with_auth).egress);
+    assert!(!http.call_annotations(without).egress);
+}
+
+#[tokio::test]
+async fn bridged_tool_annotations_follow_call_annotations() {
+    use aidaemon_core::Tool as _;
+    let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+    let (calls, _rx) = mpsc::channel(1);
+    let bridge = |tool: Arc<dyn crate::traits::Tool>| BridgedTool {
+        spec: tool_spec(tool.as_ref()),
+        tool,
+        goal_actions_only: false,
+        calls: calls.clone(),
+    };
+    let send = bridge(Arc::new(crate::tools::SendFileTool::new(
+        media_tx,
+        &[],
+        "/tmp/aidaemon-test/inbox",
+    )));
+    let args = serde_json::json!({"path": "/tmp/aidaemon-test/x.txt"});
+    assert!(send.annotations_for(&args).egress);
+    let write = bridge(Arc::new(crate::tools::WriteFileTool));
+    let args = serde_json::json!({"path": "/tmp/aidaemon-test/x.txt", "content": "x"});
+    let annotations = write.annotations_for(&args);
+    assert!(!annotations.egress && !annotations.read_only);
+    // Worst case for a tool that is not read-only as a whole.
+    assert!(write.annotations().egress && write.annotations().destructive);
 }

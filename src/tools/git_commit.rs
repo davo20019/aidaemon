@@ -61,6 +61,14 @@ impl Tool for GitCommitTool {
         }
     }
 
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let path = serde_json::from_str::<Value>(arguments)
             .ok()

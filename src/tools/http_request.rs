@@ -2263,6 +2263,28 @@ impl Tool for HttpRequestTool {
         ]
     }
 
+    /// Owner credentials turn any method into egress: a credentialed GET can
+    /// still trigger actions or leak the account's data.
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        let mut annotations = crate::traits::default_call_annotations(
+            self.capabilities(),
+            &self.call_semantics(arguments),
+        );
+        let credentialed = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .is_some_and(|args| {
+                ["auth_profile", "account_id"].iter().any(|key| {
+                    args.get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            });
+        if credentialed {
+            annotations.egress = true;
+        }
+        annotations
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args = serde_json::from_str::<Value>(arguments).ok();
         let method = args

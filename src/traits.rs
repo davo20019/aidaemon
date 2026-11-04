@@ -81,11 +81,11 @@ pub use provider::{
 };
 #[allow(unused_imports)]
 pub use tools::{
-    semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
-    AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
-    EvidenceTemporalScope, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation, SpecialistKind,
-    StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
+    default_call_annotations, semantics_for_exact_read_actions, AgentRole,
+    AuthorizationPreflightRecord, AuthorizationPreflightStatus, DurableReplayDecision,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, PreparedToolInvocation,
+    ReadFileResultMetadata, ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation,
+    SpecialistKind, StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
     ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
     ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolCollectionCompleteness, ToolCollectionObservation, ToolEvidenceCapability,
@@ -93,7 +93,7 @@ pub use tools::{
     ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
     ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
     ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 
