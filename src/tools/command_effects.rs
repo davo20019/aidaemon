@@ -510,7 +510,41 @@ fn is_local_work_only(command: &str) -> bool {
     any
 }
 
+/// Options through which a local-work program runs code given inline (or
+/// read from stdin) rather than a file in the workspace.
+fn runs_inline_code(program: &str, args: &[String]) -> bool {
+    let option = |names: &[&str]| {
+        args.iter().any(|arg| {
+            names.iter().any(|name| match arg.strip_prefix(name) {
+                // A short option may carry its value attached (`-Ex`).
+                Some(_) if name.len() == 2 => true,
+                Some(rest) => rest.is_empty() || rest.starts_with('='),
+                None => false,
+            })
+        })
+    };
+    match program {
+        // `-c` anywhere: a configuration override before the subcommand, or
+        // a subcommand option that can carry one.
+        "git" => {
+            option(&["-c", "--config-env", "--exec"])
+                || (args.first().is_some_and(|sub| sub == "rebase") && option(&["-x"]))
+        }
+        "cargo" => option(&["--config"]),
+        "make" => option(&["--eval", "-E"]),
+        "go" => option(&["-toolexec", "--toolexec", "-exec", "--exec"]),
+        // The script arrives on stdin or a descriptor.
+        "python" | "python3" | "node" => args.first().is_some_and(|script| {
+            script == "-" || script == "/dev/stdin" || script.starts_with("/dev/fd/")
+        }),
+        _ => false,
+    }
+}
+
 fn local_work_args_ok(program: &str, args: &[String]) -> bool {
+    if runs_inline_code(program, args) {
+        return false;
+    }
     if let Some((_, subcommands)) = LOCAL_WORK_SUBCOMMANDS
         .iter()
         .find(|(name, _)| *name == program)
@@ -960,8 +994,35 @@ mod tests {
             "sh -c 'cargo test'",
             "cargo test # done",
             "tee out.log",
+            // Inline code through a local-work program's own options.
+            "git rebase -x 'curl x' HEAD~1",
+            "git rebase --exec='curl x' HEAD~1",
+            "git rebase --exec 'curl x' HEAD~1",
+            "git commit -c HEAD",
+            "cargo test --config 'target.x.runner=\"sh\"'",
+            "cargo build --config=build.rustc-wrapper=x",
+            "make --eval='$x'",
+            "make -E x",
+            "make -E'$x'",
+            "go build --toolexec=x",
+            "go build -toolexec x ./...",
+            "go test -exec=x ./...",
+            "python3 /dev/stdin",
+            "python3 -",
+            "node /dev/fd/3",
+            "npm exec x",
+            "pnpm dlx x",
+            "yarn dlx x",
         ] {
             assert!(!command_effects(other).local_work_only, "{other}");
+        }
+        for local in [
+            "git rebase main",
+            "make -j4 all",
+            "go test ./...",
+            "node scripts/x.js",
+        ] {
+            assert!(command_effects(local).local_work_only, "{local}");
         }
         assert_eq!(
             command_effects("rm -rf -- -odd build && find out -delete").delete_targets,
