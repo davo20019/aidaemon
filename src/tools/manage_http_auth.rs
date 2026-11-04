@@ -1139,6 +1139,15 @@ impl Tool for ManageHttpAuthTool {
         }
     }
 
+    /// Results are the daemon's own status text, never a third party's.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
         match args.action.as_str() {
@@ -1305,6 +1314,22 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// Its results are the daemon's own status text, so reading them never
+    /// taints a run.
+    #[tokio::test]
+    async fn its_output_is_trusted() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path(), "");
+        let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tool = test_tool(config_file.path().to_path_buf(), profiles)
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots(&[])),
+            aidaemon_core::SourceTrust::Trusted
+        );
     }
 
     #[tokio::test]

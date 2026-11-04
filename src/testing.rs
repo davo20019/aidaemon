@@ -56,6 +56,9 @@ pub struct MockProvider {
     /// Errors returned, in order, by the next main-loop calls before any
     /// scripted response is used.
     leading_errors: Mutex<Vec<String>>,
+    /// Calls asking for one of these JSON-schema names fail (after being
+    /// logged), whatever the script holds.
+    failing_response_schemas: Vec<String>,
     /// When true (default), assessment/re-planner LLM calls are silently
     /// intercepted with an empty response (causing generate_task_plan()
     /// to return None). Preserves existing test behavior — no plan
@@ -77,6 +80,7 @@ impl MockProvider {
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
@@ -93,6 +97,7 @@ impl MockProvider {
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
@@ -112,6 +117,7 @@ impl MockProvider {
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
@@ -127,6 +133,13 @@ impl MockProvider {
 
     pub fn with_strict_responses(mut self) -> Self {
         self.strict_responses = true;
+        self
+    }
+
+    /// Fail every call that asks for the JSON schema `name` with a provider
+    /// error (a background lane such as a verifier, mid-run).
+    pub fn with_failing_response_schema(mut self, name: &str) -> Self {
+        self.failing_response_schemas.push(name.to_string());
         self
     }
 
@@ -432,6 +445,11 @@ impl ModelProvider for MockProvider {
             uncommitted_work: false,
             ..options.clone()
         };
+        if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode {
+            if self.failing_response_schemas.contains(name) {
+                return Err(ProviderError::from_status(503, "synthetic schema lane outage").into());
+            }
+        }
         if self.reject_non_default_options && provider_facing != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
         }

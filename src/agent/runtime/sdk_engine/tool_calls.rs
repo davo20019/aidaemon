@@ -930,10 +930,22 @@ impl Agent {
                 tool.output_trust(arguments, &crate::traits::TrustRoots(&scope.trust_roots))
             })
             .unwrap_or_default();
-        if trust == sdk::SourceTrust::Untrusted {
-            scope
+        // The first untrusted read records the turn as tainted at once, so a
+        // run that never finishes still taints later turns that see it.
+        if trust == sdk::SourceTrust::Untrusted
+            && !scope
                 .untrusted_seen
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Err(error) = crate::agent::untrusted::record_tainted_turn(
+                self.state.as_ref(),
+                scope.session_id,
+                scope.turn_id,
+            )
+            .await
+            {
+                warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
+            }
         }
         sdk::ToolOutput {
             is_error: failed,

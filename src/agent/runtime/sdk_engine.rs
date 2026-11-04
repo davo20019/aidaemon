@@ -894,6 +894,9 @@ impl Agent {
             agent: self,
             scope: &scope,
             origin_request: user_text,
+            origin_trusted: crate::agent::untrusted::origin_is_owner_authored(
+                user_role, session_id,
+            ),
         };
         let run = sdk_agent.run_resolving(state, cancel, &verifier);
         tokio::pin!(run);
@@ -931,7 +934,9 @@ impl Agent {
         }
         while ledger_writes.next().await.is_some() {}
         // A turn that read untrusted content taints later turns that still
-        // see it.
+        // see it. The dispatcher records it when it first reads untrusted
+        // content; this covers seeded turns and the kernel's own tools
+        // (recording is idempotent).
         let tainted = scope.untrusted_seen.load(Ordering::SeqCst)
             || outcome
                 .as_ref()

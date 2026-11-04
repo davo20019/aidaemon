@@ -1209,6 +1209,15 @@ impl Tool for ManageOAuthTool {
         }
     }
 
+    /// Results are the daemon's own status text, never a third party's.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.call_with_status(arguments, None).await
     }
@@ -1455,6 +1464,19 @@ mod tests {
 
     fn write_minimal_config(path: &Path) {
         std::fs::write(path, "[provider]\napi_key = \"test-key\"\n").unwrap();
+    }
+
+    /// Its results are the daemon's own status text, so reading them never
+    /// taints a run.
+    #[tokio::test]
+    async fn its_output_is_trusted() {
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        assert_eq!(
+            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots(&[])),
+            aidaemon_core::SourceTrust::Trusted
+        );
     }
 
     #[tokio::test]
