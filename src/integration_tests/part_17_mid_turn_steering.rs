@@ -189,3 +189,105 @@ async fn test_sdk_context_overflow_records_the_window_and_retries() {
     let after = crate::config::ContextWindowConfig::default().context_budget_for(model);
     assert!(after < before, "the rejection lowered the budget: {before} -> {after}");
 }
+
+/// Questions sent back to back, before the turn's first model call, all
+/// reach that call as part of the request: none of them may read as the
+/// only current request, which drops the ones before it.
+#[tokio::test]
+async fn test_sdk_messages_sent_before_the_first_call_add_to_the_request() {
+    let session = "tg_steering_adds_to_request";
+    let channel_ctx = ChannelContext::private("telegram");
+    let registry = Arc::new(crate::tasks::TaskRegistry::new(10));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("Hi Alice."),
+        MockProvider::text_response("Alice; Robert and Maria; Mia and Zoe."),
+    ]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![], None)
+        .await
+        .unwrap();
+    harness.agent.set_task_registry(registry.clone());
+
+    // An earlier exchange, so there is prior context.
+    harness
+        .agent
+        .handle_message(
+            session,
+            "Hello",
+            None,
+            UserRole::Owner,
+            channel_ctx.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let follow_ups = ["Who are my parents?", "Who are my daughters?"];
+    for text in follow_ups {
+        registry
+            .queue_message(
+                session,
+                crate::tasks::QueuedMessage::new(
+                    text,
+                    UserRole::Owner,
+                    channel_ctx.clone(),
+                    Vec::new(),
+                ),
+                None,
+            )
+            .await;
+    }
+    harness
+        .agent
+        .handle_message(
+            session,
+            "What is my name?",
+            None,
+            UserRole::Owner,
+            channel_ctx,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let log = harness.provider.call_log.lock().await;
+    let call = log.last().expect("the request reached the model");
+    let texts: Vec<(String, String)> = call
+        .messages
+        .iter()
+        .filter_map(|m| {
+            Some((
+                m["role"].as_str()?.to_string(),
+                m["content"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let request = texts
+        .iter()
+        .rposition(|(role, text)| role == "user" && text.contains("What is my name?"))
+        .expect("the request is in the call");
+    for follow_up in follow_ups {
+        let at = texts
+            .iter()
+            .position(|(role, text)| role == "user" && text.contains(follow_up))
+            .expect("each queued message reaches the first call");
+        assert!(at > request, "{follow_up} follows the request");
+        assert!(
+            texts[at].1.contains("adds to the current request"),
+            "{follow_up} is framed as part of the request: {}",
+            texts[at].1
+        );
+    }
+    // When prior context marks the current request, the marker must not
+    // single out the last user message: that drops the ones before it.
+    if let Some((_, marker)) = texts
+        .iter()
+        .find(|(role, text)| role == "system" && text.starts_with("[Current Task]"))
+    {
+        assert!(
+            marker.contains("sent while you were working add to it"),
+            "{marker}"
+        );
+    }
+    drop(log);
+    assert_eq!(registry.queue_len(session).await, 0);
+}

@@ -1193,8 +1193,9 @@ pub(super) async fn build_turn_messages(
                     // which broke follow-up references like "the ones within 20 miles".
                     let marker = json!({
                         "role": "system",
-                        "content": "[Current Task] The final user message in this transcript is the \
-                                    current request. Earlier messages remain conversation context."
+                        "content": "[Current Task] The latest user message before your work on this \
+                                    turn is the current request; user messages marked as sent while \
+                                    you were working add to it. Earlier messages remain conversation context."
                     });
                     let continuity_boundary = messages
                         .iter()
