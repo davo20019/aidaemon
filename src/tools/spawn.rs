@@ -280,6 +280,7 @@ async fn deliver_background_notification(
     notification_type: &str,
     message: &str,
     context: &str,
+    untrusted: bool,
 ) {
     let message = crate::channels::present_notification(notification_type, message);
     let mut delivered = false;
@@ -303,7 +304,8 @@ async fn deliver_background_notification(
 
     if let Some(state_store) = state {
         let entry =
-            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message);
+            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message)
+                .with_untrusted(untrusted);
         if let Err(e) = state_store.enqueue_notification(&entry).await {
             warn!(
                 session_id = %session_id,
@@ -742,6 +744,7 @@ impl Tool for SpawnAgentTool {
                             "progress",
                             &progress_message,
                             "spawn_agent background progress notifier",
+                            false,
                         )
                         .await;
                     }
@@ -813,15 +816,17 @@ impl Tool for SpawnAgentTool {
                     }
                 }
             };
-            let delivered = match agent
-                .deliver_background_child_result(
-                    hub_for_parent_delivery.as_ref(),
-                    &session_id,
-                    &message,
-                    trust,
-                )
-                .await
-            {
+            // Without a hub the queue delivers it (and the heartbeat records
+            // it in the parent session then), so it is recorded once.
+            let direct = match hub_for_parent_delivery.as_ref() {
+                Some(hub) => {
+                    agent
+                        .deliver_background_child_result(Some(hub), &session_id, &message, trust)
+                        .await
+                }
+                None => Ok(false),
+            };
+            let delivered = match direct {
                 Ok(sent) => sent,
                 Err(e) => {
                     warn!(
@@ -836,6 +841,8 @@ impl Tool for SpawnAgentTool {
             };
 
             if !delivered {
+                // The queued copy carries the child's taint into whichever
+                // parent turn records it.
                 deliver_background_notification(
                     None,
                     state.as_ref(),
@@ -844,6 +851,7 @@ impl Tool for SpawnAgentTool {
                     notification_type,
                     &message,
                     "spawn_agent background completion notifier",
+                    trust == SourceTrust::Untrusted,
                 )
                 .await;
             }
@@ -1177,6 +1185,7 @@ mod tests {
             "progress",
             "Background sub-agent still running after 20s.\nMission: test",
             "spawn_test",
+            false,
         )
         .await;
 

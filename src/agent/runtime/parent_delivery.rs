@@ -98,9 +98,9 @@ impl Agent {
     }
 
     /// Deliver a backgrounded child's result. A result from a child that
-    /// read untrusted content lands in the parent session as its own turn,
-    /// recorded tainted before the note exists, so every later turn that
-    /// still sees it starts tainted.
+    /// read untrusted content lands in a turn recorded tainted before the
+    /// note exists (`tainted_note_turn`), so every later turn that still
+    /// sees it starts tainted.
     pub(crate) async fn deliver_background_spawn_result(
         &self,
         hub: Option<&Weak<dyn OutboundRouter>>,
@@ -111,14 +111,7 @@ impl Agent {
         let turn_id = match trust {
             aidaemon_core::SourceTrust::Trusted => None,
             aidaemon_core::SourceTrust::Untrusted => {
-                let turn_id = uuid::Uuid::new_v4().to_string();
-                crate::agent::untrusted::record_tainted_turn(
-                    self.state.as_ref(),
-                    parent_session_id,
-                    &turn_id,
-                )
-                .await?;
-                Some(turn_id)
+                Some(self.tainted_note_turn(parent_session_id).await?)
             }
         };
         self.deliver_parent_text_result_in_turn(
@@ -129,6 +122,23 @@ impl Agent {
             turn_id.as_deref(),
         )
         .await
+    }
+
+    /// The turn an untrusted note joins, recorded tainted before the note
+    /// is written: the session's running turn if there is one, else a turn
+    /// of its own. Fails if the taint cannot be recorded; callers then do
+    /// not write the note.
+    pub(crate) async fn tainted_note_turn(&self, session_id: &str) -> anyhow::Result<String> {
+        let turn_id = self
+            .current_turn_ids
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::agent::untrusted::record_tainted_turn(self.state.as_ref(), session_id, &turn_id)
+            .await?;
+        Ok(turn_id)
     }
 
     pub(crate) async fn deliver_parent_text_result(

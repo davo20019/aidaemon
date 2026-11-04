@@ -1907,7 +1907,7 @@ impl HeartbeatCoordinator {
     /// Queue delivery bypasses `deliver_parent_text_result`, so persist every
     /// delivered notice in owner history: a reply to it must reach an agent
     /// that can see what it answers.
-    async fn record_delivered_notification(
+    pub(crate) async fn record_delivered_notification(
         &self,
         entry: &crate::traits::NotificationEntry,
         delivered_text: &str,
@@ -1915,11 +1915,30 @@ impl HeartbeatCoordinator {
         let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) else {
             return;
         };
+        // An untrusted notice joins a turn recorded tainted before the note
+        // exists; if the record cannot be written the note is not written
+        // either (it would read as clean).
+        let turn_id = if entry.untrusted {
+            match agent.tainted_note_turn(&entry.session_id).await {
+                Ok(turn_id) => Some(turn_id),
+                Err(error) => {
+                    warn!(
+                        notification_id = %entry.id,
+                        %error,
+                        "Untrusted notification not recorded in owner history: its taint could not be recorded"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = agent
-            .record_parent_visible_result_note(
+            .record_parent_visible_result_note_in_turn(
                 &entry.session_id,
                 QUEUED_NOTIFICATION_NOTE_PREFIX,
                 delivered_text,
+                turn_id.as_deref(),
             )
             .await
         {

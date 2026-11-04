@@ -731,3 +731,110 @@ async fn a_clean_childs_result_does_not_taint_the_parent() {
         .iter()
         .any(is_clean_verifier_call));
 }
+
+/// A tainted background child whose result could not reach the parent
+/// directly (no channel hub) is queued carrying the child's taint; when the
+/// heartbeat delivers it into the parent session, the note's turn is
+/// recorded tainted first, so any later turn that sees it starts tainted.
+/// A clean child's queued result taints nothing.
+#[tokio::test]
+async fn a_queued_tainted_background_result_taints_the_parent() {
+    for child_reads_page in [true, false] {
+        let (untrusted, note_turn, tainted) = queued_background_result(child_reads_page).await;
+        assert_eq!(untrusted, child_reads_page, "the queued result carries the child's taint");
+        if child_reads_page {
+            let note_turn = note_turn.expect("the note joins a turn");
+            assert_eq!(tainted, vec![note_turn]);
+        } else {
+            assert!(tainted.is_empty(), "{tainted:?}");
+        }
+    }
+}
+
+/// Runs a background child (no hub, so its result is queued), delivers the
+/// queued result through the heartbeat, and returns the queued entry's
+/// taint flag, the recorded note's turn and the parent's tainted turns.
+async fn queued_background_result(
+    child_reads_page: bool,
+) -> (bool, Option<String>, Vec<String>) {
+    use crate::traits::store_prelude::*;
+    use crate::traits::NotificationStore;
+    let mut script = Vec::new();
+    if child_reads_page {
+        script.push(MockProvider::tool_call_response(
+            "plain_page",
+            &json!({"url": "https://example.invalid/notes"}).to_string(),
+        ));
+    }
+    script.push(MockProvider::text_response(if child_reads_page {
+        "Summary: a synthetic page."
+    } else {
+        "Hello."
+    }));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(PlainPage)];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        tools,
+        None,
+    )
+    .await
+    .unwrap();
+    let state = harness.state.clone();
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 60)
+        .with_state(state.clone() as Arc<dyn crate::traits::StateStore>);
+    crate::traits::Tool::call(
+        &spawn_tool,
+        &json!({
+            "mission": "Summarize",
+            "task": if child_reads_page {
+                "Summarize https://example.invalid/notes"
+            } else {
+                "Reply with a one-line greeting."
+            },
+            "background": true,
+            "_session_id": INJECTION_SESSION,
+            "_user_role": "Owner",
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let mut queued = None;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pending = state.get_pending_notifications(20).await.unwrap();
+        if let Some(entry) = pending
+            .into_iter()
+            .find(|entry| entry.message.contains("Mission: Summarize"))
+        {
+            queued = Some(entry);
+            break;
+        }
+    }
+    let queued = queued.expect("the result is queued");
+    // Without a hub the result is only queued, never recorded twice.
+    assert!(state.get_history(INJECTION_SESSION, 20).await.unwrap().is_empty());
+
+    let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut coordinator = crate::heartbeat::HeartbeatCoordinator::new(
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+        60,
+        3,
+        wake_rx,
+        None,
+        None,
+        None,
+    );
+    coordinator.set_agent(Arc::downgrade(&agent));
+    coordinator
+        .record_delivered_notification(&queued, &queued.message)
+        .await;
+    let history = state.get_history(INJECTION_SESSION, 20).await.unwrap();
+    assert_eq!(history.len(), 1, "one note");
+    let tainted = crate::agent::untrusted::tainted_turns(state.as_ref(), INJECTION_SESSION)
+        .await
+        .unwrap();
+    (queued.untrusted, history[0].turn_id.clone(), tainted)
+}

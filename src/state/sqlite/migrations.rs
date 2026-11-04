@@ -2673,6 +2673,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "ALTER TABLE notification_queue ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
 
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_goals_project_status
@@ -2818,6 +2823,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "ALTER TABLE notification_queue ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_notification_queue_pending

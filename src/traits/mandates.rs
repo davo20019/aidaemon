@@ -2533,6 +2533,7 @@ impl MandateRunNotification {
             expires_at: None,
             task_id: None,
             action_token: Some(id),
+            untrusted: false,
         }
     }
 }
