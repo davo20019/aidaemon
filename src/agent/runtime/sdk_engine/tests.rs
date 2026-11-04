@@ -1832,6 +1832,41 @@ fn relative_reads_under_the_working_directory_are_trusted() {
     }
 }
 
+/// A working directory that holds other people's files (an ancestor of the
+/// home directory, a shared temp root) is never a trusted root; folders
+/// below them are.
+#[test]
+fn broad_working_directories_are_not_trusted_roots() {
+    let mut broad = vec![
+        "/".to_string(),
+        "/tmp".to_string(),
+        "/private/tmp".to_string(),
+        "/var/tmp".to_string(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+    ];
+    if let Ok(canonical) = std::fs::canonicalize(std::env::temp_dir()) {
+        broad.push(canonical.to_string_lossy().into_owned());
+    }
+    if let Some(home) = dirs::home_dir() {
+        broad.extend(
+            home.ancestors()
+                .map(|dir| dir.to_string_lossy().into_owned()),
+        );
+    }
+    for cwd in &broad {
+        assert!(
+            super::turn_trust_roots(&[], Some(cwd), None, None, None).is_empty(),
+            "{cwd} must not be a trusted root"
+        );
+    }
+    for cwd in ["/tmp/aidaemon-test/ws", "/var/tmp/aidaemon-test/ws"] {
+        assert_eq!(
+            super::turn_trust_roots(&[], Some(cwd), None, None, None),
+            vec![cwd.to_string()]
+        );
+    }
+}
+
 /// Whole path: a relative read of the owner's own file in a turn with no
 /// project scope leaves the turn clean, so a later send runs unchecked.
 #[tokio::test]

@@ -199,13 +199,26 @@ pub(in crate::agent) fn turn_trust_roots(
     roots
 }
 
-/// A directory narrower than the whole filesystem or the home directory.
+/// A directory that holds only the owner's work: not the filesystem root,
+/// the home directory or any of its ancestors (`/Users`), nor a shared temp
+/// root (`/tmp`, `/private/tmp`, `/var/tmp`, the system temp directory).
+/// Folders below them are fine.
 fn is_narrow_root(dir: &str) -> bool {
-    let dir = std::path::Path::new(dir.trim());
+    let dir = std::path::Path::new(dir.trim().trim_end_matches('/'));
     if !dir.is_absolute() || dir.parent().is_none() {
         return false;
     }
-    dirs::home_dir().is_none_or(|home| dir != home)
+    if dirs::home_dir().is_some_and(|home| home.starts_with(dir)) {
+        return false;
+    }
+    let temp = std::env::temp_dir();
+    let mut shared: Vec<std::path::PathBuf> = ["/tmp", "/private/tmp", "/var/tmp"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    shared.extend(std::fs::canonicalize(&temp).ok());
+    shared.push(temp);
+    !shared.iter().any(|root| root.as_path() == dir)
 }
 
 /// Where the file tools resolve a relative path: the execution backend's
