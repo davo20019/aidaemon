@@ -1894,7 +1894,10 @@ async fn seeded_untrusted_context_is_visible_to_hooks() {
 #[test]
 fn egress_defaults_are_conservative() {
     assert!(ToolAnnotations::default().egress);
-    assert!(ToolAnnotations::DESTRUCTIVE.egress);
-    assert!(!ToolAnnotations::READ_ONLY.egress);
-    assert!(!ToolAnnotations::WRITE.egress);
+    let presets = [
+        ToolAnnotations::DESTRUCTIVE,
+        ToolAnnotations::READ_ONLY,
+        ToolAnnotations::WRITE,
+    ];
+    assert_eq!(presets.map(|a| a.egress), [true, false, false]);
 }
