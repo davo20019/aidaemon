@@ -611,7 +611,9 @@ impl Agent {
                 .load(Ordering::Relaxed)
                 .then(|| TERMINAL_REPLY_STOP.to_string())
         });
-        builder = builder.hook(SameToolLimit);
+        builder = builder.hook(SameToolLimit {
+            read_only_tools: read_only_tool_names(self.tools.iter()),
+        });
         builder = builder.hook(LedgerStop {
             calls: calls_tx.clone(),
         });

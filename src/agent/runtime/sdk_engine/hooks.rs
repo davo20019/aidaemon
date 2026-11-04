@@ -105,7 +105,24 @@ pub(super) fn same_tool_loop(
 /// The consecutive-same-tool guard. A hook cannot end the
 /// run, so the looping call is refused with a redirect; if the model keeps
 /// at it, the kernel's stuck detector ends the run.
-pub(super) struct SameToolLimit;
+///
+/// The distinct-arguments exemption is judged by the tool's worst case
+/// (`capabilities().read_only`), not the per-call annotation: a mixed tool
+/// such as `terminal` types most calls read-only, and must stay limited.
+pub(super) struct SameToolLimit {
+    pub(super) read_only_tools: std::collections::HashSet<String>,
+}
+
+/// Names of the tools that are read-only for every call.
+pub(super) fn read_only_tool_names<'a>(
+    tools: impl IntoIterator<Item = &'a Arc<dyn crate::traits::Tool>>,
+) -> std::collections::HashSet<String> {
+    tools
+        .into_iter()
+        .filter(|tool| tool.capabilities().read_only)
+        .map(|tool| tool.name().to_string())
+        .collect()
+}
 
 #[async_trait]
 impl sdk::Hook for SameToolLimit {
@@ -113,7 +130,7 @@ impl sdk::Hook for SameToolLimit {
         &self,
         ctx: &sdk::HookContext<'_>,
         call: &sdk::ToolCall,
-        tool: &sdk::ToolInfo,
+        _tool: &sdk::ToolInfo,
     ) -> sdk::ToolDecision {
         let previous: Vec<(String, Value)> = ctx
             .run_receipts()
@@ -123,7 +140,7 @@ impl sdk::Hook for SameToolLimit {
             &previous,
             &call.name,
             &call.arguments,
-            tool.annotations.read_only,
+            self.read_only_tools.contains(&call.name),
         ) {
             return sdk::ToolDecision::Allow;
         }

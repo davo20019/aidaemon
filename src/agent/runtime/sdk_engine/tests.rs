@@ -1602,3 +1602,45 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     //   "ls /tmp | xargs rm"
     // (the native sandbox still blocks undeclared writes).
 }
+
+#[tokio::test]
+async fn same_tool_limit_still_limits_distinct_terminal_commands() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+        .await
+        .unwrap();
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+    let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await,
+    );
+    let tools = [terminal];
+    let read_only = read_only_tool_names(tools.iter());
+    // The terminal is not read-only as a whole, even though its calls are
+    // typed per call.
+    assert!(!read_only.contains("terminal"));
+    let streak = |n: usize| -> Vec<(String, serde_json::Value)> {
+        (0..n)
+            .map(|i| {
+                (
+                    "terminal".to_string(),
+                    serde_json::json!({"action": "run", "command": format!("ls /tmp/{i}")}),
+                )
+            })
+            .collect()
+    };
+    let next = serde_json::json!({"action": "run", "command": "ls /tmp/next"});
+    assert!(same_tool_loop(
+        &streak(40),
+        "terminal",
+        &next,
+        read_only.contains("terminal")
+    ));
+}
