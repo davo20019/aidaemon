@@ -124,7 +124,7 @@ async fn test_uploaded_artifact_request_has_task_boundary() {
         .await
         .unwrap();
 
-    let artifact_request = "[File received: 68235.png (413 KB, image/png)\nSaved to: /Users/davidloor/projects/aidaemon/.aidaemon/files/inbox/694c3943_68235.png]\nCheck the doc and fix the issue.";
+    let artifact_request = "[File received: 68235.png (413 KB, image/png)\nSaved to: /Users/jordan/projects/aidaemon/.aidaemon/files/inbox/694c3943_68235.png]\nCheck the doc and fix the issue.";
     let _ = harness
         .agent
         .handle_message(

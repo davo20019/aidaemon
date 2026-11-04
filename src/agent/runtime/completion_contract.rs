@@ -3147,7 +3147,7 @@ mod tests {
         // request:\n…"). An observational follow-up after a prior mutation
         // request inherited expects_mutation=true and was blocked for extra
         // iterations, then scored failed/partial.
-        let enriched = "Original request:\nCreate a python script that pings davidloor.com \
+        let enriched = "Original request:\nCreate a python script that pings example.com \
              every 5 seconds and logs the latency.\n\nCurrent request:\nHow stable is the latency?";
         let contract = infer_completion_contract(enriched, &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Answer);
@@ -3158,7 +3158,7 @@ mod tests {
     }
     #[test]
     fn observational_screenshot_followup_is_answer_not_mutation() {
-        let enriched = "Original request:\nOpen davidloor.com in the browser and take a \
+        let enriched = "Original request:\nOpen example.com in the browser and take a \
              screenshot.\n\nCurrent request:\nWhat did you see in the screenshot?";
         let contract = infer_completion_contract(enriched, &[]);
         assert!(
@@ -3593,13 +3593,14 @@ mod tests {
     fn verification_targets_do_not_resolve_plain_word_nicknames_without_local_scope_cues() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let targets = extract_verification_targets(
-            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            "Find recruiting studies in Springfield, Illinois and summarize them.",
             &alias_roots,
         );
 
@@ -3613,13 +3614,14 @@ mod tests {
     fn verification_targets_do_not_invent_targets_from_project_prose() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let targets = extract_verification_targets(
-            "Check the Fairfax project for broken links.",
+            "Check the Springfield project for broken links.",
             &alias_roots,
         );
 

@@ -3151,10 +3151,7 @@ bot_token = "bot-2"
     fn hostname_matches_zone_checks_suffix_boundaries() {
         assert!(hostname_matches_zone("legacy.aidaemon.ai", "aidaemon.ai"));
         assert!(hostname_matches_zone("aidaemon.ai", "aidaemon.ai"));
-        assert!(!hostname_matches_zone(
-            "legacy.aidaemon.ai",
-            "davidloor.com"
-        ));
+        assert!(!hostname_matches_zone("legacy.aidaemon.ai", "example.com"));
     }
 
     #[test]

@@ -99,7 +99,7 @@ fn read_only_investigation_uses_standard_budget() {
 #[test]
 fn api_read_requests_use_standard_budget_for_multi_step_lookups() {
     let (tier, route_kind, budget) = select_initial_execution_budget(
-        "Using the clinical trials API, give me studies near Fairfax for skin cancer.",
+        "Using the clinical trials API, give me studies near Springfield for skin cancer.",
         &TurnContext::default(),
         0,
         AgentRole::Orchestrator,

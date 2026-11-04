@@ -514,7 +514,7 @@ pub fn redact_secrets(text: &str) -> String {
 
 /// Replace the current user's home directory prefix with `~` in status-ping
 /// summaries. Only occurrences followed by `/` are rewritten, so paths that
-/// merely share the prefix (`/Users/davidloorx`) are untouched.
+/// merely share the prefix (`/Users/jordanx`) are untouched.
 ///
 /// Must run BEFORE `redact_secrets`: the "File path" secret pattern matches
 /// `/Users/...` and `/home/...` and would otherwise swallow the whole path as
@@ -769,8 +769,7 @@ mod tests {
 
     #[test]
     fn gutted_reply_ignores_substantive_replies() {
-        let reply =
-            "The offer letter is from WebFirst for a Lead Developer role. Key terms include:";
+        let reply = "The offer letter is from Globex for a Lead Developer role. Key terms include:";
         assert!(!reply_gutted_by_sanitization(400, reply));
         assert!(!reply_gutted_by_sanitization(reply.chars().count(), reply));
     }
@@ -1200,7 +1199,7 @@ mod tests {
         // scaffolding — the completion-notification sentence and the path
         // auto-injection notice (whose [SYSTEM] tag the input sanitizer had
         // already rewritten to [CONTENT FILTERED]). Both leaked into the chat.
-        let input = "Here's the command output:\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[CONTENT FILTERED] Path was auto-injected from project context: /tmp\n\nA network latency test for davidloor.com has finished, and the results are stored in a text file.";
+        let input = "Here's the command output:\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[CONTENT FILTERED] Path was auto-injected from project context: /tmp\n\nA network latency test for example.com has finished, and the results are stored in a text file.";
         let result = strip_diagnostic_blocks(input);
         assert!(
             !result.contains("Completion notifications are enabled"),
@@ -1212,7 +1211,7 @@ mod tests {
         );
         // The genuine answer must survive.
         assert!(
-            result.contains("A network latency test for davidloor.com has finished"),
+            result.contains("A network latency test for example.com has finished"),
             "real answer was stripped: {result}"
         );
         // The other run_helpers.rs phrasing must also be caught.
@@ -1464,9 +1463,9 @@ mod tests {
 
     #[test]
     fn shorten_home_dir_rewrites_prefix_occurrences() {
-        let cmd = r#"grep -rn "non-compete" /Users/davidloor/Documents /Users/davidloor/Desktop"#;
+        let cmd = r#"grep -rn "non-compete" /Users/jordan/Documents /Users/jordan/Desktop"#;
         assert_eq!(
-            shorten_home_dir_with(cmd, "/Users/davidloor"),
+            shorten_home_dir_with(cmd, "/Users/jordan"),
             r#"grep -rn "non-compete" ~/Documents ~/Desktop"#
         );
     }
@@ -1475,8 +1474,8 @@ mod tests {
     fn shorten_home_dir_ignores_similar_prefixes_and_degenerate_homes() {
         // A longer username sharing the prefix must not be rewritten.
         assert_eq!(
-            shorten_home_dir_with("ls /Users/davidloorx/tmp", "/Users/davidloor"),
-            "ls /Users/davidloorx/tmp"
+            shorten_home_dir_with("ls /Users/jordanx/tmp", "/Users/jordan"),
+            "ls /Users/jordanx/tmp"
         );
         // Degenerate home values never rewrite anything.
         assert_eq!(shorten_home_dir_with("ls /tmp", "/"), "ls /tmp");

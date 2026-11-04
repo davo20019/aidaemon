@@ -746,7 +746,7 @@ async fn test_upsert_fact_with_provenance_round_trips() {
         .upsert_fact(
             "identity",
             "city",
-            "Quito",
+            "Lisbon",
             "agent",
             None,
             FactPrivacy::Global,

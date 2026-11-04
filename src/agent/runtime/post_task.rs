@@ -582,7 +582,7 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
     }
     if !searches.is_empty() {
         // Dedupe and drop empty-arg entries — repeated globs otherwise render
-        // as "Searches: makpar, , makpar".
+        // as "Searches: acme, , acme".
         let mut seen = std::collections::BTreeSet::new();
         let items: Vec<&str> = searches
             .iter()

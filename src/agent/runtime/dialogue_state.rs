@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn stale_answered_request_does_not_capture_short_new_request() {
         // Incident shape: "What's a contract vehicle?" was answered hours ago,
-        // yet "Send me my makpar resume" kept anchoring to it as a followup,
+        // yet "Send me my acme resume" kept anchoring to it as a followup,
         // so the open_request never rotated.
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
@@ -1382,7 +1382,7 @@ mod tests {
             now - chrono::Duration::hours(2),
             Some(now - chrono::Duration::hours(2)),
         ));
-        apply_user_message(&mut state, "u2", "Send me my makpar resume", &[], now);
+        apply_user_message(&mut state, "u2", "Send me my acme resume", &[], now);
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::NewRequest)
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn fresh_open_question_does_not_capture_imperative_request() {
-        // Live 2026-07-12: the makpar clarifying question was only seconds old
+        // Live 2026-07-12: the acme clarifying question was only seconds old
         // when "Send me my Microsoft resume" arrived; the non-ack fallthrough
         // captured it as a clarification answer. A self-contained imperative
         // that names its own object supersedes the question instead.
@@ -1435,7 +1435,7 @@ mod tests {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         state.open_question = Some(question_with(now - chrono::Duration::hours(2), true));
-        apply_user_message(&mut state, "u2", "Send me my makpar resume", &[], now);
+        apply_user_message(&mut state, "u2", "Send me my acme resume", &[], now);
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::NewRequest)

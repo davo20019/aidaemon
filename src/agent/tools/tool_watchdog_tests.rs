@@ -565,7 +565,7 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
                 status_tx: None,
                 channel_visibility: ChannelVisibility::Private,
                 channel_id: None,
-                project_scope: Some("/Users/davidloor/Library/Logs/aidaemon"),
+                project_scope: Some("/Users/jordan/Library/Logs/aidaemon"),
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
@@ -581,7 +581,7 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
     let payload: Value = serde_json::from_str(&result).expect("spawn_agent args should be JSON");
     assert_eq!(
         payload.get("_project_scope").and_then(Value::as_str),
-        Some("/Users/davidloor/Library/Logs/aidaemon")
+        Some("/Users/jordan/Library/Logs/aidaemon")
     );
     assert_eq!(
         payload.get("mission").and_then(Value::as_str),

@@ -350,12 +350,13 @@ mod tests {
     fn does_not_extract_plain_word_nickname_without_local_scope_cues() {
         let dir = tempfile::tempdir().expect("tempdir");
         let alias_root = dir.path().join("projects");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
 
         let hint = extract_project_dir_hint_with_aliases(
-            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            "Find recruiting studies in Springfield, Illinois and summarize them.",
             &[alias_root.to_string_lossy().to_string()],
         );
 
