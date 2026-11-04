@@ -310,6 +310,37 @@ mod tests {
         assert_eq!(sent.load(Ordering::SeqCst), 1);
     }
 
+    /// Records each run end a hook sees: whether the run completed.
+    struct RunEnds(Arc<std::sync::Mutex<Vec<bool>>>);
+    #[async_trait]
+    impl crate::Hook for RunEnds {
+        async fn on_run_end(&self, _: &crate::HookContext<'_>, outcome: &crate::RunOutcome) {
+            self.0.lock().unwrap().push(outcome.is_completed());
+        }
+    }
+
+    /// Hooks see one run end per `run_resolving` call, with the final
+    /// outcome, however many interruptions were settled on the way.
+    #[tokio::test]
+    async fn run_resolving_ends_the_run_once() {
+        for (resolver, completed) in [
+            (&Fixed(Resolution::Approve) as &dyn InterruptResolver, true),
+            (&Abstain as &dyn InterruptResolver, false),
+        ] {
+            let (a, _) = setup(UntrustedMode::Enforce, egress_script());
+            let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let a = a.with_hook(RunEnds(ends.clone()));
+            a.run_resolving(
+                RunState::new("a", "s", "go"),
+                CancellationToken::new(),
+                resolver,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*ends.lock().unwrap(), vec![completed]);
+        }
+    }
+
     #[tokio::test]
     async fn run_resolving_returns_interrupted_when_resolver_abstains() {
         let (a, sent) = setup(UntrustedMode::Enforce, egress_script());

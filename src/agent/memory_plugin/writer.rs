@@ -208,6 +208,73 @@ pub(crate) mod tests {
         );
     }
 
+    struct Approve;
+    #[async_trait]
+    impl sdk::InterruptResolver for Approve {
+        async fn resolve(
+            &self,
+            _: &sdk::RunState,
+            _: &sdk::Interruption,
+        ) -> Option<sdk::Resolution> {
+            Some(sdk::Resolution::Approve)
+        }
+    }
+
+    /// A turn whose egress after an untrusted read was verified and approved
+    /// learns once, from the final outcome, not once per interruption.
+    #[tokio::test]
+    async fn a_verified_egress_turn_learns_once() {
+        use aidaemon_core::testing::{call, spec, tool_calls};
+        let writes = Arc::new(RecordingWrites::default());
+        let fetch = sdk::FnTool::new(
+            spec("fetch", "fetches", &[]),
+            sdk::ToolAnnotations::READ_ONLY,
+            |_: serde_json::Value| std::future::ready(Ok(sdk::ToolOutput::text("page"))),
+        );
+        let send = sdk::FnTool::new(
+            spec("send", "sends", &[]),
+            sdk::ToolAnnotations {
+                egress: true,
+                ..sdk::ToolAnnotations::WRITE
+            },
+            |_: serde_json::Value| std::future::ready(Ok(sdk::ToolOutput::text("sent"))),
+        )
+        .with_trust(sdk::SourceTrust::Trusted);
+        let agent = sdk::Agent::builder("test")
+            .allow_unguarded()
+            .model("scripted")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "fetch", serde_json::json!({}))]),
+                tool_calls([call("c2", "send", serde_json::json!({}))]),
+                text("Sent."),
+            ]))
+            .tool(fetch)
+            .tool(send)
+            .hook(sdk::UntrustedHook::new(
+                sdk::UntrustedMode::Enforce,
+                |_, content| content.to_string(),
+            ))
+            .hook(DaemonMemoryWriter::new(
+                turn(0, "telegram:synthetic-user-1").await,
+                SETTINGS,
+                writes.clone(),
+            ))
+            .build()
+            .unwrap();
+        let outcome = agent
+            .run_resolving(
+                sdk::RunState::new("test", "s", "go"),
+                tokio_util::sync::CancellationToken::new(),
+                &Approve,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_completed());
+        let recorded = writes.0.lock().unwrap();
+        assert_eq!(recorded.learned.len(), 1, "one run end per turn");
+        assert!(recorded.learned[0].completed_naturally);
+    }
+
     #[tokio::test]
     async fn writer_skips_failed_and_cancelled_runs() {
         let failed = run(

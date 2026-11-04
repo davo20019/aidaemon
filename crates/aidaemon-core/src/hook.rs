@@ -127,7 +127,8 @@ pub trait Hook: Send + Sync {
     /// The run ended, with any status. Fires exactly once per run, after the
     /// outcome is final and every `on_stop` check has had its say, so it is
     /// the place for after-the-fact work such as writing memory. It cannot
-    /// change the outcome.
+    /// change the outcome. A `run_resolving` call is one run: the
+    /// interruptions it settles are not run ends.
     async fn on_run_end(&self, _ctx: &HookContext<'_>, _outcome: &RunOutcome) {}
 
     /// The stuck detector fired. `None` means "no opinion"; if every hook

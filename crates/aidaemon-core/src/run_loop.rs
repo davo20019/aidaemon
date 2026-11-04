@@ -29,6 +29,9 @@ pub(crate) struct Driver<'a> {
     cancel: CancellationToken,
     segment_start: Instant,
     base_elapsed_ms: u64,
+    /// Whether this segment's end is the run's end for hooks. A segment
+    /// driven by `run_resolving` is not: the caller reports the final one.
+    report_run_end: bool,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -79,7 +82,14 @@ impl<'a> Driver<'a> {
             cancel,
             segment_start: Instant::now(),
             base_elapsed_ms,
+            report_run_end: true,
         }
+    }
+
+    /// Leave `on_run_end` to the caller (see `report_run_end`).
+    pub(crate) fn without_run_end(mut self) -> Self {
+        self.report_run_end = false;
+        self
     }
 
     pub(crate) async fn drive(
@@ -931,21 +941,28 @@ impl<'a> Driver<'a> {
             final_text,
             state: self.state,
         };
-        let ctx = HookContext {
-            run_id: outcome.state.run_id,
-            agent_id: &self.agent.id,
-            session_id: &outcome.state.session_id,
-            turn: outcome.state.turn,
-            messages: &outcome.state.messages,
-            receipts: &outcome.state.receipts,
-            usage: outcome.state.usage,
-            run_usage: outcome.state.run_usage,
-            untrusted_seen: outcome.state.untrusted_seen,
-        };
-        for hook in &self.agent.hooks {
-            hook.on_run_end(&ctx, &outcome).await;
+        if self.report_run_end {
+            report_run_end(self.agent, &outcome).await;
         }
         Ok(outcome)
+    }
+}
+
+/// Tell every hook the run is over, with its final outcome.
+pub(crate) async fn report_run_end(agent: &AgentInner, outcome: &RunOutcome) {
+    let ctx = HookContext {
+        run_id: outcome.state.run_id,
+        agent_id: &agent.id,
+        session_id: &outcome.state.session_id,
+        turn: outcome.state.turn,
+        messages: &outcome.state.messages,
+        receipts: &outcome.state.receipts,
+        usage: outcome.state.usage,
+        run_usage: outcome.state.run_usage,
+        untrusted_seen: outcome.state.untrusted_seen,
+    };
+    for hook in &agent.hooks {
+        hook.on_run_end(&ctx, outcome).await;
     }
 }
 

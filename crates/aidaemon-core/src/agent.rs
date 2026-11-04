@@ -142,24 +142,38 @@ impl Agent {
     /// `None` (the interrupted outcome is then returned as is). It has no
     /// iteration cap of its own: a resolver that keeps resolving is bounded
     /// by the run's limits (turns, tool calls, tokens).
+    ///
+    /// Hooks see one run end (`Hook::on_run_end`), for the final outcome;
+    /// the interruptions settled on the way are not run ends.
     pub async fn run_resolving(
         &self,
         state: RunState,
         cancel: CancellationToken,
         resolver: &dyn InterruptResolver,
     ) -> Result<RunOutcome, CoreError> {
-        let mut outcome = self.run_from(state, cancel.clone()).await?;
+        self.check_owner(&state)?;
+        if state.pending.is_some() {
+            return Err(CoreError::PendingInterruption);
+        }
+        let mut outcome = Driver::new(&self.inner, state, cancel.clone())
+            .without_run_end()
+            .drive(None)
+            .await?;
         loop {
             let RunStatus::Interrupted { interruption } = &outcome.status else {
-                return Ok(outcome);
+                break;
             };
             let Some(resolution) = resolver.resolve(&outcome.state, interruption).await else {
-                return Ok(outcome);
+                break;
             };
-            outcome = self
-                .resume_with_cancel(outcome.state, resolution, cancel.clone())
+            self.check_owner(&outcome.state)?;
+            outcome = Driver::new(&self.inner, outcome.state, cancel.clone())
+                .without_run_end()
+                .drive(Some(resolution))
                 .await?;
         }
+        crate::run_loop::report_run_end(&self.inner, &outcome).await;
+        Ok(outcome)
     }
 
     /// Settle the interruption in `state` and keep going. `state` may come
