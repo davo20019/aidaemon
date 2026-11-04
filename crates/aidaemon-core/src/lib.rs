@@ -15,6 +15,7 @@
 //! and `examples/quickstart.rs` for a runnable example.
 
 mod agent;
+mod authority;
 mod error;
 mod event;
 mod hook;
@@ -36,6 +37,7 @@ pub mod conformance;
 pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, Resolution};
+pub use authority::{AccessLevel, Authority, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};

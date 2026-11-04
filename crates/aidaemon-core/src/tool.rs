@@ -228,6 +228,13 @@ pub trait Tool: Send + Sync {
         ToolAnnotations::default()
     }
 
+    /// Annotations for one call. Tools whose effect depends on the arguments
+    /// (a shell running `ls` versus `rm`) override this; the default is the
+    /// tool-wide [`Tool::annotations`].
+    fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
+        self.annotations()
+    }
+
     /// Deterministic argument checks run before any policy or I/O. The
     /// default checks the schema's `required` keys; override to add more.
     fn validate(&self, arguments: &Value) -> Result<(), String> {

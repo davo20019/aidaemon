@@ -322,7 +322,7 @@ impl<'a> Driver<'a> {
                 track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 continue;
             }
-            let annotations = tool.annotations();
+            let annotations = tool.annotations_for(&call.arguments);
             let info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
