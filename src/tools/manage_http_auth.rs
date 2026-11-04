@@ -1139,13 +1139,28 @@ impl Tool for ManageHttpAuthTool {
         }
     }
 
-    /// Results are the daemon's own status text, never a third party's.
+    /// Results are the daemon's own status text, except `verify` with a
+    /// url: it previews the remote body, which someone else may have written.
     fn output_trust(
         &self,
-        _arguments: &str,
+        arguments: &str,
         _roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Trusted
+        let previews_remote_body = serde_json::from_str::<ManageHttpAuthArgs>(arguments)
+            .map(|args| {
+                args.action == "verify"
+                    && args
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty())
+            })
+            // Unreadable arguments: assume the worst.
+            .unwrap_or(true);
+        if previews_remote_body {
+            aidaemon_core::SourceTrust::Untrusted
+        } else {
+            aidaemon_core::SourceTrust::Trusted
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -1316,18 +1331,35 @@ mod tests {
         .unwrap();
     }
 
-    /// Its results are the daemon's own status text, so reading them never
-    /// taints a run.
+    /// Its results are the daemon's own status text, except a `verify` with
+    /// a url, which previews a remote body.
     #[tokio::test]
-    async fn its_output_is_trusted() {
+    async fn its_output_is_trusted_unless_it_previews_a_remote_body() {
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path(), "");
         let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let tool = test_tool(config_file.path().to_path_buf(), profiles)
             .await
             .unwrap();
+        let roots = crate::traits::TrustRoots(&[]);
         assert_eq!(
-            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots(&[])),
+            tool.output_trust(r#"{"action":"list"}"#, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        assert_eq!(
+            tool.output_trust(r#"{"action":"verify","profile":"demo"}"#, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        // A verify with a url returns a preview of the remote body.
+        assert_eq!(
+            tool.output_trust(
+                r#"{"action":"verify","profile":"demo","url":"https://api.example.invalid/issues/1"}"#,
+                &roots
+            ),
+            aidaemon_core::SourceTrust::Untrusted
+        );
+        assert_eq!(
+            tool.output_trust(r#"{"action":"verify","profile":"demo","url":"  "}"#, &roots),
             aidaemon_core::SourceTrust::Trusted
         );
     }

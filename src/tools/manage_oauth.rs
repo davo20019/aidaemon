@@ -1210,6 +1210,8 @@ impl Tool for ManageOAuthTool {
     }
 
     /// Results are the daemon's own status text, never a third party's.
+    /// Failure messages may quote a token endpoint's body; those endpoints
+    /// are owner-configured, so they stay trusted (accepted, Phase 2 review).
     fn output_trust(
         &self,
         _arguments: &str,
