@@ -272,6 +272,7 @@ fn strip_leading_wait(task: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_background_notification(
     hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn StateStore>>,
