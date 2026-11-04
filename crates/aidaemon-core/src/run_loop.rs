@@ -60,7 +60,8 @@ enum ModelCall {
 enum Verdict {
     Allow,
     Deny(String),
-    Interrupt(String),
+    /// The reason, and the index of the hook that interrupted.
+    Interrupt(String, usize),
 }
 
 /// A call that passed checks and policy, waiting to execute.
@@ -97,7 +98,7 @@ impl<'a> Driver<'a> {
                 done: earlier,
             });
             match self
-                .execute_batch(&pending.calls, pending.next, resolution)
+                .execute_batch(&pending.calls, pending.next, resolution, pending.hook_index)
                 .await?
             {
                 BatchEnd::Done => self.checkpoint().await?,
@@ -225,7 +226,7 @@ impl<'a> Driver<'a> {
                 ..InFlight::default()
             });
             self.checkpoint().await?;
-            match self.execute_batch(&calls, 0, None).await? {
+            match self.execute_batch(&calls, 0, None, None).await? {
                 BatchEnd::Done => self.checkpoint().await?,
                 end => return self.finish_batch(end).await,
             }
@@ -240,6 +241,7 @@ impl<'a> Driver<'a> {
         calls: &[ToolCall],
         start: usize,
         mut resolution: Option<Resolution>,
+        resume_after: Option<usize>,
     ) -> Result<BatchEnd, CoreError> {
         let mut group: Vec<Approved> = Vec::new();
         let mut nudge: Option<String> = None;
@@ -336,7 +338,7 @@ impl<'a> Driver<'a> {
             // fetch that taints the run before a send is judged), so queued
             // read-only calls run before a call that is not concurrent-safe
             // is put to them.
-            if !may_run_concurrently {
+            if !may_run_concurrently || annotations.egress {
                 if let Some(end) = self
                     .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                     .await?
@@ -353,9 +355,14 @@ impl<'a> Driver<'a> {
                 None
             };
             let verdict = match settled {
-                Some(Resolution::Approve) => Verdict::Allow,
+                // An approval settles only the hook that interrupted: the
+                // hooks after it still judge the call.
+                Some(Resolution::Approve) => {
+                    self.decide(&mut call, info, resume_after.map_or(0, |i| i + 1))
+                        .await
+                }
                 Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
-                None => self.decide(&mut call, info).await,
+                None => self.decide(&mut call, info, 0).await,
             };
 
             match verdict {
@@ -387,9 +394,10 @@ impl<'a> Driver<'a> {
                         reason,
                     );
                     receipt.read_only = annotations.read_only;
+                    receipt.after_untrusted = self.state.untrusted_seen;
                     track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 }
-                Verdict::Interrupt(reason) => {
+                Verdict::Interrupt(reason, hook_index) => {
                     if let Some(end) = self
                         .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                         .await?
@@ -407,6 +415,7 @@ impl<'a> Driver<'a> {
                         calls: pending_calls,
                         next: index,
                         interruption: interruption.clone(),
+                        hook_index: Some(hook_index),
                     });
                     self.emit(Event::Interrupted {
                         interruption: interruption.clone(),
@@ -452,13 +461,15 @@ impl<'a> Driver<'a> {
 
     /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
     /// arguments re-validated) before the next hook sees the call.
-    async fn decide(&self, call: &mut ToolCall, mut info: ToolInfo) -> Verdict {
+    async fn decide(&self, call: &mut ToolCall, mut info: ToolInfo, from: usize) -> Verdict {
         let ctx = self.ctx();
-        for hook in &self.agent.hooks {
+        for (hook_index, hook) in self.agent.hooks.iter().enumerate().skip(from) {
             match hook.before_tool(&ctx, call, &info).await {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
-                ToolDecision::Interrupt { reason } => return Verdict::Interrupt(reason),
+                ToolDecision::Interrupt { reason } => {
+                    return Verdict::Interrupt(reason, hook_index)
+                }
                 ToolDecision::Rewrite { arguments } => {
                     call.arguments = arguments;
                     if let Some(tool) = self.agent.tools.get(&call.name) {
@@ -793,7 +804,7 @@ impl<'a> Driver<'a> {
             indeterminate,
         })
         .await?;
-        self.execute_batch(&in_flight.calls, 0, None).await
+        self.execute_batch(&in_flight.calls, 0, None, None).await
     }
 
     fn is_done(&self, call_id: &str) -> bool {

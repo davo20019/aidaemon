@@ -35,6 +35,12 @@ pub enum UntrustedMode {
 
 /// Marks untrusted output as data and interrupts egress calls made after the
 /// run read untrusted content. Declares [`Safeguard::UntrustedOutput`].
+///
+/// Register it after the authority and scope hooks, so its interruptions are
+/// only raised for calls those already allow (an approval still passes the
+/// hooks after it, but a human should not be asked about a call that will be
+/// denied anyway). Only text is marked: images from untrusted tools reach the
+/// model unmarked.
 pub struct UntrustedHook {
     mode: UntrustedMode,
     mark: fn(tool: &str, content: &str) -> String,
@@ -338,5 +344,74 @@ mod tests {
         };
         assert!(build(true).is_ok());
         assert!(matches!(build(false), Err(BuildError::MissingSafeguard(_))));
+    }
+
+    #[tokio::test]
+    async fn approved_interrupt_still_passes_later_hooks() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let a = Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new(egress_script()))
+            .tool(fetch())
+            .tool(counting("send", SEND, sent.clone()))
+            .hook(UntrustedHook::new(UntrustedMode::Enforce, mark))
+            .hook(AuthorityHook::new(Authority::read_only()))
+            .attest(Safeguard::Scope)
+            .build()
+            .unwrap();
+        let out = a
+            .run_resolving(
+                RunState::new("a", "s", "go"),
+                CancellationToken::new(),
+                &Fixed(Resolution::Approve),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.receipts()[1].status, ReceiptStatus::Denied);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn read_only_egress_is_judged_after_an_untrusted_read_in_the_same_batch() {
+        let peeked = Arc::new(AtomicUsize::new(0));
+        let a = Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([
+                tool_calls([
+                    call("c1", "fetch", json!({})),
+                    call("c2", "peek", json!({})),
+                ]),
+                text("done"),
+            ]))
+            .tool(fetch())
+            .tool(counting(
+                "peek",
+                ToolAnnotations {
+                    egress: true,
+                    ..ToolAnnotations::READ_ONLY
+                },
+                peeked.clone(),
+            ))
+            .hook(AuthorityHook::new(Authority::full()))
+            .hook(UntrustedHook::new(UntrustedMode::Enforce, mark))
+            .attest(Safeguard::Scope)
+            .build()
+            .unwrap();
+        let out = a.run("s", "go").await.unwrap();
+        assert!(matches!(out.status, RunStatus::Interrupted { .. }));
+        assert_eq!(peeked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_receipt_after_untrusted_read_records_it() {
+        let (a, _) = setup(UntrustedMode::Enforce, egress_script());
+        let r = Fixed(Resolution::Deny {
+            reason: "no".into(),
+        });
+        let out = a
+            .run_resolving(RunState::new("a", "s", "go"), CancellationToken::new(), &r)
+            .await
+            .unwrap();
+        assert!(out.receipts()[1].after_untrusted);
     }
 }

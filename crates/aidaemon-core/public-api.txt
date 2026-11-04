@@ -385,6 +385,7 @@ pub aidaemon_core::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::Too
 pub aidaemon_core::ModelResponse::usage: aidaemon_core::Usage
 pub struct aidaemon_core::Pending
 pub aidaemon_core::Pending::calls: alloc::vec::Vec<aidaemon_core::ToolCall>
+pub aidaemon_core::Pending::hook_index: core::option::Option<usize>
 pub aidaemon_core::Pending::interruption: aidaemon_core::Interruption
 pub aidaemon_core::Pending::next: usize
 pub struct aidaemon_core::Receipt

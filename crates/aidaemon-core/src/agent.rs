@@ -20,6 +20,10 @@ use crate::tool::Tool;
 
 /// Settles interruptions inside [`Agent::run_resolving`]: a clean-check
 /// verifier, an approval UI, a policy. `None` leaves the run interrupted.
+///
+/// It is offered every interruption, whichever hook raised it: return `None`
+/// for interruptions you do not own (check the reason, for example with
+/// [`crate::is_untrusted_egress`]).
 #[async_trait]
 pub trait InterruptResolver: Send + Sync {
     async fn resolve(&self, state: &RunState, interruption: &Interruption) -> Option<Resolution>;
@@ -28,7 +32,8 @@ pub trait InterruptResolver: Send + Sync {
 /// How to settle the call an interrupted run is waiting on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
-    /// Run the call. `before_tool` hooks are not consulted again for it.
+    /// Run the call. The hook that interrupted is not asked again; hooks
+    /// registered after it still are, and may deny or interrupt.
     Approve,
     /// Refuse it. The reason goes back to the model as the tool result.
     Deny { reason: String },
@@ -134,7 +139,9 @@ impl Agent {
 
     /// Like [`Agent::run_from`], but settles each interruption with
     /// `resolver` and continues, until the run ends or the resolver returns
-    /// `None` (the interrupted outcome is then returned as is).
+    /// `None` (the interrupted outcome is then returned as is). It has no
+    /// iteration cap of its own: a resolver that keeps resolving is bounded
+    /// by the run's limits (turns, tool calls, tokens).
     pub async fn run_resolving(
         &self,
         state: RunState,
@@ -264,6 +271,9 @@ impl AgentBuilder {
         self
     }
 
+    /// Hooks run in registration order. Register a hook that interrupts
+    /// (such as [`crate::UntrustedHook`]) last so a human or verifier sees
+    /// only calls the other hooks already allowed.
     pub fn hook(mut self, hook: impl Hook + 'static) -> Self {
         self.hooks.push(Arc::new(hook));
         self

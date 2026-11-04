@@ -55,6 +55,10 @@ pub struct Pending {
     /// Index of the interrupted call; earlier calls already have results.
     pub next: usize,
     pub interruption: Interruption,
+    /// Index of the hook that interrupted. An approval settles that hook
+    /// only: hooks registered after it still judge the call on resume.
+    #[serde(default)]
+    pub hook_index: Option<usize>,
 }
 
 /// A tool batch that was executing when the state was last saved. Present
