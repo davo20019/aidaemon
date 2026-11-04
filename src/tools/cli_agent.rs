@@ -797,6 +797,33 @@ async fn resolve_executable(backend: &SharedExecutionBackend, executable: &str) 
 /// actual nested agent executable. GUI/launchd processes commonly lack user
 /// install directories such as `~/.local/bin` in PATH; accepting `env` alone
 /// used to defer that mistake until every invocation exited with code 127.
+/// Flags that switch a delegated CLI agent into unattended auto-approve mode.
+const PERMISSION_BYPASS_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--yolo",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--allow-all-tools",
+];
+
+fn is_permission_bypass_flag(arg: &str) -> bool {
+    PERMISSION_BYPASS_FLAGS.iter().any(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+/// Remove auto-approve flags from a launch argument list. Every launch goes
+/// through this one function; it refuses if a flag is still present after.
+fn strip_permission_bypass_flags(args: &mut Vec<String>) -> Result<(), String> {
+    args.retain(|arg| !is_permission_bypass_flag(arg));
+    if args.iter().any(|arg| is_permission_bypass_flag(arg)) {
+        return Err("its permission-bypass flags could not be removed".to_string());
+    }
+    Ok(())
+}
+
 async fn resolve_agent_launch(
     backend: &SharedExecutionBackend,
     command: &str,
@@ -2164,6 +2191,10 @@ impl CliAgentTool {
                 }
                 .into());
             }
+        }
+
+        if strip_permission_bypass_flags(&mut args).is_err() {
+            return Ok("Blocked: CLI delegation was not started because its permission-bypass flags could not be removed.".to_string());
         }
 
         let canonical_working_dir = match working_dir {
@@ -5022,6 +5053,69 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic run tests
     // -----------------------------------------------------------------------
+
+    const BYPASS_FLAGS: [&str; 4] = [
+        "--dangerously-skip-permissions",
+        "--yolo",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--allow-all-tools",
+    ];
+
+    async fn echo_tool_with_flags() -> (CliAgentTool, tempfile::NamedTempFile) {
+        let (tool, db) = setup_echo_tool().await;
+        let mut args: Vec<String> = BYPASS_FLAGS.iter().map(|f| f.to_string()).collect();
+        args.push("--keep-synthetic-flag".to_string());
+        tool.tools.write().unwrap().get_mut("echo").unwrap().args = args;
+        (tool, db)
+    }
+
+    #[tokio::test]
+    async fn cli_agent_args_never_contain_bypass_flags() {
+        // Direct call path.
+        let (tool, _db) = echo_tool_with_flags().await;
+        let out = tool
+            .call(r#"{"action":"run","tool":"echo","prompt":"hello"}"#)
+            .await
+            .unwrap();
+        for flag in BYPASS_FLAGS {
+            assert!(!out.contains(flag), "direct path leaked {flag}: {out}");
+        }
+        assert!(out.contains("--keep-synthetic-flag"), "got: {out}");
+
+        // Execution-context path: echo has no native sandbox adapter, so the
+        // run is blocked, and in no case may a bypass flag reach a launch.
+        let (tool, _db) = echo_tool_with_flags().await;
+        let result = tool
+            .call_with_execution_context(
+                r#"{"action":"run","tool":"echo","prompt":"hello"}"#,
+                None,
+                ToolExecutionContext::default(),
+            )
+            .await;
+        let text = match result {
+            Ok(outcome) => outcome.output,
+            Err(error) => error.to_string(),
+        };
+        for flag in BYPASS_FLAGS {
+            assert!(!text.contains(flag), "context path leaked {flag}: {text}");
+        }
+    }
+
+    #[test]
+    fn bypass_flag_stripping_keeps_other_flags() {
+        let mut args: Vec<String> = [
+            "-p",
+            "--yolo",
+            "--model",
+            "synthetic",
+            "--allow-all-tools=1",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        strip_permission_bypass_flags(&mut args).unwrap();
+        assert_eq!(args, ["-p", "--model", "synthetic"]);
+    }
 
     #[tokio::test]
     async fn test_run_echo_returns_output() {
