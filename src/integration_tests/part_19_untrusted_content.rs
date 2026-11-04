@@ -601,3 +601,133 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A page someone else wrote, with nothing in it that looks like a failure.
+struct PlainPage;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for PlainPage {
+    fn name(&self) -> &str {
+        "plain_page"
+    }
+    fn description(&self) -> &str {
+        "Fetches a synthetic web page."
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "plain_page",
+            "description": "Fetches a synthetic web page.",
+            "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
+        })
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            idempotent: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("A synthetic page about gardening.".to_string())
+    }
+}
+
+/// A clean owner turn delegates to a real child (sync `spawn_agent`); the
+/// child either reads the injected page or answers from nothing, then the
+/// parent sends. Returns the harness and the recipients sent to.
+async fn parent_send_after_child(
+    child_reads_page: bool,
+    verdict: Option<&str>,
+) -> (
+    Arc<crate::testing::MockProvider>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use crate::runtime_ports::AgentIngress;
+    let mut script = vec![MockProvider::tool_call_response(
+        "spawn_agent",
+        &json!({"mission": "Summarize", "task": "Summarize the page."}).to_string(),
+    )];
+    if child_reads_page {
+        script.push(MockProvider::tool_call_response(
+            "plain_page",
+            &json!({"url": "https://example.invalid/notes"}).to_string(),
+        ));
+    }
+    script.push(MockProvider::text_response("Summary: a synthetic page."));
+    script.push(MockProvider::tool_call_response(
+        "message_probe",
+        &json!({"to": "jordan@example.invalid"}).to_string(),
+    ));
+    if let Some(verdict) = verdict {
+        script.push(MockProvider::text_response(verdict));
+    }
+    script.push(MockProvider::text_response("Done."));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(PlainPage),
+        Arc::new(MessageProbe(sent.clone())),
+        Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
+    ];
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        tools,
+        None,
+    )
+    .await
+    .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
+    agent
+        .handle_inbound_message(crate::runtime_ports::InboundMessageRequest {
+            session_id: INJECTION_SESSION.to_string(),
+            user_text: "Have a helper summarize https://example.invalid/notes, then send \
+                        Jordan Lee the summary."
+                .to_string(),
+            attachments: Vec::new(),
+            status_tx: None,
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("telegram"),
+            heartbeat: None,
+            ingress_timing: None,
+        })
+        .await
+        .unwrap();
+    (harness.provider.clone(), sent)
+}
+
+/// A child that read untrusted content hands its taint back with its
+/// result: the clean parent's next send is checked.
+#[tokio::test]
+async fn a_tainted_childs_result_taints_the_parent() {
+    let (provider, sent) = parent_send_after_child(true, Some(DENY)).await;
+    assert!(sent.lock().unwrap().is_empty(), "the send must not run");
+    let verifier = provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .filter(|call| is_clean_verifier_call(call))
+        .count();
+    assert_eq!(verifier, 1, "the parent's send is checked once");
+}
+
+/// A child that read nothing untrusted returns a trusted result: the
+/// parent's send runs unchecked.
+#[tokio::test]
+async fn a_clean_childs_result_does_not_taint_the_parent() {
+    let (provider, sent) = parent_send_after_child(false, None).await;
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec!["jordan@example.invalid".to_string()]
+    );
+    assert!(!provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .any(is_clean_verifier_call));
+}

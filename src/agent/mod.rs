@@ -153,6 +153,8 @@ mod project_scope;
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
 mod sdk_provider;
+#[path = "turn/services.rs"]
+mod services;
 pub(crate) mod specialists;
 #[path = "runtime/tool_result_fit.rs"]
 mod tool_result_fit;
@@ -160,9 +162,6 @@ mod tool_result_fit;
 mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
-pub(crate) use parent_delivery::ParentDeliveryKind;
-#[path = "turn/services.rs"]
-mod services;
 pub(in crate::agent) use completion_contract::inherit_request_constraints;
 pub(in crate::agent) use completion_contract::persistable_completion_contract;
 pub(in crate::agent) use history::CompletionContract;

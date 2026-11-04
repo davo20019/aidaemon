@@ -955,13 +955,17 @@ impl Agent {
             "SDK engine tool call"
         );
         // Who authored what this call returned: only executed calls carry
-        // the tool's own class; every other output is the daemon's.
+        // the tool's own class (or what the tool reported for this exact
+        // output); every other output is the daemon's.
+        let reported = metadata.as_ref().and_then(|metadata| metadata.output_trust);
         let trust = self
             .tools
             .iter()
             .find(|tool| tool.name() == request.name)
             .map(|tool| {
-                tool.output_trust(arguments, &crate::traits::TrustRoots(&scope.trust_roots))
+                reported.unwrap_or_else(|| {
+                    tool.output_trust(arguments, &crate::traits::TrustRoots(&scope.trust_roots))
+                })
             })
             .unwrap_or_default();
         // The first untrusted read records the turn as tainted at once, so a

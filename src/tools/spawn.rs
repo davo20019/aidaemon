@@ -12,8 +12,9 @@ use tracing::{info, warn};
 
 use crate::events::TaskOutcome;
 use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime, OutboundRouter};
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
+use crate::traits::{AgentRole, StateStore, Tool, ToolCallOutcome, ToolCapabilities};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
+use aidaemon_core::SourceTrust;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -482,6 +483,26 @@ impl Tool for SpawnAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    /// A child's result carries the child's taint; anything the call does
+    /// not report (errors) counts as untrusted.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> SourceTrust {
+        SourceTrust::Untrusted
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
         let agent = self.get_agent()?;
 
@@ -562,7 +583,10 @@ impl Tool for SpawnAgentTool {
                 if let Some(ref task_id) = executor_task_id {
                     self.finish_executor_task(task_id).await;
                 }
-                return Ok(format!("Waited for {} second(s).", wait_secs));
+                return Ok(reported(
+                    format!("Waited for {} second(s).", wait_secs),
+                    SourceTrust::Trusted,
+                ));
             }
 
             effective_task = remainder.clone();
@@ -724,6 +748,13 @@ impl Tool for SpawnAgentTool {
                 }
             };
 
+            // Only a finished child's own record decides; any other result
+            // may carry child-written text and counts as untrusted.
+            let trust = match &result {
+                Ok(Ok(run)) => run.trust,
+                Err(_) if task_id_ref.is_none() => SourceTrust::Trusted,
+                _ => SourceTrust::Untrusted,
+            };
             let (notification_type, message) = match result {
                 Ok(Ok(run)) => format_background_completion(
                     &mission,
@@ -787,6 +818,7 @@ impl Tool for SpawnAgentTool {
                     hub_for_parent_delivery.as_ref(),
                     &session_id,
                     &message,
+                    trust,
                 )
                 .await
             {
@@ -821,12 +853,22 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        Ok(format!(
-            "Sub-agent spawned in background for mission: \"{}\". \
-             The result will be delivered through the parent session when it completes.",
-            args.mission
+        Ok(reported(
+            format!(
+                "Sub-agent spawned in background for mission: \"{}\". \
+                 The result will be delivered through the parent session when it completes.",
+                args.mission
+            ),
+            SourceTrust::Trusted,
         ))
     }
+}
+
+/// A spawn result with the trust of its content stamped for the dispatcher.
+fn reported(output: String, trust: SourceTrust) -> ToolCallOutcome {
+    let mut outcome = ToolCallOutcome::from_output(output);
+    outcome.metadata.output_trust = Some(trust);
+    outcome
 }
 
 impl SpawnAgentTool {
@@ -847,7 +889,7 @@ impl SpawnAgentTool {
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ToolCallOutcome> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
@@ -880,15 +922,16 @@ impl SpawnAgentTool {
                     }
                 };
                 let max_len = self.max_response_chars;
-                if response.len() > max_len {
+                let response = if response.len() > max_len {
                     let truncated = truncate_utf8(&response, max_len);
-                    Ok(format!(
+                    format!(
                         "{}\n\n[Sub-agent response truncated at {} chars]",
                         truncated, max_len
-                    ))
+                    )
                 } else {
-                    Ok(response)
-                }
+                    response
+                };
+                Ok(reported(response, run.trust))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
             Err(_) => {
@@ -905,7 +948,12 @@ impl SpawnAgentTool {
                             "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
                             _ => "\u{274c} Sub-agent failed",
                         };
-                        return Ok(format!("{prefix}\n\n{}", salvaged.details));
+                        // The child wrote these details; its taint is
+                        // unknown after a timeout.
+                        return Ok(reported(
+                            format!("{prefix}\n\n{}", salvaged.details),
+                            SourceTrust::Untrusted,
+                        ));
                     }
                     if child_role == Some(AgentRole::Executor) {
                         agent

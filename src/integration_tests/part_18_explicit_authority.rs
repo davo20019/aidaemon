@@ -537,6 +537,22 @@ impl crate::traits::Tool for OfferedSpawnAgent {
         crate::traits::Tool::call(self.0.as_ref(), arguments).await
     }
 
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        crate::traits::Tool::call_with_status_outcome(self.0.as_ref(), arguments, status_tx).await
+    }
+
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        crate::traits::Tool::output_trust(self.0.as_ref(), arguments, roots)
+    }
+
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             high_impact_write: false,

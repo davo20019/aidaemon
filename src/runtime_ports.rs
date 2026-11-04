@@ -23,6 +23,9 @@ use crate::types::{
 pub(crate) struct ChildAgentRun {
     pub response: String,
     pub outcome: TaskOutcome,
+    /// `Untrusted` when the child's run read (or started with) content
+    /// someone other than the owner wrote.
+    pub trust: aidaemon_core::SourceTrust,
 }
 
 /// A terminal task result recovered after a child run timed out.
@@ -80,6 +83,7 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
         router: Option<&Weak<dyn OutboundRouter>>,
         parent_session_id: &str,
         text: &str,
+        trust: aidaemon_core::SourceTrust,
     ) -> anyhow::Result<bool>;
 }
 

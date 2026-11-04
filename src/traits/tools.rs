@@ -1398,6 +1398,11 @@ pub struct ToolCallMetadata {
     /// unless the owner supplied the same identifier or requested diagnostics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub internal_identifiers: Vec<String>,
+    /// Who authored this exact output, when the tool knows better than its
+    /// declared `Tool::output_trust` (a delegated run reports whether it read
+    /// untrusted content). The dispatcher stamps this over the declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_trust: Option<aidaemon_core::SourceTrust>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

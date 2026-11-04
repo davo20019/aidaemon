@@ -17,6 +17,9 @@ struct TaskLeadSpec {
 pub(crate) struct SpawnChildResult {
     pub response: String,
     pub outcome: TaskOutcome,
+    /// `Untrusted` when the child's run read (or started with) untrusted
+    /// content: its result carries that taint back to the parent.
+    pub trust: aidaemon_core::SourceTrust,
 }
 
 #[derive(Debug)]
@@ -2602,9 +2605,21 @@ impl Agent {
             }
         }
 
+        // The child's own record of turns that read untrusted content (its
+        // session is fresh per spawn); an unreadable record counts as read.
+        let trust = match crate::agent::untrusted::tainted_turns(
+            self.state.as_ref(),
+            &child_session_for_events,
+        )
+        .await
+        {
+            Ok(turns) if turns.is_empty() => aidaemon_core::SourceTrust::Trusted,
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        };
         result.map(|response| SpawnChildResult {
             response,
             outcome: child_outcome,
+            trust,
         })
     }
 
