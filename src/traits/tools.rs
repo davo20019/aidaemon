@@ -2082,6 +2082,11 @@ impl<'a> TrustRoots<'a> {
         }
     }
 
+    /// The directory relative paths resolve against, if any.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd
+    }
+
     pub fn contains(&self, path: &str) -> bool {
         let resolved = match self.cwd {
             Some(cwd) if !is_absolute_or_home(path) => {
@@ -2089,42 +2094,54 @@ impl<'a> TrustRoots<'a> {
             }
             _ => path.to_string(),
         };
-        let Some(path) = normalize_absolute(&resolved) else {
+        let Some(path) = resolve_absolute(&resolved) else {
             return false;
         };
         self.roots
             .iter()
-            .any(|root| normalize_absolute(root).is_some_and(|root| path.starts_with(&root)))
+            .any(|root| resolve_absolute(root).is_some_and(|root| path.starts_with(&root)))
     }
 }
 
-fn is_absolute_or_home(path: &str) -> bool {
-    let path = path.trim();
-    path.starts_with('~') || std::path::Path::new(path).is_absolute()
-}
-
-/// Expand `~`, then normalize lexically. `None` for a relative path or one
-/// whose `..` climbs above the root.
-fn normalize_absolute(path: &str) -> Option<std::path::PathBuf> {
+/// Expand `~`, then resolve the path the way the filesystem will: every
+/// existing prefix through its symlinks (a link inside a root that points
+/// elsewhere leaves the root), the rest lexically. `None` for a relative
+/// path or one whose `..` climbs above the root.
+fn resolve_absolute(path: &str) -> Option<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
     let expanded = shellexpand::tilde(path.trim()).into_owned();
     let path = std::path::Path::new(&expanded);
     if !path.is_absolute() {
         return None;
     }
-    let mut normalized = PathBuf::new();
+    let mut resolved = PathBuf::new();
+    let mut existing = true;
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() {
+                if !resolved.pop() {
                     return None;
                 }
             }
-            other => normalized.push(other.as_os_str()),
+            Component::Normal(part) => {
+                resolved.push(part);
+                if existing {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => resolved = canonical,
+                        Err(_) => existing = false,
+                    }
+                }
+            }
+            other => resolved.push(other.as_os_str()),
         }
     }
-    Some(normalized)
+    Some(resolved)
+}
+
+fn is_absolute_or_home(path: &str) -> bool {
+    let path = path.trim();
+    path.starts_with('~') || std::path::Path::new(path).is_absolute()
 }
 
 /// Validated, canonical tool input. This is the boundary object shared by
@@ -2201,6 +2218,28 @@ mod tests {
         assert!(!anchored.contains("/etc/hosts"));
         assert!(!roots.contains("a.txt"));
         assert!(!TrustRoots::new(&[]).contains("/tmp/aidaemon-test/ws/a.txt"));
+    }
+
+    /// A symlink inside a root that points outside it does not carry the
+    /// root's trust: existing paths are compared after resolving links.
+    #[cfg(unix)]
+    #[test]
+    fn trust_roots_resolve_symlinks_before_comparing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.md"), "synthetic").unwrap();
+        std::fs::write(root.join("a.txt"), "synthetic").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+        let list = vec![root.to_string_lossy().into_owned()];
+        let roots = TrustRoots::new(&list);
+        assert!(roots.contains(&root.join("a.txt").to_string_lossy()));
+        assert!(!roots.contains(&root.join("docs/x.md").to_string_lossy()));
+        assert!(!roots.contains(&root.join("docs/new.md").to_string_lossy()));
+        // A path that does not exist yet is compared lexically.
+        assert!(roots.contains(&root.join("later/b.txt").to_string_lossy()));
     }
 
     struct AlwaysAvailableTool;
