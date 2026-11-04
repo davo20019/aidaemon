@@ -43,6 +43,45 @@ const GIT_OBSERVATION_SUBCOMMANDS: &[&str] = &[
     "blame",
 ];
 
+/// Executables that reach the network whatever their arguments.
+const NETWORK_PROGRAMS: &[&str] = &[
+    "curl", "wget", "http", "https", "xh", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp",
+    "rsync", "ftp", "lftp", "aria2c", "gh",
+];
+
+const GIT_NETWORK_SUBCOMMANDS: &[&str] = &["fetch", "clone", "pull", "ls-remote", "submodule"];
+
+const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "pip", "pip3", "cargo"];
+
+const PACKAGE_NETWORK_SUBCOMMANDS: &[&str] = &[
+    "install", "add", "i", "update", "fetch", "search", "view", "info",
+];
+
+/// Whether any structural invocation (including inside `sh -c`) is a known
+/// network-reaching executable or subcommand.
+pub(crate) fn fetches_network(command: &str) -> bool {
+    structural_shell_invocations(command)
+        .iter()
+        .any(|invocation| {
+            let program = basename(&invocation.program);
+            let args = &invocation.arguments;
+            if NETWORK_PROGRAMS.contains(&program) {
+                return true;
+            }
+            match program {
+                // Any argument, so `git -C dir pull` is seen; a stray match only
+                // over-taints.
+                "git" => args
+                    .iter()
+                    .any(|arg| GIT_NETWORK_SUBCOMMANDS.contains(&arg.as_str())),
+                _ if PACKAGE_MANAGERS.contains(&program) => args
+                    .first()
+                    .is_some_and(|sub| PACKAGE_NETWORK_SUBCOMMANDS.contains(&sub.as_str())),
+                _ => false,
+            }
+        })
+}
+
 pub(crate) fn command_effects(command: &str) -> CommandEffects {
     let invocations = structural_shell_invocations(command);
     let deletes = invocations.iter().any(invocation_deletes);
@@ -71,19 +110,13 @@ fn invocation_deletes(invocation: &crate::tools::command_risk::ShellInvocation) 
     }
     match program {
         "find" if args.iter().any(|arg| arg == "-delete") => true,
-        "git" => first_non_option(args) == Some("clean"),
+        "git" => args.iter().any(|arg| arg == "clean"),
         // Wrappers that run another program named in their arguments.
         "find" | "xargs" => args
             .iter()
             .any(|arg| DELETE_PROGRAMS.contains(&basename(arg))),
         _ => false,
     }
-}
-
-fn first_non_option(args: &[String]) -> Option<&str> {
-    args.iter()
-        .map(String::as_str)
-        .find(|arg| !arg.starts_with('-'))
 }
 
 fn observation_args_ok(program: &str, args: &[String]) -> bool {
@@ -103,6 +136,8 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
                 || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('o'))
         }),
         "tree" => !args.iter().any(|arg| arg == "-o"),
+        // `uniq IN OUT` writes OUT.
+        "uniq" => args.iter().filter(|arg| !arg.starts_with('-')).count() < 2,
         "git" => {
             if args.iter().any(|arg| arg.starts_with("--output")) {
                 return false;
@@ -246,6 +281,7 @@ mod tests {
             "echo hi &> out",
             "sort -o out in",
             "git diff --output=out",
+            "uniq in out",
             "echo 'unterminated",
             "",
         ] {
@@ -253,6 +289,25 @@ mod tests {
                 !command_effects(mutating).observation_only,
                 "{mutating} should not be observation-only"
             );
+        }
+    }
+
+    #[test]
+    fn fetches_network_by_executable_table() {
+        for fetching in [
+            "curl https://example.invalid",
+            "ls && wget x",
+            "git clone u",
+            "git -C d pull",
+            "npm install x",
+            "cargo add serde",
+            "sh -c 'ssh host'",
+            "gh pr list",
+        ] {
+            assert!(fetches_network(fetching), "{fetching}");
+        }
+        for local in ["git status", "npm test", "cargo build", "echo curl", "ls"] {
+            assert!(!fetches_network(local), "{local}");
         }
     }
 

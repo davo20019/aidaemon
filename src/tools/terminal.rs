@@ -7316,6 +7316,7 @@ fn terminal_run_annotations(
         idempotent: read_only,
         egress: args.network
             || effects.deletes
+            || crate::tools::command_effects::fetches_network(text)
             || (!run_is_confined(confinement) && !effects.observation_only),
     }
 }
@@ -7642,7 +7643,18 @@ impl Tool for TerminalTool {
             .iter()
             .chain(args.read_roots.iter())
             .any(|path| !roots.contains(path));
-        if args.network || !run_is_confined(self.confinement) || reads_outside_roots {
+        // Host confinement alone does not taint: the owner's own workspace
+        // output is trusted unless the run reaches the network or reads
+        // outside the trusted roots.
+        let text = args
+            .command
+            .as_deref()
+            .or(args.script.as_deref())
+            .unwrap_or("");
+        if args.network
+            || reads_outside_roots
+            || crate::tools::command_effects::fetches_network(text)
+        {
             aidaemon_core::SourceTrust::Untrusted
         } else {
             aidaemon_core::SourceTrust::Trusted
@@ -9424,10 +9436,75 @@ mod tests {
             ),
             SourceTrust::Trusted
         );
+    }
+
+    #[tokio::test]
+    async fn host_terminal_output_is_trusted_without_network_or_outside_reads() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots(&roots_list);
+        let run = |command: &str| serde_json::json!({"action":"run","command":command}).to_string();
         assert_eq!(
-            trust(&host, serde_json::json!({"action":"run","command":"ls"})),
-            SourceTrust::Untrusted
+            host.output_trust(&run("mkdir -p x && echo ok > x/f"), &roots),
+            SourceTrust::Trusted
         );
+        let status = run("git status");
+        assert_eq!(host.output_trust(&status, &roots), SourceTrust::Trusted);
+        assert!(host.call_annotations(&status).read_only);
+        let outside =
+            serde_json::json!({"action":"run","command":"cat f","read_paths":["/etc/hosts"]})
+                .to_string();
+        assert_eq!(host.output_trust(&outside, &roots), SourceTrust::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn network_programs_taint_even_on_host() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list: Vec<String> = vec![];
+        let roots = crate::traits::TrustRoots(&roots_list);
+        for command in [
+            "curl https://example.invalid",
+            "git clone https://example.invalid/r.git",
+            "npm install x",
+            "ls && wget https://example.invalid",
+        ] {
+            let args = serde_json::json!({"action":"run","command":command}).to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Untrusted,
+                "{command}"
+            );
+            let ann = host.call_annotations(&args);
+            assert!(ann.egress && !ann.read_only, "{command}");
+        }
     }
 
     #[tokio::test]

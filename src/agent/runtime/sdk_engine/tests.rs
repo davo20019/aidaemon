@@ -612,16 +612,6 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
     harness.agent.set_sdk_engine(SdkEngineSettings::default());
 
     let session_id = "executor_declared_checklist";
-    // Host terminal runs are untrusted egress; this test is about checklist
-    // demands, not the untrusted-content rule, so it runs marking-only.
-    crate::agent::authority::set_session_mode(
-        harness.state.as_ref(),
-        session_id,
-        crate::agent::authority::SessionMode::Unrestricted,
-        chrono::Utc::now(),
-    )
-    .await
-    .unwrap();
     let response = harness
         .agent
         .handle_message(
