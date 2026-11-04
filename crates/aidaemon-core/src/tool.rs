@@ -10,6 +10,18 @@ use crate::message::Image;
 use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
 
+/// Who authored the content a tool returned. `Untrusted` is content someone
+/// other than the owner wrote (a web page, an inbound message, a third-party
+/// file); it may carry instructions aimed at the model. The default is
+/// `Untrusted`, so a tool that does not say otherwise taints the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTrust {
+    Trusted,
+    #[default]
+    Untrusted,
+}
+
 /// Effect hints that drive scheduling and policy.
 ///
 /// The default is the conservative one: an unannotated tool is treated as
@@ -24,6 +36,11 @@ pub struct ToolAnnotations {
     pub destructive: bool,
     /// Safe to re-run with the same arguments (matters for resume/replay).
     pub idempotent: bool,
+    /// Sends data or acts outside the owner's machine and workspace, or is
+    /// irreversible (send, post, HTTP write, credentialed request, delete,
+    /// standing-rule change, payment).
+    #[serde(default)]
+    pub egress: bool,
 }
 
 impl ToolAnnotations {
@@ -31,16 +48,19 @@ impl ToolAnnotations {
         read_only: true,
         destructive: false,
         idempotent: true,
+        egress: false,
     };
     pub const WRITE: Self = Self {
         read_only: false,
         destructive: false,
         idempotent: false,
+        egress: false,
     };
     pub const DESTRUCTIVE: Self = Self {
         read_only: false,
         destructive: true,
         idempotent: false,
+        egress: true,
     };
 }
 
@@ -144,6 +164,10 @@ pub struct ToolOutput {
     /// adds it to the run's usage, so budgets cover delegated work.
     #[serde(default)]
     pub usage: Usage,
+    /// Overrides [`Tool::source_trust`] for this result (for example a
+    /// fetch tool that knows this particular URL is the owner's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<SourceTrust>,
 }
 
 impl ToolOutput {
@@ -154,6 +178,7 @@ impl ToolOutput {
             is_error: false,
             details: Value::Null,
             usage: Usage::default(),
+            trust: None,
         }
     }
 
@@ -164,6 +189,7 @@ impl ToolOutput {
             is_error: true,
             details: Value::Null,
             usage: Usage::default(),
+            trust: None,
         }
     }
 
@@ -179,6 +205,11 @@ impl ToolOutput {
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = details;
+        self
+    }
+
+    pub fn with_trust(mut self, trust: SourceTrust) -> Self {
+        self.trust = Some(trust);
         self
     }
 }
@@ -232,13 +263,21 @@ pub trait Tool: Send + Sync {
     /// (a shell running `ls` versus `rm`) override this; the default is the
     /// tool-wide [`Tool::annotations`].
     ///
-    /// [`Tool::annotations`] should be the worst-case (most restrictive)
+    /// [`Tool::annotations`] must be the worst-case (most restrictive)
     /// value for the tool; this may only relax it for a specific call. The
     /// result is trusted as given by authority checks (and recorded in the
     /// receipt), so it must be correct for those arguments. Concurrent
     /// scheduling always uses [`Tool::annotations`], never this value.
     fn annotations_for(&self, _arguments: &Value) -> ToolAnnotations {
         self.annotations()
+    }
+
+    /// Who authored what this call returns. The default is `Untrusted`; a
+    /// tool whose output is the owner's own (a workspace file, the
+    /// kernel's bookkeeping) returns `Trusted`. A result may override this
+    /// with [`ToolOutput::with_trust`].
+    fn source_trust(&self, _arguments: &Value) -> SourceTrust {
+        SourceTrust::Untrusted
     }
 
     /// Deterministic argument checks run before any policy or I/O. The
@@ -310,6 +349,7 @@ pub(crate) fn check_required(schema: &Value, arguments: &Value) -> Result<(), St
 pub struct FnTool<F, Fut> {
     spec: ToolSpec,
     annotations: ToolAnnotations,
+    trust: SourceTrust,
     func: F,
     _fut: PhantomData<fn() -> Fut>,
 }
@@ -323,9 +363,16 @@ where
         Self {
             spec,
             annotations,
+            trust: SourceTrust::default(),
             func,
             _fut: PhantomData,
         }
+    }
+
+    /// Declare the trust class of this tool's output (default `Untrusted`).
+    pub fn with_trust(mut self, trust: SourceTrust) -> Self {
+        self.trust = trust;
+        self
     }
 }
 
@@ -341,6 +388,10 @@ where
 
     fn annotations(&self) -> ToolAnnotations {
         self.annotations
+    }
+
+    fn source_trust(&self, _arguments: &Value) -> SourceTrust {
+        self.trust
     }
 
     async fn call(&self, arguments: Value, _ctx: &ToolContext) -> ToolResult {

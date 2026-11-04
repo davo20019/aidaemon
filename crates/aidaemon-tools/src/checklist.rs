@@ -150,6 +150,7 @@ impl Tool for Checklist {
             read_only: false,
             destructive: false,
             idempotent: true,
+            egress: false,
         }
     }
 

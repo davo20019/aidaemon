@@ -151,6 +151,7 @@ impl Tool for HangsOnce {
             read_only: false,
             destructive: false,
             idempotent: self.idempotent,
+            egress: false,
         }
     }
     async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolResult {

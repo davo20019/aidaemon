@@ -21,7 +21,7 @@ use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
 use crate::state::{InFlight, Interruption, Pending, RunId, RunState};
 use crate::stuck::StuckSignal;
-use crate::tool::{ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
+use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -332,6 +332,19 @@ impl<'a> Driver<'a> {
                 access: tool.access(&call.arguments),
             };
 
+            // Hooks must see the results of earlier calls in this batch (a
+            // fetch that taints the run before a send is judged), so queued
+            // read-only calls run before a call that is not concurrent-safe
+            // is put to them.
+            if !may_run_concurrently {
+                if let Some(end) = self
+                    .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                    .await?
+                {
+                    return Ok(end);
+                }
+            }
+
             // Policy: a pending resolution settles the first call; otherwise
             // ask the hooks.
             let settled = if index == start {
@@ -522,30 +535,51 @@ impl<'a> Driver<'a> {
                 _ = ctx.cancel.cancelled() => None,
                 // A panicking tool is a failed call, not a crashed run.
                 result = AssertUnwindSafe(tool.call(call.arguments.clone(), &ctx)).catch_unwind() => {
-                    Some(result.unwrap_or_else(|panic| {
-                        Err(ToolError(format!("the tool panicked: {}", panic_message(&*panic))))
-                    }))
+                    Some(result.map_err(|panic| panic_message(&*panic)))
                 }
             }
         })
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        let (status, reason, output) = match result {
-            Ok(Some(Ok(output))) if output.is_error => {
+        // Text the kernel wrote itself (timeout, cancel, panic) is trusted;
+        // anything the tool returned, an error included, carries the tool's
+        // trust, because an error page can hold an injection too.
+        let tool_trust = |output: &ToolOutput| {
+            output
+                .trust
+                .unwrap_or_else(|| tool.source_trust(&call.arguments))
+        };
+        let (status, reason, output, source) = match result {
+            Ok(Some(Ok(Ok(output)))) if output.is_error => {
                 let reason = output.content.chars().take(300).collect::<String>();
-                (ReceiptStatus::Failed, Some(reason), output)
+                let source = tool_trust(&output);
+                (ReceiptStatus::Failed, Some(reason), output, source)
             }
-            Ok(Some(Ok(output))) => (ReceiptStatus::Succeeded, None, output),
-            Ok(Some(Err(err))) => (
+            Ok(Some(Ok(Ok(output)))) => {
+                let source = tool_trust(&output);
+                (ReceiptStatus::Succeeded, None, output, source)
+            }
+            Ok(Some(Ok(Err(err)))) => (
                 ReceiptStatus::Failed,
                 Some(err.0.clone()),
                 ToolOutput::error(format!("Error: {err}")),
+                tool.source_trust(&call.arguments),
             ),
+            Ok(Some(Err(panic))) => {
+                let err = ToolError(format!("the tool panicked: {panic}"));
+                (
+                    ReceiptStatus::Failed,
+                    Some(err.0.clone()),
+                    ToolOutput::error(format!("Error: {err}")),
+                    SourceTrust::Trusted,
+                )
+            }
             Ok(None) => (
                 ReceiptStatus::Cancelled,
                 Some("cancelled".to_string()),
                 ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
+                SourceTrust::Trusted,
             ),
             Err(_) => {
                 let secs = timeout.as_secs_f64();
@@ -556,6 +590,7 @@ impl<'a> Driver<'a> {
                         "Error: `{}` timed out after {secs:.1}s.",
                         call.name
                     )),
+                    SourceTrust::Trusted,
                 )
             }
         };
@@ -572,6 +607,8 @@ impl<'a> Driver<'a> {
             duration_ms,
             reason,
             details: output.details.clone(),
+            source,
+            after_untrusted: self.state.untrusted_seen,
         };
         (receipt, output)
     }
@@ -626,6 +663,10 @@ impl<'a> Driver<'a> {
                 .with_images(output.images.iter().cloned())
                 .with_error(!receipt.succeeded()),
         );
+        if receipt.stage == InvocationStage::Dispatched && receipt.source == SourceTrust::Untrusted
+        {
+            self.state.untrusted_seen = true;
+        }
         self.state.receipts.push(receipt.clone());
         self.state.tool_calls += 1;
         self.state.usage.add(output.usage);
@@ -787,6 +828,7 @@ impl<'a> Driver<'a> {
             receipts: &self.state.receipts,
             usage: self.state.usage,
             run_usage: self.state.run_usage,
+            untrusted_seen: self.state.untrusted_seen,
         }
     }
 
@@ -881,6 +923,7 @@ impl<'a> Driver<'a> {
             receipts: &outcome.state.receipts,
             usage: outcome.state.usage,
             run_usage: outcome.state.run_usage,
+            untrusted_seen: outcome.state.untrusted_seen,
         };
         for hook in &self.agent.hooks {
             hook.on_run_end(&ctx, &outcome).await;
@@ -924,6 +967,8 @@ fn rejection(
         duration_ms: 0,
         reason: Some(reason),
         details: serde_json::Value::Null,
+        source: SourceTrust::Trusted,
+        after_untrusted: false,
     };
     (receipt, output)
 }

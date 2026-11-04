@@ -56,12 +56,18 @@ pub fn map_annotations(annotations: Option<&Value>) -> ToolAnnotations {
             read_only: true,
             destructive: false,
             idempotent: hint("idempotentHint").unwrap_or(true),
+            egress: false,
         };
     }
+    let destructive = hint("destructiveHint").unwrap_or(true);
     ToolAnnotations {
         read_only: false,
-        destructive: hint("destructiveHint").unwrap_or(true),
+        destructive,
         idempotent: hint("idempotentHint").unwrap_or(false),
+        // A mutating tool reaches outside the workspace unless the server
+        // says it is closed-world (`openWorldHint=false`); MCP's default
+        // for that hint is open.
+        egress: destructive || hint("openWorldHint").unwrap_or(true),
     }
 }
 
@@ -328,7 +334,8 @@ mod tests {
             ToolAnnotations {
                 read_only: false,
                 destructive: false,
-                idempotent: true
+                idempotent: true,
+                egress: true
             }
         );
         assert_eq!(

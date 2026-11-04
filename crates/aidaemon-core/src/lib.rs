@@ -54,8 +54,8 @@ pub use state::{InFlight, Interruption, Pending, RunId, RunState, RUN_STATE_SCHE
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
-    AccessManifest, FnTool, Tool, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput,
-    ToolResult,
+    AccessManifest, FnTool, SourceTrust, Tool, ToolAnnotations, ToolContext, ToolError, ToolInfo,
+    ToolOutput, ToolResult,
 };
 
 /// Re-exported so tools can observe cancellation without adding the dependency.

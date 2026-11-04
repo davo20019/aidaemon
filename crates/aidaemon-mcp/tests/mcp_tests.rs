@@ -139,7 +139,8 @@ async fn annotations_map_including_missing_ones() {
         ToolAnnotations {
             read_only: false,
             destructive: false,
-            idempotent: true
+            idempotent: true,
+            egress: true
         }
     );
     assert_eq!(

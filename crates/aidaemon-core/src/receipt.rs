@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::state::RunId;
+use crate::tool::SourceTrust;
 
 /// How far a call got before its outcome was decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +58,13 @@ pub struct Receipt {
     /// Structured evidence from [`crate::ToolOutput::details`].
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
+    /// Who authored the content this call returned. Kernel-generated text
+    /// (refusals, timeouts, cancellations) is `Trusted`.
+    #[serde(default)]
+    pub source: SourceTrust,
+    /// The run had already read untrusted content when this call was made.
+    #[serde(default)]
+    pub after_untrusted: bool,
 }
 
 impl Receipt {

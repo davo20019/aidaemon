@@ -72,6 +72,7 @@ impl Tool for RememberTool {
             read_only: false,
             destructive: false,
             idempotent: true,
+            egress: false,
         }
     }
 

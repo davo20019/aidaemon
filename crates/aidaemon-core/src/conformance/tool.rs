@@ -452,6 +452,7 @@ mod tests {
                 read_only: true,
                 destructive: true,
                 idempotent: true,
+                egress: false,
             },
         ));
         for check in [

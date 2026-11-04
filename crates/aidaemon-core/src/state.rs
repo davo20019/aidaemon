@@ -105,6 +105,11 @@ pub struct RunState {
     pub in_flight: Option<InFlight>,
     #[serde(default)]
     pub nudges: u32,
+    /// The run has seen untrusted content (a dispatched call whose result
+    /// was authored by someone else, whatever its status), or was seeded
+    /// that way. Never cleared within a run.
+    #[serde(default)]
+    pub untrusted_seen: bool,
     #[serde(default)]
     pub(crate) stuck: StuckState,
 }
@@ -129,8 +134,16 @@ impl RunState {
             pending: None,
             in_flight: None,
             nudges: 0,
+            untrusted_seen: false,
             stuck: StuckState::default(),
         }
+    }
+
+    /// Start the run as if it had already read untrusted content (the
+    /// caller knows the input itself is someone else's).
+    pub fn with_untrusted_context(mut self) -> Self {
+        self.untrusted_seen = true;
+        self
     }
 
     /// Continue an earlier, finished run with a new user message (same

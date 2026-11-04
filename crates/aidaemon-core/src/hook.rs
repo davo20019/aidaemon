@@ -24,6 +24,9 @@ pub struct HookContext<'a> {
     pub usage: Usage,
     /// Usage of the current run.
     pub run_usage: Usage,
+    /// The run has read untrusted content so far (see
+    /// [`crate::RunState::untrusted_seen`]).
+    pub untrusted_seen: bool,
 }
 
 impl HookContext<'_> {

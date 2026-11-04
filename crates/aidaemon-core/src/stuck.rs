@@ -175,6 +175,8 @@ mod tests {
             duration_ms: 0,
             reason: None,
             details: serde_json::Value::Null,
+            source: Default::default(),
+            after_untrusted: false,
         }
     }
 
