@@ -56,7 +56,6 @@ const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
 /// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
 /// cap keeps the question head and the option tail and elides the middle.
 const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
-pub mod activity_gate;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -900,11 +899,6 @@ impl Agent {
         heartbeat: Option<Arc<AtomicU64>>,
         ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
     ) -> anyhow::Result<String> {
-        // Marks an agent task in flight for the entire turn (all recursion
-        // depths route through here: interactive turns, goal-run task leads,
-        // spawned specialists). The background memory pipeline defers its
-        // LLM work while this is held — see activity_gate.
-        let _activity = activity_gate::AgentActivityGuard::acquire();
         let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
             let is_scheduled_goal =
                 goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;
@@ -1003,7 +997,6 @@ impl Agent {
         &self,
         request: &crate::runtime_ports::ConversationRequest,
     ) -> anyhow::Result<String> {
-        let _activity = activity_gate::AgentActivityGuard::acquire();
         self.handle_message_impl(
             &request.session_id,
             &request.user_text,
