@@ -770,7 +770,7 @@ async fn sdk_engine_does_not_refuse_tools_outside_the_assessed_allowlist() {
     use crate::traits::store_prelude::*;
     let provider = MockProvider::with_responses(vec![
         remember("teal"),
-        MockProvider::text_response("I could not save it."),
+        MockProvider::text_response("Saved it."),
     ])
     .with_task_assessments(vec![restricted_assessment()]);
     let harness = crate::testing::setup_test_agent_sdk(provider)
@@ -798,7 +798,7 @@ async fn sdk_engine_does_not_refuse_tools_outside_the_assessed_allowlist() {
         })
         .count();
     assert_eq!(dispatched, 1);
-    assert_eq!(reply.text, "I could not save it.");
+    assert_eq!(reply.text, "Saved it.");
 }
 
 /// A shell-like tool: not read-only as a whole, but each call says
@@ -844,6 +844,58 @@ impl crate::traits::Tool for ShellProbe {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok("acme.md\nmia.txt".to_string())
     }
+}
+
+/// A tool whose backend is down is not offered to the model.
+struct DownProbe;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for DownProbe {
+    fn name(&self) -> &str {
+        "down_probe"
+    }
+    fn description(&self) -> &str {
+        "Backend currently down."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "down_probe",
+            "description": "Backend currently down.",
+            "parameters": {"type": "object", "properties": {}}
+        })
+    }
+    fn is_available(&self) -> bool {
+        false
+    }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("unreachable".to_string())
+    }
+}
+
+#[tokio::test]
+async fn unavailable_tools_are_not_bridged() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("hi")]);
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![
+            Arc::new(ShellProbe(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
+            Arc::new(DownProbe),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(owner_request("Which file in the folder is markdown?"))
+        .await
+        .unwrap();
+    let calls = harness.provider.call_log.lock().await;
+    let offered = serde_json::Value::Array(calls[0].tools.clone()).to_string();
+    assert!(offered.contains("shell_probe"), "control: {offered}");
+    assert!(!offered.contains("down_probe"), "{offered}");
 }
 
 /// A read-only authority must not lose a mixed tool such as `terminal`:
@@ -997,6 +1049,66 @@ fn replayed_results_say_they_were_not_run_again() {
     assert!(
         text.ends_with("Reminder set: \"Water the plants.\""),
         "{text}"
+    );
+}
+
+#[tokio::test]
+async fn same_tool_limit_hook_denies_a_long_identical_streak() {
+    use aidaemon_core::Hook as _;
+    let run_id = sdk::RunId::new();
+    let receipt = |i: usize| sdk::Receipt {
+        run_id,
+        call_id: format!("c{i}"),
+        tool: "write_file".to_string(),
+        arguments: serde_json::json!({"path": "/tmp/aidaemon-test/a.txt"}),
+        turn: 1,
+        stage: sdk::InvocationStage::Dispatched,
+        status: sdk::ReceiptStatus::Succeeded,
+        read_only: false,
+        duration_ms: 1,
+        reason: None,
+        details: serde_json::Value::Null,
+        source: sdk::SourceTrust::Trusted,
+        after_untrusted: false,
+    };
+    let receipts: Vec<sdk::Receipt> = (0..8).map(receipt).collect();
+    let ctx = sdk::HookContext {
+        run_id,
+        agent_id: "synthetic-agent",
+        session_id: "synthetic-session",
+        turn: 2,
+        messages: &[],
+        receipts: &receipts,
+        usage: Default::default(),
+        run_usage: Default::default(),
+        untrusted_seen: false,
+    };
+    let call = sdk::ToolCall {
+        id: "c8".to_string(),
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({"path": "/tmp/aidaemon-test/a.txt"}),
+    };
+    let info = sdk::ToolInfo {
+        annotations: sdk::ToolAnnotations::WRITE,
+        access: Default::default(),
+    };
+    let hook = SameToolLimit {
+        read_only_tools: Default::default(),
+    };
+    match hook.before_tool(&ctx, &call, &info).await {
+        sdk::ToolDecision::Deny { reason } => {
+            assert!(reason.starts_with("[LOOP DETECTED]"), "{reason}")
+        }
+        other => panic!("expected a denial, got {other:?}"),
+    }
+    let fewer = &receipts[..2];
+    let ctx = sdk::HookContext {
+        receipts: fewer,
+        ..ctx
+    };
+    assert_eq!(
+        hook.before_tool(&ctx, &call, &info).await,
+        sdk::ToolDecision::Allow
     );
 }
 

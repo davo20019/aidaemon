@@ -1914,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_write_grant_allows_a_future_descendant_without_widening_reads() {
+    fn directory_write_grant_covers_future_descendants_for_write_and_read_back() {
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
         let task = crate::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),

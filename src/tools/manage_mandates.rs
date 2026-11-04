@@ -5248,6 +5248,75 @@ mod tests {
             .contains("unconfirmed mandate cannot be resumed"));
     }
 
+    /// `cancel` takes effect without an approval prompt, so the tool itself
+    /// must refuse anyone but the verified private owner.
+    #[tokio::test]
+    async fn cancel_requires_a_verified_private_owner_in_the_tool() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Active mandate controller",
+            "owner-session",
+            None,
+            None,
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Keep running until the owner cancels",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let before = state
+            .get_mandate(&mandate.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        assert!(!before.is_terminal());
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        for (role, visibility) in [("guest", "private"), ("owner", "public")] {
+            let result = tool
+                .call(&format!(
+                    r#"{{"action":"cancel","mandate_id":"{}","_session_id":"owner-session","_user_role":"{role}","_channel_visibility":"{visibility}"}}"#,
+                    mandate.id
+                ))
+                .await
+                .unwrap();
+            assert!(
+                result.contains("only be changed by the owner in a verified private channel"),
+                "{role}/{visibility}: {result}"
+            );
+            assert_eq!(
+                state
+                    .get_mandate(&mandate.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                before,
+                "{role}/{visibility} must not cancel"
+            );
+        }
+        let result = tool
+            .call(&format!(
+                r#"{{"action":"cancel","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await
+            .unwrap();
+        assert!(result.contains("is now cancelled"), "{result}");
+    }
+
     #[tokio::test]
     async fn ask_resume_requires_and_persists_owner_guidance() {
         use crate::traits::{

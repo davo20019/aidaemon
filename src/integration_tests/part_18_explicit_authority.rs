@@ -913,6 +913,85 @@ async fn readonly_mid_run_blocks_the_next_write() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The terminal path of the same mid-run flip: a redirect write after the
+/// chat turns read-only does not run. The kernel hook judges the call first
+/// (a redirect is not observation-only); the dispatcher's `mutation_forbidden`
+/// ceiling is the backstop behind it, and either way the file is never made.
+#[tokio::test]
+async fn readonly_mid_run_blocks_a_terminal_redirect_write() {
+    let dir = authority_test_dir();
+    let target = dir.join("redirect.txt");
+    let session = "tg_authority_readonly_mid_run_terminal";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("mode_flip_probe", "{}"),
+        MockProvider::tool_call_response(
+            "terminal",
+            &json!({
+                "action": "run",
+                "command": format!("echo no > {}", target.display()),
+                "working_dir": dir,
+            })
+            .to_string(),
+        ),
+        MockProvider::text_response("I could not write the file."),
+    ]);
+    let state_cell = Arc::new(std::sync::OnceLock::new());
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+        .await
+        .unwrap();
+    let (approval_tx, _approval_rx) =
+        tokio::sync::mpsc::channel::<crate::tools::terminal::ApprovalRequest>(1);
+    let terminal = crate::tools::TerminalTool::new(
+        vec!["*".to_string()],
+        crate::tools::ApprovalBroker::new(approval_tx),
+        30,
+        8000,
+        crate::tools::command_risk::PermissionMode::Yolo,
+        pool,
+    )
+    .await;
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(terminal),
+        Arc::new(ModeFlipProbe {
+            state: state_cell.clone(),
+            session: session.to_string(),
+        }),
+    ];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+    let _ = state_cell.set(state);
+
+    harness
+        .agent
+        .handle_message(
+            session,
+            "Look around, then write a file with the shell.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let results = authority_tool_results(&harness).await;
+    assert!(
+        !target.exists(),
+        "a redirect write after /readonly must not run; saw {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| {
+            r.contains("[AUTHORITY BLOCKED] `terminal`")
+                || r.contains("Blocked by the explicit read-only contract")
+        }),
+        "the terminal run is refused after the flip; saw {results:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A child builds its ceiling on the chat that started the work, so `/readonly`
 /// on that chat narrows the running child: here the child's own turn flips
 /// its parent's chat to read-only, and its next write is refused.
@@ -1282,4 +1361,61 @@ async fn the_inherited_request_is_capped() {
         crate::agent::authority::INHERITED_REQUEST_CHARS
     );
     assert!(request.starts_with(&inherited));
+}
+
+/// The shadow week's would-refuse counts feed the `off` decision, so only a
+/// call that actually executes is counted: a replayed durable receipt did not
+/// run again and must not add a second point.
+#[tokio::test]
+async fn replayed_call_is_not_counted_as_would_refuse() {
+    let args = r#"{"value":"same-operation"}"#;
+    let base =
+        MockProvider::semantic_task_assessment("action", true, false, &[], "new_request", "none");
+    let mut assessment: serde_json::Value =
+        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+    assessment["contract"]["mutation_scope"] = json!("read_only");
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("idempotency_probe", args),
+        MockProvider::tool_call_response("idempotency_probe", args),
+        MockProvider::text_response("The mutation was applied once."),
+    ])
+    .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut harness = crate::testing::setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(IdempotencyProbeTool {
+            calls: calls.clone(),
+        })],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .set_sdk_engine(crate::agent::sdk_engine::SdkEngineSettings {
+            task_assessment: crate::config::TaskAssessmentSetting::Shadow,
+            ..Default::default()
+        });
+    harness
+        .agent
+        .handle_message(
+            "tg_authority_shadow_replay",
+            "Apply the idempotency probe mutation once.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the second call replays");
+    let points = assessor_would_refuse_points(&harness, "tg_authority_shadow_replay").await;
+    assert_eq!(
+        points
+            .iter()
+            .filter(|data| data["metadata"]["tool"] == "idempotency_probe")
+            .count(),
+        1,
+        "{points:?}"
+    );
 }

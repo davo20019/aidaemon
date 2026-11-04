@@ -268,28 +268,30 @@ scopes, dispatch-stop rules, response contracts) is an LLM-proposed description
 of the work, produced by a small model several times per turn. It is a planning
 hint (and, while `task_assessment = "shadow"`, a logged comparison), not the
 arbiter of whether work happened and not a source of tool authority: that comes
-only from the explicit `Authority` enforced by the kernel `AuthorityHook`, and
-a no-tools contract may only reduce what the loop demands. Observed receipts are the ground truth: a run whose terminal receipts
-all succeeded or were credited closes as `succeeded` with
-`proof_basis=evidence` even when the contract could not credit it
-(`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
+only from the explicit `Authority` (role, workspace grant, goal workspace,
+session mode, config) enforced by the kernel `AuthorityHook`, and a no-tools
+contract may only reduce what the loop demands. Observed receipts are the
+ground truth: a run whose terminal receipts all succeeded or were credited
+closes as `succeeded` with `proof_basis=evidence` even when the contract could
+not credit it (`RunAggregate::evidence_closed`,
+`RunTerminalDecision::SucceededByEvidence`).
 
 The ledger-first arbiter (`RunAggregate::closeout`, admissibility in
 `src/agent/turn/closeout.rs`) is the intended home for any new "may the loop
-demand more work?" decision: the explicit Authority gates admission, expectations are
-verified by receipts, and only a *reachable* expectation may ask for another
-pass. It is authoritative: the completion phase asks for more work only on a
-`reachable` verdict (`ledger_expectations_required`), and records every
-verdict as a `ledger_closeout` decision point. The SDK engine's other
-stop-time asks (mandate decision commit, GUI click verification, reply
-repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against
-the same authority and visible tools, each with a budget, and recorded as
-`stop_demand` decision points; a new stop-time ask is a new `StopDemand`,
-not a new check. Tool authority is
-never read from the assessed contract: `CompletionContract::authority()` is no
-longer a gate, and `authority_as_assessed()` exists only for `assessor_would_refuse`
-shadow logging. `expectations()` is verified by receipts, never enforced
-directly. Do not add a gate anywhere else.
+demand more work?" decision: the explicit Authority gates admission,
+expectations are verified by receipts, and only a *reachable* expectation may
+ask for another pass. It is authoritative: the completion phase asks for more
+work only on a `reachable` verdict (`ledger_expectations_required`), and
+records every verdict as a `ledger_closeout` decision point. The SDK engine's
+other stop-time asks (mandate decision commit, GUI click verification, reply
+repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against the
+same authority and visible tools, each with a budget, and recorded as
+`stop_demand` decision points; a new stop-time ask is a new `StopDemand`, not a
+new check. Tool authority is never read from the assessed contract:
+`CompletionContract::authority()` is no longer a gate, and
+`authority_as_assessed()` exists only for `assessor_would_refuse` shadow
+logging. `expectations()` is verified by receipts, never enforced directly. Do
+not add a gate anywhere else.
 
 Do not add new obligation classes, cardinality features, stop-trigger kinds,
 or response-projection rules to make a single live test pass. If a live
@@ -304,13 +306,10 @@ and may under-describe the request; the executing model's `track_requirements`
 checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
 model's own typed statement of what it will do, so open reachable checklist
 items are demanded even after other work completed and a run that ends with
-one open is `partial`, not evidence-closed. Only receipts close either kind;
-authority comes only from the explicit `Authority` (role, workspace grant,
-goal workspace, session mode, config) enforced by the kernel `AuthorityHook`.
-The assessor's contract is an expectations hint and, with `task_assessment =
-"shadow"` (the default; `on` behaves the same without recording, `off` skips the
-assessment call), a logged comparison. `CompletionContract::authority()` is no
-longer a gate.
+one open is `partial`, not evidence-closed. Only receipts close either kind.
+`task_assessment` defaults to `"shadow"` (assess and log what the assessor
+would have refused); `on` behaves the same without recording, and `off` skips
+the assessment call.
 
 ## Untrusted Content Rule
 

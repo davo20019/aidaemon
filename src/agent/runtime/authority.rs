@@ -20,7 +20,7 @@ pub(crate) enum SessionMode {
 }
 
 /// How long a `/readonly` or `/mode unrestricted` lasts.
-const SESSION_MODE_TTL_HOURS: i64 = 4;
+pub(crate) const SESSION_MODE_TTL_HOURS: i64 = 4;
 
 fn session_mode_key(session_id: &str) -> String {
     format!("authority_mode:{session_id}")
@@ -253,6 +253,16 @@ fn bound_workspace_access(workspace: &str) -> Option<ToolCallAccessManifest> {
     let workspace = workspace.trim();
     if workspace.is_empty() {
         return None;
+    }
+    // A relative path has no anchor: it would resolve against whatever the
+    // daemon's working directory is. Fail closed: a manifest that confines
+    // writes to nothing, not an unanchored write root.
+    if !std::path::Path::new(workspace).is_absolute() {
+        tracing::warn!(
+            workspace,
+            "bound workspace is not an absolute path; confining writes to nothing"
+        );
+        return Some(ToolCallAccessManifest::default());
     }
     let write = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, workspace.to_string())?;
     let root = std::path::Path::new(workspace)
@@ -597,6 +607,18 @@ mod tests {
             origin_request: Some("Summarize the synthetic notes.".to_string()),
             origin_trusted: true,
         }
+    }
+
+    #[test]
+    fn relative_bound_workspace_confines_writes_to_nothing() {
+        for workspace in ["relative/ws", "ws", "./ws", "../ws"] {
+            let manifest = bound_workspace_access(workspace)
+                .unwrap_or_else(|| panic!("{workspace}: still a manifest, so it fails closed"));
+            assert!(manifest.write_targets.is_empty(), "{workspace}");
+            assert!(manifest.execution_cwd.is_none(), "{workspace}");
+        }
+        let absolute = bound_workspace_access("/tmp/aidaemon-test/ws").unwrap();
+        assert_eq!(absolute.write_targets.len(), 1);
     }
 
     #[test]

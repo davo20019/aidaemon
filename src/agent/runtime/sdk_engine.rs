@@ -660,6 +660,9 @@ impl Agent {
                 .tools
                 .iter()
                 .filter(|tool| offered_tools.contains(tool.name()))
+                // A tool whose backend is down is not offered (the offered
+                // set already drops it; this keeps the bridge consistent).
+                .filter(|tool| tool.is_available())
             {
                 let (spec, goal_actions_only) =
                     match daemon_tool_offer(tool.name(), memory.owned_daemon_tools) {

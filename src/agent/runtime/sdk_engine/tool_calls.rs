@@ -514,12 +514,6 @@ impl Agent {
                 return self.sdk_suppress_duplicate_send(scope, request).await;
             }
         }
-        // Shadow comparison, once per executed call (after deferral and
-        // duplicate suppression so a retried call is not counted twice).
-        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
-            self.record_assessor_would_refuse(scope, &request.name, arguments)
-                .await;
-        }
         // Calls with side effects carry an idempotency key, bound to
         // the task and the canonical arguments: a repeat reuses the durable
         // receipt instead of performing the effect twice.
@@ -537,6 +531,14 @@ impl Agent {
             .await
         {
             return output;
+        }
+        // Shadow comparison, once per call that actually executes: after
+        // deferral, duplicate suppression and durable replay, so a call that
+        // is deferred, suppressed or replayed is not counted (the shadow
+        // data feeds the decision to turn the assessor off).
+        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
+            self.record_assessor_would_refuse(scope, &request.name, arguments)
+                .await;
         }
         self.record_unrestricted_egress(scope, &request.name, arguments)
             .await;

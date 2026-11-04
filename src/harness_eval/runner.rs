@@ -37,6 +37,16 @@ async fn run_fixture_with_trace(
 
     apply_seed(&harness.state, &fixture.session_id, &fixture.seed).await?;
 
+    if let Some(raw) = &fixture.session_mode {
+        crate::agent::authority::set_session_mode(
+            harness.state.as_ref(),
+            &fixture.session_id,
+            parse_session_mode(raw)?,
+            chrono::Utc::now(),
+        )
+        .await?;
+    }
+
     let user_role = parse_user_role(&fixture.user_role)?;
     let response = harness
         .agent
@@ -117,6 +127,18 @@ fn build_mock_responses(specs: &[MockResponseSpec]) -> Vec<ProviderResponse> {
         .collect()
 }
 
+/// Unknown modes are rejected for the same reason as unknown roles.
+fn parse_session_mode(raw: &str) -> anyhow::Result<crate::agent::authority::SessionMode> {
+    use crate::agent::authority::SessionMode;
+    match raw.to_ascii_lowercase().as_str() {
+        "readonly" => Ok(SessionMode::ReadOnly),
+        "unrestricted" => Ok(SessionMode::Unrestricted),
+        other => anyhow::bail!(
+            "unknown fixture session_mode {other:?} (expected readonly or unrestricted)"
+        ),
+    }
+}
+
 /// Unknown roles are rejected: silently running a typo'd role as Owner would
 /// evaluate the most privileged path under a fixture meant to test a lesser one.
 fn parse_user_role(raw: &str) -> anyhow::Result<UserRole> {
@@ -141,8 +163,8 @@ mod tests {
         let dir = fixtures_dir();
         let fixtures = load_fixtures_dir(&dir).expect("load fixtures");
         assert!(
-            fixtures.len() >= 15,
-            "expected at least 15 fixtures in {}, got {}",
+            fixtures.len() >= 17,
+            "expected at least 17 fixtures in {}, got {}",
             dir.display(),
             fixtures.len()
         );

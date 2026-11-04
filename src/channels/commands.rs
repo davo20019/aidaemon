@@ -228,7 +228,9 @@ impl CommandContext {
     /// `/mode [full|unrestricted|readonly]`: the owner narrows or restores this
     /// chat's tool authority. Explicit command syntax, persisted with an expiry.
     async fn handle_mode(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
-        use crate::agent::authority::{session_mode_with_expiry, set_session_mode, SessionMode};
+        use crate::agent::authority::{
+            session_mode_with_expiry, set_session_mode, SessionMode, SESSION_MODE_TTL_HOURS,
+        };
         const NOT_OWNER: &str = "Only the owner can change the mode.";
         const USAGE: &str = "Usage: /mode [full|unrestricted|readonly]";
         if user_role != UserRole::Owner {
@@ -262,8 +264,8 @@ impl CommandContext {
         };
         match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
             Ok(_) => match requested {
-                SessionMode::ReadOnly => "Read-only for this chat for the next 4 hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early.".to_string(),
-                SessionMode::Unrestricted => "Unrestricted for this chat for the next 4 hours, starting with your next message.".to_string(),
+                SessionMode::ReadOnly => format!("Read-only for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."),
+                SessionMode::Unrestricted => format!("Unrestricted for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting with your next message."),
                 SessionMode::Full => "Back to full access from your next message.".to_string(),
             },
             Err(error) => {

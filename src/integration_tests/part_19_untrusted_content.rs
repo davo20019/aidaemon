@@ -377,6 +377,41 @@ fn guest_grant(
     }
 }
 
+/// Every tool result the model saw, paired with the name of the tool call it
+/// answers (matched through the call id), so an assertion about one tool's
+/// refusal cannot be satisfied by another tool's result that merely mentions it.
+async fn tool_results_by_name(provider: &crate::testing::MockProvider) -> Vec<(String, String)> {
+    let log = provider.call_log.lock().await;
+    let mut names: std::collections::HashMap<String, String> = Default::default();
+    let mut results: Vec<(String, String)> = Vec::new();
+    for message in log.iter().flat_map(|call| call.messages.iter()) {
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for call in calls {
+                let name = call["function"]["name"]
+                    .as_str()
+                    .or_else(|| call["name"].as_str());
+                if let (Some(id), Some(name)) = (call["id"].as_str(), name) {
+                    names.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+        if message["role"] == "tool" {
+            let id = message["tool_call_id"].as_str().unwrap_or_default();
+            let name = message["name"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| names.get(id).cloned())
+                .unwrap_or_default();
+            if let Some(content) = message["content"].as_str() {
+                if !results.iter().any(|(n, c)| *n == name && c == content) {
+                    results.push((name, content.to_string()));
+                }
+            }
+        }
+    }
+    results
+}
+
 #[tokio::test]
 async fn guest_message_cannot_write_or_run_even_via_a_child() {
     use aidaemon_core::Authority;
@@ -422,14 +457,7 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
         )
         .await
         .unwrap();
-    let results = {
-        let log = harness.provider.call_log.lock().await;
-        log.iter()
-            .flat_map(|call| call.messages.iter())
-            .filter(|message| message["role"] == "tool")
-            .filter_map(|message| message["content"].as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-    };
+    let results = tool_results_by_name(&harness.provider).await;
     // A guest without a grant is offered no tools; each call is refused
     // (unknown tool, no grant, or an authority block) and nothing runs.
     assert!(
@@ -438,13 +466,13 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
     );
     for tool in ["write_file", "terminal", "spawn_agent"] {
         assert!(
-            results.iter().any(|result| {
-                result.contains(tool)
+            results.iter().any(|(name, result)| {
+                name == tool
                     && (result.contains("unknown tool")
                         || result.contains("no active workspace grant")
                         || result.contains("[AUTHORITY BLOCKED]"))
             }),
-            "`{tool}` must be refused; the model saw {results:?}"
+            "`{tool}`'s own result must be a refusal; the model saw {results:?}"
         );
     }
     assert!(!written.exists() && !ran.exists());
@@ -483,20 +511,14 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
         )
         .await
         .unwrap();
-    let seen = {
-        let log = harness.provider.call_log.lock().await;
-        log.iter()
-            .flat_map(|call| call.messages.iter())
-            .filter(|message| message["role"] == "tool")
-            .filter_map(|message| message["content"].as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-    };
+    let seen = tool_results_by_name(&harness.provider).await;
     assert!(
-        seen.iter().any(|result| {
-            result.contains("[AUTHORITY BLOCKED] `spawn_agent`")
-                || result.contains("unknown tool `spawn_agent`")
+        seen.iter().any(|(name, result)| {
+            name == "spawn_agent"
+                && (result.contains("[AUTHORITY BLOCKED] `spawn_agent`")
+                    || result.contains("unknown tool `spawn_agent`"))
         }),
-        "spawn_agent is denied for a Read grant (not offered, or blocked); saw {seen:?}"
+        "spawn_agent's own result is a refusal for a Read grant; saw {seen:?}"
     );
 
     let parent = agent.inherited_for_child(None, UserRole::Guest, &ctx).await;
@@ -536,5 +558,47 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
             .any(|result| result.contains("[AUTHORITY BLOCKED]")),
         "the child's write is denied by authority; saw {child_results:?}"
     );
+    // (c) Positive control: the same Read grant still lets the guest read.
+    let project = root.join("guest-project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let readable = project.join("guest-notes.txt");
+    std::fs::write(&readable, "synthetic guest-readable notes").unwrap();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "read_file",
+            &json!({"path": readable}).to_string(),
+        ),
+        MockProvider::text_response("Read it."),
+    ]);
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::tools::ReadFileTool)];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_message(
+            "tg_untrusted_guest_read_control",
+            "Read the notes file.",
+            None,
+            UserRole::Guest,
+            guest_group_ctx(Some(guest_grant(
+                &project,
+                crate::types::WorkspaceAccessLevel::Read,
+            ))),
+            None,
+        )
+        .await
+        .unwrap();
+    let read = tool_results_by_name(&harness.provider).await;
+    assert!(
+        read.iter().any(|(name, result)| name == "read_file"
+            && result.contains("synthetic guest-readable notes")),
+        "a Read grant still reads; saw {read:?}"
+    );
+    assert!(
+        !read.iter().any(|(_, result)| result.contains("[AUTHORITY BLOCKED]")),
+        "{read:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
+
