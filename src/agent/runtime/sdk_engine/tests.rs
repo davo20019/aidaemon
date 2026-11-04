@@ -1566,6 +1566,26 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     let networked =
         bridged.annotations_for(&serde_json::json!({"action":"run","command":"ls","network":true}));
     assert!(!networked.read_only && networked.egress);
+    // The kernel's AuthorityHook refuses non-read-only calls under /readonly,
+    // so process control and the standing-rule change are refused too, and a
+    // redirecting or env-prefixed run is refused while a plain `ls` passes.
+    let readonly = sdk::Authority::read_only();
+    let permits = |args: serde_json::Value| {
+        readonly
+            .permits("terminal", bridged.annotations_for(&args))
+            .is_ok()
+    };
+    assert!(permits(run("ls /tmp")));
+    assert!(permits(serde_json::json!({"action": "check", "pid": 1})));
+    assert!(!permits(serde_json::json!({"action": "kill", "pid": 1})));
+    assert!(!permits(serde_json::json!({"action": "trust_all"})));
+    assert!(!permits(run("ls > /tmp/aidaemon-test/out")));
+    assert!(!permits(run("FOO=1 ls")));
+    assert!(
+        bridged
+            .annotations_for(&serde_json::json!({"action": "trust_all"}))
+            .egress
+    );
 }
 
 #[tokio::test]

@@ -9340,8 +9340,9 @@ mod tests {
             .join("aidaemon-test")
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("x");
-        std::fs::write(&target, "keep").unwrap();
+        // Pre-change, a run with no declared write targets was typed
+        // observation, so this redirect would have executed.
+        let target = dir.join("out");
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
             .await
@@ -9359,7 +9360,7 @@ mod tests {
         .await;
         let args = serde_json::json!({
             "action": "run",
-            "command": format!("rm -rf {}", target.display()),
+            "command": format!("ls {} > {}", dir.display(), target.display()),
             "_session_id": "telegram:synthetic-owner",
             "_user_role": "Owner"
         })
@@ -9379,7 +9380,7 @@ mod tests {
             outcome.metadata.outcome_status,
             Some(ToolOutcomeStatus::Blocked)
         );
-        assert!(target.exists(), "the file must survive the blocked rm");
+        assert!(!target.exists(), "the redirect must not have run");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
