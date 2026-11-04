@@ -801,10 +801,13 @@ impl Agent {
         // Policy filtering may rebuild definitions from `base_tool_defs`;
         // reapply the authority's tool set so it cannot widen it.
         retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
-        if !turn_context
-            .completion_contract
-            .evidence_requirements
-            .is_empty()
+        // A request that forbids tools is never told to gather evidence with
+        // them (demand-only: the tools stay offered and callable).
+        if !turn_context.completion_contract.forbids_tool_use
+            && !turn_context
+                .completion_contract
+                .evidence_requirements
+                .is_empty()
         {
             let candidate_tools = crate::agent::inquiry::candidate_tools_for_requirements(
                 &turn_context.completion_contract.evidence_requirements,

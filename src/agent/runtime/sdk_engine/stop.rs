@@ -276,7 +276,8 @@ impl Agent {
         used: u32,
     ) -> crate::agent::closeout::StopDemandVerdict {
         let authority =
-            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority);
+            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
+                .without_tool_demands(scope.contract.forbids_tool_use);
         let visible_tools =
             closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
         let find = |name: &str| self.tools.iter().find(|tool| tool.name() == name);
@@ -382,7 +383,8 @@ impl Agent {
         };
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
         let authority =
-            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority);
+            crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
+                .without_tool_demands(scope.contract.forbids_tool_use);
         let visible_tools =
             closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
         let read_only = |name: &str| {

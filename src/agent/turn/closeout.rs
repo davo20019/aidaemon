@@ -38,6 +38,16 @@ impl ClosingAuthority<'static> {
             owner_control_plane_tools: &[],
         }
     }
+
+    /// A request the assessment says forbids tool use: the loop demands no
+    /// tool work (no obligation is admissible, no tool-backed stop demand is
+    /// reachable). Demand-only, never a refusal: this view decides what the
+    /// loop may ask for, and the tools stay callable; the kernel's
+    /// `AuthorityHook` is the only thing that refuses a call.
+    pub(in crate::agent) fn without_tool_demands(mut self, request_forbids_tools: bool) -> Self {
+        self.forbids_tool_use |= request_forbids_tools;
+        self
+    }
 }
 
 impl<'a> ClosingAuthority<'a> {
@@ -260,6 +270,30 @@ mod stop_demand_tests {
         let none = ClosingAuthority::from_resolved(&aidaemon_core::Authority::no_tools());
         assert!(none.forbids_tool_use);
         assert!(!none.admits_tool("read_file", Some(true)));
+    }
+
+    /// A request that forbids tools asks for no tool work at closeout, even
+    /// under full authority; without it nothing changes.
+    #[test]
+    fn no_tools_request_admits_no_demands_under_full_authority() {
+        let obligation_tools = ["read_file"];
+        let quiet = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full())
+            .without_tool_demands(true);
+        assert!(!quiet.admits_tool("read_file", Some(true)));
+        assert_eq!(
+            stop_demand_verdict(
+                StopDemand::GuiClickVerification,
+                0,
+                &quiet,
+                &obligation_tools,
+                |_| Some(true),
+                |_, _| false,
+            ),
+            StopDemandVerdict::Unreachable
+        );
+        let normal = ClosingAuthority::from_resolved(&aidaemon_core::Authority::full())
+            .without_tool_demands(false);
+        assert!(normal.admits_tool("read_file", Some(true)));
     }
 
     fn authority<'a>(allowed: &'a [String], control_plane: &'a [String]) -> ClosingAuthority<'a> {

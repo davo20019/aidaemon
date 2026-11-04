@@ -738,6 +738,62 @@ async fn unavailable_relationship_assessments_fail_closed_to_fresh_context() {
         .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
 }
 
+/// A request the assessment says forbids tools reduces what the loop demands:
+/// no evidence directive, no verification or recovery pass. It refuses
+/// nothing: tool authority comes from explicit facts, so the tools stay
+/// offered.
+#[tokio::test]
+async fn explicit_no_tool_request_demands_no_tool_work_but_keeps_tools_offered() {
+    let base = MockProvider::semantic_task_assessment(
+        "answer",
+        false,
+        true,
+        &[],
+        "new_request",
+        "external_remote",
+    );
+    let mut assessment: Value = serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
+    assessment["schema_version"] = 10.into();
+    assessment["contract"]["tool_scope"] = "forbidden".into();
+    assessment["contract"]["tool_constraint_evidence"] = json!(["Do not use any tools"]);
+    let assessment = MockProvider::text_response(&assessment.to_string());
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I cannot establish the current release from the supplied context; that would require live evidence, which you asked me not to retrieve.",
+    )])
+    .with_task_assessments(vec![assessment]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "synthetic-no-tool-session",
+            "What is the current synthetic language release? Do not use any tools.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(reply.contains("require live evidence"));
+    let calls = harness.provider.call_log.lock().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "no verification or recovery pass is demanded"
+    );
+    assert!(
+        !calls[0].tools.is_empty(),
+        "the assessment refuses nothing: tools stay offered"
+    );
+    assert!(
+        !calls[0].messages.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("MATERIAL EVIDENCE STILL REQUIRED"))),
+        "the loop does not tell the model to gather evidence with tools"
+    );
+}
+
 #[tokio::test]
 async fn legacy_output_markers_do_not_control_finalization() {
     let assessment = MockProvider::text_response(
