@@ -344,6 +344,25 @@ impl Agent {
         .await;
     }
 
+    /// What a child spawned from this turn inherits: the turn's resolved
+    /// authority, owner level and workspace, the chat whose `/readonly`
+    /// narrows it, whether the turn has seen untrusted content so far, and
+    /// the root request with its trust.
+    fn turn_authority_for_children(
+        &self,
+        scope: &TurnScope<'_>,
+    ) -> crate::agent::authority::InheritedAuthority {
+        crate::agent::authority::InheritedAuthority {
+            authority: scope.authority.authority.clone(),
+            owner_level: scope.authority.owner_level,
+            task_access: scope.authority.task_access.clone(),
+            mode_session: Some(self.mode_session_for(scope.session_id)),
+            untrusted_context: scope.untrusted_seen.load(Ordering::SeqCst),
+            origin_request: Some(scope.origin_request.to_string()),
+            origin_trusted: scope.origin_trusted,
+        }
+    }
+
     /// Run one call and record it: a `ToolCall` event, then the tool message with a typed receipt, so the run ledger
     /// sees every operation while the run is still going.
     pub(super) async fn run_sdk_tool_call(
@@ -369,6 +388,9 @@ impl Agent {
             }
             _ => None,
         };
+        // A child spawned by this call inherits what this turn has now.
+        let turn_authority =
+            (request.name == "spawn_agent").then(|| self.turn_authority_for_children(scope));
         let mut ctx = ToolExecCtx {
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
@@ -386,6 +408,7 @@ impl Agent {
                     .await
                     .is_some(),
             scope_escalation: scope_escalation.as_ref(),
+            turn_authority: turn_authority.as_ref(),
         };
         let started = Instant::now();
         let call_semantics = self

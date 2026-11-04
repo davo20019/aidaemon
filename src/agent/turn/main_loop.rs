@@ -787,7 +787,7 @@ impl Agent {
             });
         // A spawned child is never wider than its parent's turn.
         if let Some(parent) = &self.inherited_authority {
-            resolved_authority.authority = parent.narrow(&resolved_authority.authority);
+            resolved_authority = crate::agent::authority::narrow_for_child(parent, resolved_authority);
         }
         retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
         let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(

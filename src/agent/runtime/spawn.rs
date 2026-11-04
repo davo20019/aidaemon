@@ -1417,7 +1417,7 @@ impl Agent {
         approval_session_id: Option<String>,
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
-        inherited_authority: aidaemon_core::Authority,
+        inherited_authority: crate::agent::authority::InheritedAuthority,
     ) -> Arc<Agent> {
         let spawn_tool = if add_spawn_tool {
             Some(Arc::new(
@@ -1553,6 +1553,7 @@ impl Agent {
             inherited_project_scope,
             arg_specialist,
             None,
+            None,
         )
         .await
         .map(|result| result.response)
@@ -1572,6 +1573,7 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         self.spawn_child_with_outcome_and_attempt(
             mission,
@@ -1586,6 +1588,7 @@ impl Agent {
             arg_specialist,
             approval_session_id,
             None,
+            parent_authority,
         )
         .await
     }
@@ -1608,6 +1611,7 @@ impl Agent {
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
         bound_task_attempt: Option<crate::traits::TaskAttempt>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         if self.depth >= self.limits.max_depth {
             anyhow::bail!(
@@ -1695,6 +1699,7 @@ impl Agent {
                             cancel_token,
                             inherited_project_scope,
                             approval_session_id,
+                            parent_authority,
                         )
                         .await;
                 }
@@ -1918,6 +1923,7 @@ impl Agent {
                             None, // cancel token override
                             inherited_project_scope,
                             approval_session_id,
+                            parent_authority,
                         )
                         .await;
                 }
@@ -1993,20 +1999,42 @@ impl Agent {
             None,             // cancel token override
             inherited_project_scope,
             approval_session_id,
+            parent_authority,
         )
         .await
     }
 
-    /// The most a child spawned by this agent may do: the parent turn's
-    /// authority, re-resolved from the same explicit facts (including the
-    /// owner's session mode on the originating chat), narrowed by whatever this
-    /// agent itself inherited. A child is never wider than its parent.
+    /// What a child spawned by this agent inherits: the spawning turn's
+    /// actual authority when the dispatcher supplied it (`spawn_agent`), else
+    /// the re-resolution fallback for spawns that do not come from a tool
+    /// call (goal dispatch, mandates).
+    pub(crate) async fn inherited_for_child(
+        &self,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        parent_session: Option<&str>,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+    ) -> crate::agent::authority::InheritedAuthority {
+        match parent_authority {
+            Some(parent) => parent,
+            None => {
+                self.authority_for_child(parent_session, user_role, channel_ctx)
+                    .await
+            }
+        }
+    }
+
+    /// The fallback for a spawn without the parent turn's authority: the
+    /// authority re-resolved from the same explicit facts (including the
+    /// owner's session mode on the originating chat), narrowed by whatever
+    /// this agent itself inherited, answering to the originating chat. A
+    /// child is never wider than its parent.
     pub(crate) async fn authority_for_child(
         &self,
         parent_session: Option<&str>,
         user_role: UserRole,
         channel_ctx: &ChannelContext,
-    ) -> aidaemon_core::Authority {
+    ) -> crate::agent::authority::InheritedAuthority {
         let session_mode = match parent_session {
             Some(parent_session) => {
                 crate::agent::authority::session_mode(
@@ -2026,18 +2054,32 @@ impl Agent {
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 bound_workspace: None,
             });
-        match self.inherited_authority.as_ref() {
-            Some(inherited) => inherited.narrow(&resolved.authority),
-            None => resolved.authority,
+        let inherited = self.inherited_authority.as_ref();
+        let resolved = match inherited {
+            Some(inherited) => crate::agent::authority::narrow_for_child(inherited, resolved),
+            None => resolved,
+        };
+        crate::agent::authority::InheritedAuthority {
+            authority: resolved.authority,
+            owner_level: resolved.owner_level,
+            task_access: resolved.task_access,
+            mode_session: inherited
+                .and_then(|inherited| inherited.mode_session.clone())
+                .or_else(|| parent_session.map(str::to_string)),
+            untrusted_context: inherited.is_some_and(|inherited| inherited.untrusted_context),
+            origin_request: inherited.and_then(|inherited| inherited.origin_request.clone()),
+            // Without a parent constraint the child's own facts decide.
+            origin_trusted: inherited.is_none_or(|inherited| inherited.origin_trusted),
         }
     }
 
-    /// The chat whose `/readonly` narrows this turn while it runs. A turn
-    /// answers to its own session; a child should answer to the chat that
-    /// started the work. TODO(Task 7): return the parent's `mode_session`
-    /// from `InheritedAuthority` for a child.
+    /// The chat whose `/readonly` narrows this turn while it runs: a child
+    /// answers to the chat that started the work, a root turn to its own.
     pub(crate) fn mode_session_for(&self, session_id: &str) -> String {
-        session_id.to_string()
+        self.inherited_authority
+            .as_ref()
+            .and_then(|inherited| inherited.mode_session.clone())
+            .unwrap_or_else(|| session_id.to_string())
     }
 
     /// Internal helper to create and run a child agent.
@@ -2064,6 +2106,7 @@ impl Agent {
         cancel_token_override: Option<tokio_util::sync::CancellationToken>,
         inherited_project_scope: Option<&str>,
         approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         // Resolve the immutable mandate fence before any child-setup write or
         // filesystem provisioning. A stale/revoked attempt must fail without
@@ -2320,7 +2363,8 @@ impl Agent {
             None
         };
         let parent_authority = self
-            .authority_for_child(
+            .inherited_for_child(
+                parent_authority,
                 effective_approval_session_id.as_deref(),
                 user_role,
                 &channel_ctx,

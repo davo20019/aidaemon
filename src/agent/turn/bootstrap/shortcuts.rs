@@ -51,6 +51,7 @@ pub(super) async fn maybe_handle_stop_command(
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
             },
         )
         .await;

@@ -423,7 +423,9 @@ pub struct AppConfig {
 
 /// How much the owner may do by default. Both levels act the same at the
 /// tool gate for now; `unrestricted` will turn off the untrusted-content rule.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+/// Ordered `Full < Unrestricted`: a child takes the lower of its parent's
+/// and its own.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OwnerLevel {
     #[default]

@@ -394,6 +394,10 @@ pub(in crate::agent) struct TurnScope<'a> {
     trust_roots: Vec<String>,
     /// A dispatched call returned untrusted content this turn.
     untrusted_seen: AtomicBool,
+    /// The root request egress is judged against (a child's is its root's),
+    /// and whether the owner wrote it.
+    origin_request: &'a str,
+    origin_trusted: bool,
     authorized_scopes: Vec<String>,
     /// See `SdkTurnSetup::projected_source_message_ids`.
     projected_source_message_ids: Vec<String>,
@@ -781,7 +785,10 @@ impl Agent {
                 session_id,
                 projected_turn_ids: &projected_source_turn_ids,
                 tainted_turns: tainted_turns.as_deref(),
-                inherited: false,
+                inherited: self
+                    .inherited_authority
+                    .as_ref()
+                    .is_some_and(|parent| parent.untrusted_context),
             });
         if starts_tainted {
             state = state.with_untrusted_context();
@@ -818,6 +825,15 @@ impl Agent {
             known_project_dir.as_deref(),
             authority.task_access.as_ref(),
         );
+        // A child judges egress against its root's request, which is the
+        // owner's only if every turn up to the root was.
+        let inherited = self.inherited_authority.as_ref();
+        let origin_request = inherited
+            .and_then(|parent| parent.origin_request.as_deref())
+            .unwrap_or(user_text);
+        let origin_trusted =
+            crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
+                && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
             session_id,
             user_text,
@@ -841,6 +857,8 @@ impl Agent {
             ceiling: ceiling.clone(),
             trust_roots,
             untrusted_seen: AtomicBool::new(starts_tainted),
+            origin_request,
+            origin_trusted,
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,
@@ -906,10 +924,8 @@ impl Agent {
         let verifier = crate::agent::untrusted::UntrustedVerifier {
             agent: self,
             scope: &scope,
-            origin_request: user_text,
-            origin_trusted: crate::agent::untrusted::origin_is_owner_authored(
-                user_role, session_id,
-            ),
+            origin_request,
+            origin_trusted,
         };
         let run = sdk_agent.run_resolving(state, cancel, &verifier);
         tokio::pin!(run);

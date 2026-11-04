@@ -46,6 +46,9 @@ pub(crate) struct ChildAgentRequest {
     pub project_scope: Option<String>,
     pub specialist: Option<String>,
     pub approval_session_id: Option<String>,
+    /// The spawning turn's actual authority, taint and root request
+    /// (dispatcher-injected; `None` falls back to re-resolution).
+    pub parent_authority: Option<crate::agent::authority::InheritedAuthority>,
 }
 
 /// Child-delegation capability required by `spawn_agent`.

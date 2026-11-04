@@ -61,6 +61,7 @@ impl ChildAgentRuntime for Agent {
                 request.project_scope.as_deref(),
                 request.specialist.as_deref(),
                 request.approval_session_id.as_deref(),
+                request.parent_authority,
             )
             .await?;
         Ok(ChildAgentRun {

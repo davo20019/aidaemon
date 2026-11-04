@@ -362,6 +362,11 @@ struct SpawnArgs {
     /// Parent project scope injected by execute_tool for child scope inheritance.
     #[serde(default)]
     _project_scope: Option<String>,
+    /// The spawning turn's actual authority, taint and root request,
+    /// injected by the dispatcher (model-supplied underscore keys are
+    /// stripped first).
+    #[serde(default)]
+    _parent_authority: Option<crate::agent::authority::InheritedAuthority>,
 }
 
 fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
@@ -588,6 +593,7 @@ impl Tool for SpawnAgentTool {
                     args._project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
+                    args._parent_authority.clone(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -618,6 +624,7 @@ impl Tool for SpawnAgentTool {
                     args._project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
+                    args._parent_authority.clone(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -643,6 +650,7 @@ impl Tool for SpawnAgentTool {
                         args._project_scope.as_deref(),
                         args.specialist.as_deref(),
                         approval_session_id.as_deref(),
+                        args._parent_authority.clone(),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -681,6 +689,7 @@ impl Tool for SpawnAgentTool {
                     project_scope: args._project_scope.clone(),
                     specialist: args.specialist.clone(),
                     approval_session_id: Some(session_id.clone()),
+                    parent_authority: args._parent_authority.clone(),
                 }),
             ));
             let result = loop {
@@ -837,6 +846,7 @@ impl SpawnAgentTool {
         project_scope: Option<&str>,
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
@@ -853,6 +863,7 @@ impl SpawnAgentTool {
                 project_scope: project_scope.map(str::to_string),
                 specialist: arg_specialist.map(str::to_string),
                 approval_session_id: approval_session_id.map(str::to_string),
+                parent_authority,
             }),
         )
         .await;
@@ -1022,6 +1033,29 @@ mod tests {
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
         assert_eq!(args._session_id.as_deref(), Some("tg:123"));
+    }
+
+    #[test]
+    fn spawn_args_carry_the_injected_parent_authority() {
+        let parent = crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::read_only(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: Some("tg:123".to_string()),
+            untrusted_context: true,
+            origin_request: Some("Summarize the synthetic notes.".to_string()),
+            origin_trusted: true,
+        };
+        let json = serde_json::json!({
+            "mission": "test",
+            "task": "do stuff",
+            "_parent_authority": parent,
+        });
+        let args: SpawnArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(args._parent_authority, Some(parent));
+        let args: SpawnArgs =
+            serde_json::from_str(r#"{"mission": "test", "task": "do stuff"}"#).unwrap();
+        assert!(args._parent_authority.is_none());
     }
 
     #[test]

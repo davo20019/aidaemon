@@ -380,10 +380,13 @@ pub struct Agent {
     /// Root agents leave this unset; every spawned descendant inherits the
     /// originating conversation while retaining its own isolated runtime ID.
     approval_session_id: Option<String>,
-    /// The most a spawned child may do: its parent turn's resolved tool
-    /// authority. The child's own resolution is narrowed by it, so a child
-    /// is never wider than the agent that spawned it. Root agents leave it unset.
-    inherited_authority: Option<aidaemon_core::Authority>,
+    /// What a spawned child inherited from the turn that spawned it: its
+    /// authority, owner level and workspace narrow the child's own
+    /// resolution (a child is never wider than its parent), its mode session
+    /// is the chat whose `/readonly` narrows the child, and its taint and root
+    /// request carry the untrusted-content rule across. Root agents leave it
+    /// unset.
+    inherited_authority: Option<crate::agent::authority::InheritedAuthority>,
     /// Full tool list from the root agent — used by TaskLead when spawning
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.

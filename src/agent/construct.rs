@@ -307,7 +307,10 @@ impl Agent {
     }
 
     #[cfg(test)]
-    pub fn set_test_inherited_authority(&mut self, authority: aidaemon_core::Authority) {
+    pub(crate) fn set_test_inherited_authority(
+        &mut self,
+        authority: crate::agent::authority::InheritedAuthority,
+    ) {
         self.inherited_authority = Some(authority);
     }
 

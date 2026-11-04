@@ -158,6 +158,44 @@ pub(in crate::agent) struct ResolvedAuthority {
     pub task_access: Option<ToolCallAccessManifest>,
 }
 
+/// What a spawned child inherits from the turn that spawned it: the turn's
+/// actual authority (not a re-resolution at spawn time), the chat whose
+/// `/readonly` narrows it, the turn's taint, and the root request egress is
+/// judged against. The dispatcher injects it into `spawn_agent` as
+/// `_parent_authority`; model-supplied underscore keys are stripped first.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InheritedAuthority {
+    pub authority: aidaemon_core::Authority,
+    pub owner_level: Option<OwnerLevel>,
+    pub task_access: Option<ToolCallAccessManifest>,
+    /// The chat whose live `/readonly` narrows the child while it runs.
+    pub mode_session: Option<String>,
+    /// The parent turn had read untrusted content (or started tainted).
+    pub untrusted_context: bool,
+    /// The root request the verifier judges the child's egress against.
+    pub origin_request: Option<String>,
+    /// The root request was owner-authored; a child of an untrusted-origin
+    /// turn is never trusted (it only ever stays or turns false).
+    pub origin_trusted: bool,
+}
+
+/// A child's own resolution narrowed by what its parent turn had: the
+/// narrower authority, the lower owner level (a guest parent's `None` stays
+/// `None`), and the parent's workspace confinement when it had one.
+pub(in crate::agent) fn narrow_for_child(
+    parent: &InheritedAuthority,
+    own: ResolvedAuthority,
+) -> ResolvedAuthority {
+    ResolvedAuthority {
+        authority: parent.authority.narrow(&own.authority),
+        owner_level: match (parent.owner_level, own.owner_level) {
+            (Some(parent), Some(own)) => Some(parent.min(own)),
+            _ => None,
+        },
+        task_access: parent.task_access.clone().or(own.task_access),
+    }
+}
+
 pub(in crate::agent) fn resolve_authority(facts: &AuthorityFacts<'_>) -> ResolvedAuthority {
     use aidaemon_core::Authority;
     match facts.user_role {
@@ -518,6 +556,7 @@ mod tests {
             tool_call_id: None,
             mutation_forbidden: false,
             scope_escalation: None,
+            turn_authority: None,
         };
         let error = harness
             .agent
@@ -531,6 +570,127 @@ mod tests {
         assert!(
             error.to_string().contains("no active workspace grant"),
             "{error}"
+        );
+    }
+
+    fn inherited(
+        authority: Authority,
+        owner_level: Option<OwnerLevel>,
+        task_access: Option<ToolCallAccessManifest>,
+    ) -> InheritedAuthority {
+        InheritedAuthority {
+            authority,
+            owner_level,
+            task_access,
+            mode_session: Some("tg_synthetic_parent".to_string()),
+            untrusted_context: false,
+            origin_request: Some("Summarize the synthetic notes.".to_string()),
+            origin_trusted: true,
+        }
+    }
+
+    #[test]
+    fn narrow_for_child_never_widens() {
+        let bound = bound_workspace_access("/tmp/aidaemon-test/parent-ws");
+        assert!(bound.is_some());
+        let parent = inherited(
+            Authority::read_only(),
+            Some(OwnerLevel::Unrestricted),
+            bound.clone(),
+        );
+        let own = ResolvedAuthority {
+            authority: Authority::full(),
+            owner_level: Some(OwnerLevel::Full),
+            task_access: None,
+        };
+        let child = narrow_for_child(&parent, own);
+        assert_eq!(child.authority, Authority::read_only());
+        assert_eq!(child.owner_level, Some(OwnerLevel::Full));
+        assert_eq!(child.task_access, bound);
+
+        // The lower owner level wins from either side.
+        let child = narrow_for_child(
+            &inherited(Authority::full(), Some(OwnerLevel::Full), None),
+            ResolvedAuthority {
+                authority: Authority::full(),
+                owner_level: Some(OwnerLevel::Unrestricted),
+                task_access: None,
+            },
+        );
+        assert_eq!(child.owner_level, Some(OwnerLevel::Full));
+
+        // A parent without a workspace keeps the child's own.
+        let own_bound = bound_workspace_access("/tmp/aidaemon-test/child-ws");
+        let child = narrow_for_child(
+            &inherited(Authority::full(), Some(OwnerLevel::Full), None),
+            ResolvedAuthority {
+                authority: Authority::full(),
+                owner_level: Some(OwnerLevel::Full),
+                task_access: own_bound.clone(),
+            },
+        );
+        assert_eq!(child.task_access, own_bound);
+
+        // A guest parent (no owner level) gives a child none.
+        let child = narrow_for_child(
+            &inherited(Authority::full(), None, None),
+            ResolvedAuthority {
+                authority: Authority::full(),
+                owner_level: Some(OwnerLevel::Unrestricted),
+                task_access: None,
+            },
+        );
+        assert_eq!(child.owner_level, None);
+    }
+
+    /// Review focus 5: `/mode unrestricted` on a shared chat never relaxes a
+    /// guest turn there, or a child spawned from it.
+    #[tokio::test]
+    async fn unrestricted_never_reaches_a_guest_or_its_child() {
+        use crate::agent::untrusted::untrusted_mode;
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(&dir.path().join("a.db")).await;
+        let t = chrono::Utc::now();
+        let shared = "tg_synthetic_shared";
+        set_session_mode(&store, shared, SessionMode::Unrestricted, t)
+            .await
+            .unwrap();
+        let mode = session_mode(&store, shared, t).await;
+        assert_eq!(mode, Some(SessionMode::Unrestricted));
+
+        let guest = resolve_authority(&AuthorityFacts {
+            session_mode: mode,
+            owner_default: OwnerLevel::Unrestricted,
+            ..facts(UserRole::Guest)
+        });
+        assert_eq!(guest.owner_level, None);
+        assert_eq!(
+            untrusted_mode(guest.owner_level),
+            aidaemon_core::UntrustedMode::Enforce
+        );
+
+        // The guest turn's child, even resolving as the owner under the same
+        // mode, stays enforced.
+        let parent = InheritedAuthority {
+            authority: guest.authority.clone(),
+            owner_level: guest.owner_level,
+            task_access: guest.task_access.clone(),
+            mode_session: Some(shared.to_string()),
+            untrusted_context: true,
+            origin_request: Some("Post this for me.".to_string()),
+            origin_trusted: false,
+        };
+        let own = resolve_authority(&AuthorityFacts {
+            session_mode: mode,
+            owner_default: OwnerLevel::Unrestricted,
+            ..facts(UserRole::Owner)
+        });
+        assert_eq!(own.owner_level, Some(OwnerLevel::Unrestricted));
+        let child = narrow_for_child(&parent, own);
+        assert_eq!(child.owner_level, None);
+        assert_eq!(
+            untrusted_mode(child.owner_level),
+            aidaemon_core::UntrustedMode::Enforce
         );
     }
 

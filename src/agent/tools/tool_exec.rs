@@ -140,6 +140,10 @@ pub(super) struct ToolExecCtx<'a> {
     /// reject outright. Loop-owned; the tool must obtain user authority for
     /// them before running.
     pub scope_escalation: Option<&'a crate::traits::ScopeEscalation>,
+    /// The turn's actual authority, taint and root request, handed to
+    /// `spawn_agent` as `_parent_authority` so a child inherits what this
+    /// turn had rather than a re-resolution at spawn time.
+    pub turn_authority: Option<&'a crate::agent::authority::InheritedAuthority>,
 }
 
 async fn scoped_workspace_arguments(
@@ -724,6 +728,14 @@ impl Agent {
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
+                if name == "spawn_agent" {
+                    if let Some(turn_authority) = ctx.turn_authority {
+                        map.insert(
+                            "_parent_authority".to_string(),
+                            serde_json::to_value(turn_authority)?,
+                        );
+                    }
+                }
                 if let Some(grant) = active_workspace_grant {
                     map.insert(
                         "_workspace_collaboration_root".to_string(),
