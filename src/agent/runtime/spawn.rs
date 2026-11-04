@@ -1997,8 +1997,6 @@ impl Agent {
         .await
     }
 
-    /// Internal helper to create and run a child agent.
-    #[allow(clippy::too_many_arguments)]
     /// The most a child spawned by this agent may do: the parent turn's
     /// authority, re-resolved from the same explicit facts (including the
     /// owner's session mode on the originating chat), narrowed by whatever this
@@ -2034,6 +2032,7 @@ impl Agent {
         }
     }
 
+    /// Internal helper to create and run a child agent.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_child_inner(
         &self,
