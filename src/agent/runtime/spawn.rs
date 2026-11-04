@@ -2090,6 +2090,7 @@ impl Agent {
             origin_request: inherited.and_then(|inherited| inherited.origin_request.clone()),
             // Without a parent constraint the child's own facts decide.
             origin_trusted: inherited.is_none_or(|inherited| inherited.origin_trusted),
+            trusted_roots: inherited.and_then(|inherited| inherited.trusted_roots.clone()),
         }
     }
 

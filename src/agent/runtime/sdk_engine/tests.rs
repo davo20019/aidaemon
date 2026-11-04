@@ -1802,7 +1802,7 @@ fn relative_reads_under_the_working_directory_are_trusted() {
     use crate::traits::{Tool as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
     let cwd = "/tmp/aidaemon-test/ws";
-    let roots = super::turn_trust_roots(&[], Some(cwd), None, None, None);
+    let roots = cwd_roots(cwd);
     assert_eq!(
         roots,
         vec![cwd.to_string()],
@@ -1825,10 +1825,10 @@ fn relative_reads_under_the_working_directory_are_trusted() {
         Trusted
     );
     // Too broad to trust as a whole.
-    assert!(super::turn_trust_roots(&[], Some("/"), None, None, None).is_empty());
+    assert!(cwd_roots("/").is_empty());
     if let Some(home) = dirs::home_dir() {
         let home = home.to_string_lossy().into_owned();
-        assert!(super::turn_trust_roots(&[], Some(&home), None, None, None).is_empty());
+        assert!(cwd_roots(&home).is_empty());
     }
 }
 
@@ -1855,16 +1855,168 @@ fn broad_working_directories_are_not_trusted_roots() {
     }
     for cwd in &broad {
         assert!(
-            super::turn_trust_roots(&[], Some(cwd), None, None, None).is_empty(),
+            cwd_roots(cwd).is_empty(),
             "{cwd} must not be a trusted root"
         );
     }
     for cwd in ["/tmp/aidaemon-test/ws", "/var/tmp/aidaemon-test/ws"] {
-        assert_eq!(
-            super::turn_trust_roots(&[], Some(cwd), None, None, None),
-            vec![cwd.to_string()]
-        );
+        assert_eq!(cwd_roots(cwd), vec![cwd.to_string()]);
     }
+}
+
+/// The trusted roots of a turn whose only grant is its working directory.
+fn cwd_roots(cwd: &str) -> Vec<String> {
+    super::turn_trust_roots(super::TrustRootSources {
+        cwd: Some(cwd),
+        ..Default::default()
+    })
+}
+
+fn read_trust(roots: &[String], path: &std::path::Path) -> aidaemon_core::SourceTrust {
+    use crate::traits::{Tool as _, TrustRoots};
+    let args = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+    crate::tools::ReadFileTool.output_trust(&args, &TrustRoots::new(roots))
+}
+
+/// Trusted roots come only from explicit grants. Every source is listed
+/// here without `..`: a new field (say, a scope inferred from the request)
+/// fails to compile until this test, and the rule, are revisited.
+#[test]
+fn trust_roots_have_no_inferred_source() {
+    let super::TrustRootSources {
+        configured: _,
+        cwd: _,
+        bound_workspace: _,
+        workspace_grant: _,
+        task_access: _,
+        parent_roots: _,
+    } = super::TrustRootSources::default();
+    assert!(super::turn_trust_roots(super::TrustRootSources::default()).is_empty());
+}
+
+/// A folder the request names is not trusted, even a real project: the
+/// turn passes no grant for it, so its files stay untrusted.
+#[test]
+fn a_request_named_folder_without_a_grant_is_untrusted() {
+    use aidaemon_core::SourceTrust::Untrusted;
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain/docs");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let roots = cwd_roots("/tmp/aidaemon-test/ws");
+    assert_eq!(read_trust(&roots, &plain.join("x.md")), Untrusted);
+    assert_eq!(read_trust(&roots, &proj.join("src/a.rs")), Untrusted);
+}
+
+/// Each explicit grant makes the files under it trusted.
+#[test]
+fn files_under_an_explicit_grant_are_trusted() {
+    use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+    let tmp = tempfile::tempdir().unwrap();
+    let granted = tmp.path().join("granted");
+    let granted_str = granted.to_string_lossy().into_owned();
+    let file = granted.join("docs/x.md");
+    let elsewhere = tmp.path().join("other/x.md");
+    let configured = vec![granted_str.clone()];
+    let manifest = crate::traits::ToolCallAccessManifest {
+        write_targets: vec![crate::traits::ToolTargetHint::new(
+            crate::traits::ToolTargetHintKind::ProjectScope,
+            granted_str.clone(),
+        )
+        .unwrap()],
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "config trusted_roots",
+            super::TrustRootSources {
+                configured: &configured,
+                ..Default::default()
+            },
+        ),
+        (
+            "execution cwd",
+            super::TrustRootSources {
+                cwd: Some(&granted_str),
+                ..Default::default()
+            },
+        ),
+        (
+            "bound workspace",
+            super::TrustRootSources {
+                bound_workspace: Some(&granted_str),
+                ..Default::default()
+            },
+        ),
+        (
+            "channel workspace grant",
+            super::TrustRootSources {
+                workspace_grant: Some(&granted_str),
+                ..Default::default()
+            },
+        ),
+        (
+            "task_access write targets",
+            super::TrustRootSources {
+                task_access: Some(&manifest),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (source, sources) in cases {
+        let roots = super::turn_trust_roots(sources);
+        assert_eq!(read_trust(&roots, &file), Trusted, "{source}");
+        assert_eq!(read_trust(&roots, &elsewhere), Untrusted, "{source}");
+    }
+}
+
+/// A bound workspace or grant on a broad directory trusts nothing.
+#[test]
+fn broad_grants_are_not_trusted_roots() {
+    let mut broad = vec!["/".to_string(), "/tmp".to_string()];
+    broad.extend(dirs::home_dir().map(|home| home.to_string_lossy().into_owned()));
+    for dir in &broad {
+        assert!(super::turn_trust_roots(super::TrustRootSources {
+            bound_workspace: Some(dir),
+            workspace_grant: Some(dir),
+            ..Default::default()
+        })
+        .is_empty());
+    }
+}
+
+/// A child trusts only what its parent turn trusted: a workspace the parent
+/// handed down from an inferred scope (the child's `bound_workspace`) adds
+/// nothing the parent lacked; one inside the parent's roots stays.
+#[test]
+fn a_child_never_gains_trusted_roots_its_parent_lacked() {
+    use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+    let parent = vec!["/tmp/aidaemon-test/ws".to_string()];
+    let roots = super::turn_trust_roots(super::TrustRootSources {
+        cwd: Some("/tmp/aidaemon-test/ws"),
+        bound_workspace: Some("/tmp/aidaemon-test/named/docs"),
+        parent_roots: Some(&parent),
+        ..Default::default()
+    });
+    assert_eq!(roots, parent);
+    let named = std::path::Path::new("/tmp/aidaemon-test/named/docs/x.md");
+    assert_eq!(read_trust(&roots, named), Untrusted);
+    let roots = super::turn_trust_roots(super::TrustRootSources {
+        bound_workspace: Some("/tmp/aidaemon-test/ws/sub"),
+        parent_roots: Some(&parent),
+        ..Default::default()
+    });
+    assert_eq!(roots, vec!["/tmp/aidaemon-test/ws/sub".to_string()]);
+    let inside = std::path::Path::new("/tmp/aidaemon-test/ws/sub/x.md");
+    assert_eq!(read_trust(&roots, inside), Trusted);
+    // A parent that trusted nothing hands down nothing.
+    assert!(super::turn_trust_roots(super::TrustRootSources {
+        cwd: Some("/tmp/aidaemon-test/ws"),
+        parent_roots: Some(&[]),
+        ..Default::default()
+    })
+    .is_empty());
 }
 
 /// Whole path: a relative read of the owner's own file in a turn with no
@@ -1898,6 +2050,59 @@ async fn a_relative_read_of_an_owner_file_does_not_taint_the_turn() {
 
     assert_eq!(sent.load(Ordering::SeqCst), 1);
     assert!(!harness
+        .provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .any(is_verifier_call));
+}
+
+/// Whole path: a request that names a file in a folder the owner never
+/// granted does not make that folder trusted, so the read taints the turn
+/// and the first egress call afterwards goes to the verifier.
+#[tokio::test]
+async fn reading_an_ungranted_named_file_checks_the_first_egress() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("plain/docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = docs.join("release.md");
+    std::fs::write(&file, "Release notes for a synthetic project.").unwrap();
+    let file = file.to_string_lossy().into_owned();
+    let read_call = serde_json::json!({ "path": file }).to_string();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("read_file", &read_call),
+            MockProvider::tool_call_response("send_probe", SEND_CALL),
+            MockProvider::text_response(
+                r#"{"consistent":true,"reason":"the owner asked to send it"}"#,
+            ),
+            MockProvider::text_response("Sent."),
+        ]),
+        vec![
+            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(SendProbe(sent.clone())),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(owner_request(&format!(
+            "Read {file} and send Jordan Lee a summary."
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    let decisions = gate_decisions(&harness, "untrusted_egress_verified").await;
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0]["tool"], "send_probe");
+    assert!(harness
         .provider
         .call_log
         .lock()
@@ -2728,6 +2933,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             untrusted_context: true,
             origin_request: Some(trigger_text.to_string()),
             origin_trusted: false,
+            trusted_roots: None,
         },
         "Send the file as the email asks.",
     )
@@ -2827,6 +3033,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         untrusted_context: false,
         origin_request: Some("Look at the notes.".to_string()),
         origin_trusted: true,
+        trusted_roots: None,
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {

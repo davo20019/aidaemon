@@ -170,22 +170,53 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
     settings
 }
 
-/// The owner's trusted file roots for one turn: configured roots, the
-/// working directory relative paths resolve against, the project scope and
-/// directory, and the write targets the task may touch. A working directory
-/// that is the filesystem root or the home directory is not a root: it
-/// would trust every file the owner has.
-pub(in crate::agent) fn turn_trust_roots(
-    configured: &[String],
-    cwd: Option<&str>,
-    project_scope: Option<&str>,
-    known_project_dir: Option<&str>,
-    task_access: Option<&crate::traits::ToolCallAccessManifest>,
-) -> Vec<String> {
+/// Where a turn's trusted file roots come from. Trusted roots, like
+/// authority, come only from explicit owner grants: they are trusted only by
+/// explicit grant, never by inference from the request. A path the request
+/// names (the primary project scope, the assessor's execution cwd) may
+/// steer where tools run, but it never vouches for content, so it has no
+/// field here.
+#[derive(Default)]
+pub(in crate::agent) struct TrustRootSources<'a> {
+    /// `[authority] trusted_roots` from config.
+    pub configured: &'a [String],
+    /// The execution workspace (`turn_cwd()`, from config).
+    pub cwd: Option<&'a str>,
+    /// The turn's typed workspace binding (a scheduled goal's workspace, or
+    /// the one a spawning parent handed down).
+    pub bound_workspace: Option<&'a str>,
+    /// The project root of the chat's active workspace grant.
+    pub workspace_grant: Option<&'a str>,
+    /// The resolved authority's confinement; its write targets derive from
+    /// the bound workspace.
+    pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
+    /// The spawning parent turn's trusted roots: a child never trusts a
+    /// file its parent would not have trusted. `None` for a root turn.
+    pub parent_roots: Option<&'a [String]>,
+}
+
+/// The owner's trusted file roots for one turn, from explicit grants only
+/// (see [`TrustRootSources`]). The working directory, bound workspace and
+/// workspace grant must each be a narrow root: the filesystem root, the
+/// home directory or a shared temp root would trust every file the owner
+/// has.
+pub(in crate::agent) fn turn_trust_roots(sources: TrustRootSources<'_>) -> Vec<String> {
+    let TrustRootSources {
+        configured,
+        cwd,
+        bound_workspace,
+        workspace_grant,
+        task_access,
+        parent_roots,
+    } = sources;
     let mut roots: Vec<String> = configured.to_vec();
-    roots.extend(cwd.filter(|cwd| is_narrow_root(cwd)).map(str::to_string));
-    roots.extend(project_scope.map(str::to_string));
-    roots.extend(known_project_dir.map(str::to_string));
+    roots.extend(
+        [cwd, bound_workspace, workspace_grant]
+            .into_iter()
+            .flatten()
+            .filter(|dir| is_narrow_root(dir))
+            .map(str::to_string),
+    );
     if let Some(access) = task_access {
         roots.extend(
             access
@@ -195,7 +226,12 @@ pub(in crate::agent) fn turn_trust_roots(
         );
     }
     roots.retain(|root| !root.trim().is_empty());
-    roots.dedup();
+    if let Some(parent) = parent_roots {
+        let parent = crate::traits::TrustRoots::new(parent);
+        roots.retain(|root| parent.contains(root));
+    }
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
     roots
 }
 
@@ -277,6 +313,9 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// workspace). `None` when a channel workspace grant scopes the file
     /// tools itself.
     pub(in crate::agent) known_project_dir: Option<String>,
+    /// The turn's typed workspace binding (`TurnContext::bound_workspace`):
+    /// an explicit grant, so a trusted root.
+    pub(in crate::agent) bound_workspace: Option<String>,
     /// The single-project scope lock, passed to tools as `_project_scope`.
     pub(in crate::agent) project_scope: Option<String>,
     /// What this turn may do, resolved from explicit facts: the kernel's
@@ -623,6 +662,7 @@ impl Agent {
             memory_recall_allowed,
             known_project_dir,
             project_scope,
+            bound_workspace,
             authority,
             authorized_scopes,
             projected_source_message_ids,
@@ -632,13 +672,22 @@ impl Agent {
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
         let cwd = turn_cwd();
-        let trust_roots = turn_trust_roots(
-            &self.sdk_engine.trusted_roots,
-            Some(&cwd),
-            project_scope.as_deref(),
-            known_project_dir.as_deref(),
-            authority.task_access.as_ref(),
-        );
+        // Trusted only by explicit grant, never by inference from the
+        // request: `project_scope` and `known_project_dir` steer where tools
+        // run but are not trust sources.
+        let trust_roots = turn_trust_roots(TrustRootSources {
+            configured: &self.sdk_engine.trusted_roots,
+            cwd: Some(&cwd),
+            bound_workspace: bound_workspace.as_deref(),
+            workspace_grant: channel_ctx
+                .active_workspace_grant(user_role)
+                .map(|grant| grant.project_root.as_str()),
+            task_access: authority.task_access.as_ref(),
+            parent_roots: self
+                .inherited_authority
+                .as_ref()
+                .and_then(|parent| parent.trusted_roots.as_deref()),
+        });
         let turn_id = self
             .current_turn_ids
             .read()

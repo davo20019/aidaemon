@@ -177,6 +177,11 @@ pub(crate) struct InheritedAuthority {
     /// The root request was owner-authored; a child of an untrusted-origin
     /// turn is never trusted (it only ever stays or turns false).
     pub origin_trusted: bool,
+    /// The parent turn's trusted file roots: the child trusts only files
+    /// under them (`None`: no parent constraint, the child's own explicit
+    /// grants decide).
+    #[serde(default)]
+    pub trusted_roots: Option<Vec<String>>,
 }
 
 /// The most of the root request a child inherits (and the verifier is
@@ -606,6 +611,7 @@ mod tests {
             untrusted_context: false,
             origin_request: Some("Summarize the synthetic notes.".to_string()),
             origin_trusted: true,
+            trusted_roots: None,
         }
     }
 
@@ -711,6 +717,7 @@ mod tests {
             untrusted_context: true,
             origin_request: Some("Post this for me.".to_string()),
             origin_trusted: false,
+            trusted_roots: None,
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,
