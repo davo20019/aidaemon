@@ -1411,9 +1411,15 @@ impl HttpRequestTool {
         }
     }
 
-    /// The URL as outbound data: everything but its host and port.
-    fn url_without_host_port(url: &reqwest::Url) -> String {
+    /// The URL as outbound data: everything but its port. The host stays
+    /// (a secret can leave in a DNS label); dropping the port keeps an
+    /// `IP:port` destination from reading as a leaked endpoint.
+    fn url_scan_text(url: &reqwest::Url) -> String {
         let mut scanned = String::new();
+        if let Some(host) = url.host_str() {
+            scanned.push_str(host);
+            scanned.push(' ');
+        }
         if !url.username().is_empty() {
             scanned.push_str(url.username());
             if let Some(password) = url.password() {
@@ -1652,13 +1658,13 @@ impl HttpRequestTool {
             .map(|s| s.to_string())
             .or_else(|| body.map(|b| Self::detect_content_type(b).to_string()));
 
-        // Step 7: Scan for secrets in outbound data. The URL's host and port
-        // are where the request goes, not data it carries (an IP:port would
-        // otherwise read as a leaked endpoint); its userinfo, path, query and
-        // fragment can carry leaked tokens, so they are scanned.
+        // Step 7: Scan for secrets in outbound data. The URL is scanned
+        // without its port (an IP:port destination would otherwise read as a
+        // leaked endpoint); its host labels, userinfo, path, query and
+        // fragment can all carry leaked tokens.
         let check_parts = format!(
             "{} {} {}",
-            Self::url_without_host_port(&parsed_url),
+            Self::url_scan_text(&parsed_url),
             body.unwrap_or(""),
             custom_headers
                 .map(|h| serde_json::to_string(h).unwrap_or_default())
@@ -4235,6 +4241,19 @@ mod tests {
             serde_json::from_str::<Value>(&text).is_ok(),
             "raw body must be valid JSON"
         );
+    }
+
+    /// A secret in a host label is outbound data (DNS-label exfiltration);
+    /// the URL's own IP and port are not.
+    #[test]
+    fn the_secret_scan_covers_host_labels_but_not_ip_ports() {
+        let secret_host = reqwest::Url::parse(
+            "https://sk-synthetic0123456789abcdefghijKLMNOP.attacker.example/collect",
+        )
+        .unwrap();
+        assert!(sanitize_output(&HttpRequestTool::url_scan_text(&secret_host)).1);
+        let local = reqwest::Url::parse("http://127.0.0.1:8765/announce").unwrap();
+        assert!(!sanitize_output(&HttpRequestTool::url_scan_text(&local)).1);
     }
 
     fn local_tool() -> HttpRequestTool {
