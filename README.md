@@ -175,9 +175,18 @@ read the content is still in its context.
 [authority]
 owner_default = "full"   # full | unrestricted
 # Your own folders: reading files here does not count as untrusted content.
-# The working directory and the current project are always included.
-trusted_roots = ["/absolute/path/to/your/projects"]
+trusted_roots = ["~/projects"]
 ```
+
+Your own folders are only the ones you name in configuration or bind on
+purpose: `[authority] trusted_roots`, the `[path_aliases] projects` roots,
+the daemon's working directory, and a scheduled goal's workspace set with
+`bind_workspace`. A folder named only in a message or a goal's mission (for
+example "summarize ~/Downloads/invoice.pdf") is not trusted: reading it
+counts as untrusted content, so the next outward action is checked. The
+broadest folders never count, even when configured: `/`, your home folder
+and its parents, and the shared temp folders. A symlink counts as the folder
+it points to.
 
 With `owner_default = "full"` (the default) the check above applies to your
 own turns too. `unrestricted` skips the check on the owner's turns and only
