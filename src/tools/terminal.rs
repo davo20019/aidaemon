@@ -7694,33 +7694,43 @@ impl Tool for TerminalTool {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::SourceTrust::Untrusted;
         };
-        // Relative read paths resolve against the run's own directory.
-        let base = args
-            .working_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|dir| std::path::Path::new(dir).is_absolute());
-        let roots = roots.anchored_at(base);
-        let reads_outside_roots = args
-            .read_paths
-            .iter()
-            .chain(args.read_roots.iter())
-            .any(|path| !roots.contains(path));
-        // Host confinement alone does not taint: the owner's own workspace
-        // output is trusted unless the run reaches the network or reads
-        // outside the trusted roots.
         let text = args
             .command
             .as_deref()
             .or(args.script.as_deref())
             .unwrap_or("");
-        if args.network
-            || reads_outside_roots
-            || crate::tools::command_effects::fetches_network(text)
-        {
-            aidaemon_core::SourceTrust::Untrusted
+        if args.network || crate::tools::command_effects::fetches_network(text) {
+            return aidaemon_core::SourceTrust::Untrusted;
+        }
+        // The run's own absolute directory, else the turn's cwd (where a
+        // run without one executes).
+        let working_dir = args
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| std::path::Path::new(dir).is_absolute())
+            .or(roots.cwd());
+        let roots = roots.anchored_at(working_dir);
+        let trusted = if run_is_confined(self.confinement) {
+            // The sandbox enforces the declared read set, so it decides.
+            args.read_paths
+                .iter()
+                .chain(args.read_roots.iter())
+                .all(|path| roots.contains(path))
         } else {
+            // On the host nothing enforces declared reads: trust comes from
+            // the command's structure. An observation or ordinary local work,
+            // run inside the roots, on operands that all resolve inside them.
+            let effects = crate::tools::command_effects::command_effects(text);
+            (effects.observation_only || effects.local_work_only)
+                && working_dir.is_some_and(|dir| roots.contains(dir))
+                && crate::tools::command_effects::path_operands(text)
+                    .is_some_and(|operands| operands.iter().all(|path| roots.contains(path)))
+        };
+        if trusted {
             aidaemon_core::SourceTrust::Trusted
+        } else {
+            aidaemon_core::SourceTrust::Untrusted
         }
     }
 
@@ -9521,7 +9531,14 @@ mod tests {
         .await;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
         let roots = crate::traits::TrustRoots::new(&roots_list);
-        let run = |command: &str| serde_json::json!({"action":"run","command":command}).to_string();
+        let run = |command: &str| {
+            serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string()
+        };
         assert_eq!(
             host.output_trust(&run("mkdir -p x && echo ok > x/f"), &roots),
             SourceTrust::Trusted
@@ -9529,10 +9546,75 @@ mod tests {
         let status = run("git status");
         assert_eq!(host.output_trust(&status, &roots), SourceTrust::Trusted);
         assert!(host.call_annotations(&status).read_only);
-        let outside =
-            serde_json::json!({"action":"run","command":"cat f","read_paths":["/etc/hosts"]})
-                .to_string();
-        assert_eq!(host.output_trust(&outside, &roots), SourceTrust::Untrusted);
+        assert_eq!(
+            host.output_trust(&run("cat /etc/hosts"), &roots),
+            SourceTrust::Untrusted
+        );
+    }
+
+    /// On the host nothing enforces declared read paths, so trust comes
+    /// from the command's structure: an observation or local work, no
+    /// network, run inside the roots on operands inside the roots.
+    #[tokio::test]
+    async fn host_terminal_trust_comes_from_the_command_structure() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let project = "/tmp/aidaemon-test/project";
+        let roots_list = vec![project.to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let run = |command: &str, working_dir: &str| {
+            serde_json::json!({"action":"run","command":command,"working_dir":working_dir})
+                .to_string()
+        };
+        let outside = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        for (command, working_dir, expected) in [
+            ("cat ~/Downloads/x", project, Untrusted),
+            ("cat src/lib.rs", project, Trusted),
+            (&*format!("rg foo {outside}"), project, Untrusted),
+            ("cargo test", project, Trusted),
+            ("curl https://example.invalid/x", project, Untrusted),
+            ("cat src/lib.rs", "/tmp/aidaemon-test/elsewhere", Untrusted),
+            ("cat ../other/x", project, Untrusted),
+            ("cat src/*.rs", project, Untrusted),
+            ("cd /etc && cat hosts", project, Untrusted),
+            ("cat $HOME/x", project, Untrusted),
+            ("python3 -c 'print(1)'", project, Untrusted),
+        ] {
+            assert_eq!(
+                host.output_trust(&run(command, working_dir), &roots),
+                expected,
+                "{command} in {working_dir}"
+            );
+        }
+        // Declared read paths do not vouch for a host run.
+        let declared = serde_json::json!({
+            "action": "run",
+            "command": "cat /etc/hosts",
+            "working_dir": project,
+            "read_paths": [format!("{project}/f")],
+        })
+        .to_string();
+        assert_eq!(host.output_trust(&declared, &roots), Untrusted);
+        // Without its own directory the run is judged at the turn's cwd.
+        let bare = serde_json::json!({"action":"run","command":"cat src/lib.rs"}).to_string();
+        assert_eq!(
+            host.output_trust(&bare, &roots.anchored_at(Some(project))),
+            Trusted
+        );
+        assert_eq!(host.output_trust(&bare, &roots), Untrusted);
     }
 
     #[tokio::test]

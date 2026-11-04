@@ -472,6 +472,59 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
+/// Every operand a command could read as a path, as written: each
+/// non-option argument of every reachable command (patterns included; they
+/// are judged as paths, which only over-reports), and the value of a
+/// `--option=value`. `None` when any cannot be determined structurally: shell
+/// expansion (variables, substitutions, globs, braces, `~` other than a
+/// leading `~/`), ANSI-C quoting, an option with a path glued to it
+/// (`-I/x`), or a command that changes directory (`cd`, `pushd`, `popd`),
+/// since relative operands then resolve somewhere else.
+pub(crate) fn path_operands(command: &str) -> Option<Vec<String>> {
+    if command.contains("$'") {
+        return None;
+    }
+    let unreadable = |operand: &str| {
+        let rest = operand
+            .strip_prefix("~/")
+            .or_else(|| (operand == "~").then_some(""))
+            .unwrap_or(operand);
+        rest.contains(['$', '`', '\\', '{', '}', '*', '?', '[', '~'])
+    };
+    let commands = expanded_commands(command);
+    let mut operands: Vec<String> = Vec::new();
+    for tokens in &commands {
+        if matches!(basename(&tokens[0]), "cd" | "pushd" | "popd") {
+            return None;
+        }
+        let mut options_done = false;
+        for arg in &tokens[1..] {
+            let operand = if options_done || !arg.starts_with('-') {
+                arg.as_str()
+            } else if arg == "--" {
+                options_done = true;
+                continue;
+            } else if let Some((_, value)) = arg.split_once('=') {
+                value
+            } else if arg.contains(['/', '~']) {
+                return None;
+            } else {
+                continue;
+            };
+            if operand.is_empty() {
+                continue;
+            }
+            if unreadable(operand) {
+                return None;
+            }
+            if !operands.iter().any(|known| known == operand) {
+                operands.push(operand.to_string());
+            }
+        }
+    }
+    Some(operands)
+}
+
 fn is_local_work_only(command: &str) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return false;
