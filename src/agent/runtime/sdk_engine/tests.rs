@@ -3285,36 +3285,50 @@ async fn a_goal_bound_workspace_is_trusted() {
         .any(is_verifier_call));
 }
 
-/// `[path_aliases] projects` is owner config, so its roots are trusted.
+/// A path alias is a naming convenience, not a grant: with no
+/// `trusted_roots` entry, a file under `[path_aliases] projects` is
+/// untrusted, also for a goal-dispatched child.
 #[tokio::test]
-async fn configured_project_aliases_are_trusted_roots() {
+async fn path_aliases_are_not_trusted_roots() {
+    use aidaemon_core::SourceTrust::Untrusted;
     let mut harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
         .await
         .unwrap();
-    harness.agent.sdk_engine = Arc::new(super::SdkEngineSettings {
-        trusted_roots: vec!["/tmp/aidaemon-test/trusted".to_string()],
-        ..Default::default()
-    });
     harness.agent.path_aliases.projects = vec!["/tmp/aidaemon-test/projects".to_string()];
     let configured = harness.agent.configured_trust_roots();
     let roots = super::turn_trust_roots(super::TrustRootSources {
         configured: &configured,
         ..Default::default()
     });
-    assert_eq!(
-        roots,
-        vec![
-            "/tmp/aidaemon-test/trusted".to_string(),
-            "/tmp/aidaemon-test/projects".to_string()
-        ]
-    );
-    // A goal-dispatched child starts from the same configuration.
+    let file = std::path::Path::new("/tmp/aidaemon-test/projects/cloned/README.md");
+    assert_eq!(read_trust(&roots, file), Untrusted);
     let dispatched = harness
         .agent
         .authority_for_child(UserRole::Owner, &ChannelContext::private("telegram"), None)
         .await;
-    assert!(dispatched
-        .trusted_roots
-        .contains(&"/tmp/aidaemon-test/projects".to_string()));
-    assert!(dispatched.trusted_roots.contains(&super::turn_cwd()));
+    assert_eq!(read_trust(&dispatched.trusted_roots, file), Untrusted);
+}
+
+/// A root that is a symlink to a broad directory is judged by where it
+/// points: a link to the shared temp directory adds nothing.
+#[cfg(unix)]
+#[test]
+fn a_symlink_root_to_a_broad_directory_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("everything");
+    std::os::unix::fs::symlink(std::env::temp_dir(), &link).unwrap();
+    let link = link.to_string_lossy().into_owned();
+    let configured = vec![link.clone()];
+    for sources in [
+        super::TrustRootSources {
+            configured: &configured,
+            ..Default::default()
+        },
+        super::TrustRootSources {
+            bound_workspace: Some(&link),
+            ..Default::default()
+        },
+    ] {
+        assert!(super::turn_trust_roots(sources).is_empty());
+    }
 }

@@ -167,6 +167,7 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         trusted_roots: config.authority.trusted_roots.clone(),
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
+    log_configured_trust_roots(&settings.trusted_roots);
     settings
 }
 
@@ -178,8 +179,8 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
 /// never vouches for content: callers pass only explicit values here.
 #[derive(Default)]
 pub(in crate::agent) struct TrustRootSources<'a> {
-    /// Owner configuration: `[authority] trusted_roots` and
-    /// `[path_aliases] projects` (`Agent::configured_trust_roots`).
+    /// Owner configuration: `[authority] trusted_roots`
+    /// (`Agent::configured_trust_roots`). Path aliases are not grants.
     pub configured: &'a [String],
     /// The execution workspace (`turn_cwd()`, from config).
     pub cwd: Option<&'a str>,
@@ -225,7 +226,7 @@ pub(in crate::agent) fn turn_trust_roots(sources: TrustRootSources<'_>) -> Vec<S
         )
         .chain(write_targets)
         .map(|root| shellexpand::tilde(root.trim()).into_owned())
-        .filter(|root| is_narrow_root(root))
+        .filter(|root| is_narrow_root_resolved(root))
         .collect();
     if let Some(parent) = parent_roots {
         let within = crate::traits::TrustRoots::new(parent);
@@ -238,16 +239,38 @@ pub(in crate::agent) fn turn_trust_roots(sources: TrustRootSources<'_>) -> Vec<S
 }
 
 impl Agent {
-    /// The trusted roots the owner configured: `[authority] trusted_roots`
-    /// and the `[path_aliases] projects` roots, both owner-written config.
+    /// The trusted roots the owner configured: `[authority] trusted_roots`.
+    /// `[path_aliases] projects` is a naming convenience, not a grant.
     pub(in crate::agent) fn configured_trust_roots(&self) -> Vec<String> {
-        self.sdk_engine
-            .trusted_roots
-            .iter()
-            .chain(self.path_aliases.projects.iter())
-            .cloned()
-            .collect()
+        self.sdk_engine.trusted_roots.clone()
     }
+}
+
+/// Log, once at startup, the trusted roots the owner configured plus the
+/// execution workspace, and which of them are dropped as too broad.
+fn log_configured_trust_roots(configured: &[String]) {
+    let workspace = turn_cwd();
+    let (kept, dropped): (Vec<String>, Vec<String>) = configured
+        .iter()
+        .map(|root| shellexpand::tilde(root.trim()).into_owned())
+        .chain(std::iter::once(workspace))
+        .partition(|root| is_narrow_root_resolved(root));
+    info!(
+        trusted_roots = ?kept,
+        dropped_as_too_broad = ?dropped,
+        "Trusted roots: [authority] trusted_roots and the execution workspace \
+         (a goal's bind_workspace and a channel workspace grant add to these per turn)"
+    );
+}
+
+/// `is_narrow_root` for both the root as written and, when it exists, the
+/// directory it resolves to: a link to the home directory or `/` is as
+/// broad as its target.
+fn is_narrow_root_resolved(root: &str) -> bool {
+    is_narrow_root(root)
+        && std::fs::canonicalize(root)
+            .map(|resolved| is_narrow_root(&resolved.to_string_lossy()))
+            .unwrap_or(true)
 }
 
 /// A directory that holds only the owner's work: not the filesystem root,

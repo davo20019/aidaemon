@@ -178,15 +178,18 @@ owner_default = "full"   # full | unrestricted
 trusted_roots = ["~/projects"]
 ```
 
-Your own folders are only the ones you name in configuration or bind on
-purpose: `[authority] trusted_roots`, the `[path_aliases] projects` roots,
-the daemon's working directory, and a scheduled goal's workspace set with
-`bind_workspace`. A folder named only in a message or a goal's mission (for
-example "summarize ~/Downloads/invoice.pdf") is not trusted: reading it
-counts as untrusted content, so the next outward action is checked. The
-broadest folders never count, even when configured: `/`, your home folder
-and its parents, and the shared temp folders. A symlink counts as the folder
-it points to.
+Your own folders are only the ones you grant on purpose: `[authority]
+trusted_roots`, the daemon's working directory, a scheduled goal's workspace
+set with `bind_workspace`, and a group chat's workspace grant. Path aliases
+(`[path_aliases] projects`) only help aidaemon find projects by name; they do
+not grant trust, so add a folder to `trusted_roots` if you want it trusted.
+A folder named only in a message or a goal's mission (for example "summarize
+~/Downloads/invoice.pdf") is not trusted: reading it counts as untrusted
+content, so the next outward action is checked. The broadest folders never
+count, even when configured or reached through a symlink: `/`, your home
+folder and its parents, and the shared temp folders. A symlink counts as the
+folder it points to. At startup the daemon logs the trusted roots it uses
+and any it dropped as too broad.
 
 With `owner_default = "full"` (the default) the check above applies to your
 own turns too. `unrestricted` skips the check on the owner's turns and only
