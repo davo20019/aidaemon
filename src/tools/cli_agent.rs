@@ -666,6 +666,8 @@ async fn list_backend_files(
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
+/// Any auto-approve flags listed here are stripped at launch
+/// (`strip_permission_bypass_flags`), so descriptions must not promise that mode.
 fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>
 {
     vec![
@@ -679,7 +681,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "stream-json",
                 "--verbose",
             ],
-            "Claude Code — Anthropic's AI coding agent (auto-approve mode)",
+            "Claude Code — Anthropic's AI coding agent",
         ),
         (
             "gemini",
@@ -690,7 +692,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "--output-format",
                 "stream-json",
             ],
-            "Gemini CLI — Google's AI coding agent (auto-approve mode)",
+            "Gemini CLI — Google's AI coding agent",
         ),
         (
             "codex",
@@ -700,13 +702,13 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
             ],
-            "Codex CLI — OpenAI's AI coding agent (auto-approve mode)",
+            "Codex CLI — OpenAI's AI coding agent",
         ),
         (
             "copilot",
             "copilot",
             vec!["-p", "--allow-all-tools", "--allow-all-paths"],
-            "GitHub Copilot CLI (auto-approve mode)",
+            "GitHub Copilot CLI",
         ),
         (
             "aider",
@@ -4700,6 +4702,18 @@ impl CliAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bypass flags in the defaults are stripped at launch, so the
+    /// model-facing descriptions must not promise an auto-approve mode.
+    #[test]
+    fn default_descriptions_do_not_claim_auto_approve() {
+        for (name, _, _, description) in default_tool_definitions() {
+            assert!(
+                !description.to_ascii_lowercase().contains("auto-approve"),
+                "{name}: {description}"
+            );
+        }
+    }
     use crate::config::CliAgentsConfig;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
