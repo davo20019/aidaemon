@@ -417,3 +417,31 @@ async fn background_phrase_in_output_does_not_end_the_run() {
     assert_eq!(reply, "The log says a job moved to the background earlier.");
     assert_eq!(harness.provider.call_count().await, 2);
 }
+
+/// A handoff stands even when the handed-off work's description reads like a
+/// failure (a sub-agent sent to fix an error): the work is running.
+#[tokio::test]
+async fn handoff_whose_output_reads_like_a_failure_still_ends_the_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_delegate", "{}"),
+        MockProvider::text_response("UNREACHED model narration"),
+    ]);
+    let delegate = MockTool::new(
+        "synthetic_delegate",
+        "Hands a fix to a helper",
+        "Error: build failed. A helper is fixing it and will report when done.",
+    )
+    .with_metadata(ToolCallMetadata {
+        background_handoff: true,
+        ..ToolCallMetadata::default()
+    })
+    .with_finish(handoff());
+    let harness = root(provider, vec![Arc::new(delegate)]).await;
+    let reply = ask(&harness, "finish-delegate-error", "Fix the synthetic build").await;
+
+    assert_eq!(
+        reply,
+        "Error: build failed. A helper is fixing it and will report when done."
+    );
+    assert_eq!(harness.provider.call_count().await, 1);
+}

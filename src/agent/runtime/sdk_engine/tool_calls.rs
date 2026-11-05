@@ -899,10 +899,12 @@ impl Agent {
                 // model reports it. Work a tool handed to the background ends
                 // the run on the tool's finish, unless the assessed task
                 // shape keeps independent inline work going.
+                let mut handed_off = false;
                 if outcome.metadata.background_started || outcome.metadata.background_handoff {
                     let hands_off = finish.is_some()
                         && !scope.continue_inline_after_background
                         && !outcome.metadata.detached;
+                    handed_off = hands_off;
                     let directive = if hands_off {
                         // With notifications on, the result follows by
                         // itself: a plain handoff, no pid or tool jargon.
@@ -932,22 +934,26 @@ impl Agent {
                 }
                 let satisfied = !status.is_failure();
                 // The tool's own typed finish ends the run once the batch
-                // completes. One without a reply ships the call's output, the
-                // untrusted-data wrapper removed so reply sanitization does not
-                // empty it.
-                let finish = finish.filter(|_| satisfied).map(|mut finish| {
-                    if finish
-                        .reply
-                        .as_deref()
-                        .is_none_or(|reply| reply.trim().is_empty())
-                    {
-                        finish.reply = Some(
-                            crate::agent::completion_checks::strip_untrusted_wrapper(&output)
-                                .to_string(),
-                        );
-                    }
-                    finish
-                });
+                // completes; a failed call's finish is dropped, except a
+                // handoff, whose work is running whatever its output reads
+                // like (as before, a detach was never judged by status). One
+                // without a reply ships the call's output, the untrusted-data
+                // wrapper removed so reply sanitization does not empty it.
+                let finish = finish
+                    .filter(|_| satisfied || handed_off)
+                    .map(|mut finish| {
+                        if finish
+                            .reply
+                            .as_deref()
+                            .is_none_or(|reply| reply.trim().is_empty())
+                        {
+                            finish.reply = Some(
+                                crate::agent::completion_checks::strip_untrusted_wrapper(&output)
+                                    .to_string(),
+                            );
+                        }
+                        finish
+                    });
                 (
                     output,
                     images,
@@ -1212,7 +1218,7 @@ impl Agent {
         }
         .with_trust(trust);
         match finish {
-            Some(finish) if !failed => output.finish(finish),
+            Some(finish) => output.finish(finish),
             _ => output,
         }
     }
