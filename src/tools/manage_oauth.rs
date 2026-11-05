@@ -11,10 +11,10 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
-    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
-    ToolTargetHintKind,
+    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
+    ToolTargetHint, ToolTargetHintKind,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -38,8 +38,9 @@ struct ManageOAuthArgs {
     scopes: Option<Vec<String>>,
     allowed_domains: Option<Vec<String>>,
     confirm_disconnect: Option<bool>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 pub struct ManageOAuthTool {
@@ -889,10 +890,10 @@ impl ManageOAuthTool {
                 anyhow::anyhow!("'register_provider' requires 'allowed_domains'")
             })?)?;
         let scopes = Self::normalize_scopes(args.scopes.as_deref().unwrap_or(&[]));
-        let session_id = if args._session_id.is_empty() {
+        let session_id = if args.call_session.is_empty() {
             "unknown"
         } else {
-            args._session_id.as_str()
+            args.call_session.as_str()
         };
         let approval_description = format!(
             "Register custom OAuth provider '{}' (authorize={}, token={})",
@@ -1174,7 +1175,70 @@ impl Tool for ManageOAuthTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        self.run(arguments, status_tx, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        if args.action == "list" {
+            let (output, members) = self.handle_list_snapshot().await?;
+            let observations = members
+                .iter()
+                .cloned()
+                .map(|subject| {
+                    ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
+                })
+                .collect();
+            return Ok(ToolCallOutcome {
+                output,
+                metadata: ToolCallMetadata {
+                    observations,
+                    collection_observations: vec![ToolCollectionObservation::complete(
+                        Self::connection_collection_hint(),
+                        &[ToolSemanticFacet::Authorization],
+                        members,
+                    )],
+                    ..ToolCallMetadata::default()
+                },
+            });
+        }
+        let output = self.run(arguments, status_tx, &facts).await?;
+        let mut outcome = ToolCallOutcome::from_output(output.clone());
+        if args.action == "connect" {
+            outcome.metadata = ToolCallMetadata {
+                direct_response: Some(output),
+                ..ToolCallMetadata::default()
+            };
+        }
+        Ok(outcome)
+    }
+}
+
+impl ManageOAuthTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
         match args.action.as_str() {
             "providers" => self.handle_providers().await,
             "describe_provider" => {
@@ -1192,10 +1256,10 @@ impl Tool for ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
                 )?;
-                let session_id = if args._session_id.is_empty() {
+                let session_id = if args.call_session.is_empty() {
                     "unknown"
                 } else {
-                    args._session_id.as_str()
+                    args.call_session.as_str()
                 };
                 self.handle_bind_account(
                     &service,
@@ -1218,10 +1282,10 @@ impl Tool for ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'connect' requires 'service' parameter"))?,
                 )?;
-                let session_id = if args._session_id.is_empty() {
+                let session_id = if args.call_session.is_empty() {
                     "unknown"
                 } else {
-                    args._session_id.as_str()
+                    args.call_session.as_str()
                 };
                 self.handle_connect(&service, session_id, status_tx).await
             }
@@ -1231,10 +1295,10 @@ impl Tool for ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
                 )?;
-                let session_id = if args._session_id.is_empty() {
+                let session_id = if args.call_session.is_empty() {
                     "unknown"
                 } else {
-                    args._session_id.as_str()
+                    args.call_session.as_str()
                 };
                 self.handle_remove(
                     &service,
@@ -1257,10 +1321,10 @@ impl Tool for ManageOAuthTool {
                         anyhow::anyhow!("'remove_provider' requires 'service' parameter")
                     })?,
                 )?;
-                let session_id = if args._session_id.is_empty() {
+                let session_id = if args.call_session.is_empty() {
                     "unknown"
                 } else {
-                    args._session_id.as_str()
+                    args.call_session.as_str()
                 };
                 self.handle_remove_provider(&service, session_id).await
             }
@@ -1293,45 +1357,6 @@ impl Tool for ManageOAuthTool {
                 other
             )),
         }
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
-        if args.action == "list" {
-            let (output, members) = self.handle_list_snapshot().await?;
-            let observations = members
-                .iter()
-                .cloned()
-                .map(|subject| {
-                    ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
-                })
-                .collect();
-            return Ok(ToolCallOutcome {
-                output,
-                metadata: ToolCallMetadata {
-                    observations,
-                    collection_observations: vec![ToolCollectionObservation::complete(
-                        Self::connection_collection_hint(),
-                        &[ToolSemanticFacet::Authorization],
-                        members,
-                    )],
-                    ..ToolCallMetadata::default()
-                },
-            });
-        }
-        let output = self.call_with_status(arguments, status_tx).await?;
-        let mut outcome = ToolCallOutcome::from_output(output.clone());
-        if args.action == "connect" {
-            outcome.metadata = ToolCallMetadata {
-                direct_response: Some(output),
-                ..ToolCallMetadata::default()
-            };
-        }
-        Ok(outcome)
     }
 }
 
@@ -1643,8 +1668,7 @@ mod tests {
                     "authorize_url": "https://linear.app/oauth/authorize",
                     "token_url": "https://api.linear.app/oauth/token",
                     "scopes": ["read", "write"],
-                    "allowed_domains": ["api.linear.app"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.linear.app"]
                 }"#,
             )
             .await
@@ -1679,8 +1703,7 @@ mod tests {
                     "auth_type": "oauth2_client_credentials",
                     "token_url": "https://auth.example.com/oauth/token",
                     "scopes": ["read"],
-                    "allowed_domains": ["api.example.com"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.example.com"]
                 }"#,
             )
             .await
@@ -1742,7 +1765,7 @@ allowed_domains = ["api.linear.app"]
             .await;
 
         let result = tool
-            .call(r#"{"action":"remove_provider","service":"linear","_session_id":"test"}"#)
+            .call(r#"{"action":"remove_provider","service":"linear"}"#)
             .await
             .unwrap();
 
@@ -1844,9 +1867,10 @@ allowed_domains = ["api.linear.app"]
         let tool_task = {
             let tool = tool.clone();
             tokio::spawn(async move {
-                tool.call_with_status_outcome(
-                    r#"{"action":"connect","service":"linear","_session_id":"telegram:123"}"#,
+                tool.call_with_execution_context(
+                    r#"{"action":"connect","service":"linear"}"#,
                     Some(status_tx),
+                    crate::testing::call_facts("telegram:123"),
                 )
                 .await
             })
@@ -1971,7 +1995,6 @@ allowed_domains = ["api.linear.app"]
                     "account_id": "2018008573557551105",
                     "identity_url": identity_url,
                     "account_id_pointer": "/data/id",
-                    "_session_id": "test",
                 })
                 .to_string(),
             )
@@ -1997,7 +2020,6 @@ allowed_domains = ["api.linear.app"]
                     "account_id": "different-account",
                     "identity_url": identity_url,
                     "account_id_pointer": "/data/id",
-                    "_session_id": "test",
                 })
                 .to_string(),
             )
@@ -2038,7 +2060,7 @@ allowed_domains = ["api.linear.app"]
             .unwrap();
 
         let result = tool
-            .call(r#"{"action":"remove","service":"twitter","_session_id":"test"}"#)
+            .call(r#"{"action":"remove","service":"twitter"}"#)
             .await
             .unwrap();
 
@@ -2074,9 +2096,7 @@ allowed_domains = ["api.linear.app"]
             .unwrap();
 
         let result = tool
-            .call(
-                r#"{"action":"remove","service":"twitter","confirm_disconnect":true,"_session_id":"test"}"#,
-            )
+            .call(r#"{"action":"remove","service":"twitter","confirm_disconnect":true}"#)
             .await
             .unwrap();
 

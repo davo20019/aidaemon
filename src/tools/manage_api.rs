@@ -54,8 +54,9 @@ struct ManageApiArgs {
     verify_method: Option<String>,
     timeout_secs: Option<u64>,
     connect: Option<bool>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 pub struct ManageApiTool {
@@ -171,10 +172,18 @@ impl ManageApiTool {
     }
 
     fn session_id(args: &ManageApiArgs) -> &str {
-        if args._session_id.is_empty() {
+        if args.call_session.is_empty() {
             "unknown"
         } else {
-            args._session_id.as_str()
+            args.call_session.as_str()
+        }
+    }
+
+    /// The facts an inner auth call receives: this call's session.
+    fn inner_facts(args: &ManageApiArgs) -> ToolCallContext {
+        ToolCallContext {
+            session_id: Self::session_id(args).to_string(),
+            ..Default::default()
         }
     }
 
@@ -484,11 +493,14 @@ impl ManageApiTool {
             let connect_args = json!({
                 "action": "connect",
                 "service": service,
-                "_session_id": Self::session_id(args),
             });
             sections.push(
                 self.manage_oauth
-                    .call_with_status(&connect_args.to_string(), status_tx.cloned())
+                    .run(
+                        &connect_args.to_string(),
+                        status_tx.cloned(),
+                        &Self::inner_facts(args),
+                    )
                     .await?,
             );
         } else if sections.is_empty() {
@@ -526,16 +538,20 @@ impl ManageApiTool {
             "header_name": args.header_name.clone(),
             "username": args.username.clone(),
             "user_id": args.user_id.clone(),
-            "_session_id": Self::session_id(args),
         });
-        let upsert_result = self.manage_http_auth.call(&upsert_args.to_string()).await?;
+        let upsert_result = self
+            .manage_http_auth
+            .run(&upsert_args.to_string(), &Self::inner_facts(args))
+            .await?;
 
         let sync_args = json!({
             "action": "verify",
             "profile": service,
-            "_session_id": Self::session_id(args),
         });
-        let sync_result = self.manage_http_auth.call(&sync_args.to_string()).await?;
+        let sync_result = self
+            .manage_http_auth
+            .run(&sync_args.to_string(), &Self::inner_facts(args))
+            .await?;
         let ready = !sync_result.contains("not ready for live API calls yet")
             && !sync_result.contains("missing secure credentials");
 
@@ -668,7 +684,6 @@ impl ManageApiTool {
             "content_type": probe.content_type,
             "timeout_secs": args.timeout_secs,
             "max_response_bytes": 4096,
-            "_session_id": Self::session_id(args),
         });
         let probe_ctx = Self::probe_context(kernel_approved, args, &probe);
         self.http_request
@@ -695,7 +710,7 @@ impl ManageApiTool {
                 method: probe.method.clone(),
                 url: probe.url.clone(),
             }),
-            ..Default::default()
+            ..Self::inner_facts(args)
         }
     }
 
@@ -875,7 +890,8 @@ impl Tool for ManageApiTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        self.dispatch(arguments, status_tx, None).await
+        self.dispatch(arguments, status_tx, &ToolCallContext::default())
+            .await
     }
 
     async fn call_with_execution_context(
@@ -884,7 +900,7 @@ impl Tool for ManageApiTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.dispatch(arguments, status_tx, exec_ctx.kernel_approved.as_ref())
+        self.dispatch(arguments, status_tx, &exec_ctx)
             .await
             .map(ToolCallOutcome::from_output)
     }
@@ -935,11 +951,15 @@ impl ManageApiTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        kernel_approved: Option<&ApprovalScope>,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
-        let args: ManageApiArgs = serde_json::from_str(arguments)?;
+        let mut args: ManageApiArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
         match args.action.as_str() {
-            "onboard" => self.handle_onboard(args, status_tx, kernel_approved).await,
+            "onboard" => {
+                self.handle_onboard(args, status_tx, facts.kernel_approved.as_ref())
+                    .await
+            }
             other => Ok(format!("Unknown action '{}'. Use: onboard.", other)),
         }
     }

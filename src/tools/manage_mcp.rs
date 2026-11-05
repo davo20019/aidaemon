@@ -8,7 +8,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
+    semantics_for_exact_read_actions, Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects,
 };
 use crate::types::ApprovalResponse;
@@ -215,8 +215,9 @@ struct ManageMcpArgs {
     args: Vec<String>,
     key: Option<String>,
     value: Option<String>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 fn manage_mcp_schema() -> Value {
@@ -260,8 +261,31 @@ impl Tool for ManageMcpTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageMcpArgs = serde_json::from_str(arguments)
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageMcpTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageMcpArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
+        args.call_session = facts.session_id.clone();
 
         match args.action.as_str() {
             "add" => {
@@ -273,7 +297,7 @@ impl Tool for ManageMcpTool {
                     .command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'command' is required for add action"))?;
-                self.handle_add(&args._session_id, name, command, args.args)
+                self.handle_add(&args.call_session, name, command, args.args)
                     .await
             }
             "list" => self.handle_list().await,

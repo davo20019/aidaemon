@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::traits::{
     HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, TaskBookends, Tool,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolOutcomeStatus,
-    ToolVerificationMode,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolOutcomeStatus, ToolVerificationMode,
 };
 use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
 
@@ -30,14 +30,6 @@ impl SearchHistoryTool {
             state,
             retention_days,
             cursor_secret: Uuid::new_v4().as_bytes().to_vec(),
-        }
-    }
-
-    fn parse_role(raw: &str) -> UserRole {
-        match raw.to_ascii_lowercase().as_str() {
-            "owner" => UserRole::Owner,
-            "guest" => UserRole::Guest,
-            _ => UserRole::Public,
         }
     }
 
@@ -68,21 +60,24 @@ impl SearchHistoryTool {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    fn runtime_scope(args: &SearchHistoryArgs, snapshot: i64) -> anyhow::Result<HistoryScope> {
-        let session_id = args
-            .session_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
+    /// The caller's scope, from the dispatcher's `facts` only.
+    fn runtime_scope(
+        args: &SearchHistoryArgs,
+        facts: &ToolCallContext,
+        snapshot: i64,
+    ) -> anyhow::Result<HistoryScope> {
+        let session_id = facts
+            .session()
             .ok_or_else(|| anyhow::anyhow!("missing trusted session scope"))?
             .to_string();
         Ok(HistoryScope {
             session_id,
-            channel_id: args.channel_id.clone(),
-            visibility: ChannelVisibility::from_str_lossy(
-                args.channel_visibility.as_deref().unwrap_or("internal"),
-            ),
-            user_role: Self::parse_role(args.user_role.as_deref().unwrap_or("public")),
-            trusted: args.trusted_session,
+            channel_id: facts.channel_id.clone(),
+            visibility: facts
+                .channel_visibility
+                .unwrap_or(ChannelVisibility::Internal),
+            user_role: facts.user_role.unwrap_or(UserRole::Public),
+            trusted: facts.trusted_session,
             include_subagents: args.include_subagents,
             session_filter: args.filter_session_id.clone(),
             task_filter: args.task_id.clone(),
@@ -113,9 +108,10 @@ impl SearchHistoryTool {
 
     fn scope_from_cursor(
         args: &SearchHistoryArgs,
+        facts: &ToolCallContext,
         cursor: &CursorPayload,
     ) -> anyhow::Result<HistoryScope> {
-        let runtime = Self::runtime_scope(args, cursor.snapshot_max_event_id)?;
+        let runtime = Self::runtime_scope(args, facts, cursor.snapshot_max_event_id)?;
         if cursor.version != 1
             || cursor.runtime_session_id != runtime.session_id
             || cursor.channel_id != runtime.channel_id
@@ -165,11 +161,18 @@ impl SearchHistoryTool {
             || (scope.visibility == ChannelVisibility::Internal && scope.trusted)
     }
 
-    async fn execute(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
+    async fn execute(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: SearchHistoryArgs = serde_json::from_str(arguments)?;
         let action = args.action.as_str();
-        let authorization_scope =
-            Self::runtime_scope(&args, self.state.history_snapshot_max_event_id().await?)?;
+        let authorization_scope = Self::runtime_scope(
+            &args,
+            facts,
+            self.state.history_snapshot_max_event_id().await?,
+        )?;
         if authorization_scope.user_role != UserRole::Owner {
             anyhow::bail!("exact history is restricted to the owner");
         }
@@ -217,7 +220,7 @@ impl SearchHistoryTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("cursor is required for page"))?,
             )?;
-            let scope = Self::scope_from_cursor(&args, &cursor)?;
+            let scope = Self::scope_from_cursor(&args, facts, &cursor)?;
             (
                 scope,
                 Some(cursor.anchor_event_id),
@@ -225,7 +228,11 @@ impl SearchHistoryTool {
             )
         } else {
             let snapshot = self.state.history_snapshot_max_event_id().await?;
-            (Self::runtime_scope(&args, snapshot)?, args.event_id, false)
+            (
+                Self::runtime_scope(&args, facts, snapshot)?,
+                args.event_id,
+                false,
+            )
         };
 
         let limit = args.limit.unwrap_or(8).clamp(1, 20);
@@ -391,16 +398,6 @@ struct SearchHistoryArgs {
     #[serde(rename = "session_id")]
     filter_session_id: Option<String>,
     task_id: Option<String>,
-    #[serde(rename = "_session_id")]
-    session_id: Option<String>,
-    #[serde(rename = "_channel_id")]
-    channel_id: Option<String>,
-    #[serde(rename = "_channel_visibility")]
-    channel_visibility: Option<String>,
-    #[serde(rename = "_user_role")]
-    user_role: Option<String>,
-    #[serde(default, rename = "_trusted_session")]
-    trusted_session: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -485,7 +482,10 @@ impl Tool for SearchHistoryTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.execute(arguments).await?.output)
+        Ok(self
+            .execute(arguments, &ToolCallContext::default())
+            .await?
+            .output)
     }
 
     async fn call_with_status_outcome(
@@ -493,7 +493,16 @@ impl Tool for SearchHistoryTool {
         arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(arguments).await
+        self.execute(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute(arguments, &facts).await
     }
 }
 
@@ -545,6 +554,7 @@ mod tests {
     use crate::events::{Event, EventStore, EventType};
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::CallWithFacts;
 
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
@@ -600,16 +610,19 @@ mod tests {
             .unwrap();
 
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "search",
-                    "query": "needle",
-                    "_session_id": "root-session",
-                    "_channel_visibility": "private",
-                    "_user_role": "Owner"
+                    "query": "needle"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "root-session".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -628,16 +641,19 @@ mod tests {
         let cursor = value["matches"][0]["older_cursor"].as_str().unwrap();
         let newer_cursor = value["matches"][0]["newer_cursor"].as_str().unwrap();
         let page = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "page",
-                    "cursor": newer_cursor,
-                    "_session_id": "root-session",
-                    "_channel_visibility": "private",
-                    "_user_role": "Owner"
+                    "cursor": newer_cursor
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "root-session".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -645,16 +661,19 @@ mod tests {
         assert!(!page.output.contains("interleaved other-session message"));
 
         let widened = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "page",
-                    "cursor": cursor,
-                    "_session_id": "different-session",
-                    "_channel_visibility": "private",
-                    "_user_role": "Owner"
+                    "cursor": cursor
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "different-session".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(widened.is_err());
@@ -663,19 +682,26 @@ mod tests {
     #[tokio::test]
     async fn scoped_contexts_hide_global_projection_metadata_and_cannot_repair() {
         let (tool, _events, _db) = tool().await;
-        let scoped_args = json!({
-            "action": "health",
-            "_session_id": "slack:C1",
-            "_channel_id": "slack:C1",
-            "_channel_visibility": "private_group",
-            "_user_role": "Owner"
-        });
-        let health = tool.call(&scoped_args.to_string()).await.unwrap();
+        let scoped_args = json!({ "action": "health" });
+        let facts = crate::traits::ToolCallContext {
+            session_id: "slack:C1".into(),
+            channel_id: Some("slack:C1".into()),
+            channel_visibility: Some(ChannelVisibility::PrivateGroup),
+            user_role: Some(UserRole::Owner),
+            ..Default::default()
+        };
+        let health = tool
+            .call_with(&scoped_args.to_string(), facts.clone())
+            .await
+            .unwrap();
         assert!(!health.contains("canonical_messages"));
         assert!(health.contains("counts are hidden"));
 
         let mut repair_args = scoped_args;
         repair_args["action"] = json!("repair");
-        assert!(tool.call(&repair_args.to_string()).await.is_err());
+        assert!(tool
+            .call_with(&repair_args.to_string(), facts)
+            .await
+            .is_err());
     }
 }

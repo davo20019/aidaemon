@@ -10,7 +10,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
+    semantics_for_exact_read_actions, Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects,
 };
 use crate::types::ApprovalResponse;
@@ -1057,7 +1057,7 @@ impl ConfigManagerTool {
             selection.smart_model
         );
         match self
-            .request_approval(&args._session_id, &approval_description)
+            .request_approval(&args.call_session, &approval_description)
             .await
         {
             Ok(ApprovalResponse::AllowOnce)
@@ -1179,7 +1179,7 @@ impl ConfigManagerTool {
         };
         let approval_description = format!("Remove failover provider {}", removed_summary);
         match self
-            .request_approval(&args._session_id, &approval_description)
+            .request_approval(&args.call_session, &approval_description)
             .await
         {
             Ok(ApprovalResponse::AllowOnce)
@@ -1283,7 +1283,7 @@ impl ConfigManagerTool {
             selection.smart_model
         );
         match self
-            .request_approval(&args._session_id, &approval_description)
+            .request_approval(&args.call_session, &approval_description)
             .await
         {
             Ok(ApprovalResponse::AllowOnce)
@@ -1454,9 +1454,10 @@ struct ConfigArgs {
     stt_language: Option<String>,
     #[serde(default)]
     stt_ffmpeg_path: Option<String>,
-    /// Session ID for routing approval requests (injected by agent).
-    #[serde(default)]
-    _session_id: String,
+    /// The session approval requests are routed to, from the dispatcher's
+    /// facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 fn default_true() -> bool {
@@ -1518,7 +1519,30 @@ impl Tool for ConfigManagerTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ConfigArgs = serde_json::from_str(arguments)?;
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ConfigManagerTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ConfigArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
 
         match args.action.as_str() {
             "list_provider_presets" => Ok(Self::list_provider_presets_message()),
@@ -1573,7 +1597,7 @@ impl Tool for ConfigManagerTool {
                     };
                     let description = format!("Config change: {} = {}", args.key, display_value);
 
-                    match self.request_approval(&args._session_id, &description).await {
+                    match self.request_approval(&args.call_session, &description).await {
                         Ok(ApprovalResponse::AllowOnce)
                         | Ok(ApprovalResponse::AllowSession)
                         | Ok(ApprovalResponse::AllowAlways) => {
@@ -1769,7 +1793,7 @@ mod tests {
             stt_model_path: None,
             stt_language: None,
             stt_ffmpeg_path: None,
-            _session_id: "test-session".to_string(),
+            call_session: "test-session".to_string(),
         }
     }
 

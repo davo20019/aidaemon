@@ -15,9 +15,10 @@ use crate::tools::http_request::HttpRequestTool;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolCollectionObservation, ToolMutationEffects,
-    ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint, ToolTargetHintKind,
+    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
+    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
+    ToolTargetHintKind,
 };
 use crate::types::ApprovalResponse;
 
@@ -36,8 +37,9 @@ struct ManageHttpAuthArgs {
     url: Option<String>,
     method: Option<String>,
     timeout_secs: Option<u64>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 #[derive(Clone)]
@@ -650,10 +652,10 @@ impl ManageHttpAuthTool {
             ));
         }
 
-        let session_id = if args._session_id.is_empty() {
+        let session_id = if args.call_session.is_empty() {
             "unknown"
         } else {
-            args._session_id.as_str()
+            args.call_session.as_str()
         };
         let mut doc = self.load_config_doc().await?;
         let existing_auth_type = Self::profile_table(&doc, profile_name)
@@ -1096,70 +1098,30 @@ impl Tool for ManageHttpAuthTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
-        match args.action.as_str() {
-            "list" => self.handle_list().await,
-            "describe" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='describe' requires 'profile'"))?,
-                )?;
-                self.handle_describe(&profile).await
-            }
-            "upsert" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
-                )?;
-                self.handle_upsert(&profile, &args).await
-            }
-            "remove" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_remove(&profile, session_id).await
-            }
-            "verify" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
-                )?;
-                self.handle_verify(
-                    &profile,
-                    args.url.as_deref(),
-                    args.method.as_deref(),
-                    args.timeout_secs,
-                )
-                .await
-            }
-            other => Ok(format!(
-                "Unknown action '{}'. Use: list, describe, upsert, remove, verify.",
-                other
-            )),
-        }
+        self.run(arguments, &ToolCallContext::default()).await
     }
 
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
         let (output, list_members) = if args.action == "list" {
             let (output, members) = self.handle_list_snapshot().await?;
             (output, Some(members))
         } else {
-            (self.call(arguments).await?, None)
+            (self.run(arguments, &facts).await?, None)
         };
         let mut observations = Vec::new();
         let mut collections = Vec::new();
@@ -1199,6 +1161,68 @@ impl Tool for ManageHttpAuthTool {
                 ..ToolCallMetadata::default()
             },
         })
+    }
+}
+
+impl ManageHttpAuthTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
+        match args.action.as_str() {
+            "list" => self.handle_list().await,
+            "describe" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='describe' requires 'profile'"))?,
+                )?;
+                self.handle_describe(&profile).await
+            }
+            "upsert" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
+                )?;
+                self.handle_upsert(&profile, &args).await
+            }
+            "remove" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_remove(&profile, session_id).await
+            }
+            "verify" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
+                )?;
+                self.handle_verify(
+                    &profile,
+                    args.url.as_deref(),
+                    args.method.as_deref(),
+                    args.timeout_secs,
+                )
+                .await
+            }
+            other => Ok(format!(
+                "Unknown action '{}'. Use: list, describe, upsert, remove, verify.",
+                other
+            )),
+        }
     }
 }
 
@@ -1376,18 +1400,18 @@ mod tests {
             .await
             .unwrap();
 
-        let result = tool
-            .call(
-                r#"{
+        let result = crate::testing::call_with_facts(
+            &tool,
+            r#"{
                     "action": "upsert",
                     "profile": "stripe",
                     "auth_type": "bearer",
-                    "allowed_domains": ["api.stripe.com"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.stripe.com"]
                 }"#,
-            )
-            .await
-            .unwrap();
+            crate::testing::call_facts("test"),
+        )
+        .await
+        .unwrap();
 
         assert!(result.contains("Saved manual API auth profile `stripe`."));
         assert!(result.contains("aidaemon keychain set http_auth_stripe_token"));

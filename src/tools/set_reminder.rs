@@ -11,8 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::tools::ManageMemoriesTool;
 use crate::traits::{
-    StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus,
+    StateStore, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolOutcomeStatus,
 };
 
 pub struct SetReminderTool {
@@ -27,8 +27,9 @@ impl SetReminderTool {
     }
 }
 
-/// The equivalent `manage_memories` call, keeping the runtime's `_` fields
-/// (session, role, channel) so ownership and scoping checks apply unchanged.
+/// The equivalent `manage_memories` call. It runs with this call's
+/// dispatcher facts (session, role, channel), so ownership and scoping
+/// checks apply unchanged.
 fn scheduler_arguments(arguments: &str) -> anyhow::Result<String> {
     let args: Map<String, Value> = serde_json::from_str(arguments)?;
     let field = |name: &str| {
@@ -45,9 +46,6 @@ fn scheduler_arguments(arguments: &str) -> anyhow::Result<String> {
     call.insert("goal".into(), json!(message));
     call.insert("schedule".into(), json!(when));
     call.insert("reminder".into(), json!(message));
-    for (key, value) in args.iter().filter(|(key, _)| key.starts_with('_')) {
-        call.insert(key.clone(), value.clone());
-    }
     Ok(Value::Object(call).to_string())
 }
 
@@ -78,15 +76,33 @@ impl Tool for SetReminderTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.scheduler.call(&scheduler_arguments(arguments)?).await
+        self.scheduler
+            .run(
+                &scheduler_arguments(arguments)?,
+                &ToolCallContext::default(),
+            )
+            .await
     }
 
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call(arguments).await?;
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self
+            .scheduler
+            .run(&scheduler_arguments(arguments)?, &facts)
+            .await?;
         let outcome_status = if output.starts_with("Reminder set") {
             ToolOutcomeStatus::Succeeded
         } else {
@@ -140,15 +156,18 @@ mod tests {
         let state = state().await;
         let tool = SetReminderTool::new(state.clone());
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "message": "Check the oven.",
-                    "when": "in 2h",
-                    "_user_role": "owner",
-                    "_session_id": "telegram:synthetic-user-1"
+                    "when": "in 2h"
                 })
                 .to_string(),
                 None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-user-1".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -179,15 +198,18 @@ mod tests {
     async fn non_owner_cannot_set_a_reminder() {
         let tool = SetReminderTool::new(state().await);
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "message": "Check the oven.",
-                    "when": "in 2h",
-                    "_user_role": "guest",
-                    "_session_id": "telegram:synthetic-user-2"
+                    "when": "in 2h"
                 })
                 .to_string(),
                 None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-user-2".into(),
+                    user_role: Some(crate::types::UserRole::Guest),
+                    ..Default::default()
+                },
             )
             .await;
         let failed = match outcome {
