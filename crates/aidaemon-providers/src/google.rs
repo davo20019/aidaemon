@@ -425,6 +425,10 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
                     parts.push(json!({"text": message.content}));
                 }
                 parts.extend(message.images.iter().map(image_part));
+                parts.extend(message.audio.iter().filter_map(|audio| {
+                    let media_type = audio.media_type()?;
+                    Some(json!({"inlineData": {"mimeType": media_type, "data": audio.data}}))
+                }));
                 if !parts.is_empty() {
                     contents.push(json!({"role": "user", "parts": parts}));
                 }
@@ -1104,6 +1108,21 @@ mod tests {
 
         let body = build_body(&request(vec![Message::user("plain")]));
         assert!(body.get("generation_config").is_none());
+    }
+
+    #[test]
+    fn user_audio_becomes_inline_data() {
+        let request = ModelRequest {
+            model: "gemini-test".into(),
+            messages: vec![Message::user("Transcribe.")
+                .with_audio([aidaemon_core::Audio::new("opus", "QUJD")])],
+            ..Default::default()
+        };
+        let body = build_body(&request);
+        assert_eq!(
+            body["contents"][0]["parts"][1],
+            json!({"inlineData": {"mimeType": "audio/ogg", "data": "QUJD"}})
+        );
     }
 
     #[test]

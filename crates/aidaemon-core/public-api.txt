@@ -140,6 +140,7 @@ pub aidaemon_core::Image::Url
 pub aidaemon_core::Image::Url::url: alloc::string::String
 impl aidaemon_core::Image
 pub fn aidaemon_core::Image::base64(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn aidaemon_core::Image::from_url_or_data(&str) -> Self
 pub fn aidaemon_core::Image::to_url(&self) -> alloc::string::String
 pub fn aidaemon_core::Image::url(impl core::convert::Into<alloc::string::String>) -> Self
 impl core::fmt::Debug for aidaemon_core::Image
@@ -310,6 +311,14 @@ pub fn aidaemon_core::AgentBuilder::store(self, alloc::sync::Arc<dyn aidaemon_co
 pub fn aidaemon_core::AgentBuilder::stuck_detection(self, aidaemon_core::StuckConfig) -> Self
 pub fn aidaemon_core::AgentBuilder::tool(self, impl aidaemon_core::Tool + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::tool_arc(self, alloc::sync::Arc<dyn aidaemon_core::Tool>) -> Self
+pub struct aidaemon_core::Audio
+pub aidaemon_core::Audio::data: alloc::string::String
+pub aidaemon_core::Audio::format: alloc::string::String
+impl aidaemon_core::Audio
+pub fn aidaemon_core::Audio::media_type(&self) -> core::option::Option<&'static str>
+pub fn aidaemon_core::Audio::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Debug for aidaemon_core::Audio
+pub fn aidaemon_core::Audio::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::Authority
 pub aidaemon_core::Authority::level: aidaemon_core::AccessLevel
 pub aidaemon_core::Authority::tools: core::option::Option<alloc::collections::btree::set::BTreeSet<alloc::string::String>>
@@ -406,6 +415,7 @@ pub fn aidaemon_core::MemoryStore::append_event<'life0, 'life1, 'async_trait>(&'
 pub fn aidaemon_core::MemoryStore::load_state<'life0, 'async_trait>(&'life0 self, aidaemon_core::RunId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<aidaemon_core::RunState>, aidaemon_core::StoreError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn aidaemon_core::MemoryStore::save_state<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::RunState) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::StoreError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub struct aidaemon_core::Message
+pub aidaemon_core::Message::audio: alloc::vec::Vec<aidaemon_core::Audio>
 pub aidaemon_core::Message::content: alloc::string::String
 pub aidaemon_core::Message::images: alloc::vec::Vec<aidaemon_core::Image>
 pub aidaemon_core::Message::is_error: bool
@@ -422,6 +432,7 @@ pub fn aidaemon_core::Message::is_injected(&self) -> bool
 pub fn aidaemon_core::Message::system(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::Message::tool_result(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::Message::user(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn aidaemon_core::Message::with_audio(self, impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::Audio>) -> Self
 pub fn aidaemon_core::Message::with_error(self, bool) -> Self
 pub fn aidaemon_core::Message::with_images(self, impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::Image>) -> Self
 impl core::convert::From<&alloc::string::String> for aidaemon_core::Message

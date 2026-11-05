@@ -195,6 +195,10 @@ fn build_body(request: &ModelRequest, defaults: &Defaults) -> Value {
         };
         body["parallel_tool_calls"] = json!(true);
     }
+    // Audio models otherwise default to answering in audio.
+    if request.messages.iter().any(|m| !m.audio.is_empty()) {
+        body["modalities"] = json!(["text"]);
+    }
     if let Some(max) = request.max_output_tokens.or(defaults.max_tokens) {
         body["max_tokens"] = json!(max);
     }
@@ -259,7 +263,7 @@ fn image_part(image: &Image) -> Value {
 fn wire_message(message: &Message) -> Value {
     match message.role {
         Role::System => json!({"role": "system", "content": message.content}),
-        Role::User if message.images.is_empty() => {
+        Role::User if message.images.is_empty() && message.audio.is_empty() => {
             json!({"role": "user", "content": message.content})
         }
         Role::User => {
@@ -268,6 +272,12 @@ fn wire_message(message: &Message) -> Value {
                 parts.push(json!({"type": "text", "text": message.content}));
             }
             parts.extend(message.images.iter().map(image_part));
+            parts.extend(message.audio.iter().map(|audio| {
+                json!({"type": "input_audio", "input_audio": {
+                    "data": audio.data,
+                    "format": audio.format,
+                }})
+            }));
             json!({"role": "user", "content": parts})
         }
         Role::Assistant => {

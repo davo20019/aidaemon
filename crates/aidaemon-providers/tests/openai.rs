@@ -424,3 +424,17 @@ fn json_formats_reasoning_and_defaults_reach_the_body() {
     assert_eq!(body["response_format"], json!({"type": "json_object"}));
     assert_eq!(body["max_tokens"], 50);
 }
+
+#[test]
+fn user_audio_becomes_input_audio_and_text_only_output() {
+    let provider = OpenAiCompatible::builder().api_key("k").build().unwrap();
+    let body =
+        provider
+            .request_body(&request(vec![Message::user("What is said?")
+                .with_audio([aidaemon_core::Audio::new("ogg", "QUJD")])]));
+    assert_eq!(
+        body["messages"][0]["content"][1],
+        json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "ogg"}})
+    );
+    assert_eq!(body["modalities"], json!(["text"]));
+}

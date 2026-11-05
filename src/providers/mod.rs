@@ -1,25 +1,16 @@
-mod anthropic_native;
 mod error;
 pub(crate) mod factory;
-mod google_genai;
 pub(crate) mod multimodal;
-mod openai_chatgpt;
-mod openai_compatible;
+pub(crate) mod sdk_backed;
 pub(crate) mod streaming;
-mod xai_native;
 
 use std::time::Duration;
 
 use reqwest::Client;
 use tracing::warn;
 
-pub use anthropic_native::AnthropicNativeProvider;
 pub(crate) use error::ProviderRecoveryRoute;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
-pub use google_genai::GoogleGenAiProvider;
-pub use openai_chatgpt::OpenAiChatGptProvider;
-pub use openai_compatible::OpenAiCompatibleProvider;
-pub use xai_native::XaiNativeProvider;
 
 /// Build an HTTP client with a panic-safe fallback when system proxy discovery
 /// is unavailable in the runtime environment.
@@ -61,15 +52,6 @@ pub(crate) fn build_http_client(timeout: Duration) -> Result<Client, String> {
         .no_proxy()
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
-}
-
-/// A system message that arrives after the conversation started, for a
-/// provider with no mid-conversation system role: it rides in a user turn,
-/// delimited so the model reads it as harness context rather than the
-/// user's words. Hoisting it into the top-level system field instead would
-/// rewrite the cached prefix of every request and lose its position.
-pub(crate) fn in_place_system_text(text: &str) -> String {
-    format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
 /// Whether a provider error says the request exceeded the model's context

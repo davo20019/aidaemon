@@ -83,6 +83,19 @@ impl Image {
         Self::Url { url: url.into() }
     }
 
+    /// An image from a URL: a `data:<type>;base64,` URL becomes inline
+    /// bytes (providers that take no URLs can then still send it), anything
+    /// else stays a URL.
+    pub fn from_url_or_data(url: &str) -> Self {
+        url.strip_prefix("data:")
+            .and_then(|rest| rest.split_once(";base64,"))
+            .filter(|(media_type, data)| !media_type.is_empty() && !data.is_empty())
+            .map_or_else(
+                || Self::url(url),
+                |(media_type, data)| Self::base64(media_type, data),
+            )
+    }
+
     /// The image as a URL: the URL itself, or a `data:` URL for inline bytes.
     pub fn to_url(&self) -> String {
         match self {
@@ -105,6 +118,45 @@ impl std::fmt::Debug for Image {
     }
 }
 
+/// Audio the model should hear, on a user message: base64 data in a
+/// container named the OpenAI way (`ogg`/`opus`, `mp3`, `wav`, `flac`,
+/// `aac`). Providers without audio input drop it. `Debug` omits the bytes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Audio {
+    pub format: String,
+    pub data: String,
+}
+
+impl Audio {
+    pub fn new(format: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            format: format.into(),
+            data: data.into(),
+        }
+    }
+
+    /// The MIME type for [`Audio::format`], when it is a known one.
+    pub fn media_type(&self) -> Option<&'static str> {
+        Some(match self.format.as_str() {
+            "ogg" | "opus" => "audio/ogg",
+            "mp3" => "audio/mp3",
+            "wav" => "audio/wav",
+            "flac" => "audio/flac",
+            "aac" => "audio/aac",
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Debug for Audio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Audio")
+            .field("format", &self.format)
+            .field("bytes_b64", &self.data.len())
+            .finish()
+    }
+}
+
 /// A provider-neutral transcript entry.
 ///
 /// The transcript stored in [`crate::RunState`] never contains the agent's
@@ -123,6 +175,9 @@ pub struct Message {
     /// text. Providers ignore them on other roles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<Image>,
+    /// Audio on `Role::User` messages. Providers ignore it on other roles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<Audio>,
     /// Set on `Role::Tool` messages whose receipt is not a success, so
     /// providers can flag the result (for example Anthropic's `is_error`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -177,6 +232,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             images: Vec::new(),
+            audio: Vec::new(),
             is_error: false,
             origin: None,
         }
@@ -189,6 +245,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             images: Vec::new(),
+            audio: Vec::new(),
             is_error: false,
             origin: None,
         }
@@ -197,6 +254,12 @@ impl Message {
     /// Attach images (see [`Image`]).
     pub fn with_images(mut self, images: impl IntoIterator<Item = Image>) -> Self {
         self.images.extend(images);
+        self
+    }
+
+    /// Attach audio (see [`Audio`]).
+    pub fn with_audio(mut self, audio: impl IntoIterator<Item = Audio>) -> Self {
+        self.audio.extend(audio);
         self
     }
 
@@ -213,6 +276,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            audio: Vec::new(),
             is_error: false,
             origin: None,
         }

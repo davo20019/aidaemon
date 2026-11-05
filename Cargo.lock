@@ -75,6 +75,7 @@ dependencies = [
  "aidaemon-memory",
  "aidaemon-node-protocol",
  "aidaemon-policies",
+ "aidaemon-providers",
  "anyhow",
  "assert_cmd",
  "async-imap",

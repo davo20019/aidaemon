@@ -132,33 +132,7 @@ impl ProviderError {
         }
     }
 
-    pub fn timeout_msg(message: impl Into<String>) -> Self {
-        Self {
-            kind: ProviderErrorKind::Timeout,
-            status: None,
-            message: message.into(),
-            malformed_reason: None,
-            retry_after_secs: None,
-            affordable_tokens: None,
-        }
-    }
-
-    pub fn network(err: &reqwest::Error) -> Self {
-        let kind = if err.is_timeout() {
-            ProviderErrorKind::Timeout
-        } else {
-            ProviderErrorKind::Network
-        };
-        Self {
-            kind,
-            status: None,
-            message: err.to_string(),
-            malformed_reason: None,
-            retry_after_secs: None,
-            affordable_tokens: None,
-        }
-    }
-
+    #[cfg(test)]
     pub fn malformed_parse(message: impl Into<String>) -> Self {
         Self {
             kind: ProviderErrorKind::MalformedResponse,
