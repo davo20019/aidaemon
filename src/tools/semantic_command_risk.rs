@@ -18,7 +18,8 @@ use tracing::warn;
 use crate::events::EventStore;
 use crate::execution::SharedExecutionBackend;
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::traits::{ChatOptions, ModelProvider, StateStore};
+use crate::providers::ChatJson;
+use crate::traits::{ChatOptions, StateStore};
 use crate::types::RiskLevel;
 
 pub(crate) const ASSESSMENT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -340,7 +341,7 @@ pub(crate) async fn assess_command(
         &referenced_files,
     );
     let snapshot = runtime.snapshot();
-    let provider: Arc<dyn ModelProvider> = snapshot.provider();
+    let provider: crate::llm_runtime::ModelBackend = snapshot.provider();
     let model = snapshot.primary_model();
     let options = ChatOptions {
         response_mode: crate::traits::ResponseMode::JsonSchema {

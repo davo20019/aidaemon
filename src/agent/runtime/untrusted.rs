@@ -20,6 +20,7 @@ use super::Agent;
 use crate::config::OwnerLevel;
 use crate::events::EventStore;
 use crate::llm_runtime::SharedLlmRuntime;
+use crate::providers::ChatJson;
 use crate::traits::{ChatOptions, ResponseMode, TokenUsageStore};
 use crate::types::{ChannelVisibility, UserRole};
 

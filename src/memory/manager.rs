@@ -8,6 +8,7 @@ use crate::memory::embedding_index::{
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::scoring::calculate_episode_importance;
+use crate::providers::ChatJson;
 use crate::traits::{BehaviorPattern, Message, MessageAnnotation, Person, StateStore, UserProfile};
 use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 use chrono::{DateTime, Utc};

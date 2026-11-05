@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
-use crate::config::{AppConfig, IterationLimitConfig, ProviderKind};
+use crate::config::{AppConfig, IterationLimitConfig};
 use crate::events::EventStore;
 use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
@@ -26,7 +26,7 @@ use crate::testing::TestChannel;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
-use crate::traits::{Channel, ModelProvider};
+use crate::traits::Channel;
 use crate::types::{ChannelContext, UserRole};
 
 /// Check if live tests should run.
@@ -64,34 +64,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let config = load_live_test_config(&config_path)?;
 
     // Create real provider
-    let provider: Arc<dyn ModelProvider> = match config.provider.kind {
-        ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::XaiNative => Arc::new(
-            crate::providers::XaiNativeProvider::new_with_options(
-                &config.provider.api_key,
-                Some(&config.provider.base_url),
-                config.provider.max_tokens,
-                config.provider.extra_headers.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None)
-                .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-    };
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     // Temp DB for isolation
     let db_file = tempfile::NamedTempFile::new()?;
@@ -269,34 +242,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
 
     let config = load_live_test_config(&config_path)?;
 
-    let provider: Arc<dyn ModelProvider> = match config.provider.kind {
-        ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::XaiNative => Arc::new(
-            crate::providers::XaiNativeProvider::new_with_options(
-                &config.provider.api_key,
-                Some(&config.provider.base_url),
-                config.provider.max_tokens,
-                config.provider.extra_headers.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None)
-                .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-    };
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();

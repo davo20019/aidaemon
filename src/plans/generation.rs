@@ -4,7 +4,8 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::events::EventStore;
-use crate::traits::{ModelProvider, StateStore};
+use crate::providers::ChatJson;
+use crate::traits::StateStore;
 
 const PLAN_GENERATION_PROMPT: &str = r#"You are a task planner. Given a user request, break it down into discrete, actionable steps.
 
@@ -39,7 +40,7 @@ Now break down this request:
 
 /// Generate plan steps from a user message using an LLM.
 pub async fn generate_plan_steps(
-    provider: &dyn ModelProvider,
+    provider: &dyn aidaemon_core::Provider,
     model: &str,
     user_message: &str,
     state: Option<&Arc<dyn StateStore>>,

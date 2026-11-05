@@ -10,10 +10,11 @@ use tracing::{info, warn};
 pub mod resources;
 pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
 
+use crate::providers::ChatJson;
 use crate::tools::sanitize::sanitize_external_content;
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Fact, Goal, ModelProvider, Person, PersonFact,
-    Procedure, StateStore, UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Fact, Goal, Person, PersonFact, Procedure, StateStore,
+    UserProfile,
 };
 use crate::types::{ChannelVisibility, UserRole};
 
@@ -838,7 +839,7 @@ pub fn match_skills<'a>(
 /// relevant to the user message. Returns only the confirmed subset. Malformed
 /// classifier output is an error so lexical candidates never activate alone.
 pub async fn confirm_skills<'a>(
-    provider: &dyn ModelProvider,
+    provider: &dyn aidaemon_core::Provider,
     fast_model: &str,
     candidates: Vec<&'a Skill>,
     user_message: &str,

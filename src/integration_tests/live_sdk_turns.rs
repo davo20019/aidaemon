@@ -27,7 +27,7 @@ mod live_sdk_turns {
             eprintln!("SKIPPED: no ChatGPT login found — run `aidaemon auth login openai`");
             return None;
         }
-        let provider = crate::providers::OpenAiChatGptProvider::new(None).unwrap();
+        let provider = crate::providers::factory::chatgpt_backend(None, None).unwrap();
         Some(
             setup_live_agent(Arc::new(provider), ProviderKind::OpenaiChatgpt, &live_model())
                 .await

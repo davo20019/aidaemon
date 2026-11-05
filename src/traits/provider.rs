@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use serde_json::Value;
 
 use super::ToolCall;
@@ -69,34 +68,6 @@ pub struct ChatOptions {
     /// The interactive generation loop sets `Some(interactive_slot)` to keep the
     /// conversation's KV cache warm against background-task eviction.
     pub id_slot: Option<u32>,
-}
-
-/// Model provider — sends messages + tool defs to an LLM, gets back response.
-#[async_trait]
-pub trait ModelProvider: Send + Sync {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse>;
-
-    /// Extended chat API with per-call behavior controls.
-    ///
-    /// Default implementation preserves backwards compatibility by delegating
-    /// to `chat()` and ignoring options for providers that don't implement it.
-    async fn chat_with_options(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-        _options: &ChatOptions,
-    ) -> anyhow::Result<ProviderResponse> {
-        self.chat(model, messages, tools).await
-    }
-
-    /// List available models from the provider. Returns model ID strings.
-    async fn list_models(&self) -> anyhow::Result<Vec<String>>;
 }
 
 /// Token usage statistics from an LLM API response.

@@ -6,8 +6,6 @@
 //! the turn's own task. This module also translates between the SDK message
 //! model and the OpenAI-style JSON the daemon providers speak.
 
-use std::collections::HashMap;
-
 use aidaemon_core as sdk;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -17,7 +15,8 @@ use super::sdk_engine::DaemonCall;
 use crate::memory::context_window::{
     estimate_multimodal_message_tokens, fit_messages_with_source_quotas,
 };
-use crate::traits::{ChatOptions, ProviderResponse, TokenUsage, ToolChoiceMode};
+use crate::providers::ChatJson;
+use crate::traits::{ChatOptions, ProviderResponse};
 
 /// One model request handed from the SDK run to the daemon dispatcher.
 pub(super) struct ModelCall {
@@ -133,7 +132,7 @@ impl sdk::Provider for RuntimeProvider {
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let snapshot = self.runtime.snapshot();
         let provider = snapshot.provider();
-        let options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        let options = to_chat_options(request);
         let messages = to_daemon_messages_from(&request.messages);
         let tools = to_daemon_tools(&request.tools);
         let primary = snapshot.primary_model();
@@ -191,24 +190,6 @@ impl sdk::Provider for RuntimeProvider {
     }
 }
 
-fn image_block(image: &sdk::Image) -> Value {
-    json!({"type": "image_url", "image_url": {"url": image.to_url()}})
-}
-
-/// Text plus images as OpenAI-style content: a plain string without images,
-/// content parts with them.
-fn content_with_images(text: &str, images: &[sdk::Image]) -> Value {
-    if images.is_empty() {
-        return Value::String(text.to_string());
-    }
-    let mut blocks = Vec::with_capacity(images.len() + 1);
-    if !text.trim().is_empty() {
-        blocks.push(json!({"type": "text", "text": text}));
-    }
-    blocks.extend(images.iter().map(image_block));
-    Value::Array(blocks)
-}
-
 /// The request's transcript as the daemon providers expect it.
 ///
 /// Images a tool observed cannot ride on a `tool` message for every backend,
@@ -219,74 +200,7 @@ pub(super) fn to_daemon_messages(request: &sdk::ModelRequest) -> Vec<Value> {
 }
 
 pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
-    let mut names: HashMap<&str, &str> = HashMap::new();
-    let mut out = Vec::with_capacity(messages.len());
-    let mut pending_images: Vec<Value> = Vec::new();
-    for message in messages {
-        if message.role != sdk::Role::Tool && !pending_images.is_empty() {
-            out.append(&mut pending_images);
-        }
-        match message.role {
-            sdk::Role::System => out.push(json!({"role": "system", "content": message.content})),
-            // Harness and stop-hook messages are directives, which the
-            // daemon sends as system messages.
-            sdk::Role::User if message.is_injected() => out.push(json!({
-                "role": "system",
-                "content": message.content,
-            })),
-            sdk::Role::User => out.push(json!({
-                "role": "user",
-                "content": content_with_images(&message.content, &message.images),
-            })),
-            sdk::Role::Assistant => {
-                let mut value = json!({"role": "assistant", "content": message.content});
-                if !message.tool_calls.is_empty() {
-                    let calls: Vec<Value> = message
-                        .tool_calls
-                        .iter()
-                        .map(|call| {
-                            names.insert(call.id.as_str(), call.name.as_str());
-                            let mut value = json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": call.arguments.to_string(),
-                                },
-                            });
-                            // Reasoning signatures and thinking blocks the
-                            // provider needs back on replay.
-                            if let Some(data) = &call.provider_data {
-                                value["extra_content"] = data.clone();
-                            }
-                            value
-                        })
-                        .collect();
-                    value["tool_calls"] = Value::Array(calls);
-                }
-                out.push(value);
-            }
-            sdk::Role::Tool => {
-                let call_id = message.tool_call_id.as_deref().unwrap_or_default();
-                let name = names.get(call_id).copied().unwrap_or("tool");
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": message.content,
-                }));
-                if !message.images.is_empty() {
-                    let label = format!("[Image observed by `{name}`]");
-                    pending_images.push(json!({
-                        "role": "user",
-                        "content": content_with_images(&label, &message.images),
-                    }));
-                }
-            }
-        }
-    }
-    out.append(&mut pending_images);
-    out
+    crate::providers::sdk_backed::to_chat_messages(messages)
 }
 
 /// The daemon-format transcript for a model call: the projected `prefix`
@@ -500,73 +414,22 @@ fn repair_tool_pairs(messages: Vec<Value>) -> Vec<Value> {
 
 /// SDK tool specs as the daemon's OpenAI-style tool definitions.
 pub(super) fn to_daemon_tools(specs: &[sdk::ToolSpec]) -> Vec<Value> {
-    specs
-        .iter()
-        .map(|spec| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "parameters": spec.parameters,
-                },
-            })
-        })
-        .collect()
+    crate::providers::sdk_backed::to_chat_tools(specs)
 }
 
-pub(super) fn to_chat_options(
-    choice: &sdk::ToolChoice,
-    max_output_tokens: Option<u32>,
-) -> ChatOptions {
-    ChatOptions {
-        tool_choice: match choice {
-            sdk::ToolChoice::Auto => ToolChoiceMode::Auto,
-            sdk::ToolChoice::None => ToolChoiceMode::None,
-            sdk::ToolChoice::Required => ToolChoiceMode::Required,
-            sdk::ToolChoice::Specific(name) => ToolChoiceMode::Specific(name.clone()),
-        },
-        max_tokens_override: max_output_tokens,
-        ..ChatOptions::default()
-    }
+pub(super) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
+    crate::providers::sdk_backed::to_chat_options(request)
 }
 
-pub(super) fn sdk_usage(usage: Option<&TokenUsage>) -> sdk::Usage {
-    usage
-        .map(|usage| sdk::Usage {
-            input_tokens: usage.input_tokens.into(),
-            output_tokens: usage.output_tokens.into(),
-            cached_input_tokens: usage.cached_input_tokens.unwrap_or_default().into(),
-            cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or_default().into(),
-        })
-        .unwrap_or_default()
-}
-
-/// A daemon provider reply as an SDK response. Arguments that are not valid
-/// JSON become `{}`: the tool then reports the missing fields to the model.
+/// A daemon provider reply as an SDK response.
 pub(super) fn from_provider_response(response: ProviderResponse) -> sdk::ModelResponse {
-    let usage = sdk_usage(response.usage.as_ref());
-    sdk::ModelResponse {
-        text: response.content.unwrap_or_default(),
-        tool_calls: response
-            .tool_calls
-            .into_iter()
-            .map(|call| {
-                let arguments = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-                let mut sdk_call = sdk::ToolCall::new(call.id, call.name, arguments);
-                sdk_call.provider_data = call.extra_content.filter(|data| !data.is_null());
-                sdk_call
-            })
-            .collect(),
-        usage,
-        reasoning: response.thinking,
-        note: response.response_note,
-    }
+    crate::providers::sdk_backed::to_sdk_response(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::{TokenUsage, ToolChoiceMode};
     use serde_json::json;
 
     /// Hook notes are found by their origin, wherever they sit; a plain
@@ -795,7 +658,9 @@ mod tests {
             response_note: None,
         });
         assert_eq!(response.text, "hi");
-        assert_eq!(response.tool_calls[0].arguments, json!({}));
+        // Kept verbatim in the SDK's `_raw` form: the tool reports the bad
+        // arguments, and the call replays byte for byte.
+        assert_eq!(response.tool_calls[0].arguments, json!({"_raw": "not json"}));
         assert_eq!(response.tool_calls[0].name, "terminal");
         assert_eq!(response.usage.input_tokens, 100);
         assert_eq!(response.usage.output_tokens, 7);
@@ -916,12 +781,36 @@ mod tests {
         assert_eq!(messages[1]["content"], "[SYSTEM] answer now");
     }
 
+    /// Everything a kernel request asks for reaches the daemon call path:
+    /// tool choice, output cap, response format, effort, single attempt.
     #[test]
-    fn tool_choice_maps_to_chat_options() {
-        let options = to_chat_options(&sdk::ToolChoice::Required, Some(512));
+    fn request_options_map_to_chat_options() {
+        let request = sdk::ModelRequest {
+            tool_choice: sdk::ToolChoice::Required,
+            max_output_tokens: Some(512),
+            options: sdk::RequestOptions {
+                response_format: sdk::ResponseFormat::JsonObject,
+                reasoning_effort: Some("low".into()),
+                single_attempt: true,
+            },
+            ..Default::default()
+        };
+        let options = to_chat_options(&request);
         assert_eq!(options.tool_choice, ToolChoiceMode::Required);
         assert_eq!(options.max_tokens_override, Some(512));
-        let options = to_chat_options(&sdk::ToolChoice::Specific("x".into()), None);
-        assert_eq!(options.tool_choice, ToolChoiceMode::Specific("x".into()));
+        assert_eq!(
+            options.response_mode,
+            crate::traits::ResponseMode::JsonObject
+        );
+        assert_eq!(options.reasoning_effort_override.as_deref(), Some("low"));
+        assert!(options.single_attempt_fail_closed);
+        let request = sdk::ModelRequest {
+            tool_choice: sdk::ToolChoice::Specific("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            to_chat_options(&request).tool_choice,
+            ToolChoiceMode::Specific("x".into())
+        );
     }
 }

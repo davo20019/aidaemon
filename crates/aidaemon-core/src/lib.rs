@@ -53,7 +53,7 @@ pub use failover::{
 };
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};
 pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
-pub use message::{Image, Message, MessageOrigin, Role, ToolCall};
+pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{RunOutcome, RunStatus};
 pub use provider::{
     collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,

@@ -57,6 +57,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         router,
         provider_kind,
         failover_targets,
+        models,
     } = crate::providers::factory::build_provider_router(&config)?;
     let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
@@ -64,7 +65,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         provider_kind,
         model.clone(),
         failover_targets,
-    );
+    )
+    .with_models(models);
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,

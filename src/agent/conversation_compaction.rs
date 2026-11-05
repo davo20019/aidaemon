@@ -300,7 +300,6 @@ mod tests {
     use crate::events::{Event, EventType};
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
-    use crate::traits::ModelProvider;
     use serde_json::json;
 
     async fn seed_complete_turn(store: &EventStore, session: &str, number: usize) {
@@ -337,7 +336,7 @@ mod tests {
 
     fn runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
         SharedLlmRuntime::new(
-            provider as Arc<dyn ModelProvider>,
+            provider as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "mock-model".to_string(),

@@ -142,6 +142,7 @@ impl Agent {
             bundle.provider_kind,
             new_primary.clone(),
             bundle.failover_targets,
+            bundle.models,
         );
 
         {
@@ -197,7 +198,7 @@ impl Agent {
 
     /// List available models from the provider.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        self.llm_runtime.provider().list_models().await
+        self.llm_runtime.snapshot().models().list().await
     }
 
     /// Stamp the current config as "last known good" — called after a

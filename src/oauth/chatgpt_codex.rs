@@ -298,18 +298,6 @@ impl ChatGptCredentialManager {
             persist_refreshes: false,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_token_url(credentials: ChatGptCredentials, token_url: String) -> Self {
-        Self {
-            state: Mutex::new(CredentialState {
-                credentials: Some(credentials),
-                rejection: None,
-            }),
-            token_url,
-            persist_refreshes: false,
-        }
-    }
 }
 
 static SHARED_CREDENTIAL_MANAGER: Lazy<Arc<ChatGptCredentialManager>> =

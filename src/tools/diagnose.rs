@@ -12,6 +12,7 @@ use crate::events::{
     TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
 };
 use crate::llm_runtime::SharedLlmRuntime;
+use crate::providers::ChatJson;
 use crate::tools::sanitize::redact_secrets;
 use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCapabilities};
 use crate::utils::truncate_str;
@@ -1988,19 +1989,21 @@ mod tests {
     use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{ModelProvider, TokenUsage};
+    use crate::traits::TokenUsage;
 
     struct MockProvider {
         content: String,
     }
 
-    #[async_trait]
-    impl ModelProvider for MockProvider {
-        async fn chat(
+    crate::testing::chat_json_provider!(MockProvider);
+
+    impl MockProvider {
+        async fn respond(
             &self,
             _model: &str,
             _messages: &[Value],
             _tools: &[Value],
+            _options: &crate::traits::ChatOptions,
         ) -> anyhow::Result<ProviderResponse> {
             Ok(ProviderResponse {
                 content: Some(self.content.clone()),
@@ -2017,10 +2020,6 @@ mod tests {
                 response_note: None,
             })
         }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(vec!["mock-fast".to_string()])
-        }
     }
 
     async fn setup_tool() -> DiagnoseTool {
@@ -2035,7 +2034,7 @@ mod tests {
         std::mem::forget(db_file);
 
         let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider {
+        let provider: crate::llm_runtime::ModelBackend = Arc::new(MockProvider {
             content: json!({
                 "what_failed":"Tool execution failed",
                 "candidates":[

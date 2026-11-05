@@ -1141,7 +1141,19 @@ async fn test_slack_command_request_llm_payload() {
 async fn test_gemini_no_grounding_with_function_tools() {
     use serde_json::json;
 
-    let provider = crate::providers::GoogleGenAiProvider::new("fake-key");
+    let provider = aidaemon_providers::GoogleGenai::builder()
+        .api_key("fake-key")
+        .build()
+        .unwrap();
+    let body_for = |tools: &[serde_json::Value]| {
+        let messages = vec![json!({"role": "user", "content": "What time is it?"})];
+        provider.request_body(&crate::providers::sdk_backed::to_sdk_request(
+            "gemini-test",
+            &messages,
+            tools,
+            &crate::traits::ChatOptions::default(),
+        ))
+    };
 
     let tools = vec![json!({
         "type": "function",
@@ -1157,17 +1169,13 @@ async fn test_gemini_no_grounding_with_function_tools() {
         }
     })];
 
-    // When function tools are present, grounding must be disabled
-    let converted = provider.convert_tools_for_test(&tools, false);
-    assert!(converted.is_some(), "Should have tools");
-    let tools_array = converted.unwrap();
-
-    // Should have only 1 entry: function_declarations (NO google_search)
+    // When function tools are present, grounding must be disabled.
+    let body = body_for(&tools);
+    let tools_array = body["tools"].as_array().expect("should have tools");
     assert_eq!(
         tools_array.len(),
         1,
-        "Expected only function_declarations, got: {:?}",
-        tools_array
+        "Expected only function_declarations, got: {tools_array:?}"
     );
     assert!(
         tools_array[0].get("function_declarations").is_some(),
@@ -1178,10 +1186,9 @@ async fn test_gemini_no_grounding_with_function_tools() {
         "google_search should NOT be present alongside function tools"
     );
 
-    // When no function tools, grounding IS included
-    let converted_grounding = provider.convert_tools_for_test(&[], true);
-    assert!(converted_grounding.is_some());
-    let grounding_array = converted_grounding.unwrap();
+    // When no function tools, grounding IS included.
+    let body = body_for(&[]);
+    let grounding_array = body["tools"].as_array().expect("grounding tool");
     assert_eq!(grounding_array.len(), 1);
     assert!(
         grounding_array[0].get("google_search").is_some(),

@@ -614,10 +614,19 @@ async fn test_tool_schemas_gemini_compatible() {
     let tools = &call_log[0].tools;
     assert!(!tools.is_empty(), "Expected tools in the LLM call");
 
-    // Run them through the Gemini convert_tools pipeline
-    let gemini = crate::providers::GoogleGenAiProvider::new("fake-key");
-    let converted = gemini.convert_tools_for_test(tools, false);
-    assert!(converted.is_some(), "convert_tools should return Some");
+    // Run them through the Gemini request builder.
+    let gemini = aidaemon_providers::GoogleGenai::builder()
+        .api_key("fake-key")
+        .build()
+        .unwrap();
+    let body = gemini.request_body(&crate::providers::sdk_backed::to_sdk_request(
+        "gemini-test",
+        &[serde_json::json!({"role": "user", "content": "hi"})],
+        tools,
+        &crate::traits::ChatOptions::default(),
+    ));
+    let converted = body.get("tools").cloned();
+    assert!(converted.is_some(), "the request should carry tools");
 
     // Recursively check no $schema anywhere in the output
     fn assert_no_schema(value: &serde_json::Value, path: &str) {

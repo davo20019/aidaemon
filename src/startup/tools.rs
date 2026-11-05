@@ -1266,7 +1266,6 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
-    use crate::traits::ModelProvider;
     use proptest::prelude::*;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1307,7 +1306,7 @@ mod tests {
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
-        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
+        let model_provider = Arc::new(MockProvider::new()) as crate::llm_runtime::ModelBackend;
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
