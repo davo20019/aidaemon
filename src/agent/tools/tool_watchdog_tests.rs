@@ -1106,3 +1106,107 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
 }
+
+/// The instance the kernel bridged and judged for a turn: it records that it
+/// ran, so a test can tell it from the registry's tool of the same name.
+struct JudgedMcpStandIn(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Tool for JudgedMcpStandIn {
+    fn name(&self) -> &str {
+        "fake__echo"
+    }
+
+    fn description(&self) -> &str {
+        "The judged instance of an MCP tool"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "fake__echo",
+            "description": "The judged instance of an MCP tool",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": true}
+        })
+    }
+
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok("ran the judged instance".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for JudgedMcpStandIn {}
+
+fn kernel_mcp_ctx<'a>(mcp_tool: Option<&'a Arc<dyn Tool>>) -> ToolExecCtx<'a> {
+    ToolExecCtx {
+        mcp_tool,
+        owner_approval_by_kernel: true,
+        ..mandate_tool_ctx(None)
+    }
+}
+
+/// A kernel call runs the MCP instance judged at turn start, even when the
+/// registry now holds a different tool under the same name (a server
+/// reloaded mid-turn): the registry's tool never runs.
+#[tokio::test]
+async fn kernel_call_runs_the_judged_mcp_instance_not_the_registrys() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let judged: Arc<dyn Tool> = Arc::new(JudgedMcpStandIn(ran.clone()));
+
+    let outcome = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(Some(&judged)),
+        )
+        .await
+        .expect("the judged instance runs");
+
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
+    assert!(
+        outcome.output.contains("ran the judged instance"),
+        "{}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("synthetic registry echo"),
+        "the registry's tool ran: {}",
+        outcome.output
+    );
+}
+
+/// A kernel call for which the kernel judged no MCP tool runs nothing,
+/// even though the registry holds a tool under that name.
+#[tokio::test]
+async fn kernel_call_without_a_judged_mcp_tool_runs_nothing() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+
+    let result = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(None),
+        )
+        .await;
+
+    match result {
+        Err(error) => assert!(
+            error.downcast_ref::<UnknownToolError>().is_some(),
+            "{error}"
+        ),
+        Ok(outcome) => panic!("an unjudged MCP tool ran: {}", outcome.output),
+    }
+}
