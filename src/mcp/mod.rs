@@ -78,9 +78,8 @@ impl McpTool {
 /// itself; the MCP specification says to treat them as untrusted. They never
 /// relax a safeguard here: nothing that gates a decision (the authority
 /// hook's read-only level, the profile's tool pruning, the untrusted-content
-/// verifier, transport retries) reads them. The definition is taken only so
-/// callers state where the tool came from.
-pub(crate) fn capabilities_from_tool_definition(_definition: &Value) -> ToolCapabilities {
+/// verifier, transport retries) reads them.
+pub(crate) fn mcp_tool_capabilities() -> ToolCapabilities {
     ToolCapabilities {
         read_only: false,
         external_side_effect: true,
@@ -311,7 +310,7 @@ pub async fn discover_mcp_tools(
                                 name,
                                 tool_schema,
                                 Arc::clone(&client),
-                                capabilities_from_tool_definition(&td),
+                                mcp_tool_capabilities(),
                             )));
                         }
                     }
@@ -336,9 +335,15 @@ mod annotation_tests {
     fn mcp_tool(annotations: Value) -> McpTool {
         McpTool::new(
             "synthetic_tool".to_string(),
-            serde_json::json!({"name": "synthetic_tool", "description": "", "parameters": {"type": "object"}}),
+            // The server's hints travel with the definition; nothing reads them.
+            serde_json::json!({
+                "name": "synthetic_tool",
+                "description": "",
+                "parameters": {"type": "object"},
+                "annotations": annotations,
+            }),
             Arc::new(McpClient::idle_for_test()),
-            capabilities_from_tool_definition(&serde_json::json!({"annotations": annotations})),
+            mcp_tool_capabilities(),
         )
     }
 
