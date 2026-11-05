@@ -453,6 +453,29 @@ impl Tool for ManageGoalTasksTool {
             high_impact_write: false,
         }
     }
+
+    /// `list_tasks`, `claim_task` and an `update_task` that does not put a
+    /// task back to `pending` only write the daemon's own task records.
+    /// Creating, retrying or unblocking a task queues work, and completing
+    /// or failing a goal can alert the owner, so those stay undeclared.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let field = |key: &str| {
+            args.as_ref()
+                .and_then(|args| args.get(key))
+                .and_then(Value::as_str)
+        };
+        let internal = match field("action") {
+            Some("list_tasks" | "claim_task") => true,
+            Some("update_task") => field("status") != Some("pending"),
+            _ => false,
+        };
+        if internal {
+            aidaemon_core::CallEffects::none()
+        } else {
+            aidaemon_core::CallEffects::unknown()
+        }
+    }
 }
 
 /// Check if all dependencies for a task are completed. Returns Ok(()) if all are met,
@@ -1475,6 +1498,35 @@ mod tests {
         // We need to keep db_file alive, but for tests we'll leak it
         std::mem::forget(db_file);
         (state as Arc<dyn StateStore>, goal.id)
+    }
+
+    /// Bookkeeping on existing tasks declares no effects; actions that queue
+    /// work or end a goal stay undeclared.
+    #[tokio::test]
+    async fn only_bookkeeping_actions_declare_no_effects() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id, state);
+        let effects = |args: Value| tool.call_effects(&args.to_string());
+        let none = aidaemon_core::CallEffects::none();
+        assert_eq!(effects(json!({"action": "list_tasks"})), none);
+        assert_eq!(
+            effects(json!({"action": "claim_task", "task_id": "t1"})),
+            none
+        );
+        assert_eq!(
+            effects(json!({"action": "update_task", "task_id": "t1", "status": "completed"})),
+            none
+        );
+        for queues_work in [
+            json!({"action": "update_task", "task_id": "t1", "status": "pending"}),
+            json!({"action": "create_task", "description": "synthetic"}),
+            json!({"action": "retry_task", "task_id": "t1"}),
+            json!({"action": "resolve_blocker", "task_id": "t1"}),
+            json!({"action": "complete_goal"}),
+            json!({"action": "fail_goal"}),
+        ] {
+            assert!(!effects(queues_work.clone()).complete, "{queues_work}");
+        }
     }
 
     fn test_task(goal_id: &str, id: &str, description: &str, created_at: &str) -> Task {

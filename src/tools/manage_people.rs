@@ -160,6 +160,26 @@ impl Tool for ManagePeopleTool {
             high_impact_write: false,
         }
     }
+
+    /// Every action but `enable`/`disable` (a runtime setting) touches only
+    /// the agent's own people store.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        match action.as_deref() {
+            Some(
+                "status" | "add" | "list" | "view" | "brief" | "upcoming" | "reconnect" | "update"
+                | "remove" | "add_fact" | "remove_fact" | "link" | "export" | "purge" | "audit"
+                | "confirm",
+            ) => aidaemon_core::CallEffects::none(),
+            _ => aidaemon_core::CallEffects::unknown(),
+        }
+    }
 }
 
 impl ManagePeopleTool {
@@ -857,6 +877,26 @@ mod tests {
             bytes <= 1000,
             "manage_people schema is {bytes} bytes, budget is 1000"
         );
+    }
+
+    /// The people store is the agent's own; only the enable/disable setting
+    /// stays undeclared.
+    #[tokio::test]
+    async fn people_store_actions_declare_no_effects() {
+        let tool = setup_tool().await;
+        let effects = |action: &str| tool.call_effects(&json!({"action": action}).to_string());
+        for action in [
+            "add", "update", "remove", "add_fact", "purge", "export", "view",
+        ] {
+            assert_eq!(
+                effects(action),
+                aidaemon_core::CallEffects::none(),
+                "{action}"
+            );
+        }
+        for action in ["enable", "disable", "unknown"] {
+            assert!(!effects(action).complete, "{action}");
+        }
     }
 
     async fn setup_tool() -> ManagePeopleTool {

@@ -517,6 +517,36 @@ impl Tool for ManageMemoriesTool {
             high_impact_write: true,
         }
     }
+
+    /// Reads, `repair` and `forget` touch only the agent's own memory store.
+    /// `set_privacy` widens who may see a fact, and the goal and schedule
+    /// actions start or schedule work, so those stay undeclared.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        match action_of(arguments).as_deref() {
+            Some(
+                "list"
+                | "health"
+                | "search"
+                | "search_episodes"
+                | "list_goals"
+                | "list_scheduled"
+                | "list_scheduled_matching"
+                | "diagnose_scheduled"
+                | "repair"
+                | "forget",
+            ) => aidaemon_core::CallEffects::none(),
+            _ => aidaemon_core::CallEffects::unknown(),
+        }
+    }
+}
+
+/// The `action` argument, if any.
+fn action_of(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_string)
 }
 
 impl ManageMemoriesTool {
@@ -2421,6 +2451,26 @@ mod tests {
             bytes <= 1250,
             "manage_memories schema is {bytes} bytes, budget is 1250"
         );
+    }
+
+    /// Memory-store actions declare no effects; privacy, goal and schedule
+    /// actions stay undeclared.
+    #[tokio::test]
+    async fn memory_store_actions_declare_no_effects() {
+        let tool = ManageMemoriesTool::new(setup_state().await);
+        let effects = |args: Value| tool.call_effects(&args.to_string());
+        for action in ["forget", "repair", "list", "search"] {
+            assert!(effects(json!({"action": action})).complete, "{action}");
+        }
+        for action in [
+            "set_privacy",
+            "create_personal_goal",
+            "create_scheduled_goal",
+            "cancel_scheduled",
+            "retry_scheduled",
+        ] {
+            assert!(!effects(json!({"action": action})).complete, "{action}");
+        }
     }
 
     #[tokio::test]

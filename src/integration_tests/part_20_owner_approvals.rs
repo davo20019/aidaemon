@@ -256,6 +256,94 @@ async fn declined_http_post_blocks_curl_to_same_host() {
     assert_eq!(decisions[1]["reason"], "declined by the owner");
 }
 
+/// `manage_config` as is, except that it is offered on a Balanced turn
+/// (`high_impact_write` only filters the offer; effects, semantics and
+/// annotations are the real tool's).
+struct OfferedConfigTool(crate::tools::ConfigManagerTool);
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for OfferedConfigTool {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn schema(&self) -> serde_json::Value {
+        self.0.schema()
+    }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.0.call(arguments).await
+    }
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        self.0.call_semantics(arguments)
+    }
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        self.0.call_effects(arguments)
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            high_impact_write: false,
+            ..self.0.capabilities()
+        }
+    }
+}
+
+/// A tool whose only effect is the agent's own memory declares none, so a
+/// decline earlier in the run never puts it to the owner; a configuration
+/// change still asks.
+#[tokio::test]
+async fn internal_state_tools_are_not_reasked_after_a_decline() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(&config_path, "[provider]\nmodel = \"synthetic-model\"\n").unwrap();
+    let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
+    std::mem::forget(_tool_rx);
+    let config: Arc<dyn crate::traits::Tool> = Arc::new(OfferedConfigTool(
+        crate::tools::ConfigManagerTool::new(
+            config_path.clone(),
+            crate::tools::ApprovalBroker::new(tool_tx),
+        ),
+    ));
+    let (harness, approver) = approvals_harness_with(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::tool_call_response(
+                "remember_fact",
+                &json!({"category": "preference", "key": "report_format", "value": "short summaries for Alice Rivera"}).to_string(),
+            ),
+            MockProvider::tool_call_response(
+                "manage_config",
+                &json!({"action": "set", "key": "provider.model", "value": "\"synthetic-other\""}).to_string(),
+            ),
+            MockProvider::text_response("Noted the preference; the rest was declined."),
+        ],
+        vec![
+            Some(crate::types::ApprovalResponse::Deny),
+            Some(crate::types::ApprovalResponse::Deny),
+        ],
+        None,
+        vec![config],
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 2, "the POST and the config change only");
+    let cards = approver.cards.lock().unwrap().clone();
+    assert!(cards[1].command.contains("manage_config"), "{cards:?}");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert!(!results[1].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[2].contains("[OWNER DECLINED]"), "{results:?}");
+    use crate::traits::store_prelude::*;
+    let facts = harness.state.get_facts(Some("preference")).await.unwrap();
+    assert!(
+        facts.iter().any(|fact| fact.key == "report_format"),
+        "the fact was stored: {facts:?}"
+    );
+    assert!(std::fs::read_to_string(&config_path).unwrap().contains("synthetic-model"));
+}
+
 #[tokio::test]
 async fn approval_timeout_is_a_decline() {
     let (harness, approver) = approvals_harness(

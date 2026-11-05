@@ -478,6 +478,12 @@ impl Tool for RememberFactTool {
             high_impact_write: false,
         }
     }
+
+    /// Only the agent's own memory store changes, so a decline earlier in
+    /// the run never puts a fact to the owner.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::none()
+    }
 }
 
 #[cfg(test)]

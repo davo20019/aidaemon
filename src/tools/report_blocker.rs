@@ -448,6 +448,11 @@ impl Tool for ReportBlockerTool {
         ToolCallSemantics::administrative()
     }
 
+    /// Records the blocker in the agent's own task state; nothing else.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::none()
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let mut args: ReportBlockerArgs = serde_json::from_str(arguments)?;
         if self.mandate_execution {
