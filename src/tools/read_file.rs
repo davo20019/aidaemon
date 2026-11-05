@@ -178,7 +178,7 @@ impl ReadFileTool {
         let backend = active_execution_backend();
         let path = backend.resolve_path(path_str).await?;
         let local_path = std::path::Path::new(path.as_str());
-        if fs_utils::is_sensitive_path(local_path) && !is_env_template(local_path) {
+        if fs_utils::is_secret_path(local_path) && !is_env_template(local_path) {
             return Ok(ToolCallOutcome::contract_rejection(format!(
                 "read_file does not open credential or secret files ({path_str}). Ask the owner to share what is needed."
             )));
@@ -794,6 +794,36 @@ mod tests {
             let text = read_in_tempdir(name, "API_TOKEN=changeme\n").await.unwrap();
             assert!(text.contains("API_TOKEN=changeme"), "{name}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_git_head_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
+        for (name, needle) in [("HEAD", "refs/heads/main"), ("config", "bare = false")] {
+            let args = json!({"path": git.join(name).to_str().unwrap()}).to_string();
+            let text = ReadFileTool.call(&args).await.unwrap();
+            assert!(text.contains(needle), "{name}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_the_daemons_own_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("daemon-config.toml");
+        std::fs::write(&own, "token = \"synthetic-secret\"\n").unwrap();
+        let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
+        let args = json!({"path": own.to_str().unwrap()}).to_string();
+        let text = ReadFileTool.call(&args).await.unwrap();
+        assert!(text.contains("does not open credential or secret files"));
+        assert!(!text.contains("synthetic-secret"));
+        let other = dir.path().join("config.toml");
+        std::fs::write(&other, "title = \"ok\"\n").unwrap();
+        let args = json!({"path": other.to_str().unwrap()}).to_string();
+        assert!(ReadFileTool.call(&args).await.unwrap().contains("title"));
     }
 
     #[tokio::test]
