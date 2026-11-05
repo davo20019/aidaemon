@@ -1580,7 +1580,10 @@ fn segment_effects(tokens: &[String], here: Option<&str>, out: &mut ShellAnalysi
     }
     let name = basename(program);
     let args = &tokens[1..];
-    if OBSERVATION_PROGRAMS.contains(&name) && observation_args_ok(name, args) {
+    // Every git command can run repository-configured code (diff.external,
+    // core.fsmonitor, aliases, pagers, hooks), so none is a modelled
+    // observation here; `git` below declares what it can as a lower bound.
+    if name != "git" && OBSERVATION_PROGRAMS.contains(&name) && observation_args_ok(name, args) {
         return;
     }
     match name {
@@ -2651,22 +2654,24 @@ fn git_remote(remote: &str) -> Result<Option<EffectKey>, ()> {
     }
 }
 
-/// git's network commands. `ls-remote <strict URL>` with no options is
-/// complete (it only lists the remote's refs). `clone`, `fetch`, `pull` and
-/// `push` are always incomplete: they run repository hooks and may fetch
-/// submodules from other hosts. The remote's egress is still declared when
-/// it is a URL. Any other git command that is not an observation is
-/// undeterminable.
+/// Every git command is incomplete: repository config (diff.external,
+/// core.fsmonitor, aliases, pagers, hooks) can run code, and `clone`,
+/// `fetch` and `pull` may fetch submodules from other hosts. The remote of
+/// `ls-remote <strict URL>` and of the network subcommands is still declared
+/// as a lower bound.
 fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     let Some(subcommand) = args.first().filter(|arg| !arg.starts_with('-')) else {
         out.opaque();
         return;
     };
     let rest = &args[1..];
+    // Repository config can run code for any subcommand: never complete.
+    out.opaque();
     if subcommand == "ls-remote" {
-        match rest {
-            [remote] if remote.contains("://") => out.egress(url_effect(remote)),
-            _ => out.opaque(),
+        if let [remote] = rest {
+            if let Some(key) = url_effect(remote) {
+                out.add(key);
+            }
         }
         return;
     }
@@ -3204,10 +3209,6 @@ mod tests {
                 "http POST https://api.example.invalid/v1 name=x",
                 &["api.example.invalid:443"],
             ),
-            (
-                "git ls-remote https://git.example.invalid/acme/repo.git",
-                &["git.example.invalid:443"],
-            ),
         ];
         for (command, hosts) in cases {
             let effects = shell_call_effects(command, None);
@@ -3303,7 +3304,7 @@ mod tests {
         let resolved = shell_call_effects("rm build", Some(&dir));
         assert!(resolved.complete);
         assert_eq!(resolved.keys[0].target, canonical(&format!("{dir}/build")));
-        for observation in ["ls -la", "git status", "echo hi", "cat a | grep b"] {
+        for observation in ["ls -la", "echo hi", "cat a | grep b"] {
             assert_eq!(
                 shell_call_effects(observation, None),
                 CallEffects::none(),
@@ -3392,10 +3393,7 @@ mod tests {
             ("git push https://a.example.invalid/r main", Incomplete),
             ("git clone https://a.example.invalid/r /tmp/aidaemon-test/c", Incomplete),
             ("git clone https://h.example.invalid/a.bundle", Incomplete),
-            (
-                "git ls-remote https://a.example.invalid/r",
-                Exact(vec![egress("a.example.invalid:443")]),
-            ),
+            ("git ls-remote https://a.example.invalid/r", Incomplete),
             ("git ls-remote --heads https://a.example.invalid/r", Incomplete),
             // I5: rsync writes outside the destination.
             (
@@ -3472,7 +3470,15 @@ mod tests {
             ("git clone --upload-pack=x https://a.example.invalid/r", Incomplete),
             ("git push --receive-pack=x https://a.example.invalid/r", Incomplete),
             ("git commit -m x", Incomplete),
-            ("git status", Exact(vec![])),
+            // Repository config (diff.external, core.fsmonitor, aliases,
+            // pagers, hooks) runs code for every git command.
+            ("git status", Incomplete),
+            ("git diff", Incomplete),
+            ("git log --oneline", Incomplete),
+            ("git show HEAD", Incomplete),
+            ("git rev-parse HEAD", Incomplete),
+            ("git branch --list", Incomplete),
+            ("ls -la && git status", Incomplete),
             // Probe list: ssh, scp, nc, rsync.
             ("ssh -o ProxyCommand=x h.example.invalid", Incomplete),
             ("ssh -F cfg h.example.invalid", Incomplete),
