@@ -732,3 +732,114 @@ async fn test_live_behavior_no_web_search_for_local_files() {
         &response[..response.len().min(500)]
     );
 }
+
+/// A capped primary plan falls over to the real Claude and Gemini backends
+/// at once: the capped account is sent one request, its other model none,
+/// and no backoff is spent.
+///
+/// Keys come from `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (the environment
+/// or `.env`); models from `AIDAEMON_LIVE_ANTHROPIC_MODEL` /
+/// `AIDAEMON_LIVE_GEMINI_MODEL`. A provider without a key is left out, and
+/// the test fails when neither has one.
+///
+/// ```bash
+/// AIDAEMON_LIVE_TEST=1 cargo test test_live_capped_plan -- --nocapture
+/// ```
+#[tokio::test]
+async fn test_live_capped_plan_falls_over_to_other_providers() {
+    use aidaemon_core::{
+        Failover, FailoverStep, ModelRequest, Provider, ProviderError, QuotaGuard,
+    };
+    if !should_run_live_tests() {
+        return;
+    }
+    let _ = dotenvy::from_path(".env");
+    let key = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+    };
+    let model = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+
+    let mut others: Vec<(String, Arc<dyn Provider>)> = Vec::new();
+    if let Some(api_key) = key("ANTHROPIC_API_KEY") {
+        let backend = aidaemon_providers::Anthropic::builder()
+            .api_key(api_key)
+            .build()
+            .expect("anthropic backend");
+        let model = model("AIDAEMON_LIVE_ANTHROPIC_MODEL", "claude-haiku-5-5");
+        others.push((model, Arc::new(QuotaGuard::new(backend))));
+    }
+    if let Some(api_key) = key("GEMINI_API_KEY").or_else(|| key("GOOGLE_API_KEY")) {
+        let backend = aidaemon_providers::GoogleGenai::builder()
+            .api_key(api_key)
+            .build()
+            .expect("gemini backend");
+        let model = model("AIDAEMON_LIVE_GEMINI_MODEL", "gemini-2.5-flash");
+        others.push((model, Arc::new(QuotaGuard::new(backend))));
+    }
+    assert!(
+        !others.is_empty(),
+        "set ANTHROPIC_API_KEY and/or GEMINI_API_KEY (environment or .env)"
+    );
+
+    let request = |model: &str| ModelRequest {
+        model: model.into(),
+        messages: vec![aidaemon_core::Message::user(
+            "Reply with exactly one word: pong",
+        )],
+        max_output_tokens: Some(256),
+        ..Default::default()
+    };
+
+    // Each real provider answers on its own.
+    for (model, provider) in &others {
+        let started = std::time::Instant::now();
+        match provider.complete(&request(model)).await {
+            Ok(response) => println!(
+                "{} {model}: {:?} in {:?}",
+                provider.name(),
+                response.text.trim(),
+                started.elapsed()
+            ),
+            Err(error) => panic!("{} {model} failed on its own: {error}", provider.name()),
+        }
+    }
+
+    // The capped plan, then each real provider in turn.
+    for (model, provider) in &others {
+        let capped_inner = Arc::new(aidaemon_core::testing::ScriptedProvider::with_results(
+            vec![Err(ProviderError::QuotaExhausted {
+                message: "The usage limit has been reached".into(),
+                resets_at: Some(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+                per_model: false,
+            })],
+        ));
+        let capped: Arc<dyn Provider> = Arc::new(QuotaGuard::from_arc(capped_inner.clone()));
+        let chain = Failover::new(vec![
+            FailoverStep::from_arc(capped.clone())
+                .model("plan-model")
+                .attempts(3),
+            FailoverStep::from_arc(capped)
+                .model("plan-model-small")
+                .attempts(3),
+            FailoverStep::from_arc(provider.clone()).model(model.clone()),
+        ]);
+        let started = std::time::Instant::now();
+        let response = chain
+            .complete(&request("plan-model"))
+            .await
+            .unwrap_or_else(|error| panic!("chain to {model} failed: {error}"));
+        let elapsed = started.elapsed();
+        println!(
+            "capped plan -> {} {model}: {:?} in {elapsed:?}",
+            provider.name(),
+            response.text.trim()
+        );
+        assert!(response.text.to_ascii_lowercase().contains("pong"));
+        assert_eq!(capped_inner.requests().len(), 1, "capped account sent once");
+        assert!(elapsed < std::time::Duration::from_secs(60));
+    }
+}
