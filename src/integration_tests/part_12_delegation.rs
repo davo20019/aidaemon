@@ -579,6 +579,18 @@ async fn test_report_blocker_terminates_executor_loop() {
 
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(updated.status, "blocked");
+
+    // The executor's run ends completed with partial work.
+    let ends: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE event_type = 'task_end' ORDER BY id DESC",
+    )
+    .fetch_all(&agent.event_store().pool())
+    .await
+    .unwrap();
+    let end: crate::events::TaskEndData =
+        serde_json::from_str(ends.first().expect("executor task end")).unwrap();
+    assert_eq!(end.status, crate::events::TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), crate::events::TaskOutcome::Partial);
 }
 
 #[tokio::test]

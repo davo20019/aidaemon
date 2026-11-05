@@ -365,6 +365,11 @@ async fn test_sdk_committed_mandate_wait_ends_the_review() {
         1,
         "no model call after the committed decision"
     );
+    assert_eq!(
+        latest_task_outcome(&harness, "mandate-review").await,
+        crate::events::TaskOutcome::Succeeded,
+        "a committed WAIT completes the review"
+    );
 
     // A fenced worker's operations are ledgered on its durable worker task:
     // each call sits with its result, where the run-scoped receipt checks

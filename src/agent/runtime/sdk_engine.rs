@@ -1482,3 +1482,7 @@ impl Agent {
 #[cfg(test)]
 #[path = "sdk_engine/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sdk_engine/finish_tests.rs"]
+mod finish_tests;
