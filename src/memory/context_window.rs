@@ -28,8 +28,9 @@ static SUMMARY_SEMAPHORE: std::sync::LazyLock<Semaphore> =
 static SUMMARY_SESSION_LOCKS: std::sync::LazyLock<
     AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
 > = std::sync::LazyLock::new(|| AsyncMutex::new(HashMap::new()));
-/// A running background job owns each key. The bool is a coalesced dirty bit.
-static SUMMARY_JOBS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, bool>>> =
+/// A running background job owns each key. The value is the finished turn a
+/// coalesced rerun must use (`Some` once another turn ended while it ran).
+static SUMMARY_JOBS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 /// Rolling provider/model correction for the portable chars/4 fallback.
 static TOKEN_ESTIMATE_CORRECTION: std::sync::LazyLock<
@@ -754,7 +755,14 @@ fn summary_prefix_len(
     turns: &[FetchedTurn],
     token_threshold: usize,
     recent_token_budget: usize,
+    finished_turn_id: Option<&str>,
 ) -> usize {
+    // A turn is over once its `task_end` lands, or, for the caller that just
+    // finished it, as soon as its run ended (the `task_end` comes after).
+    let is_finished = |turn: &FetchedTurn| {
+        turn.terminal_status.is_some()
+            || finished_turn_id.is_some_and(|id| turn.turn_id.as_deref() == Some(id))
+    };
     let turn_tokens = turns
         .iter()
         .map(|turn| {
@@ -768,10 +776,7 @@ fn summary_prefix_len(
         return 0;
     }
 
-    let protected_turns = if turns
-        .last()
-        .is_some_and(|turn| turn.terminal_status.is_some())
-    {
+    let protected_turns = if turns.last().is_some_and(is_finished) {
         1
     } else {
         2
@@ -785,7 +790,7 @@ fn summary_prefix_len(
     let mut summarized_tokens = 0usize;
     let mut prefix_len = 0;
     for (index, turn) in turns.iter().enumerate().take(max_prefix_len) {
-        let is_closed = turn.terminal_status.is_some() || index + 1 < turns.len();
+        let is_closed = is_finished(turn) || index + 1 < turns.len();
         let next_tokens = summarized_tokens.saturating_add(turn_tokens[index]);
         if !is_closed || next_tokens > target_summary_tokens {
             break;
@@ -843,6 +848,7 @@ pub(crate) async fn refresh_incremental_summarization(
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
     session_id: &str,
+    finished_turn_id: Option<&str>,
     token_threshold: usize,
     recent_token_budget: usize,
 ) -> anyhow::Result<Option<ConversationSummary>> {
@@ -874,7 +880,12 @@ pub(crate) async fn refresh_incremental_summarization(
     let correction = token_estimate_correction(model);
     let raw_token_threshold = ((token_threshold as f64) / correction).ceil() as usize;
     let raw_recent_token_budget = ((recent_token_budget as f64) / correction).ceil() as usize;
-    let prefix_len = summary_prefix_len(&turns, raw_token_threshold, raw_recent_token_budget);
+    let prefix_len = summary_prefix_len(
+        &turns,
+        raw_token_threshold,
+        raw_recent_token_budget,
+        finished_turn_id,
+    );
     if prefix_len == 0 {
         return Ok(None);
     }
@@ -1431,6 +1442,7 @@ pub fn spawn_incremental_summarization(
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
     session_id: String,
+    finished_turn_id: String,
     token_threshold: usize,
     recent_token_budget: usize,
     user_role: UserRole,
@@ -1442,11 +1454,11 @@ pub fn spawn_incremental_summarization(
         let mut jobs = SUMMARY_JOBS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(dirty) = jobs.get_mut(&session_id) {
-            *dirty = true;
+        if let Some(rerun) = jobs.get_mut(&session_id) {
+            *rerun = Some(finished_turn_id.clone());
             false
         } else {
-            jobs.insert(session_id.clone(), false);
+            jobs.insert(session_id.clone(), None);
             true
         }
     };
@@ -1456,6 +1468,7 @@ pub fn spawn_incremental_summarization(
     }
 
     tokio::spawn(async move {
+        let mut finished_turn_id = finished_turn_id;
         loop {
             match refresh_incremental_summarization(
                 provider.clone(),
@@ -1463,6 +1476,7 @@ pub fn spawn_incremental_summarization(
                 state.clone(),
                 event_store.clone(),
                 &session_id,
+                Some(&finished_turn_id),
                 token_threshold,
                 recent_token_budget,
             )
@@ -1482,19 +1496,17 @@ pub fn spawn_incremental_summarization(
                 let mut jobs = SUMMARY_JOBS
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match jobs.get_mut(&session_id) {
-                    Some(dirty) if *dirty => {
-                        *dirty = false;
-                        true
-                    }
-                    _ => {
+                match jobs.get_mut(&session_id).and_then(Option::take) {
+                    Some(turn_id) => Some(turn_id),
+                    None => {
                         jobs.remove(&session_id);
-                        false
+                        None
                     }
                 }
             };
-            if !rerun {
-                break;
+            match rerun {
+                Some(turn_id) => finished_turn_id = turn_id,
+                None => break,
             }
         }
     });
@@ -1544,7 +1556,7 @@ mod tests {
             estimate_multimodal_message_tokens(&summary_messages_from_turns(&turns[1..]));
         // The token overlap covers the tool turn plus newest turn, so only the
         // oldest whole turn is compacted.
-        assert_eq!(summary_prefix_len(&turns, 1, recent_tokens), 1);
+        assert_eq!(summary_prefix_len(&turns, 1, recent_tokens, None), 1);
         let rendered = summary_messages_from_turns(&turns[..1]);
         assert_eq!(rendered.len(), 2);
         assert!(!serde_json::to_string(&rendered)
@@ -1559,7 +1571,7 @@ mod tests {
             fetched_turn(20, &[("user", "two"), ("assistant", "two")], true),
             fetched_turn(30, &[("user", "three"), ("assistant", "three")], true),
         ];
-        let prefix = summary_prefix_len(&turns, 1, 0);
+        let prefix = summary_prefix_len(&turns, 1, 0, None);
         assert_eq!(prefix, 2);
         assert_eq!(turns[prefix - 1].turn_seq, 20);
         assert_eq!(turns[prefix - 1].messages.last().unwrap().id, "msg-20-1");
@@ -1600,7 +1612,30 @@ mod tests {
             fetched_turn(10, &[("user", "old"), ("assistant", "done")], false),
             fetched_turn(20, &[("user", "active"), ("assistant", "working")], false),
         ];
-        assert_eq!(summary_prefix_len(&turns, 1, 0), 1);
+        assert_eq!(summary_prefix_len(&turns, 1, 0, None), 1);
+    }
+
+    /// The pass after a reply runs before that turn's `task_end` lands. Told
+    /// which turn just finished, it compacts what the next turn's bootstrap
+    /// would otherwise have to compact while the user waits.
+    #[test]
+    fn turn_that_just_finished_counts_as_closed_before_its_task_end() {
+        let turns = vec![
+            fetched_turn(10, &[("user", "one"), ("assistant", "one")], true),
+            fetched_turn(20, &[("user", "two"), ("assistant", "two")], true),
+            fetched_turn(30, &[("user", "three"), ("assistant", "three")], false),
+        ];
+        // Unaware, the newest turn looks open and shields the one before it.
+        assert_eq!(summary_prefix_len(&turns, 1, 0, None), 1);
+        assert_eq!(summary_prefix_len(&turns, 1, 0, Some("turn-30")), 2);
+        // The same prefix the next turn's bootstrap computes once `task_end`
+        // has landed and a new turn has opened.
+        let mut later = turns.clone();
+        later[2].terminal_status = Some(crate::events::TaskStatus::Completed);
+        later.push(fetched_turn(40, &[("user", "four")], false));
+        assert_eq!(summary_prefix_len(&later, 1, 0, None), 2);
+        // Another turn's id does not close the newest one.
+        assert_eq!(summary_prefix_len(&turns, 1, 0, Some("turn-20")), 1);
     }
 
     #[tokio::test]
@@ -1664,6 +1699,7 @@ mod tests {
             state.clone(),
             event_store.clone(),
             session,
+            None,
             1,
             1,
         )
@@ -1683,6 +1719,7 @@ mod tests {
             state,
             event_store,
             session,
+            None,
             1,
             1,
         )

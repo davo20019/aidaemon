@@ -775,6 +775,7 @@ impl Agent {
         let memory_turn = MemoryTurn {
             session_id: session_id.to_string(),
             task_id: task_id.clone(),
+            turn_id: turn_id.clone(),
             emitter: emitter.clone(),
             user_text: user_text.to_string(),
             user_role,

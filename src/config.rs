@@ -3507,10 +3507,13 @@ pub struct ContextWindowConfig {
     #[allow(dead_code)]
     #[serde(default = "default_summarize_threshold")]
     pub summarize_threshold: usize,
-    /// Estimated unsummarized conversation tokens that trigger compaction.
+    /// Cap on the estimated unsummarized conversation tokens that trigger
+    /// compaction. Unset, compaction waits until the history fills 60% of the
+    /// turn model's context window.
     #[serde(default = "default_summarize_token_threshold")]
     pub summarize_token_threshold: usize,
-    /// Estimated tokens of recent whole turns to keep verbatim after compaction.
+    /// Cap on the estimated tokens of recent whole turns kept verbatim after
+    /// compaction. Unset, a quarter of the compaction threshold.
     #[serde(default = "default_summary_recent_tokens")]
     pub summary_recent_tokens: usize,
 }
@@ -3568,7 +3571,10 @@ impl ContextWindowConfig {
         learned_context_budget(model).map_or(assumed, |learned| learned.min(assumed))
     }
 
-    /// Token-pressure high-water mark, clamped for small model windows.
+    /// Token-pressure high-water mark for the model whose window the history
+    /// fills (the turn's model, not the summarizer's): 60% of that window, or
+    /// the configured cap when lower. Compaction runs after a reply, so a
+    /// turn never waits for it below `emergency_compaction_threshold_for`.
     pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
         let model_budget = self.context_budget_for(model);
         self.summarize_token_threshold
@@ -3576,11 +3582,23 @@ impl ContextWindowConfig {
             .max(512)
     }
 
+    /// History size at which a turn waits for compaction before its first
+    /// call: 80% of the model's window, so only a history the background
+    /// pass could not keep up with blocks a reply.
+    pub fn emergency_compaction_threshold_for(&self, model: &str) -> usize {
+        let model_budget = self.context_budget_for(model);
+        (model_budget.saturating_mul(4) / 5).max(self.summarize_token_threshold_for(model))
+    }
+
     /// Raw recent-context overlap, also clamped so a summary can make progress.
     pub fn summary_recent_tokens_for(&self, model: &str) -> usize {
-        self.summary_recent_tokens
-            .min(self.summarize_token_threshold_for(model) / 2)
-            .max(256)
+        let threshold = self.summarize_token_threshold_for(model);
+        let recent = if self.summary_recent_tokens == default_summary_recent_tokens() {
+            threshold / 4
+        } else {
+            self.summary_recent_tokens.min(threshold / 2)
+        };
+        recent.max(256)
     }
 }
 
@@ -3661,11 +3679,12 @@ fn default_summary_window() -> usize {
 fn default_summarize_threshold() -> usize {
     12
 }
+// No cap: both follow the model's context window.
 fn default_summarize_token_threshold() -> usize {
-    12_000
+    usize::MAX
 }
 fn default_summary_recent_tokens() -> usize {
-    4_000
+    usize::MAX
 }
 
 fn default_heartbeat_tick() -> u64 {
@@ -4374,6 +4393,58 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         );
         config.model_budgets.insert("gpt-6-sol".to_string(), 50_000);
         assert_eq!(config.context_budget_for("gpt-6-sol"), 50_000);
+    }
+
+    /// Compaction follows each model's own window: a history that fits a
+    /// large-window model is left alone, the same history is compacted for a
+    /// small one, and a turn waits only near the window.
+    #[test]
+    fn compaction_thresholds_follow_each_models_window() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 138_720);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 34_680);
+        assert_eq!(
+            config.summarize_token_threshold_for("claude-opus-5-5"),
+            102_000
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("claude-opus-5-5"),
+            136_000
+        );
+        assert_eq!(
+            config.summarize_token_threshold_for("models/gemini-3-pro"),
+            510_000
+        );
+        config
+            .model_budgets
+            .insert("synthetic-local-32k".to_string(), 32_000);
+        assert_eq!(
+            config.summarize_token_threshold_for("synthetic-local-32k"),
+            19_200
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("synthetic-local-32k"),
+            25_600
+        );
+        assert_eq!(
+            config.summary_recent_tokens_for("synthetic-local-32k"),
+            4_800
+        );
+
+        // An explicit cap lowers the background threshold, never the point at
+        // which a turn waits.
+        config.summarize_token_threshold = 12_000;
+        config.summary_recent_tokens = 4_000;
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 12_000);
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 4_000);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
     }
 
     #[test]
