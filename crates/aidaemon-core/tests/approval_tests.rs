@@ -44,14 +44,21 @@ fn owner_request(effects: Vec<EffectKey>) -> OwnerApprovalRequest {
 /// `HookContext::declined` and `ToolInfo::effects` held when it was asked.
 struct AskBeforeSend {
     kind: InterruptKind,
+    asks: &'static [&'static str],
     seen_declined: Mutex<Vec<Vec<EffectKey>>>,
     seen_effects: Mutex<Vec<CallEffects>>,
 }
 
 impl AskBeforeSend {
     fn new(kind: InterruptKind) -> Arc<Self> {
+        Self::asking(kind, &["send"])
+    }
+
+    /// Interrupts calls of every tool in `asks`.
+    fn asking(kind: InterruptKind, asks: &'static [&'static str]) -> Arc<Self> {
         Arc::new(Self {
             kind,
+            asks,
             seen_declined: Mutex::default(),
             seen_effects: Mutex::default(),
         })
@@ -71,7 +78,7 @@ impl Hook for AskBeforeSend {
             .unwrap()
             .push(ctx.declined.to_vec());
         self.seen_effects.lock().unwrap().push(tool.effects.clone());
-        if call.name == "send" {
+        if self.asks.contains(&call.name.as_str()) {
             ToolDecision::Interrupt {
                 reason: "the owner must confirm this send".to_string(),
                 kind: self.kind.clone(),
@@ -196,11 +203,13 @@ async fn owner_approval_deny_records_declined_effects() {
 
 #[tokio::test]
 async fn owner_approval_deny_dedups_and_hooks_see_declined() {
-    // The same request denied twice (two pending interruptions in one
-    // batch) is remembered once, and a later call of another tool sees it.
-    let hook = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(vec![
-        egress_key(),
-    ])));
+    // The same effect denied twice (`send`, then `note`, which declares no
+    // effects of its own so the kernel lets it reach the hook) is
+    // remembered once, and the second ask sees the first decline.
+    let hook = AskBeforeSend::asking(
+        InterruptKind::OwnerApproval(owner_request(vec![egress_key()])),
+        &["send", "note"],
+    );
     let sent = Arc::new(AtomicUsize::new(0));
     let a = Agent::builder("a")
         .allow_unguarded()
@@ -229,8 +238,18 @@ async fn owner_approval_deny_dedups_and_hooks_see_declined() {
 
     assert_eq!(out.state.declined, vec![egress_key()]);
     let seen = hook.seen_declined.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the hook was asked about both calls");
     assert!(seen[0].is_empty());
     assert_eq!(seen[1], vec![egress_key()]);
+    let reasons: Vec<_> = out
+        .receipts()
+        .iter()
+        .map(|r| r.reason.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        reasons.iter().all(|r| r.starts_with("[OWNER DECLINED]")),
+        "{reasons:?}"
+    );
 }
 
 #[tokio::test]
@@ -735,4 +754,106 @@ fn untrusted_egress_is_judged_by_kind() {
         ..untrusted
     };
     assert!(!is_untrusted_egress(&owner));
+}
+
+// ---------- fix round 1 ----------
+
+#[tokio::test]
+async fn trailing_dot_host_is_the_same_declined_host() {
+    let (a, hook, ran) = http_then(
+        "shell",
+        CallEffects {
+            keys: vec![EffectKey::egress("https", "H.example.invalid.", None)],
+            complete: true,
+        },
+    );
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &CountingDeny::default(),
+        )
+        .await
+        .unwrap();
+    let shell = &out.receipts()[1];
+    assert_eq!(shell.status, ReceiptStatus::Denied);
+    assert!(shell
+        .reason
+        .as_deref()
+        .unwrap()
+        .starts_with("[OWNER DECLINED]"));
+    assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        EffectKey::egress("https", "h.example.invalid.", None).target,
+        "h.example.invalid:443"
+    );
+}
+
+#[tokio::test]
+async fn decline_without_effects_records_the_call_subject() {
+    let hook = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(Vec::new())));
+    let (a, _) = agent(hook, send_once());
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &deny(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.state.declined,
+        vec![EffectKey::named(
+            EffectClass::Call,
+            "POST https://h.example.invalid/report"
+        )]
+    );
+    assert_eq!(EffectClass::Call.to_string(), "call");
+}
+
+#[tokio::test]
+async fn decline_binds_a_later_call_in_the_same_batch() {
+    let hook = Arc::new(AskBeforeHttp::default());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let a = Agent::builder("a")
+        .allow_unguarded()
+        .model("m")
+        .provider(ScriptedProvider::new(vec![
+            tool_calls([
+                call("c1", "http", json!({})),
+                call("c2", "shell", json!({})),
+            ]),
+            text("done"),
+        ]))
+        .tool(effect_tool(
+            "http",
+            egress("h.example.invalid:443"),
+            ran.clone(),
+        ))
+        .tool(effect_tool(
+            "shell",
+            egress("h.example.invalid:443"),
+            ran.clone(),
+        ))
+        .hook_arc(hook.clone())
+        .build()
+        .unwrap();
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &CountingDeny::default(),
+        )
+        .await
+        .unwrap();
+    let r = out.receipts();
+    assert_eq!(r[1].tool, "shell");
+    assert!(r[1]
+        .reason
+        .as_deref()
+        .unwrap()
+        .starts_with("[OWNER DECLINED] The owner declined"));
+    assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
 }

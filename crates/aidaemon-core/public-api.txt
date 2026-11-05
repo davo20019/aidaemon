@@ -98,6 +98,7 @@ pub aidaemon_core::CoreError::UnsupportedRunState
 pub aidaemon_core::CoreError::UnsupportedRunState::found: u32
 pub aidaemon_core::CoreError::UnsupportedRunState::supported: u32
 #[non_exhaustive] pub enum aidaemon_core::EffectClass
+pub aidaemon_core::EffectClass::Call
 pub aidaemon_core::EffectClass::Configuration
 pub aidaemon_core::EffectClass::Credential
 pub aidaemon_core::EffectClass::Delete

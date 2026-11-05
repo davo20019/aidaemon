@@ -11,7 +11,7 @@ use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
-use crate::approval::{EffectKey, InterruptKind, OWNER_DECLINED};
+use crate::approval::{EffectClass, EffectKey, InterruptKind, OWNER_DECLINED};
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
@@ -101,7 +101,15 @@ impl<'a> Driver<'a> {
         else {
             return resolution;
         };
-        for effect in &request.effects {
+        // A request without effects is remembered by its exact subject.
+        let call_key;
+        let effects: &[EffectKey] = if request.effects.is_empty() {
+            call_key = [EffectKey::named(EffectClass::Call, &request.subject)];
+            &call_key
+        } else {
+            &request.effects
+        };
+        for effect in effects {
             if !self.state.declined.contains(effect) {
                 self.state.declined.push(effect.clone());
             }

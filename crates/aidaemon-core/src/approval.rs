@@ -29,6 +29,10 @@ pub enum EffectClass {
     Credential,
     /// Starts a program.
     Process,
+    /// One exact call, named by its approval subject. Recorded when the
+    /// owner declines a request that declared no effects, so the identical
+    /// request is not put to the owner again.
+    Call,
 }
 
 impl std::fmt::Display for EffectClass {
@@ -40,6 +44,7 @@ impl std::fmt::Display for EffectClass {
             Self::Configuration => "configuration",
             Self::Credential => "credential",
             Self::Process => "process",
+            Self::Call => "call",
         })
     }
 }
@@ -94,7 +99,8 @@ impl EffectKey {
     }
 
     /// An egress effect on `host`, with target `host:port`: the host
-    /// lowercased, and the port given or else the scheme's default (http
+    /// lowercased and without a trailing dot (`h.example.` is `h.example`),
+    /// and the port given or else the scheme's default (http
     /// 80, https 443, ssh 22; 0 for an unknown scheme).
     pub fn egress(scheme: &str, host: &str, port: Option<u16>) -> EffectKey {
         let port = port.unwrap_or_else(|| match scheme.to_ascii_lowercase().as_str() {
@@ -105,7 +111,7 @@ impl EffectKey {
         });
         EffectKey {
             class: EffectClass::Egress,
-            target: format!("{}:{port}", host.to_ascii_lowercase()),
+            target: format!("{}:{port}", host.to_ascii_lowercase().trim_end_matches('.')),
         }
     }
 
