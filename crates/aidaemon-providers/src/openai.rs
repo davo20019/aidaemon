@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, Role,
-    StreamEvent, ToolCall, ToolChoice, Usage,
+    collect_stream, Image, Message, ModelRequest, ModelResponse, Provider, ProviderError,
+    ResponseFormat, Role, StreamEvent, ToolCall, ToolChoice, Usage,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -32,6 +32,14 @@ pub struct OpenAiCompatible {
     api_key: Option<Secret>,
     headers: HeaderMap,
     timeout: Duration,
+    defaults: Defaults,
+}
+
+/// What a request that sets none of its own gets.
+#[derive(Debug, Clone, Default)]
+struct Defaults {
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatible {
@@ -41,7 +49,7 @@ impl OpenAiCompatible {
 
     /// The JSON body this provider would send for `request`.
     pub fn request_body(&self, request: &ModelRequest) -> Value {
-        build_body(request)
+        build_body(request, &self.defaults)
     }
 }
 
@@ -54,6 +62,7 @@ pub struct OpenAiCompatibleBuilder {
     headers: Vec<(String, String)>,
     timeout: Duration,
     connect_timeout: Duration,
+    defaults: Defaults,
 }
 
 impl Default for OpenAiCompatibleBuilder {
@@ -65,6 +74,7 @@ impl Default for OpenAiCompatibleBuilder {
             headers: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            defaults: Defaults::default(),
         }
     }
 }
@@ -106,6 +116,21 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// The output cap for requests that set none.
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.defaults.max_tokens = Some(tokens);
+        self
+    }
+
+    /// The reasoning effort for requests that set none, sent as
+    /// `reasoning: {effort}` (OpenRouter and compatible servers); `off`
+    /// sends nothing.
+    pub fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        let effort = effort.into();
+        self.defaults.reasoning_effort = (!effort.trim().is_empty()).then_some(effort);
+        self
+    }
+
     pub fn build(self) -> Result<OpenAiCompatible, ConfigError> {
         Ok(OpenAiCompatible {
             name: self.name,
@@ -114,6 +139,7 @@ impl OpenAiCompatibleBuilder {
             api_key: self.api_key.filter(|k| !k.0.is_empty()),
             headers: header_map(&self.headers)?,
             timeout: self.timeout,
+            defaults: self.defaults,
         })
     }
 }
@@ -138,7 +164,7 @@ impl Provider for OpenAiCompatible {
             .timeout(self.timeout)
             .headers(self.headers.clone())
             .header("accept", "text/event-stream")
-            .json(&build_body(request));
+            .json(&build_body(request, &self.defaults));
         if let Some(key) = &self.api_key {
             http = http.bearer_auth(&key.0);
         }
@@ -146,7 +172,7 @@ impl Provider for OpenAiCompatible {
     }
 }
 
-fn build_body(request: &ModelRequest) -> Value {
+fn build_body(request: &ModelRequest, defaults: &Defaults) -> Value {
     let mut body = json!({
         "model": request.model,
         "messages": wire_messages(&request.messages),
@@ -167,9 +193,35 @@ fn build_body(request: &ModelRequest) -> Value {
                 json!({"type": "function", "function": {"name": name}})
             }
         };
+        body["parallel_tool_calls"] = json!(true);
     }
-    if let Some(max) = request.max_output_tokens {
+    if let Some(max) = request.max_output_tokens.or(defaults.max_tokens) {
         body["max_tokens"] = json!(max);
+    }
+    let effort = request
+        .options
+        .reasoning_effort
+        .as_deref()
+        .or(defaults.reasoning_effort.as_deref());
+    if let Some(effort) = effort.filter(|effort| *effort != "off") {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    match &request.options.response_format {
+        ResponseFormat::Text => {}
+        ResponseFormat::JsonObject => {
+            body["response_format"] = json!({"type": "json_object"});
+        }
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            body["response_format"] = json!({"type": "json_schema", "json_schema": {
+                "name": name,
+                "schema": schema,
+                "strict": strict,
+            }});
+        }
     }
     body
 }

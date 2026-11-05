@@ -8,6 +8,9 @@
 //!   prefix (system prompt and tool definitions).
 //! - [`ChatGpt`]: models on a ChatGPT subscription through the Codex
 //!   backend's Responses API, with credentials from a [`ChatGptAuth`].
+//! - [`GoogleGenai`]: Gemini's `generateContent`, with thought signatures
+//!   carried in `ToolCall::provider_data` and Google Search grounding.
+//! - [`Xai`]: xAI's Responses API.
 //!
 //! Both stream over SSE: [`Provider::stream`](aidaemon_core::Provider::stream)
 //! yields [`StreamEvent::TextDelta`](aidaemon_core::StreamEvent::TextDelta)
@@ -54,9 +57,11 @@
 mod anthropic;
 mod chatgpt;
 mod errors;
+mod google;
 mod openai;
 mod sse;
 mod transport;
+mod xai;
 
 pub use anthropic::{
     Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
@@ -67,5 +72,10 @@ pub use chatgpt::{
     CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_REASONING_EFFORTS,
 };
 pub use errors::{affordable_tokens, context_overflow, error_for_status};
+pub use google::{
+    GoogleGenai, GoogleGenaiBuilder, GOOGLE_DEFAULT_BASE_URL, GOOGLE_PART_FIELDS,
+    TEXT_ONLY_RESPONSE_MARKER,
+};
 pub use openai::{OpenAiCompatible, OpenAiCompatibleBuilder, OPENAI_DEFAULT_BASE_URL};
 pub use transport::ConfigError;
+pub use xai::{Xai, XaiBuilder, XAI_DEFAULT_BASE_URL};
