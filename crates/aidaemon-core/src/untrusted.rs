@@ -19,9 +19,11 @@ use crate::tool::{SourceTrust, ToolInfo, ToolOutput};
 /// Prefix of the interruption reason raised by [`UntrustedHook`].
 pub const UNTRUSTED_EGRESS_INTERRUPT: &str = "[UNTRUSTED EGRESS]";
 
-/// Whether `interruption` was raised by [`UntrustedHook`].
+/// Whether `interruption` was raised by [`UntrustedHook`]: its kind is
+/// [`InterruptKind::Untrusted`] and its reason carries the hook's prefix.
 pub fn is_untrusted_egress(interruption: &Interruption) -> bool {
-    interruption.reason.starts_with(UNTRUSTED_EGRESS_INTERRUPT)
+    interruption.kind == InterruptKind::Untrusted
+        && interruption.reason.starts_with(UNTRUSTED_EGRESS_INTERRUPT)
 }
 
 /// How strictly the untrusted-content rule applies.
@@ -144,6 +146,8 @@ mod tests {
             .hook(AuthorityHook::new(Authority::full()))
             .hook(UntrustedHook::new(mode, mark))
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .build()
             .unwrap()
     }
@@ -369,7 +373,9 @@ mod tests {
                     level: AccessLevel::Write,
                     tools: None,
                 }))
-                .attest(Safeguard::Scope);
+                .attest(Safeguard::Scope)
+                .attest(Safeguard::Approval)
+                .attest(Safeguard::Egress);
             if with_hook {
                 b = b.hook(UntrustedHook::new(UntrustedMode::Enforce, mark));
             }
@@ -390,6 +396,8 @@ mod tests {
             .hook(UntrustedHook::new(UntrustedMode::Enforce, mark))
             .hook(AuthorityHook::new(Authority::read_only()))
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .build()
             .unwrap();
         let out = a
@@ -428,6 +436,8 @@ mod tests {
             .hook(AuthorityHook::new(Authority::full()))
             .hook(UntrustedHook::new(UntrustedMode::Enforce, mark))
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .build()
             .unwrap();
         let out = a.run("s", "go").await.unwrap();

@@ -104,6 +104,8 @@ pub aidaemon_core::EffectClass::Delete
 pub aidaemon_core::EffectClass::Egress
 pub aidaemon_core::EffectClass::Process
 pub aidaemon_core::EffectClass::Write
+impl core::fmt::Display for aidaemon_core::EffectClass
+pub fn aidaemon_core::EffectClass::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum aidaemon_core::Event
 pub aidaemon_core::Event::Finished
 pub aidaemon_core::Event::Finished::status: aidaemon_core::RunStatus
@@ -206,11 +208,13 @@ pub aidaemon_core::RunStatus::Stopped::reason: alloc::string::String
 pub aidaemon_core::RunStatus::Stuck
 pub aidaemon_core::RunStatus::Stuck::signal: aidaemon_core::StuckSignal
 #[non_exhaustive] pub enum aidaemon_core::Safeguard
+pub aidaemon_core::Safeguard::Approval
 pub aidaemon_core::Safeguard::Authority
+pub aidaemon_core::Safeguard::Egress
 pub aidaemon_core::Safeguard::Scope
 pub aidaemon_core::Safeguard::UntrustedOutput
 impl aidaemon_core::Safeguard
-pub const aidaemon_core::Safeguard::REQUIRED: [aidaemon_core::Safeguard; 3]
+pub const aidaemon_core::Safeguard::REQUIRED: [aidaemon_core::Safeguard; 5]
 impl core::fmt::Display for aidaemon_core::Safeguard
 pub fn aidaemon_core::Safeguard::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub enum aidaemon_core::SourceTrust
@@ -328,7 +332,10 @@ pub struct aidaemon_core::EffectKey
 pub aidaemon_core::EffectKey::class: aidaemon_core::EffectClass
 pub aidaemon_core::EffectKey::target: alloc::string::String
 impl aidaemon_core::EffectKey
+pub fn aidaemon_core::EffectKey::egress(&str, &str, core::option::Option<u16>) -> aidaemon_core::EffectKey
+pub fn aidaemon_core::EffectKey::named(aidaemon_core::EffectClass, &str) -> aidaemon_core::EffectKey
 pub fn aidaemon_core::EffectKey::overlaps(&self, &aidaemon_core::EffectKey) -> bool
+pub fn aidaemon_core::EffectKey::path(aidaemon_core::EffectClass, &str) -> core::option::Option<aidaemon_core::EffectKey>
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self

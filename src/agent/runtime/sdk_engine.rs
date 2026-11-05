@@ -759,6 +759,12 @@ impl Agent {
                 sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone()),
             )
             .attest(sdk::Safeguard::Scope)
+            // Owner approvals and the outbound secret scan are still done by
+            // the daemon's tools (terminal, http_request) in this phase.
+            // Phase 3a Task 4 replaces these two attestations with the real
+            // `EgressGuard` and `ApprovalPolicy` hooks.
+            .attest(sdk::Safeguard::Approval)
+            .attest(sdk::Safeguard::Egress)
             .model(model.clone())
             .provider(DaemonProvider {
                 calls: calls_tx.clone(),

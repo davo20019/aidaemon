@@ -1196,6 +1196,8 @@ fn an_agent_with_tools_must_cover_every_safeguard() {
         .tool(echo_tool())
         .hook(Guards(&[Safeguard::Authority, Safeguard::UntrustedOutput]))
         .attest(Safeguard::Scope)
+        .hook(Guards(&[Safeguard::Approval]))
+        .attest(Safeguard::Egress)
         .build()
         .is_ok());
 

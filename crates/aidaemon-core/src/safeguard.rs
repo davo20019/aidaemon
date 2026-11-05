@@ -22,14 +22,23 @@ pub enum Safeguard {
     /// verified by a clean check or, by the owner's explicit choice,
     /// recorded.
     UntrustedOutput,
+    /// Calls that need the owner's approval are put to the owner (as an
+    /// [`crate::InterruptKind::OwnerApproval`] interruption) before they run,
+    /// unless a standing grant already covers them.
+    Approval,
+    /// Outbound calls (egress annotations or effects) never carry
+    /// credentials or other secrets off the machine.
+    Egress,
 }
 
 impl Safeguard {
     /// Every safeguard an agent with tools must cover.
-    pub const REQUIRED: [Safeguard; 3] = [
+    pub const REQUIRED: [Safeguard; 5] = [
         Safeguard::Authority,
         Safeguard::Scope,
         Safeguard::UntrustedOutput,
+        Safeguard::Approval,
+        Safeguard::Egress,
     ];
 }
 
@@ -39,6 +48,8 @@ impl std::fmt::Display for Safeguard {
             Safeguard::Authority => "authority",
             Safeguard::Scope => "scope",
             Safeguard::UntrustedOutput => "untrusted output",
+            Safeguard::Approval => "approval",
+            Safeguard::Egress => "egress",
         })
     }
 }

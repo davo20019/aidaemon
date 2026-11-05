@@ -82,9 +82,10 @@ impl Hook for AskBeforeSend {
     }
 }
 
-/// A send tool that declares its egress effect.
+/// A send tool that declares one effect.
 struct Send {
     count: Arc<AtomicUsize>,
+    effect: EffectKey,
 }
 
 #[async_trait]
@@ -100,7 +101,7 @@ impl Tool for Send {
     }
     fn effects(&self, _args: &Value) -> CallEffects {
         CallEffects {
-            keys: vec![egress_key()],
+            keys: vec![self.effect.clone()],
             complete: true,
         }
     }
@@ -133,6 +134,14 @@ fn agent(
     hook: Arc<AskBeforeSend>,
     replies: Vec<aidaemon_core::ModelResponse>,
 ) -> (Agent, Arc<AtomicUsize>) {
+    agent_with_effect(hook, replies, egress_key())
+}
+
+fn agent_with_effect(
+    hook: Arc<AskBeforeSend>,
+    replies: Vec<aidaemon_core::ModelResponse>,
+    effect: EffectKey,
+) -> (Agent, Arc<AtomicUsize>) {
     let sent = Arc::new(AtomicUsize::new(0));
     let agent = Agent::builder("a")
         .allow_unguarded()
@@ -140,6 +149,7 @@ fn agent(
         .provider(ScriptedProvider::new(replies))
         .tool(Send {
             count: sent.clone(),
+            effect,
         })
         .hook_arc(hook)
         .build()
@@ -186,17 +196,28 @@ async fn owner_approval_deny_records_declined_effects() {
 
 #[tokio::test]
 async fn owner_approval_deny_dedups_and_hooks_see_declined() {
+    // The same request denied twice (two pending interruptions in one
+    // batch) is remembered once, and a later call of another tool sees it.
     let hook = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(vec![
         egress_key(),
     ])));
-    let (a, _sent) = agent(
-        hook.clone(),
-        vec![
+    let sent = Arc::new(AtomicUsize::new(0));
+    let a = Agent::builder("a")
+        .allow_unguarded()
+        .model("m")
+        .provider(ScriptedProvider::new(vec![
             tool_calls([call("c1", "send", json!({}))]),
-            tool_calls([call("c2", "send", json!({}))]),
+            tool_calls([call("c2", "note", json!({}))]),
             text("done"),
-        ],
-    );
+        ]))
+        .tool(Send {
+            count: sent.clone(),
+            effect: egress_key(),
+        })
+        .tool(effect_tool("note", CallEffects::none(), Arc::default()))
+        .hook_arc(hook.clone())
+        .build()
+        .unwrap();
     let out = a
         .run_resolving(
             RunState::new("a", "s", "go"),
@@ -259,7 +280,7 @@ async fn declined_survives_serde_and_segments() {
     let second = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(vec![
         other.clone()
     ])));
-    let (b, _) = agent(second.clone(), send_once());
+    let (b, _) = agent_with_effect(second.clone(), send_once(), other.clone());
     let mut state = restored;
     state.messages.push(aidaemon_core::Message::user("again"));
     let out = b
@@ -358,4 +379,360 @@ fn default_effects_follow_read_only() {
 #[test]
 fn interrupt_kind_defaults_to_untrusted() {
     assert_eq!(InterruptKind::default(), InterruptKind::Untrusted);
+}
+
+// ---------- Task 2: a decline binds the run before any hook ----------
+
+/// A tool with fixed effects that counts its calls.
+struct EffectTool {
+    name: String,
+    effects: CallEffects,
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for EffectTool {
+    fn spec(&self) -> aidaemon_core::ToolSpec {
+        spec(&self.name, "acts", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        SEND
+    }
+    fn source_trust(&self, _: &Value) -> SourceTrust {
+        SourceTrust::Trusted
+    }
+    fn effects(&self, _args: &Value) -> CallEffects {
+        self.effects.clone()
+    }
+    async fn call(
+        &self,
+        _args: Value,
+        _ctx: &aidaemon_core::ToolContext,
+    ) -> aidaemon_core::ToolResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("acted"))
+    }
+}
+
+fn effect_tool(name: &str, effects: CallEffects, count: Arc<AtomicUsize>) -> EffectTool {
+    EffectTool {
+        name: name.to_string(),
+        effects,
+        count,
+    }
+}
+
+fn egress(target: &str) -> CallEffects {
+    CallEffects {
+        keys: vec![key(EffectClass::Egress, target)],
+        complete: true,
+    }
+}
+
+/// Records every call it is asked about; asks the owner before `http`,
+/// with the call's declared effects.
+#[derive(Default)]
+struct AskBeforeHttp {
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Hook for AskBeforeHttp {
+    async fn before_tool(
+        &self,
+        _ctx: &HookContext<'_>,
+        call: &ToolCall,
+        tool: &ToolInfo,
+    ) -> ToolDecision {
+        self.seen.lock().unwrap().push(call.name.clone());
+        if call.name == "http" {
+            ToolDecision::Interrupt {
+                reason: "the owner must confirm this request".to_string(),
+                kind: InterruptKind::OwnerApproval(owner_request(tool.effects.keys.clone())),
+            }
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+/// Denies every interruption and counts how often it was asked.
+#[derive(Default)]
+struct CountingDeny {
+    asked: AtomicUsize,
+}
+
+#[async_trait]
+impl InterruptResolver for CountingDeny {
+    async fn resolve(&self, _: &RunState, _: &Interruption) -> Option<Resolution> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Some(Resolution::Deny {
+            reason: "Alice Rivera said no".to_string(),
+        })
+    }
+}
+
+fn http_then(
+    second: &str,
+    second_effects: CallEffects,
+) -> (Agent, Arc<AskBeforeHttp>, Arc<AtomicUsize>) {
+    let hook = Arc::new(AskBeforeHttp::default());
+    let ran = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::builder("a")
+        .allow_unguarded()
+        .model("m")
+        .provider(ScriptedProvider::new(vec![
+            tool_calls([call("c1", "http", json!({}))]),
+            tool_calls([call("c2", second, json!({}))]),
+            text("done"),
+        ]))
+        .tool(effect_tool(
+            "http",
+            egress("h.example.invalid:443"),
+            ran.clone(),
+        ))
+        .tool(effect_tool(second, second_effects, ran.clone()))
+        .hook_arc(hook.clone())
+        .build()
+        .unwrap();
+    (agent, hook, ran)
+}
+
+#[tokio::test]
+async fn declined_effect_blocks_other_tool_in_same_run() {
+    let (a, hook, ran) = http_then("shell", egress("h.example.invalid:443"));
+    let resolver = CountingDeny::default();
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &resolver,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.is_completed(), "{:?}", out.status);
+    let shell = &out.receipts()[1];
+    assert_eq!(shell.tool, "shell");
+    assert_eq!(shell.status, ReceiptStatus::Denied);
+    let reason = shell.reason.as_deref().unwrap();
+    assert!(reason.starts_with("[OWNER DECLINED]"), "{reason}");
+    assert!(reason.contains("egress h.example.invalid:443"), "{reason}");
+    assert!(reason.contains("Do not attempt it another way"), "{reason}");
+    assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
+    assert_eq!(resolver.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn decline_does_not_block_other_targets() {
+    let (a, hook, ran) = http_then("shell", egress("other.example.invalid:443"));
+    let resolver = CountingDeny::default();
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &resolver,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.is_completed(), "{:?}", out.status);
+    assert_eq!(out.receipts()[1].status, ReceiptStatus::Succeeded);
+    assert_eq!(
+        *hook.seen.lock().unwrap(),
+        vec!["http".to_string(), "shell".to_string()]
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+/// Declares the safeguards it is built with.
+struct Guards(&'static [aidaemon_core::Safeguard]);
+
+impl Hook for Guards {
+    fn safeguards(&self) -> &'static [aidaemon_core::Safeguard] {
+        self.0
+    }
+}
+
+#[test]
+fn build_requires_approval_and_egress_safeguards() {
+    use aidaemon_core::{BuildError, Safeguard};
+    assert_eq!(Safeguard::REQUIRED.len(), 5);
+    assert!(Safeguard::REQUIRED.contains(&Safeguard::Approval));
+    assert!(Safeguard::REQUIRED.contains(&Safeguard::Egress));
+
+    let base = || {
+        Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([]))
+            .tool(effect_tool("t", CallEffects::none(), Arc::default()))
+            .hook(Guards(&[
+                Safeguard::Authority,
+                Safeguard::Scope,
+                Safeguard::UntrustedOutput,
+            ]))
+    };
+    assert!(matches!(
+        base().build(),
+        Err(BuildError::MissingSafeguard(Safeguard::Approval))
+    ));
+    assert!(matches!(
+        base().attest(Safeguard::Approval).build(),
+        Err(BuildError::MissingSafeguard(Safeguard::Egress))
+    ));
+    assert!(base()
+        .attest(Safeguard::Approval)
+        .hook(Guards(&[Safeguard::Egress]))
+        .build()
+        .is_ok());
+    assert_eq!(Safeguard::Approval.to_string(), "approval");
+    assert_eq!(Safeguard::Egress.to_string(), "egress");
+}
+
+// ---------- normalizing constructors ----------
+
+#[test]
+fn path_constructor_normalizes() {
+    let p = |raw: &str| EffectKey::path(EffectClass::Delete, raw).map(|k| k.target);
+    assert_eq!(
+        p("/tmp/aidaemon-test/a"),
+        Some("/tmp/aidaemon-test/a".into())
+    );
+    assert_eq!(
+        p("/tmp//aidaemon-test/./a/"),
+        Some("/tmp/aidaemon-test/a".into())
+    );
+    assert_eq!(
+        p("/tmp/aidaemon-test/x/../a"),
+        Some("/tmp/aidaemon-test/a".into())
+    );
+    assert_eq!(p("/"), Some("/".into()));
+    assert_eq!(p("//"), Some("/".into()));
+    assert_eq!(p("/tmp/.."), Some("/".into()));
+    assert_eq!(p("/.."), None);
+    assert_eq!(p("/tmp/../../etc"), None);
+    let k = EffectKey::path(EffectClass::Write, "/etc/hosts").unwrap();
+    assert_eq!(k.class, EffectClass::Write);
+}
+
+#[test]
+fn relative_path_rejected() {
+    assert_eq!(EffectKey::path(EffectClass::Write, "notes.txt"), None);
+    assert_eq!(EffectKey::path(EffectClass::Write, "./a"), None);
+    assert_eq!(EffectKey::path(EffectClass::Write, "~/a"), None);
+    assert_eq!(EffectKey::path(EffectClass::Write, ""), None);
+}
+
+#[test]
+fn egress_default_ports() {
+    let t = |scheme, host, port| EffectKey::egress(scheme, host, port).target;
+    assert_eq!(
+        t("https", "H.Example.Invalid", None),
+        "h.example.invalid:443"
+    );
+    assert_eq!(t("http", "h.example.invalid", None), "h.example.invalid:80");
+    assert_eq!(t("ssh", "h.example.invalid", None), "h.example.invalid:22");
+    assert_eq!(
+        t("HTTPS", "h.example.invalid", None),
+        "h.example.invalid:443"
+    );
+    assert_eq!(
+        t("https", "h.example.invalid", Some(8443)),
+        "h.example.invalid:8443"
+    );
+    assert_eq!(
+        t("ftp", "h.example.invalid", Some(21)),
+        "h.example.invalid:21"
+    );
+    assert_eq!(t("ftp", "h.example.invalid", None), "h.example.invalid:0");
+    assert_eq!(
+        EffectKey::egress("https", "h", None).class,
+        EffectClass::Egress
+    );
+}
+
+#[test]
+fn host_and_host_443_overlap_via_constructor() {
+    let bare = EffectKey::egress("https", "H.example.invalid", None);
+    let explicit = EffectKey::egress("https", "h.example.invalid", Some(443));
+    assert!(bare.overlaps(&explicit));
+    assert!(!bare.overlaps(&EffectKey::egress("http", "h.example.invalid", None)));
+
+    let named = EffectKey::named(EffectClass::Credential, "acme-dev");
+    assert_eq!(named, key(EffectClass::Credential, "acme-dev"));
+    assert_eq!(
+        EffectKey::named(EffectClass::Process, "git"),
+        key(EffectClass::Process, "git")
+    );
+}
+
+// ---------- every way of denying records the decline ----------
+
+fn interrupted_send() -> (Agent, RunState) {
+    let hook = AskBeforeSend::new(InterruptKind::OwnerApproval(owner_request(vec![
+        egress_key(),
+    ])));
+    let (a, _) = agent(hook, send_once());
+    let state = futures_block(a.run("s", "go")).unwrap().state;
+    assert!(state.pending.is_some());
+    (a, state)
+}
+
+fn futures_block<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+fn no() -> Resolution {
+    Resolution::Deny {
+        reason: "Alice Rivera said no".to_string(),
+    }
+}
+
+#[test]
+fn resume_deny_records_decline() {
+    let (a, state) = interrupted_send();
+    let out = futures_block(a.resume(state, no())).unwrap();
+    assert_eq!(out.state.declined, vec![egress_key()]);
+    let reason = out.receipts()[0].reason.clone().unwrap();
+    assert!(reason.starts_with("[OWNER DECLINED]"), "{reason}");
+}
+
+#[test]
+fn resume_with_cancel_deny_records_decline() {
+    let (a, state) = interrupted_send();
+    let out = futures_block(a.resume_with_cancel(state, no(), CancellationToken::new())).unwrap();
+    assert_eq!(out.state.declined, vec![egress_key()]);
+}
+
+#[test]
+fn deny_after_cancel_records_decline() {
+    // The run is cancelled while the owner is being asked; the denial that
+    // arrives afterwards still binds the run.
+    let (a, state) = interrupted_send();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let out = futures_block(a.resume_with_cancel(state, no(), cancel)).unwrap();
+    assert_eq!(out.state.declined, vec![egress_key()]);
+}
+
+#[test]
+fn untrusted_egress_is_judged_by_kind() {
+    use aidaemon_core::{is_untrusted_egress, UNTRUSTED_EGRESS_INTERRUPT};
+    let reason = format!("{UNTRUSTED_EGRESS_INTERRUPT} `send` acts outside the workspace");
+    let untrusted = Interruption {
+        call: call("c1", "send", json!({})),
+        reason: reason.clone(),
+        kind: InterruptKind::Untrusted,
+    };
+    assert!(is_untrusted_egress(&untrusted));
+    let owner = Interruption {
+        kind: InterruptKind::OwnerApproval(owner_request(vec![egress_key()])),
+        ..untrusted
+    };
+    assert!(!is_untrusted_egress(&owner));
 }

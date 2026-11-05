@@ -11,7 +11,7 @@ use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
-use crate::approval::{InterruptKind, OWNER_DECLINED};
+use crate::approval::{EffectKey, InterruptKind, OWNER_DECLINED};
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
@@ -503,7 +503,15 @@ impl<'a> Driver<'a> {
 
     /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
     /// arguments re-validated) before the next hook sees the call.
+    ///
+    /// A call with an effect the owner declined earlier in the run is
+    /// refused before any hook sees it, and again after any rewrite: no
+    /// hook or application can opt out, so a model cannot retry a declined
+    /// action through another tool.
     async fn decide(&self, call: &mut ToolCall, info: &mut ToolInfo, from: usize) -> Verdict {
+        if let Some(reason) = declined_reason(&self.state.declined, info) {
+            return Verdict::Deny(reason);
+        }
         let ctx = self.ctx();
         for (hook_index, hook) in self.agent.hooks.iter().enumerate().skip(from) {
             match hook.before_tool(&ctx, call, info).await {
@@ -525,6 +533,9 @@ impl<'a> Driver<'a> {
                         info.annotations = tool.annotations_for(&call.arguments);
                         info.access = tool.access(&call.arguments);
                         info.effects = tool.effects(&call.arguments);
+                    }
+                    if let Some(reason) = declined_reason(&self.state.declined, info) {
+                        return Verdict::Deny(reason);
                     }
                 }
             }
@@ -1082,6 +1093,21 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     format!(
         "{head_text}\n\n[... {omitted} characters omitted by the harness; narrow the request to see them ...]\n\n{tail_text}"
     )
+}
+
+/// The refusal for a call with an effect the owner declined earlier in the
+/// run, if it has one.
+fn declined_reason(declined: &[EffectKey], info: &ToolInfo) -> Option<String> {
+    let effect = info
+        .effects
+        .keys
+        .iter()
+        .find(|key| declined.iter().any(|d| d.overlaps(key)))?;
+    Some(format!(
+        "{OWNER_DECLINED} The owner declined {} {} earlier in this run. Do not attempt it \
+         another way; tell the owner it was not done.",
+        effect.class, effect.target
+    ))
 }
 
 #[cfg(test)]

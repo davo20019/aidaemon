@@ -288,6 +288,8 @@ mod tests {
                     .with_ceiling(std::sync::Arc::new(FlagCeiling(flag))),
             )
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .attest(Safeguard::UntrustedOutput)
             .build()
             .unwrap();
@@ -319,6 +321,8 @@ mod tests {
                     .with_ceiling(std::sync::Arc::new(FullCeiling)),
             )
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .attest(Safeguard::UntrustedOutput)
             .build()
             .unwrap();
@@ -342,6 +346,8 @@ mod tests {
             .tool(writer)
             .hook(AuthorityHook::new(Authority::read_only()))
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .attest(Safeguard::UntrustedOutput)
             .build()
             .unwrap();
@@ -389,6 +395,8 @@ mod tests {
             .tool(Mixed)
             .hook(AuthorityHook::new(Authority::read_only()))
             .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
             .attest(Safeguard::UntrustedOutput)
             .build()
             .unwrap();

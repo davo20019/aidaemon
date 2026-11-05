@@ -31,6 +31,19 @@ pub enum EffectClass {
     Process,
 }
 
+impl std::fmt::Display for EffectClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Egress => "egress",
+            Self::Delete => "delete",
+            Self::Write => "write",
+            Self::Configuration => "configuration",
+            Self::Credential => "credential",
+            Self::Process => "process",
+        })
+    }
+}
+
 impl EffectClass {
     /// Whether targets of this class are paths, so a target covers the
     /// paths below it.
@@ -41,11 +54,13 @@ impl EffectClass {
 
 /// One effect of a call on one target.
 ///
-/// The producer normalizes `target`: lowercase `host[:port]` for
+/// The producer normalizes `target`: lowercase `host:port` for
 /// [`EffectClass::Egress`]; an absolute, normalized path for
 /// [`EffectClass::Delete`], [`EffectClass::Write`] and
 /// [`EffectClass::Configuration`]; the profile name for
 /// [`EffectClass::Credential`]; the program name for [`EffectClass::Process`].
+/// Build keys with [`EffectKey::path`], [`EffectKey::egress`] and
+/// [`EffectKey::named`] so every producer uses the same convention.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EffectKey {
     pub class: EffectClass,
@@ -53,8 +68,63 @@ pub struct EffectKey {
 }
 
 impl EffectKey {
+    /// A path effect (`Delete`, `Write`, `Configuration`) on an absolute
+    /// path, normalized lexically: empty and `.` components dropped, `..`
+    /// resolved, no trailing slash. `None` for a relative path or one that
+    /// climbs above `/`. The filesystem is not consulted (symlinks are not
+    /// resolved).
+    pub fn path(class: EffectClass, raw: &str) -> Option<EffectKey> {
+        if !raw.starts_with('/') {
+            return None;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for part in raw.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                part => parts.push(part),
+            }
+        }
+        Some(EffectKey {
+            class,
+            target: format!("/{}", parts.join("/")),
+        })
+    }
+
+    /// An egress effect on `host`, with target `host:port`: the host
+    /// lowercased, and the port given or else the scheme's default (http
+    /// 80, https 443, ssh 22; 0 for an unknown scheme).
+    pub fn egress(scheme: &str, host: &str, port: Option<u16>) -> EffectKey {
+        let port = port.unwrap_or_else(|| match scheme.to_ascii_lowercase().as_str() {
+            "http" => 80,
+            "https" => 443,
+            "ssh" => 22,
+            _ => 0,
+        });
+        EffectKey {
+            class: EffectClass::Egress,
+            target: format!("{}:{port}", host.to_ascii_lowercase()),
+        }
+    }
+
+    /// An effect named by an identifier rather than a path or host: the
+    /// profile name for [`EffectClass::Credential`], the program name for
+    /// [`EffectClass::Process`].
+    pub fn named(class: EffectClass, name: &str) -> EffectKey {
+        EffectKey {
+            class,
+            target: name.to_string(),
+        }
+    }
+
     /// Same class, and the same target or, for path classes, one target is
-    /// the other or below it.
+    /// the other or below it. Targets are compared as given, so both keys
+    /// must be normalized (built with [`EffectKey::path`],
+    /// [`EffectKey::egress`] or [`EffectKey::named`]): `h.example.invalid`
+    /// does not overlap `h.example.invalid:443`, and `/a/../b` does not
+    /// overlap `/b`.
     pub fn overlaps(&self, other: &EffectKey) -> bool {
         if self.class != other.class {
             return false;
