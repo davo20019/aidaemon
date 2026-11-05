@@ -58,9 +58,80 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
     ".htpasswd",
     ".git-credentials",
     "secrets",
-    // The daemon's own config; the owner changes it through `manage_config`.
-    "config.toml",
 ];
+
+/// Entries that hold secrets; `read_file` refuses these. Narrower than
+/// `SENSITIVE_PATTERNS`, which also guards non-secret writes such as `.git`.
+pub const SECRET_READ_PATTERNS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".env",
+    ".envrc",
+    ".dev.vars",
+    ".key",
+    ".pem",
+    ".aws/credentials",
+    ".netrc",
+    ".docker/config.json",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".npmrc",
+    ".pypirc",
+    ".htpasswd",
+    ".git-credentials",
+    "secrets",
+];
+
+static DAEMON_PROTECTED_PATHS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// Register the daemon's own config and env files (set at startup). These are
+/// changed only through `manage_config`, never by the file tools.
+pub fn set_daemon_protected_paths(paths: Vec<PathBuf>) {
+    if let Ok(mut guard) = DAEMON_PROTECTED_PATHS.write() {
+        *guard = paths;
+    }
+}
+
+/// Test helper: protect `paths` as the daemon's own files until dropped.
+#[cfg(test)]
+pub(crate) struct DaemonPathsGuard(Vec<PathBuf>);
+
+#[cfg(test)]
+impl DaemonPathsGuard {
+    pub(crate) fn set(paths: Vec<PathBuf>) -> Self {
+        let previous = DAEMON_PROTECTED_PATHS
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        set_daemon_protected_paths(paths);
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DaemonPathsGuard {
+    fn drop(&mut self) {
+        set_daemon_protected_paths(std::mem::take(&mut self.0));
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+fn is_daemon_protected(path: &Path) -> bool {
+    DAEMON_PROTECTED_PATHS
+        .read()
+        .is_ok_and(|guard| guard.iter().any(|p| same_file(p, path)))
+}
 
 /// Env files named by the daemon's own environment variables
 /// (`AIDAEMON_ENV_FILE`, `AIDAEMON_RUNTIME_ENV_FILE`), wherever they live.
@@ -69,14 +140,7 @@ fn is_configured_env_file(path: &Path) -> bool {
         .iter()
         .filter_map(std::env::var_os)
         .filter(|value| !value.is_empty())
-        .any(|value| {
-            let configured = Path::new(&value);
-            configured == path
-                || matches!(
-                    (configured.canonicalize(), path.canonicalize()),
-                    (Ok(a), Ok(b)) if a == b
-                )
-        })
+        .any(|value| same_file(Path::new(&value), path))
 }
 
 /// Files/directories that strongly indicate a project/workspace root.
@@ -812,10 +876,10 @@ pub async fn backup_before_overwrite(
     let _ = backend.copy(path, &backup).await;
 }
 
-pub fn is_sensitive_path(path: &Path) -> bool {
+fn matches_patterns(path: &Path, patterns: &[&str]) -> bool {
     let path_str = path.to_string_lossy();
     let path_lower = path_str.to_ascii_lowercase();
-    let pattern_match = SENSITIVE_PATTERNS.iter().any(|pat| {
+    patterns.iter().any(|pat| {
         if pat.contains('/') {
             // Multi-component patterns (e.g., ".aws/credentials"): substring match is fine
             // because the slash provides enough specificity.
@@ -828,11 +892,33 @@ pub fn is_sensitive_path(path: &Path) -> bool {
                     .file_name()
                     .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(pat))
         }
-    });
+    })
+}
+
+/// True for files that hold secrets (keys, credentials, env files, the
+/// daemon's own config). Used by `read_file`.
+pub fn is_secret_path(path: &Path) -> bool {
+    matches_patterns(path, SECRET_READ_PATTERNS)
+        || is_configured_env_file(path)
+        || is_daemon_protected(path)
+        || has_secret_name_shape(path)
+}
+
+pub fn is_sensitive_path(path: &Path) -> bool {
+    let pattern_match = matches_patterns(path, SENSITIVE_PATTERNS) || is_daemon_protected(path);
     if pattern_match || is_configured_env_file(path) {
         return true;
     }
 
+    has_secret_name_shape(path)
+        || path.components().any(|component| {
+            let component = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+            component == "terraform.tfstate" || component.starts_with("terraform.tfstate.")
+        })
+}
+
+/// Secret-shaped names: env variants, key and keystore extensions.
+fn has_secret_name_shape(path: &Path) -> bool {
     path.components().any(|component| {
         let component = component.as_os_str().to_string_lossy().to_ascii_lowercase();
         component.starts_with(".env.")

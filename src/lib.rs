@@ -110,6 +110,11 @@ fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
 }
 
 fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir: &Path) {
+    tools::fs_utils::set_daemon_protected_paths(vec![
+        config_path.to_path_buf(),
+        env_file_path.to_path_buf(),
+        working_dir.join(".env"),
+    ]);
     std::env::set_var(
         RUNTIME_CONFIG_PATH_ENV_KEY,
         config_path.to_string_lossy().to_string(),

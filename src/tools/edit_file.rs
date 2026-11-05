@@ -466,21 +466,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_refuses_daemon_config_toml() {
+    async fn edit_file_allows_unrelated_config_toml_and_refuses_the_daemons_own() {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config.toml");
-        std::fs::write(&config, "mode = \"a\"\n").unwrap();
-        let args =
-            json!({"path": config.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string();
-        let err = EditFileTool.call(&args).await.unwrap_err().to_string();
+        let project = dir.path().join("config.toml");
+        let own = dir.path().join("daemon-config.toml");
+        std::fs::write(&project, "mode = \"a\"\n").unwrap();
+        std::fs::write(&own, "mode = \"a\"\n").unwrap();
+        let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
+        let edit = |p: &std::path::Path| {
+            json!({"path": p.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string()
+        };
+        EditFileTool.call(&edit(&project)).await.unwrap();
+        let err = EditFileTool
+            .call(&edit(&own))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("sensitive"), "got: {err}");
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), "mode = \"a\"\n");
-
-        let notes = dir.path().join("notes.toml");
-        std::fs::write(&notes, "mode = \"a\"\n").unwrap();
-        let args =
-            json!({"path": notes.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string();
-        EditFileTool.call(&args).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mode = \"a\"\n");
     }
 
     #[test]

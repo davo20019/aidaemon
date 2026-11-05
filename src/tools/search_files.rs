@@ -517,6 +517,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_files_finds_unrelated_project_config_toml() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.toml"), "title = \"a\"").unwrap();
+        let glob = compile_glob("*config.toml").unwrap();
+        let mut results = Vec::new();
+        let mut stats = SearchStats::default();
+        let backend = active_execution_backend();
+        let root_path = backend
+            .resolve_path(&root.path().to_string_lossy())
+            .await
+            .unwrap();
+        walk_dir(
+            backend,
+            &root_path,
+            &None,
+            &Some(glob),
+            10,
+            50,
+            None,
+            &mut results,
+            &mut stats,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
     async fn walk_truncates_at_entry_budget_and_reports_it() {
         let root = tempfile::tempdir().unwrap();
         for i in 0..50 {
