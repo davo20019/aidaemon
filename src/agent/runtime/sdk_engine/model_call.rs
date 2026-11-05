@@ -51,6 +51,15 @@ pub(super) fn thinking_cutoff_effort(cutoffs: u8) -> Option<String> {
 /// streaming call that keeps producing output is not cut off at `idle`; a
 /// provider that does not stream reports nothing and gets `idle` in all.
 /// The error carries the limit that fired.
+/// The first provider attempt's own deadline under an idle watchdog of
+/// `idle`: a little shorter, so a hung primary hands over to the fallback
+/// chain (whose switch event counts as progress) instead of the watchdog
+/// cancelling the whole call.
+pub(super) fn first_attempt_deadline(idle: Duration) -> Duration {
+    idle.saturating_sub(Duration::from_secs(2))
+        .max(Duration::from_secs(10))
+}
+
 pub(super) async fn with_idle_timeout<F: std::future::Future>(
     idle: Duration,
     hard: Duration,
@@ -237,7 +246,7 @@ impl Agent {
             .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
         let messages = fit_run_values(&prefix, run, budget);
-        let mut options = to_chat_options(&request);
+        let mut options = to_chat_options(request);
         // A reasoning model that spent its whole output budget thinking was
         // usually on a hard step: give it more output room first, and lower
         // reasoning effort only when the cutoffs repeat.
@@ -310,6 +319,7 @@ impl Agent {
                 &options,
                 &mut telemetry,
                 None,
+                first_attempt_deadline(idle_timeout),
             ),
         )
         .await

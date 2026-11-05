@@ -185,7 +185,8 @@ impl FailoverPolicy for DefaultFailover {
 ///
 /// Unlike wrapping the chain in one timeout, every attempt gets its own
 /// [`FailoverStep::deadline`], so a step that hangs cannot use up the time
-/// of the steps after it. Once a step has started streaming, the chain is
+/// of the steps after it; a step whose attempt hit its deadline is not
+/// retried. Once a step has started streaming, the chain is
 /// committed to it: switching then would duplicate visible output.
 ///
 /// Every move to the next step is yielded as [`StreamEvent::Switched`]
@@ -291,6 +292,12 @@ impl Provider for Failover {
                     {
                         Ok(Ok(response)) => return Ok(response),
                         Ok(Err(error)) => error,
+                        // A step that hung is not retried: the next step
+                        // gets the time instead (a single-attempt request
+                        // stops below).
+                        Err(_) if !step_request.options.single_attempt => {
+                            break timed_out(step.deadline)
+                        }
                         Err(_) => timed_out(step.deadline),
                     },
                 };
@@ -344,6 +351,12 @@ impl Provider for Failover {
                                 Ok(None) => ProviderError::Other(
                                     "provider stream ended without a response".into(),
                                 ),
+                                // A step that hung is not retried: the next
+                                // step gets the time instead (a single-attempt
+                                // request stops below).
+                                Err(_) if !step_request.options.single_attempt => {
+                                    break timed_out(step.deadline)
+                                }
                                 Err(_) => timed_out(step.deadline),
                             }
                         }
@@ -617,6 +630,32 @@ mod tests {
         assert!(
             matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "from the fallback")
         );
+    }
+
+    /// A hung step is not retried, even when its policy would retry a
+    /// transient error; a single-attempt request stops at the first one.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_step_moves_on_unless_the_request_is_single_attempt() {
+        let chain = || {
+            Failover::new(vec![
+                FailoverStep::new(Hanging)
+                    .deadline(Duration::from_secs(5))
+                    .attempts(5),
+                FailoverStep::new(ScriptedProvider::new(vec![text("fallback")])),
+            ])
+        };
+        let started = tokio::time::Instant::now();
+        let events = collect(&chain()).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "fallback"));
+
+        let mut single = request();
+        single.options.single_attempt = true;
+        let events: Vec<_> = chain().stream(&single).collect().await;
+        assert!(matches!(
+            events.as_slice(),
+            [Err(ProviderError::Transient(_))]
+        ));
     }
 
     #[test]
