@@ -765,6 +765,7 @@ async fn cancel_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use async_trait::async_trait;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
@@ -775,7 +776,6 @@ mod tests {
     use crate::nodes::simulator::NodeSimulator;
     use crate::nodes::store::NodeStore;
     use crate::nodes::tool::{ReadNodeHealthTool, ReadNodeSensorsTool};
-    use crate::traits::Tool;
 
     struct EchoIngress;
     #[async_trait]
@@ -1037,11 +1037,29 @@ mod tests {
         .unwrap();
         assert_eq!(history_count, 2);
         let tool = ReadNodeSensorsTool::new(store.pool().clone());
-        let tool_output = tool.call(r#"{"_user_role":"Owner"}"#).await.unwrap();
+        let tool_output = tool
+            .call_with(
+                r#"{}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(tool_output.contains("22.75"));
         assert!(tool_output.contains("72.95"));
         let health_tool = ReadNodeHealthTool::new(store.pool().clone());
-        let health_output = health_tool.call(r#"{"_user_role":"Owner"}"#).await.unwrap();
+        let health_output = health_tool
+            .call_with(
+                r#"{}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(health_output.contains("recently_connected"));
         assert!(health_output.contains("aidaemon.runtime.recovery.v1"));
         assert!(health_output.contains("test_restart"));

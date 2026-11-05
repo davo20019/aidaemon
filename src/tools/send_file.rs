@@ -11,7 +11,7 @@ use crate::events::{
 use crate::execution::{BackendKind, SharedExecutionBackend};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus, ToolSemantics, ToolTargetHintKind,
 };
 use crate::types::{MediaKind, MediaMessage};
@@ -154,14 +154,56 @@ impl Tool for SendFileTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.run(arguments, &facts).await?;
+        let outcome_status = if output.starts_with("File sent:") {
+            ToolOutcomeStatus::Succeeded
+        } else if output.starts_with("File queued for delivery:") {
+            ToolOutcomeStatus::Backgrounded
+        } else {
+            ToolOutcomeStatus::FailedPermanent
+        };
+        Ok(ToolCallOutcome {
+            metadata: ToolCallMetadata {
+                outcome_status: Some(outcome_status),
+                background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+            output,
+        })
+    }
+}
+
+impl SendFileTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
         let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
 
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = facts.session_id.as_str();
 
         let resource_id = args
             .get("resource_id")
@@ -364,30 +406,6 @@ impl Tool for SendFileTool {
             Ok(format!("File sent: {} ({})", ready.filename, size_display))
         }
     }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call(arguments).await?;
-        let outcome_status = if output.starts_with("File sent:") {
-            ToolOutcomeStatus::Succeeded
-        } else if output.starts_with("File queued for delivery:") {
-            ToolOutcomeStatus::Backgrounded
-        } else {
-            ToolOutcomeStatus::FailedPermanent
-        };
-        Ok(ToolCallOutcome {
-            metadata: ToolCallMetadata {
-                outcome_status: Some(outcome_status),
-                background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
-                semantics: self.call_semantics(arguments),
-                ..ToolCallMetadata::default()
-            },
-            output,
-        })
-    }
 }
 
 impl crate::traits::ToolSemantics for SendFileTool {
@@ -442,6 +460,7 @@ impl crate::traits::ToolSemantics for SendFileTool {
 mod tests {
     use super::*;
     use crate::events::{ResourceProvenance, ResourceRegisteredData};
+    use crate::testing::CallWithFacts;
     use crate::tools::file_delivery::is_recoverable_source;
     use std::path::Path;
 
@@ -516,11 +535,21 @@ mod tests {
             )
             .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
 
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(
+                    &args,
+                    None,
+                    crate::traits::ToolCallContext {
+                        session_id: "sess-1".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
         // Deliver the receipt like the hub's media_listener does.
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg
@@ -555,10 +584,20 @@ mod tests {
             )
             .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(
+                    &args,
+                    None,
+                    crate::traits::ToolCallContext {
+                        session_id: "sess-1".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg.result_tx.take().expect("receipt requested");
         receipt
@@ -593,10 +632,17 @@ mod tests {
             &inbox.to_string_lossy(),
         )
         .with_receipt_timeout(std::time::Duration::from_millis(100));
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
         // Nobody answers the receipt (congested channel) → honest pending text.
         let outcome = tool
-            .call_with_status_outcome(&args, None)
+            .call_with_execution_context(
+                &args,
+                None,
+                crate::traits::ToolCallContext {
+                    session_id: "sess-1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("call ok");
         let _keep_queue_alive = rx.recv().await; // message was still enqueued
@@ -636,13 +682,22 @@ mod tests {
         );
 
         let args = json!({
-            "_session_id": "sess-1",
-            "file_path": src.to_string_lossy(),
+            "file_path": src.to_string_lossy()
         })
         .to_string();
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(
+                    &args,
+                    None,
+                    crate::traits::ToolCallContext {
+                        session_id: "sess-1".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
         let mut msg = rx.recv().await.expect("media message sent");
         msg.result_tx
             .take()
@@ -697,14 +752,23 @@ mod tests {
             .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
         let args = json!({
-            "_session_id": "sess-resource",
             "resource_id": "res_exact"
         })
         .to_string();
 
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(
+                    &args,
+                    None,
+                    crate::traits::ToolCallContext {
+                        session_id: "sess-resource".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
         let mut message = rx.recv().await.expect("media enqueued");
         match &message.kind {
             MediaKind::Document { file_path, .. } => {
@@ -749,13 +813,16 @@ mod tests {
         )
         .with_event_store(store.clone());
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
-                    "_session_id": "sess-resource",
                     "resource_id": "res_changed"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "sess-resource".into(),
+                    ..Default::default()
+                },
             )
             .await
             .expect("call");
@@ -824,11 +891,19 @@ mod tests {
             &inbox.to_string_lossy(),
         );
         let args = json!({
-            "_session_id": "s",
-            "file_path": manifest.to_string_lossy(),
+            "file_path": manifest.to_string_lossy()
         })
         .to_string();
-        let out = tool.call(&args).await.expect("call ok");
+        let out = tool
+            .call_with(
+                &args,
+                crate::traits::ToolCallContext {
+                    session_id: "s".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call ok");
         assert!(out.contains("outside allowed directories"), "got: {out}");
         assert!(
             !inbox.join("Cargo.toml").exists(),
@@ -856,11 +931,19 @@ mod tests {
         );
 
         let args = json!({
-            "_session_id": "s",
-            "file_path": src.to_string_lossy(),
+            "file_path": src.to_string_lossy()
         })
         .to_string();
-        let out = tool.call(&args).await.expect("call ok");
+        let out = tool
+            .call_with(
+                &args,
+                crate::traits::ToolCallContext {
+                    session_id: "s".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call ok");
         assert!(out.contains("blocked for security"), "got: {out}");
         assert!(
             !inbox.join(".env").exists(),

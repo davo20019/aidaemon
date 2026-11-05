@@ -14,7 +14,7 @@ use crate::events::{
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::providers::ChatJson;
 use crate::tools::sanitize::redact_secrets;
-use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCapabilities};
+use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCallContext, ToolCapabilities};
 use crate::utils::truncate_str;
 
 pub struct DiagnoseTool {
@@ -1828,8 +1828,6 @@ struct DiagnoseArgs {
     limit: Option<usize>,
     #[serde(default)]
     failures_only: Option<bool>,
-    #[serde(default)]
-    _session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1926,11 +1924,31 @@ impl Tool for DiagnoseTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl DiagnoseTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: DiagnoseArgs = serde_json::from_str(arguments)?;
-        let session_id = args
-            ._session_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
+        let session_id = facts
+            .session()
             .ok_or_else(|| anyhow::anyhow!("self_diagnose requires internal _session_id"))?;
 
         match args.action.as_str() {
@@ -1984,6 +2002,7 @@ impl crate::traits::ToolSemantics for DiagnoseTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use chrono::{Duration, Utc};
 
     use crate::config::ProviderKind;
@@ -2144,7 +2163,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"list_tasks","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"list_tasks"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(res.contains("t1"));
@@ -2185,7 +2210,13 @@ mod tests {
         )
         .await;
         let res = tool
-            .call(r#"{"action":"timeline","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"timeline","task_id":"t1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(res.contains("Task Timeline"));
@@ -2244,7 +2275,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(res.contains("Diagnosis for Task t1"));
@@ -2356,7 +2393,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t-replay","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t-replay"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(res.contains("### Execution Replay Summary"));
@@ -2461,7 +2504,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(res.contains("### Route Health Alerts"));
@@ -2519,7 +2568,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t-ctx","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t-ctx"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -2656,7 +2711,13 @@ mod tests {
         }
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -2785,7 +2846,13 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"child-1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"child-1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -2820,7 +2887,13 @@ mod tests {
         )
         .await;
         let res = tool
-            .call(r#"{"action":"timeline","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"timeline","task_id":"t1"}"#,
+                crate::traits::ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(!res.contains("sk-abc"));

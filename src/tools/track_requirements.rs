@@ -11,8 +11,8 @@ use crate::events::{ExecutorExpectationItem, ExecutorExpectationsDeclaredData};
 use crate::plans::{ChecklistItem, PlanStore, StepStatus};
 use crate::traits::{
     RequestObservationTarget, RequestVerificationTargetKind, StableObservationSubject, Tool,
-    ToolArgumentContractViolation, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolSemanticFacet,
+    ToolArgumentContractViolation, ToolCallContext, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolSemanticFacet,
 };
 
 /// Item-level key under which canonicalization records resource-ID targets
@@ -519,9 +519,31 @@ impl Tool for TrackRequirementsTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl TrackRequirementsTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let v: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-        let session_id = match v.get("_session_id").and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => s.to_string(),
+        let session_id = match facts.session_id.as_str() {
+            s if !s.is_empty() => s.to_string(),
             _ => {
                 return Ok(
                     "track_requirements: no session context available; checklist not saved."
@@ -529,10 +551,7 @@ impl Tool for TrackRequirementsTool {
                 )
             }
         };
-        let task_id = v
-            .get("_task_id")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
+        let task_id = facts.task_id.clone();
 
         let Some(raw_items) = v.get("items").and_then(Value::as_array) else {
             return Ok("track_requirements: no items provided.".to_string());
@@ -699,6 +718,7 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use crate::traits::ToolSemantics;
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -795,14 +815,16 @@ mod tests {
     async fn test_track_requirements_persists_and_returns_rendered_list() {
         let (tool, plan_store) = test_tool().await;
         let args = json!({
-            "_session_id": "sess-1",
             "items": [
                 {"text": "create script", "status": "in_progress"},
                 {"text": "send the file", "status": "pending"}
             ]
         })
         .to_string();
-        let out = tool.call(&args).await.unwrap();
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-1"))
+            .await
+            .unwrap();
         assert!(out.contains("create script"));
         assert!(out.contains("send the file"));
         let plan = plan_store
@@ -819,12 +841,13 @@ mod tests {
         let (tool, plan_store) = test_tool().await;
         let mk = |status: &str| {
             json!({
-                "_session_id": "sess-2",
                 "items": [{"text": "send the file", "status": status}]
             })
             .to_string()
         };
-        tool.call(&mk("pending")).await.unwrap();
+        tool.call_with(&mk("pending"), crate::testing::call_facts("sess-2"))
+            .await
+            .unwrap();
         // While still pending it is the session's active (incomplete) checklist.
         let id = plan_store
             .get_incomplete_for_session("sess-2")
@@ -833,7 +856,9 @@ mod tests {
             .unwrap()
             .id;
 
-        tool.call(&mk("completed")).await.unwrap();
+        tool.call_with(&mk("completed"), crate::testing::call_facts("sess-2"))
+            .await
+            .unwrap();
         // Once all items are completed the plan is auto-completed (no longer
         // "incomplete"), so fetch it by id to verify the final state.
         let plan = plan_store.get(&id).await.unwrap().unwrap();
@@ -878,8 +903,6 @@ mod tests {
     /// no adapter reports.
     fn audit_checklist_arguments(status: &str) -> Value {
         json!({
-            "_session_id": "sess-audit",
-            "_task_id": "task-audit",
             "items": [
                 {
                     "text": "Audit the schedule state and latest run outcome.",
@@ -943,7 +966,11 @@ mod tests {
             "the drop must be recorded, never silent"
         );
 
-        let out = tool.call(&canonical).await.unwrap();
+        let facts = crate::traits::ToolCallContext {
+            task_id: Some("task-audit".into()),
+            ..crate::testing::call_facts("sess-audit")
+        };
+        let out = tool.call_with(&canonical, facts).await.unwrap();
         assert!(
             out.contains("x_owner_credential_state"),
             "the model must be told which target was unbound: {out}"

@@ -16,11 +16,11 @@ use crate::traits::{
     MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationScope,
     MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
     MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
-    MandateTerminationKind, MandateToolStore, StateStore, Tool, ToolCallMetadata,
+    MandateTerminationKind, MandateToolStore, StateStore, Tool, ToolCallContext, ToolCallMetadata,
     ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
     ToolOutcomeStatus, ToolRole,
 };
-use crate::types::{ApprovalKind, ApprovalResponse};
+use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, UserRole};
 
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
@@ -148,16 +148,12 @@ impl ManageMandatesTool {
     }
 
     fn is_owner(args: &ManageMandatesArgs) -> bool {
-        args._user_role
-            .as_deref()
-            .is_some_and(|role| role.eq_ignore_ascii_case("owner"))
+        args.call_role == Some(UserRole::Owner)
     }
 
     fn is_internal(args: &ManageMandatesArgs) -> bool {
-        args._channel_visibility
-            .as_deref()
-            .is_some_and(|visibility| visibility.eq_ignore_ascii_case("internal"))
-            || args._session_id.as_deref().is_some_and(|session| {
+        args.call_visibility == Some(ChannelVisibility::Internal)
+            || args.call_session.as_deref().is_some_and(|session| {
                 session.starts_with("specialist:") || session.starts_with("sub-")
             })
     }
@@ -182,15 +178,12 @@ impl ManageMandatesTool {
     fn is_private_owner_control(args: &ManageMandatesArgs) -> bool {
         Self::is_owner(args)
             && !Self::is_internal(args)
-            && args
-                ._channel_visibility
-                .as_deref()
-                .is_some_and(|visibility| visibility.eq_ignore_ascii_case("private"))
+            && args.call_visibility == Some(ChannelVisibility::Private)
     }
 
     fn owner_session(args: &ManageMandatesArgs) -> anyhow::Result<&str> {
         let session = args
-            ._session_id
+            .call_session
             .as_deref()
             .map(str::trim)
             .filter(|session| !session.is_empty())
@@ -1832,8 +1825,9 @@ impl ManageMandatesTool {
                 "record_measurement is reserved for the internal mandate deliberator.".to_string(),
             );
         }
-        let goal_id = required_trimmed(args._goal_id.as_deref(), "internal _goal_id")?;
-        let goal_run_id = required_trimmed(args._goal_run_id.as_deref(), "internal _goal_run_id")?;
+        let goal_id = required_trimmed(args.call_goal_id.as_deref(), "internal _goal_id")?;
+        let goal_run_id =
+            required_trimmed(args.call_goal_run_id.as_deref(), "internal _goal_run_id")?;
         let mandate = self
             .state
             .get_mandate_for_goal(goal_id)
@@ -1882,11 +1876,11 @@ impl ManageMandatesTool {
                 "record_decision is reserved for the internal mandate deliberator.".to_string(),
             );
         }
-        let goal_id = required_trimmed(args._goal_id.as_deref(), "internal _goal_id")?;
+        let goal_id = required_trimmed(args.call_goal_id.as_deref(), "internal _goal_id")?;
         let pinned_run_id =
-            required_trimmed(args._goal_run_id.as_deref(), "internal _goal_run_id")?;
+            required_trimmed(args.call_goal_run_id.as_deref(), "internal _goal_run_id")?;
         let pinned_attempt_id = required_trimmed(
-            args._task_attempt_id.as_deref(),
+            args.call_task_attempt_id.as_deref(),
             "internal _task_attempt_id",
         )?;
         let mandate = self
@@ -2259,21 +2253,33 @@ struct ManageMandatesArgs {
     guidance: Option<String>,
     reconciliation_resolution: Option<String>,
     target_session_id: Option<String>,
-    #[serde(default)]
-    _session_id: Option<String>,
-    #[serde(default)]
-    _user_role: Option<String>,
-    #[serde(default)]
-    _channel_visibility: Option<String>,
-    #[serde(default)]
-    _goal_id: Option<String>,
-    #[serde(default)]
-    _goal_run_id: Option<String>,
-    #[serde(default)]
-    _task_attempt_id: Option<String>,
+    /// The dispatcher's facts about this call ([`Self::bind_facts`]),
+    /// never arguments.
+    #[serde(skip)]
+    call_session: Option<String>,
+    #[serde(skip)]
+    call_role: Option<UserRole>,
+    #[serde(skip)]
+    call_visibility: Option<ChannelVisibility>,
+    #[serde(skip)]
+    call_goal_id: Option<String>,
+    #[serde(skip)]
+    call_goal_run_id: Option<String>,
+    #[serde(skip)]
+    call_task_attempt_id: Option<String>,
 }
 
 impl ManageMandatesArgs {
+    /// Take the caller's identity and run fence from the dispatcher's facts.
+    fn bind_facts(&mut self, facts: &ToolCallContext) {
+        self.call_session = Some(facts.session_id.clone());
+        self.call_role = facts.user_role;
+        self.call_visibility = facts.channel_visibility;
+        self.call_goal_id = facts.goal_id.clone();
+        self.call_goal_run_id = facts.goal_run_id.clone();
+        self.call_task_attempt_id = facts.task_attempt_id.clone();
+    }
+
     /// Normalize compatibility noise from structured-tool providers before any
     /// action-specific validation. Some providers materialize every optional
     /// scalar using an empty string or its schema minimum. Those placeholders
@@ -2518,32 +2524,27 @@ impl Tool for ManageMandatesTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let mut args: ManageMandatesArgs = serde_json::from_str(arguments)?;
-        args.normalize_for_action();
-        match args.action.as_str() {
-            "draft" => self.draft(&args).await,
-            "create" => self.create(&args).await,
-            "list" => self.list(&args).await,
-            "get" => self.get(&args).await,
-            "update" => self.update(&args).await,
-            "transfer_owner" => self.transfer_owner(&args).await,
-            "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
-                self.transition(&args, &args.action).await
-            }
-            "record_decision" => self.record_decision(&args).await,
-            "record_measurement" => self.record_measurement(&args).await,
-            "list_intentions" => self.list_intentions(&args).await,
-            other => anyhow::bail!("unknown manage_mandates action `{other}`"),
-        }
+        self.run(arguments, &ToolCallContext::default()).await
     }
 
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let mut args: ManageMandatesArgs = serde_json::from_str(arguments)?;
         args.normalize_for_action();
+        args.bind_facts(&facts);
         let (output, objective_evidence) = if args.action == "list" {
             let (output, portfolio) = self.list_snapshot(&args).await?;
             (
@@ -2551,7 +2552,7 @@ impl Tool for ManageMandatesTool {
                 portfolio.map(|portfolio| portfolio.receipt_evidence()),
             )
         } else {
-            (self.call(arguments).await?, None)
+            (self.run(arguments, &facts).await?, None)
         };
         let trimmed = output.trim_start();
         let outcome_status = if trimmed.starts_with("Mandates can only")
@@ -2578,6 +2579,34 @@ impl Tool for ManageMandatesTool {
             outcome = outcome.with_observation_evidence(observations, collections);
         }
         Ok(outcome)
+    }
+}
+
+impl ManageMandatesTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageMandatesArgs = serde_json::from_str(arguments)?;
+        args.normalize_for_action();
+        args.bind_facts(facts);
+        match args.action.as_str() {
+            "draft" => self.draft(&args).await,
+            "create" => self.create(&args).await,
+            "list" => self.list(&args).await,
+            "get" => self.get(&args).await,
+            "update" => self.update(&args).await,
+            "transfer_owner" => self.transfer_owner(&args).await,
+            "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
+                self.transition(&args, &args.action).await
+            }
+            "record_decision" => self.record_decision(&args).await,
+            "record_measurement" => self.record_measurement(&args).await,
+            "list_intentions" => self.list_intentions(&args).await,
+            other => anyhow::bail!("unknown manage_mandates action `{other}`"),
+        }
     }
 }
 
@@ -3263,7 +3292,18 @@ fn display_policy(values: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The dispatcher's facts for the owner in a private chat.
+    fn owner_facts() -> crate::traits::ToolCallContext {
+        crate::traits::ToolCallContext {
+            session_id: "owner-session".into(),
+            user_role: Some(crate::types::UserRole::Owner),
+            channel_visibility: Some(crate::types::ChannelVisibility::Private),
+            ..Default::default()
+        }
+    }
+
     use super::*;
+    use crate::testing::CallWithFacts;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
 
@@ -3326,14 +3366,17 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let output = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "list",
-                    "_session_id": "owner-session",
-                    "_user_role": "Owner",
-                    "_channel_visibility": "private",
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3445,15 +3488,18 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "list",
-                    "_session_id": "owner-session",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3557,15 +3603,18 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "list",
-                    "_session_id": "owner-session",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3588,15 +3637,18 @@ mod tests {
 
         // Non-owner and non-private callers still get nothing at all.
         let refused = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "list",
-                    "_session_id": "owner-session",
-                    "_user_role": "member",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: None,
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3850,7 +3902,7 @@ mod tests {
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "record_decision",
                     "outcome": "wait",
@@ -3862,13 +3914,16 @@ mod tests {
                     "strategy_key": "",
                     "strategy_kind": "explore",
                     "strategy_confidence_bps": 0,
-                    "_goal_id": goal.id,
-                    "_goal_run_id": run.id,
-                    "_task_attempt_id": attempt.id,
-                    "_session_id": "synthetic-task-lead",
-                    "_channel_visibility": "internal"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    goal_id: Some((goal.id).to_string()),
+                    goal_run_id: Some((run.id).to_string()),
+                    task_attempt_id: Some((attempt.id).to_string()),
+                    session_id: "synthetic-task-lead".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Internal),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4068,14 +4123,20 @@ mod tests {
         .unwrap();
     }
 
+    fn lead_facts(run: &ReviewRun) -> crate::traits::ToolCallContext {
+        crate::traits::ToolCallContext {
+            goal_id: Some(run.goal_id.clone()),
+            goal_run_id: Some(run.run_id.clone()),
+            task_attempt_id: Some(run.attempt_id.clone()),
+            session_id: "specialist:task_lead:synthetic".into(),
+            channel_visibility: Some(ChannelVisibility::Internal),
+            ..Default::default()
+        }
+    }
+
     fn lead_args(run: &ReviewRun, fields: Value) -> String {
         let mut args = json!({
             "mandate_id": run.mandate.id,
-            "_goal_id": run.goal_id,
-            "_goal_run_id": run.run_id,
-            "_task_attempt_id": run.attempt_id,
-            "_session_id": "specialist:task_lead:synthetic",
-            "_channel_visibility": "internal"
         });
         for (key, value) in fields.as_object().unwrap() {
             args[key] = value.clone();
@@ -4109,7 +4170,7 @@ mod tests {
         file_receipt(&run, "call_read_acme_feed", "http_request").await;
         file_receipt(&run, "call_create_task", "manage_goal_tasks").await;
         let result = tool_for(&run)
-            .call(&lead_args(&run, act_fields(&run)))
+            .call_with(&lead_args(&run, act_fields(&run)), lead_facts(&run))
             .await
             .unwrap();
         assert!(result.contains("ACT committed"), "{result}");
@@ -4132,18 +4193,21 @@ mod tests {
         let run = review_run(false).await;
         file_receipt(&run, "call_read_acme_feed", "http_request").await;
         let result = tool_for(&run)
-            .call(&lead_args(
-                &run,
-                json!({
-                    "action": "record_decision",
-                    "outcome": "wait",
-                    "rationale": "The feed has nothing new since the last note",
-                    "learning_note": "The Acme feed updates in the morning",
-                    "strategy_key": "acme_feed_timing",
-                    "strategy_kind": "explore",
-                    "strategy_confidence_bps": 6_000
-                }),
-            ))
+            .call_with(
+                &lead_args(
+                    &run,
+                    json!({
+                        "action": "record_decision",
+                        "outcome": "wait",
+                        "rationale": "The feed has nothing new since the last note",
+                        "learning_note": "The Acme feed updates in the morning",
+                        "strategy_key": "acme_feed_timing",
+                        "strategy_kind": "explore",
+                        "strategy_confidence_bps": 6_000
+                    }),
+                ),
+                lead_facts(&run),
+            )
             .await
             .unwrap();
         assert!(result.contains("WAIT recorded"), "{result}");
@@ -4173,7 +4237,7 @@ mod tests {
         let run = review_run(false).await;
         file_receipt(&run, "call_create_task", "manage_goal_tasks").await;
         let error = tool_for(&run)
-            .call(&lead_args(&run, act_fields(&run)))
+            .call_with(&lead_args(&run, act_fields(&run)), lead_facts(&run))
             .await
             .unwrap_err();
         assert!(
@@ -4189,16 +4253,19 @@ mod tests {
         let run = review_run(true).await;
         file_receipt(&run, "call_read_acme_feed", "http_request").await;
         let result = tool_for(&run)
-            .call(&lead_args(
-                &run,
-                json!({
-                    "action": "record_measurement",
-                    "measurement_value_micros": 0,
-                    "measurement_confidence_bps": 10_000,
-                    "measurement_observed_at": chrono::Utc::now().to_rfc3339(),
-                    "evidence_receipt_ids": []
-                }),
-            ))
+            .call_with(
+                &lead_args(
+                    &run,
+                    json!({
+                        "action": "record_measurement",
+                        "measurement_value_micros": 0,
+                        "measurement_confidence_bps": 10_000,
+                        "measurement_observed_at": chrono::Utc::now().to_rfc3339(),
+                        "evidence_receipt_ids": []
+                    }),
+                ),
+                lead_facts(&run),
+            )
             .await
             .unwrap();
         assert!(result.contains("Objective measurement"), "{result}");
@@ -4260,7 +4327,7 @@ mod tests {
         let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let call = tokio::spawn(async move {
-            tool.call(
+            tool.call_with(
                 r#"{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
@@ -4277,12 +4344,8 @@ mod tests {
                     "max_mutating_actions_per_rolling_24h":8,
                     "min_seconds_between_mutations":900,
                     "constraints":["No fabrication"],
-                    "success_criteria":["Interventions measurably improve the usefulness of the account without degrading trust"],
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
-                }"#,
-            )
+                    "success_criteria":["Interventions measurably improve the usefulness of the account without degrading trust"]
+                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
             .await
         });
 
@@ -4366,7 +4429,7 @@ mod tests {
         let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let call = tokio::spawn(async move {
-            tool.call(
+            tool.call_with(
                 r#"{
                     "action":"create",
                     "objective":"Maintain the synthetic account without routine hand-holding",
@@ -4398,12 +4461,8 @@ mod tests {
                     "max_mutating_actions_per_cycle":2,
                     "max_mutating_actions_per_rolling_24h":12,
                     "min_seconds_between_mutations":900,
-                    "success_criteria":["Each intervention provides concrete value to the synthetic audience"],
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
-                }"#,
-            )
+                    "success_criteria":["Each intervention provides concrete value to the synthetic audience"]
+                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
             .await
         });
 
@@ -4476,8 +4535,9 @@ mod tests {
             .with_skills_dir(Some(skills_dir.path().to_path_buf()));
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
         let call = tokio::spawn(async move {
-            tool.call(&format!(
-                r#"{{
+            tool.call_with(
+                &format!(
+                    r#"{{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
                     "allow_observations":false,
@@ -4485,12 +4545,11 @@ mod tests {
                     "success_criteria":["Owner ends stewardship"],
                     "stop_conditions":["Credentials are revoked"],
                     "strategy_skill":"x-stewardship",
-                    "expires_at":"{expires_at}",
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "expires_at":"{expires_at}"
                 }}"#,
-            ))
+                ),
+                owner_facts(),
+            )
             .await
         });
 
@@ -4560,7 +4619,7 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(harness.state.clone(), ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "draft",
                     "objective": "Post one note about the Acme feed",
@@ -4583,11 +4642,14 @@ mod tests {
                     "max_mutating_actions_per_rolling_24h": 1,
                     "min_seconds_between_mutations": 900,
                     "success_criteria": ["The note is grounded in the Acme feed"],
-                    "_session_id": "owner-session",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4626,15 +4688,18 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Manage the account as an ongoing presence",
-                    "max_mutating_actions_per_cycle":1,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "max_mutating_actions_per_cycle":1
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4666,16 +4731,19 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Steward the account for exactly 24 hours after activation",
                     "duration_minutes":1440,
-                    "expires_at":"2099-01-01T00:00:00Z",
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "expires_at":"2099-01-01T00:00:00Z"
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4699,14 +4767,17 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
-                    "objective":"Maintain a bounded internal posture",
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "objective":"Maintain a bounded internal posture"
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4728,16 +4799,19 @@ mod tests {
         assert!(properties.get("budget_daily").is_none());
 
         let error = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Do not confuse actions with tokens",
                     "budget_per_cycle":1,
-                    "budget_daily":1,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "budget_daily":1
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap_err();
@@ -4753,18 +4827,21 @@ mod tests {
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
 
         let error = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Review every thirty minutes for one day",
                     "default_review_minutes":30,
                     "duration_minutes":1440,
                     "budget_per_cycle":30000,
-                    "budget_daily":30000,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "budget_daily":30000
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap_err();
@@ -4773,16 +4850,19 @@ mod tests {
             .contains("cannot fund 48 default review cycle"));
 
         let defaulted = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Use cadence-aware defaults every thirty minutes",
                     "default_review_minutes":30,
-                    "duration_minutes":1440,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "duration_minutes":1440
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4797,18 +4877,21 @@ mod tests {
         );
 
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"draft",
                     "objective":"Review every thirty minutes for one day",
                     "default_review_minutes":30,
                     "duration_minutes":1440,
                     "budget_per_cycle":30000,
-                    "budget_daily":1440000,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
+                    "budget_daily":1440000
                 }"#,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4829,7 +4912,7 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
         let error = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"create",
                     "objective":"Do not combine unrelated reads and writes",
@@ -4838,12 +4921,8 @@ mod tests {
                     "allowed_target_prefixes":["https://blog.aidaemon.ai/posts/","https://api.x.com/2/tweets"],
                     "max_mutating_actions_per_cycle":1,
                     "max_mutating_actions_per_rolling_24h":1,
-                    "min_seconds_between_mutations":900,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
-                }"#,
-            )
+                    "min_seconds_between_mutations":900
+                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("operation_scopes"));
@@ -4914,17 +4993,20 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "get",
                     "mandate_id": mandate.id,
                     "section": "policy",
-                    "_session_id": "owner-session",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4964,7 +5046,7 @@ mod tests {
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let mandate_id = mandate.id.clone();
         let update = tokio::spawn(async move {
-            tool.call(
+            tool.call_with(
                 &json!({
                     "action": "update",
                     "mandate_id": mandate_id,
@@ -4973,11 +5055,14 @@ mod tests {
                     "priority": "critical",
                     "duration_minutes": 1,
                     "expires_at": "2099-02-15T13:31:00Z",
-                    "_session_id": "owner-session",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "owner-session".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
         });
@@ -5034,30 +5119,26 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-        let owner = json!({
-            "_session_id": "owner-session",
-            "_user_role": "owner",
-            "_channel_visibility": "private"
-        });
-
         let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = Arc::new(ManageMandatesTool::new(
             state.clone(),
             ApprovalBroker::new(approval_tx),
         ));
-        let mut get = json!({"action": "get", "mandate_id": mandate.id, "section": "policy"});
-        get.as_object_mut()
-            .unwrap()
-            .extend(owner.as_object().unwrap().clone());
-        let policy: Value = serde_json::from_str(&tool.call(&get.to_string()).await.unwrap())
-            .expect("policy view is JSON");
+        let get = json!({"action": "get", "mandate_id": mandate.id, "section": "policy"});
+        let policy: Value = serde_json::from_str(
+            &tool
+                .call_with(&get.to_string(), owner_facts())
+                .await
+                .unwrap(),
+        )
+        .expect("policy view is JSON");
         assert_eq!(policy["min_review_minutes"], 15);
         assert_eq!(policy["default_review_minutes"], 240);
         assert_eq!(policy["max_review_minutes"], 1440);
 
         // A structured-output provider fills every field; without the bounds
         // in the policy view it invented the schema minimum (1 minute).
-        let mut placeholder = json!({
+        let placeholder = json!({
             "action": "update",
             "mandate_id": mandate.id,
             "review_effort": "balanced",
@@ -5065,12 +5146,8 @@ mod tests {
             "default_review_minutes": 1,
             "max_review_minutes": 1
         });
-        placeholder
-            .as_object_mut()
-            .unwrap()
-            .extend(owner.as_object().unwrap().clone());
         let error = tool
-            .call(&placeholder.to_string())
+            .call_with(&placeholder.to_string(), owner_facts())
             .await
             .unwrap_err()
             .to_string();
@@ -5089,12 +5166,12 @@ mod tests {
         ] {
             copied[field] = policy[field].clone();
         }
-        copied
-            .as_object_mut()
-            .unwrap()
-            .extend(owner.as_object().unwrap().clone());
         let update_tool = tool.clone();
-        let update = tokio::spawn(async move { update_tool.call(&copied.to_string()).await });
+        let update = tokio::spawn(async move {
+            update_tool
+                .call_with(&copied.to_string(), owner_facts())
+                .await
+        });
         approval_rx
             .recv()
             .await
@@ -5117,17 +5194,13 @@ mod tests {
         drop(approval_rx);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"create",
                     "objective":"Never activate without confirmation",
                     "max_mutating_actions_per_cycle":0,
-                    "success_criteria":["The bounded source is reviewed without unauthorized action"],
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
-                }"#,
-            )
+                    "success_criteria":["The bounded source is reviewed without unauthorized action"]
+                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
             .await
             .unwrap();
         assert!(result.contains("pending mandate was cancelled"));
@@ -5185,10 +5258,10 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
         let result = tool
-            .call(&format!(
-                r#"{{"action":"get","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
-                mandate.id
-            ))
+            .call_with(
+                &format!(r#"{{"action":"get","mandate_id":"{}"}}"#, mandate.id),
+                owner_facts(),
+            )
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&result).unwrap();
@@ -5239,10 +5312,10 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
         let error = tool
-            .call(&format!(
-                r#"{{"action":"resume","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
-                mandate.id
-            ))
+            .call_with(
+                &format!(r#"{{"action":"resume","mandate_id":"{}"}}"#, mandate.id),
+                owner_facts(),
+            )
             .await
             .unwrap_err();
         assert!(error
@@ -5286,12 +5359,25 @@ mod tests {
 
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
-        for (role, visibility) in [("guest", "private"), ("owner", "public")] {
+        for (role, visibility) in [
+            (
+                crate::types::UserRole::Guest,
+                crate::types::ChannelVisibility::Private,
+            ),
+            (
+                crate::types::UserRole::Owner,
+                crate::types::ChannelVisibility::Public,
+            ),
+        ] {
             let result = tool
-                .call(&format!(
-                    r#"{{"action":"cancel","mandate_id":"{}","_session_id":"owner-session","_user_role":"{role}","_channel_visibility":"{visibility}"}}"#,
-                    mandate.id
-                ))
+                .call_with(
+                    &format!(r#"{{"action":"cancel","mandate_id":"{}"}}"#, mandate.id),
+                    crate::traits::ToolCallContext {
+                        user_role: Some(role),
+                        channel_visibility: Some(visibility),
+                        ..owner_facts()
+                    },
+                )
                 .await
                 .unwrap();
             assert!(
@@ -5310,10 +5396,10 @@ mod tests {
             );
         }
         let result = tool
-            .call(&format!(
-                r#"{{"action":"cancel","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
-                mandate.id
-            ))
+            .call_with(
+                &format!(r#"{{"action":"cancel","mandate_id":"{}"}}"#, mandate.id),
+                owner_facts(),
+            )
             .await
             .unwrap();
         assert!(result.contains("is now cancelled"), "{result}");
@@ -5431,10 +5517,13 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let missing = tool
-            .call(&format!(
-                r#"{{"action":"answer_question","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
-                mandate.id
-            ))
+            .call_with(
+                &format!(
+                    r#"{{"action":"answer_question","mandate_id":"{}"}}"#,
+                    mandate.id
+                ),
+                owner_facts(),
+            )
             .await;
         assert!(missing
             .unwrap_err()
@@ -5442,10 +5531,10 @@ mod tests {
             .contains("guidance is required"));
 
         let resumed = tool
-            .call(&format!(
-                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Prefer thoughtful replies over original posts.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+            .call_with(&format!(
+                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Prefer thoughtful replies over original posts."}}"#,
                 mandate.id
-            ))
+            ), owner_facts())
             .await
             .unwrap();
         assert!(resumed.contains("is active"));
@@ -5471,10 +5560,10 @@ mod tests {
         // An unanswered ASK resumes on its own, so an answer can arrive while
         // the mandate is already active. It still lands as bounded guidance.
         let late = tool
-            .call(&format!(
-                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Keep posts under two sentences.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+            .call_with(&format!(
+                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Keep posts under two sentences."}}"#,
                 mandate.id
-            ))
+            ), owner_facts())
             .await
             .unwrap();
         assert!(late.contains("late answer"), "{late}");
@@ -5536,10 +5625,17 @@ mod tests {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let error = tool
-            .call(&format!(
-                r#"{{"action":"record_decision","outcome":"wait","rationale":"stale","_goal_id":"{}","_goal_run_id":"{}","_task_attempt_id":"stale-attempt","_session_id":"sub-task-lead","_channel_visibility":"internal"}}"#,
-                goal.id, stale_run.id
-            ))
+            .call_with(
+                r#"{"action":"record_decision","outcome":"wait","rationale":"stale"}"#,
+                crate::traits::ToolCallContext {
+                    goal_id: Some(goal.id.clone()),
+                    goal_run_id: Some(stale_run.id.clone()),
+                    task_attempt_id: Some("stale-attempt".into()),
+                    session_id: "sub-task-lead".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Internal),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no longer executable"));

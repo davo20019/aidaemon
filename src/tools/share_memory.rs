@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{FactStore, Tool, ToolCapabilities};
+use crate::traits::{FactStore, Tool, ToolCallContext, ToolCapabilities};
 use crate::types::{ApprovalResponse, FactPrivacy};
 
 /// Timeout for approval requests (5 minutes).
@@ -71,8 +71,6 @@ impl ShareMemoryTool {
 struct ShareArgs {
     category: String,
     key: String,
-    #[serde(default)]
-    _session_id: String,
 }
 
 #[async_trait]
@@ -108,6 +106,28 @@ impl Tool for ShareMemoryTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ShareMemoryTool {
+    /// Run one call with the dispatcher's facts (`call`).
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        call: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: ShareArgs = serde_json::from_str(arguments)?;
 
         // Find the fact by category + key
@@ -126,7 +146,7 @@ impl Tool for ShareMemoryTool {
                     crate::utils::truncate_str(&f.value, 83)
                 );
                 match self
-                    .request_approval(&args._session_id, &description)
+                    .request_approval(&call.session_id, &description)
                     .await?
                 {
                     ApprovalResponse::Deny => Ok("Memory sharing denied by user.".to_string()),

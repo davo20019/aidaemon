@@ -6,9 +6,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
+use crate::types::{ChannelVisibility, UserRole};
+
 use crate::traits::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, Tool, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, Tool, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
     ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolVerificationMode,
 };
 
@@ -42,13 +44,15 @@ impl SendNodeAudioTool {
         Self { announcements }
     }
 
-    async fn execute_delivery(&self, arguments: &str) -> anyhow::Result<(String, String)> {
+    async fn execute_delivery(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<(String, String)> {
         let args: SendNodeAudioArgs = serde_json::from_str(arguments)
             .context("send_node_audio arguments must be valid JSON")?;
         anyhow::ensure!(
-            args.user_role
-                .as_deref()
-                .is_some_and(|role| role.eq_ignore_ascii_case("owner")),
+            facts.user_role == Some(UserRole::Owner),
             "Only the AIdaemon owner may send Node audio"
         );
         let delivery = self
@@ -142,16 +146,12 @@ impl ReadNodeHealthTool {
 struct ReadNodeSensorsArgs {
     #[serde(default)]
     node: Option<String>,
-    #[serde(default, rename = "_user_role")]
-    user_role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReadNodeHealthArgs {
     #[serde(default)]
     node: Option<String>,
-    #[serde(default, rename = "_user_role")]
-    user_role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,8 +159,6 @@ struct SendNodeAudioArgs {
     text: String,
     #[serde(default)]
     node: Option<String>,
-    #[serde(default, rename = "_user_role")]
-    user_role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,12 +196,6 @@ struct ManageNodeMonitorsArgs {
     since_hours: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
-    #[serde(default, rename = "_user_role")]
-    user_role: Option<String>,
-    #[serde(default, rename = "_channel_visibility")]
-    channel_visibility: Option<String>,
-    #[serde(default, rename = "_session_id")]
-    session_id: Option<String>,
 }
 
 fn required_arg<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
@@ -257,6 +249,38 @@ impl Tool for ReadNodeSensorsTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        Ok(ToolCallOutcome {
+            output: self.run(arguments, &facts).await?,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
+}
+
+impl ReadNodeSensorsTool {
+    /// Run one call with the dispatcher's `facts`.
+    async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ReadNodeSensorsArgs = serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
         } else {
@@ -264,7 +288,7 @@ impl Tool for ReadNodeSensorsTool {
         })
         .context("read_node_sensors arguments must be valid JSON")?;
         anyhow::ensure!(
-            args.user_role.as_deref() == Some("Owner"),
+            facts.user_role == Some(UserRole::Owner),
             "Only the AIdaemon owner may read Node sensor values"
         );
         let readings =
@@ -306,21 +330,6 @@ impl Tool for ReadNodeSensorsTool {
             "readings": output_readings,
             "interpretation": "These are the latest Device-reported ambient readings. A stale reading must be described as stale, not current."
         }))?)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        Ok(ToolCallOutcome {
-            output: self.call(arguments).await?,
-            metadata: ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::Succeeded),
-                semantics: self.call_semantics(arguments),
-                ..ToolCallMetadata::default()
-            },
-        })
     }
 }
 
@@ -374,6 +383,38 @@ impl Tool for ReadNodeHealthTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        Ok(ToolCallOutcome {
+            output: self.run(arguments, &facts).await?,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
+}
+
+impl ReadNodeHealthTool {
+    /// Run one call with the dispatcher's `facts`.
+    async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ReadNodeHealthArgs = serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
         } else {
@@ -381,7 +422,7 @@ impl Tool for ReadNodeHealthTool {
         })
         .context("read_node_health arguments must be valid JSON")?;
         anyhow::ensure!(
-            args.user_role.as_deref() == Some("Owner"),
+            facts.user_role == Some(UserRole::Owner),
             "Only the AIdaemon owner may read Node health"
         );
         let health = super::store::node_health_snapshot(&self.pool, args.node.as_deref()).await?;
@@ -411,21 +452,6 @@ impl Tool for ReadNodeHealthTool {
             "current_authorizations": health.authorizations,
             "interpretation": "This is the latest authenticated Runtime report stored by AIdaemon. Capability absence means the Node did not report that protocol control; it does not prove the physical hardware lacks it. Authorization absence means the gateway has not granted that action. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
         }))?)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        Ok(ToolCallOutcome {
-            output: self.call(arguments).await?,
-            metadata: ToolCallMetadata {
-                outcome_status: Some(ToolOutcomeStatus::Succeeded),
-                semantics: self.call_semantics(arguments),
-                ..ToolCallMetadata::default()
-            },
-        })
     }
 }
 
@@ -484,15 +510,28 @@ impl Tool for SendNodeAudioTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.execute_delivery(arguments).await?.0)
+        Ok(self
+            .execute_delivery(arguments, &ToolCallContext::default())
+            .await?
+            .0)
     }
 
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let (output, status) = self.execute_delivery(arguments).await?;
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let (output, status) = self.execute_delivery(arguments, &facts).await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -570,21 +609,35 @@ impl Tool for ManageNodeMonitorsTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageNodeMonitorsTool {
+    /// Run one call with the dispatcher's `facts`.
+    async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ManageNodeMonitorsArgs = serde_json::from_str(arguments)
             .context("manage_node_monitors arguments must be valid JSON")?;
         anyhow::ensure!(
-            args.user_role
-                .as_deref()
-                .is_some_and(|role| role.eq_ignore_ascii_case("owner")),
+            facts.user_role == Some(UserRole::Owner),
             "Only the AIdaemon owner may manage Node monitors"
         );
         anyhow::ensure!(
-            args.channel_visibility
-                .as_deref()
-                .is_some_and(|visibility| visibility.eq_ignore_ascii_case("private")),
+            facts.channel_visibility == Some(ChannelVisibility::Private),
             "Node monitors may only be managed from a private Channel"
         );
-        let session_id = required_arg(args.session_id.as_deref(), "owner session")?;
+        let session_id = required_arg(facts.session(), "owner session")?;
         let output = match args.action.as_str() {
             "create" | "create_linked" => {
                 let mandate_id = monitor_mandate_for_action(&args.action, args.mandate_id)?;
@@ -683,6 +736,7 @@ impl crate::traits::ToolSemantics for ManageNodeMonitorsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
 
     #[test]
     fn played_audio_receipt_is_authoritative_delivery_and_outcome_evidence() {
@@ -722,11 +776,26 @@ mod tests {
     async fn rejects_non_owner_before_reading_node_state() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         let tool = ReadNodeSensorsTool::new(pool.clone());
-        let error = tool.call(r#"{"_user_role":"Public"}"#).await.unwrap_err();
+        let error = tool
+            .call_with(
+                r#"{}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Public),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("Only the AIdaemon owner"));
         let health_tool = ReadNodeHealthTool::new(pool);
         let error = health_tool
-            .call(r#"{"_user_role":"Public"}"#)
+            .call_with(
+                r#"{}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Only the AIdaemon owner"));
@@ -744,13 +813,25 @@ mod tests {
         let tool = SendNodeAudioTool::new(announcements);
 
         let non_owner = tool
-            .call(r#"{"text":"hello","_user_role":"Public"}"#)
+            .call_with(
+                r#"{"text":"hello"}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(non_owner.to_string().contains("Only the AIdaemon owner"));
 
         let disabled = tool
-            .call(r#"{"text":"hello","_user_role":"Owner"}"#)
+            .call_with(
+                r#"{"text":"hello"}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(disabled
@@ -768,19 +849,43 @@ mod tests {
         let tool = ManageNodeMonitorsTool::new(service);
 
         let non_owner = tool
-            .call(r#"{"action":"list","_user_role":"Public","_channel_visibility":"private","_session_id":"public-session"}"#)
+            .call_with(
+                r#"{"action":"list"}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Public),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    session_id: "public-session".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(non_owner.to_string().contains("Only the AIdaemon owner"));
 
         let public_channel = tool
-            .call(r#"{"action":"list","_user_role":"Owner","_channel_visibility":"public_external","_session_id":"owner-session"}"#)
+            .call_with(
+                r#"{"action":"list"}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::PublicExternal),
+                    session_id: "owner-session".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(public_channel.to_string().contains("private Channel"));
 
         let disabled = tool
-            .call(r#"{"action":"list","_user_role":"Owner","_channel_visibility":"private","_session_id":"owner-session"}"#)
+            .call_with(
+                r#"{"action":"list"}"#,
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    session_id: "owner-session".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(disabled.to_string().contains("monitoring is disabled"));

@@ -24,7 +24,7 @@ use crate::events::{
 };
 use crate::oauth::chatgpt_codex::{self, ChatGptCredentialManager, CODEX_BACKEND_BASE_URL};
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
@@ -501,6 +501,7 @@ impl GenerateImageTool {
     async fn resolve_reference_images(
         &self,
         args: &Value,
+        facts: &ToolCallContext,
     ) -> Result<Vec<ImageGenerationReference>, ImageGenerationError> {
         let Some(values) = args.get("reference_image_resource_ids") else {
             return Ok(Vec::new());
@@ -519,10 +520,7 @@ impl GenerateImageTool {
             )));
         }
 
-        let session_id = args
-            .get("_session_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let session_id = facts.session_id.as_str();
         let mut seen = HashSet::new();
         let mut references = Vec::with_capacity(values.len());
         for (index, value) in values.iter().enumerate() {
@@ -605,6 +603,7 @@ impl GenerateImageTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         let prompt = args
@@ -619,7 +618,7 @@ impl GenerateImageTool {
             ));
         };
 
-        let references = match self.resolve_reference_images(&args).await {
+        let references = match self.resolve_reference_images(&args, facts).await {
             Ok(references) => references,
             Err(error) => return Ok(error_outcome(error, self.call_semantics(arguments))),
         };
@@ -653,9 +652,9 @@ impl GenerateImageTool {
         let request = ImageGenerationRequest {
             prompt: prompt.to_string(),
             references,
-            turn_id: args
-                .get("_turn_id")
-                .and_then(Value::as_str)
+            turn_id: facts
+                .turn_id
+                .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
@@ -784,7 +783,10 @@ impl Tool for GenerateImageTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.generate_outcome(arguments, None).await?.output)
+        Ok(self
+            .generate_outcome(arguments, None, &ToolCallContext::default())
+            .await?
+            .output)
     }
 
     async fn call_with_status_outcome(
@@ -792,7 +794,17 @@ impl Tool for GenerateImageTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.generate_outcome(arguments, status_tx).await
+        self.generate_outcome(arguments, status_tx, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.generate_outcome(arguments, status_tx, &facts).await
     }
 }
 
@@ -1015,13 +1027,16 @@ mod tests {
         let tool = GenerateImageTool::new(Arc::new(backend), temp.path().to_path_buf());
 
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
-                    "prompt": "A tiny red fox in watercolor",
-                    "_turn_id": "turn-synthetic-1"
+                    "prompt": "A tiny red fox in watercolor"
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    turn_id: Some("turn-synthetic-1".into()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("generate image");
@@ -1175,15 +1190,18 @@ mod tests {
         let tool =
             GenerateImageTool::new(backend, temp.path().to_path_buf()).with_event_store(store);
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "prompt": "Keep Bella's exact face",
-                    "reference_image_resource_ids": ["res_primary", "res_secondary"],
-                    "_session_id": "slack:test",
-                    "_turn_id": "turn-follow-up"
+                    "reference_image_resource_ids": ["res_primary", "res_secondary"]
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "slack:test".into(),
+                    turn_id: Some("turn-follow-up".into()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("generate from registered references");
@@ -1228,14 +1246,17 @@ mod tests {
         let tool =
             GenerateImageTool::new(backend, temp.path().to_path_buf()).with_event_store(store);
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "prompt": "Use another session's image",
-                    "reference_image_resource_ids": ["res_private"],
-                    "_session_id": "slack:private-b"
+                    "reference_image_resource_ids": ["res_private"]
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "slack:private-b".into(),
+                    ..Default::default()
+                },
             )
             .await
             .expect("return a structured reference error");
@@ -1275,14 +1296,17 @@ mod tests {
         let tool = GenerateImageTool::new(backend, temp.path().to_path_buf())
             .with_event_store(store.clone());
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "prompt": "Use the changed image",
-                    "reference_image_resource_ids": ["res_changed"],
-                    "_session_id": "slack:test"
+                    "reference_image_resource_ids": ["res_changed"]
                 })
                 .to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "slack:test".into(),
+                    ..Default::default()
+                },
             )
             .await
             .expect("return a structured integrity error");

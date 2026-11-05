@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 
 use crate::execution::{BackendFileType, BackendPath, SharedExecutionBackend};
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+    Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind,
+    ToolVerificationMode,
 };
 
 use super::fs_utils;
@@ -69,6 +70,28 @@ impl Tool for SearchFilesTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl SearchFilesTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let content_pattern = args["pattern"].as_str();
         let glob_pattern = args["glob"].as_str();
@@ -114,10 +137,7 @@ impl Tool for SearchFilesTool {
         if !search_metadata.is_dir() {
             anyhow::bail!("Not a directory: {}", search_dir);
         }
-        let collaboration_root = if let Some(root) = args
-            .get("_workspace_collaboration_root")
-            .and_then(Value::as_str)
-        {
+        let collaboration_root = if let Some(root) = facts.workspace_collaboration_root.as_deref() {
             anyhow::ensure!(
                 backend.kind() == crate::execution::BackendKind::Local,
                 "Workspace collaboration requires a local execution backend"
@@ -656,14 +676,18 @@ mod tests {
         let args = serde_json::json!({
             "pattern": "COLLAB_NEEDLE",
             "path": canonical_root,
-            "_workspace_collaboration_root": canonical_root,
         })
         .to_string();
+        let facts = crate::traits::ToolCallContext {
+            workspace_collaboration_root: Some(canonical_root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
 
         let result = SearchFilesTool::new(crate::execution::active_execution_backend())
-            .call(&args)
+            .call_with_execution_context(&args, None, facts)
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(result.contains("safe.txt"));
         assert!(!result.contains(".env.local"));
         assert!(!result.contains("secret"));

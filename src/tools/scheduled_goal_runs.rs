@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 
 use crate::traits::{
     semantics_for_exact_read_actions, Goal, ScheduledGoalRunsStore, StateStore, Task, TaskActivity,
-    Tool, ToolArgumentContractViolation, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
+    Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
 };
 use crate::types::StatusUpdate;
 
@@ -1144,8 +1144,6 @@ struct ScheduledGoalRunsArgs {
     include_diagnostics: Option<bool>,
     #[serde(default)]
     workspace_path: Option<String>,
-    #[serde(default)]
-    _user_role: Option<String>,
 }
 
 fn string_enum(values: &[&str]) -> Value {
@@ -1212,6 +1210,79 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
+        let (output, objective_evidence) = if args.action == "overview" {
+            let (output, portfolio) = self
+                .overview_snapshot(
+                    args.limit.unwrap_or(50),
+                    args.include_diagnostics.unwrap_or(false),
+                )
+                .await?;
+            (output, Some(portfolio.receipt_evidence()))
+        } else {
+            (self.run(arguments, &facts).await?, None)
+        };
+        let mut internal_identifiers = crate::tools::sanitize::extract_uuid_identifiers(&output);
+        for candidate in [args.goal_id.as_deref(), args.schedule_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            internal_identifiers
+                .extend(crate::tools::sanitize::extract_uuid_identifiers(candidate));
+        }
+        internal_identifiers.sort();
+        internal_identifiers.dedup();
+
+        let presentation = if args.include_diagnostics.unwrap_or(false) {
+            Some(ToolResultPresentation::DiagnosticDetail)
+        } else if matches!(
+            args.action.as_str(),
+            "run_now" | "set_budget" | "update_instructions"
+        ) {
+            Some(ToolResultPresentation::NaturalSummary)
+        } else {
+            None
+        };
+        let mut outcome = ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                presentation,
+                internal_identifiers,
+                ..ToolCallMetadata::default()
+            },
+        };
+        if let Some((observations, collections)) = objective_evidence {
+            outcome = outcome.with_observation_evidence(observations, collections);
+        }
+        Ok(outcome)
+    }
+}
+
+impl ScheduledGoalRunsTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
         match args.action.as_str() {
@@ -1251,10 +1322,7 @@ impl Tool for ScheduledGoalRunsTool {
 	                self.unblock_hints(goal_id).await
 	            }
 	            "set_budget" => {
-	                let is_owner = args
-	                    ._user_role
-	                    .as_deref()
-	                    .is_some_and(|r| r.eq_ignore_ascii_case("owner"));
+	                let is_owner = facts.user_role == Some(crate::types::UserRole::Owner);
 	                if !is_owner {
 	                    return Ok("Only owners can change scheduled goal budgets.".to_string());
 	                }
@@ -1266,10 +1334,7 @@ impl Tool for ScheduledGoalRunsTool {
 	                    .await
 	            }
 	            "update_instructions" => {
-	                let is_owner = args
-	                    ._user_role
-	                    .as_deref()
-	                    .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
+	                let is_owner = facts.user_role == Some(crate::types::UserRole::Owner);
 	                if !is_owner {
 	                    return Ok("Only owners can update scheduled goal instructions.".to_string());
 	                }
@@ -1289,10 +1354,7 @@ impl Tool for ScheduledGoalRunsTool {
                     .await
 	            }
 	            "bind_workspace" => {
-	                let is_guest = args
-	                    ._user_role
-	                    .as_deref()
-	                    .is_some_and(|role| role.eq_ignore_ascii_case("guest"));
+	                let is_guest = facts.user_role == Some(crate::types::UserRole::Guest);
 	                if is_guest {
 	                    return Ok("Guests cannot bind scheduled goal workspaces.".to_string());
 	                }
@@ -1310,58 +1372,6 @@ impl Tool for ScheduledGoalRunsTool {
 	                other
 	            )),
 	        }
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
-        let (output, objective_evidence) = if args.action == "overview" {
-            let (output, portfolio) = self
-                .overview_snapshot(
-                    args.limit.unwrap_or(50),
-                    args.include_diagnostics.unwrap_or(false),
-                )
-                .await?;
-            (output, Some(portfolio.receipt_evidence()))
-        } else {
-            (self.call(arguments).await?, None)
-        };
-        let mut internal_identifiers = crate::tools::sanitize::extract_uuid_identifiers(&output);
-        for candidate in [args.goal_id.as_deref(), args.schedule_id.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            internal_identifiers
-                .extend(crate::tools::sanitize::extract_uuid_identifiers(candidate));
-        }
-        internal_identifiers.sort();
-        internal_identifiers.dedup();
-
-        let presentation = if args.include_diagnostics.unwrap_or(false) {
-            Some(ToolResultPresentation::DiagnosticDetail)
-        } else if matches!(
-            args.action.as_str(),
-            "run_now" | "set_budget" | "update_instructions"
-        ) {
-            Some(ToolResultPresentation::NaturalSummary)
-        } else {
-            None
-        };
-        let mut outcome = ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                presentation,
-                internal_identifiers,
-                ..ToolCallMetadata::default()
-            },
-        };
-        if let Some((observations, collections)) = objective_evidence {
-            outcome = outcome.with_observation_evidence(observations, collections);
-        }
-        Ok(outcome)
     }
 }
 
@@ -1434,6 +1444,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::CallWithFacts;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task};
 
@@ -2090,14 +2101,17 @@ mod tests {
             "Use one current primary source and write a human-useful insight.",
         ] {
             let result = tool
-                .call(
+                .call_with(
                     &json!({
                         "action": "update_instructions",
                         "goal_id": goal.id,
-                        "instructions": instructions,
-                        "_user_role": "Owner"
+                        "instructions": instructions
                     })
                     .to_string(),
+                    crate::traits::ToolCallContext {
+                        user_role: Some(crate::types::UserRole::Owner),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap();
@@ -2170,16 +2184,19 @@ mod tests {
             .unwrap();
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "update_instructions",
                     "goal_id": goal.id,
                     "instructions": "Always finish the run.",
                     "run_requirement": "must_complete",
-                    "insufficient_evidence": "skip_run",
-                    "_user_role": "Owner"
+                    "insufficient_evidence": "skip_run"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2407,15 +2424,18 @@ mod tests {
         state.create_goal_schedule(&schedule).await.unwrap();
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "set_budget",
                     "goal_id": goal_id,
                     "budget_per_check": 1234,
-                    "budget_daily": 5678,
-                    "_user_role": "Owner"
+                    "budget_daily": 5678
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2461,14 +2481,17 @@ mod tests {
         state.create_goal_schedule(&schedule).await.unwrap();
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "set_budget",
                     "goal_id": goal_id,
-                    "budget_daily": 9999,
-                    "_user_role": "Guest"
+                    "budget_daily": 9999
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Guest),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2510,43 +2533,52 @@ mod tests {
         state.create_goal_schedule(&schedule).await.unwrap();
 
         let negative = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "set_budget",
                     "goal_id": goal_id,
-                    "budget_daily": -1,
-                    "_user_role": "Owner"
+                    "budget_daily": -1
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         assert!(negative.contains("budget_daily must be >="));
 
         let too_large = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "set_budget",
                     "goal_id": goal_id,
-                    "budget_daily": 2000001,
-                    "_user_role": "Owner"
+                    "budget_daily": 2000001
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         assert!(too_large.contains("max"));
 
         let allowed_relation = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "set_budget",
                     "goal_id": goal_id,
                     "budget_per_check": 200,
-                    "budget_daily": 100,
-                    "_user_role": "Owner"
+                    "budget_daily": 100
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

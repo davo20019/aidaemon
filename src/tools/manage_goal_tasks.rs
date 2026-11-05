@@ -7,7 +7,8 @@ use tracing::info;
 
 use crate::traits::{
     semantics_for_exact_read_actions, HandoffArtifact, StateStore, Task, TaskAttemptPatch,
-    TaskHandoff, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
+    TaskHandoff, Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolRole,
 };
 
 /// Tool for task leads to manage tasks within their assigned goal.
@@ -296,14 +297,16 @@ struct ManageGoalTasksArgs {
     remaining_risk: Option<String>,
     #[serde(default)]
     next_step: Option<String>,
-    #[serde(default)]
-    _mandate_id: Option<String>,
-    #[serde(default)]
-    _mandate_version: Option<i64>,
-    #[serde(default)]
-    _goal_run_id: Option<String>,
-    #[serde(default)]
-    _task_attempt_id: Option<String>,
+    /// The dispatcher's mandate fence (from the call's facts, never an
+    /// argument).
+    #[serde(skip)]
+    fence_mandate_id: Option<String>,
+    #[serde(skip)]
+    fence_mandate_version: Option<i64>,
+    #[serde(skip)]
+    fence_goal_run_id: Option<String>,
+    #[serde(skip)]
+    fence_task_attempt_id: Option<String>,
 }
 
 #[async_trait]
@@ -403,9 +406,36 @@ impl Tool for ManageGoalTasksTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageGoalTasksArgs = serde_json::from_str(arguments)?;
+        self.run(arguments, &ToolCallContext::default()).await
+    }
 
-        let mandate_context = args._mandate_id.is_some()
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageGoalTasksTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageGoalTasksArgs = serde_json::from_str(arguments)?;
+        // The mandate fence comes from the dispatcher, never the arguments.
+        args.fence_mandate_id = facts.mandate_id.clone();
+        args.fence_mandate_version = facts.mandate_version;
+        args.fence_goal_run_id = facts.goal_run_id.clone();
+        args.fence_task_attempt_id = facts.task_attempt_id.clone();
+
+        let mandate_context = args.fence_mandate_id.is_some()
             || self
                 .state
                 .get_mandate_for_goal(&self.goal_id)
@@ -547,20 +577,20 @@ fn validate_no_cycles(
 impl ManageGoalTasksTool {
     async fn create_task(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
         let persisted_mandate = self.state.get_mandate_for_goal(&self.goal_id).await?;
-        let mandate_context = args._mandate_id.is_some() || persisted_mandate.is_some();
+        let mandate_context = args.fence_mandate_id.is_some() || persisted_mandate.is_some();
         let mandate_fence = if mandate_context {
-            let mandate_id = args._mandate_id.as_deref().ok_or_else(|| {
+            let mandate_id = args.fence_mandate_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("mandate task creation is missing its dispatcher-owned mandate id")
             })?;
-            let mandate_version = args._mandate_version.ok_or_else(|| {
+            let mandate_version = args.fence_mandate_version.ok_or_else(|| {
                 anyhow::anyhow!(
                     "mandate task creation is missing its dispatcher-owned policy version"
                 )
             })?;
-            let goal_run_id = args._goal_run_id.as_deref().ok_or_else(|| {
+            let goal_run_id = args.fence_goal_run_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("mandate task creation is missing its dispatcher-owned goal run")
             })?;
-            let task_attempt_id = args._task_attempt_id.as_deref().ok_or_else(|| {
+            let task_attempt_id = args.fence_task_attempt_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "mandate task creation is missing its dispatcher-owned task attempt"
                 )
@@ -997,23 +1027,23 @@ impl ManageGoalTasksTool {
         }
 
         let agent_id = args.agent_id.as_deref().unwrap_or("executor");
-        if args._mandate_id.is_some()
+        if args.fence_mandate_id.is_some()
             || self
                 .state
                 .get_mandate_for_goal(&self.goal_id)
                 .await?
                 .is_some()
         {
-            let mandate_id = args._mandate_id.as_deref().ok_or_else(|| {
+            let mandate_id = args.fence_mandate_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("mandate task claim is missing its dispatcher-owned mandate id")
             })?;
-            let mandate_version = args._mandate_version.ok_or_else(|| {
+            let mandate_version = args.fence_mandate_version.ok_or_else(|| {
                 anyhow::anyhow!("mandate task claim is missing its dispatcher-owned policy version")
             })?;
-            let goal_run_id = args._goal_run_id.as_deref().ok_or_else(|| {
+            let goal_run_id = args.fence_goal_run_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("mandate task claim is missing its dispatcher-owned goal run")
             })?;
-            let root_attempt_id = args._task_attempt_id.as_deref().ok_or_else(|| {
+            let root_attempt_id = args.fence_task_attempt_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("mandate task claim is missing its dispatcher-owned root attempt")
             })?;
             anyhow::ensure!(
@@ -3198,22 +3228,28 @@ mod tests {
             .with_goal_run_id(Some(run.id.clone()));
         // The schema offers placement hints; a mandate task lead that fills
         // them in must still be able to create its committed work task.
+        let fence = crate::traits::ToolCallContext {
+            mandate_id: Some(mandate.id.clone()),
+            mandate_version: Some(mandate.version),
+            goal_run_id: Some(run.id.clone()),
+            task_attempt_id: Some(root_attempt.id.clone()),
+            ..Default::default()
+        };
         let result = tool
-            .call(
+            .call_with_execution_context(
                 &json!({
                     "action": "create_task",
                     "description": "Publish exactly one synthetic post",
                     "worker_profile": "executor",
                     "workspace_policy": "isolated",
-                    "_mandate_id": mandate.id,
-                    "_mandate_version": mandate.version,
-                    "_goal_run_id": run.id,
-                    "_task_attempt_id": root_attempt.id,
                 })
                 .to_string(),
+                None,
+                fence,
             )
             .await
-            .expect("placement hints must not block a committed ACT");
+            .expect("placement hints must not block a committed ACT")
+            .output;
         assert!(!result.contains("Cannot create task"), "{result}");
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert!(tasks
