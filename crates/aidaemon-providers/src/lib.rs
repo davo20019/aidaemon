@@ -6,6 +6,8 @@
 //!   OpenRouter, Ollama, llama.cpp, vLLM and other compatible servers.
 //! - [`Anthropic`]: the Messages API, with prompt caching of the stable
 //!   prefix (system prompt and tool definitions).
+//! - [`ChatGpt`]: models on a ChatGPT subscription through the Codex
+//!   backend's Responses API, with credentials from a [`ChatGptAuth`].
 //!
 //! Both stream over SSE: [`Provider::stream`](aidaemon_core::Provider::stream)
 //! yields [`StreamEvent::TextDelta`](aidaemon_core::StreamEvent::TextDelta)
@@ -50,6 +52,7 @@
 //! ```
 
 mod anthropic;
+mod chatgpt;
 mod errors;
 mod openai;
 mod sse;
@@ -58,6 +61,10 @@ mod transport;
 pub use anthropic::{
     Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
     ANTHROPIC_VERSION,
+};
+pub use chatgpt::{
+    ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials, StaticChatGptAuth,
+    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_REASONING_EFFORTS,
 };
 pub use errors::{affordable_tokens, context_overflow, error_for_status};
 pub use openai::{OpenAiCompatible, OpenAiCompatibleBuilder, OPENAI_DEFAULT_BASE_URL};

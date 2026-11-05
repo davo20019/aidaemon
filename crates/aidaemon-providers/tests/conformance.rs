@@ -224,3 +224,38 @@ async fn provider_errors_are_reported_not_panicked() {
         .failure("provider.stream_well_formed/plain")
         .is_some_and(|r| r.contains("error")));
 }
+
+fn chatgpt_text() -> String {
+    data_events(&[
+        json!({"type": "response.output_text.delta", "delta": "Hello "}),
+        json!({"type": "response.output_text.delta", "delta": "there."}),
+        json!({"type": "response.output_item.done", "item": {"type": "message", "content": [{"text": "Hello there."}]}}),
+        json!({"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 20, "output_tokens": 3, "input_tokens_details": {"cached_tokens": 8}}}}),
+    ])
+}
+
+fn chatgpt_tool() -> String {
+    data_events(&[
+        json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "call_a", "name": "get_time", "arguments": "{\"city\": \"Springfield\"}"}}),
+        json!({"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 30, "output_tokens": 9}}}),
+    ])
+}
+
+#[tokio::test]
+async fn chatgpt_passes_the_provider_kit() {
+    let server = MockServer::start(queue(chatgpt_text(), chatgpt_tool())).await;
+    let provider = aidaemon_providers::ChatGpt::builder()
+        .base_url(&server.base)
+        .auth(aidaemon_providers::StaticChatGptAuth(
+            aidaemon_providers::ChatGptCredentials {
+                access_token: "synthetic-token".into(),
+                account_id: "acct-synthetic".into(),
+            },
+        ))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let report = check_provider(&provider).await;
+    report.assert_all_passed();
+    assert_eq!(server.requests().len(), 2 * PROVIDER_CALLS_PER_REQUEST);
+}
