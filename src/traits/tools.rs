@@ -81,29 +81,6 @@ impl SpecialistKind {
     }
 }
 
-/// Structured semantic affordances for matching tools to contextual requests.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolSemanticAffordances {
-    pub scope: ToolSemanticScope,
-    #[serde(default)]
-    pub facets: Vec<ToolSemanticFacet>,
-}
-
-#[allow(dead_code)]
-impl ToolSemanticAffordances {
-    pub fn new(scope: ToolSemanticScope, facets: &[ToolSemanticFacet]) -> Self {
-        Self {
-            scope,
-            facets: facets.to_vec(),
-        }
-    }
-
-    pub fn supports(&self, facet: ToolSemanticFacet) -> bool {
-        self.facets.contains(&facet)
-    }
-}
-
 /// A daemon tool: its identity and execution. What it says about a call
 /// without running it lives on the [`ToolSemantics`] supertrait.
 #[async_trait]
@@ -119,22 +96,6 @@ pub trait Tool: ToolSemantics {
     /// Returns the OpenAI-format function schema as a JSON Value.
     fn schema(&self) -> Value;
 
-    /// Produce the single typed invocation object consumed by the execution
-    /// control plane. Validation deliberately precedes semantics and access
-    /// derivation so a rejected proposal can never acquire intended effects.
-    fn prepare_invocation(
-        &self,
-        arguments: &str,
-    ) -> Result<PreparedToolInvocation, ToolArgumentContractViolation> {
-        let canonical_arguments = self.canonicalize_arguments(arguments)?;
-        self.validate_arguments(&canonical_arguments)?;
-        Ok(PreparedToolInvocation {
-            semantics: self.call_semantics(&canonical_arguments),
-            access_manifest: self.call_access_manifest(&canonical_arguments),
-            receipt_kind: self.receipt_kind(&canonical_arguments),
-            canonical_arguments,
-        })
-    }
     /// Execute the tool with the given JSON arguments string, returns result text.
     async fn call(&self, arguments: &str) -> anyhow::Result<String>;
 
@@ -181,23 +142,6 @@ pub trait Tool: ToolSemantics {
         let _ = exec_ctx;
         self.call_with_status_outcome(arguments, status_tx).await
     }
-
-    /// Semantic domains this tool can answer or affect.
-    #[allow(dead_code)]
-    fn semantic_affordances(&self) -> Option<ToolSemanticAffordances> {
-        None
-    }
-}
-
-/// Validated, canonical tool input. This is the boundary object shared by
-/// policy, retry, dispatch, and receipt projection; raw model JSON is not an
-/// execution fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedToolInvocation {
-    pub canonical_arguments: String,
-    pub semantics: ToolCallSemantics,
-    pub access_manifest: ToolCallAccessManifest,
-    pub receipt_kind: ToolReceiptKind,
 }
 
 #[cfg(test)]

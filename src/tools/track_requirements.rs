@@ -1064,7 +1064,7 @@ mod tests {
             }]
         })
         .to_string();
-        let violation = tool.prepare_invocation(&raw).unwrap_err();
+        let violation = crate::traits::prepare_invocation(&tool, &raw).unwrap_err();
         assert!(violation.reason.contains("item 0"), "{violation:?}");
     }
 

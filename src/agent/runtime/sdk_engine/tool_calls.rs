@@ -27,8 +27,7 @@ pub(super) fn call_scope_check(
     arguments: &str,
     facts: &CallScopeFacts<'_>,
 ) -> Option<crate::agent::tool_execution::ScopeCheck> {
-    let mut manifest = tool
-        .prepare_invocation(arguments)
+    let mut manifest = crate::traits::prepare_invocation(tool, arguments)
         .map(|prepared| prepared.access_manifest)
         .unwrap_or_else(|_| tool.call_access_manifest(arguments));
     manifest.adapter_read_targets = tool
@@ -448,7 +447,10 @@ impl Agent {
             .tools
             .iter()
             .find(|tool| tool.name() == tool_name)
-            .map(|tool| tool.call_annotations(arguments).read_only);
+            .map(|tool| {
+                tool.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
+                    .read_only
+            });
         let assessed = crate::agent::closeout::ClosingAuthority::from_authority(
             scope.contract.authority_as_assessed(),
         );
@@ -969,7 +971,9 @@ impl Agent {
                     .tools
                     .iter()
                     .find(|tool| tool.name() == request.name)
-                    .and_then(|tool| tool.prepare_invocation(arguments).ok());
+                    .and_then(|tool| {
+                        crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
+                    });
                 let mut metadata = crate::traits::ToolCallMetadata {
                     outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
                     transport_error: Some(error.to_string()),

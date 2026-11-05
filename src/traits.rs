@@ -80,17 +80,17 @@ pub use provider::{
 };
 #[allow(unused_imports)]
 pub use tools::{
-    default_call_annotations, semantics_for_exact_read_actions, AgentRole, ApprovalScope,
-    AuthorizationPreflightRecord, AuthorizationPreflightStatus, DurableReplayDecision,
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, PreparedToolInvocation,
-    ReadFileResultMetadata, ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation,
-    SpecialistKind, StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
-    ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
-    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolCollectionCompleteness, ToolCollectionObservation, ToolEvidenceCapability,
-    ToolExecutionContext, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
-    ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
-    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
+    default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
+    ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
+    DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope,
+    PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    RuntimePreparationFailure, ScopeEscalation, SpecialistKind, StableObservationSubject, Tool,
+    ToolAccessDenial, ToolAccessEnforcement, ToolArgumentContractViolation, ToolCallAccessManifest,
+    ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolCollectionCompleteness, ToolCollectionObservation,
+    ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,
+    ToolObservationEvidence, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
+    ToolResultContentSource, ToolResultPresentation, ToolResultProvenance, ToolRole,
     ToolSemanticFacet, ToolSemanticScope, ToolSemantics, ToolTargetHint, ToolTargetHintKind,
     ToolVerificationMode, TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };

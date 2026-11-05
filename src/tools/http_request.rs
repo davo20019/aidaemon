@@ -2205,7 +2205,11 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
 
     /// Owner credentials turn any method into egress: a credentialed GET can
     /// still trigger actions or leak the account's data.
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
         let mut annotations = crate::traits::default_call_annotations(
             self.capabilities(),
             &self.call_semantics(arguments),
@@ -3928,7 +3932,7 @@ mod tests {
         let tool = local_tool();
         let raw = arguments.to_string();
         let info = aidaemon_core::ToolInfo {
-            annotations: tool.call_annotations(&raw),
+            annotations: tool.call_annotations_in(&raw, &crate::traits::TrustRoots::new(&[])),
             access: aidaemon_core::AccessManifest::default(),
             effects: tool.call_effects(&raw),
         };

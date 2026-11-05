@@ -7896,11 +7896,6 @@ impl crate::traits::ToolSemantics for TerminalTool {
         terminal_call_effects(arguments)
     }
 
-    /// Without the turn's roots every delete counts as outside them.
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
-        self.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
-    }
-
     fn call_annotations_in(
         &self,
         arguments: &str,
@@ -9909,7 +9904,10 @@ mod tests {
         );
         let status = run("git status");
         assert_eq!(host.output_trust(&status, &roots), SourceTrust::Trusted);
-        assert!(host.call_annotations(&status).read_only);
+        assert!(
+            host.call_annotations_in(&status, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
         assert_eq!(
             host.output_trust(&run("cat /etc/hosts"), &roots),
             SourceTrust::Untrusted
@@ -10018,7 +10016,7 @@ mod tests {
                 SourceTrust::Untrusted,
                 "{command}"
             );
-            let ann = host.call_annotations(&args);
+            let ann = host.call_annotations_in(&args, &crate::traits::TrustRoots::new(&[]));
             assert!(ann.egress && !ann.read_only, "{command}");
         }
     }
@@ -10058,8 +10056,9 @@ mod tests {
     async fn host_local_work_is_not_egress() {
         let (host, _) = host_and_sandboxed_terminals().await;
         let ann = |command: &str| {
-            host.call_annotations(
+            host.call_annotations_in(
                 &serde_json::json!({"action":"run","command":command}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
             )
         };
         for local in [
@@ -10167,7 +10166,9 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        let ann = |args: serde_json::Value| tool.call_annotations(&args.to_string());
+        let ann = |args: serde_json::Value| {
+            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+        };
         let config = ann(serde_json::json!({
             "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.git/config"]
         }));
@@ -10207,12 +10208,13 @@ mod tests {
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         let ann = |command: &str, root: &std::path::Path| {
-            tool.call_annotations(
+            tool.call_annotations_in(
                 &serde_json::json!({
                     "action":"run","command":command,
                     "write_roots":[root.to_string_lossy()]
                 })
                 .to_string(),
+                &crate::traits::TrustRoots::new(&[]),
             )
         };
         let planted = ann("cp x .git/config", &repo);
@@ -10242,7 +10244,9 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        let ann = |args: serde_json::Value| tool.call_annotations(&args.to_string());
+        let ann = |args: serde_json::Value| {
+            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+        };
         let global = ann(serde_json::json!({"action":"run","command":"cp x ~/.gitconfig"}));
         assert!(global.egress && !global.read_only);
         let declared = ann(serde_json::json!({

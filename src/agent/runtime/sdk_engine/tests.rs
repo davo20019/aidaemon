@@ -2307,8 +2307,15 @@ async fn http_request_with_owner_credentials_is_egress_even_for_get() {
     let with_auth =
         r#"{"method":"GET","url":"https://example.invalid","auth_profile":"synthetic"}"#;
     let without = r#"{"method":"GET","url":"https://example.invalid"}"#;
-    assert!(http.call_annotations(with_auth).egress);
-    assert!(!http.call_annotations(without).egress);
+    assert!(
+        http.call_annotations_in(with_auth, &crate::traits::TrustRoots::new(&[]))
+            .egress
+    );
+    assert!(
+        !http
+            .call_annotations_in(without, &crate::traits::TrustRoots::new(&[]))
+            .egress
+    );
 }
 
 #[tokio::test]

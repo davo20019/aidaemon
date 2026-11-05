@@ -1912,14 +1912,6 @@ pub trait ToolSemantics: Send + Sync {
         Vec::new()
     }
 
-    /// Authority annotations for this exact call: read-only, destructive,
-    /// idempotent, and whether it sends data or acts outside the owner's
-    /// machine and workspace (`egress`). Derived from the call's typed
-    /// semantics, never from the tool's name.
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
-        default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
-    }
-
     /// The typed effects of this exact call (effect class and normalized
     /// target), which the kernel checks against the owner's declines and
     /// hands the approval and egress policies. Build keys only with the
@@ -1935,15 +1927,20 @@ pub trait ToolSemantics: Send + Sync {
         }
     }
 
-    /// `call_annotations` judged against the turn's trusted roots, for
-    /// effects whose class depends on where they land (a delete inside the
-    /// owner's roots is not egress). The default ignores the roots.
+    /// Authority annotations for this exact call, judged against the turn's
+    /// trusted roots: read-only, destructive, idempotent, and whether it
+    /// sends data or acts outside the owner's machine and workspace
+    /// (`egress`). Derived from the call's typed semantics, never from the
+    /// tool's name. Roots matter for effects whose class depends on where
+    /// they land (a delete inside the owner's roots is not egress); empty
+    /// roots mean every such target counts as outside them. The default
+    /// ignores the roots.
     fn call_annotations_in(
         &self,
         arguments: &str,
         _roots: &TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
-        self.call_annotations(arguments)
+        default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
     }
 
     /// Who authored what this exact call returns. The default is
@@ -2091,4 +2088,32 @@ fn resolve_absolute(path: &str) -> Option<std::path::PathBuf> {
 fn is_absolute_or_home(path: &str) -> bool {
     let path = path.trim();
     path.starts_with('~') || std::path::Path::new(path).is_absolute()
+}
+
+/// Validated, canonical tool input. This is the boundary object shared by
+/// policy, retry, dispatch, and receipt projection; raw model JSON is not an
+/// execution fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedToolInvocation {
+    pub canonical_arguments: String,
+    pub semantics: ToolCallSemantics,
+    pub access_manifest: ToolCallAccessManifest,
+    pub receipt_kind: ToolReceiptKind,
+}
+
+/// Produce the single typed invocation object consumed by the execution
+/// control plane. Validation deliberately precedes semantics and access
+/// derivation so a rejected proposal can never acquire intended effects.
+pub fn prepare_invocation<T: ToolSemantics + ?Sized>(
+    tool: &T,
+    arguments: &str,
+) -> Result<PreparedToolInvocation, ToolArgumentContractViolation> {
+    let canonical_arguments = tool.canonicalize_arguments(arguments)?;
+    tool.validate_arguments(&canonical_arguments)?;
+    Ok(PreparedToolInvocation {
+        semantics: tool.call_semantics(&canonical_arguments),
+        access_manifest: tool.call_access_manifest(&canonical_arguments),
+        receipt_kind: tool.receipt_kind(&canonical_arguments),
+        canonical_arguments,
+    })
 }

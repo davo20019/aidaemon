@@ -18,7 +18,7 @@ fn prepare_tool_arguments(
     tool: &dyn crate::traits::Tool,
     arguments: &str,
 ) -> Result<crate::traits::PreparedToolInvocation, Box<crate::traits::ToolCallOutcome>> {
-    match tool.prepare_invocation(arguments) {
+    match crate::traits::prepare_invocation(tool, arguments) {
         Ok(prepared) => Ok(prepared),
         Err(violation) => Err(Box::new(argument_contract_rejection_outcome(violation))),
     }

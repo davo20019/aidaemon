@@ -206,7 +206,11 @@ impl crate::traits::ToolSemantics for EditFileTool {
         super::command_effects::file_tool_write_effects(arguments)
     }
 
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
         let semantics = self.call_semantics(arguments);
         let mut annotations =
             crate::traits::default_call_annotations(self.capabilities(), &semantics);
@@ -325,7 +329,12 @@ mod tests {
     #[test]
     fn git_config_targets_are_configuration_egress() {
         let tool = EditFileTool;
-        let ann = |path: &str| tool.call_annotations(&json!({"path": path}).to_string());
+        let ann = |path: &str| {
+            tool.call_annotations_in(
+                &json!({"path": path}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
         let config = ann("/tmp/aidaemon-test/repo/.git/config");
         assert!(config.egress && !config.read_only);
         assert!(ann("/tmp/aidaemon-test/repo/.gitattributes").egress);

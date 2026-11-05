@@ -1434,12 +1434,7 @@ pub(in crate::agent) async fn run_bootstrap(
             .filter(|tool| tool.owner_control_plane())
             .filter(|tool| available_tool_names.iter().any(|name| name == tool.name()))
             .map(|tool| {
-                let scope = tool
-                    .semantic_affordances()
-                    .map(|affordances| affordances.scope)
-                    .or_else(|| {
-                        crate::agent::tool_execution::fallback_tool_semantic_scope(tool.name())
-                    });
+                let scope = crate::agent::tool_execution::fallback_tool_semantic_scope(tool.name());
                 (tool.name().to_string(), scope)
             })
             .collect::<Vec<_>>()
