@@ -140,7 +140,8 @@ async fn request_body_shape_and_cache_markers() {
         json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_1", "content": "alpha"},
             {"type": "tool_result", "tool_use_id": "toolu_2", "content": "beta"},
-            {"type": "text", "text": "Now summarize."},
+            // The conversation tail is a cache breakpoint too.
+            {"type": "text", "text": "Now summarize.", "cache_control": {"type": "ephemeral"}},
         ]})
     );
 }
@@ -378,4 +379,99 @@ async fn stream_without_message_stop_is_transient() {
     let body = body.replace("{\"type\":\"message_stop\"}", "{\"type\":\"ignored\"}");
     let err = error_for(MockResponse::sse(body, 32)).await;
     assert!(matches!(err, ProviderError::Transient(_)), "{err:?}");
+}
+
+/// A system message after the conversation started stays where it is, in a
+/// user turn, so the cached system prompt is not rewritten.
+#[test]
+fn later_system_messages_stay_in_place_as_reminders() {
+    let p = Anthropic::builder().api_key("k").build().unwrap();
+    let body = p.request_body(&request(vec![
+        Message::system("Stable instructions."),
+        Message::user("Hi"),
+        Message::hook_note("[Compacted Conversation State] goals"),
+    ]));
+    assert_eq!(body["system"].as_array().unwrap().len(), 1);
+    let content = &body["messages"][0]["content"];
+    assert_eq!(content[0]["text"], "Hi");
+    assert_eq!(
+        content[1]["text"],
+        "<system-reminder>\n[Compacted Conversation State] goals\n</system-reminder>"
+    );
+}
+
+#[test]
+fn reasoning_effort_sets_a_thinking_budget_unless_a_tool_is_forced() {
+    let p = Anthropic::builder()
+        .api_key("k")
+        .max_tokens(1024)
+        .reasoning_effort("high")
+        .build()
+        .unwrap();
+    let mut req = request(vec![Message::user("Think.")]);
+    let body = p.request_body(&req);
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "enabled", "budget_tokens": 16384})
+    );
+    assert_eq!(body["max_tokens"], 16384 + 4096);
+
+    req.options.reasoning_effort = Some("off".into());
+    assert!(p.request_body(&req).get("thinking").is_none());
+
+    req.options.reasoning_effort = Some("low".into());
+    req.tools = vec![tool("read")];
+    req.tool_choice = ToolChoice::Specific("read".into());
+    assert!(p.request_body(&req).get("thinking").is_none());
+}
+
+/// Signed thinking blocks come back on the turn's first tool call and lead
+/// the assistant message when that turn is replayed.
+#[tokio::test]
+async fn thinking_blocks_are_kept_and_replayed() {
+    let body = named_events(&[
+        message_start(json!({"input_tokens": 5})),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Need the file."}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-synthetic"}}),
+        ),
+        (
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a.txt\"}"}}),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ]);
+    let server = MockServer::start(vec![MockResponse::sse(body, 13)]).await;
+    let response = provider(&server)
+        .complete(&request(vec![Message::user("Read a.txt")]))
+        .await
+        .unwrap();
+    assert_eq!(response.reasoning.as_deref(), Some("Need the file."));
+    let block =
+        json!({"type": "thinking", "thinking": "Need the file.", "signature": "sig-synthetic"});
+    assert_eq!(
+        response.tool_calls[0].provider_data,
+        Some(json!({ aidaemon_providers::THINKING_BLOCKS_KEY: [block.clone()] }))
+    );
+
+    let p = Anthropic::builder().api_key("k").build().unwrap();
+    let replay = p.request_body(&request(vec![
+        Message::user("Read a.txt"),
+        Message::assistant("", response.tool_calls.clone()),
+        Message::tool_result("toolu_1", "alpha"),
+    ]));
+    assert_eq!(replay["messages"][1]["content"][0], block);
+    assert_eq!(replay["messages"][1]["content"][1]["type"], "tool_use");
 }

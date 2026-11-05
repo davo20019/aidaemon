@@ -40,6 +40,7 @@ pub struct Anthropic {
     timeout: Duration,
     max_tokens: u32,
     prompt_caching: bool,
+    reasoning_effort: Option<String>,
 }
 
 impl Anthropic {
@@ -49,7 +50,12 @@ impl Anthropic {
 
     /// The JSON body this provider would send for `request`.
     pub fn request_body(&self, request: &ModelRequest) -> Value {
-        build_body(request, self.max_tokens, self.prompt_caching)
+        build_body(
+            request,
+            self.max_tokens,
+            self.prompt_caching,
+            self.reasoning_effort.as_deref(),
+        )
     }
 }
 
@@ -65,6 +71,7 @@ pub struct AnthropicBuilder {
     connect_timeout: Duration,
     max_tokens: u32,
     prompt_caching: bool,
+    reasoning_effort: Option<String>,
 }
 
 impl Default for AnthropicBuilder {
@@ -79,6 +86,7 @@ impl Default for AnthropicBuilder {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_tokens: ANTHROPIC_DEFAULT_MAX_TOKENS,
             prompt_caching: true,
+            reasoning_effort: None,
         }
     }
 }
@@ -140,6 +148,15 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Extended thinking for requests that set no effort of their own
+    /// ([`aidaemon_core::RequestOptions::reasoning_effort`]): `low`,
+    /// `medium` or `high` budgets, `off` for none. Default: no thinking.
+    pub fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        let effort = effort.into();
+        self.reasoning_effort = (!effort.trim().is_empty()).then_some(effort);
+        self
+    }
+
     pub fn build(self) -> Result<Anthropic, ConfigError> {
         let api_key = self
             .api_key
@@ -158,6 +175,7 @@ impl AnthropicBuilder {
             timeout: self.timeout,
             max_tokens: self.max_tokens,
             prompt_caching: self.prompt_caching,
+            reasoning_effort: self.reasoning_effort,
         })
     }
 }
@@ -208,11 +226,39 @@ fn ephemeral() -> Value {
     json!({"type": "ephemeral"})
 }
 
-fn build_body(request: &ModelRequest, default_max_tokens: u32, caching: bool) -> Value {
-    let mut system: Vec<Value> = request
-        .messages
+/// Where tool calls carry the signed thinking blocks of the turn that made
+/// them: they must lead the assistant message when the turn is replayed
+/// with thinking enabled.
+pub const THINKING_BLOCKS_KEY: &str = "anthropic_thinking_blocks";
+
+/// The extended-thinking budget for a reasoning effort.
+fn thinking_budget(effort: &str) -> u32 {
+    match effort {
+        "low" => 2_048,
+        "high" => 16_384,
+        // "medium" and unknown labels get the balanced default.
+        _ => 8_192,
+    }
+}
+
+/// Messages before the first non-system message: the system prompt.
+fn leading_system(messages: &[Message]) -> usize {
+    messages
         .iter()
-        .filter(|m| m.role == Role::System && !m.content.is_empty())
+        .position(|m| m.role != Role::System)
+        .unwrap_or(messages.len())
+}
+
+fn build_body(
+    request: &ModelRequest,
+    default_max_tokens: u32,
+    caching: bool,
+    default_effort: Option<&str>,
+) -> Value {
+    let leading = leading_system(&request.messages);
+    let mut system: Vec<Value> = request.messages[..leading]
+        .iter()
+        .filter(|m| !m.content.is_empty())
         .map(|m| json!({"type": "text", "text": m.content}))
         .collect();
     if caching {
@@ -221,12 +267,41 @@ fn build_body(request: &ModelRequest, default_max_tokens: u32, caching: bool) ->
         }
     }
 
+    // Anthropic rejects thinking with a forced tool choice, and a forced
+    // choice is a contract the caller relies on: it wins.
+    let forced = !request.tools.is_empty()
+        && matches!(
+            request.tool_choice,
+            ToolChoice::Required | ToolChoice::Specific(_)
+        );
+    let budget = request
+        .options
+        .reasoning_effort
+        .as_deref()
+        .or(default_effort)
+        .filter(|effort| *effort != "off" && !forced)
+        .map(thinking_budget);
+    let mut max_tokens = request.max_output_tokens.unwrap_or(default_max_tokens);
+    if let Some(budget) = budget {
+        // The budget counts against max_tokens; keep room for the answer.
+        max_tokens = max_tokens.max(budget + 4_096);
+    }
+
+    let mut messages = wire_messages(&request.messages[leading..]);
+    if caching {
+        if let Some(last) = messages.last_mut() {
+            tail_breakpoint(last);
+        }
+    }
     let mut body = json!({
         "model": request.model,
-        "max_tokens": request.max_output_tokens.unwrap_or(default_max_tokens),
-        "messages": wire_messages(&request.messages),
+        "max_tokens": max_tokens,
+        "messages": messages,
         "stream": true,
     });
+    if let Some(budget) = budget {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    }
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
@@ -258,15 +333,42 @@ fn build_body(request: &ModelRequest, default_max_tokens: u32, caching: bool) ->
     body
 }
 
-/// Map the transcript to Anthropic's strictly alternating user/assistant
-/// messages of content blocks. System messages are lifted out; tool results
-/// become `tool_result` blocks in a user message; consecutive messages with
-/// the same wire role are merged.
+/// Mark the conversation's last block as a cache breakpoint, so the next
+/// call reuses this one's prefix. Thinking blocks cannot carry one.
+fn tail_breakpoint(message: &mut Value) {
+    if let Some(block) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+    {
+        let kind = block.get("type").and_then(Value::as_str);
+        if !matches!(kind, Some("thinking" | "redacted_thinking")) {
+            block["cache_control"] = ephemeral();
+        }
+    }
+}
+
+/// Map the transcript (after the system prompt) to Anthropic's strictly
+/// alternating user/assistant messages of content blocks. A later system
+/// message (a hook note, a mid-run directive) stays in place inside a user
+/// turn, delimited as harness context: lifting it into `system` would
+/// rewrite the cached prefix of every request and lose its position. Tool
+/// results become `tool_result` blocks in a user message; consecutive
+/// messages with the same wire role are merged.
 fn wire_messages(messages: &[Message]) -> Vec<Value> {
     let mut out: Vec<(&'static str, Vec<Value>)> = Vec::new();
     for message in messages {
         let (role, blocks) = match message.role {
-            Role::System => continue,
+            Role::System => (
+                "user",
+                text_block(&format!(
+                    "<system-reminder>\n{}\n</system-reminder>",
+                    message.content
+                ))
+                .into_iter()
+                .filter(|_| !message.content.trim().is_empty())
+                .collect(),
+            ),
             Role::User => {
                 // Images first: Anthropic recommends them before the text
                 // that refers to them.
@@ -296,7 +398,17 @@ fn wire_messages(messages: &[Message]) -> Vec<Value> {
                 }],
             ),
             Role::Assistant => {
-                let mut blocks = text_block(&message.content);
+                // Signed thinking blocks lead the message on replay.
+                let mut blocks: Vec<Value> = message
+                    .tool_calls
+                    .iter()
+                    .filter_map(|call| call.provider_data.as_ref())
+                    .filter_map(|data| data.get(THINKING_BLOCKS_KEY))
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .cloned()
+                    .collect();
+                blocks.extend(text_block(&message.content));
                 blocks.extend(message.tool_calls.iter().map(|call| {
                     let input = if call.arguments.is_object() {
                         call.arguments.clone()
@@ -366,6 +478,11 @@ enum Block {
         initial_input: Value,
         json: String,
     },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking(Value),
     Other,
 }
 
@@ -437,6 +554,11 @@ impl SseDecoder for MessagesDecoder {
                         initial_input: block.get("input").cloned().unwrap_or(json!({})),
                         json: String::new(),
                     },
+                    Some("thinking") => Block::Thinking {
+                        thinking: str_field(&block, "thinking"),
+                        signature: str_field(&block, "signature"),
+                    },
+                    Some("redacted_thinking") => Block::RedactedThinking(block),
                     _ => Block::Other,
                 };
                 self.blocks.insert(index, parsed);
@@ -461,8 +583,23 @@ impl SseDecoder for MessagesDecoder {
                             );
                         }
                     }
-                    // thinking / signature / citations deltas are not part
-                    // of the provider-neutral response.
+                    Some("thinking_delta") => {
+                        if let Some(Block::Thinking { thinking, .. }) = self.blocks.get_mut(&index)
+                        {
+                            thinking.push_str(
+                                delta.get("thinking").and_then(Value::as_str).unwrap_or(""),
+                            );
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(Block::Thinking { signature, .. }) = self.blocks.get_mut(&index)
+                        {
+                            signature.push_str(
+                                delta.get("signature").and_then(Value::as_str).unwrap_or(""),
+                            );
+                        }
+                    }
+                    // citations deltas are not part of the response.
                     _ => {}
                 }
             }
@@ -497,9 +634,11 @@ impl SseDecoder for MessagesDecoder {
                 "stream ended before message_stop".into(),
             ));
         }
-        let tool_calls = std::mem::take(&mut self.blocks)
-            .into_values()
-            .filter_map(|block| match block {
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut reasoning = String::new();
+        let mut thinking_blocks = Vec::new();
+        for block in std::mem::take(&mut self.blocks).into_values() {
+            match block {
                 Block::ToolUse {
                     id,
                     name,
@@ -511,14 +650,32 @@ impl SseDecoder for MessagesDecoder {
                     } else {
                         parse_arguments(&json)
                     };
-                    Some(ToolCall::new(id, name, arguments))
+                    tool_calls.push(ToolCall::new(id, name, arguments));
                 }
-                _ => None,
-            })
-            .collect();
+                Block::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    reasoning.push_str(&thinking);
+                    thinking_blocks.push(
+                        json!({"type": "thinking", "thinking": thinking, "signature": signature}),
+                    );
+                }
+                Block::RedactedThinking(block) => thinking_blocks.push(block),
+                Block::Text | Block::Other => {}
+            }
+        }
+        // A tool-use turn continued with thinking must replay its signed
+        // thinking blocks; they ride on the first tool call.
+        if let Some(first) = tool_calls.first_mut() {
+            if !thinking_blocks.is_empty() {
+                first.provider_data = Some(json!({ THINKING_BLOCKS_KEY: thinking_blocks }));
+            }
+        }
         Ok(ModelResponse {
             text: std::mem::take(&mut self.text),
             tool_calls,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
             usage: Usage {
                 input_tokens: self.input_tokens + self.cache_read + self.cache_creation,
                 output_tokens: self.output_tokens,

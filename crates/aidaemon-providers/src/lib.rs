@@ -60,7 +60,7 @@ mod transport;
 
 pub use anthropic::{
     Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
-    ANTHROPIC_VERSION,
+    ANTHROPIC_VERSION, THINKING_BLOCKS_KEY,
 };
 pub use chatgpt::{
     ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials, StaticChatGptAuth,
