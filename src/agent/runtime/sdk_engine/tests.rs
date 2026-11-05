@@ -268,6 +268,94 @@ async fn sdk_engine_retries_a_timed_out_model_call() {
     );
 }
 
+/// A turn that fails on a used-up quota before any tool call is queued to
+/// re-run after the stated reset, and the reply says so.
+#[tokio::test]
+async fn a_capped_plan_queues_the_request_until_the_reset() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    use crate::traits::store_prelude::*;
+    let reset = std::time::SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+    let capped = || {
+        let mut error =
+            crate::providers::ProviderError::from_status(429, "The usage limit has been reached");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error.resets_at = Some(reset);
+        error
+    };
+    let provider =
+        MockProvider::new().with_leading_provider_errors((0..8).map(|_| capped()).collect());
+    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+        .await
+        .unwrap();
+    // A person's turn runs on the root agent.
+    harness.agent.set_test_orchestrator_mode();
+    let reply = harness
+        .agent
+        .handle_inbound_message(owner_request("Summarize the plan."))
+        .await
+        .unwrap();
+    assert!(
+        reply
+            .text
+            .contains("usage limit has been reached; it resets at")
+            && reply
+                .text
+                .contains("will run it automatically after the reset"),
+        "{}",
+        reply.text
+    );
+    let queued: Vec<crate::agent::deferred_retry::DeferredRequest> = serde_json::from_str(
+        &harness
+            .state
+            .get_setting("deferred_provider_retries")
+            .await
+            .unwrap()
+            .expect("the request is queued"),
+    )
+    .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].user_text, "Summarize the plan.");
+    assert_eq!(queued[0].failure_kind, "quota_exhausted");
+    let not_before = chrono::DateTime::parse_from_rfc3339(queued[0].not_before.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let reset = chrono::DateTime::<chrono::Utc>::from(reset);
+    assert!(!queued[0].due(reset));
+    assert!(queued[0].due(not_before));
+}
+
+/// An automated trigger's turn is not a person's request: a capped plan
+/// fails it without queueing a re-run.
+#[tokio::test]
+async fn a_capped_plan_does_not_queue_an_automated_trigger() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::traits::store_prelude::*;
+    let mut capped =
+        crate::providers::ProviderError::from_status(429, "The usage limit has been reached");
+    capped.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+    let provider = crate::testing::MockProvider::new()
+        .with_leading_provider_errors((0..8).map(|_| capped.clone()).collect());
+    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+        .await
+        .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+    let mut request = owner_request("[AUTOMATED TRIGGER from synthetic-feed] new item");
+    request.channel_ctx = ChannelContext::internal();
+    let reply = harness.agent.handle_inbound_message(request).await.unwrap();
+    assert!(
+        !reply.text.contains("I saved this request"),
+        "{}",
+        reply.text
+    );
+    assert!(harness
+        .state
+        .get_setting("deferred_provider_retries")
+        .await
+        .unwrap()
+        .is_none_or(|raw| raw == "[]"));
+}
+
 #[tokio::test]
 async fn sdk_engine_fails_after_repeated_model_call_timeouts() {
     use crate::runtime_ports::AgentIngress;

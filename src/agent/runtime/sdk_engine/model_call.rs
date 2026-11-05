@@ -497,6 +497,12 @@ impl Agent {
                     );
                     scope.context_overflowed.store(true, Ordering::Relaxed);
                 }
+                if let (Some(typed), Ok(mut slot)) = (
+                    error.downcast_ref::<crate::providers::ProviderError>(),
+                    scope.provider_failure.lock(),
+                ) {
+                    *slot = Some(typed.clone());
+                }
                 // A used-up quota stays typed: the reply names it and its
                 // reset instead of a generic provider error.
                 if let Some(quota) = error

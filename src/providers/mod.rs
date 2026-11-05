@@ -8,7 +8,7 @@ use std::time::Duration;
 use reqwest::Client;
 use tracing::warn;
 
-pub(crate) use error::ProviderRecoveryRoute;
+pub(crate) use error::{describe_reset, ProviderRecoveryRoute};
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub(crate) use sdk_backed::ChatJson;
 

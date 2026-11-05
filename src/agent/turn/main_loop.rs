@@ -1216,6 +1216,20 @@ impl Agent {
                         .map(|grant| grant.project_root.clone()),
                     turn_context.filesystem_access.as_ref(),
                 ),
+                // Only a person's request is queued: a channel turn on the
+                // root agent, or a queued request's own re-run. Goal
+                // workers, sub-agents, automated triggers and continuations
+                // of another task recover through their owners.
+                defer_on_provider_failure: self.depth == 0
+                    && self.goal_id.is_none()
+                    && if internal_continuation {
+                        continuation_parent_task_id.is_none()
+                    } else {
+                        !matches!(
+                            channel_ctx.visibility,
+                            crate::types::ChannelVisibility::Internal
+                        )
+                    },
             };
             // Boxed so the SDK turn does not grow this already large state machine.
             return Box::pin(self.handle_message_sdk(
@@ -1355,11 +1369,7 @@ impl Agent {
                     .await
             };
             let reply = match deferred {
-                Some(0) => "The model provider is unavailable right now. I saved this request and will retry it automatically once the provider recovers, then reply here.".to_string(),
-                Some(attempt) => format!(
-                    "The model provider is still unavailable (automatic retry {attempt} of {}). I will keep retrying with a longer wait and reply here when it succeeds.",
-                    crate::agent::deferred_retry::MAX_DEFERRED_ATTEMPTS
-                ),
+                Some(attempt) => crate::agent::deferred_retry::deferral_notice(attempt, &error),
                 None => "I couldn't complete this request because the response provider failed before a confirmed result was available.".to_string(),
             };
             (
