@@ -846,6 +846,69 @@ impl crate::traits::Tool for ShellProbe {
     }
 }
 
+/// A tool that declares a fixed set of typed effects.
+struct EffectsProbe;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for EffectsProbe {
+    fn name(&self) -> &str {
+        "effects_probe"
+    }
+    fn description(&self) -> &str {
+        "Sends a synthetic report."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "effects_probe",
+            "description": "Sends a synthetic report.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+        })
+    }
+    fn call_effects(&self, arguments: &str) -> sdk::CallEffects {
+        let args = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+        let path = args["path"].as_str().unwrap_or_default();
+        sdk::CallEffects {
+            keys: vec![
+                sdk::EffectKey::egress("https", "reports.example.invalid", None),
+                sdk::EffectKey::path(sdk::EffectClass::Write, path).unwrap(),
+                sdk::EffectKey::named(sdk::EffectClass::Credential, "acme"),
+            ],
+            complete: true,
+        }
+    }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("sent".to_string())
+    }
+}
+
+/// The kernel builds `ToolInfo` from the bridged tool: the daemon tool's
+/// declared effects reach it unchanged, and the access manifest carries the
+/// same hosts and paths.
+#[test]
+fn bridged_tool_exposes_effects_to_kernel() {
+    use aidaemon_core::Tool as _;
+    let probe: Arc<dyn crate::traits::Tool> = Arc::new(EffectsProbe);
+    let (calls, _rx) = mpsc::channel(1);
+    let bridged = BridgedTool {
+        spec: tool_spec(probe.as_ref()),
+        tool: probe.clone(),
+        goal_actions_only: false,
+        calls,
+        trust_roots: Arc::new(Vec::new()),
+    };
+    let arguments = serde_json::json!({"path": "/tmp/aidaemon-test/report/out.md"});
+    let info = sdk::ToolInfo {
+        annotations: bridged.annotations_for(&arguments),
+        access: bridged.access(&arguments),
+        effects: bridged.effects(&arguments),
+    };
+    assert_eq!(info.effects, probe.call_effects(&arguments.to_string()));
+    assert!(info.effects.complete);
+    assert_eq!(info.access.hosts, vec!["reports.example.invalid:443"]);
+    assert_eq!(info.access.writes, vec!["/tmp/aidaemon-test/report/out.md"]);
+    assert!(info.access.reads.is_empty() && info.access.commands.is_empty());
+}
+
 /// A tool whose backend is down is not offered to the model.
 struct DownProbe;
 

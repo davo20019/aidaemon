@@ -7560,6 +7560,63 @@ fn validate_terminal_argument_contract(
     Ok(())
 }
 
+/// The typed effects of a terminal call: `check` reads a tracked process,
+/// `run` declares what its command does (see
+/// `command_effects::shell_call_effects`), anything else is undeclared.
+fn terminal_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
+    terminal_call_effects_on(
+        arguments,
+        crate::tools::command_effects::execution_backend_is_local(),
+    )
+}
+
+/// `terminal_call_effects` for a backend that is (`local`) or is not the
+/// daemon's own machine. On a remote (SSH, Docker) workspace the paths a
+/// command touches live there, so they are not resolved on the local disk:
+/// path effects are left undeclared and the call is incomplete.
+fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::CallEffects {
+    use crate::tools::command_effects::{path_effect, shell_call_effects, without_local_paths};
+    let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+        return aidaemon_core::CallEffects::unknown();
+    };
+    match args.action.trim().to_ascii_lowercase().as_str() {
+        "check" => aidaemon_core::CallEffects::none(),
+        "run" => {
+            let Some(text) = args
+                .command
+                .as_deref()
+                .or(args.script.as_deref())
+                .filter(|text| !text.trim().is_empty())
+            else {
+                return aidaemon_core::CallEffects::unknown();
+            };
+            // Only an explicit absolute directory is known here: a run
+            // without one executes wherever the dispatcher anchors it.
+            let cwd = args
+                .working_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|dir| dir.starts_with('/'));
+            let mut effects = shell_call_effects(text, cwd);
+            // Declared write targets are what a confined run may change.
+            for target in args.write_paths.iter().chain(args.write_roots.iter()) {
+                match path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
+                    Some(key) if !effects.keys.contains(&key) => effects.keys.push(key),
+                    Some(_) => {}
+                    None => effects.complete = false,
+                }
+            }
+            if local {
+                effects
+            } else {
+                without_local_paths(effects)
+            }
+        }
+        // `kill` signals a process and `trust_all` changes a standing rule.
+        _ => aidaemon_core::CallEffects::unknown(),
+    }
+}
+
 fn canonicalize_terminal_arguments(
     arguments: &str,
 ) -> Result<String, ToolArgumentContractViolation> {
@@ -7687,6 +7744,10 @@ impl Tool for TerminalTool {
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         terminal_call_semantics(arguments)
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        terminal_call_effects(arguments)
     }
 
     /// Without the turn's roots every delete counts as outside them.
@@ -13201,6 +13262,119 @@ mod policy_dump_probe {
                 );
             }
             other => println!("NON-ARGV: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod call_effects_tests {
+    use super::{terminal_call_effects, terminal_call_effects_on};
+    use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+
+    fn run(command: &str) -> CallEffects {
+        terminal_call_effects(&serde_json::json!({"action": "run", "command": command}).to_string())
+    }
+
+    fn egress(target: &str) -> EffectKey {
+        EffectKey {
+            class: EffectClass::Egress,
+            target: target.to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_curl_post_declares_egress_host() {
+        let effects = run("curl -X POST https://h.example.invalid:8443/x -d '{}'");
+        assert_eq!(effects.keys, vec![egress("h.example.invalid:8443")]);
+        assert!(effects.complete);
+    }
+
+    #[test]
+    fn terminal_curl_default_port() {
+        let effects = run("curl https://h.example.invalid/x");
+        assert_eq!(effects.keys, vec![egress("h.example.invalid:443")]);
+        assert!(effects.complete);
+    }
+
+    #[test]
+    fn terminal_script_is_incomplete() {
+        for command in ["bash run.sh", "python3 tool.py"] {
+            assert!(!run(command).complete, "{command}");
+        }
+        let script = terminal_call_effects(
+            &serde_json::json!({"action": "run", "script": "ls\\nbash run.sh"}).to_string(),
+        );
+        assert!(!script.complete);
+    }
+
+    #[test]
+    fn terminal_redirect_declares_write() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/f");
+        let effects = run(&format!("echo x >> {path}"));
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![
+                crate::tools::command_effects::path_effect(EffectClass::Write, &path, None)
+                    .unwrap()
+            ]
+        );
+        assert!(effects.keys[0].target.ends_with("/f"));
+    }
+
+    #[test]
+    fn terminal_relative_paths_resolve_against_working_dir() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let effects = terminal_call_effects(
+            &serde_json::json!({"action": "run", "command": "echo x > out.txt", "working_dir": dir})
+                .to_string(),
+        );
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![crate::tools::command_effects::path_effect(
+                EffectClass::Write,
+                &format!("{dir}/out.txt"),
+                None
+            )
+            .unwrap()]
+        );
+        // Without a working directory the target is undeterminable.
+        assert!(!run("echo x > out.txt").complete);
+    }
+
+    #[test]
+    fn terminal_remote_backend_paths_are_incomplete() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!("curl -o {dir}/page https://h.example.invalid/ && rm -rf {dir}/old"),
+        })
+        .to_string();
+        let local = terminal_call_effects_on(&arguments, true);
+        assert!(local.complete);
+        assert_eq!(local.keys.len(), 3);
+        // On an SSH or Docker workspace the paths are not on this disk.
+        let remote = terminal_call_effects_on(&arguments, false);
+        assert!(!remote.complete);
+        assert_eq!(remote.keys, vec![egress("h.example.invalid:443")]);
+    }
+
+    #[test]
+    fn terminal_check_reads_and_other_actions_are_undeclared() {
+        let check = terminal_call_effects(r#"{"action":"check","pid":42}"#);
+        assert_eq!(check, CallEffects::none());
+        for other in [
+            r#"{"action":"kill","pid":42}"#,
+            r#"{"action":"trust_all"}"#,
+            "{",
+        ] {
+            assert_eq!(
+                terminal_call_effects(other),
+                CallEffects::unknown(),
+                "{other}"
+            );
         }
     }
 }

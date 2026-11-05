@@ -2319,6 +2319,44 @@ impl Tool for HttpRequestTool {
         ]
     }
 
+    /// The request's host (`host:port`, the URL's port or else the scheme's
+    /// default) and the stored credential profile it uses, after the same
+    /// URL canonicalization the request runs with (tool parameters embedded
+    /// in the query are recovered first).
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        let Ok(mut args) = serde_json::from_str::<Value>(arguments) else {
+            return aidaemon_core::CallEffects::unknown();
+        };
+        let Some(mut url) = args["url"]
+            .as_str()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+        else {
+            return aidaemon_core::CallEffects::unknown();
+        };
+        if Self::recover_embedded_tool_params_from_url(&mut args, &mut url).is_err() {
+            return aidaemon_core::CallEffects::unknown();
+        }
+        let Some(host) = crate::tools::command_effects::url_host_effect(&url) else {
+            return aidaemon_core::CallEffects::unknown();
+        };
+        let mut keys = vec![host];
+        if let Some(profile) = args
+            .get("auth_profile")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+        {
+            keys.push(aidaemon_core::EffectKey::named(
+                aidaemon_core::EffectClass::Credential,
+                profile,
+            ));
+        }
+        aidaemon_core::CallEffects {
+            keys,
+            complete: true,
+        }
+    }
+
     /// Owner credentials turn any method into egress: a credentialed GET can
     /// still trigger actions or leak the account's data.
     fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
@@ -4388,5 +4426,57 @@ mod tests {
             result.contains("studies"),
             "expected a studies array in the payload"
         );
+    }
+
+    mod call_effects {
+        use super::*;
+        use aidaemon_core::{EffectClass, EffectKey};
+
+        fn tool() -> HttpRequestTool {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            HttpRequestTool::new(
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                ApprovalBroker::new(tx),
+            )
+        }
+
+        #[test]
+        fn http_request_effects_host_and_profile() {
+            let effects = tool().call_effects(
+                &json!({
+                    "method": "POST",
+                    "url": "https://api.example.invalid/v1",
+                    "auth_profile": "acme",
+                    "body": "{}"
+                })
+                .to_string(),
+            );
+            assert!(effects.complete);
+            assert_eq!(
+                effects.keys,
+                vec![
+                    EffectKey::egress("https", "api.example.invalid", None),
+                    EffectKey::named(EffectClass::Credential, "acme"),
+                ]
+            );
+            assert_eq!(effects.keys[0].target, "api.example.invalid:443");
+        }
+
+        #[test]
+        fn http_request_local_port() {
+            let effects = tool().call_effects(
+                &json!({"method": "POST", "url": "http://127.0.0.1:8765/announce"}).to_string(),
+            );
+            assert!(effects.complete);
+            assert_eq!(effects.keys.len(), 1);
+            assert_eq!(effects.keys[0].target, "127.0.0.1:8765");
+        }
+
+        #[test]
+        fn http_request_unparsable_url_is_undeclared() {
+            let effects =
+                tool().call_effects(&json!({"method": "GET", "url": "not a url"}).to_string());
+            assert!(!effects.complete);
+        }
     }
 }

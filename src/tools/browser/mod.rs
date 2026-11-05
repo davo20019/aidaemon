@@ -2287,6 +2287,10 @@ impl Tool for BrowserTool {
         }
     }
 
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        browser_call_effects(arguments)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args = serde_json::from_str::<Value>(arguments).ok();
         let action = args
@@ -2316,6 +2320,44 @@ impl Tool for BrowserTool {
             .unwrap_or_default();
 
         browser_call_semantics(action.as_deref(), url, selector, script, output_filename)
+    }
+}
+
+/// The typed effects of a browser call: opening a page is egress to its
+/// host. Acting on the current page (`click`, `fill`, `execute_js`) would be
+/// egress to that page's host, which is tracked per session and not known
+/// from the arguments, so it is undeclared, as is any action that writes or
+/// changes the browser. Actions that only read the open page declare none.
+fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    match (action.as_str(), url) {
+        ("navigate" | "new_tab", Some(url)) => reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            }),
+        // A blank tab.
+        ("new_tab", None) => aidaemon_core::CallEffects::none(),
+        (
+            "screenshot" | "get_text" | "inspect_page" | "list_tabs" | "get_console_logs"
+            | "get_network_errors" | "wait",
+            _,
+        ) => aidaemon_core::CallEffects::none(),
+        _ => aidaemon_core::CallEffects::unknown(),
     }
 }
 

@@ -9,6 +9,7 @@
 //! No wording of the command is ever read for intent.
 
 use crate::tools::command_risk::structural_shell_invocations;
+use aidaemon_core::{CallEffects, EffectClass, EffectKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandEffects {
@@ -671,6 +672,9 @@ struct Scan {
     /// as written. A here-doc, here-string or process substitution is
     /// unsafe syntax instead.
     input_targets: Vec<String>,
+    /// Targets of output redirects into files, as written (not
+    /// descriptor duplications or the null and standard-stream devices).
+    output_targets: Vec<String>,
 }
 
 fn redirect_target(chars: &[char], mut j: usize) -> String {
@@ -690,6 +694,7 @@ fn scan(command: &str) -> Scan {
     let mut unsafe_syntax = false;
     let mut writes_file = false;
     let mut input_targets = Vec::new();
+    let mut output_targets = Vec::new();
     let (mut in_single, mut in_double) = (false, false);
     let mut i = 0;
     while i < chars.len() {
@@ -768,8 +773,14 @@ fn scan(command: &str) -> Scan {
                 }
                 if next == Some('(') {
                     unsafe_syntax = true;
-                } else if !dup && redirect_target(&chars, j) != "/dev/null" {
-                    writes_file = true;
+                } else if !dup {
+                    let target = redirect_target(&chars, j);
+                    if target != "/dev/null" {
+                        writes_file = true;
+                        if !is_standard_stream(&target) {
+                            output_targets.push(target);
+                        }
+                    }
                 }
                 cur.extend(&chars[i..j]);
                 i = j;
@@ -788,7 +799,16 @@ fn scan(command: &str) -> Scan {
         unsafe_syntax,
         writes_file,
         input_targets,
+        output_targets,
     }
+}
+
+/// A redirect target that is a process's own stream, not a file.
+fn is_standard_stream(target: &str) -> bool {
+    matches!(target, "/dev/stdout" | "/dev/stderr")
+        || target
+            .strip_prefix("/dev/fd/")
+            .is_some_and(|fd| !fd.is_empty() && fd.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn is_redirect_word(token: &str) -> bool {
@@ -1061,6 +1081,1330 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
                 push_with_wrappers(tokens[index + 1..].to_vec(), depth + 1, out);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed call effects
+// ---------------------------------------------------------------------------
+//
+// What a call does, for the kernel's decline memory and the approval and
+// egress policies. Keys are built only with the kernel constructors. A
+// command is `complete` only when every segment is fully understood: a known
+// observation, or a program from the tables below in a shape whose every
+// option is known. Anything else (scripts, interpreters, wrappers, unknown
+// options, shell expansion) leaves the declared keys as a lower bound.
+// Configuration files a program reads on its own (`~/.curlrc`,
+// `~/.ssh/config` host aliases, git `insteadOf` rewrites) are not consulted.
+
+/// An egress effect on `host`, with IPv6 brackets stripped so `[::1]` and
+/// `::1` name one host. `None` for an empty or unreadable host.
+pub(crate) fn egress_effect(scheme: &str, host: &str, port: Option<u16>) -> Option<EffectKey> {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty()
+        || host.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '@' | '$' | '`'))
+    {
+        return None;
+    }
+    Some(EffectKey::egress(scheme, host, port))
+}
+
+/// Default ports the kernel's egress constructor does not know.
+fn scheme_default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "git" => Some(9418),
+        "rsync" => Some(873),
+        "ssh" | "git+ssh" | "ssh+git" | "sftp" | "scp" => Some(22),
+        _ => None,
+    }
+}
+
+/// The egress effect of a URL, read as `default_scheme` when it names no
+/// scheme. `None` when it has no network host or cannot be read
+/// structurally (shell expansion, unparsable).
+pub(crate) fn url_effect(raw: &str, default_scheme: &str) -> Option<EffectKey> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains(['$', '`']) {
+        return None;
+    }
+    let text = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("{default_scheme}://{raw}")
+    };
+    let url = reqwest::Url::parse(&text).ok()?;
+    url_host_effect(&url)
+}
+
+/// The egress effect of a parsed URL: its host and its explicit port, else
+/// the scheme's default.
+pub(crate) fn url_host_effect(url: &reqwest::Url) -> Option<EffectKey> {
+    let scheme = url.scheme();
+    let port = url
+        .port()
+        .or_else(|| scheme_default_port(scheme))
+        .or_else(|| url.port_or_known_default());
+    egress_effect(scheme, url.host_str()?, port)
+}
+
+/// A path effect on `raw`, absolute and normalized: `~/` expands to the home
+/// directory and a relative path resolves against `cwd` (an absolute
+/// directory). On disk the nearest existing ancestor is canonicalized, so an
+/// existing path is declared by its canonical form (symlinks resolved, and on
+/// macOS case and `/tmp` as `/private/tmp`) and a new one below it agrees with
+/// it. A `Delete` keeps its last component: removing a symlink removes the
+/// link. `None` when the path cannot be read structurally (shell expansion)
+/// or is relative with no known working directory.
+pub(crate) fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> Option<EffectKey> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains(['$', '`', '*', '?', '[', '{', '}', '\\', '\0']) {
+        return None;
+    }
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        format!("{}{}", dirs::home_dir()?.to_str()?, &raw[1..])
+    } else if raw.starts_with('~') {
+        return None;
+    } else {
+        raw.to_string()
+    };
+    let absolute = if expanded.starts_with('/') {
+        expanded
+    } else {
+        let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
+        format!("{}/{expanded}", cwd.trim_end_matches('/'))
+    };
+    let lexical = EffectKey::path(class, &absolute)?;
+    Some(resolved_on_disk(class, lexical))
+}
+
+fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
+    let path = std::path::Path::new(&lexical.target);
+    let (base, leaf) = match (class, path.parent(), path.file_name()) {
+        (EffectClass::Delete, Some(parent), Some(name)) => (parent, Some(name)),
+        _ => (path, None),
+    };
+    for ancestor in base.ancestors() {
+        let Ok(mut real) = std::fs::canonicalize(ancestor) else {
+            continue;
+        };
+        if let Ok(rest) = base.strip_prefix(ancestor) {
+            if !rest.as_os_str().is_empty() {
+                real.push(rest);
+            }
+        }
+        if let Some(leaf) = leaf {
+            real.push(leaf);
+        }
+        return real
+            .to_str()
+            .and_then(|real| EffectKey::path(class, real))
+            .unwrap_or(lexical);
+    }
+    lexical
+}
+
+/// Whether the active execution backend is this machine, so paths resolve on
+/// the local disk.
+pub(crate) fn execution_backend_is_local() -> bool {
+    crate::execution::active_execution_backend().kind() == crate::execution::BackendKind::Local
+}
+
+/// Effects on a remote (SSH, Docker) workspace: its paths cannot be
+/// resolved on this disk, so path keys are dropped and the effects are
+/// incomplete. Egress keys stay.
+pub(crate) fn without_local_paths(mut effects: CallEffects) -> CallEffects {
+    effects.keys.retain(|key| {
+        !matches!(
+            key.class,
+            EffectClass::Write | EffectClass::Delete | EffectClass::Configuration
+        )
+    });
+    effects.complete = false;
+    effects
+}
+
+/// The effects of `write_file`/`edit_file`: a write of the path argument
+/// (or its aliases). A relative path, or any path on a remote workspace, is
+/// undeterminable here.
+pub(crate) fn file_tool_write_effects(arguments: &str) -> CallEffects {
+    if !execution_backend_is_local() {
+        return CallEffects::unknown();
+    }
+    let path = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|args| {
+            ["path", "file_path", "file", "filename"]
+                .iter()
+                .find_map(|key| {
+                    args.get(*key)
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+        });
+    match path.and_then(|path| path_effect(EffectClass::Write, &path, None)) {
+        Some(key) => CallEffects {
+            keys: vec![key],
+            complete: true,
+        },
+        None => CallEffects::unknown(),
+    }
+}
+
+/// The egress targets (`host:port`) of a shell command, or `None` when any
+/// segment's network reach cannot be determined (an opaque program, a
+/// wrapper, an unknown option, a remote named only by configuration).
+// Produced for the terminal approval and egress rules that consume it next.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn egress_hosts(command: &str) -> Option<Vec<String>> {
+    let analysis = analyze_shell(command, None);
+    analysis.egress_complete.then(|| {
+        analysis
+            .keys
+            .into_iter()
+            .filter(|key| key.class == EffectClass::Egress)
+            .map(|key| key.target)
+            .collect()
+    })
+}
+
+/// The typed effects of a shell command run in `cwd` (an absolute directory,
+/// if known): egress hosts from the URL operands of network programs,
+/// deletes, and writes from output redirects, `tee`, `cp`/`mv`
+/// destinations, `touch` and `mkdir`. Complete only when every segment is
+/// determinable.
+pub(crate) fn shell_call_effects(command: &str, cwd: Option<&str>) -> CallEffects {
+    let analysis = analyze_shell(command, cwd);
+    CallEffects {
+        keys: analysis.keys,
+        complete: analysis.complete,
+    }
+}
+
+struct ShellAnalysis {
+    keys: Vec<EffectKey>,
+    /// Every effect is in `keys`.
+    complete: bool,
+    /// Every egress effect is in `keys` (a local target may still be
+    /// unresolved).
+    egress_complete: bool,
+}
+
+impl ShellAnalysis {
+    fn add(&mut self, key: EffectKey) {
+        if !self.keys.contains(&key) {
+            self.keys.push(key);
+        }
+    }
+
+    /// A segment that may do anything, including reach the network.
+    fn opaque(&mut self) {
+        self.complete = false;
+        self.egress_complete = false;
+    }
+
+    /// A local target that cannot be named.
+    fn unresolved(&mut self) {
+        self.complete = false;
+    }
+
+    fn path(&mut self, class: EffectClass, raw: &str, cwd: Option<&str>) {
+        // A word glued to a redirect (`a>b`) is not the operand it looks like.
+        if raw.contains(['<', '>']) {
+            self.unresolved();
+            return;
+        }
+        match path_effect(class, raw, cwd) {
+            Some(key) => self.add(key),
+            None => self.unresolved(),
+        }
+    }
+
+    fn egress(&mut self, key: Option<EffectKey>) {
+        match key {
+            Some(key) => self.add(key),
+            None => self.opaque(),
+        }
+    }
+}
+
+fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
+    let mut out = ShellAnalysis {
+        keys: Vec::new(),
+        complete: true,
+        egress_complete: true,
+    };
+    if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
+        out.opaque();
+    }
+    // A `cd` moves where later relative paths resolve.
+    let mut cwd = cwd.map(str::to_string);
+    for line in command.replace("\\\n", " ").split('\n') {
+        let scanned = scan(line);
+        // Substitutions, groupings, heredocs and comments hide commands.
+        if scanned.unsafe_syntax {
+            out.opaque();
+        }
+        for target in &scanned.output_targets {
+            if target.contains(['"', '\'']) {
+                out.unresolved();
+            } else {
+                out.path(EffectClass::Write, target, cwd.as_deref());
+            }
+        }
+        for segment in &scanned.segments {
+            if segment.trim().is_empty() {
+                continue;
+            }
+            let Ok(tokens) = shell_words::split(segment) else {
+                out.opaque();
+                continue;
+            };
+            segment_effects(&strip_redirections(tokens), &mut cwd, &mut out);
+        }
+    }
+    out
+}
+
+fn segment_effects(tokens: &[String], cwd: &mut Option<String>, out: &mut ShellAnalysis) {
+    let Some(program) = tokens.first() else {
+        return;
+    };
+    let path_ok = !program.contains('/')
+        || program
+            .rsplit_once('/')
+            .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
+    if is_env_assignment(program) || !path_ok {
+        out.opaque();
+        return;
+    }
+    let name = basename(program);
+    let args = &tokens[1..];
+    if OBSERVATION_PROGRAMS.contains(&name) && observation_args_ok(name, args) {
+        return;
+    }
+    let cwd_now = cwd.clone();
+    let here = cwd_now.as_deref();
+    match name {
+        "cd" | "pushd" | "popd" => *cwd = None,
+        "rm" | "rmdir" | "unlink" => deleted(tokens, here, out),
+        "find"
+            if args.iter().any(|arg| arg == "-delete")
+                && !args
+                    .iter()
+                    .any(|arg| arg != "-delete" && FIND_MUTATING_FLAGS.contains(&arg.as_str())) =>
+        {
+            deleted(tokens, here, out)
+        }
+        "cp" | "mv" => copied(name, args, here, out),
+        "tee" | "touch" | "mkdir" => created(name, args, here, out),
+        "curl" => curl(args, here, out),
+        "wget" => wget(args, here, out),
+        "http" | "https" | "xh" | "xhs" => httpie(name, args, here, out),
+        "nc" | "ncat" | "netcat" => netcat(args, out),
+        "ssh" => ssh(args, here, out),
+        "scp" => scp(args, here, out),
+        "rsync" => rsync(args, here, out),
+        "git" => git(args, here, out),
+        _ => out.opaque(),
+    }
+}
+
+fn deleted(tokens: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    match delete_targets(&shell_words::join(tokens)) {
+        Some(targets) => {
+            for target in targets {
+                out.path(EffectClass::Delete, &target, cwd);
+            }
+        }
+        None => out.unresolved(),
+    }
+}
+
+/// What an option's value means for the call's effects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptionValue {
+    /// Does not change what the call touches (a header, a timeout).
+    Ignore,
+    /// A URL the program contacts.
+    Url,
+    /// A proxy the program connects through.
+    Proxy,
+    /// A file the program writes (`-` is stdout).
+    Write,
+    /// The file a download is saved to (`-` is stdout).
+    Document,
+    /// The port of the destination.
+    Port,
+    /// The directory `cp`/`mv` write into (`-t`).
+    TargetDir,
+}
+
+/// The options a program is understood with. An option not listed makes
+/// the segment undeterminable.
+struct OptionSpec {
+    /// Short options without a value; they may be clustered.
+    flags: &'static str,
+    /// Short options with a value, attached or in the next word.
+    valued: &'static [(char, OptionValue)],
+    long_flags: &'static [&'static str],
+    long_valued: &'static [(&'static str, OptionValue)],
+    /// Long options accept `--name=value`.
+    long_equals: bool,
+    /// Whole words without a value (wget's `-nv`).
+    exact: &'static [&'static str],
+}
+
+#[derive(Default)]
+struct ParsedOptions {
+    positionals: Vec<String>,
+    values: Vec<(OptionValue, String)>,
+    long_flags: Vec<String>,
+}
+
+fn parse_options(spec: &OptionSpec, args: &[String]) -> Option<ParsedOptions> {
+    let mut parsed = ParsedOptions::default();
+    let mut index = 0;
+    let mut options_done = false;
+    while index < args.len() {
+        let arg = &args[index];
+        index += 1;
+        if options_done || arg == "-" || !arg.starts_with('-') {
+            parsed.positionals.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            options_done = true;
+            continue;
+        }
+        if spec.exact.contains(&arg.as_str()) {
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if let Some((name, value)) = long.split_once('=') {
+                if !spec.long_equals {
+                    return None;
+                }
+                let role = lookup(spec.long_valued, name)?;
+                parsed.values.push((role, value.to_string()));
+            } else if spec.long_flags.contains(&long) {
+                parsed.long_flags.push(long.to_string());
+            } else {
+                let role = lookup(spec.long_valued, long)?;
+                parsed.values.push((role, args.get(index)?.clone()));
+                index += 1;
+            }
+            continue;
+        }
+        let cluster: Vec<char> = arg[1..].chars().collect();
+        for (position, letter) in cluster.iter().enumerate() {
+            if spec.flags.contains(*letter) {
+                continue;
+            }
+            let role = spec
+                .valued
+                .iter()
+                .find(|(short, _)| short == letter)
+                .map(|(_, role)| *role)?;
+            let rest: String = cluster[position + 1..].iter().collect();
+            let value = if rest.is_empty() {
+                index += 1;
+                args.get(index - 1)?.clone()
+            } else {
+                rest
+            };
+            parsed.values.push((role, value));
+            break;
+        }
+    }
+    Some(parsed)
+}
+
+fn lookup(table: &[(&str, OptionValue)], name: &str) -> Option<OptionValue> {
+    table
+        .iter()
+        .find(|(long, _)| *long == name)
+        .map(|(_, role)| *role)
+}
+
+/// Apply the option values every program shares: written files, proxies
+/// and URLs.
+fn apply_values(
+    parsed: &ParsedOptions,
+    default_scheme: &str,
+    cwd: Option<&str>,
+    out: &mut ShellAnalysis,
+) {
+    for (role, value) in &parsed.values {
+        match role {
+            OptionValue::Write | OptionValue::Document if value != "-" => {
+                out.path(EffectClass::Write, value, cwd)
+            }
+            OptionValue::Url => out.egress(url_effect(value, default_scheme)),
+            OptionValue::Proxy => out.egress(url_effect(value, "http")),
+            _ => {}
+        }
+    }
+}
+
+const CURL: OptionSpec = OptionSpec {
+    flags: "sSLfiIkvGNqjgn0123456#Z",
+    valued: &[
+        ('X', OptionValue::Ignore),
+        ('d', OptionValue::Ignore),
+        ('H', OptionValue::Ignore),
+        ('u', OptionValue::Ignore),
+        ('A', OptionValue::Ignore),
+        ('e', OptionValue::Ignore),
+        ('F', OptionValue::Ignore),
+        ('m', OptionValue::Ignore),
+        ('T', OptionValue::Ignore),
+        ('b', OptionValue::Ignore),
+        ('w', OptionValue::Ignore),
+        ('r', OptionValue::Ignore),
+        ('C', OptionValue::Ignore),
+        ('Y', OptionValue::Ignore),
+        ('y', OptionValue::Ignore),
+        ('z', OptionValue::Ignore),
+        ('E', OptionValue::Ignore),
+        ('U', OptionValue::Ignore),
+        ('x', OptionValue::Proxy),
+        ('o', OptionValue::Write),
+        ('D', OptionValue::Write),
+        ('c', OptionValue::Write),
+    ],
+    long_flags: &[
+        "silent",
+        "show-error",
+        "location",
+        "location-trusted",
+        "fail",
+        "fail-with-body",
+        "fail-early",
+        "include",
+        "head",
+        "insecure",
+        "verbose",
+        "get",
+        "compressed",
+        "http0.9",
+        "http1.0",
+        "http1.1",
+        "http2",
+        "http2-prior-knowledge",
+        "http3",
+        "http3-only",
+        "no-buffer",
+        "globoff",
+        "ipv4",
+        "ipv6",
+        "no-progress-meter",
+        "progress-bar",
+        "netrc",
+        "netrc-optional",
+        "raw",
+        "tr-encoding",
+        "no-keepalive",
+        "ssl-reqd",
+        "tcp-nodelay",
+        "path-as-is",
+        "retry-all-errors",
+        "retry-connrefused",
+        "anyauth",
+        "basic",
+        "digest",
+        "ntlm",
+        "negotiate",
+        "disable",
+        "junk-session-cookies",
+        "parallel",
+        "tlsv1.2",
+        "tlsv1.3",
+        "styled-output",
+        "no-styled-output",
+    ],
+    long_valued: &[
+        ("url", OptionValue::Url),
+        ("request", OptionValue::Ignore),
+        ("data", OptionValue::Ignore),
+        ("data-raw", OptionValue::Ignore),
+        ("data-binary", OptionValue::Ignore),
+        ("data-urlencode", OptionValue::Ignore),
+        ("data-ascii", OptionValue::Ignore),
+        ("json", OptionValue::Ignore),
+        ("header", OptionValue::Ignore),
+        ("user", OptionValue::Ignore),
+        ("user-agent", OptionValue::Ignore),
+        ("referer", OptionValue::Ignore),
+        ("form", OptionValue::Ignore),
+        ("form-string", OptionValue::Ignore),
+        ("max-time", OptionValue::Ignore),
+        ("connect-timeout", OptionValue::Ignore),
+        ("upload-file", OptionValue::Ignore),
+        ("cookie", OptionValue::Ignore),
+        ("write-out", OptionValue::Ignore),
+        ("range", OptionValue::Ignore),
+        ("retry", OptionValue::Ignore),
+        ("retry-delay", OptionValue::Ignore),
+        ("retry-max-time", OptionValue::Ignore),
+        ("cacert", OptionValue::Ignore),
+        ("capath", OptionValue::Ignore),
+        ("cert", OptionValue::Ignore),
+        ("cert-type", OptionValue::Ignore),
+        ("key", OptionValue::Ignore),
+        ("key-type", OptionValue::Ignore),
+        ("oauth2-bearer", OptionValue::Ignore),
+        ("max-redirs", OptionValue::Ignore),
+        ("limit-rate", OptionValue::Ignore),
+        ("max-filesize", OptionValue::Ignore),
+        ("continue-at", OptionValue::Ignore),
+        ("time-cond", OptionValue::Ignore),
+        ("proxy-user", OptionValue::Ignore),
+        ("proxy", OptionValue::Proxy),
+        ("preproxy", OptionValue::Proxy),
+        ("output", OptionValue::Write),
+        ("dump-header", OptionValue::Write),
+        ("cookie-jar", OptionValue::Write),
+        ("trace", OptionValue::Write),
+        ("trace-ascii", OptionValue::Write),
+        ("libcurl", OptionValue::Write),
+        ("stderr", OptionValue::Write),
+        ("etag-save", OptionValue::Write),
+    ],
+    long_equals: false,
+    exact: &[],
+};
+
+fn curl(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&CURL, args) else {
+        out.opaque();
+        return;
+    };
+    // `--write-out '%output{file}'` writes a file the option names inline.
+    if parsed
+        .values
+        .iter()
+        .any(|(_, value)| value.contains("%output{"))
+    {
+        out.unresolved();
+    }
+    apply_values(&parsed, "http", cwd, out);
+    for url in &parsed.positionals {
+        out.egress(url_effect(url, "http"));
+    }
+}
+
+const WGET: OptionSpec = OptionSpec {
+    flags: "qvSc",
+    valued: &[
+        ('O', OptionValue::Document),
+        ('o', OptionValue::Write),
+        ('a', OptionValue::Write),
+        ('T', OptionValue::Ignore),
+        ('t', OptionValue::Ignore),
+        ('U', OptionValue::Ignore),
+    ],
+    long_flags: &[
+        "quiet",
+        "verbose",
+        "no-verbose",
+        "server-response",
+        "spider",
+        "continue",
+        "no-check-certificate",
+        "no-clobber",
+        "inet4-only",
+        "inet6-only",
+        "no-cache",
+        "no-cookies",
+        "content-on-error",
+        "ignore-length",
+        "auth-no-challenge",
+        "no-proxy",
+    ],
+    long_valued: &[
+        ("output-document", OptionValue::Document),
+        ("output-file", OptionValue::Write),
+        ("append-output", OptionValue::Write),
+        ("save-cookies", OptionValue::Write),
+        ("timeout", OptionValue::Ignore),
+        ("tries", OptionValue::Ignore),
+        ("header", OptionValue::Ignore),
+        ("method", OptionValue::Ignore),
+        ("body-data", OptionValue::Ignore),
+        ("body-file", OptionValue::Ignore),
+        ("post-data", OptionValue::Ignore),
+        ("post-file", OptionValue::Ignore),
+        ("user-agent", OptionValue::Ignore),
+        ("user", OptionValue::Ignore),
+        ("password", OptionValue::Ignore),
+        ("http-user", OptionValue::Ignore),
+        ("http-password", OptionValue::Ignore),
+        ("referer", OptionValue::Ignore),
+        ("wait", OptionValue::Ignore),
+        ("limit-rate", OptionValue::Ignore),
+        ("read-timeout", OptionValue::Ignore),
+        ("connect-timeout", OptionValue::Ignore),
+        ("dns-timeout", OptionValue::Ignore),
+        ("max-redirect", OptionValue::Ignore),
+        ("progress", OptionValue::Ignore),
+        ("ca-certificate", OptionValue::Ignore),
+        ("certificate", OptionValue::Ignore),
+        ("private-key", OptionValue::Ignore),
+        ("load-cookies", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &["-nv", "-nc", "-nd", "-nH"],
+};
+
+fn wget(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&WGET, args) else {
+        out.opaque();
+        return;
+    };
+    apply_values(&parsed, "http", cwd, out);
+    for url in &parsed.positionals {
+        out.egress(url_effect(url, "http"));
+    }
+    // Without `-O` wget saves under a name taken from the URL or response.
+    let names_output = parsed
+        .values
+        .iter()
+        .any(|(role, _)| *role == OptionValue::Document);
+    let spider = parsed.long_flags.iter().any(|flag| flag == "spider");
+    if !names_output && !spider {
+        out.unresolved();
+    }
+}
+
+const HTTPIE: OptionSpec = OptionSpec {
+    flags: "vhbfjFIq",
+    valued: &[
+        ('p', OptionValue::Ignore),
+        ('s', OptionValue::Ignore),
+        ('a', OptionValue::Ignore),
+        ('A', OptionValue::Ignore),
+        ('o', OptionValue::Write),
+    ],
+    long_flags: &[
+        "json",
+        "form",
+        "multipart",
+        "verbose",
+        "headers",
+        "body",
+        "follow",
+        "check-status",
+        "ignore-stdin",
+        "quiet",
+        "offline",
+        "all",
+    ],
+    long_valued: &[
+        ("print", OptionValue::Ignore),
+        ("pretty", OptionValue::Ignore),
+        ("style", OptionValue::Ignore),
+        ("auth", OptionValue::Ignore),
+        ("auth-type", OptionValue::Ignore),
+        ("timeout", OptionValue::Ignore),
+        ("max-redirects", OptionValue::Ignore),
+        ("verify", OptionValue::Ignore),
+        ("cert", OptionValue::Ignore),
+        ("cert-key", OptionValue::Ignore),
+        ("output", OptionValue::Write),
+    ],
+    long_equals: true,
+    exact: &[],
+};
+
+/// HTTPie (`http`, `https`) and xh: `[METHOD] URL [items]`, where a URL
+/// may be `:port/path` for localhost and names no scheme by default.
+fn httpie(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&HTTPIE, args) else {
+        out.opaque();
+        return;
+    };
+    apply_values(&parsed, "http", cwd, out);
+    let mut positionals = parsed.positionals.iter();
+    let mut url = positionals.next();
+    if url.is_some_and(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_uppercase())) {
+        url = positionals.next();
+    }
+    let Some(url) = url else {
+        out.opaque();
+        return;
+    };
+    let scheme = if matches!(program, "https" | "xhs") {
+        "https"
+    } else {
+        "http"
+    };
+    let url = match url.strip_prefix(':') {
+        Some(rest) => format!("localhost:{rest}"),
+        None => url.clone(),
+    };
+    out.egress(url_effect(&url, scheme));
+}
+
+const NETCAT: OptionSpec = OptionSpec {
+    flags: "vznu46CDdN",
+    valued: &[
+        ('w', OptionValue::Ignore),
+        ('p', OptionValue::Ignore),
+        ('s', OptionValue::Ignore),
+        ('q', OptionValue::Ignore),
+        ('i', OptionValue::Ignore),
+    ],
+    long_flags: &[],
+    long_valued: &[],
+    long_equals: false,
+    exact: &[],
+};
+
+/// `nc host port`. Listening, proxies and `-e` are not understood.
+fn netcat(args: &[String], out: &mut ShellAnalysis) {
+    let target = parse_options(&NETCAT, args).and_then(|parsed| match &parsed.positionals[..] {
+        [host, port] => egress_effect("", host, Some(port.parse::<u16>().ok()?)),
+        _ => None,
+    });
+    out.egress(target);
+}
+
+const SSH: OptionSpec = OptionSpec {
+    flags: "46AaCfGgKkMNnqsTtVvXxYy",
+    valued: &[
+        ('p', OptionValue::Port),
+        ('i', OptionValue::Ignore),
+        ('l', OptionValue::Ignore),
+        ('L', OptionValue::Ignore),
+        ('R', OptionValue::Ignore),
+        ('D', OptionValue::Ignore),
+        ('c', OptionValue::Ignore),
+        ('m', OptionValue::Ignore),
+        ('b', OptionValue::Ignore),
+        ('e', OptionValue::Ignore),
+        ('E', OptionValue::Write),
+    ],
+    long_flags: &[],
+    long_valued: &[],
+    long_equals: false,
+    exact: &[],
+};
+
+fn port_option(parsed: &ParsedOptions) -> Result<Option<u16>, ()> {
+    match parsed
+        .values
+        .iter()
+        .rev()
+        .find(|(role, _)| *role == OptionValue::Port)
+    {
+        Some((_, port)) => port.parse::<u16>().map(Some).map_err(|_| ()),
+        None => Ok(None),
+    }
+}
+
+/// `user@host` or `host` (brackets allowed for IPv6) as an ssh egress.
+fn ssh_host_effect(destination: &str, port: Option<u16>) -> Option<EffectKey> {
+    let host = destination
+        .rsplit_once('@')
+        .map_or(destination, |(_, host)| host);
+    egress_effect("ssh", host, port)
+}
+
+/// `ssh [options] destination [command]`: the remote command runs on the
+/// destination, so only the destination is an effect here.
+fn ssh(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&SSH, args) else {
+        out.opaque();
+        return;
+    };
+    apply_values(&parsed, "ssh", cwd, out);
+    let Ok(port) = port_option(&parsed) else {
+        out.opaque();
+        return;
+    };
+    let key = parsed.positionals.first().and_then(|destination| {
+        if destination.contains("://") {
+            let url = reqwest::Url::parse(destination).ok()?;
+            if url.scheme() != "ssh" {
+                return None;
+            }
+            egress_effect("ssh", url.host_str()?, port.or(url.port()))
+        } else {
+            ssh_host_effect(destination, port)
+        }
+    });
+    out.egress(key);
+}
+
+/// A remote operand of scp or rsync (`[user@]host:path`, `host::module`,
+/// `scheme://`), as an egress on `scheme`. `Ok(None)` for a local path,
+/// `Err` when it cannot be read.
+fn remote_operand(operand: &str, scheme: &str, port: Option<u16>) -> Result<Option<EffectKey>, ()> {
+    if operand.contains("://") {
+        return url_effect(operand, scheme).map(Some).ok_or(());
+    }
+    if operand.starts_with(['/', '.', '~']) {
+        return Ok(None);
+    }
+    let (user_host, rest) = match operand.find('[') {
+        // `[user@][v6]:path`
+        Some(open) => {
+            let close = operand.find(']').ok_or(())?;
+            if close < open || operand.as_bytes().get(close + 1) != Some(&b':') {
+                return Err(());
+            }
+            (&operand[..=close], &operand[close + 1..])
+        }
+        None => match operand.split_once(':') {
+            Some((before, _)) if !before.contains('/') => (before, &operand[before.len()..]),
+            _ => return Ok(None),
+        },
+    };
+    if user_host.is_empty() {
+        return Err(());
+    }
+    // `host::module` is the rsync daemon.
+    if rest.starts_with("::") && scheme == "rsync" {
+        let host = user_host
+            .rsplit_once('@')
+            .map_or(user_host, |(_, host)| host);
+        return egress_effect("rsync", host, port.or(Some(873)))
+            .map(Some)
+            .ok_or(());
+    }
+    ssh_host_effect(user_host, port).map(Some).ok_or(())
+}
+
+/// Sources and destination of scp/rsync: remote operands are egress, a
+/// local destination is written. `Some(true)` when the destination is
+/// local; `None` when the operands cannot be read.
+fn transfer(
+    positionals: &[String],
+    scheme: &str,
+    port: Option<u16>,
+    cwd: Option<&str>,
+    out: &mut ShellAnalysis,
+) -> Option<bool> {
+    let Some((destination, sources)) = positionals.split_last().filter(|(_, s)| !s.is_empty())
+    else {
+        out.opaque();
+        return None;
+    };
+    for source in sources {
+        match remote_operand(source, scheme, port) {
+            Ok(Some(key)) => out.add(key),
+            Ok(None) => {}
+            Err(()) => out.opaque(),
+        }
+    }
+    match remote_operand(destination, scheme, port) {
+        Ok(Some(key)) => {
+            out.add(key);
+            Some(false)
+        }
+        Ok(None) => {
+            out.path(EffectClass::Write, destination, cwd);
+            Some(true)
+        }
+        Err(()) => {
+            out.opaque();
+            None
+        }
+    }
+}
+
+const SCP: OptionSpec = OptionSpec {
+    flags: "346BCpqrTvA",
+    valued: &[
+        ('P', OptionValue::Port),
+        ('i', OptionValue::Ignore),
+        ('l', OptionValue::Ignore),
+        ('c', OptionValue::Ignore),
+    ],
+    long_flags: &[],
+    long_valued: &[],
+    long_equals: false,
+    exact: &[],
+};
+
+fn scp(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&SCP, args) else {
+        out.opaque();
+        return;
+    };
+    let Ok(port) = port_option(&parsed) else {
+        out.opaque();
+        return;
+    };
+    transfer(&parsed.positionals, "ssh", port, cwd, out);
+}
+
+const RSYNC: OptionSpec = OptionSpec {
+    flags: "avzrlptgoDhPnciuqHAXSWxRbIKLkmyO",
+    valued: &[('T', OptionValue::Ignore), ('B', OptionValue::Ignore)],
+    long_flags: &[
+        "archive",
+        "verbose",
+        "compress",
+        "recursive",
+        "links",
+        "perms",
+        "times",
+        "group",
+        "owner",
+        "devices",
+        "specials",
+        "human-readable",
+        "progress",
+        "partial",
+        "dry-run",
+        "checksum",
+        "update",
+        "quiet",
+        "hard-links",
+        "acls",
+        "xattrs",
+        "sparse",
+        "whole-file",
+        "one-file-system",
+        "relative",
+        "backup",
+        "ignore-existing",
+        "inplace",
+        "append",
+        "stats",
+        "itemize-changes",
+        "delete",
+        "delete-before",
+        "delete-during",
+        "delete-after",
+        "delete-delay",
+        "delete-excluded",
+        "remove-source-files",
+        "prune-empty-dirs",
+        "numeric-ids",
+        "safe-links",
+        "copy-links",
+        "keep-dirlinks",
+        "no-motd",
+        "mkpath",
+    ],
+    long_valued: &[
+        ("exclude", OptionValue::Ignore),
+        ("include", OptionValue::Ignore),
+        ("exclude-from", OptionValue::Ignore),
+        ("include-from", OptionValue::Ignore),
+        ("bwlimit", OptionValue::Ignore),
+        ("timeout", OptionValue::Ignore),
+        ("contimeout", OptionValue::Ignore),
+        ("chmod", OptionValue::Ignore),
+        ("max-size", OptionValue::Ignore),
+        ("min-size", OptionValue::Ignore),
+        ("temp-dir", OptionValue::Ignore),
+        ("partial-dir", OptionValue::Ignore),
+        ("backup-dir", OptionValue::Ignore),
+        ("suffix", OptionValue::Ignore),
+        ("password-file", OptionValue::Ignore),
+        ("port", OptionValue::Port),
+        ("log-file", OptionValue::Write),
+    ],
+    long_equals: true,
+    exact: &[],
+};
+
+fn rsync(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&RSYNC, args) else {
+        out.opaque();
+        return;
+    };
+    apply_values(&parsed, "rsync", cwd, out);
+    let Ok(port) = port_option(&parsed) else {
+        out.opaque();
+        return;
+    };
+    let Some(local_destination) = transfer(&parsed.positionals, "rsync", port, cwd, out) else {
+        return;
+    };
+    let flag = |name: &str| parsed.long_flags.iter().any(|flag| flag.starts_with(name));
+    let Some((destination, sources)) = parsed.positionals.split_last() else {
+        return;
+    };
+    // `--delete*` removes files below a local destination (a remote one is
+    // already egress).
+    if flag("delete") && local_destination {
+        out.path(EffectClass::Delete, destination, cwd);
+    }
+    // `--remove-source-files` deletes what it sent.
+    if flag("remove-source-files") {
+        for source in sources {
+            if matches!(remote_operand(source, "rsync", port), Ok(None)) {
+                out.path(EffectClass::Delete, source, cwd);
+            }
+        }
+    }
+}
+
+const COPY: OptionSpec = OptionSpec {
+    flags: "rRfinpavLPHlsuxXTcbdD",
+    valued: &[('t', OptionValue::TargetDir), ('S', OptionValue::Ignore)],
+    long_flags: &[
+        "archive",
+        "recursive",
+        "force",
+        "interactive",
+        "no-clobber",
+        "verbose",
+        "update",
+        "parents",
+        "no-target-directory",
+        "dereference",
+        "no-dereference",
+        "one-file-system",
+        "link",
+        "symbolic-link",
+        "preserve",
+        "backup",
+        "reflink",
+        "strip-trailing-slashes",
+    ],
+    long_valued: &[
+        ("target-directory", OptionValue::TargetDir),
+        ("preserve", OptionValue::Ignore),
+        ("no-preserve", OptionValue::Ignore),
+        ("backup", OptionValue::Ignore),
+        ("suffix", OptionValue::Ignore),
+        ("sparse", OptionValue::Ignore),
+        ("reflink", OptionValue::Ignore),
+        ("update", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+};
+
+/// `cp`/`mv`: the destination (the last operand, or `-t DIR`) is written;
+/// `mv` also removes its sources.
+fn copied(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(parsed) = parse_options(&COPY, args) else {
+        out.unresolved();
+        return;
+    };
+    let target_dir = parsed
+        .values
+        .iter()
+        .rev()
+        .find(|(role, _)| *role == OptionValue::TargetDir)
+        .map(|(_, dir)| dir.clone());
+    let (destination, sources) = match &target_dir {
+        Some(dir) => (dir.as_str(), &parsed.positionals[..]),
+        None => match parsed.positionals.split_last() {
+            Some((destination, sources)) if !sources.is_empty() => (destination.as_str(), sources),
+            _ => {
+                out.unresolved();
+                return;
+            }
+        },
+    };
+    out.path(EffectClass::Write, destination, cwd);
+    if program == "mv" {
+        for source in sources {
+            out.path(EffectClass::Delete, source, cwd);
+        }
+    }
+}
+
+const CREATE: OptionSpec = OptionSpec {
+    flags: "aipcmhf",
+    valued: &[
+        ('t', OptionValue::Ignore),
+        ('d', OptionValue::Ignore),
+        ('r', OptionValue::Ignore),
+    ],
+    long_flags: &[
+        "append",
+        "ignore-interrupts",
+        "no-create",
+        "no-dereference",
+        "parents",
+        "verbose",
+    ],
+    long_valued: &[
+        ("output-error", OptionValue::Ignore),
+        ("date", OptionValue::Ignore),
+        ("reference", OptionValue::Ignore),
+        ("time", OptionValue::Ignore),
+        ("mode", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+};
+
+/// `tee`, `touch` and `mkdir` write each operand.
+fn created(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    // `mkdir -m MODE` takes a value where `touch -m` does not.
+    let spec = if program == "mkdir" {
+        OptionSpec {
+            flags: "pv",
+            valued: &[('m', OptionValue::Ignore)],
+            ..CREATE
+        }
+    } else {
+        CREATE
+    };
+    match parse_options(&spec, args) {
+        Some(parsed) => {
+            for operand in &parsed.positionals {
+                if operand != "-" {
+                    out.path(EffectClass::Write, operand, cwd);
+                }
+            }
+        }
+        None => out.unresolved(),
+    }
+}
+
+const GIT_REMOTE: OptionSpec = OptionSpec {
+    flags: "fuqvndptrhls",
+    valued: &[
+        ('b', OptionValue::Ignore),
+        ('o', OptionValue::Ignore),
+        ('j', OptionValue::Ignore),
+    ],
+    long_flags: &[
+        "quiet",
+        "verbose",
+        "progress",
+        "force",
+        "tags",
+        "no-tags",
+        "prune",
+        "dry-run",
+        "atomic",
+        "follow-tags",
+        "set-upstream",
+        "delete",
+        "force-with-lease",
+        "rebase",
+        "no-rebase",
+        "ff-only",
+        "ff",
+        "no-ff",
+        "unshallow",
+        "heads",
+        "refs",
+        "no-checkout",
+        "bare",
+        "mirror",
+        "single-branch",
+        "no-single-branch",
+        "shallow-submodules",
+        "no-hardlinks",
+        "local",
+        "shared",
+        "sparse",
+    ],
+    long_valued: &[
+        ("branch", OptionValue::Ignore),
+        ("origin", OptionValue::Ignore),
+        ("depth", OptionValue::Ignore),
+        ("deepen", OptionValue::Ignore),
+        ("shallow-since", OptionValue::Ignore),
+        ("shallow-exclude", OptionValue::Ignore),
+        ("filter", OptionValue::Ignore),
+        ("jobs", OptionValue::Ignore),
+        ("push-option", OptionValue::Ignore),
+        ("force-with-lease", OptionValue::Ignore),
+        ("rebase", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+};
+
+/// A git remote given as a URL (`https://`, `ssh://`, `git://`, or
+/// scp-like `user@host:path`). `Ok(None)` for a local repository path;
+/// `Err` for a remote named only by configuration (`origin`).
+fn git_remote(remote: &str) -> Result<Option<EffectKey>, ()> {
+    // `transport::address` (`ext::` runs a command).
+    if remote.contains("::") {
+        return Err(());
+    }
+    if let Some(scheme_end) = remote.find("://") {
+        return match &remote[..scheme_end] {
+            "file" => Ok(None),
+            "ext" => Err(()),
+            _ => url_effect(remote, "https").map(Some).ok_or(()),
+        };
+    }
+    if remote.starts_with(['/', '.', '~']) {
+        return Ok(None);
+    }
+    match remote.split_once(':') {
+        Some((before, _)) if !before.contains('/') && !before.is_empty() => {
+            ssh_host_effect(before, None).map(Some).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// `git clone|fetch|pull|push|ls-remote` with the remote given as a URL.
+/// Any other git command that is not an observation is undeterminable
+/// (hooks, configuration, aliases).
+fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+    let Some(subcommand) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        out.opaque();
+        return;
+    };
+    if !matches!(
+        subcommand.as_str(),
+        "clone" | "fetch" | "pull" | "push" | "ls-remote"
+    ) {
+        out.opaque();
+        return;
+    }
+    let Some(parsed) = parse_options(&GIT_REMOTE, &args[1..]) else {
+        out.opaque();
+        return;
+    };
+    let Some(remote) = parsed.positionals.first() else {
+        out.opaque();
+        return;
+    };
+    match git_remote(remote) {
+        Ok(Some(key)) => out.add(key),
+        Ok(None) => {}
+        Err(()) => {
+            out.opaque();
+            return;
+        }
+    }
+    match subcommand.as_str() {
+        "clone" => {
+            let directory = match parsed.positionals.get(1) {
+                Some(directory) => directory.clone(),
+                None => {
+                    let name = remote
+                        .trim_end_matches('/')
+                        .rsplit(['/', ':'])
+                        .next()
+                        .unwrap_or_default();
+                    name.strip_suffix(".git").unwrap_or(name).to_string()
+                }
+            };
+            if directory.is_empty() {
+                out.unresolved();
+            } else {
+                out.path(EffectClass::Write, &directory, cwd);
+            }
+        }
+        // They update the repository they run in.
+        "fetch" | "pull" => match cwd {
+            Some(cwd) => out.path(EffectClass::Write, cwd, None),
+            None => out.unresolved(),
+        },
+        _ => {}
     }
 }
 
@@ -1429,6 +2773,261 @@ mod tests {
             "find . -name x",
         ] {
             assert!(!command_effects(benign).deletes, "{benign}");
+        }
+    }
+
+    fn egress(target: &str) -> EffectKey {
+        EffectKey {
+            class: EffectClass::Egress,
+            target: target.to_string(),
+        }
+    }
+
+    /// The canonical form of a path that may not exist yet: its nearest
+    /// existing ancestor canonicalized (macOS `/tmp` is `/private/tmp`).
+    fn canonical(path: &str) -> String {
+        let path = std::path::Path::new(path);
+        for ancestor in path.ancestors() {
+            if let Ok(real) = std::fs::canonicalize(ancestor) {
+                let rest = path.strip_prefix(ancestor).unwrap();
+                return real
+                    .join(rest)
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string();
+            }
+        }
+        unreachable!()
+    }
+
+    fn synthetic_dir() -> String {
+        format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn ipv6_bracketed_and_bare_hosts_match() {
+        assert_eq!(
+            egress_effect("http", "[::1]", Some(8765)),
+            egress_effect("http", "::1", Some(8765))
+        );
+        assert_eq!(
+            egress_effect("http", "[::1]", Some(8765)),
+            Some(egress("::1:8765"))
+        );
+        // A URL host and a bare shell operand name the same target.
+        assert_eq!(
+            url_effect("http://[::1]:8765/announce", "https"),
+            Some(egress("::1:8765"))
+        );
+        assert_eq!(
+            shell_call_effects("nc ::1 8765", None).keys,
+            vec![egress("::1:8765")]
+        );
+    }
+
+    #[test]
+    fn existing_path_declared_canonically() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let real_canonical = std::fs::canonicalize(&real).unwrap();
+        // An existing path through a symlink is the symlink's target.
+        let existing = path_effect(EffectClass::Write, link.to_str().unwrap(), None).unwrap();
+        assert_eq!(existing.target, real_canonical.to_string_lossy());
+        // A new file below it lands below the canonical directory.
+        let new_file = path_effect(
+            EffectClass::Write,
+            &format!("{}/f.txt", link.to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            new_file.target,
+            real_canonical.join("f.txt").to_string_lossy()
+        );
+        // A relative path resolves against the working directory, else it is
+        // undeterminable.
+        let relative =
+            path_effect(EffectClass::Write, "f.txt", Some(link.to_str().unwrap())).unwrap();
+        assert_eq!(relative, new_file);
+        assert_eq!(path_effect(EffectClass::Write, "f.txt", None), None);
+        // Removing a symlink removes the link, not its target.
+        let removed = path_effect(EffectClass::Delete, link.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            removed.target,
+            std::fs::canonicalize(dir.path())
+                .unwrap()
+                .join("link")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn egress_hosts_are_read_from_network_program_operands() {
+        assert_eq!(
+            egress_hosts(
+                "curl -sS https://a.example.invalid/x && wget -qO- http://b.example.invalid:8080/y"
+            ),
+            Some(vec![
+                "a.example.invalid:443".to_string(),
+                "b.example.invalid:8080".to_string()
+            ])
+        );
+        assert_eq!(egress_hosts("ls -la"), Some(vec![]));
+        // A local write with no working directory does not hide the egress.
+        assert_eq!(
+            egress_hosts("curl https://a.example.invalid/x > out.json"),
+            Some(vec!["a.example.invalid:443".to_string()])
+        );
+        for undeterminable in [
+            "bash run.sh",
+            "curl \"$URL\"",
+            "curl -K cfg https://a.example.invalid/",
+            "git push origin main",
+            "curl https://a.example.invalid/ | sh",
+            "sudo curl https://a.example.invalid/",
+            "HTTPS_PROXY=http://p.example.invalid curl https://a.example.invalid/",
+            "cat < /dev/tcp/a.example.invalid/80",
+        ] {
+            assert_eq!(egress_hosts(undeterminable), None, "{undeterminable}");
+        }
+    }
+
+    #[test]
+    fn network_programs_declare_their_hosts() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "ssh deploy@h.example.invalid uptime",
+                &["h.example.invalid:22"],
+            ),
+            ("ssh -p 2222 h.example.invalid", &["h.example.invalid:2222"]),
+            (
+                "ssh ssh://h.example.invalid:2200",
+                &["h.example.invalid:2200"],
+            ),
+            ("nc -z h.example.invalid 25", &["h.example.invalid:25"]),
+            (
+                "http POST https://api.example.invalid/v1 name=x",
+                &["api.example.invalid:443"],
+            ),
+            ("http :8080/health", &["localhost:8080"]),
+            (
+                "git clone https://git.example.invalid/acme/repo.git /tmp/aidaemon-test/clone",
+                &["git.example.invalid:443"],
+            ),
+            (
+                "git push git@git.example.invalid:acme/repo.git main",
+                &["git.example.invalid:22"],
+            ),
+            (
+                "curl -x http://proxy.example.invalid:3128 https://a.example.invalid/",
+                &["proxy.example.invalid:3128", "a.example.invalid:443"],
+            ),
+        ];
+        for (command, hosts) in cases {
+            let effects = shell_call_effects(command, None);
+            let egress: Vec<_> = effects
+                .keys
+                .iter()
+                .filter(|key| key.class == EffectClass::Egress)
+                .map(|key| key.target.as_str())
+                .collect();
+            assert_eq!(&egress, hosts, "{command}");
+        }
+    }
+
+    #[test]
+    fn local_file_effects_are_declared_with_their_class() {
+        let dir = synthetic_dir();
+        let key = |class: EffectClass, path: &str| EffectKey {
+            class,
+            target: canonical(path),
+        };
+        let cases: Vec<(String, Vec<EffectKey>)> = vec![
+            (
+                format!("rm -rf {dir}/build"),
+                vec![key(EffectClass::Delete, &format!("{dir}/build"))],
+            ),
+            (
+                format!("cp a.txt {dir}/b.txt"),
+                vec![key(EffectClass::Write, &format!("{dir}/b.txt"))],
+            ),
+            (
+                format!("mv {dir}/a {dir}/b"),
+                vec![
+                    key(EffectClass::Delete, &format!("{dir}/a")),
+                    key(EffectClass::Write, &format!("{dir}/b")),
+                ],
+            ),
+            (
+                format!("printf x | tee -a {dir}/log"),
+                vec![key(EffectClass::Write, &format!("{dir}/log"))],
+            ),
+            (
+                format!("curl -o {dir}/page.html https://a.example.invalid/"),
+                vec![
+                    key(EffectClass::Write, &format!("{dir}/page.html")),
+                    egress("a.example.invalid:443"),
+                ],
+            ),
+            (
+                format!("scp h.example.invalid:/srv/x {dir}/x"),
+                vec![
+                    egress("h.example.invalid:22"),
+                    key(EffectClass::Write, &format!("{dir}/x")),
+                ],
+            ),
+        ];
+        for (command, expected) in cases {
+            let effects = shell_call_effects(&command, None);
+            assert!(effects.complete, "{command}");
+            let mut keys = effects.keys.clone();
+            let mut expected = expected.clone();
+            keys.sort_by(|a, b| a.target.cmp(&b.target));
+            expected.sort_by(|a, b| a.target.cmp(&b.target));
+            assert_eq!(keys, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn undeterminable_segments_make_effects_incomplete() {
+        for command in [
+            "bash run.sh",
+            "python3 tool.py",
+            "rm build",
+            "echo x > out.txt",
+            "cd /tmp/aidaemon-test && rm -rf x",
+            "curl -O https://a.example.invalid/f",
+            "curl --frobnicate https://a.example.invalid/",
+            "wget https://a.example.invalid/f",
+            "cargo build",
+            "git commit -m x",
+            "rm $TARGET",
+            "echo $(curl https://a.example.invalid/)",
+            "ssh -o ProxyCommand=x h.example.invalid",
+        ] {
+            assert!(!shell_call_effects(command, None).complete, "{command}");
+        }
+        // Keys found before the opaque segment are still declared.
+        let partial = shell_call_effects("curl https://a.example.invalid/ && bash run.sh", None);
+        assert!(!partial.complete);
+        assert_eq!(partial.keys, vec![egress("a.example.invalid:443")]);
+        // A relative path resolves against a known working directory.
+        let dir = synthetic_dir();
+        let resolved = shell_call_effects("rm build", Some(&dir));
+        assert!(resolved.complete);
+        assert_eq!(resolved.keys[0].target, canonical(&format!("{dir}/build")));
+        for observation in ["ls -la", "git status", "echo hi", "cat a | grep b"] {
+            assert_eq!(
+                shell_call_effects(observation, None),
+                CallEffects::none(),
+                "{observation}"
+            );
         }
     }
 }

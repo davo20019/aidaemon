@@ -4271,6 +4271,11 @@ impl Tool for CliAgentTool {
         }
     }
 
+    /// A delegated agent may do anything its own tools allow.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
     fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
         let action = serde_json::from_str::<Value>(arguments)
             .ok()

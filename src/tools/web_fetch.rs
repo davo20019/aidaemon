@@ -590,6 +590,22 @@ impl Tool for WebFetchTool {
             .with_target_hint(ToolTargetHintKind::Url, url)
     }
 
+    /// The page's host.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                let url = reqwest::Url::parse(args.get("url")?.as_str()?.trim()).ok()?;
+                crate::tools::command_effects::url_host_effect(&url)
+            })
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            })
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.execute(arguments, false)
             .await
@@ -1202,5 +1218,23 @@ mod extraction_tests {
         assert_eq!(buf.len(), 3);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.starts_with("ab"));
+    }
+
+    #[test]
+    fn web_fetch_declares_egress_host() {
+        let tool = WebFetchTool::new();
+        let effects =
+            tool.call_effects(&json!({"url": "https://Docs.Example.Invalid/guide"}).to_string());
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "docs.example.invalid",
+                None
+            )]
+        );
+        let bad = tool.call_effects(&json!({"url": "::"}).to_string());
+        assert!(!bad.complete);
     }
 }

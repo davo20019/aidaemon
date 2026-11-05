@@ -1986,6 +1986,21 @@ pub trait Tool: Send + Sync {
         default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
     }
 
+    /// The typed effects of this exact call (effect class and normalized
+    /// target), which the kernel checks against the owner's declines and
+    /// hands the approval and egress policies. Build keys only with the
+    /// kernel constructors, through `command_effects::{path_effect,
+    /// egress_effect, url_effect}`. The default is `CallEffects::none()` for a
+    /// tool whose capabilities are read-only and `CallEffects::unknown()`
+    /// otherwise; a tool that can name what a call does overrides it.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        if self.capabilities().read_only {
+            aidaemon_core::CallEffects::none()
+        } else {
+            aidaemon_core::CallEffects::unknown()
+        }
+    }
+
     /// `call_annotations` judged against the turn's trusted roots, for
     /// effects whose class depends on where they land (a delete inside the
     /// owner's roots is not egress). The default ignores the roots.

@@ -4402,3 +4402,38 @@ async fn get_console_logs_unknown_tab_is_rejected() {
 
     assert!(out.contains("Unknown tab"), "{out}");
 }
+
+#[test]
+fn browser_effects_declare_navigation_hosts() {
+    use aidaemon_core::{CallEffects, EffectKey};
+    let effects = |args: serde_json::Value| super::browser_call_effects(&args.to_string());
+    for action in ["navigate", "new_tab"] {
+        let declared =
+            effects(json!({"action": action, "url": "https://shop.example.invalid/cart"}));
+        assert!(declared.complete, "{action}");
+        assert_eq!(
+            declared.keys,
+            vec![EffectKey::egress("https", "shop.example.invalid", None)],
+            "{action}"
+        );
+    }
+    // The current page is not known to the kernel: acting on it is undeclared.
+    for action in ["click", "fill", "execute_js"] {
+        assert_eq!(
+            effects(json!({"action": action, "selector": "#buy"})),
+            CallEffects::unknown(),
+            "{action}"
+        );
+    }
+    for read in ["screenshot", "get_text", "list_tabs"] {
+        assert_eq!(
+            effects(json!({"action": read})),
+            CallEffects::none(),
+            "{read}"
+        );
+    }
+    assert_eq!(
+        effects(json!({"action": "navigate", "url": "not a url"})),
+        CallEffects::unknown()
+    );
+}

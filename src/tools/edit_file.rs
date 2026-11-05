@@ -84,6 +84,12 @@ impl Tool for EditFileTool {
             .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
+    /// A write of the target path (absolute; a relative path resolves where
+    /// the execution backend puts it, which is not known here).
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        super::command_effects::file_tool_write_effects(arguments)
+    }
+
     fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
         let semantics = self.call_semantics(arguments);
         let mut annotations =
@@ -494,5 +500,27 @@ mod tests {
             "edit_file is documented as a dedicated file tool that does not require approval"
         );
         assert!(!caps.high_impact_write);
+    }
+
+    #[test]
+    fn declares_write_of_the_absolute_path() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/notes/../acme.md");
+        for key in ["path", "file_path"] {
+            let effects = EditFileTool.call_effects(&json!({key: path}).to_string());
+            assert!(effects.complete, "{key}");
+            assert_eq!(
+                effects.keys,
+                vec![crate::tools::command_effects::path_effect(
+                    aidaemon_core::EffectClass::Write,
+                    &format!("{dir}/acme.md"),
+                    None
+                )
+                .unwrap()]
+            );
+        }
+        // A relative path has no known working directory here.
+        let relative = EditFileTool.call_effects(&json!({"path": "acme.md"}).to_string());
+        assert_eq!(relative, aidaemon_core::CallEffects::unknown());
     }
 }

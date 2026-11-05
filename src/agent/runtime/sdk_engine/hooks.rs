@@ -198,6 +198,33 @@ impl sdk::Tool for BridgedTool {
         )
     }
 
+    /// The daemon tool's own declaration for the arguments it will be
+    /// dispatched with (after its argument canonicalization).
+    fn effects(&self, arguments: &Value) -> sdk::CallEffects {
+        let raw = arguments.to_string();
+        let canonical = self.tool.canonicalize_arguments(&raw).unwrap_or(raw);
+        self.tool.call_effects(&canonical)
+    }
+
+    /// The declared effects as the kernel's access manifest: egress
+    /// targets as hosts, path effects as writes.
+    fn access(&self, arguments: &Value) -> sdk::AccessManifest {
+        let mut manifest = sdk::AccessManifest::default();
+        for key in self.effects(arguments).keys {
+            let list = match key.class {
+                sdk::EffectClass::Egress => &mut manifest.hosts,
+                sdk::EffectClass::Write
+                | sdk::EffectClass::Delete
+                | sdk::EffectClass::Configuration => &mut manifest.writes,
+                _ => continue,
+            };
+            if !list.contains(&key.target) {
+                list.push(key.target);
+            }
+        }
+        manifest
+    }
+
     /// Fallback only: the dispatcher stamps each result with the exact
     /// call's trust (`Tool::output_trust`).
     fn source_trust(&self, _arguments: &Value) -> sdk::SourceTrust {
