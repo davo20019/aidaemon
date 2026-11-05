@@ -43,6 +43,12 @@ aidaemon-channel-discord = { path = "../aidaemon-channel-discord", optional = tr
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tempfile = "3"
+
+[[test]]
+name = "web_fetch_egress"
+required-features = ["tools", "policies", "testing"]
 
 [[example]]
 name = "coding_agent"

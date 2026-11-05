@@ -306,11 +306,15 @@ pub trait Tool: Send + Sync {
     }
 
     /// The typed effects of this call (effect class and normalized target).
-    /// The default is [`CallEffects::none`] for a call that is read-only
-    /// (per [`Tool::annotations_for`]) and [`CallEffects::unknown`]
-    /// otherwise. Recomputed after a hook rewrites the arguments.
+    /// The default is [`CallEffects::none`] for a call that is read-only and
+    /// not egress (per [`Tool::annotations_for`]) and [`CallEffects::unknown`]
+    /// otherwise: a read from another host still sends the request off the
+    /// machine, so a tool annotated `egress` should declare its
+    /// [`EffectKey::egress`](crate::EffectKey::egress) target. Recomputed
+    /// after a hook rewrites the arguments.
     fn effects(&self, arguments: &Value) -> CallEffects {
-        if self.annotations_for(arguments).read_only {
+        let annotations = self.annotations_for(arguments);
+        if annotations.read_only && !annotations.egress {
             CallEffects::none()
         } else {
             CallEffects::unknown()
@@ -429,6 +433,29 @@ mod tests {
         let err = check_required(&schema, &json!({"path": "a"})).unwrap_err();
         assert!(err.contains("text"), "{err}");
         assert!(check_required(&schema, &json!("not an object")).is_err());
+    }
+
+    #[test]
+    fn default_effects_of_a_read_only_egress_call_are_unknown() {
+        let tool = |annotations| {
+            FnTool::new(
+                ToolSpec {
+                    name: "probe".into(),
+                    description: "synthetic".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                annotations,
+                |_args: Value| async move { Ok(ToolOutput::text("ok")) },
+            )
+        };
+        let local_read = tool(ToolAnnotations::READ_ONLY);
+        assert_eq!(local_read.effects(&json!({})), CallEffects::none());
+        // Reading from another host still sends the request off the machine.
+        let remote_read = tool(ToolAnnotations {
+            egress: true,
+            ..ToolAnnotations::READ_ONLY
+        });
+        assert_eq!(remote_read.effects(&json!({})), CallEffects::unknown());
     }
 
     #[test]

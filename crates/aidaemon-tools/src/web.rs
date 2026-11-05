@@ -9,7 +9,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use aidaemon_core::{
-    AccessManifest, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
+    AccessManifest, CallEffects, EffectKey, Tool, ToolAnnotations, ToolContext, ToolOutput,
+    ToolResult, ToolSpec,
 };
 
 use crate::util::{fail, parse_args, truncate_chars};
@@ -121,8 +122,32 @@ impl Tool for WebFetch {
         }
     }
 
+    /// A read, but the request (its URL, query included) leaves the
+    /// machine, so outbound policies such as an egress secret scan see it.
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations::READ_ONLY
+        ToolAnnotations {
+            egress: true,
+            ..ToolAnnotations::READ_ONLY
+        }
+    }
+
+    /// The one host contacted (redirects stay on it). An unparsable URL is
+    /// refused by `validate` before any policy runs; its effects are unknown.
+    fn effects(&self, arguments: &Value) -> CallEffects {
+        let Some(url) = arguments
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|u| parse_url(u).ok())
+        else {
+            return CallEffects::unknown();
+        };
+        let host = url.host_str().unwrap_or_default();
+        // `Url` brackets an IPv6 host; the effect target does not.
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        CallEffects {
+            keys: vec![EffectKey::egress(url.scheme(), host, url.port())],
+            complete: true,
+        }
     }
 
     fn validate(&self, arguments: &Value) -> Result<(), String> {
@@ -297,6 +322,25 @@ mod tests {
     use super::*;
     use crate::testutil::ctx;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn web_fetch_declares_its_egress_host() {
+        let tool = WebFetch::new();
+        assert!(tool.annotations().egress);
+        assert!(tool.annotations().read_only);
+        let effects = tool.effects(&json!({"url": "https://Docs.Example.Invalid/guide?q=1"}));
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![EffectKey::egress("https", "docs.example.invalid", None)]
+        );
+        let local = tool.effects(&json!({"url": "http://[::1]:8765/status"}));
+        assert_eq!(
+            local.keys,
+            vec![EffectKey::egress("http", "::1", Some(8765))]
+        );
+        assert!(!tool.effects(&json!({"url": "not a url"})).complete);
+    }
 
     /// Serve canned responses on a local port: path -> (status line, content type, body).
     async fn serve(routes: Vec<(&'static str, &'static str, &'static str, String)>) -> String {

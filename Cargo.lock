@@ -345,6 +345,8 @@ dependencies = [
  "aidaemon-providers",
  "aidaemon-store-sqlite",
  "aidaemon-tools",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

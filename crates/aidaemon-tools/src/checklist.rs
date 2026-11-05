@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use aidaemon_core::{
-    Hook, HookContext, StopDecision, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult,
-    ToolSpec,
+    CallEffects, Hook, HookContext, StopDecision, Tool, ToolAnnotations, ToolContext, ToolOutput,
+    ToolResult, ToolSpec,
 };
 
 use crate::util::{fail, parse_args};
@@ -154,6 +154,11 @@ impl Tool for Checklist {
         }
     }
 
+    /// Only the agent's own list changes; nothing outside the agent.
+    fn effects(&self, _arguments: &Value) -> CallEffects {
+        CallEffects::none()
+    }
+
     async fn call(&self, arguments: Value, _ctx: &ToolContext) -> ToolResult {
         let args: ChecklistArgs = match parse_args("track_requirements", arguments) {
             Ok(a) => a,
@@ -241,6 +246,16 @@ mod tests {
     use super::*;
     use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
     use aidaemon_core::{Agent, Role};
+
+    #[test]
+    fn checklist_has_no_effects_outside_the_agent() {
+        // Complete and empty, so a decline in the run never puts the
+        // checklist to the owner.
+        assert_eq!(
+            Checklist::default().effects(&json!({"items": []})),
+            aidaemon_core::CallEffects::none()
+        );
+    }
 
     #[tokio::test]
     async fn tool_replaces_list_and_validates() {
