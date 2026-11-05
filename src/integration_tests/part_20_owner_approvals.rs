@@ -419,6 +419,37 @@ async fn egress_guard_allows_local_port_url() {
     assert!(!results[0].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
 }
 
+/// Review Focus 5 for curl, end to end: a POST to a local `IP:port` is
+/// not mistaken for a secret, and the same POST carrying one is refused
+/// before any card.
+#[tokio::test]
+async fn egress_guard_curl_local_port_passes_and_secret_body_is_blocked() {
+    let (port, sent) = spawn_approvals_server().await;
+    let (harness, approver) = approvals_harness(
+        vec![
+            curl_call(&format!(
+                r#"curl -s -X POST http://127.0.0.1:{port}/x -d '{{"t":"ok"}}'"#
+            )),
+            curl_call(&format!(
+                r#"curl -s -X POST http://127.0.0.1:{port}/x -d '{{"k":"AKIAIOSFODNN7EXAMPLE"}}'"#
+            )),
+            MockProvider::text_response("Posted once; the second was refused."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::AllowOnce)],
+        None,
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "only the clean POST is asked about");
+    assert_eq!(requests_sent(&sent), 1, "only the clean POST is sent");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(!results[0].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
+    assert!(results[1].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
+    assert!(!results[1].contains("AKIAIOSFODNN7EXAMPLE"), "{results:?}");
+}
+
 #[tokio::test]
 async fn http_request_outside_kernel_requires_kernel_approval() {
     use crate::traits::Tool as _;
