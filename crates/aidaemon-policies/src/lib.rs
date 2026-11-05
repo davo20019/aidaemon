@@ -27,6 +27,7 @@
 mod approval;
 mod completion;
 mod context_window;
+mod conversation;
 mod instructions;
 mod memory;
 mod redact;
@@ -38,6 +39,10 @@ mod untrusted;
 pub use approval::{ApprovalMode, ApprovalPolicy};
 pub use completion::{ReceiptCompletionCheck, Requirement};
 pub use context_window::{estimate_tokens, ContextWindow};
+pub use conversation::{
+    ConversationCompaction, ConversationSummary, InMemorySummaries, ProviderSummarizer, Summarizer,
+    SummaryStore,
+};
 pub use instructions::{InstructionSource, ProjectInstructions};
 pub use memory::{InMemoryRecall, MemoryInjection, Recall};
 pub use redact::Redactor;
