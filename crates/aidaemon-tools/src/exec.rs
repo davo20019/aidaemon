@@ -1,6 +1,6 @@
-//! Execution backends for the `shell` tool.
+//! Sandboxes for the `shell` tool.
 //!
-//! A backend decides *where and how contained* a command runs. It never
+//! A sandbox decides *where and how contained* a command runs. It never
 //! decides *whether* it may run: approval is a policy concern and belongs in
 //! an [`aidaemon_core::Hook`].
 
@@ -20,7 +20,7 @@ use crate::util::HeadTail;
 
 /// One command to run.
 #[derive(Debug, Clone)]
-pub struct CommandSpec {
+pub struct SandboxCommand {
     /// Shell command line, run with `sh -c`.
     pub command: String,
     /// Working directory (absolute, inside `workspace_root`).
@@ -39,7 +39,7 @@ pub struct CommandSpec {
     pub cancel: CancellationToken,
 }
 
-impl CommandSpec {
+impl SandboxCommand {
     /// A spec with defaults: 60 s timeout, 20 000 output bytes, no network.
     pub fn new(command: impl Into<String>, workspace_root: impl Into<PathBuf>) -> Self {
         let root = workspace_root.into();
@@ -84,21 +84,21 @@ pub type Result<T> = std::result::Result<T, ExecError>;
 
 /// Where commands run.
 #[async_trait]
-pub trait ExecutionBackend: Send + Sync {
+pub trait Sandbox: Send + Sync {
     /// Short name recorded in receipts, for example `local` or `bubblewrap`.
     fn name(&self) -> &'static str;
     /// Whether this backend can run commands here.
     fn is_available(&self) -> bool;
     /// Whether the backend confines writes to the workspace.
     fn is_contained(&self) -> bool;
-    async fn run(&self, cmd: &CommandSpec) -> Result<CommandOutput>;
+    async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput>;
 }
 
 /// Spawn `command`, collect combined output with a bound, enforce the
 /// timeout and cancellation, and kill the process group on expiry.
 async fn run_process(
     mut command: Command,
-    spec: &CommandSpec,
+    spec: &SandboxCommand,
     clear_env: bool,
 ) -> Result<CommandOutput> {
     if clear_env {
@@ -204,10 +204,10 @@ fn probe(program: &str, args: &[&str]) -> bool {
 /// can `cd` anywhere. Use it only with trusted models or behind an approval
 /// hook.
 #[derive(Debug, Clone, Default)]
-pub struct LocalBackend;
+pub struct LocalSandbox;
 
 #[async_trait]
-impl ExecutionBackend for LocalBackend {
+impl Sandbox for LocalSandbox {
     fn name(&self) -> &'static str {
         "local"
     }
@@ -220,7 +220,7 @@ impl ExecutionBackend for LocalBackend {
         false
     }
 
-    async fn run(&self, cmd: &CommandSpec) -> Result<CommandOutput> {
+    async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         let mut command = Command::new("sh");
         command.arg("-c").arg(&cmd.command).current_dir(&cmd.cwd);
         run_process(command, cmd, true).await
@@ -234,11 +234,11 @@ impl ExecutionBackend for LocalBackend {
 /// allowed) network namespaces are unshared, and the sandbox dies with its
 /// parent.
 #[derive(Debug, Clone)]
-pub struct BubblewrapBackend {
+pub struct BubblewrapSandbox {
     program: String,
 }
 
-impl Default for BubblewrapBackend {
+impl Default for BubblewrapSandbox {
     fn default() -> Self {
         Self {
             program: "bwrap".into(),
@@ -246,13 +246,13 @@ impl Default for BubblewrapBackend {
     }
 }
 
-impl BubblewrapBackend {
+impl BubblewrapSandbox {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The `bwrap` argument list for a spec (before `sh -c <command>`).
-    pub fn args(&self, cmd: &CommandSpec) -> Vec<String> {
+    pub fn args(&self, cmd: &SandboxCommand) -> Vec<String> {
         let ws = cmd.workspace_root.display().to_string();
         let mut args: Vec<String> = [
             "--ro-bind",
@@ -289,7 +289,7 @@ impl BubblewrapBackend {
 }
 
 #[async_trait]
-impl ExecutionBackend for BubblewrapBackend {
+impl Sandbox for BubblewrapSandbox {
     fn name(&self) -> &'static str {
         "bubblewrap"
     }
@@ -318,7 +318,7 @@ impl ExecutionBackend for BubblewrapBackend {
         true
     }
 
-    async fn run(&self, cmd: &CommandSpec) -> Result<CommandOutput> {
+    async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         if !self.is_available() {
             return Err(ExecError::Unavailable("bubblewrap"));
         }
@@ -334,20 +334,20 @@ impl ExecutionBackend for BubblewrapBackend {
 /// is readable, writes are allowed only under the workspace (plus the
 /// `/dev` null/tty nodes), and the network is denied unless allowed.
 #[derive(Debug, Clone, Default)]
-pub struct SeatbeltBackend;
+pub struct SeatbeltSandbox;
 
 fn sbpl_string(path: &Path) -> String {
     let raw = path.display().to_string();
     format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-impl SeatbeltBackend {
+impl SeatbeltSandbox {
     pub fn new() -> Self {
         Self
     }
 
     /// The generated sandbox profile (SBPL) for a spec.
-    pub fn profile(&self, cmd: &CommandSpec) -> String {
+    pub fn profile(&self, cmd: &SandboxCommand) -> String {
         let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
         profile.push_str(&format!(
             "(allow file-write* (subpath {}) (literal \"/dev/null\") (literal \"/dev/tty\") \
@@ -360,7 +360,7 @@ impl SeatbeltBackend {
         profile
     }
 
-    pub fn args(&self, cmd: &CommandSpec) -> Vec<String> {
+    pub fn args(&self, cmd: &SandboxCommand) -> Vec<String> {
         vec![
             "-p".into(),
             self.profile(cmd),
@@ -372,7 +372,7 @@ impl SeatbeltBackend {
 }
 
 #[async_trait]
-impl ExecutionBackend for SeatbeltBackend {
+impl Sandbox for SeatbeltSandbox {
     fn name(&self) -> &'static str {
         "seatbelt"
     }
@@ -385,7 +385,7 @@ impl ExecutionBackend for SeatbeltBackend {
         true
     }
 
-    async fn run(&self, cmd: &CommandSpec) -> Result<CommandOutput> {
+    async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         if !self.is_available() {
             return Err(ExecError::Unavailable("seatbelt"));
         }
@@ -406,14 +406,14 @@ impl ExecutionBackend for SeatbeltBackend {
 /// config paths and so on); the command inside sees only the spec's env,
 /// minus `PATH` and `HOME`, which come from the image.
 #[derive(Debug, Clone)]
-pub struct DockerBackend {
+pub struct DockerSandbox {
     image: String,
     program: String,
 }
 
 static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-impl DockerBackend {
+impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
         Self {
             image: image.into(),
@@ -426,7 +426,7 @@ impl DockerBackend {
     }
 
     /// The `docker` argument list for a spec and container name.
-    pub fn args(&self, cmd: &CommandSpec, name: &str) -> Vec<String> {
+    pub fn args(&self, cmd: &SandboxCommand, name: &str) -> Vec<String> {
         let rel = cmd
             .cwd
             .strip_prefix(&cmd.workspace_root)
@@ -470,7 +470,7 @@ impl DockerBackend {
 }
 
 #[async_trait]
-impl ExecutionBackend for DockerBackend {
+impl Sandbox for DockerSandbox {
     fn name(&self) -> &'static str {
         "docker"
     }
@@ -484,7 +484,7 @@ impl ExecutionBackend for DockerBackend {
         true
     }
 
-    async fn run(&self, cmd: &CommandSpec) -> Result<CommandOutput> {
+    async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         if !self.is_available() {
             return Err(ExecError::Unavailable("docker"));
         }
@@ -513,26 +513,26 @@ impl ExecutionBackend for DockerBackend {
 }
 
 /// The most contained backend available here: bubblewrap on Linux,
-/// seatbelt on macOS, otherwise [`LocalBackend`] (uncontained). Docker is
+/// seatbelt on macOS, otherwise [`LocalSandbox`] (uncontained). Docker is
 /// never picked automatically because it needs an image choice.
-pub fn best_available_backend() -> Arc<dyn ExecutionBackend> {
-    let bwrap = BubblewrapBackend::new();
+pub fn best_available_sandbox() -> Arc<dyn Sandbox> {
+    let bwrap = BubblewrapSandbox::new();
     if bwrap.is_available() {
         return Arc::new(bwrap);
     }
-    let seatbelt = SeatbeltBackend::new();
+    let seatbelt = SeatbeltSandbox::new();
     if seatbelt.is_available() {
         return Arc::new(seatbelt);
     }
-    Arc::new(LocalBackend)
+    Arc::new(LocalSandbox)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spec(root: &Path) -> CommandSpec {
-        let mut s = CommandSpec::new("echo hi", root);
+    fn spec(root: &Path) -> SandboxCommand {
+        let mut s = SandboxCommand::new("echo hi", root);
         s.cwd = root.join("sub");
         s.env = vec![
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn bubblewrap_args_confine_and_drop_network() {
         let s = spec(Path::new("/tmp/ws"));
-        let args = BubblewrapBackend::new().args(&s);
+        let args = BubblewrapSandbox::new().args(&s);
         let joined = args.join(" ");
         assert!(joined.starts_with(
             "--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind /tmp/ws /tmp/ws"
@@ -554,7 +554,7 @@ mod tests {
         assert!(joined.ends_with("--chdir /tmp/ws/sub -- sh -c echo hi"));
         let mut open = s.clone();
         open.allow_network = true;
-        assert!(!BubblewrapBackend::new()
+        assert!(!BubblewrapSandbox::new()
             .args(&open)
             .contains(&"--unshare-net".to_string()));
     }
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn seatbelt_profile_limits_writes_and_network() {
         let s = spec(Path::new("/Users/alice/ws \"q\""));
-        let profile = SeatbeltBackend::new().profile(&s);
+        let profile = SeatbeltSandbox::new().profile(&s);
         assert!(profile.contains("(deny file-write*)"));
         assert!(
             profile.contains("(subpath \"/Users/alice/ws \\\"q\\\"\")"),
@@ -571,13 +571,13 @@ mod tests {
         assert!(profile.contains("(deny network*)"));
         let mut open = s.clone();
         open.allow_network = true;
-        assert!(!SeatbeltBackend::new().profile(&open).contains("network"));
+        assert!(!SeatbeltSandbox::new().profile(&open).contains("network"));
     }
 
     #[test]
     fn docker_args_mount_workspace_without_network() {
         let s = spec(Path::new("/srv/ws"));
-        let args = DockerBackend::new("alpine:3").args(&s, "c1");
+        let args = DockerSandbox::new("alpine:3").args(&s, "c1");
         let joined = args.join(" ");
         assert!(joined.contains("--network none"));
         assert!(joined.contains("-v /srv/ws:/workspace -w /workspace/sub"));
@@ -588,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn bubblewrap_blocks_writes_outside_workspace() {
-        let backend = BubblewrapBackend::new();
+        let backend = BubblewrapSandbox::new();
         if !backend.is_available() {
             println!("skipping: bubblewrap is not available");
             return;
@@ -598,7 +598,7 @@ mod tests {
         let outside = tempfile::tempdir_in(std::env::var("HOME").unwrap_or("/".into()))
             .or_else(|_| tempfile::tempdir())
             .unwrap();
-        let mut s = CommandSpec::new(
+        let mut s = SandboxCommand::new(
             format!(
                 "echo ok > inside.txt; echo bad > {}/x.txt; echo done",
                 outside.path().display()
@@ -613,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn seatbelt_blocks_writes_outside_workspace() {
-        let backend = SeatbeltBackend::new();
+        let backend = SeatbeltSandbox::new();
         if !backend.is_available() {
             println!("skipping: sandbox-exec is not available");
             return;
@@ -621,7 +621,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(ws.path()).unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut s = CommandSpec::new(
+        let mut s = SandboxCommand::new(
             format!(
                 "echo ok > inside.txt; echo bad > {}/x.txt",
                 outside.path().display()

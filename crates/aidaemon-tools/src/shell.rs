@@ -1,4 +1,4 @@
-//! `shell`: run a command through an [`ExecutionBackend`].
+//! `shell`: run a command through an [`Sandbox`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use aidaemon_core::{
     AccessManifest, Tool, ToolAnnotations, ToolContext, ToolOutput, ToolResult, ToolSpec,
 };
 
-use crate::exec::{best_available_backend, CommandSpec, ExecutionBackend};
+use crate::exec::{best_available_sandbox, Sandbox, SandboxCommand};
 use crate::util::{fail, parse_args};
 use crate::workspace::Workspace;
 
@@ -31,7 +31,7 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
 #[derive(Clone)]
 pub struct Shell {
     workspace: Workspace,
-    backend: Arc<dyn ExecutionBackend>,
+    backend: Arc<dyn Sandbox>,
     env_allowlist: Vec<String>,
     extra_env: Vec<(String, String)>,
     default_timeout: Duration,
@@ -51,7 +51,7 @@ impl std::fmt::Debug for Shell {
 }
 
 impl Shell {
-    pub fn new(workspace: Workspace, backend: Arc<dyn ExecutionBackend>) -> Self {
+    pub fn new(workspace: Workspace, backend: Arc<dyn Sandbox>) -> Self {
         Self {
             workspace,
             backend,
@@ -67,9 +67,9 @@ impl Shell {
         }
     }
 
-    /// Shell with [`best_available_backend`].
+    /// Shell with [`best_available_sandbox`].
     pub fn sandboxed(workspace: Workspace) -> Self {
-        Self::new(workspace, best_available_backend())
+        Self::new(workspace, best_available_sandbox())
     }
 
     /// Replace the list of host environment variables passed through.
@@ -95,14 +95,14 @@ impl Shell {
         self
     }
 
-    /// Let sandboxed commands use the network (ignored by `LocalBackend`,
+    /// Let sandboxed commands use the network (ignored by `LocalSandbox`,
     /// which never restricts it).
     pub fn allow_network(mut self, allow: bool) -> Self {
         self.allow_network = allow;
         self
     }
 
-    pub fn backend(&self) -> &Arc<dyn ExecutionBackend> {
+    pub fn backend(&self) -> &Arc<dyn Sandbox> {
         &self.backend
     }
 
@@ -223,7 +223,7 @@ impl Tool for Shell {
             .unwrap_or(self.default_timeout)
             .clamp(Duration::from_secs(1), self.max_timeout);
 
-        let spec = CommandSpec {
+        let spec = SandboxCommand {
             command: args.command,
             cwd: cwd.clone(),
             workspace_root: self.workspace.root().to_path_buf(),
@@ -281,11 +281,11 @@ impl Tool for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::LocalBackend;
+    use crate::exec::LocalSandbox;
     use crate::testutil::{ctx, ws};
 
     fn shell(ws: &Workspace) -> Shell {
-        Shell::new(ws.clone(), Arc::new(LocalBackend))
+        Shell::new(ws.clone(), Arc::new(LocalSandbox))
     }
 
     #[tokio::test]

@@ -280,7 +280,7 @@ any crate, including third-party ones:
 | A tool | `aidaemon_core::Tool` |
 | A policy or guardrail | `aidaemon_core::Hook` |
 | A memory backend | `aidaemon_memory::{MemoryStore, Embedder, Scorer}` or `aidaemon_policies::Recall` |
-| A sandbox | `aidaemon_tools::ExecutionBackend` |
+| A sandbox | `aidaemon_tools::Sandbox` |
 | Run storage | `aidaemon_core::RunStore` |
 | Telemetry | `aidaemon_core::EventSink` |
 

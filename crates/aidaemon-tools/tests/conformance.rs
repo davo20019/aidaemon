@@ -16,7 +16,7 @@ fn bundled_tools_pass_the_tool_kit() {
     tools.push(Arc::new(Checklist::default()));
     tools.push(Arc::new(Shell::new(
         workspace,
-        Arc::new(aidaemon_tools::LocalBackend),
+        Arc::new(aidaemon_tools::LocalSandbox),
     )));
 
     let mut all = ConformanceReport::new("aidaemon-tools");

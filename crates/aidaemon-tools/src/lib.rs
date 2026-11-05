@@ -17,7 +17,7 @@
 //! | [`Checklist`] | `track_requirements` | write (agent state only) |
 //!
 //! Every file tool is confined to a [`Workspace`]. The shell runs through an
-//! [`ExecutionBackend`]; containment (sandboxing) lives there, while approval
+//! [`Sandbox`]; containment (sandboxing) lives there, while approval
 //! stays a policy concern for [`aidaemon_core::Hook`]s. No tool contains
 //! approval logic.
 //!
@@ -58,8 +58,8 @@ mod testutil;
 
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
-    best_available_backend, BubblewrapBackend, CommandOutput, CommandSpec, DockerBackend,
-    ExecError, ExecutionBackend, LocalBackend, SeatbeltBackend,
+    best_available_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError,
+    LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox,
 };
 pub use fs::{EditFile, ReadFile, WriteFile, DEFAULT_READ_LIMIT};
 pub use search::{Glob, Grep};
@@ -68,7 +68,7 @@ pub use web::WebFetch;
 pub use workspace::{PathError, Workspace};
 
 /// The standard set: `read_file`, `write_file`, `edit_file`, `glob`, `grep`,
-/// `shell` (with [`best_available_backend`]) and `web_fetch`.
+/// `shell` (with [`best_available_sandbox`]) and `web_fetch`.
 ///
 /// `track_requirements` is not included because it is only useful together
 /// with its stop hook; add both with [`Checklist::with_gate`].

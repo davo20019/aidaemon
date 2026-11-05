@@ -18,7 +18,7 @@ store, ...) use exactly the same traits, so they double as templates.
 | An embedding model | `Embedder` | `aidaemon-memory` | `HashEmbedder`, `FastEmbedder` |
 | Memory ranking | `Scorer` | `aidaemon-memory` | `HybridScorer` |
 | A whole memory system | `Recall` | `aidaemon-policies` | `aidaemon_memory::MemoryRecall` |
-| A sandbox | `ExecutionBackend` | `aidaemon-tools` | `BubblewrapBackend` |
+| A sandbox | `Sandbox` | `aidaemon-tools` | `BubblewrapSandbox` |
 | Run storage | `RunStore` | `aidaemon-core` | `aidaemon-store-sqlite` |
 | Telemetry | `EventSink` | `aidaemon-core` | `aidaemon_policies::TracingSink` |
 

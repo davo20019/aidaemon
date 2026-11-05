@@ -31,7 +31,7 @@ pub enum PathError {
 ///
 /// The check happens when a tool resolves its argument; a concurrent process
 /// that swaps a directory for a symlink between the check and the I/O is not
-/// defended against. Use an [`crate::ExecutionBackend`] sandbox when the
+/// defended against. Use a [`crate::Sandbox`] when the
 /// workspace itself is shared with untrusted processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
