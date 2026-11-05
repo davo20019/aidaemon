@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Only a tool's typed finish ends a run.** A phrase like "Moved to background" in a tool's output no longer ends the run; a tool that hands work off says so with its typed finish.
+- **A tool must now explicitly signal that it has finished.** A phrase like "Moved to background" in its output no longer ends a run.
 
 - **A request that fails on the provider is queued again.** Since every turn moved to the SDK kernel, a turn that failed on the model provider before any tool ran was no longer queued for an automatic re-run. It is again, for a person's own request (not goal runs, sub-agents or automated triggers). After a plan's usage limit, the re-run waits until just after the stated reset, as long as that is within 12 hours, and the reply says when.
 
@@ -33,7 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Tools from MCP servers work again**, and every safety check (authority, scope, untrusted content, approvals, secret egress) applies to them.
 - **SDK turns keep the legacy tool boundary.** Behavior the old dispatcher owned is back on every turn:
   - Untrusted tool output (web, MCP, terminal, channel history) is wrapped as data and sanitized again before the model sees it, and an oversized result is paged, spilled to a file, or compressed to the per-model cap.
   - A call without a directory runs in the request's project directory (a scheduled goal's bound workspace), not the daemon's cwd.
@@ -61,8 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Tools no longer receive call facts in their arguments.** MCP servers no longer see the session id, role, channel visibility, project scope, task, turn or tool-call ids in tool arguments; built-in tools get these as typed facts outside the arguments.
-- **An MCP server's annotation hints never loosen a safety check.** A tool whose server marks it read-only or closed-world is still treated as mutating, destructive and sending data out: read-only sessions refuse it and, after untrusted content, it is checked like any other outbound call.
+- **MCP servers no longer receive session, role or channel details in tool arguments.**
+- **An MCP server's own hints (read-only, closed-world) no longer relax any safety check.**
 
 ## [0.12.9] - 2026-10-22
 

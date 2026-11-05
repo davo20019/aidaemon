@@ -253,10 +253,16 @@ Order:
         their output text;
       - `stop.rs` closeout lookups that see daemon tools only;
       - a background handoff that bypasses a typed `FailedPermanent`;
-      - name checks left in `tool_exec.rs` (checkpoints for
-        `write_file`/`edit_file`, `cli_agent`'s watchdog bypass) and the
-        `manage_memories`/`manage_people` status summary in
-        `tool_calls.rs`;
+      - name checks left in `tool_exec.rs`: checkpoints for
+        `write_file`/`edit_file`, `cli_agent`'s watchdog bypass, the
+        terminal's trust roots, `spawn_agent`'s turn authority, the
+        goal-context tool list (`spawn_agent`, `cli_agent`, `terminal`,
+        `manage_mandates`, `manage_goal_tasks`) and `computer_use`'s live
+        model; and the `manage_memories`/`manage_people` status summary
+        in `tool_calls.rs`;
+      - `semantics_for_exact_tool_call` resolves an MCP tool with a fresh
+        `registry.find_tool`, which can disagree with the instance judged
+        at turn start after a server reload;
       - the goals/mandates store slice and the concrete `EventStore`
         (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`.
