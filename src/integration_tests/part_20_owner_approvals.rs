@@ -347,6 +347,32 @@ async fn egress_guard_blocks_secret_in_http_body_and_curl() {
         ["egress_secret_blocked", "egress_secret_blocked"],
         "{decisions:?}"
     );
+    // The refused calls' rows in the ledger never hold the secret.
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_type, data FROM events WHERE session_id = ? ORDER BY id",
+    )
+    .bind(APPROVALS_SESSION)
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    // The model's own reply (`assistant_response`) holds what it wrote; the
+    // refused calls' rows (`tool_call`, and anything else the dispatcher
+    // records) hold redacted arguments.
+    let leaked: Vec<&String> = rows
+        .iter()
+        .filter(|(event_type, data)| {
+            event_type != "assistant_response" && data.contains(SYNTHETIC_AWS_KEY)
+        })
+        .map(|(event_type, _)| event_type)
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
+    let refused_calls = rows
+        .iter()
+        .filter(|(event_type, data)| {
+            event_type == "tool_call" && data.contains("[REDACTED:aws_access_key]")
+        })
+        .count();
+    assert_eq!(refused_calls, 2, "both refused calls are recorded, redacted");
 }
 
 #[tokio::test]
@@ -410,4 +436,33 @@ async fn scheduled_trusted_session_post_has_no_card() {
 
     assert_eq!(approver.card_count(), 0);
     assert_eq!(requests_sent(&sent), 1);
+}
+
+/// The kernel's approval policy hard-denies a catastrophic terminal command
+/// it reads from the bridged access manifest, before any card and in every
+/// session, a trusted one included.
+#[tokio::test]
+async fn catastrophic_terminal_command_is_denied_by_the_kernel() {
+    let dir = std::env::temp_dir()
+        .join("aidaemon-test")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sentinel.txt"), "synthetic").unwrap();
+    let command = format!("rm -rf --no-preserve-root {}", dir.display());
+    let (harness, approver) = approvals_harness(
+        vec![curl_call(&command), MockProvider::text_response("Refused.")],
+        vec![],
+        None,
+    )
+    .await;
+    let mut channel_ctx = ChannelContext::private("telegram");
+    channel_ctx.trusted = true;
+    run_owner_turn(&harness, channel_ctx).await;
+
+    assert_eq!(approver.card_count(), 0);
+    assert!(dir.join("sentinel.txt").exists(), "nothing was deleted");
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("blocked by policy"), "{results:?}");
+    assert!(results[0].contains("--no-preserve-root"), "{results:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

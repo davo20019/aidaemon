@@ -1716,12 +1716,23 @@ fn default_semantics_from_identity(
     semantics
 }
 
+/// The scope of an approval the agent kernel gave a call (see
+/// [`ToolExecutionContext::kernel_approved`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalScope {
+    /// This call came through the kernel, which judged it.
+    Call,
+    /// One exact inner request (`METHOD url`) of an outer call the kernel
+    /// approved, for example `manage_api`'s live probe.
+    Request { method: String, url: String },
+}
+
 /// Dispatcher-owned execution context passed to tools via the trait method.
 ///
 /// This is a Rust-side control-plane type — it is NEVER serialized, never appears
 /// in model-visible JSON, tool schemas, logs, or persisted tool arguments.
 /// Do NOT add fields here that duplicate information already in the enriched args.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     /// True only after the final common dispatcher revalidated an exact,
     /// action-bound `MandateAuthorityGrant` for this mutating call, so tools
@@ -1735,11 +1746,13 @@ pub struct ToolExecutionContext {
     /// Hard negative task contract propagated from the validated request.
     /// Open-ended adapters must prove an operation is observational before I/O.
     pub mutation_forbidden: bool,
-    /// True only when the call came through the agent kernel, whose
-    /// `ApprovalPolicy` already asked the owner where the daemon's rules
-    /// require it. A tool that needs the owner's approval refuses a call
-    /// without it rather than asking itself.
-    pub owner_approval_by_kernel: bool,
+    /// What the agent kernel approved, set only by the dispatcher (never
+    /// from arguments): `Call` for a call that came through the kernel,
+    /// whose `ApprovalPolicy` already asked the owner where the daemon's
+    /// rules require it; `Request` for one exact inner request an approved
+    /// outer call makes. A tool that needs the owner's approval refuses a
+    /// call without a matching scope rather than asking itself.
+    pub kernel_approved: Option<ApprovalScope>,
 }
 
 /// Filesystem targets a tool call declared that fall outside the compiled

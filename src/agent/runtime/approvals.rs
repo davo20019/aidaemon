@@ -52,6 +52,17 @@ pub(crate) struct AppApprovalRules {
     /// A mandate run: the dispatcher admits only calls its exact action
     /// grant covers, so the owner already approved them.
     pub mandate_preapproved: bool,
+    /// The turn's session. With the two facts below, the terminal's
+    /// approval ladder needs it (Task 5); http_request does not.
+    #[allow(dead_code)]
+    pub session_id: String,
+    /// The role of the turn's user (`None` when unknown).
+    #[allow(dead_code)]
+    pub user_role: Option<crate::types::UserRole>,
+    /// The session was started by an automated trigger (an email, an
+    /// event), not by the owner: its terminal calls always ask.
+    #[allow(dead_code)]
+    pub untrusted_trigger_session: bool,
 }
 
 #[async_trait]
@@ -72,6 +83,17 @@ impl ApprovalRules for AppApprovalRules {
                     None => RuleDecision::Allow,
                 }
             }
+            // The live probe's inner request is approved here, at the outer
+            // call, and runs with a scope for exactly that request.
+            "manage_api" => {
+                if self.trusted_session || self.mandate_preapproved {
+                    return RuleDecision::Defer;
+                }
+                match crate::tools::ManageApiTool::probe_approval_request(&call.arguments) {
+                    Some(request) => RuleDecision::Ask(request),
+                    None => RuleDecision::Defer,
+                }
+            }
             _ => RuleDecision::Defer,
         }
     }
@@ -79,6 +101,10 @@ impl ApprovalRules for AppApprovalRules {
 
 /// The owner's approvals across turns: the card channel, one set of grants
 /// per chat session, and the cards still waiting for an answer.
+///
+/// A chat's grants are shared with every child agent spawned from it (they
+/// are keyed by [`grant_session`]): "Allow for session" on a request in a
+/// chat also covers the identical request from that chat's children.
 pub(crate) struct OwnerApprovals {
     broker: std::sync::RwLock<Option<ApprovalBroker>>,
     grants: Mutex<HashMap<String, Arc<SessionGrants>>>,
@@ -218,6 +244,12 @@ impl OwnerApprovals {
             other => other,
         }
     }
+}
+
+/// The session whose grants a turn uses and adds to: the human-facing chat
+/// a child agent was spawned from, else the turn's own session.
+pub(crate) fn grant_session(approval_session_id: Option<&str>, session_id: &str) -> String {
+    approval_session_id.unwrap_or(session_id).to_string()
 }
 
 /// The card's risk level for a kernel request.
@@ -551,6 +583,79 @@ mod tests {
                 .grants_for("telegram:synthetic-user-2")
                 .covers(&request)
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_and_its_children_share_grants() {
+        use aidaemon_policies::ApprovalGrants;
+        let approvals = OwnerApprovals::default();
+        let request = sdk::OwnerApprovalRequest {
+            effects: vec![sdk::EffectKey::egress("https", "h.example.invalid", None)],
+            summary: "POST https://h.example.invalid/x".to_string(),
+            subject: "POST https://h.example.invalid/x".to_string(),
+            risk: sdk::ApprovalRisk::High,
+            warnings: Vec::new(),
+        };
+        let chat = "telegram:synthetic-user-1";
+        // The owner allows it for the session in the chat.
+        approvals.record_grant(&grant_session(None, chat), &request);
+        // A child spawned from the chat uses the chat's grants.
+        let child = grant_session(Some(chat), "sub-agent:synthetic-child-1");
+        assert_eq!(child, chat);
+        assert!(approvals.grants_for(&child).covers(&request).await);
+        // Another chat's child does not.
+        let other = grant_session(
+            Some("telegram:synthetic-user-2"),
+            "sub-agent:synthetic-child-2",
+        );
+        assert!(!approvals.grants_for(&other).covers(&request).await);
+    }
+
+    #[test]
+    fn manage_api_derived_probe_asks_at_the_outer_call() {
+        let onboard = |extra: serde_json::Value| {
+            let mut args = json!({
+                "action": "onboard",
+                "service": "synthetic-api",
+                "learn_url": "https://docs.example.invalid/graphql",
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            crate::tools::ManageApiTool::probe_approval_request(&args)
+        };
+        let request = onboard(json!({})).expect("a derived probe may POST");
+        assert_eq!(
+            request.subject,
+            "manage_api probe POST https://docs.example.invalid/graphql"
+        );
+        assert_eq!(request.risk, sdk::ApprovalRisk::High);
+        // A verify_url probe is GET or HEAD; an OpenAPI source probes with
+        // GET or HEAD only.
+        assert!(onboard(json!({"verify_url": "https://api.example.invalid/me"})).is_none());
+        assert!(
+            onboard(json!({"openapi_url": "https://api.example.invalid/openapi.json"})).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_api_rules_ask_unless_trusted() {
+        let args = json!({
+            "action": "onboard",
+            "service": "synthetic-api",
+            "learn_url": "https://docs.example.invalid/graphql",
+        });
+        let call = sdk::ToolCall::new("c1", "manage_api", args);
+        let asked = rules().judge(&hook_ctx(), &call, &tool_info()).await;
+        assert!(matches!(asked, RuleDecision::Ask(_)), "{asked:?}");
+        let trusted = AppApprovalRules {
+            trusted_session: true,
+            ..rules()
+        };
+        assert_eq!(
+            trusted.judge(&hook_ctx(), &call, &tool_info()).await,
+            RuleDecision::Defer
         );
     }
 

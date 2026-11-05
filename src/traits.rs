@@ -81,7 +81,7 @@ pub use provider::{
 };
 #[allow(unused_imports)]
 pub use tools::{
-    default_call_annotations, semantics_for_exact_read_actions, AgentRole,
+    default_call_annotations, semantics_for_exact_read_actions, AgentRole, ApprovalScope,
     AuthorizationPreflightRecord, AuthorizationPreflightStatus, DurableReplayDecision,
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, PreparedToolInvocation,
     ReadFileResultMetadata, ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation,

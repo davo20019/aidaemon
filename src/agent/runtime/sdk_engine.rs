@@ -453,6 +453,10 @@ impl TurnScope<'_> {
 /// Everything a dispatched call needs from the turn.
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
+    /// Redacts secrets (the SDK's shapes and the configured literals) from
+    /// the arguments of calls the kernel refused before they are written to
+    /// the ledger.
+    ledger_redactor: aidaemon_policies::Redactor,
     /// The user's message for this turn.
     user_text: &'a str,
     pub(in crate::agent) task_id: &'a str,
@@ -597,10 +601,12 @@ impl Agent {
     /// an unknown tool or invalid arguments is a typed failed proposal; a
     /// hook denial is a policy denial.
     async fn record_kernel_refusal(&self, scope: &TurnScope<'_>, receipt: sdk::Receipt) {
+        // A refused call may be refused because it carries a secret: the
+        // ledger never stores its arguments unredacted.
         let call = crate::traits::ToolCall {
             id: receipt.call_id.clone(),
             name: receipt.tool.clone(),
-            arguments: receipt.arguments.to_string(),
+            arguments: scope.ledger_redactor.redact(&receipt.arguments.to_string()),
             extra_content: None,
         };
         let reason = receipt
@@ -697,26 +703,21 @@ impl Agent {
             .map_or(scope.task_id, |fence| fence.worker_task_id.as_str())
     }
 
-    /// The outbound secret scan: the SDK's secret shapes plus the daemon's
-    /// configured API keys and tokens and those of dynamically connected
-    /// bots.
-    async fn egress_guard(&self, engine: &SdkEngineSettings) -> aidaemon_policies::EgressGuard {
-        let mut guard = aidaemon_policies::EgressGuard::new();
-        for secret in engine.outbound_secrets.values() {
-            guard = guard.secret(secret.clone());
-        }
+    /// The daemon's configured API keys and tokens and those of
+    /// dynamically connected bots: refused in outbound calls by
+    /// `EgressGuard` and redacted from refusal rows written to the ledger.
+    async fn configured_secret_literals(&self, engine: &SdkEngineSettings) -> Vec<String> {
+        let mut secrets = engine.outbound_secrets.values().to_vec();
         match self.state.get_dynamic_bots().await {
             Ok(bots) => {
                 for bot in bots {
-                    guard = guard.secret(bot.bot_token);
-                    if let Some(app_token) = bot.app_token {
-                        guard = guard.secret(app_token);
-                    }
+                    secrets.push(bot.bot_token);
+                    secrets.extend(bot.app_token);
                 }
             }
-            Err(error) => warn!(%error, "Could not read dynamic bots for the egress guard"),
+            Err(error) => warn!(%error, "Could not read dynamic bots for the secret scan"),
         }
-        guard
+        secrets
     }
 
     /// One turn on the SDK kernel, after turn setup built `setup`. See the
@@ -908,10 +909,8 @@ impl Agent {
         }
         // Owner approvals: the daemon's rules for this turn and the chat's
         // grants (a child shares its parent chat's).
-        let grant_session = self
-            .approval_session_id
-            .clone()
-            .unwrap_or_else(|| session_id.to_string());
+        let grant_session =
+            super::approvals::grant_session(self.approval_session_id.as_deref(), session_id);
         let mandate_run = self.mandate_execution.is_some();
         let rules = super::approvals::AppApprovalRules {
             trusted_session: !mandate_run
@@ -919,13 +918,26 @@ impl Agent {
                     .session_trusted(channel_ctx.trusted, Some(task_id.as_str()))
                     .await,
             mandate_preapproved: mandate_run,
+            session_id: session_id.to_string(),
+            user_role: Some(user_role),
+            untrusted_trigger_session: super::is_trigger_session(session_id),
         };
         let approvals = self.owner_approvals.clone();
         let approval =
             aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
                 .with_rules(Arc::new(rules))
                 .with_grants(approvals.grants_for(&grant_session));
-        let egress = self.egress_guard(engine).await;
+        let secrets = self.configured_secret_literals(engine).await;
+        let egress = secrets
+            .iter()
+            .fold(aidaemon_policies::EgressGuard::new(), |guard, secret| {
+                guard.secret(secret.clone())
+            });
+        let ledger_redactor = secrets
+            .iter()
+            .fold(aidaemon_policies::Redactor::new(), |redactor, secret| {
+                redactor.secret(secret.clone())
+            });
         let hooks = TurnHooks {
             authority: authority_hook,
             same_tool: SameToolLimit {
@@ -1051,6 +1063,7 @@ impl Agent {
                 && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
             session_id,
+            ledger_redactor,
             user_text,
             task_id: &task_id,
             status_tx: status_tx.clone(),

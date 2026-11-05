@@ -138,7 +138,7 @@ pub(super) struct ToolExecCtx<'a> {
     pub mutation_forbidden: bool,
     /// The call came through the agent kernel, whose `ApprovalPolicy` asked
     /// the owner where needed (passed on to the tool as
-    /// `ToolExecutionContext::owner_approval_by_kernel`).
+    /// `ToolExecutionContext::kernel_approved` as `ApprovalScope::Call`).
     pub owner_approval_by_kernel: bool,
     /// Exact out-of-scope filesystem targets the controller declined to
     /// reject outright. Loop-owned; the tool must obtain user authority for
@@ -857,7 +857,9 @@ impl Agent {
                 mandate_preapproved,
                 mandate_execution: under_mandate,
                 mutation_forbidden: ctx.mutation_forbidden,
-                owner_approval_by_kernel: ctx.owner_approval_by_kernel,
+                kernel_approved: ctx
+                    .owner_approval_by_kernel
+                    .then_some(crate::traits::ApprovalScope::Call),
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -910,7 +912,9 @@ impl Agent {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
-                    owner_approval_by_kernel: ctx.owner_approval_by_kernel,
+                    kernel_approved: ctx
+                        .owner_approval_by_kernel
+                        .then_some(crate::traits::ApprovalScope::Call),
                 };
                 let result = tool
                     .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
@@ -962,7 +966,9 @@ impl Agent {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
-                    owner_approval_by_kernel: ctx.owner_approval_by_kernel,
+                    kernel_approved: ctx
+                        .owner_approval_by_kernel
+                        .then_some(crate::traits::ApprovalScope::Call),
                 };
                 return tool
                     .call_with_execution_context(
