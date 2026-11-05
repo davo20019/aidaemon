@@ -5,7 +5,7 @@
 //!
 //! | Policy | Hook point | What it decides from |
 //! |---|---|---|
-//! | [`ApprovalPolicy`] | `before_tool` | annotations, tool names, tokenized commands |
+//! | [`ApprovalPolicy`] | `before_tool` | annotations, tool names, tokenized commands, [`ApprovalRules`], [`ApprovalGrants`] |
 //! | [`ScopeGuard`] | `before_tool` | the call's access manifest |
 //! | [`ReceiptCompletionCheck`] | `on_stop` | receipts since the last user message |
 //! | [`Redactor`] | `after_tool` | secret shapes and literal secrets in output |
@@ -23,10 +23,16 @@
 //! injectors (`ProjectInstructions`, `MemoryInjection`) before
 //! `ContextWindow` so the size estimate includes what they add, and
 //! `Redactor` before `UntrustedOutput` so redaction sees raw output.
+//! Before tools run, the order is pinned: authority and scope, then the
+//! egress guard, then [`aidaemon_core::UntrustedHook`], then
+//! [`ApprovalPolicy`] last, so the owner is only asked about calls every
+//! other hook allows. (The kernel refuses a call the owner already declined
+//! in the run before any hook sees it.)
 
 mod approval;
 mod completion;
 mod context_window;
+pub mod grants;
 mod instructions;
 mod memory;
 mod redact;
@@ -35,9 +41,10 @@ mod shell;
 mod tracing_sink;
 mod untrusted;
 
-pub use approval::{ApprovalMode, ApprovalPolicy};
+pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision};
 pub use completion::{ReceiptCompletionCheck, Requirement};
 pub use context_window::{estimate_tokens, ContextWindow};
+pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, ProjectInstructions};
 pub use memory::{InMemoryRecall, MemoryInjection, Recall};
 pub use redact::Redactor;
