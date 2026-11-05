@@ -252,16 +252,19 @@ impl sdk::Tool for BridgedTool {
 
     /// The declared effects as the kernel's access manifest: egress
     /// targets as hosts, path effects as writes, and the terminal's command
-    /// line (so the approval policy's catastrophic-command check sees it).
+    /// line, given as `command` or `script` (so the approval policy's
+    /// catastrophic-command check sees it).
     fn access(&self, arguments: &Value) -> sdk::AccessManifest {
         let mut manifest = sdk::AccessManifest::default();
         if self.spec.name == "terminal" {
-            if let Some(command) = arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .filter(|command| !command.trim().is_empty())
-            {
-                manifest.commands.push(command.to_string());
+            for field in ["command", "script"] {
+                if let Some(text) = arguments
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    manifest.commands.push(text.to_string());
+                }
             }
         }
         for key in self.effects(arguments).keys {

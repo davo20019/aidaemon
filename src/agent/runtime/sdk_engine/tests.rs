@@ -1677,6 +1677,45 @@ fn directives_stay_where_they_were_raised() {
     assert!(interleave_directives(run.clone(), &[]) == run);
 }
 
+/// The kernel's catastrophic-command check reads the terminal's command
+/// line from the access manifest, whether it comes as `command` or
+/// `script`.
+#[tokio::test]
+async fn bridged_terminal_access_lists_command_and_script() {
+    use aidaemon_core::Tool as _;
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+        .await
+        .unwrap();
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+    let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await,
+    );
+    let (calls, _rx) = mpsc::channel(1);
+    let bridged = BridgedTool {
+        spec: tool_spec(terminal.as_ref()),
+        tool: terminal,
+        goal_actions_only: false,
+        calls,
+        trust_roots: Arc::new(Vec::new()),
+    };
+    let command = "rm -rf --no-preserve-root /";
+    let by_command = bridged.access(&serde_json::json!({"action": "run", "command": command}));
+    assert_eq!(by_command.commands, [command]);
+    let by_script = bridged.access(&serde_json::json!({"action": "run", "script": command}));
+    assert_eq!(by_script.commands, [command]);
+    let blank = bridged.access(&serde_json::json!({"action": "run", "script": "  "}));
+    assert!(blank.commands.is_empty());
+}
+
 #[tokio::test]
 async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     use aidaemon_core::Tool as _;
