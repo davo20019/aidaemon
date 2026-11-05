@@ -79,6 +79,11 @@ impl Agent {
         self.sdk_engine = Arc::new(settings);
     }
 
+    /// The kernel run store for this agent's turns (and its children's).
+    pub(crate) fn set_run_store(&mut self, store: Arc<aidaemon_store_sqlite::SqliteStore>) {
+        self.run_store = Some(store);
+    }
+
     /// The owner's approvals for this agent's turns (and its children's).
     pub(crate) fn owner_approvals(&self) -> Arc<super::approvals::OwnerApprovals> {
         self.owner_approvals.clone()
@@ -220,6 +225,7 @@ impl Agent {
             mandate_execution: None,
             cancel_token: None,
             sdk_engine: Arc::default(),
+            run_store: None,
             owner_approvals: Arc::default(),
             memory,
             transcript_writes,
@@ -475,6 +481,7 @@ impl Agent {
             mandate_execution,
             cancel_token,
             sdk_engine: Arc::default(),
+            run_store: None,
             owner_approvals: Arc::default(),
             memory,
             transcript_writes,

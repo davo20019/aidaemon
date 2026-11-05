@@ -342,6 +342,9 @@ pub struct Agent {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// SDK kernel settings for this agent's turns; inherited by spawned children.
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
+    /// The kernel's durable run store: every SDK run journals its events and
+    /// checkpoints its state here. Inherited by spawned children.
+    run_store: Option<Arc<aidaemon_store_sqlite::SqliteStore>>,
     /// The owner's approval cards, grants and waiting cards; shared with
     /// every child, so a grant in a chat covers its children's calls.
     owner_approvals: Arc<approvals::OwnerApprovals>,

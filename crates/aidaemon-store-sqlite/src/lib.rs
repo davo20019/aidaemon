@@ -320,3 +320,37 @@ impl RunStore for SqliteStore {
         Ok(self.state(run_id).await?)
     }
 }
+
+/// Erase every run of one session from the journal and the checkpoints, in
+/// the caller's transaction (a `/wipe` deletes conversation text atomically).
+///
+/// `run_events` is append-only: a trigger aborts every `DELETE`. This is the
+/// one sanctioned exception. It drops the guard, deletes the session's rows
+/// and restores the guard inside the same transaction, so no other delete can
+/// slip through. The trigger body must match migration 1.
+pub async fn erase_session_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+) -> Result<(), Error> {
+    sqlx::query("DROP TRIGGER IF EXISTS run_events_no_delete")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM run_events
+         WHERE run_id IN (SELECT run_id FROM run_states WHERE session_id = ?)",
+    )
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER run_events_no_delete BEFORE DELETE ON run_events
+         BEGIN SELECT RAISE(ABORT, 'run_events is append-only'); END",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM run_states WHERE session_id = ?")
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}

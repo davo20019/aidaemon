@@ -257,6 +257,8 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        // The kernel's run journal and checkpoints hold the same text.
+        aidaemon_store_sqlite::erase_session_in_tx(&mut tx, session_id).await?;
         tx.commit().await?;
         super::history_search::checkpoint_after_wipe(&self.pool).await?;
         Ok(())

@@ -72,6 +72,8 @@ mod hooks;
 mod model_call;
 #[path = "sdk_engine/outcome.rs"]
 mod outcome;
+#[path = "sdk_engine/recovery.rs"]
+mod recovery;
 #[path = "sdk_engine/stop.rs"]
 mod stop;
 #[path = "sdk_engine/tool_calls.rs"]
@@ -1109,6 +1111,12 @@ impl Agent {
         let sink_heartbeat = heartbeat.clone();
         // The kernel holds one sink: heartbeat, kernel refusals for the
         // ledger, and the thinking status all go through it.
+        // Every run journals its events and checkpoints its state, so a
+        // crash leaves the kernel's own record (`in_flight` / `pending`).
+        if let Some(store) = self.run_store.clone() {
+            let store: Arc<dyn sdk::RunStore> = store;
+            builder = builder.store(store);
+        }
         builder = builder.event_sink(move |_run, event: &sdk::Event| {
             touch_heartbeat(&sink_heartbeat);
             match event {
@@ -1327,7 +1335,24 @@ impl Agent {
                 cancel: cancel.clone(),
             },
         };
-        let run = sdk_agent.run_resolving(state, cancel, &resolver);
+        // A run the daemon stopped on (a crash, a restart) is settled first,
+        // so its batch finishes under the kernel's rules before this turn.
+        let stranded = recovery::stranded_run(self.run_store.as_deref(), session_id).await;
+        let run = async {
+            if let Some(stranded) = stranded {
+                let settled =
+                    recovery::settle(&sdk_agent, stranded, cancel.clone(), &resolver).await;
+                match settled {
+                    Ok(Some(_)) => info!(session_id, "Settled the run a restart left unfinished"),
+                    Ok(None) => warn!(
+                        session_id,
+                        "The unfinished run was not settled; it stays for a later turn"
+                    ),
+                    Err(error) => warn!(session_id, %error, "Settling the unfinished run failed"),
+                }
+            }
+            sdk_agent.run_resolving(state, cancel, &resolver).await
+        };
         tokio::pin!(run);
         let mut in_flight = FuturesUnordered::new();
         // Ledger writes for kernel notices run apart from the run's own calls:

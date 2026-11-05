@@ -1527,6 +1527,7 @@ impl Agent {
             .push(inherited_authority.clone());
         child.inherited_authority = Some(inherited_authority);
         child.sdk_engine = self.sdk_engine.clone();
+        child.run_store = self.run_store.clone();
         child.owner_approvals = self.owner_approvals.clone();
         child.memory = self.memory.clone();
         child.transcript_writes = self.transcript_writes.clone();

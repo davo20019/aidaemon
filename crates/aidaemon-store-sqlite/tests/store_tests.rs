@@ -383,3 +383,39 @@ async fn crashed_run_is_found_after_reopen_and_finished() {
     assert!(events.iter().any(|e| matches!(e, Event::Recovered { .. })));
     assert!(matches!(events.last(), Some(Event::Finished { .. })));
 }
+
+#[tokio::test]
+async fn erase_session_removes_only_that_sessions_runs_and_keeps_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(db_path(&dir)).await.unwrap();
+    let erased = aidaemon_core::RunState::new("aidaemon", "s-erased", "private text");
+    let kept = aidaemon_core::RunState::new("aidaemon", "s-kept", "other text");
+    for state in [&erased, &kept] {
+        store
+            .append(state.run_id, &Event::TurnStarted { turn: 1 })
+            .await
+            .unwrap();
+        store.upsert_state(state).await.unwrap();
+    }
+
+    let mut tx = store.pool().begin().await.unwrap();
+    aidaemon_store_sqlite::erase_session_in_tx(&mut tx, "s-erased")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(store.state(erased.run_id).await.unwrap().is_none());
+    assert!(store.events(erased.run_id).await.unwrap().is_empty());
+    assert!(store.state(kept.run_id).await.unwrap().is_some());
+    assert_eq!(store.events(kept.run_id).await.unwrap().len(), 1);
+
+    // The append-only guard is back in force for every other delete.
+    let blocked = sqlx::query("DELETE FROM run_events WHERE run_id = ?")
+        .bind(kept.run_id.to_string())
+        .execute(store.pool())
+        .await;
+    let message = blocked
+        .expect_err("run_events must stay append-only")
+        .to_string();
+    assert!(message.contains("append-only"), "wrong failure: {message}");
+}

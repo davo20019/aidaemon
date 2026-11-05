@@ -210,6 +210,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
     });
     agent.set_sdk_engine(sdk_engine);
+    // The kernel's run store shares the daemon's pool, so runs inherit its
+    // encryption and WAL settings and live in the same database file.
+    agent.set_run_store(Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?,
+    ));
     // Owner-approval cards from the kernel go out on the same channel the
     // tools' cards use.
     agent.owner_approvals().set_broker(approval_tx.clone());

@@ -4282,3 +4282,99 @@ fn a_decline_prevents_success_even_with_an_external_ack() {
     outcome.final_text = Some("Done.".into());
     assert_eq!(verdict.resolve(&outcome).2, TaskOutcome::Partial);
 }
+
+/// A turn journals its run into the kernel store on the daemon's own pool,
+/// and `/wipe` (`clear_session`) erases that journal with the conversation.
+#[tokio::test]
+async fn sdk_turn_journals_its_run_and_wipe_erases_it() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    use crate::traits::store_prelude::*;
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Noted.")]);
+    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+        .await
+        .unwrap();
+    let pool = harness.state.pool();
+    harness.agent.set_run_store(std::sync::Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+            .await
+            .unwrap(),
+    ));
+    let session = "telegram:synthetic-user-1";
+    harness
+        .agent
+        .handle_inbound_message(owner_request("Hello there."))
+        .await
+        .unwrap();
+
+    let states: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_states WHERE session_id = ?")
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(states >= 1, "the turn must checkpoint its run");
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(events >= 1, "the turn must journal its events");
+
+    harness.state.clear_session(session).await.unwrap();
+
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_states WHERE session_id = ?")
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "/wipe must erase the session's checkpoints");
+    let left_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left_events, 0, "/wipe must erase the session's journal");
+}
+
+/// A run a restart left mid tool batch is settled before the session's next
+/// turn: the next turn finds no unfinished run and proceeds normally.
+#[tokio::test]
+async fn a_turn_settles_the_run_a_restart_left_in_flight() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("Recovered."),
+        MockProvider::text_response("Noted."),
+    ]);
+    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+        .await
+        .unwrap();
+    let pool = harness.state.pool();
+    let store = std::sync::Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+            .await
+            .unwrap(),
+    );
+    harness.agent.set_run_store(store.clone());
+    let session = "telegram:synthetic-user-1";
+
+    let mut stranded = aidaemon_core::RunState::new("aidaemon", session, "Earlier request.");
+    stranded.in_flight = Some(aidaemon_core::InFlight::default());
+    store.upsert_state(&stranded).await.unwrap();
+
+    harness
+        .agent
+        .handle_inbound_message(owner_request("Hello again."))
+        .await
+        .unwrap();
+
+    // The stranded run was settled (its model call ran) before the new turn.
+    assert_eq!(harness.provider.call_count().await, 2);
+    let latest = store
+        .latest_state_for_session(session)
+        .await
+        .unwrap()
+        .expect("the session has runs");
+    assert!(latest.in_flight.is_none(), "no run stays in flight");
+    assert_ne!(latest.run_id, stranded.run_id);
+}

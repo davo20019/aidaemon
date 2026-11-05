@@ -106,6 +106,8 @@ portable-pty = { version = "0.8", optional = true }
 
 # The agent kernel (workspace crate).
 aidaemon-core = { path = "crates/aidaemon-core" }
+# The kernel's run journal and checkpoints, on the daemon's own pool.
+aidaemon-store-sqlite = { path = "crates/aidaemon-store-sqlite" }
 aidaemon-policies = { path = "crates/aidaemon-policies" }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { path = "crates/aidaemon-tools" }

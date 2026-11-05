@@ -76,6 +76,7 @@ dependencies = [
  "aidaemon-node-protocol",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-store-sqlite",
  "aidaemon-tools",
  "anyhow",
  "assert_cmd",
