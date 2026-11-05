@@ -797,28 +797,83 @@ async fn resolve_executable(backend: &SharedExecutionBackend, executable: &str) 
 /// actual nested agent executable. GUI/launchd processes commonly lack user
 /// install directories such as `~/.local/bin` in PATH; accepting `env` alone
 /// used to defer that mistake until every invocation exited with code 127.
-/// Flags that switch a delegated CLI agent into unattended auto-approve mode.
-const PERMISSION_BYPASS_FLAGS: &[&str] = &[
+/// Boolean flags that switch a CLI agent into unattended auto-approve mode,
+/// across every agent we launch. The single list for the cli_agent tool and
+/// the terminal-bridge review profiles.
+pub(crate) const PERMISSION_BYPASS_FLAGS: &[&str] = &[
+    // claude
     "--dangerously-skip-permissions",
-    "--yolo",
+    "--allow-dangerously-skip-permissions",
+    "--dangerously-bypass-hook-trust",
+    // codex
     "--dangerously-bypass-approvals-and-sandbox",
+    "--full-auto",
+    // gemini
+    "--yolo",
+    // copilot
     "--allow-all-tools",
+    "--allow-all-paths",
+    // aider
+    "--yes",
+    "--yes-always",
 ];
 
-fn is_permission_bypass_flag(arg: &str) -> bool {
+/// Options whose given value turns them into a bypass: (flag, value).
+const PERMISSION_BYPASS_OPTION_VALUES: &[(&str, &str)] = &[
+    ("--sandbox", "false"),
+    ("--sandbox", "danger-full-access"),
+    ("--approval-mode", "yolo"),
+    ("--permission-mode", "bypassPermissions"),
+];
+
+fn is_permission_bypass_flag(arg: &str, agent: &str) -> bool {
+    if arg == "-y" {
+        // `-y` means something else for most CLIs; it is gemini's --yolo.
+        return agent.eq_ignore_ascii_case("gemini");
+    }
     PERMISSION_BYPASS_FLAGS.iter().any(|flag| {
         arg == *flag
             || arg
                 .strip_prefix(flag)
                 .is_some_and(|rest| rest.starts_with('='))
+    }) || PERMISSION_BYPASS_OPTION_VALUES.iter().any(|(flag, value)| {
+        arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) == Some(value)
     })
 }
 
-/// Remove auto-approve flags from a launch argument list. Every launch goes
-/// through this one function; it refuses if a flag is still present after.
-fn strip_permission_bypass_flags(args: &mut Vec<String>) -> Result<(), String> {
-    args.retain(|arg| !is_permission_bypass_flag(arg));
-    if args.iter().any(|arg| is_permission_bypass_flag(arg)) {
+fn without_permission_bypass(args: &[String], agent: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if is_permission_bypass_flag(arg, agent) {
+            index += 1;
+            continue;
+        }
+        if let Some(value) = args.get(index + 1) {
+            if PERMISSION_BYPASS_OPTION_VALUES
+                .iter()
+                .any(|(flag, v)| arg == *flag && value == v)
+            {
+                index += 2;
+                continue;
+            }
+        }
+        out.push(args[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// Remove auto-approve flags from a launch argument list. `agent` is the
+/// agent's name or executable name (it only matters for gemini's `-y`).
+/// Every launch goes through this function; it refuses if a flag survives.
+pub(crate) fn strip_permission_bypass_flags(
+    args: &mut Vec<String>,
+    agent: &str,
+) -> Result<(), String> {
+    *args = without_permission_bypass(args, agent);
+    if without_permission_bypass(args, agent).len() != args.len() {
         return Err("its permission-bypass flags could not be removed".to_string());
     }
     Ok(())
@@ -2193,7 +2248,17 @@ impl CliAgentTool {
             }
         }
 
-        if strip_permission_bypass_flags(&mut args).is_err() {
+        let agent_kind = std::path::Path::new(&command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !is_env_launcher(name))
+            .unwrap_or(tool_name);
+        let agent_kind = if tool_name.eq_ignore_ascii_case("gemini") {
+            "gemini"
+        } else {
+            agent_kind
+        };
+        if strip_permission_bypass_flags(&mut args, agent_kind).is_err() {
             return Ok("Blocked: CLI delegation was not started because its permission-bypass flags could not be removed.".to_string());
         }
 
@@ -5081,40 +5146,135 @@ mod tests {
             assert!(!out.contains(flag), "direct path leaked {flag}: {out}");
         }
         assert!(out.contains("--keep-synthetic-flag"), "got: {out}");
+    }
 
-        // Execution-context path: echo has no native sandbox adapter, so the
-        // run is blocked, and in no case may a bypass flag reach a launch.
-        let (tool, _db) = echo_tool_with_flags().await;
-        let result = tool
+    /// Execution-context path: a fake `codex` (the one agent with a native
+    /// sandbox adapter) records the argv it was really launched with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_agent_context_launch_never_passes_bypass_flags() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tool, _db) = setup_echo_tool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let argv_file = dir.path().join("argv.txt");
+        let script = dir.path().join("codex");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args: Vec<String> = ["exec", "--yolo", "--dangerously-skip-permissions"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        args.extend(["--allow-all-tools", "--keep-synthetic-flag"].map(String::from));
+        tool.tools.write().unwrap().insert(
+            "codex".to_string(),
+            CliToolEntry {
+                command: script.to_string_lossy().to_string(),
+                args,
+                description: "fake codex".to_string(),
+                timeout: Duration::from_secs(10),
+                max_output_chars: 10000,
+                is_dynamic: false,
+            },
+        );
+        tool.tool_names.write().unwrap().push("codex".to_string());
+        let outcome = tool
             .call_with_execution_context(
-                r#"{"action":"run","tool":"echo","prompt":"hello"}"#,
+                r#"{"action":"run","tool":"codex","prompt":"hello","workspace_mode":"read_only"}"#,
                 None,
                 ToolExecutionContext::default(),
             )
-            .await;
-        let text = match result {
-            Ok(outcome) => outcome.output,
-            Err(error) => error.to_string(),
-        };
-        for flag in BYPASS_FLAGS {
-            assert!(!text.contains(flag), "context path leaked {flag}: {text}");
+            .await
+            .unwrap();
+        let argv = std::fs::read_to_string(&argv_file)
+            .unwrap_or_else(|_| panic!("agent was not launched: {}", outcome.output));
+        for flag in [
+            "--yolo",
+            "--dangerously-skip-permissions",
+            "--allow-all-tools",
+        ] {
+            assert!(
+                !argv.lines().any(|l| l == flag),
+                "launched with {flag}: {argv}"
+            );
         }
+        assert!(argv.lines().any(|l| l == "--keep-synthetic-flag"), "{argv}");
+    }
+
+    fn strip(agent: &str, args: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        strip_permission_bypass_flags(&mut args, agent).unwrap();
+        args
     }
 
     #[test]
     fn bypass_flag_stripping_keeps_other_flags() {
-        let mut args: Vec<String> = [
-            "-p",
+        assert_eq!(
+            strip(
+                "claude",
+                &[
+                    "-p",
+                    "--yolo",
+                    "--model",
+                    "synthetic",
+                    "--allow-all-tools=1"
+                ]
+            ),
+            ["-p", "--model", "synthetic"]
+        );
+    }
+
+    #[test]
+    fn every_known_bypass_flag_is_stripped() {
+        for flag in [
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--dangerously-bypass-hook-trust",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--full-auto",
             "--yolo",
-            "--model",
-            "synthetic",
-            "--allow-all-tools=1",
-        ]
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
-        strip_permission_bypass_flags(&mut args).unwrap();
-        assert_eq!(args, ["-p", "--model", "synthetic"]);
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--yes",
+            "--yes-always",
+        ] {
+            assert_eq!(strip("any", &["a", flag, "b"]), ["a", "b"], "{flag}");
+            let valued = format!("{flag}=1");
+            assert_eq!(strip("any", &["a", &valued, "b"]), ["a", "b"], "{valued}");
+        }
+        assert_eq!(strip("gemini", &["--sandbox=false", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--sandbox", "false", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--approval-mode", "yolo", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--approval-mode=yolo", "x"]), ["x"]);
+        assert_eq!(
+            strip("claude", &["--permission-mode", "bypassPermissions", "x"]),
+            ["x"]
+        );
+        // Non-bypass values of the same options survive.
+        assert_eq!(
+            strip(
+                "gemini",
+                &["--approval-mode", "default", "--sandbox", "true"]
+            ),
+            ["--approval-mode", "default", "--sandbox", "true"]
+        );
+        assert_eq!(
+            strip("claude", &["--permission-mode", "plan"]),
+            ["--permission-mode", "plan"]
+        );
+    }
+
+    #[test]
+    fn short_y_is_stripped_only_for_gemini() {
+        assert_eq!(strip("gemini", &["-y", "x"]), ["x"]);
+        assert_eq!(strip("aider", &["-y", "x"]), ["-y", "x"]);
+        assert_eq!(strip("claude", &["-y"]), ["-y"]);
     }
 
     #[tokio::test]
