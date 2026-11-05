@@ -39,10 +39,10 @@ hooks or the tool batch.
 | `Agent` / `AgentBuilder` | `agent.rs` | Configuration as data with a stable id. No per-run state, cheap to clone. |
 | `Provider` | `provider.rs` | `complete(&ModelRequest) -> ModelResponse`. Retries are a wrapper (`Retry`), not loop logic. |
 | `Tool` | `tool.rs` | `spec` + `call` required. `annotations` default to destructive; `validate` defaults to a `required`-keys check; `effects` declares what a call does (`CallEffects`). |
-| `ToolContext` | `tool.rs` | Trusted run/session/call ids and a cancel token, passed *beside* the model's arguments. |
+| `ToolContext` | `tool.rs` | Trusted run/session/call ids, a cancel token, and the agent's typed `Extensions` (application values keyed by type, set with `AgentBuilder::tool_extensions`), passed *beside* the model's arguments. |
 | `Hook` | `hook.rs` | `before_model`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`. All default to no-ops. |
 | `Receipt` | `receipt.rs` | One per tool call, refusals included: status, stage, duration, reason, structured details. |
-| `RunOutcome` / `RunStatus` | `outcome.rs` | Every exit maps to one variant. Usage, turns and receipts travel with it. |
+| `RunOutcome` / `RunStatus` | `outcome.rs` | Every exit maps to one variant. Usage, turns and receipts travel with it. A tool may end the run with `ToolOutput::finish`: once its whole batch has run, the run ends `Finished { outcome, tool }` with the finish's reply as final text (first finish in call order wins; `on_stop` is not consulted, `on_run_end` is). |
 | `RunState` | `state.rs` | Plain serializable data: transcript, receipts, usage, pending interruption. |
 | `Event` / `EventSink` | `event.rs` | One ordered stream for UIs, tracing, stores and eval assertions. |
 | `RunStore` | `store.rs` | Event journal + latest state. The whole persistence contract of the kernel. |

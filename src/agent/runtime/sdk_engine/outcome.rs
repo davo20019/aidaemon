@@ -83,6 +83,18 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
             TaskStatus::Interrupted,
             TaskOutcome::Partial,
         ),
+        // A tool ended the run. Until tool-driven finishes are wired in
+        // (Phase 8.2), a successful one reads as a completed run and any
+        // other as partial work.
+        sdk::RunStatus::Finished { outcome, .. } => (
+            text.unwrap_or_default(),
+            TaskStatus::Completed,
+            if matches!(outcome, sdk::FinishOutcome::Succeeded) {
+                TaskOutcome::Succeeded
+            } else {
+                TaskOutcome::Partial
+            },
+        ),
         sdk::RunStatus::Cancelled => (
             "Cancelled.".to_string(),
             TaskStatus::Cancelled,

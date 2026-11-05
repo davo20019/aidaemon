@@ -16,7 +16,7 @@ use crate::safeguard::Safeguard;
 use crate::state::{Interruption, RunState, RUN_STATE_SCHEMA};
 use crate::store::RunStore;
 use crate::stuck::StuckConfig;
-use crate::tool::Tool;
+use crate::tool::{Extensions, Tool};
 
 /// Settles interruptions inside [`Agent::run_resolving`]: a clean-check
 /// verifier, an approval UI, a policy. `None` leaves the run interrupted.
@@ -56,6 +56,8 @@ pub(crate) struct AgentInner {
     pub sink: Option<Arc<dyn EventSink>>,
     pub store: Option<Arc<dyn RunStore>>,
     pub max_output_tokens: Option<u32>,
+    /// Carried by every call's [`crate::ToolContext`].
+    pub extensions: Extensions,
 }
 
 /// An agent is configuration: a stable id, a model, instructions, tools and
@@ -234,6 +236,7 @@ pub struct AgentBuilder {
     sink: Option<Arc<dyn EventSink>>,
     store: Option<Arc<dyn RunStore>>,
     max_output_tokens: Option<u32>,
+    extensions: Extensions,
 }
 
 impl AgentBuilder {
@@ -253,6 +256,7 @@ impl AgentBuilder {
             sink: None,
             store: None,
             max_output_tokens: None,
+            extensions: Extensions::default(),
         }
     }
 
@@ -340,6 +344,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Application values every tool call can read from
+    /// [`crate::ToolContext::extensions`]. Replaces any earlier set.
+    pub fn tool_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, BuildError> {
         if self.id.trim().is_empty() {
             return Err(BuildError::EmptyAgentId);
@@ -387,6 +398,7 @@ impl AgentBuilder {
                 sink: self.sink,
                 store: self.store,
                 max_output_tokens: self.max_output_tokens,
+                extensions: self.extensions,
             }),
         })
     }

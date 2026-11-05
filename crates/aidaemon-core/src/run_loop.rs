@@ -22,7 +22,9 @@ use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
 use crate::state::{InFlight, Interruption, Pending, RunId, RunState};
 use crate::stuck::StuckSignal;
-use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
+use crate::tool::{
+    Finish, SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput,
+};
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -33,6 +35,9 @@ pub(crate) struct Driver<'a> {
     /// Whether this segment's end is the run's end for hooks. A segment
     /// driven by `run_resolving` is not: the caller reports the final one.
     report_run_end: bool,
+    /// The first finish a dispatched call returned in the current batch,
+    /// with its tool's name. It ends the run when the batch completes.
+    finishing: Option<(Finish, String)>,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -45,6 +50,8 @@ enum BatchEnd {
     Stuck(StuckSignal),
     Limit(LimitKind),
     Cancelled,
+    /// A call asked to end the run and the whole batch ran.
+    Finished(Finish, String),
 }
 
 /// What the stuck policy asked for while recording a result.
@@ -84,6 +91,7 @@ impl<'a> Driver<'a> {
             segment_start: Instant::now(),
             base_elapsed_ms,
             report_run_end: true,
+            finishing: None,
         }
     }
 
@@ -481,6 +489,11 @@ impl<'a> Driver<'a> {
         self.flush(&mut group, &mut nudge, &mut stop).await?;
         self.state.in_flight = None;
 
+        // Every call ran: a tool's finish now ends the run, ahead of any
+        // stuck verdict or nudge about the batch.
+        if let Some((finish, tool)) = self.finishing.take() {
+            return Ok(BatchEnd::Finished(finish, tool));
+        }
         if let Some(signal) = stop {
             return Ok(BatchEnd::Stuck(signal));
         }
@@ -599,7 +612,8 @@ impl<'a> Driver<'a> {
             .clone();
         let ctx = ToolContext::new(self.state.session_id.clone(), call.id.clone())
             .with_run(self.state.run_id, self.state.turn)
-            .with_cancel(self.cancel.child_token());
+            .with_cancel(self.cancel.child_token())
+            .with_extensions(self.agent.extensions.clone());
         // A tool's own timeout hint replaces the default, but nothing may
         // outlive the run's remaining wall-clock budget.
         let per_tool = tool.timeout().unwrap_or(self.agent.limits.tool_timeout);
@@ -742,6 +756,13 @@ impl<'a> Driver<'a> {
                 .with_images(output.images.iter().cloned())
                 .with_error(!receipt.succeeded()),
         );
+        // Results are appended in call order, so the first finish kept is
+        // the first in call order.
+        if receipt.stage == InvocationStage::Dispatched && self.finishing.is_none() {
+            if let Some(finish) = output.finish.clone() {
+                self.finishing = Some((finish, receipt.tool.clone()));
+            }
+        }
         if receipt.stage == InvocationStage::Dispatched && receipt.source == SourceTrust::Untrusted
         {
             self.state.untrusted_seen = true;
@@ -972,14 +993,21 @@ impl<'a> Driver<'a> {
     }
 
     async fn finish_batch(self, end: BatchEnd) -> Result<RunOutcome, CoreError> {
-        let status = match end {
-            BatchEnd::Interrupted(interruption) => RunStatus::Interrupted { interruption },
-            BatchEnd::Stuck(signal) => RunStatus::Stuck { signal },
-            BatchEnd::Limit(limit) => RunStatus::LimitReached { limit },
-            BatchEnd::Cancelled => RunStatus::Cancelled,
+        let (status, final_text) = match end {
+            BatchEnd::Interrupted(interruption) => (RunStatus::Interrupted { interruption }, None),
+            BatchEnd::Stuck(signal) => (RunStatus::Stuck { signal }, None),
+            BatchEnd::Limit(limit) => (RunStatus::LimitReached { limit }, None),
+            BatchEnd::Cancelled => (RunStatus::Cancelled, None),
+            BatchEnd::Finished(finish, tool) => (
+                RunStatus::Finished {
+                    outcome: finish.outcome,
+                    tool,
+                },
+                finish.reply,
+            ),
             BatchEnd::Done => unreachable!("finish_batch is only called for terminal batch ends"),
         };
-        self.finish(status, None).await
+        self.finish(status, final_text).await
     }
 
     async fn finish(

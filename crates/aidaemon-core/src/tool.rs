@@ -1,5 +1,9 @@
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::CallEffects;
 use crate::message::Image;
+use crate::outcome::FinishOutcome;
 use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
 
@@ -108,6 +113,37 @@ pub struct ToolInfo {
     pub effects: CallEffects,
 }
 
+/// Typed application values a tool can read from its [`ToolContext`],
+/// keyed by type: at most one value per type. The application sets them on
+/// the agent with [`crate::AgentBuilder::tool_extensions`]; every call's
+/// context carries them. Cloning is cheap (values are shared).
+#[derive(Clone, Default)]
+pub struct Extensions {
+    values: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl Extensions {
+    /// Store `value`, replacing any earlier value of the same type.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.values.insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// The value of type `T`, if one was inserted.
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.values
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<T>())
+    }
+}
+
+impl fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Extensions")
+            .field("len", &self.values.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Trusted, harness-provided context for one call.
 ///
 /// This is passed beside the model's arguments rather than injected into
@@ -121,6 +157,8 @@ pub struct ToolContext {
     pub turn: u32,
     /// Cancelled when the run is cancelled; long tools should watch it.
     pub cancel: CancellationToken,
+    /// Application values set with [`crate::AgentBuilder::tool_extensions`].
+    pub extensions: Extensions,
 }
 
 impl ToolContext {
@@ -133,6 +171,7 @@ impl ToolContext {
             call_id: call_id.into(),
             turn: 0,
             cancel: CancellationToken::new(),
+            extensions: Extensions::default(),
         }
     }
 
@@ -146,6 +185,22 @@ impl ToolContext {
         self.cancel = cancel;
         self
     }
+
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+}
+
+/// A tool's request to end the run once its batch completes. The run ends
+/// with [`crate::RunStatus::Finished`] and `reply` as its final text, without
+/// another model call and without consulting `on_stop` hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finish {
+    /// The run's final text, if the tool has one for the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    pub outcome: FinishOutcome,
 }
 
 /// What a tool hands back to the model, plus structured details for receipts.
@@ -171,6 +226,9 @@ pub struct ToolOutput {
     /// fetch tool that knows this particular URL is the owner's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<SourceTrust>,
+    /// End the run after this call's batch (see [`ToolOutput::finish`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<Finish>,
 }
 
 impl ToolOutput {
@@ -182,6 +240,7 @@ impl ToolOutput {
             details: Value::Null,
             usage: Usage::default(),
             trust: None,
+            finish: None,
         }
     }
 
@@ -193,6 +252,7 @@ impl ToolOutput {
             details: Value::Null,
             usage: Usage::default(),
             trust: None,
+            finish: None,
         }
     }
 
@@ -213,6 +273,14 @@ impl ToolOutput {
 
     pub fn with_trust(mut self, trust: SourceTrust) -> Self {
         self.trust = Some(trust);
+        self
+    }
+
+    /// End the run once the batch this call belongs to completes. Every
+    /// call in the batch still runs and gets its receipt; if several calls
+    /// finish, the first in call order wins.
+    pub fn finish(mut self, finish: Finish) -> Self {
+        self.finish = Some(finish);
         self
     }
 }

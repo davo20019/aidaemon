@@ -33,6 +33,22 @@ pub enum RunStatus {
     ProviderFailed {
         error: String,
     },
+    /// A tool ended the run with [`crate::ToolOutput::finish`]; `tool` is
+    /// the name of the tool whose finish won.
+    Finished {
+        outcome: FinishOutcome,
+        tool: String,
+    },
+}
+
+/// How a tool-driven finish judged the work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FinishOutcome {
+    Succeeded,
+    Partial,
+    Blocked,
 }
 
 /// The typed result of [`crate::Agent::run`] or [`crate::Agent::resume`].

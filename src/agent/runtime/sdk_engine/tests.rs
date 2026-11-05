@@ -1441,6 +1441,23 @@ fn interrupted_and_failed_runs_map_to_non_success_outcomes() {
     assert_eq!(reply, "All set.");
     assert_eq!(status, TaskStatus::Completed);
     assert_eq!(task_outcome, TaskOutcome::Succeeded);
+
+    outcome.status = sdk::RunStatus::Finished {
+        outcome: sdk::FinishOutcome::Succeeded,
+        tool: "synthetic_finisher".into(),
+    };
+    let (reply, status, task_outcome) = reply_for(&outcome);
+    assert_eq!(reply, "All set.");
+    assert_eq!(status, TaskStatus::Completed);
+    assert_eq!(task_outcome, TaskOutcome::Succeeded);
+
+    outcome.status = sdk::RunStatus::Finished {
+        outcome: sdk::FinishOutcome::Blocked,
+        tool: "synthetic_finisher".into(),
+    };
+    let (_, status, task_outcome) = reply_for(&outcome);
+    assert_eq!(status, TaskStatus::Completed);
+    assert_eq!(task_outcome, TaskOutcome::Partial);
 }
 
 /// A stopped run's reply gets the same checks as a completed one: no

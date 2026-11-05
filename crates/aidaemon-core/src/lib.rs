@@ -54,7 +54,7 @@ pub use failover::{
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};
 pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
-pub use outcome::{RunOutcome, RunStatus};
+pub use outcome::{FinishOutcome, RunOutcome, RunStatus};
 pub use provider::{
     collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,
     ResponseFormat, Retry, StreamEvent, ToolChoice, ToolSpec, Usage,
@@ -65,8 +65,8 @@ pub use state::{InFlight, Interruption, Pending, RunId, RunState, RUN_STATE_SCHE
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
-    AccessManifest, FnTool, SourceTrust, Tool, ToolAnnotations, ToolContext, ToolError, ToolInfo,
-    ToolOutput, ToolResult,
+    AccessManifest, Extensions, Finish, FnTool, SourceTrust, Tool, ToolAnnotations, ToolContext,
+    ToolError, ToolInfo, ToolOutput, ToolResult,
 };
 
 pub use untrusted::{

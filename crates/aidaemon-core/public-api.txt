@@ -149,6 +149,10 @@ pub aidaemon_core::FailoverAction::RetryWith
 pub aidaemon_core::FailoverAction::RetryWith::delay: core::time::Duration
 pub aidaemon_core::FailoverAction::RetryWith::request: alloc::boxed::Box<aidaemon_core::ModelRequest>
 pub aidaemon_core::FailoverAction::Stop
+#[non_exhaustive] pub enum aidaemon_core::FinishOutcome
+pub aidaemon_core::FinishOutcome::Blocked
+pub aidaemon_core::FinishOutcome::Partial
+pub aidaemon_core::FinishOutcome::Succeeded
 pub enum aidaemon_core::Image
 pub aidaemon_core::Image::Base64
 pub aidaemon_core::Image::Base64::data: alloc::string::String
@@ -226,6 +230,9 @@ pub aidaemon_core::Role::User
 #[non_exhaustive] pub enum aidaemon_core::RunStatus
 pub aidaemon_core::RunStatus::Cancelled
 pub aidaemon_core::RunStatus::Completed
+pub aidaemon_core::RunStatus::Finished
+pub aidaemon_core::RunStatus::Finished::outcome: aidaemon_core::FinishOutcome
+pub aidaemon_core::RunStatus::Finished::tool: alloc::string::String
 pub aidaemon_core::RunStatus::Interrupted
 pub aidaemon_core::RunStatus::Interrupted::interruption: aidaemon_core::Interruption
 pub aidaemon_core::RunStatus::LimitReached
@@ -334,6 +341,7 @@ pub fn aidaemon_core::AgentBuilder::store(self, alloc::sync::Arc<dyn aidaemon_co
 pub fn aidaemon_core::AgentBuilder::stuck_detection(self, aidaemon_core::StuckConfig) -> Self
 pub fn aidaemon_core::AgentBuilder::tool(self, impl aidaemon_core::Tool + 'static) -> Self
 pub fn aidaemon_core::AgentBuilder::tool_arc(self, alloc::sync::Arc<dyn aidaemon_core::Tool>) -> Self
+pub fn aidaemon_core::AgentBuilder::tool_extensions(self, aidaemon_core::Extensions) -> Self
 pub struct aidaemon_core::Audio
 pub aidaemon_core::Audio::data: alloc::string::String
 pub aidaemon_core::Audio::format: alloc::string::String
@@ -386,6 +394,12 @@ pub fn aidaemon_core::EffectKey::egress(&str, &str, core::option::Option<u16>) -
 pub fn aidaemon_core::EffectKey::named(aidaemon_core::EffectClass, &str) -> aidaemon_core::EffectKey
 pub fn aidaemon_core::EffectKey::overlaps(&self, &aidaemon_core::EffectKey) -> bool
 pub fn aidaemon_core::EffectKey::path(aidaemon_core::EffectClass, &str) -> core::option::Option<aidaemon_core::EffectKey>
+pub struct aidaemon_core::Extensions
+impl aidaemon_core::Extensions
+pub fn aidaemon_core::Extensions::get<T: 'static>(&self) -> core::option::Option<&T>
+pub fn aidaemon_core::Extensions::insert<T: core::marker::Send + core::marker::Sync + 'static>(&mut self, T)
+impl core::fmt::Debug for aidaemon_core::Extensions
+pub fn aidaemon_core::Extensions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::Failover
 impl aidaemon_core::Failover
 pub fn aidaemon_core::Failover::name(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -403,6 +417,9 @@ pub fn aidaemon_core::FailoverStep::deadline(self, core::time::Duration) -> Self
 pub fn aidaemon_core::FailoverStep::from_arc(alloc::sync::Arc<dyn aidaemon_core::Provider>) -> Self
 pub fn aidaemon_core::FailoverStep::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::FailoverStep::new(impl aidaemon_core::Provider + 'static) -> Self
+pub struct aidaemon_core::Finish
+pub aidaemon_core::Finish::outcome: aidaemon_core::FinishOutcome
+pub aidaemon_core::Finish::reply: core::option::Option<alloc::string::String>
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self
@@ -613,12 +630,14 @@ pub fn aidaemon_core::ToolCall::with_provider_data(self, serde_json::value::Valu
 #[non_exhaustive] pub struct aidaemon_core::ToolContext
 pub aidaemon_core::ToolContext::call_id: alloc::string::String
 pub aidaemon_core::ToolContext::cancel: tokio_util::sync::cancellation_token::CancellationToken
+pub aidaemon_core::ToolContext::extensions: aidaemon_core::Extensions
 pub aidaemon_core::ToolContext::run_id: aidaemon_core::RunId
 pub aidaemon_core::ToolContext::session_id: alloc::string::String
 pub aidaemon_core::ToolContext::turn: u32
 impl aidaemon_core::ToolContext
 pub fn aidaemon_core::ToolContext::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::ToolContext::with_cancel(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
+pub fn aidaemon_core::ToolContext::with_extensions(self, aidaemon_core::Extensions) -> Self
 pub fn aidaemon_core::ToolContext::with_run(self, aidaemon_core::RunId, u32) -> Self
 pub struct aidaemon_core::ToolError(pub alloc::string::String)
 impl core::convert::From<&str> for aidaemon_core::ToolError
@@ -636,12 +655,14 @@ pub aidaemon_core::ToolInfo::effects: aidaemon_core::CallEffects
 pub struct aidaemon_core::ToolOutput
 pub aidaemon_core::ToolOutput::content: alloc::string::String
 pub aidaemon_core::ToolOutput::details: serde_json::value::Value
+pub aidaemon_core::ToolOutput::finish: core::option::Option<aidaemon_core::Finish>
 pub aidaemon_core::ToolOutput::images: alloc::vec::Vec<aidaemon_core::Image>
 pub aidaemon_core::ToolOutput::is_error: bool
 pub aidaemon_core::ToolOutput::trust: core::option::Option<aidaemon_core::SourceTrust>
 pub aidaemon_core::ToolOutput::usage: aidaemon_core::Usage
 impl aidaemon_core::ToolOutput
 pub fn aidaemon_core::ToolOutput::error(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn aidaemon_core::ToolOutput::finish(self, aidaemon_core::Finish) -> Self
 pub fn aidaemon_core::ToolOutput::text(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::ToolOutput::with_details(self, serde_json::value::Value) -> Self
 pub fn aidaemon_core::ToolOutput::with_images(self, impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::Image>) -> Self
