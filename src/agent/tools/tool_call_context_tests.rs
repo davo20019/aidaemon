@@ -306,6 +306,24 @@ async fn model_supplied_underscore_keys_have_no_effect() {
             Box::new(|c| c.mandate_version.is_none()),
         ),
     ];
+    // Negative rows: a fact one tool receives does not leak to another.
+    let rows: Vec<(&str, &crate::traits::ToolCallContext, Check)> = rows
+        .into_iter()
+        .chain([
+            (
+                "_trust_roots",
+                &spawn,
+                Box::new(|c: &crate::traits::ToolCallContext| c.trust_roots.is_none()) as Check,
+            ),
+            (
+                "_parent_authority",
+                &terminal,
+                Box::new(|c: &crate::traits::ToolCallContext| {
+                    crate::agent::authority::parent_authority(c).is_none()
+                }) as Check,
+            ),
+        ])
+        .collect();
     let covered: Vec<&str> = rows.iter().map(|(key, _, _)| *key).collect();
     for (key, _) in HOSTILE {
         assert!(covered.contains(&key), "no row for {key}");
@@ -479,5 +497,56 @@ async fn no_underscore_injection_remains() {
             "{tool} received underscore arguments: {keys:?}"
         );
         assert_eq!(arguments["action"], "list", "{tool} keeps the model's own");
+    }
+}
+
+/// Each registered tool that needs the call's session gets it from the
+/// dispatcher's typed context: dispatched for real, none of them reports the
+/// session fact as missing.
+#[tokio::test]
+async fn fact_reading_tools_receive_call_context() {
+    let roots = vec![PROJECT.to_string()];
+    let authority = real_authority();
+    let mut harness = owner_harness().await;
+    let ctx = owner_ctx(&roots, &authority);
+    let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+    harness
+        .agent
+        .tools
+        .push(Arc::new(crate::tools::ManageMemoriesTool::new(
+            state.clone(),
+        )));
+    harness
+        .agent
+        .tools
+        .push(Arc::new(crate::tools::DiagnoseTool::new(
+            harness.agent.event_store.clone(),
+            harness.state.clone(),
+            harness.agent.llm_runtime.clone(),
+            20,
+            false,
+        )));
+
+    let calls = [
+        (
+            "manage_memories",
+            json!({"action": "create_personal_goal", "goal": "Synthetic reading goal"}),
+        ),
+        (
+            "manage_memories",
+            json!({"action": "cancel_scheduled", "goal_id": "all"}),
+        ),
+        ("self_diagnose", json!({"action": "list_tasks"})),
+    ];
+    for (tool, arguments) in calls {
+        let output = harness
+            .agent
+            .execute_tool_with_watchdog(tool, &arguments.to_string(), &ctx)
+            .await
+            .unwrap_or_else(|error| panic!("{tool} {arguments}: {error}"));
+        assert!(
+            !output.contains("missing from the call context"),
+            "{tool} {arguments}: {output}"
+        );
     }
 }

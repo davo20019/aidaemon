@@ -1947,9 +1947,9 @@ impl DiagnoseTool {
         facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
         let args: DiagnoseArgs = serde_json::from_str(arguments)?;
-        let session_id = facts
-            .session()
-            .ok_or_else(|| anyhow::anyhow!("self_diagnose requires internal _session_id"))?;
+        let session_id = facts.session().ok_or_else(|| {
+            anyhow::anyhow!("self_diagnose: the session fact is missing from the call context")
+        })?;
 
         match args.action.as_str() {
             "list_tasks" => {

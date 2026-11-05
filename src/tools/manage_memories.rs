@@ -1071,7 +1071,7 @@ impl ManageMemoriesTool {
                     .filter(|session| !session.is_empty())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Internal error: create_personal_goal requires _session_id."
+                            "Internal error: create_personal_goal: the session fact is missing from the call context."
                         )
                     })?;
                 let desc = args
@@ -1140,7 +1140,7 @@ impl ManageMemoriesTool {
 
                 let session_id = facts.session().unwrap_or("");
                 if session_id.trim().is_empty() {
-                    return Ok("Internal error: create_scheduled_goal requires _session_id.".to_string());
+                    return Ok("Internal error: create_scheduled_goal: the session fact is missing from the call context.".to_string());
                 }
                 let is_internal_visibility = facts.channel_visibility == Some(ChannelVisibility::Internal);
                 // `sub-` is the legacy child-session prefix (replaced by
@@ -1440,7 +1440,7 @@ impl ManageMemoriesTool {
                 let session_id = facts.session().unwrap_or("").trim();
                 if session_id.is_empty() {
                     return Ok(
-                        "Internal error: activate_scheduled requires _session_id.".to_string(),
+                        "Internal error: activate_scheduled: the session fact is missing from the call context.".to_string(),
                     );
                 }
                 let goal_id = args.goal_id.as_deref().ok_or_else(|| {
@@ -1775,7 +1775,7 @@ impl ManageMemoriesTool {
                     let session_id = facts.session().unwrap_or("").trim();
                     if session_id.is_empty() {
                         return Ok(
-                            "Internal error: cancel_scheduled with goal_id='all' requires _session_id."
+                            "Internal error: cancel_scheduled with goal_id='all': the session fact is missing from the call context."
                                 .to_string(),
                         );
                     }
@@ -3806,7 +3806,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("create_personal_goal requires _session_id"));
+            .contains("create_personal_goal: the session fact is missing from the call context"));
         assert!(state
             .get_active_personal_goals(50)
             .await
@@ -4312,7 +4312,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("requires _session_id"));
+        assert!(result.contains("the session fact is missing from the call context"));
+        assert!(!result.contains("_session_id"), "{result}");
         let goals = state.get_scheduled_goals().await.unwrap();
         assert!(goals.is_empty());
     }

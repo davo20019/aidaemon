@@ -1825,9 +1825,8 @@ impl ManageMandatesTool {
                 "record_measurement is reserved for the internal mandate deliberator.".to_string(),
             );
         }
-        let goal_id = required_trimmed(args.call_goal_id.as_deref(), "internal _goal_id")?;
-        let goal_run_id =
-            required_trimmed(args.call_goal_run_id.as_deref(), "internal _goal_run_id")?;
+        let goal_id = required_call_fact(args.call_goal_id.as_deref(), "goal")?;
+        let goal_run_id = required_call_fact(args.call_goal_run_id.as_deref(), "goal run")?;
         let mandate = self
             .state
             .get_mandate_for_goal(goal_id)
@@ -1876,13 +1875,10 @@ impl ManageMandatesTool {
                 "record_decision is reserved for the internal mandate deliberator.".to_string(),
             );
         }
-        let goal_id = required_trimmed(args.call_goal_id.as_deref(), "internal _goal_id")?;
-        let pinned_run_id =
-            required_trimmed(args.call_goal_run_id.as_deref(), "internal _goal_run_id")?;
-        let pinned_attempt_id = required_trimmed(
-            args.call_task_attempt_id.as_deref(),
-            "internal _task_attempt_id",
-        )?;
+        let goal_id = required_call_fact(args.call_goal_id.as_deref(), "goal")?;
+        let pinned_run_id = required_call_fact(args.call_goal_run_id.as_deref(), "goal run")?;
+        let pinned_attempt_id =
+            required_call_fact(args.call_task_attempt_id.as_deref(), "task attempt")?;
         let mandate = self
             .state
             .get_mandate_for_goal(goal_id)
@@ -2706,6 +2702,14 @@ fn required_trimmed<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{name} is required"))
+}
+
+/// A dispatcher fact the call needs (from its `ToolCallContext`).
+fn required_call_fact<'a>(value: Option<&'a str>, fact: &str) -> anyhow::Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("the {fact} fact is missing from the call context"))
 }
 
 fn required_bounded_trimmed<'a>(
