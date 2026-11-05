@@ -58,6 +58,7 @@ pub fn probe_requests() -> Vec<(&'static str, ModelRequest)> {
         tools,
         tool_choice: ToolChoice::Auto,
         max_output_tokens: Some(256),
+        ..Default::default()
     };
     vec![
         ("plain", base(Vec::new(), "Reply with a short greeting.")),
@@ -314,6 +315,10 @@ fn well_formed(events: &[StreamEvent]) -> Result<(Vec<String>, ModelResponse), S
     let mut done: Option<ModelResponse> = None;
     for (i, event) in events.iter().enumerate() {
         match (event, &done) {
+            (StreamEvent::Switched(_), None) => {}
+            (StreamEvent::Switched(_), Some(_)) => {
+                return Err(format!("event {i} is a Switched after Done"))
+            }
             (StreamEvent::TextDelta(d), None) => deltas.push(d.clone()),
             (StreamEvent::Done(r), None) => done = Some(r.clone()),
             (StreamEvent::TextDelta(_), Some(_)) => {
@@ -370,6 +375,7 @@ mod tests {
                     cached_input_tokens: 5,
                     cache_creation_tokens: 0,
                 },
+                ..Default::default()
             })
         }
         fn stream<'a>(

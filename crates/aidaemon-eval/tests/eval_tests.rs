@@ -379,6 +379,7 @@ impl Provider for Flaky {
                 cached_input_tokens: 20,
                 cache_creation_tokens: 0,
             },
+            ..Default::default()
         })
     }
 }

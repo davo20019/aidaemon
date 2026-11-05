@@ -89,6 +89,7 @@ pub fn text(content: impl Into<String>) -> ModelResponse {
         text: content.into(),
         tool_calls: Vec::new(),
         usage: SCRIPTED_USAGE,
+        ..Default::default()
     }
 }
 
@@ -98,6 +99,7 @@ pub fn tool_calls(calls: impl IntoIterator<Item = ToolCall>) -> ModelResponse {
         text: String::new(),
         tool_calls: calls.into_iter().collect(),
         usage: SCRIPTED_USAGE,
+        ..Default::default()
     }
 }
 

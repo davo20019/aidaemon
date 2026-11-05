@@ -6,6 +6,11 @@
 //!   OpenRouter, Ollama, llama.cpp, vLLM and other compatible servers.
 //! - [`Anthropic`]: the Messages API, with prompt caching of the stable
 //!   prefix (system prompt and tool definitions).
+//! - [`ChatGpt`]: models on a ChatGPT subscription through the Codex
+//!   backend's Responses API, with credentials from a [`ChatGptAuth`].
+//! - [`GoogleGenai`]: Gemini's `generateContent`, with thought signatures
+//!   carried in `ToolCall::provider_data` and Google Search grounding.
+//! - [`Xai`]: xAI's Responses API.
 //!
 //! Both stream over SSE: [`Provider::stream`](aidaemon_core::Provider::stream)
 //! yields [`StreamEvent::TextDelta`](aidaemon_core::StreamEvent::TextDelta)
@@ -17,9 +22,11 @@
 //! HTTP failures map to [`ProviderError`](aidaemon_core::ProviderError):
 //! 429 becomes `RateLimited` (with `retry-after`), 5xx, 408, timeouts,
 //! connection failures and mid-stream error events become `Transient`,
-//! 401/403 become `Auth`, and other 4xx become `InvalidRequest` with a
-//! short excerpt of the response body. Wrap a provider in
-//! [`aidaemon_core::Retry`] to retry the retryable ones.
+//! 401/403 `Auth`, 402 `Billing` (with the affordable tokens when stated),
+//! 404 `NotFound`, a context-length error `ContextOverflow` (with the
+//! window when stated), and other 4xx `InvalidRequest`, each with a short
+//! excerpt of the response body. Wrap a provider in
+//! [`aidaemon_core::Retry`] or [`aidaemon_core::Failover`] to recover.
 //!
 //! ```no_run
 //! use aidaemon_core::{Agent, Retry};
@@ -48,13 +55,27 @@
 //! ```
 
 mod anthropic;
+mod chatgpt;
+mod errors;
+mod google;
 mod openai;
 mod sse;
 mod transport;
+mod xai;
 
 pub use anthropic::{
     Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
-    ANTHROPIC_VERSION,
+    ANTHROPIC_VERSION, THINKING_BLOCKS_KEY,
+};
+pub use chatgpt::{
+    ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials, StaticChatGptAuth,
+    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_REASONING_EFFORTS,
+};
+pub use errors::{affordable_tokens, context_overflow, error_for_status};
+pub use google::{
+    GoogleGenai, GoogleGenaiBuilder, GOOGLE_DEFAULT_BASE_URL, GOOGLE_PART_FIELDS,
+    TEXT_ONLY_RESPONSE_MARKER,
 };
 pub use openai::{OpenAiCompatible, OpenAiCompatibleBuilder, OPENAI_DEFAULT_BASE_URL};
 pub use transport::ConfigError;
+pub use xai::{Xai, XaiBuilder, XAI_DEFAULT_BASE_URL};

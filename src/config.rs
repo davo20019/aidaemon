@@ -3576,9 +3576,10 @@ impl ContextWindowConfig {
     /// the configured cap when lower. Compaction runs after a reply, so a
     /// turn never waits for it below `emergency_compaction_threshold_for`.
     pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
-        let model_budget = self.context_budget_for(model);
         self.summarize_token_threshold
-            .min(model_budget.saturating_mul(3) / 5)
+            .min(aidaemon_policies::compaction_threshold(
+                self.context_budget_for(model),
+            ))
             .max(512)
     }
 
@@ -3586,15 +3587,15 @@ impl ContextWindowConfig {
     /// call: 80% of the model's window, so only a history the background
     /// pass could not keep up with blocks a reply.
     pub fn emergency_compaction_threshold_for(&self, model: &str) -> usize {
-        let model_budget = self.context_budget_for(model);
-        (model_budget.saturating_mul(4) / 5).max(self.summarize_token_threshold_for(model))
+        aidaemon_policies::wait_threshold(self.context_budget_for(model))
+            .max(self.summarize_token_threshold_for(model))
     }
 
     /// Raw recent-context overlap, also clamped so a summary can make progress.
     pub fn summary_recent_tokens_for(&self, model: &str) -> usize {
         let threshold = self.summarize_token_threshold_for(model);
         let recent = if self.summary_recent_tokens == default_summary_recent_tokens() {
-            threshold / 4
+            aidaemon_policies::verbatim_tokens(threshold)
         } else {
             self.summary_recent_tokens.min(threshold / 2)
         };

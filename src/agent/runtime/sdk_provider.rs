@@ -246,14 +246,20 @@ pub(super) fn to_daemon_messages_from(messages: &[sdk::Message]) -> Vec<Value> {
                         .iter()
                         .map(|call| {
                             names.insert(call.id.as_str(), call.name.as_str());
-                            json!({
+                            let mut value = json!({
                                 "id": call.id,
                                 "type": "function",
                                 "function": {
                                     "name": call.name,
                                     "arguments": call.arguments.to_string(),
                                 },
-                            })
+                            });
+                            // Reasoning signatures and thinking blocks the
+                            // provider needs back on replay.
+                            if let Some(data) = &call.provider_data {
+                                value["extra_content"] = data.clone();
+                            }
+                            value
                         })
                         .collect();
                     value["tool_calls"] = Value::Array(calls);
@@ -384,11 +390,16 @@ pub(super) fn values_to_sdk(values: &[Value]) -> Vec<sdk::Message> {
                                         .and_then(Value::as_str)
                                         .and_then(|raw| serde_json::from_str(raw).ok())
                                         .unwrap_or_else(|| json!({}));
-                                    Some(sdk::ToolCall::new(
+                                    let mut sdk_call = sdk::ToolCall::new(
                                         call.get("id")?.as_str()?,
                                         function.get("name")?.as_str()?,
                                         arguments,
-                                    ))
+                                    );
+                                    sdk_call.provider_data = call
+                                        .get("extra_content")
+                                        .filter(|data| !data.is_null())
+                                        .cloned();
+                                    Some(sdk_call)
                                 })
                                 .collect()
                         })
@@ -542,10 +553,14 @@ pub(super) fn from_provider_response(response: ProviderResponse) -> sdk::ModelRe
             .into_iter()
             .map(|call| {
                 let arguments = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-                sdk::ToolCall::new(call.id, call.name, arguments)
+                let mut sdk_call = sdk::ToolCall::new(call.id, call.name, arguments);
+                sdk_call.provider_data = call.extra_content.filter(|data| !data.is_null());
+                sdk_call
             })
             .collect(),
         usage,
+        reasoning: response.thinking,
+        note: response.response_note,
     }
 }
 
@@ -635,6 +650,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: sdk::ToolChoice::Auto,
             max_output_tokens: None,
+            ..Default::default()
         };
         let messages = to_daemon_messages(&request);
         assert_eq!(messages.len(), 4);
@@ -678,6 +694,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: sdk::ToolChoice::Auto,
             max_output_tokens: None,
+            ..Default::default()
         };
         let messages = to_daemon_messages(&request);
         let roles: Vec<_> = messages.iter().map(|m| m["role"].clone()).collect();
@@ -696,6 +713,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: sdk::ToolChoice::Auto,
             max_output_tokens: None,
+            ..Default::default()
         };
         let messages = to_daemon_messages(&request);
         let blocks = messages[0]["content"].as_array().unwrap();
@@ -718,6 +736,41 @@ mod tests {
                 "parameters": {"type": "object"}
             }})]
         );
+    }
+
+    /// A reasoning signature the provider returned on a tool call is sent
+    /// back with that call on the run's next request, and the reply's
+    /// reasoning and note reach the SDK response.
+    #[test]
+    fn provider_data_round_trips_through_the_run_transcript() {
+        let signature = json!({"thought_signature": "sig-synthetic"});
+        let response = from_provider_response(ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "c1".into(),
+                name: "terminal".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+                extra_content: Some(signature.clone()),
+            }],
+            usage: None,
+            thinking: Some("considered the listing".into()),
+            response_note: Some("truncated".into()),
+        });
+        assert_eq!(
+            response.reasoning.as_deref(),
+            Some("considered the listing")
+        );
+        assert_eq!(response.note.as_deref(), Some("truncated"));
+        assert_eq!(
+            response.tool_calls[0].provider_data,
+            Some(signature.clone())
+        );
+
+        let replayed =
+            to_daemon_messages_from(&[sdk::Message::assistant("", response.tool_calls.clone())]);
+        assert_eq!(replayed[0]["tool_calls"][0]["extra_content"], signature);
+        let back = values_to_sdk(&replayed);
+        assert_eq!(back[0].tool_calls[0].provider_data, Some(signature));
     }
 
     #[test]

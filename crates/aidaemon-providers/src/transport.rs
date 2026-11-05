@@ -26,6 +26,8 @@ const BODY_EXCERPT_CHARS: usize = 300;
 pub enum ConfigError {
     #[error("missing API key")]
     MissingApiKey,
+    #[error("missing {0}")]
+    Missing(&'static str),
     #[error("invalid header `{0}`")]
     InvalidHeader(String),
     #[error("could not build HTTP client: {0}")]
@@ -87,11 +89,7 @@ pub(crate) fn map_status(status: StatusCode, headers: &HeaderMap, body: &str) ->
         429 => ProviderError::RateLimited {
             retry_after: retry_after(headers),
         },
-        401 | 403 => ProviderError::Auth(detail),
-        408 => ProviderError::Transient(detail),
-        400..=499 => ProviderError::InvalidRequest(detail),
-        500..=599 => ProviderError::Transient(detail),
-        _ => ProviderError::Other(detail),
+        status => crate::errors::error_for_status(status, body, detail),
     }
 }
 
@@ -222,8 +220,24 @@ pub(crate) fn drive<D: SseDecoder>(
     request: reqwest::RequestBuilder,
     decoder: D,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    run(Phase::Start(Box::new(request)), decoder)
+}
+
+/// Like [`drive`], for a successful response the caller already received
+/// (after its own authentication handshake, for example).
+pub(crate) fn drive_response<D: SseDecoder>(
+    response: reqwest::Response,
+    decoder: D,
+) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    run(Phase::Body(response.bytes_stream().boxed()), decoder)
+}
+
+fn run<D: SseDecoder>(
+    phase: Phase,
+    decoder: D,
+) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
     let driver = Driver {
-        phase: Phase::Start(Box::new(request)),
+        phase,
         parser: SseParser::default(),
         decoder,
         queue: VecDeque::new(),

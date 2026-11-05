@@ -34,6 +34,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         tools: vec![],
         tool_choice: ToolChoice::Auto,
         max_output_tokens: None,
+        ..Default::default()
     }
 }
 
@@ -393,4 +394,33 @@ async fn no_auth_header_without_key() {
         .unwrap();
     assert!(!server.requests()[0].headers.contains_key("authorization"));
     assert_eq!(server.requests()[0].path, "/chat/completions");
+}
+
+#[test]
+fn json_formats_reasoning_and_defaults_reach_the_body() {
+    let provider = OpenAiCompatible::builder()
+        .api_key("k")
+        .max_tokens(700)
+        .reasoning_effort("high")
+        .build()
+        .unwrap();
+    let mut req = request(vec![Message::user("Give JSON.")]);
+    req.options.response_format = aidaemon_core::ResponseFormat::JsonSchema {
+        name: "answer".into(),
+        schema: json!({"type": "object"}),
+        strict: true,
+    };
+    let body = provider.request_body(&req);
+    assert_eq!(body["max_tokens"], 700);
+    assert_eq!(body["reasoning"], json!({"effort": "high"}));
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["name"], "answer");
+
+    req.options.reasoning_effort = Some("off".into());
+    req.options.response_format = aidaemon_core::ResponseFormat::JsonObject;
+    req.max_output_tokens = Some(50);
+    let body = provider.request_body(&req);
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    assert_eq!(body["max_tokens"], 50);
 }

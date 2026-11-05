@@ -19,6 +19,7 @@ mod approval;
 mod authority;
 mod error;
 mod event;
+mod failover;
 mod hook;
 mod limits;
 mod message;
@@ -46,13 +47,17 @@ pub use approval::{
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
+pub use failover::{
+    DefaultFailover, Failover, FailoverAction, FailoverPolicy, FailoverStep, ProviderSwitch,
+    SwitchReason,
+};
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};
 pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{RunOutcome, RunStatus};
 pub use provider::{
-    collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, Retry, StreamEvent,
-    ToolChoice, ToolSpec, Usage,
+    collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,
+    ResponseFormat, Retry, StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
 pub use safeguard::Safeguard;

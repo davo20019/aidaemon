@@ -818,6 +818,9 @@ impl<'a> Driver<'a> {
                 Some(Ok(StreamEvent::TextDelta(text))) => {
                     self.emit(Event::TextDelta { turn, text }).await?;
                 }
+                Some(Ok(StreamEvent::Switched(switch))) => {
+                    self.emit(Event::ProviderSwitched { turn, switch }).await?;
+                }
                 Some(Ok(StreamEvent::Done(response))) => return Ok(ModelCall::Response(response)),
                 Some(Err(err)) => return Ok(ModelCall::Failed(err.to_string())),
                 None => {
@@ -895,6 +898,7 @@ impl<'a> Driver<'a> {
             tools: self.agent.specs.clone(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: self.agent.max_output_tokens,
+            ..Default::default()
         }
     }
 

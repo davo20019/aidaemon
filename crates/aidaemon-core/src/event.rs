@@ -29,6 +29,12 @@ pub enum Event {
         reran: Vec<String>,
         indeterminate: Vec<String>,
     },
+    /// A [`crate::Failover`] chain moved to its next provider during this
+    /// turn's model call.
+    ProviderSwitched {
+        turn: u32,
+        switch: crate::ProviderSwitch,
+    },
     ModelResponded {
         turn: u32,
         usage: Usage,

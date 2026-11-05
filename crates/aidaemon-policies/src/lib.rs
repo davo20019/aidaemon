@@ -48,8 +48,10 @@ pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, 
 pub use completion::{ReceiptCompletionCheck, Requirement};
 pub use context_window::{estimate_tokens, ContextWindow};
 pub use conversation::{
-    ConversationCompaction, ConversationSummary, InMemorySummaries, ProviderSummarizer, Summarizer,
-    SummaryStore,
+    compaction_threshold, elide_middle, render_summary_note, turns_to_summarize, verbatim_tokens,
+    wait_threshold, CompactionJobs, CompactionLimits, Compactor, ConversationCompaction,
+    ConversationSource, ConversationSummary, ConversationTurn, InMemorySummaries, PendingTurns,
+    ProviderSummarizer, Summarizer, SummaryNote, SummaryStore, COMPACTED_STATE_HEADINGS,
 };
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
