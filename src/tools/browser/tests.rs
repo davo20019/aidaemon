@@ -4,6 +4,7 @@
 //! `execute_js` null/undefined handling, screenshot target selection) that
 //! later tasks will touch.
 
+use crate::testing::CallWithFacts;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,9 +69,17 @@ fn no_channel_tool(
 async fn dispatch_observation_navigate_routes_through_backend() {
     let (tool, backend, _rx) = mock_tool();
 
-    let args =
-        json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "navigate", "url": "https://example.com/"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out,
         "Navigated to https://example.com/\n\nPage text:\nmock text"
@@ -131,9 +140,17 @@ async fn dispatch_observation_scroll_routes_without_approval() {
         "action": "scroll",
         "direction": "down",
         "tab_id": "0",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "Scrolled down 700 pixels");
 
     let calls = backend.calls();
@@ -178,10 +195,16 @@ async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
         "action": "render_pdf",
         "source_path": source,
         "output_filename": "quarterly-investor-brief.pdf",
-        "_session_id": "sess-pdf"
     });
     let outcome: ToolCallOutcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(
+            &args.to_string(),
+            None,
+            crate::traits::ToolCallContext {
+                session_id: "sess-pdf".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -243,13 +266,16 @@ async fn render_pdf_rejects_non_html_and_output_path_traversal_before_launch() {
     let (tool, backend, _rx) = mock_tool();
 
     let non_html = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "render_pdf",
                 "source_path": source,
-                "_session_id": "sess-pdf-invalid"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-pdf-invalid".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -258,14 +284,17 @@ async fn render_pdf_rejects_non_html_and_output_path_traversal_before_launch() {
     let html = temp.path().join("document.html");
     std::fs::write(&html, "<p>safe</p>").unwrap();
     let traversal = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "render_pdf",
                 "source_path": html,
                 "output_filename": "../escaped.pdf",
-                "_session_id": "sess-pdf-invalid"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-pdf-invalid".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -291,14 +320,17 @@ async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
         );
 
     let result = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "render_pdf",
                 "source_path": source,
                 "output_filename": "never-produced.pdf",
-                "_session_id": "sess-pdf-timeout"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-pdf-timeout".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -318,8 +350,17 @@ async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
 async fn dispatch_mutation_click_routes_through_backend() {
     let (tool, backend, _rx) = mock_tool();
 
-    let args = json!({ "action": "click", "selector": "#submit", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "click", "selector": "#submit"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "Clicked element '#submit'");
 
     // Exact sequence: ensure_ready -> create_page -> click(selector) -> a
@@ -357,8 +398,17 @@ async fn dispatch_mutation_click_routes_through_backend() {
 async fn get_text_with_selector_routes_through_inner_text() {
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("hello inner"));
 
-    let args = json!({ "action": "get_text", "selector": "#headline", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text", "selector": "#headline"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "hello inner", "should return the mocked inner_text");
 
     let calls = backend.calls();
@@ -395,8 +445,17 @@ async fn get_text_selector_with_single_quote_passes_through_unchanged() {
     let selector = "input[name='x']";
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("field text"));
 
-    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text", "selector": selector});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "field text");
 
     let calls = backend.calls();
@@ -424,8 +483,17 @@ async fn get_text_selector_with_backslash_passes_through_unchanged() {
     let (tool, backend, _rx) =
         mock_tool_with(MockBackend::new().with_text_result("backslash text"));
 
-    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text", "selector": selector});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "backslash text");
 
     let calls = backend.calls();
@@ -449,8 +517,17 @@ async fn get_text_selector_with_newline_passes_through_unchanged() {
     let selector = "div[data-x=\"line1\nline2\"]";
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("newline text"));
 
-    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text", "selector": selector});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "newline text");
 
     let calls = backend.calls();
@@ -476,8 +553,17 @@ async fn get_text_selector_with_css_escape_passes_through_unchanged() {
     let (tool, backend, _rx) =
         mock_tool_with(MockBackend::new().with_text_result("escaped id text"));
 
-    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text", "selector": selector});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "escaped id text");
 
     let calls = backend.calls();
@@ -510,8 +596,16 @@ async fn get_text_with_selector_never_calls_evaluate() {
     for selector in selectors {
         let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("t"));
 
-        let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
-        tool.call(&args.to_string()).await.unwrap();
+        let args = json!({ "action": "get_text", "selector": selector});
+        tool.call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let calls = backend.calls();
         let calls = calls.lock().await;
@@ -526,8 +620,17 @@ async fn get_text_with_selector_never_calls_evaluate() {
 async fn get_text_without_selector_routes_through_body_text() {
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("hello body"));
 
-    let args = json!({ "action": "get_text", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "hello body", "should return the mocked body_text");
 
     let calls = backend.calls();
@@ -549,8 +652,17 @@ async fn execute_js_json_null_renders_as_null_string() {
     let (tool, backend, _rx) =
         mock_tool_with(MockBackend::new().with_eval_result(Some(serde_json::Value::Null)));
 
-    let args = json!({ "action": "execute_js", "script": "return null;", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "execute_js", "script": "return null;"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "null", "JSON null must render as the string \"null\"");
 
     let calls = backend.calls();
@@ -567,8 +679,17 @@ async fn execute_js_undefined_renders_as_no_return_value() {
     // fallback, NOT "null".
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_eval_result(None));
 
-    let args = json!({ "action": "execute_js", "script": "void 0;", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "execute_js", "script": "void 0;"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out, "(no return value)",
         "undefined/void must render as the (no return value) fallback"
@@ -588,8 +709,17 @@ async fn screenshot_with_selector_records_element_target() {
     // Channel ACCEPTS the delivery → the tool reports honest success.
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "selector": "#hero", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot", "selector": "#hero"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("delivered to chat"),
         "screenshot should report honest delivery: {out}"
@@ -626,8 +756,17 @@ async fn fill_result_contains_selector_but_not_value() {
     let (tool, _backend, _rx) = mock_tool();
 
     let value = "hunter2-super-secret-token-1234567890";
-    let args = json!({ "action": "fill", "selector": "#password", "value": value, "_session_id": "sess-a" });
-    let result = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "fill", "selector": "#password", "value": value});
+    let result = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // The selector must appear in the result so callers know which field was filled.
     assert!(
@@ -667,9 +806,17 @@ async fn fill_replaces_existing_value_not_appends() {
         "action": "fill",
         "selector": "#email",
         "value": "new@example.com",
-        "_session_id": "sess-a"
     });
-    let result = tool.call(&args.to_string()).await.unwrap();
+    let result = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // Action should succeed and report the selector.
     assert!(
@@ -714,8 +861,17 @@ async fn fill_replace_value_cases_round_trip_and_stay_secret() {
     for (selector, value) in cases {
         let (tool, backend, _rx) = mock_tool();
 
-        let args = json!({ "action": "fill", "selector": selector, "value": value, "_session_id": "sess-a" });
-        let result = tool.call(&args.to_string()).await.unwrap();
+        let args = json!({ "action": "fill", "selector": selector, "value": value});
+        let result = tool
+            .call_with(
+                &args.to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         // Result must contain selector (callers know which field was filled).
         assert!(
@@ -750,8 +906,17 @@ async fn screenshot_without_selector_defaults_to_viewport() {
     let (tool, backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("delivered to chat"),
         "screenshot should report honest delivery: {out}"
@@ -785,8 +950,17 @@ async fn screenshot_full_page_true_passes_through() {
     let (tool, backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot", "full_page": true});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(out.contains("delivered to chat"), "should succeed: {out}");
 
     let calls = backend.calls();
@@ -806,9 +980,18 @@ async fn screenshot_delivery_failure_is_reported_honestly() {
     // Channel REJECTS the delivery.
     let _media = spawn_media_responder(rx, Err("PHOTO_INVALID_DIMENSIONS".to_string()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    let args = json!({ "action": "screenshot"});
     // The Tool::call wrapper surfaces an internal Err(String) as Ok("Error: ..").
-    let msg = tool.call(&args.to_string()).await.unwrap();
+    let msg = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         msg.starts_with("Error:"),
         "a rejected delivery must surface as an error: {msg}"
@@ -834,8 +1017,17 @@ async fn screenshot_delivery_success_is_reported() {
     let (tool, _backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("captured and delivered to chat"),
         "successful delivery should be reported as delivered: {out}"
@@ -852,9 +1044,16 @@ async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
     let (tool, _backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    let args = json!({ "action": "screenshot"});
     let outcome: ToolCallOutcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(
+            &args.to_string(),
+            None,
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(outcome.metadata.attachments.len(), 1);
@@ -873,8 +1072,17 @@ async fn screenshot_oversized_delivered_as_document() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot", "full_page": true});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("delivered to chat as a file"),
         "oversized capture should report delivery as a file: {out}"
@@ -911,8 +1119,17 @@ async fn screenshot_document_delivery_failure_is_reported_and_inbox_persists() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Err("file too large".to_string()));
 
-    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
-    let msg = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot", "full_page": true});
+    let msg = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         msg.starts_with("Error:"),
         "a rejected document delivery must surface as an error: {msg}"
@@ -978,8 +1195,17 @@ async fn screenshot_empty_session_id_refused() {
     let (tool, backend, rx) = mock_tool();
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "" });
-    let msg = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot"});
+    let msg = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         msg.starts_with("Error:") && msg.contains("session id"),
         "empty session id must be refused: {msg}"
@@ -1004,8 +1230,17 @@ async fn screenshot_caption_redacts_query_and_fragment() {
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Ok(()));
 
-    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "screenshot"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // Result string: no token, no fragment; host + path present.
     assert!(
@@ -1096,12 +1331,28 @@ async fn two_sessions_get_distinct_pages() {
     let (tool, backend, _rx) = mock_tool();
 
     // Session A navigates.
-    let a = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
-    tool.call(&a.to_string()).await.unwrap();
+    let a = json!({ "action": "navigate", "url": "https://a.example/"});
+    tool.call_with(
+        &a.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // Session B navigates.
-    let b = json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-b" });
-    tool.call(&b.to_string()).await.unwrap();
+    let b = json!({ "action": "navigate", "url": "https://b.example/"});
+    tool.call_with(
+        &b.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-b".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // Exactly two create_page calls so far, with DISTINCT ids — the two sessions
     // hold different pages.
@@ -1117,8 +1368,16 @@ async fn two_sessions_get_distinct_pages() {
     );
 
     // A SECOND action on session A must REUSE A's page — no new create_page.
-    let a2 = json!({ "action": "get_text", "_session_id": "sess-a" });
-    tool.call(&a2.to_string()).await.unwrap();
+    let a2 = json!({ "action": "get_text"});
+    tool.call_with(
+        &a2.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let ids_after = create_page_ids(&backend).await;
     assert_eq!(
@@ -1135,8 +1394,17 @@ async fn two_sessions_get_distinct_pages() {
 async fn empty_session_id_rejected_before_launch() {
     // Explicit empty session id.
     let (tool, backend, _rx) = mock_tool();
-    let args = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "navigate", "url": "https://a.example/"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.to_lowercase().contains("session id"),
         "empty session id must produce a session-id error: {out}"
@@ -1174,10 +1442,26 @@ async fn two_sessions_reuse_pages_without_deadlock() {
     let (tool, backend, _rx) = mock_tool();
 
     for _ in 0..3 {
-        let a = json!({ "action": "get_text", "_session_id": "sess-a" });
-        tool.call(&a.to_string()).await.unwrap();
-        let b = json!({ "action": "get_text", "_session_id": "sess-b" });
-        tool.call(&b.to_string()).await.unwrap();
+        let a = json!({ "action": "get_text"});
+        tool.call_with(
+            &a.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let b = json!({ "action": "get_text"});
+        tool.call_with(
+            &b.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-b".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     }
 
     // Despite six actions, only two pages were ever created (one per session).
@@ -1219,16 +1503,37 @@ async fn list_tabs_reports_tabs_with_redacted_origins() {
     let (tool, _backend, _rx) = mock_tool_with(MockBackend::new().with_url(secret));
 
     // Open the session's first tab via navigate.
-    let nav =
-        json!({ "action": "navigate", "url": "https://first.example/", "_session_id": "sess-a" });
-    tool.call(&nav.to_string()).await.unwrap();
+    let nav = json!({ "action": "navigate", "url": "https://first.example/"});
+    tool.call_with(
+        &nav.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // new_tab — its page reports the secret url; only the origin must be shown.
-    let nt = json!({ "action": "new_tab", "_session_id": "sess-a" });
-    tool.call(&nt.to_string()).await.unwrap();
+    let nt = json!({ "action": "new_tab"});
+    tool.call_with(
+        &nt.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let out = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -1261,15 +1566,32 @@ async fn new_tab_adds_and_activates_tab() {
     let (tool, backend, _rx) = mock_tool();
 
     // First tab via navigate.
-    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
-    tool.call(&nav.to_string()).await.unwrap();
+    let nav = json!({ "action": "navigate", "url": "https://a.example/"});
+    tool.call_with(
+        &nav.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let ids_before = create_page_ids(&backend).await;
     assert_eq!(ids_before.len(), 1, "one page so far: {ids_before:?}");
 
     // Open a second tab.
-    let nt = json!({ "action": "new_tab", "_session_id": "sess-a" });
-    let out = tool.call(&nt.to_string()).await.unwrap();
+    let nt = json!({ "action": "new_tab"});
+    let out = tool
+        .call_with(
+            &nt.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Opened new tab"),
         "new_tab should report id: {out}"
@@ -1284,7 +1606,13 @@ async fn new_tab_adds_and_activates_tab() {
 
     // list_tabs shows two tabs with the second active (new_tab activates it).
     let list = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(list.contains("Open tabs (2)"), "two tabs expected: {list}");
@@ -1308,8 +1636,16 @@ async fn popup_after_click_is_discoverable() {
     let (tool, backend, _rx) = mock_tool();
 
     // Establish the session's first tab.
-    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
-    tool.call(&nav.to_string()).await.unwrap();
+    let nav = json!({ "action": "navigate", "url": "https://a.example/"});
+    tool.call_with(
+        &nav.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // The session's active tab is the page minted by navigate — it is the
     // legitimate opener for a popup this session spawns.
@@ -1330,8 +1666,12 @@ async fn popup_after_click_is_discoverable() {
 
     // Click — should detect the popup and report its tab id.
     let out = tool
-        .call(
-            &json!({ "action": "click", "selector": "#open", "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#open"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1342,7 +1682,13 @@ async fn popup_after_click_is_discoverable() {
 
     // list_tabs now shows BOTH the original and the popup tab.
     let list = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -1380,8 +1726,16 @@ async fn popup_with_foreign_opener_is_not_attributed() {
     let (tool, backend, _rx) = mock_tool();
 
     // Session A establishes its first tab.
-    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
-    tool.call(&nav.to_string()).await.unwrap();
+    let nav = json!({ "action": "navigate", "url": "https://a.example/"});
+    tool.call_with(
+        &nav.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // Script a net-new target whose opener is some OTHER target (not A's active
     // tab) — modeling a tab spawned by a different session or independently.
@@ -1397,8 +1751,12 @@ async fn popup_with_foreign_opener_is_not_attributed() {
     // A clicks. The new target appears in the global set, but its opener is not
     // A's active tab, so the click must NOT report a new tab.
     let out = tool
-        .call(
-            &json!({ "action": "click", "selector": "#open", "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#open"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1414,7 +1772,13 @@ async fn popup_with_foreign_opener_is_not_attributed() {
     // list_tabs for session A must NOT include the foreign target — only A's
     // original tab remains.
     let list = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -1434,20 +1798,37 @@ async fn switch_tab_changes_active_page() {
     let (tool, backend, _rx) = mock_tool();
 
     // First tab.
-    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
-    tool.call(&nav.to_string()).await.unwrap();
+    let nav = json!({ "action": "navigate", "url": "https://a.example/"});
+    tool.call_with(
+        &nav.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let first_id = create_page_ids(&backend).await[0].clone();
 
     // Second tab (now active).
-    tool.call(&json!({ "action": "new_tab", "_session_id": "sess-a" }).to_string())
-        .await
-        .unwrap();
+    tool.call_with(
+        &json!({ "action": "new_tab"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // Switch back to the first tab by its id.
     let out = tool
-        .call(
-            &json!({ "action": "switch_tab", "tab_id": first_id, "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "switch_tab", "tab_id": first_id}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1458,7 +1839,13 @@ async fn switch_tab_changes_active_page() {
 
     // list_tabs now marks the first tab active again.
     let list = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let active_line = list
@@ -1479,18 +1866,24 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     let (tool, backend, _rx) = mock_tool();
 
     // Session A has one tab.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     let a_tab = create_page_ids(&backend).await[0].clone();
 
     // Session B has one tab — capture B's real tab id.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-b" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://b.example/"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-b".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -1499,9 +1892,12 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
 
     // A switching to a totally unknown id errors.
     let out = tool
-        .call(
-            &json!({ "action": "switch_tab", "tab_id": "no-such-tab", "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "switch_tab", "tab_id": "no-such-tab"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1512,9 +1908,12 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
 
     // A switching to B's REAL tab id must be rejected (cross-session).
     let out = tool
-        .call(
-            &json!({ "action": "switch_tab", "tab_id": b_tab, "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "switch_tab", "tab_id": b_tab}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1525,8 +1924,12 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
 
     // A closing B's REAL tab id must be rejected too.
     let out = tool
-        .call(
-            &json!({ "action": "close_tab", "tab_id": b_tab, "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "close_tab", "tab_id": b_tab}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1537,9 +1940,12 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
 
     // Sanity: B can still switch to its own tab.
     let out = tool
-        .call(
-            &json!({ "action": "switch_tab", "tab_id": b_tab, "_session_id": "sess-b" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "switch_tab", "tab_id": b_tab}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-b".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1556,23 +1962,35 @@ async fn close_tab_removes_and_reports_new_active() {
     let (tool, _backend, _rx) = mock_tool();
 
     // First tab + a second (active) tab.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     let opened = tool
-        .call(&json!({ "action": "new_tab", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "new_tab"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let second_id = tab_id_from_opened(&opened);
 
     // Close the active (second) tab — the first must become active again.
     let out = tool
-        .call(
-            &json!({ "action": "close_tab", "tab_id": second_id, "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "close_tab", "tab_id": second_id}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1583,7 +2001,13 @@ async fn close_tab_removes_and_reports_new_active() {
 
     // Only one tab remains.
     let list = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -1650,16 +2074,25 @@ async fn single_page_actions_use_active_tab() {
         mock_tool_with(MockBackend::new().with_text_result("active tab text"));
 
     // Navigate establishes the active tab.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
 
     // get_text routes through the active tab's page.
     let out = tool
-        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "get_text"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out, "active tab text");
@@ -1826,9 +2259,12 @@ async fn public_navigation_skips_approval_and_reaches_backend() {
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
-        .call(
-            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "navigate", "url": "https://example.com/"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1859,14 +2295,17 @@ async fn trusted_scheduled_navigation_skips_prompt() {
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://www.nist.gov/research",
-                "_session_id": "scheduled-worker",
-                "_trusted_session": true
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "scheduled-worker".into(),
+                trusted_session: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1896,14 +2335,17 @@ async fn trusted_scheduled_session_executes_consequential_click_without_prompt()
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "click",
                 "selector": "#publish",
-                "_session_id": "scheduled-worker",
-                "_trusted_session": true
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "scheduled-worker".into(),
+                trusted_session: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1920,14 +2362,17 @@ async fn trusted_scheduled_session_executes_consequential_click_without_prompt()
 async fn trusted_scheduled_session_still_prompts_for_arbitrary_javascript() {
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "execute_js",
                 "script": "document.body.remove()",
-                "_session_id": "scheduled-worker",
-                "_trusted_session": true
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "scheduled-worker".into(),
+                trusted_session: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1950,8 +2395,12 @@ async fn approval_deny_blocks_ordinary_mutation_before_backend() {
     let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
-        .call(
-            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#menu"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1979,9 +2428,12 @@ async fn approval_deny_blocks_consequential_click_before_backend() {
 
     // "#delete" → consequential (point-of-action), so it always prompts.
     let out = tool
-        .call(
-            &json!({ "action": "click", "selector": "#delete", "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#delete"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2013,8 +2465,12 @@ async fn approval_timeout_denies_without_backend() {
 
     let start = std::time::Instant::now();
     let out = tool
-        .call(
-            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#menu"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2054,9 +2510,12 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
 
     // Public navigation is read-only and remains available without a channel.
     let nav = tool
-        .call(
-            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "navigate", "url": "https://example.com/"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2075,8 +2534,12 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
 
     // A mutation still requires approval and fails closed without a channel.
     let mutation = tool
-        .call(
-            &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+        .call_with(
+            &json!({ "action": "click", "selector": "#menu"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2091,7 +2554,13 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
 
     // An observation (get_text) is free — it runs without a channel.
     let obs = tool
-        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "get_text"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -2112,7 +2581,13 @@ async fn observations_never_prompt() {
 
     for action in &["get_text", "inspect_page", "screenshot", "list_tabs"] {
         let out = tool
-            .call(&json!({ "action": action, "_session_id": "sess-obs" }).to_string())
+            .call_with(
+                &json!({ "action": action}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-obs".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2150,15 +2625,23 @@ async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
-    tool.call(
-        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     assert_eq!(recorder.count().await, 1, "first mutation must prompt");
 
-    tool.call(
-        &json!({ "action": "click", "selector": "#details", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#details"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2182,23 +2665,29 @@ async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
 async fn public_navigation_is_free_across_origins_and_agent_sessions() {
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
-    tool.call(
+    tool.call_with(
         &json!({
             "action": "navigate",
             "url": "https://site.example/first?secret=one",
-            "_session_id": "specialist:code:first"
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "specialist:code:first".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
-    tool.call(
+    tool.call_with(
         &json!({
             "action": "navigate",
             "url": "https://different.example/second?secret=two",
-            "_session_id": "parent-session"
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "parent-session".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2222,13 +2711,16 @@ async fn public_navigation_needs_no_persistent_grant_after_tool_restart() {
     let (first, _backend, first_recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::Deny);
     first
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://persistent.example/first",
-                "_session_id": "first-agent"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "first-agent".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2237,13 +2729,16 @@ async fn public_navigation_needs_no_persistent_grant_after_tool_restart() {
     let (restarted, backend, restarted_recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::Deny);
     let out = restarted
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://persistent.example/after-restart",
-                "_session_id": "different-agent"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "different-agent".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2267,8 +2762,9 @@ async fn ordinary_mutation_approval_is_session_only() {
         approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
 
     for session in ["specialist:one", "parent-session"] {
-        tool.call(
-            &json!({ "action": "click", "selector": "#menu", "_session_id": session }).to_string(),
+        tool.call_with(
+            &json!({ "action": "click", "selector": "#menu" }).to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .unwrap();
@@ -2294,9 +2790,12 @@ async fn execute_js_prompts_every_call_and_hides_script() {
     let script = format!("var token = '{sentinel}'; return token;");
 
     for _ in 0..2 {
-        tool.call(
-            &json!({ "action": "execute_js", "script": script, "_session_id": "sess-a" })
-                .to_string(),
+        tool.call_with(
+            &json!({ "action": "execute_js", "script": script}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2339,23 +2838,29 @@ async fn execute_js_prompt_uses_origin_cached_after_navigation() {
         ApprovalResponse::AllowSession,
     );
 
-    tool.call(
+    tool.call_with(
         &json!({
             "action": "navigate",
             "url": "https://example.com/reservations?token=SECRET",
-            "_session_id": "sess-origin"
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-origin".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
-    tool.call(
+    tool.call_with(
         &json!({
             "action": "execute_js",
             "script": "1 + 1",
-            "_session_id": "sess-origin"
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-origin".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2377,17 +2882,24 @@ async fn consequential_click_prompts_despite_session_approval() {
 
     // Public navigation is read-only and does not prompt or grant mutation
     // authority.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     assert_eq!(recorder.count().await, 0);
 
     // An ordinary mutation receives reusable session approval.
-    tool.call(
-        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2395,8 +2907,12 @@ async fn consequential_click_prompts_despite_session_approval() {
 
     // A consequential click ("#delete") must still prompt despite the approved
     // session.
-    tool.call(
-        &json!({ "action": "click", "selector": "#delete", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#delete"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2416,14 +2932,17 @@ async fn consequential_fill_prompt_hides_value() {
     // "#submit-password" selector is opaque/hyphenated (not consequential), so
     // force point-of-action via a standalone consequential token in the selector.
     let secret_value = "hunter2-super-secret";
-    tool.call(
+    tool.call_with(
         &json!({
             "action": "fill",
             "selector": "#submit",
             "value": secret_value,
-            "_session_id": "sess-a"
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2454,13 +2973,21 @@ async fn allow_once_does_not_persist_session_approval() {
     let (tool, _backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
 
-    tool.call(
-        &json!({ "action": "click", "selector": "#menu", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
-    tool.call(
-        &json!({ "action": "click", "selector": "#details", "_session_id": "sess-a" }).to_string(),
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#details"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -2479,7 +3006,13 @@ async fn administrative_actions_never_prompt() {
     let (tool, _backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
     let out = tool
-        .call(&json!({ "action": "close", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "close"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -2526,13 +3059,16 @@ async fn navigate_redirect_to_loopback_is_blocked_on_final_url() {
     );
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://public-redirector.example/go",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2565,13 +3101,16 @@ async fn navigate_redirect_to_public_is_allowed() {
     );
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://start.example/",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2590,13 +3129,16 @@ async fn navigate_to_metadata_endpoint_is_blocked_preflight() {
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2631,13 +3173,16 @@ async fn new_tab_to_private_url_is_blocked() {
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "new_tab",
                 "url": "http://10.0.0.5/internal?secret=abc",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2695,13 +3240,16 @@ async fn navigate_blocked_redirect_resets_page_to_about_blank() {
     );
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": "https://public-redirector.example/go",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2753,7 +3301,13 @@ async fn observation_actions_refuse_on_blocked_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "get_text"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2782,7 +3336,13 @@ async fn observation_actions_refuse_on_blocked_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(&json!({ "action": "screenshot", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "screenshot"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2810,7 +3370,13 @@ async fn observation_actions_refuse_on_blocked_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(&json!({ "action": "inspect_page", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "inspect_page"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2838,13 +3404,16 @@ async fn observation_actions_refuse_on_blocked_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "execute_js",
                     "script": "document.body.innerText",
-                    "_session_id": "sess-a"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2878,7 +3447,13 @@ async fn observation_actions_refuse_on_private_current_url() {
     );
 
     let out = tool
-        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "get_text"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -2913,7 +3488,13 @@ async fn observation_actions_allowed_on_public_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "get_text"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out, "public body", "public get_text must proceed: {out}");
@@ -2929,7 +3510,13 @@ async fn observation_actions_allowed_on_public_current_url() {
         let (tool, backend, rx) = mock_tool_with(MockBackend::new().with_url(public));
         let _media = spawn_media_responder(rx, Ok(()));
         let out = tool
-            .call(&json!({ "action": "screenshot", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "screenshot"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2949,9 +3536,12 @@ async fn observation_actions_allowed_on_public_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(
-                &json!({ "action": "execute_js", "script": "1 + 1", "_session_id": "sess-a" })
-                    .to_string(),
+            .call_with(
+                &json!({ "action": "execute_js", "script": "1 + 1"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2972,7 +3562,13 @@ async fn observation_actions_allowed_on_public_current_url() {
             ApprovalResponse::AllowSession,
         );
         let out = tool
-            .call(&json!({ "action": "inspect_page", "_session_id": "sess-a" }).to_string())
+            .call_with(
+                &json!({ "action": "inspect_page"}).to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(!out.to_lowercase().contains("block"), "{out}");
@@ -3016,12 +3612,20 @@ async fn oversized_script_rejected_before_evaluate() {
     let script = "x".repeat(64 * 1024 + 1);
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
 
-    let args = serde_json::json!({
+    let args = json!({
         "action": "execute_js",
         "script": script,
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // The error must name the size and the limit.
     assert!(
@@ -3071,12 +3675,20 @@ async fn browser_management_api_denied_not_evaluated() {
     for (script, denied_capability) in denied_scripts {
         let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "execute_js",
             "script": script,
-            "_session_id": "sess-a"
         });
-        let out = tool.call(&args.to_string()).await.unwrap();
+        let out = tool
+            .call_with(
+                &args.to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "sess-a".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         // Error must name the capability class, not echo the full script.
         assert!(
@@ -3102,12 +3714,20 @@ async fn browser_management_api_denied_not_evaluated() {
     // CONTROL: a benign script must NOT be blocked.
     let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
     let benign = "document.title";
-    let args = serde_json::json!({
+    let args = json!({
         "action": "execute_js",
         "script": benign,
-        "_session_id": "sess-control"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-control".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         !out.to_lowercase().contains("browser management")
             && !out.to_lowercase().contains("not allowed"),
@@ -3133,12 +3753,20 @@ async fn approved_execute_js_refused_on_blocked_current_url() {
         ApprovalResponse::AllowOnce,
     );
 
-    let args = serde_json::json!({
+    let args = json!({
         "action": "execute_js",
         "script": "document.body.innerText",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // Blocked by the live-URL gate, even though the user approved.
     assert!(
@@ -3181,12 +3809,20 @@ async fn execute_js_result_is_redacted() {
         ApprovalResponse::AllowOnce,
     );
 
-    let args = serde_json::json!({
+    let args = json!({
         "action": "execute_js",
         "script": "getSecret()",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // The raw secret must not appear in the output.
     assert!(
@@ -3219,11 +3855,19 @@ async fn get_text_result_is_redacted() {
         ApprovalResponse::AllowSession,
     );
 
-    let args = serde_json::json!({
+    let args = json!({
         "action": "get_text",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     // The raw bearer token must not survive in the output.
     assert!(
@@ -3248,12 +3892,20 @@ async fn get_text_result_is_redacted() {
 async fn denied_execute_js_not_evaluated() {
     let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
-    let args = serde_json::json!({
+    let args = json!({
         "action": "execute_js",
         "script": "document.title",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     assert!(
         out.to_lowercase().contains("denied"),
@@ -3317,8 +3969,17 @@ async fn dead_handler_triggers_relaunch_on_next_action() {
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("alive"));
 
     // First action establishes the connection.
-    let args = json!({ "action": "get_text", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "alive");
     assert!(
         backend.is_connected().await,
@@ -3335,7 +3996,16 @@ async fn dead_handler_triggers_relaunch_on_next_action() {
 
     // Next action must observe the dead handler and relaunch (fresh EnsureReady),
     // then succeed.
-    let out2 = tool.call(&args.to_string()).await.unwrap();
+    let out2 = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out2, "alive", "action after relaunch should succeed");
     assert!(
         backend.is_connected().await,
@@ -3365,8 +4035,17 @@ async fn observation_retries_once_after_connection_error() {
         .fail_once_with_connection_error_on(FailOp::BodyText)
         .await;
 
-    let args = json!({ "action": "get_text", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "get_text"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out, "recovered text",
         "observation should retry and return the text after reconnect"
@@ -3402,8 +4081,17 @@ async fn mutation_is_not_replayed_after_connection_error() {
         .fail_once_with_connection_error_on(FailOp::Click)
         .await;
 
-    let args = json!({ "action": "click", "selector": "#buy-now", "_session_id": "sess-a" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "click", "selector": "#buy-now"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.to_lowercase().contains("could not be confirmed")
             || out.to_lowercase().contains("not retried")
@@ -3444,9 +4132,17 @@ async fn fill_is_not_replayed_after_connection_error() {
         "action": "fill",
         "selector": "#card-number",
         "value": "4111111111111111",
-        "_session_id": "sess-a"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.to_lowercase().contains("connection was lost")
             || out.to_lowercase().contains("could not be confirmed"),
@@ -3482,14 +4178,23 @@ async fn ordinary_error_does_not_trigger_reconnect() {
 
     // Establish the session first.
     let _ = tool
-        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "list_tabs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
     let out = tool
-        .call(
-            &json!({ "action": "switch_tab", "tab_id": "does-not-exist", "_session_id": "sess-a" })
-                .to_string(),
+        .call_with(
+            &json!({ "action": "switch_tab", "tab_id": "does-not-exist"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -3517,9 +4222,12 @@ async fn close_on_launched_browser_records_graceful_shutdown() {
     let (tool, backend, _rx) = mock_tool();
 
     // Establish a session so a browser is "live", then close.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -3551,9 +4259,12 @@ async fn set_mode_change_reuses_graceful_shutdown() {
     // Bring a browser up (the mock defaults to headless), then switch to visible
     // — a REAL mode change while a browser is live, which must reuse the graceful
     // teardown path.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -3581,9 +4292,12 @@ async fn set_mode_change_reuses_graceful_shutdown() {
 
     // A no-op same-mode call (switch to visible again) must NOT tear the browser
     // down again — bring a browser back up first, then re-issue the SAME mode.
-    tool.call(
-        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
-            .to_string(),
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -3970,8 +4684,17 @@ async fn wait_present_succeeds_when_element_appears_before_deadline() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args = json!({ "action": "wait", "selector": "#go", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#go"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "Element '#go' found", "present should succeed: {out}");
 }
 
@@ -3982,8 +4705,17 @@ async fn wait_present_times_out_when_element_never_appears() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args = json!({ "action": "wait", "selector": "#never", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#never"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("#never") && out.contains("4s"),
         "present should bound-timeout: {out}"
@@ -3999,9 +4731,17 @@ async fn wait_visible_succeeds_when_element_becomes_visible() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#v", "condition": "visible", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#v", "condition": "visible"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out, "Element '#v' is visible",
         "visible should succeed: {out}"
@@ -4015,9 +4755,17 @@ async fn wait_visible_times_out_when_never_visible() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#v", "condition": "visible", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#v", "condition": "visible"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("not visible"),
         "visible should bound-timeout: {out}"
@@ -4033,9 +4781,17 @@ async fn wait_enabled_succeeds_when_element_becomes_enabled() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#e", "condition": "enabled", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#e", "condition": "enabled"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out, "Element '#e' is enabled",
         "enabled should succeed: {out}"
@@ -4049,9 +4805,17 @@ async fn wait_enabled_times_out_when_never_enabled() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#e", "condition": "enabled", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#e", "condition": "enabled"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("not enabled"),
         "enabled should bound-timeout: {out}"
@@ -4068,9 +4832,17 @@ async fn wait_hidden_succeeds_when_element_becomes_hidden() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#h", "condition": "hidden", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#h", "condition": "hidden"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out, "Element '#h' is hidden",
         "hidden should succeed: {out}"
@@ -4085,9 +4857,17 @@ async fn wait_hidden_times_out_when_element_stays_visible() {
         ..Default::default()
     };
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
-    let args =
-        json!({ "action": "wait", "selector": "#h", "condition": "hidden", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "wait", "selector": "#h", "condition": "hidden"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("still visible"),
         "hidden should bound-timeout: {out}"
@@ -4109,9 +4889,17 @@ async fn wait_text_contains_succeeds_when_text_appears() {
         "selector": "#status",
         "condition": "text_contains",
         "text": "complete",
-        "_session_id": "s"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("text contains the expected value"),
         "text_contains should succeed: {out}"
@@ -4132,9 +4920,17 @@ async fn wait_text_contains_times_out_when_text_never_matches() {
         "selector": "#status",
         "condition": "text_contains",
         "text": "complete",
-        "_session_id": "s"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("did not contain"),
         "text_contains should bound-timeout: {out}"
@@ -4148,9 +4944,17 @@ async fn wait_text_contains_requires_a_needle() {
         "action": "wait",
         "selector": "#status",
         "condition": "text_contains",
-        "_session_id": "s"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error") && out.contains("text_contains") && out.contains("text"),
         "text_contains without a needle should error: {out}"
@@ -4164,9 +4968,17 @@ async fn wait_rejects_unknown_condition() {
         "action": "wait",
         "selector": "#x",
         "condition": "exists",
-        "_session_id": "s"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error") && out.contains("Invalid wait condition"),
         "unknown condition should error: {out}"
@@ -4187,9 +4999,17 @@ async fn wait_per_call_timeout_overrides_default_and_clamps() {
         "action": "wait",
         "selector": "#never",
         "timeout_secs": 2,
-        "_session_id": "s"
     });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("Error: Timeout") && out.contains("2s"),
         "per-call timeout_secs should override the default: {out}"
@@ -4203,8 +5023,17 @@ async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
     // The navigating mock resolves wait_for_navigation immediately, so navigate
     // returns promptly under the fake clock (no 2s blind sleep).
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
-    let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "navigate", "url": "https://example.com/"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out,
         "Navigated to https://example.com/\n\nPage text:\nmock text"
@@ -4237,8 +5066,17 @@ async fn navigate_bounds_when_navigation_never_settles() {
     // proving navigate is bounded (never hangs) even when `load` never fires,
     // and still revalidates the committed URL afterward.
     let (tool, backend) = wait_tool(MockBackend::new().with_nav_never_settles());
-    let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "navigate", "url": "https://example.com/"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         out,
         "Navigated to https://example.com/\n\nPage text:\nmock text"
@@ -4256,8 +5094,17 @@ async fn click_that_navigates_waits_for_navigation() {
     // A click that triggers navigation: wait_for_navigation resolves immediately,
     // so the nav branch of the race wins and the probe is recorded.
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
-    let args = json!({ "action": "click", "selector": "#go", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "click", "selector": "#go"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "Clicked element '#go'");
     let calls = backend.calls();
     let calls = calls.lock().await;
@@ -4283,8 +5130,17 @@ async fn click_that_does_not_navigate_returns_fast_via_settle() {
     // completes instantly. Use `with_nav_never_settles()` to exercise the
     // bounded-timeout path specifically.
     let (tool, backend) = wait_tool(MockBackend::new());
-    let args = json!({ "action": "click", "selector": "#noop", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "click", "selector": "#noop"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(out, "Clicked element '#noop'");
     // The race still launched the nav probe (recorded), but the result is the
     // fast settle path — the click succeeded without a popup/navigation.
@@ -4301,8 +5157,16 @@ async fn click_navrace_still_detects_popup() {
     let (tool, backend) = wait_tool(MockBackend::new());
 
     // Prime the session so it has an active tab id (the legitimate opener).
-    let prime = json!({ "action": "list_tabs", "_session_id": "s" });
-    tool.call(&prime.to_string()).await.unwrap();
+    let prime = json!({ "action": "list_tabs"});
+    tool.call_with(
+        &prime.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "s".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let opener = backend
         .calls()
         .lock()
@@ -4324,8 +5188,17 @@ async fn click_navrace_still_detects_popup() {
         )
         .await;
 
-    let args = json!({ "action": "click", "selector": "#open", "_session_id": "s" });
-    let out = tool.call(&args.to_string()).await.unwrap();
+    let args = json!({ "action": "click", "selector": "#open"});
+    let out = tool
+        .call_with(
+            &args.to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "s".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         out.contains("opened new tab") && out.contains("popup-xyz"),
         "click nav-race must still detect the spawned popup: {out}"
@@ -4344,11 +5217,25 @@ async fn get_console_logs_returns_scripted_entries_for_active_tab() {
     ]);
     let (tool, _backend, _rec) = mock_tool_with(backend);
 
-    let prime = json!({ "action": "list_tabs", "_session_id": "sess-a" });
-    tool.call(&prime.to_string()).await.unwrap();
+    let prime = json!({ "action": "list_tabs"});
+    tool.call_with(
+        &prime.to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let out = tool
-        .call(&json!({ "action": "get_console_logs", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "get_console_logs"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -4365,12 +5252,24 @@ async fn get_network_errors_redacts_url_origin() {
     )]);
     let (tool, _backend, _rec) = mock_tool_with(backend);
 
-    tool.call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
-        .await
-        .unwrap();
+    tool.call_with(
+        &json!({ "action": "list_tabs"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let out = tool
-        .call(&json!({ "action": "get_network_errors", "_session_id": "sess-a" }).to_string())
+        .call_with(
+            &json!({ "action": "get_network_errors"}).to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -4384,18 +5283,27 @@ async fn get_network_errors_redacts_url_origin() {
 async fn get_console_logs_unknown_tab_is_rejected() {
     let (tool, _backend, _rec) = mock_tool();
 
-    tool.call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
-        .await
-        .unwrap();
+    tool.call_with(
+        &json!({ "action": "list_tabs"}).to_string(),
+        crate::traits::ToolCallContext {
+            session_id: "sess-a".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let out = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "get_console_logs",
                 "tab_id": "not-a-real-tab",
-                "_session_id": "sess-a"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                session_id: "sess-a".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

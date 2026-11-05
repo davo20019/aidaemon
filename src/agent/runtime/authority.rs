@@ -190,6 +190,15 @@ pub(crate) struct InheritedAuthority {
     pub declined: Vec<aidaemon_core::EffectKey>,
 }
 
+/// The parent turn's authority the dispatcher handed `spawn_agent`: an
+/// application fact (it carries the owner's configured level), so it rides
+/// in the call context's extensions rather than as a typed SDK field.
+pub(crate) fn parent_authority(
+    facts: &crate::traits::ToolCallContext,
+) -> Option<&InheritedAuthority> {
+    facts.extensions.get::<InheritedAuthority>()
+}
+
 /// The union of two decline lists, in order, without repeats.
 pub(crate) fn union_declines(
     first: &[aidaemon_core::EffectKey],

@@ -12,7 +12,8 @@ use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
 use crate::events::{Event, EventStore, EventType};
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolRole,
 };
 use crate::types::{MediaKind, MediaMessage, StatusUpdate};
 
@@ -276,9 +277,10 @@ impl ComputerUseTool {
         }
     }
 
-    fn parse_provider_kind(args: &Value) -> ProviderKind {
-        args.get("_provider_kind")
-            .and_then(|v| v.as_str())
+    fn parse_provider_kind(facts: &ToolCallContext) -> ProviderKind {
+        facts
+            .provider_kind
+            .as_deref()
             .and_then(|raw| match raw {
                 "OpenaiCompatible" => Some(ProviderKind::OpenaiCompatible),
                 "Anthropic" => Some(ProviderKind::Anthropic),
@@ -289,14 +291,10 @@ impl ComputerUseTool {
             .unwrap_or(ProviderKind::OpenaiCompatible)
     }
 
-    fn parse_model_chain(args: &Value, current_model: &str) -> Vec<String> {
-        if let Some(chain) = args.get("_model_chain").and_then(|v| v.as_array()) {
-            let models: Vec<String> = chain
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            if !models.is_empty() {
-                return models;
+    fn parse_model_chain(facts: &ToolCallContext, current_model: &str) -> Vec<String> {
+        if let Some(chain) = facts.model_chain.as_ref() {
+            if !chain.is_empty() {
+                return chain.clone();
             }
         }
         vec![current_model.to_string()]
@@ -304,15 +302,15 @@ impl ComputerUseTool {
 
     async fn ensure_model_pin(
         &self,
-        args: &Value,
+        facts: &ToolCallContext,
         ctx: &HarnessRequestContext,
     ) -> Result<(), String> {
         if self.pins.get(&ctx.task_id).await.is_some() {
             return Ok(());
         }
-        let current_model = args.get("_model").and_then(|v| v.as_str()).unwrap_or("");
-        let chain = Self::parse_model_chain(args, current_model);
-        let provider_kind = Self::parse_provider_kind(args);
+        let current_model = facts.model.as_deref().unwrap_or("");
+        let chain = Self::parse_model_chain(facts, current_model);
+        let provider_kind = Self::parse_provider_kind(facts);
         let capable = pick_capable_model(&chain, &self.vision, provider_kind)?;
         self.pins.pin(ctx.task_id.clone(), capable).await;
         Ok(())
@@ -370,20 +368,15 @@ impl ComputerUseTool {
         Ok(())
     }
 
-    fn parse_context(args: &Value) -> Result<HarnessRequestContext, String> {
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    fn parse_context(facts: &ToolCallContext) -> Result<HarnessRequestContext, String> {
+        let session_id = facts.session_id.clone();
         if session_id.is_empty() {
             return Err("computer_use actions require a session id".to_string());
         }
-        let task_id = args
-            .get("_task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
+        let task_id = facts
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         Ok(HarnessRequestContext {
             task_id,
             session_id,
@@ -393,7 +386,7 @@ impl ComputerUseTool {
     async fn ensure_session_ready(
         &self,
         ctx: &HarnessRequestContext,
-        args: &Value,
+        facts: &ToolCallContext,
         _action: ComputerActionKind,
     ) -> Result<(), String> {
         self.harness.check_permissions()?;
@@ -403,7 +396,7 @@ impl ComputerUseTool {
                     .to_string(),
             );
         }
-        self.ensure_model_pin(args, ctx).await?;
+        self.ensure_model_pin(facts, ctx).await?;
         Ok(())
     }
 
@@ -466,7 +459,11 @@ impl ComputerUseTool {
         })
     }
 
-    async fn dispatch(&self, args: &Value) -> Result<ToolCallOutcome, String> {
+    async fn dispatch(
+        &self,
+        args: &Value,
+        facts: &ToolCallContext,
+    ) -> Result<ToolCallOutcome, String> {
         let action_raw = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -489,8 +486,8 @@ impl ComputerUseTool {
             )));
         }
 
-        let ctx = Self::parse_context(args)?;
-        self.ensure_session_ready(&ctx, args, action).await?;
+        let ctx = Self::parse_context(facts)?;
+        self.ensure_session_ready(&ctx, facts, action).await?;
 
         match action {
             ComputerActionKind::GetAppState => {
@@ -1204,26 +1201,30 @@ impl Tool for ComputerUseTool {
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
         _status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         self.clear_pending_meta().await;
         let started = std::time::Instant::now();
-        let result = self.dispatch(&args).await;
+        let result = self.dispatch(&args, &facts).await;
         let pending = self.take_pending_meta().await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("?");
         let app = args.get("app").and_then(|v| v.as_str()).unwrap_or("");
         let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
-        let task_id = args
-            .get("_task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let task_id = facts.task_id.as_deref().unwrap_or("default");
+        let session_id = facts.session_id.as_str();
         let is_mutation = !matches!(action, "list_apps" | "get_app_state" | "screenshot");
 
         let mut element_target = pending.element_target;
@@ -1233,7 +1234,7 @@ impl Tool for ComputerUseTool {
             }
         }
         if element_target.title.is_none() && !app.is_empty() {
-            if let Ok(ctx) = Self::parse_context(&args) {
+            if let Ok(ctx) = Self::parse_context(&facts) {
                 if let Ok(bundle_id) = self.resolve_bundle_id(app).await {
                     let resolved = self.resolve_element_target(&args, &ctx, &bundle_id).await;
                     if resolved.title.is_some() || resolved.role.is_some() {

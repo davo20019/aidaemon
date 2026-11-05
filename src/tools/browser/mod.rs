@@ -13,7 +13,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    MessageAttachment, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    MessageAttachment, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
@@ -2100,7 +2100,11 @@ impl BrowserTool {
         }
     }
 
-    async fn run_action(&self, arguments: &str) -> anyhow::Result<DispatchResult> {
+    async fn run_action(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<DispatchResult> {
         let args: Value = serde_json::from_str(arguments)?;
 
         let action = args
@@ -2108,10 +2112,7 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
 
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = facts.session_id.as_str();
 
         let needs_session = !matches!(action, "close" | "set_mode");
         if needs_session && session_id.is_empty() {
@@ -2156,10 +2157,7 @@ impl BrowserTool {
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
             session_id,
-            trusted_session: args
-                .get("_trusted_session")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            trusted_session: facts.trusted_session,
         };
         if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
             warn!(action, "Browser action blocked by approval gate");
@@ -2262,7 +2260,10 @@ impl Tool for BrowserTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run_action(arguments).await?.text)
+        Ok(self
+            .run_action(arguments, &ToolCallContext::default())
+            .await?
+            .text)
     }
 
     async fn call_with_status_outcome(
@@ -2270,8 +2271,18 @@ impl Tool for BrowserTool {
         arguments: &str,
         status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let result = self.run_action(arguments).await?;
+        let result = self.run_action(arguments, &facts).await?;
         Ok(ToolCallOutcome {
             output: result.text,
             metadata: ToolCallMetadata {
