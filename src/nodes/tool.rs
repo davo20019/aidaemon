@@ -265,6 +265,12 @@ impl Tool for ReadNodeSensorsTool {
         }
     }
 
+    /// The request travels to an enrolled Node over the network, whose
+    /// address is not known from the arguments.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
     }
@@ -372,6 +378,12 @@ impl Tool for ReadNodeHealthTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    /// The request travels to an enrolled Node over the network, whose
+    /// address is not known from the arguments.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {

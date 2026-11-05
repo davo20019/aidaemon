@@ -404,6 +404,19 @@ impl Tool for ReadChannelHistoryTool {
         }
     }
 
+    /// The channel API host (Slack's Web API) the history is read from.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            })
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -790,5 +803,15 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["text"].as_str(), Some("from second token"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn channel_history_declares_the_api_host() {
+        use crate::traits::Tool as _;
+        let tool = ReadChannelHistoryTool::new(vec!["xoxb-synthetic".to_string()]);
+        let effects = tool.call_effects(r#"{"channel_id":"C123"}"#);
+        assert!(effects.complete);
+        assert_eq!(effects.keys.len(), 1);
+        assert_eq!(effects.keys[0].target, "slack.com:443");
     }
 }

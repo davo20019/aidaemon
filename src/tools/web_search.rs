@@ -79,9 +79,17 @@ impl Freshness {
     }
 }
 
+const DUCKDUCKGO_ENDPOINT: &str = "https://lite.duckduckgo.com/lite/";
+const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+
 #[async_trait]
 pub trait SearchBackend: Send + Sync {
     fn name(&self) -> &'static str;
+    /// The URL this backend sends queries to, for the call's declared egress.
+    /// `None` when it is not known (the call is then undeclared).
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
     async fn search(
         &self,
         query: &str,
@@ -149,6 +157,10 @@ impl SearchBackend for DuckDuckGoBackend {
         "duckduckgo"
     }
 
+    fn endpoint(&self) -> Option<&str> {
+        Some(DUCKDUCKGO_ENDPOINT)
+    }
+
     async fn search(
         &self,
         query: &str,
@@ -160,7 +172,7 @@ impl SearchBackend for DuckDuckGoBackend {
             params.push(("df", f.ddg_param().to_string()));
         }
         let url = reqwest::Url::parse_with_params(
-            "https://lite.duckduckgo.com/lite/",
+            DUCKDUCKGO_ENDPOINT,
             params.iter().map(|(k, v)| (*k, v.as_str())),
         )?
         .to_string();
@@ -351,6 +363,10 @@ impl SearchBackend for BraveBackend {
         "brave"
     }
 
+    fn endpoint(&self) -> Option<&str> {
+        Some(BRAVE_ENDPOINT)
+    }
+
     async fn search(
         &self,
         query: &str,
@@ -362,7 +378,7 @@ impl SearchBackend for BraveBackend {
             params.push(("freshness", f.brave_param().to_string()));
         }
         let url = reqwest::Url::parse_with_params(
-            "https://api.search.brave.com/res/v1/web/search",
+            BRAVE_ENDPOINT,
             params.iter().map(|(k, v)| (*k, v.as_str())),
         )?
         .to_string();
@@ -463,6 +479,10 @@ impl SearxngBackend {
 impl SearchBackend for SearxngBackend {
     fn name(&self) -> &'static str {
         "searxng"
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        (!self.base_url.is_empty()).then_some(self.base_url.as_str())
     }
 
     async fn search(
@@ -654,6 +674,31 @@ impl Tool for WebSearchTool {
             needs_approval: false,
             idempotent: true,
             high_impact_write: false,
+        }
+    }
+
+    /// The query goes to every configured backend's host, so the egress
+    /// policy scans it and a declined host binds the search.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        let mut keys = Vec::new();
+        for backend in &self.backends {
+            let Some(key) = backend
+                .endpoint()
+                .and_then(|endpoint| reqwest::Url::parse(endpoint).ok())
+                .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            else {
+                return aidaemon_core::CallEffects::unknown();
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return aidaemon_core::CallEffects::unknown();
+        }
+        aidaemon_core::CallEffects {
+            keys,
+            complete: true,
         }
     }
 
@@ -1004,5 +1049,28 @@ mod format_output_tests {
         // "synthesize promptly" must not invite assembling full lists from snippets.
         assert!(desc.contains("previews"));
         assert!(desc.contains("web_fetch"));
+    }
+
+    /// A read-only search still sends the query out: it declares each
+    /// configured backend's host so the egress policy sees it.
+    #[test]
+    fn web_search_declares_backend_hosts() {
+        use aidaemon_core::EffectKey;
+        let default = WebSearchTool::new(&SearchConfig::default());
+        let effects = default.call_effects(r#"{"query":"acme"}"#);
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![EffectKey::egress("https", "lite.duckduckgo.com", None)]
+        );
+        let config = SearchConfig {
+            backend: SearchBackendKind::Searxng,
+            searxng_url: "http://localhost:8080".to_string(),
+            parallel: false,
+            ..SearchConfig::default()
+        };
+        let searxng = WebSearchTool::new(&config).call_effects(r#"{"query":"acme"}"#);
+        assert!(searxng.complete);
+        assert_eq!(searxng.keys[0].target, "localhost:8080");
     }
 }

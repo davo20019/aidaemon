@@ -2340,11 +2340,11 @@ impl Tool for HttpRequestTool {
             return aidaemon_core::CallEffects::unknown();
         };
         let mut keys = vec![host];
+        // The name exactly as `execute` looks it up.
         if let Some(profile) = args
             .get("auth_profile")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|profile| !profile.is_empty())
+            .filter(|profile| !profile.trim().is_empty())
         {
             keys.push(aidaemon_core::EffectKey::named(
                 aidaemon_core::EffectClass::Credential,
