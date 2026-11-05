@@ -201,7 +201,8 @@ Order:
       `Redactor`'s patterns. Plan:
       `docs/superpowers/plans/2026-11-04-authority-phase-3a-effects-and-approvals.md`
       (local; `docs/` is gitignored).
-- [ ] 8.1b Provider failover in the kernel. Today the daemon's
+- [x] 8.1b Provider failover in the kernel (done by a parallel session:
+      `c8dc38c`, `c13ab02`, daemon recovery on `Failover` in `c65cbc6`). Today the daemon's
       `sdk_engine/model_call.rs` runs the router and its fallbacks, and the
       whole call sits under one 90 s cap (`FOREGROUND_MAX_MODEL_CALL`), so
       a fallback inherits whatever time the failing provider left and can
@@ -247,8 +248,10 @@ Order:
       The daemon's heartbeat, schedules and mandate reviews become
       services. It comes before 8.8 because channel runners are services
       too.
-- [ ] 8.8 Channels, providers, MCP and store, each promoted into its SDK
-      crate.
+- [ ] 8.8 Channels, MCP and store, each promoted into its SDK crate.
+      Providers are done: every daemon model call runs on an
+      `aidaemon-providers` backend and the daemon `ModelProvider` trait is
+      deleted (`e0e8899`..`29c3824`).
 
 ## Parallel track: fixes found in the daemon
 
