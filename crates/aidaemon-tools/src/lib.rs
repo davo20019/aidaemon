@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use aidaemon_core::Tool;
 
+pub mod backend;
 mod checklist;
 mod exec;
 mod fs;
@@ -56,6 +57,11 @@ mod workspace;
 #[cfg(test)]
 mod testutil;
 
+pub use backend::{
+    shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
+    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, ProcessHandle,
+    SpawnedProcess, WriteMode,
+};
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
     best_available_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError,
