@@ -86,13 +86,13 @@ pub use tools::{
     PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
     RuntimePreparationFailure, ScopeEscalation, SpecialistKind, StableObservationSubject, Tool,
     ToolAccessDenial, ToolAccessEnforcement, ToolArgumentContractViolation, ToolCallAccessManifest,
-    ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolCollectionCompleteness, ToolCollectionObservation,
-    ToolEvidenceCapability, ToolExecutionContext, ToolInvocationStage, ToolMutationEffects,
-    ToolObservationEvidence, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
-    ToolResultContentSource, ToolResultPresentation, ToolResultProvenance, ToolRole,
-    ToolSemanticFacet, ToolSemanticScope, ToolSemantics, ToolTargetHint, ToolTargetHintKind,
-    ToolVerificationMode, TruncationInfo, TrustRoots, EGRESS_EFFECTS,
+    ToolCallContext, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolCollectionCompleteness, ToolCollectionObservation,
+    ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
+    ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
+    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticFacet, ToolSemanticScope,
+    ToolSemantics, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 

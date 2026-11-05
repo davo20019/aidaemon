@@ -454,7 +454,7 @@ impl Tool for ManageMemoriesTool {
         &self,
         arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolExecutionContext,
+        exec_ctx: crate::traits::ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         self.outcome(arguments, exec_ctx.trusted_session).await
     }
@@ -3038,7 +3038,7 @@ mod tests {
             "an argument does not widen recall to other sessions: {result}"
         );
         // The dispatcher's typed trust does.
-        let ctx = crate::traits::ToolExecutionContext {
+        let ctx = crate::traits::ToolCallContext {
             trusted_session: true,
             ..Default::default()
         };

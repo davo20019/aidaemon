@@ -7,6 +7,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::services::ChannelVisibility;
+
 /// Role assigned to a user based on config (owner_ids).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserRole {
@@ -1679,7 +1681,7 @@ fn default_semantics_from_identity(arguments: &str, caps: ToolCapabilities) -> T
 }
 
 /// The scope of an approval the agent kernel gave a call (see
-/// [`ToolExecutionContext::kernel_approved`]).
+/// [`ToolCallContext::kernel_approved`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalScope {
     /// This call came through the kernel, which judged it.
@@ -1689,17 +1691,16 @@ pub enum ApprovalScope {
     Request { method: String, url: String },
 }
 
-/// Dispatcher-owned execution context passed to tools via the trait method.
+/// The dispatcher's facts about one tool call, passed to the tool beside its
+/// arguments.
 ///
-/// This is a Rust-side control-plane type — it is NEVER serialized, never appears
-/// in model-visible JSON, tool schemas, logs, or persisted tool arguments.
-/// Trust and approval facts belong here, not in the enriched args: a tool
-/// reads them from this context only (`trusted_session`, `user_role`,
-/// `untrusted_source`, `scope_escalation`, `kernel_approved`). The
-/// `_trusted_session` and `_user_role` arguments the dispatcher still adds
-/// remain for tools not yet moved off them.
-#[derive(Debug, Clone, Default)]
-pub struct ToolExecutionContext {
+/// This is a Rust-side control-plane type: it is NEVER serialized and never
+/// appears in model-visible JSON, tool schemas, logs, or persisted tool
+/// arguments. Every fact about who is calling, from where, and under what
+/// authority lives here and only here: a tool's arguments are the model's
+/// own, and the dispatcher strips any `_`-prefixed key a model sends.
+#[derive(Clone, Default)]
+pub struct ToolCallContext {
     /// True only after the final common dispatcher revalidated an exact,
     /// action-bound `MandateAuthorityGrant` for this mutating call, so tools
     /// can honor owner-delegated autonomy.
@@ -1721,17 +1722,108 @@ pub struct ToolExecutionContext {
     pub kernel_approved: Option<ApprovalScope>,
     /// The turn is a trusted scheduled session (never one under a mandate),
     /// set only by the dispatcher from the channel context and the goal's
-    /// provenance. Tools read trust here, never from their arguments.
+    /// provenance.
     pub trusted_session: bool,
-    /// The role of the turn's user, set only by the dispatcher (`None`
-    /// outside it: an unknown caller is not the owner).
+    /// The role of the turn's user (`None` outside the dispatcher: an
+    /// unknown caller is not the owner).
     pub user_role: Option<UserRole>,
     /// The session was started by an automated trigger (an email, an
-    /// event), not by the owner. Set only by the dispatcher.
+    /// event), not by the owner.
     pub untrusted_source: bool,
     /// Exact out-of-scope targets the controller routed to the owner's
-    /// approval instead of refusing them. Set only by the dispatcher.
+    /// approval instead of refusing them.
     pub scope_escalation: Option<ScopeEscalation>,
+    /// The session the call belongs to (empty outside the dispatcher).
+    pub session_id: String,
+    /// Visibility of the channel the turn came from (`None` outside the
+    /// dispatcher; each tool keeps its own fallback).
+    pub channel_visibility: Option<ChannelVisibility>,
+    /// The channel the turn came from, when the channel has an id.
+    pub channel_id: Option<String>,
+    /// The task the call runs under.
+    pub task_id: Option<String>,
+    /// The model's id for this tool call.
+    pub tool_call_id: Option<String>,
+    /// The session's current turn.
+    pub turn_id: Option<String>,
+    /// The goal the call serves: the agent's goal, or (for `cli_agent` and
+    /// `terminal`) the goal of the executor's task, so background
+    /// notifications reach the origin session.
+    pub goal_id: Option<String>,
+    /// The goal run of the mandate fence the call runs under.
+    pub goal_run_id: Option<String>,
+    /// The task attempt of the mandate fence the call runs under.
+    pub task_attempt_id: Option<String>,
+    /// The mandate of the fence the call runs under.
+    pub mandate_id: Option<String>,
+    /// The mandate version of the fence the call runs under.
+    pub mandate_version: Option<i64>,
+    /// The single project the turn is scoped to.
+    pub project_scope: Option<String>,
+    /// A guest's granted workspace root (only under an active grant).
+    pub workspace_collaboration_root: Option<String>,
+    /// The turn's trusted file roots (set for `terminal`), so a run moved to
+    /// the background records the trust its launch was judged with.
+    pub trust_roots: Option<Vec<String>>,
+    /// The cwd relative paths resolve against for [`Self::trust_roots`].
+    pub trust_cwd: Option<String>,
+    /// The live model (set for `computer_use`).
+    pub model: Option<String>,
+    /// The provider kind behind [`Self::model`], as the daemon names it.
+    pub provider_kind: Option<String>,
+    /// The router's models in order, when a router is configured.
+    pub model_chain: Option<Vec<String>>,
+    /// Application facts whose types cannot live in the SDK (they depend on
+    /// the application's configuration), read by the tool that needs them
+    /// through a typed getter.
+    pub extensions: aidaemon_core::Extensions,
+}
+
+impl std::fmt::Debug for ToolCallContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallContext")
+            .field("mandate_preapproved", &self.mandate_preapproved)
+            .field("mandate_execution", &self.mandate_execution)
+            .field("mutation_forbidden", &self.mutation_forbidden)
+            .field("kernel_approved", &self.kernel_approved)
+            .field("trusted_session", &self.trusted_session)
+            .field("user_role", &self.user_role)
+            .field("untrusted_source", &self.untrusted_source)
+            .field("scope_escalation", &self.scope_escalation)
+            .field("session_id", &self.session_id)
+            .field("channel_visibility", &self.channel_visibility)
+            .field("channel_id", &self.channel_id)
+            .field("task_id", &self.task_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("turn_id", &self.turn_id)
+            .field("goal_id", &self.goal_id)
+            .field("goal_run_id", &self.goal_run_id)
+            .field("task_attempt_id", &self.task_attempt_id)
+            .field("mandate_id", &self.mandate_id)
+            .field("mandate_version", &self.mandate_version)
+            .field("project_scope", &self.project_scope)
+            .field(
+                "workspace_collaboration_root",
+                &self
+                    .workspace_collaboration_root
+                    .as_ref()
+                    .map(|_| "[SCOPED WORKSPACE]"),
+            )
+            .field("trust_roots", &self.trust_roots)
+            .field("trust_cwd", &self.trust_cwd)
+            .field("model", &self.model)
+            .field("provider_kind", &self.provider_kind)
+            .field("model_chain", &self.model_chain)
+            .field("extensions", &self.extensions)
+            .finish()
+    }
+}
+
+impl ToolCallContext {
+    /// The session id, or `None` when the call carries none.
+    pub fn session(&self) -> Option<&str> {
+        Some(self.session_id.as_str()).filter(|id| !id.trim().is_empty())
+    }
 }
 
 /// Filesystem targets a tool call declared that fall outside the compiled
@@ -1859,7 +1951,7 @@ pub trait ToolSemantics: Send + Sync {
     fn owner_approval_request(
         &self,
         _arguments: &str,
-        _facts: &ToolExecutionContext,
+        _facts: &ToolCallContext,
     ) -> Option<aidaemon_core::OwnerApprovalRequest> {
         None
     }

@@ -12,8 +12,8 @@ use crate::tools::web_search::{SearchBackend, SearchResult};
 use crate::tools::ApprovalBroker;
 use crate::tools::{HttpRequestTool, ManageHttpAuthTool, ManageOAuthTool, ManageSkillsTool};
 use crate::traits::{
-    ApprovalScope, SkillsStore, StateStore, Tool, ToolCallOutcome, ToolCapabilities,
-    ToolExecutionContext,
+    ApprovalScope, SkillsStore, StateStore, Tool, ToolCallContext, ToolCallOutcome,
+    ToolCapabilities,
 };
 use crate::types::StatusUpdate;
 
@@ -687,10 +687,10 @@ impl ManageApiTool {
         kernel_approved: Option<&ApprovalScope>,
         args: &ManageApiArgs,
         probe: &ApiSafeProbe,
-    ) -> ToolExecutionContext {
+    ) -> ToolCallContext {
         let owner_asked = kernel_approved == Some(&ApprovalScope::Call)
             && Self::probe_approval_for(args).is_some();
-        ToolExecutionContext {
+        ToolCallContext {
             kernel_approved: owner_asked.then(|| ApprovalScope::Request {
                 method: probe.method.clone(),
                 url: probe.url.clone(),
@@ -882,7 +882,7 @@ impl Tool for ManageApiTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         self.dispatch(arguments, status_tx, exec_ctx.kernel_approved.as_ref())
             .await
@@ -1055,7 +1055,7 @@ mod tests {
         (url, count)
     }
 
-    async fn run_probe(ctx: ToolExecutionContext, url: &str) -> anyhow::Result<ToolCallOutcome> {
+    async fn run_probe(ctx: ToolCallContext, url: &str) -> anyhow::Result<ToolCallOutcome> {
         let http = HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )));

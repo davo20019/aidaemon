@@ -24,9 +24,9 @@ use crate::execution::{BackendKind, ExecutionRequest, ProcessHandle, SharedExecu
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
-    StateStore, Tool, ToolArgumentContractViolation, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolMutationEffects,
-    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    StateStore, Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -6746,13 +6746,13 @@ impl TerminalTool {
     /// For action="run": the hard blocks (`pre_approval_block`) always run
     /// here; the owner's approval ladder (`approval_ladder`) ran in the
     /// agent kernel before a call that carries
-    /// `ToolExecutionContext::kernel_approved`, and refuses any other call
+    /// `ToolCallContext::kernel_approved`, and refuses any other call
     /// it would ask about. Trust facts come only from `exec_ctx`.
     async fn execute_terminal(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: &ToolExecutionContext,
+        exec_ctx: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let mutation_forbidden = exec_ctx.mutation_forbidden;
         let args: TerminalArgs = serde_json::from_str(arguments)?;
@@ -7152,7 +7152,7 @@ struct TerminalArgs {
 }
 
 /// The turn's facts the terminal's approval ladder and hard blocks read:
-/// from the dispatcher's typed [`ToolExecutionContext`], or from the
+/// from the dispatcher's typed [`ToolCallContext`], or from the
 /// kernel's per-turn approval rules. Never from the call's arguments.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TerminalTrust {
@@ -7168,7 +7168,7 @@ pub(crate) struct TerminalTrust {
 }
 
 impl TerminalTrust {
-    fn from_execution_context(session_id: &str, ctx: &ToolExecutionContext) -> Self {
+    fn from_execution_context(session_id: &str, ctx: &ToolCallContext) -> Self {
         Self {
             session_id: session_id.to_string(),
             owner: ctx.user_role == Some(crate::types::UserRole::Owner),
@@ -7853,7 +7853,7 @@ impl Tool for TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, &ToolExecutionContext::default())
+        self.execute_terminal(arguments, status_tx, &ToolCallContext::default())
             .await
     }
 
@@ -7861,7 +7861,7 @@ impl Tool for TerminalTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         self.execute_terminal(arguments, status_tx, &exec_ctx).await
     }
@@ -8093,8 +8093,8 @@ mod tests {
     use std::time::Duration;
 
     /// The dispatcher's context for an owner's call the kernel approved.
-    fn kernel_owner_ctx() -> ToolExecutionContext {
-        ToolExecutionContext {
+    fn kernel_owner_ctx() -> ToolCallContext {
+        ToolCallContext {
             kernel_approved: Some(crate::traits::ApprovalScope::Call),
             user_role: Some(crate::types::UserRole::Owner),
             ..Default::default()
@@ -9750,7 +9750,7 @@ mod tests {
             .call_with_execution_context(
                 &args,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mutation_forbidden: true,
                     ..Default::default()
                 },
@@ -10315,7 +10315,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"seq 1 3","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mutation_forbidden: true,
                     ..Default::default()
                 },
@@ -10368,7 +10368,7 @@ mod tests {
             .call_with_execution_context(
                 &args,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mutation_forbidden: false,
                     ..Default::default()
                 },
@@ -11736,7 +11736,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#,
                 None,
-                ToolExecutionContext::default(),
+                ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -13530,7 +13530,7 @@ mod tests {
 
         // The untrusted-source rung asks, so outside the kernel the call is
         // refused; the dispatcher's typed fact, not an argument, says so.
-        let ctx = ToolExecutionContext {
+        let ctx = ToolCallContext {
             untrusted_source: true,
             user_role: Some(crate::types::UserRole::Owner),
             ..Default::default()

@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
 
@@ -590,7 +590,7 @@ impl Tool for WebFetchTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
         let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;

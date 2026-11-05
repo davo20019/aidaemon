@@ -89,7 +89,7 @@ async fn call_scoped_builtin_file_tool(
     name: &str,
     arguments: &str,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    exec_ctx: crate::traits::ToolExecutionContext,
+    exec_ctx: crate::traits::ToolCallContext,
 ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
     // Instantiate the daemon's exact built-in implementation. Looking up by
     // name in the general registry would let an injected/custom duplicate tool
@@ -146,7 +146,7 @@ pub(super) struct ToolExecCtx<'a> {
     pub mutation_forbidden: bool,
     /// The call came through the agent kernel, whose `ApprovalPolicy` asked
     /// the owner where needed (passed on to the tool as
-    /// `ToolExecutionContext::kernel_approved` as `ApprovalScope::Call`).
+    /// `ToolCallContext::kernel_approved` as `ApprovalScope::Call`).
     pub owner_approval_by_kernel: bool,
     /// Exact out-of-scope filesystem targets the controller declined to
     /// reject outright. Loop-owned; the tool must obtain user authority for
@@ -857,7 +857,7 @@ impl Agent {
             } else {
                 false
             };
-            let exec_ctx = crate::traits::ToolExecutionContext {
+            let exec_ctx = crate::traits::ToolCallContext {
                 mandate_preapproved,
                 mandate_execution: under_mandate,
                 mutation_forbidden: ctx.mutation_forbidden,
@@ -868,6 +868,7 @@ impl Agent {
                 user_role: Some(user_role),
                 untrusted_source,
                 scope_escalation: scope_escalation.clone(),
+                ..Default::default()
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -916,7 +917,7 @@ impl Agent {
                 } else {
                     false
                 };
-                let exec_ctx = crate::traits::ToolExecutionContext {
+                let exec_ctx = crate::traits::ToolCallContext {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
@@ -927,6 +928,7 @@ impl Agent {
                     user_role: Some(user_role),
                     untrusted_source,
                     scope_escalation: scope_escalation.clone(),
+                    ..Default::default()
                 };
                 let result = tool
                     .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
@@ -974,7 +976,7 @@ impl Agent {
                 } else {
                     false
                 };
-                let exec_ctx = crate::traits::ToolExecutionContext {
+                let exec_ctx = crate::traits::ToolCallContext {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
@@ -985,6 +987,7 @@ impl Agent {
                     user_role: Some(user_role),
                     untrusted_source,
                     scope_escalation: scope_escalation.clone(),
+                    ..Default::default()
                 };
                 return tool
                     .call_with_execution_context(

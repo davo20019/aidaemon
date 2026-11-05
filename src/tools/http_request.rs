@@ -12,10 +12,9 @@ use crate::config::HttpAuthProfile;
 use crate::tools::sanitize::{sanitize_external_content, wrap_untrusted_output};
 use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::traits::{
-    AuthorizationPreflightRecord, AuthorizationPreflightStatus, Tool, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolExecutionContext,
-    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    AuthorizationPreflightRecord, AuthorizationPreflightStatus, Tool, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 use crate::types::StatusUpdate;
 
@@ -2044,7 +2043,7 @@ impl Tool for HttpRequestTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
         let authenticated_request = serde_json::from_str::<Value>(arguments)
@@ -2913,7 +2912,7 @@ mod tests {
                 tool.call_with_execution_context(
                     &arguments.to_string(),
                     None,
-                    ToolExecutionContext {
+                    ToolCallContext {
                         mandate_preapproved: true,
                         mandate_execution: true,
                         ..Default::default()
@@ -2993,7 +2992,7 @@ mod tests {
                 tool.call_with_execution_context(
                     &arguments.to_string(),
                     None,
-                    ToolExecutionContext {
+                    ToolCallContext {
                         mandate_preapproved: true,
                         mandate_execution: true,
                         ..Default::default()
@@ -3040,7 +3039,7 @@ mod tests {
         let cases = [
             (
                 "ordinary",
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: true,
                     mandate_execution: false,
                     ..Default::default()
@@ -3049,7 +3048,7 @@ mod tests {
             ),
             (
                 "ungranted-mandate",
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: false,
                     mandate_execution: true,
                     ..Default::default()
@@ -3058,7 +3057,7 @@ mod tests {
             ),
             (
                 "ungranted-mandate-cannot-inherit-trusted-session",
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: false,
                     mandate_execution: true,
                     ..Default::default()
@@ -3111,7 +3110,7 @@ mod tests {
             .call_with_execution_context(
                 &json!({"method": "POST", "url": url, "body": "x"}).to_string(),
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
@@ -3138,7 +3137,7 @@ mod tests {
                 tool.call_with_execution_context(
                     &arguments,
                     None,
-                    ToolExecutionContext {
+                    ToolCallContext {
                         mandate_preapproved: true,
                         mandate_execution: true,
                         ..Default::default()
@@ -3178,7 +3177,7 @@ mod tests {
             .call_with_execution_context(
                 &json!({"method": "POST", "url": url}).to_string(),
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: true,
                     mandate_execution: true,
                     ..Default::default()
@@ -3219,7 +3218,7 @@ mod tests {
             .call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: true,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3254,7 +3253,7 @@ mod tests {
             .call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3297,7 +3296,7 @@ mod tests {
             .call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3346,7 +3345,7 @@ mod tests {
             .call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_execution: true,
                     ..Default::default()
                 },
@@ -3384,7 +3383,7 @@ mod tests {
             .call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: false,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3426,7 +3425,7 @@ mod tests {
             tool.call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     // The dispatcher issued an exact grant for this
                     // authenticated observation, including its stable account.
                     mandate_preapproved: true,
@@ -3484,7 +3483,7 @@ mod tests {
             tool.call_with_execution_context(
                 &arguments,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     mandate_preapproved: true,
                     mandate_execution: true,
                     mutation_forbidden: false,
@@ -3767,7 +3766,7 @@ mod tests {
                     "_session_id": "telegram:test"
                 }"#,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
@@ -4030,7 +4029,7 @@ mod tests {
             .call_with_execution_context(
                 &args,
                 None,
-                ToolExecutionContext {
+                ToolCallContext {
                     kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
@@ -4050,7 +4049,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_scope_covers_only_its_exact_request() {
         let (url, count, server) = spawn_counting_status_server("200 OK").await;
-        let scoped = |method: &str, url: &str| ToolExecutionContext {
+        let scoped = |method: &str, url: &str| ToolCallContext {
             kernel_approved: Some(crate::traits::ApprovalScope::Request {
                 method: method.to_string(),
                 url: url.to_string(),

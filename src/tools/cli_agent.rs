@@ -31,9 +31,8 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     DynamicCliAgent, Message, StateStore, Tool, ToolArgumentContractViolation,
-    ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
-    ToolVerificationMode,
+    ToolCallAccessManifest, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
@@ -4231,7 +4230,7 @@ impl Tool for CliAgentTool {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
         let action = parsed
@@ -5184,7 +5183,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","tool":"codex","prompt":"hello","workspace_mode":"read_only"}"#,
                 None,
-                ToolExecutionContext::default(),
+                ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -7008,7 +7007,7 @@ mod tests {
                 "prompt": prompt,
             });
             // A trusted session, as the dispatcher's typed context says
-            // (`ToolExecutionContext::trusted_session`).
+            // (`ToolCallContext::trusted_session`).
             let result = tool
                 .call_with_status_under_contract(&args.to_string(), None, false, false, true)
                 .await

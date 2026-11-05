@@ -111,7 +111,7 @@ impl Tool for MandateMutationSpy {
         &self,
         arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolExecutionContext,
+        exec_ctx: crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         self.saw_mandate_preapproval
             .store(exec_ctx.mandate_preapproved, AtomicOrdering::SeqCst);

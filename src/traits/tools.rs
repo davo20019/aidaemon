@@ -137,7 +137,7 @@ pub trait Tool: ToolSemantics {
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
+        exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = exec_ctx;
         self.call_with_status_outcome(arguments, status_tx).await
@@ -162,8 +162,8 @@ mod tests {
             TypeId::of::<aidaemon_tools::semantics::ToolCallMetadata>()
         );
         assert_eq!(
-            TypeId::of::<crate::traits::ToolExecutionContext>(),
-            TypeId::of::<aidaemon_tools::semantics::ToolExecutionContext>()
+            TypeId::of::<crate::traits::ToolCallContext>(),
+            TypeId::of::<aidaemon_tools::semantics::ToolCallContext>()
         );
         assert_eq!(
             TypeId::of::<crate::types::UserRole>(),
