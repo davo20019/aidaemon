@@ -128,6 +128,7 @@ fn owner_ctx<'a>(
     authority: &'a crate::agent::authority::InheritedAuthority,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: SESSION,
         task_id: Some("task-real"),
@@ -372,6 +373,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
     };
     let ctx = ToolExecCtx {
+        mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "slack:synthetic-guest",
         task_id: None,
@@ -444,6 +446,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
 
 fn mandate_free_ctx() -> ToolExecCtx<'static> {
     ToolExecCtx {
+        mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,

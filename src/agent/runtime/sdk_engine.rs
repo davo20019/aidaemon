@@ -508,7 +508,6 @@ struct BudgetGoal {
     scheduled: bool,
 }
 
-/// Everything a dispatched call needs from the turn.
 /// The kernel's tool-name rule: 1-64 characters from `[a-zA-Z0-9_-]`.
 fn kernel_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -517,6 +516,7 @@ fn kernel_tool_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Everything a dispatched call needs from the turn.
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
     /// The MCP-registry tools bridged for this turn (daemon tools are

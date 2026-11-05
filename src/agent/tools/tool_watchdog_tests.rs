@@ -389,6 +389,7 @@ fn mandate_tool_ctx<'a>(
     grant: Option<&'a crate::traits::MandateAuthorityGrant>,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
@@ -473,6 +474,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
             "slow_tool",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-1"),
@@ -521,6 +523,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
             "cli_agent",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-3"),
@@ -561,6 +564,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
             "system_info",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-2"),
@@ -602,6 +606,7 @@ async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
             "spawn_agent",
             r#"{"mission":"delegate log analysis","task":"inspect the logs","_project_scope":"/tmp/spoofed"}"#,
             &ToolExecCtx {
+                mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-4"),
@@ -666,6 +671,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         .call_semantics(arguments);
 
     let base_ctx = |grant| ToolExecCtx {
+        mcp_tool: None,
         owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
@@ -950,6 +956,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
             "mandate_mutation_spy",
             arguments,
             &ToolExecCtx {
+                mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id: "owner-session",
                 task_id: None,

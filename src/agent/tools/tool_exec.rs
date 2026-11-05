@@ -168,6 +168,11 @@ pub(super) struct ToolExecCtx<'a> {
     /// The call is the only one in a root turn's model response (passed on
     /// as `ToolCallContext::lone_root_call`).
     pub lone_root_call: bool,
+    /// The MCP-registry tool the kernel bridged and judged at turn start
+    /// for this call. A kernel call executes exactly this instance, never a
+    /// fresh registry lookup, so a server reload mid-turn cannot swap in a
+    /// tool nobody judged.
+    pub mcp_tool: Option<&'a Arc<dyn crate::traits::Tool>>,
 }
 
 async fn scoped_workspace_arguments(
@@ -928,8 +933,15 @@ impl Agent {
         // Search MCP registry for dynamically registered tools.
         // A mandate bit can reach an MCP adapter only after the same exact-grant revalidation used
         // for builtins (MCP tools are non-delegable under the v1 policy).
-        if let Some(ref registry) = self.mcp_registry {
-            if let Some(tool) = registry.find_tool(name).await {
+        let mcp_tool = match (ctx.mcp_tool, &self.mcp_registry) {
+            (Some(judged), _) => Some(judged.clone()),
+            // The kernel judged no MCP tool under this name for the turn.
+            _ if ctx.owner_approval_by_kernel => None,
+            (None, Some(registry)) => registry.find_tool(name).await,
+            (None, None) => None,
+        };
+        {
+            if let Some(tool) = mcp_tool {
                 let prepared = match prepare_tool_arguments(tool.as_ref(), &enriched_args) {
                     Ok(prepared) => prepared,
                     Err(rejection) => return Ok(*rejection),
