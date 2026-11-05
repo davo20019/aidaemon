@@ -178,10 +178,13 @@ impl ReadFileTool {
         let backend = active_execution_backend();
         let path = backend.resolve_path(path_str).await?;
         let local_path = std::path::Path::new(path.as_str());
-        if fs_utils::is_secret_path(local_path)
-            && !(is_env_template(local_path)
-                && !fs_utils::is_secret_path_ignoring_name_shape(local_path))
-        {
+        let refused = if is_env_template(local_path) {
+            // A template is judged by where it lives, not by its `.env.` name.
+            fs_utils::is_secret_path_ignoring_name_shape(local_path)
+        } else {
+            fs_utils::is_secret_path(local_path)
+        };
+        if refused {
             return Ok(ToolCallOutcome::contract_rejection(format!(
                 "read_file does not open credential or secret files ({path_str}). Ask the owner to share what is needed."
             )));
