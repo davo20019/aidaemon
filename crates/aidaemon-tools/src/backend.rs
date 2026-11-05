@@ -249,7 +249,8 @@ impl ExecutionOutput {
 }
 
 /// Opaque process identity. The numeric ID is only a user-facing handle; a
-/// remote backend also carries a private token used for remote termination.
+/// remote backend also carries a backend-internal token used for remote
+/// termination.
 #[derive(Debug, Clone)]
 pub struct ProcessHandle {
     display_id: u32,
@@ -258,6 +259,9 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
+    /// Backend implementors only: tools receive handles from a backend and
+    /// never build one.
+    #[doc(hidden)]
     pub fn new(display_id: u32, local_pid: Option<u32>, remote_token: Option<String>) -> Self {
         Self {
             display_id,
@@ -274,7 +278,10 @@ impl ProcessHandle {
         self.local_pid
     }
 
-    /// The private token a remote backend uses to terminate the process.
+    /// Backend implementors only: the token a remote backend uses to
+    /// terminate the process. It is internal to the backend that issued it,
+    /// not a secret the type protects (it is readable here).
+    #[doc(hidden)]
     pub fn remote_token(&self) -> Option<&str> {
         self.remote_token.as_deref()
     }
@@ -290,7 +297,9 @@ impl SpawnedProcess {
         Self { handle, child }
     }
 
-    /// Attach the remote termination token once the backend has read it.
+    /// Backend implementors only: attach the remote termination token once
+    /// the backend has read it.
+    #[doc(hidden)]
     pub fn set_remote_token(&mut self, token: String) {
         self.handle.remote_token = Some(token);
     }

@@ -1,4 +1,4 @@
-//! `shell`: run a command through an [`Sandbox`].
+//! `shell`: run a command through a [`Sandbox`].
 
 use std::sync::Arc;
 use std::time::Duration;

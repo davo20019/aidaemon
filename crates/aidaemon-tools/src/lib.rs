@@ -16,7 +16,7 @@
 //! | [`WebFetch`] | `web_fetch` | read-only |
 //! | [`Checklist`] | `track_requirements` | write (agent state only) |
 //!
-//! Every file tool is confined to a [`Workspace`]. The shell runs through an
+//! Every file tool is confined to a [`Workspace`]. The shell runs through a
 //! [`Sandbox`]; containment (sandboxing) lives there, while approval
 //! stays a policy concern for [`aidaemon_core::Hook`]s. No tool contains
 //! approval logic.

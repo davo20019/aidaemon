@@ -1281,7 +1281,7 @@ mod tests {
         let result_str = result.to_string_lossy();
         assert!(
             !result_str.ends_with("/."),
-            "validate_path(&*crate::execution::active_execution_backend(), \".\") should not end with trailing dot, got: {}",
+            "validate_path(\".\") should not end with trailing dot, got: {}",
             result_str
         );
         assert_eq!(result, std::env::current_dir().unwrap());
@@ -1295,7 +1295,7 @@ mod tests {
         let result_str = result.to_string_lossy();
         assert!(
             !result_str.ends_with("/."),
-            "validate_path(&*crate::execution::active_execution_backend(), \"src/.\") should not end with trailing dot, got: {}",
+            "validate_path(\"src/.\") should not end with trailing dot, got: {}",
             result_str
         );
     }

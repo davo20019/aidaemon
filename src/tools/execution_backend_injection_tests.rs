@@ -75,10 +75,41 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether `text` names `ident` as a whole identifier: a call, a path
+/// segment, or a bare name (an alias import such as
+/// `use crate::execution::active_execution_backend as backend;`).
+fn names_identifier(text: &str, ident: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(ident).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + ident.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+#[test]
+fn names_identifier_matches_calls_aliases_and_paths_only() {
+    let ident = "active_execution_backend";
+    assert!(names_identifier(
+        "let b = active_execution_backend();",
+        ident
+    ));
+    assert!(names_identifier(
+        "use crate::execution::active_execution_backend as backend;",
+        ident
+    ));
+    assert!(names_identifier(
+        "use crate::execution::{active_execution_backend};",
+        ident
+    ));
+    assert!(!names_identifier("set_active_execution_backend(b);", ident));
+    assert!(!names_identifier("active_execution_backend_slot", ident));
+}
+
 #[test]
 fn no_tool_reads_global_execution_backend() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools");
-    let needle = ["active_execution_backend", "("].concat();
+    let needle = ["active_execution", "_backend"].concat();
     let mut files = Vec::new();
     rust_files(&root, &mut files);
     files.sort();
@@ -90,7 +121,7 @@ fn no_tool_reads_global_execution_backend() {
         })
         .filter(|path| {
             let text = std::fs::read_to_string(path).expect("read tool source");
-            production_source(&text).contains(&needle)
+            names_identifier(&production_source(&text), &needle)
         })
         .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
         .collect();
