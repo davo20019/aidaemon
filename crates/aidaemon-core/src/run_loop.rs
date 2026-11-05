@@ -1029,7 +1029,14 @@ impl<'a> Driver<'a> {
             BatchEnd::Cancelled => (RunStatus::Cancelled, None),
             BatchEnd::Finished(PendingFinish { finish, tool }) => (
                 RunStatus::Finished {
-                    outcome: finish.outcome,
+                    // A run in which the owner declined something never
+                    // reports success, whatever the tool judged.
+                    outcome: match finish.outcome {
+                        crate::FinishOutcome::Succeeded if !self.state.declined.is_empty() => {
+                            crate::FinishOutcome::Partial
+                        }
+                        outcome => outcome,
+                    },
                     tool,
                 },
                 finish.reply,

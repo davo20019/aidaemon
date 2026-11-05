@@ -408,3 +408,51 @@ async fn after_tool_hook_can_strip_finish() {
     assert_eq!(out.final_text.as_deref(), Some("kept going"));
     assert_eq!(provider.requests().len(), 2);
 }
+
+/// A run in which the owner declined something never reports success: a
+/// tool's `Succeeded` finish is reported as `Partial`, so no host can say
+/// "Done" over the decline.
+#[tokio::test]
+async fn declined_run_finish_succeeded_reports_partial() {
+    let agent = |provider: ScriptedProvider| {
+        base(provider)
+            .tool(finisher(
+                "finisher",
+                ToolAnnotations::WRITE,
+                FinishOutcome::Succeeded,
+                "all done",
+                Duration::ZERO,
+            ))
+            .build()
+            .unwrap()
+    };
+    let script = || ScriptedProvider::new([tool_calls([call("c1", "finisher", json!({}))])]);
+
+    // Control: without a decline the finish stays `Succeeded`.
+    let out = agent(script()).run("s", "go").await.unwrap();
+    assert_eq!(
+        out.status,
+        RunStatus::Finished {
+            outcome: FinishOutcome::Succeeded,
+            tool: "finisher".to_string(),
+        }
+    );
+
+    let mut state = RunState::new("test-agent", "s", "go");
+    state.declined.push(aidaemon_core::EffectKey {
+        class: aidaemon_core::EffectClass::Egress,
+        target: "h.example.invalid:443".to_string(),
+    });
+    let out = agent(script())
+        .run_from(state, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status,
+        RunStatus::Finished {
+            outcome: FinishOutcome::Partial,
+            tool: "finisher".to_string(),
+        }
+    );
+    assert_eq!(out.final_text.as_deref(), Some("all done"));
+}

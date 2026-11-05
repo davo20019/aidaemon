@@ -34,7 +34,9 @@ pub enum RunStatus {
         error: String,
     },
     /// A tool ended the run with [`crate::ToolOutput::finish`]; `tool` is
-    /// the name of the tool whose finish won.
+    /// the name of the tool whose finish won. A `Succeeded` finish in a run
+    /// with declined effects ([`crate::RunState::declined`]) is reported as
+    /// `Partial`.
     Finished {
         outcome: FinishOutcome,
         tool: String,
