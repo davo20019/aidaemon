@@ -197,6 +197,8 @@ pub async fn drain(
         match item {
             Ok(StreamEvent::TextDelta(d)) => deltas.push(d),
             Ok(StreamEvent::Done(r)) => done.push(r),
+            // Only a failover chain switches; these providers never do.
+            Ok(StreamEvent::Switched(_)) => {}
             Err(e) => {
                 error = Some(e);
                 break;

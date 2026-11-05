@@ -18,6 +18,7 @@ mod agent;
 mod authority;
 mod error;
 mod event;
+mod failover;
 mod hook;
 mod limits;
 mod message;
@@ -41,6 +42,10 @@ pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};
+pub use failover::{
+    DefaultFailover, Failover, FailoverAction, FailoverPolicy, FailoverStep, ProviderSwitch,
+    SwitchReason,
+};
 pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};
 pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Image, Message, MessageOrigin, Role, ToolCall};

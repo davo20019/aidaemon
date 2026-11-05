@@ -77,6 +77,9 @@ pub enum StreamEvent {
     TextDelta(String),
     /// The full reply, with tool calls and usage.
     Done(ModelResponse),
+    /// A [`crate::Failover`] chain gave up on one provider and is trying
+    /// the next. Comes before any text of the reply.
+    Switched(crate::ProviderSwitch),
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

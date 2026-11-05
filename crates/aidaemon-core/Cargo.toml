@@ -26,7 +26,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 aidaemon-core = { path = ".", features = ["testing"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[example]]
 name = "quickstart"
