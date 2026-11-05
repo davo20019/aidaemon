@@ -184,16 +184,11 @@ async fn intent_classifier_bench_run_corpus() {
     println!("base_url: {base_url}");
     println!("model:    {model}");
 
-    let provider = crate::providers::sdk_backed::SdkBacked::new(
-        std::sync::Arc::new(
-            aidaemon_providers::OpenAiCompatible::builder()
-                .base_url(&base_url)
-                .api_key(&api_key)
-                .build()
-                .expect("failed to construct provider"),
-        ),
-        crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
-    );
+    let provider = aidaemon_providers::OpenAiCompatible::builder()
+        .base_url(&base_url)
+        .api_key(&api_key)
+        .build()
+        .expect("failed to construct provider");
 
     let cases = corpus();
     let total = cases.len();

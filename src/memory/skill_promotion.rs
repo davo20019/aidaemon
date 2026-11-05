@@ -12,6 +12,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::llm_runtime::SharedLlmRuntime;
+use crate::providers::ChatJson;
 use crate::skills::{self, Skill};
 use crate::traits::{Procedure, SkillDraft, StateStore};
 

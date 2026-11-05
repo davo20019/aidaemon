@@ -26,7 +26,7 @@ use crate::testing::TestChannel;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
-use crate::traits::{Channel, ModelProvider};
+use crate::traits::Channel;
 use crate::types::{ChannelContext, UserRole};
 
 /// Check if live tests should run.
@@ -64,8 +64,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let config = load_live_test_config(&config_path)?;
 
     // Create real provider
-    let provider: Arc<dyn ModelProvider> =
-        crate::providers::factory::build_provider(&config.provider)?;
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     // Temp DB for isolation
     let db_file = tempfile::NamedTempFile::new()?;
@@ -243,8 +242,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
 
     let config = load_live_test_config(&config_path)?;
 
-    let provider: Arc<dyn ModelProvider> =
-        crate::providers::factory::build_provider(&config.provider)?;
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();

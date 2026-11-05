@@ -237,7 +237,7 @@ impl Agent {
             .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
         let messages = fit_run_values(&prefix, run, budget);
-        let mut options = to_chat_options(&request.tool_choice, request.max_output_tokens);
+        let mut options = to_chat_options(&request);
         // A reasoning model that spent its whole output budget thinking was
         // usually on a hard step: give it more output room first, and lower
         // reasoning effort only when the cutoffs repeat.

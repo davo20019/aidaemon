@@ -24,8 +24,8 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
-    Channel, ChannelCapabilities, ChatOptions, ModelProvider, ProviderResponse, TokenUsage, Tool,
-    ToolCall, ToolRole,
+    Channel, ChannelCapabilities, ChatOptions, ProviderResponse, TokenUsage, Tool, ToolCall,
+    ToolRole,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -372,19 +372,74 @@ impl MockProvider {
     }
 }
 
+/// Make a test type an SDK provider. The type defines
+/// `async fn respond(&self, model: &str, messages: &[Value], tools: &[Value],
+/// options: &ChatOptions) -> anyhow::Result<ProviderResponse>`, working in
+/// the daemon's chat JSON; errors are the daemon's classified
+/// `ProviderError`s.
+macro_rules! chat_json_provider {
+    ($ty:ty) => {
+        #[async_trait::async_trait]
+        impl aidaemon_core::Provider for $ty {
+            fn name(&self) -> &str {
+                stringify!($ty)
+            }
+
+            async fn complete(
+                &self,
+                request: &aidaemon_core::ModelRequest,
+            ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+                use $crate::providers::sdk_backed::{
+                    to_chat_messages, to_chat_options, to_chat_tools, to_sdk_error, to_sdk_response,
+                };
+                let messages = to_chat_messages(&request.messages);
+                let tools = to_chat_tools(&request.tools);
+                let options = to_chat_options(request);
+                self.respond(&request.model, &messages, &tools, &options)
+                    .await
+                    .map(to_sdk_response)
+                    .map_err(
+                        |error| match error.downcast::<$crate::providers::ProviderError>() {
+                            Ok(error) => to_sdk_error(&error),
+                            Err(other) => aidaemon_core::ProviderError::Other(other.to_string()),
+                        },
+                    )
+            }
+        }
+    };
+}
+pub(crate) use chat_json_provider;
+
+/// The mock is an SDK provider like every real backend. It scripts and
+/// records calls in the daemon's chat JSON, which is what the tests read.
 #[async_trait]
-impl ModelProvider for MockProvider {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        self.chat_with_options(model, messages, tools, &ChatOptions::default())
-            .await
+impl aidaemon_core::Provider for MockProvider {
+    fn name(&self) -> &str {
+        "mock"
     }
 
-    async fn chat_with_options(
+    async fn complete(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+    ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+        use crate::providers::sdk_backed::{
+            to_chat_messages, to_chat_options, to_chat_tools, to_sdk_error, to_sdk_response,
+        };
+        let messages = to_chat_messages(&request.messages);
+        let tools = to_chat_tools(&request.tools);
+        let options = to_chat_options(request);
+        self.scripted(&request.model, &messages, &tools, &options)
+            .await
+            .map(to_sdk_response)
+            .map_err(|error| match error.downcast::<ProviderError>() {
+                Ok(error) => to_sdk_error(&error),
+                Err(other) => aidaemon_core::ProviderError::Other(other.to_string()),
+            })
+    }
+}
+
+impl MockProvider {
+    async fn scripted(
         &self,
         model: &str,
         messages: &[Value],
@@ -486,10 +541,6 @@ impl ModelProvider for MockProvider {
         } else {
             Ok(responses.remove(0))
         }
-    }
-
-    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        Ok(vec!["mock-model".to_string()])
     }
 }
 
@@ -797,7 +848,7 @@ async fn setup_test_agent_internal(
         smart: "mock-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -921,7 +972,7 @@ pub async fn setup_test_agent_with_models_and_policy(
         smart: smart_model.to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -1014,7 +1065,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         smart: "smart-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -1274,7 +1325,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         smart: "mock-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -1376,7 +1427,7 @@ pub struct LiveHarness {
 }
 
 pub async fn setup_live_agent(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     provider_kind: ProviderKind,
     model: &str,
 ) -> anyhow::Result<LiveHarness> {

@@ -5,12 +5,12 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, ProviderConfig, ProviderKind};
 use crate::llm_runtime::ProviderRuntimeTarget;
 use crate::router::Router;
-use crate::traits::ModelProvider;
 
-use super::sdk_backed::{ModelList, SdkBacked};
+use super::sdk_backed::ModelList;
 
 pub(crate) struct ProviderRouterBundle {
-    pub provider: Arc<dyn ModelProvider>,
+    pub provider: crate::llm_runtime::ModelBackend,
+    pub models: ModelList,
     pub primary_model: String,
     pub router: Option<Router>,
     pub provider_kind: ProviderKind,
@@ -103,9 +103,10 @@ fn configured_models(config: &ProviderConfig) -> Vec<String> {
     out
 }
 
-/// The daemon's model provider for `config`: the SDK backend for its kind
-/// behind the daemon's [`ModelProvider`] facade.
-pub(crate) fn build_provider(config: &ProviderConfig) -> anyhow::Result<Arc<dyn ModelProvider>> {
+/// The SDK backend for `config`'s kind, and how its models are listed.
+pub(crate) fn build_provider(
+    config: &ProviderConfig,
+) -> anyhow::Result<(crate::llm_runtime::ModelBackend, ModelList)> {
     use aidaemon_providers as backends;
     let config_error = |error: backends::ConfigError| anyhow::anyhow!("{error}");
     let base_override = provider_specific_base_url_override(config);
@@ -208,22 +209,20 @@ pub(crate) fn build_provider(config: &ProviderConfig) -> anyhow::Result<Arc<dyn 
             )?)
         }
     };
-    Ok(Arc::new(SdkBacked::new(backend, models)))
+    Ok((backend, models))
 }
 
 fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRuntimeTarget> {
-    let provider = build_provider(config)?;
+    let (provider, models) = build_provider(config)?;
 
     let router = Router::new(config.models.clone());
     let primary_model = router.default_model().to_string();
     let router = (!router.is_uniform()).then_some(router);
 
-    Ok(ProviderRuntimeTarget::new(
-        provider,
-        router,
-        config.kind,
-        primary_model,
-    ))
+    Ok(
+        ProviderRuntimeTarget::new(provider, router, config.kind, primary_model)
+            .with_models(models),
+    )
 }
 
 pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
@@ -249,6 +248,7 @@ pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<Provid
 
     Ok(ProviderRouterBundle {
         provider: primary_target.provider(),
+        models: primary_target.models().clone(),
         primary_model,
         router: primary_router,
         provider_kind: primary_target.provider_kind(),

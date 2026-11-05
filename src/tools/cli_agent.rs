@@ -31,7 +31,7 @@ use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRou
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolArgumentContractViolation,
+    DynamicCliAgent, Message, StateStore, Tool, ToolArgumentContractViolation,
     ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
     ToolVerificationMode,
@@ -2004,71 +2004,6 @@ impl CliAgentTool {
             persisted_output: display_output.to_string(),
             response: None,
             error: Some(display_output.to_string()),
-        }
-    }
-
-    /// Try to answer a question from a CLI agent using the LLM.
-    /// Currently unused — stdin is null so we kill stuck processes instead.
-    /// Kept for future interactive feedback support.
-    #[allow(dead_code)]
-    async fn answer_cli_question(
-        provider: &Arc<dyn ModelProvider>,
-        task_context: &str,
-        recent_output: &str,
-        question: &str,
-    ) -> Option<String> {
-        // Don't answer auth prompts
-        let lower = question.to_lowercase();
-        if lower.contains("password")
-            || lower.contains("token")
-            || lower.contains("api key")
-            || lower.contains("secret")
-            || lower.contains("credentials")
-        {
-            return None; // Signal to kill the process
-        }
-
-        let prompt = format!(
-            "You are answering on behalf of the user. Based on the task context, \
-             answer this question from a CLI agent. Be concise (1-2 sentences max).\n\n\
-             Task context: {}\n\n\
-             Recent agent output:\n{}\n\n\
-             Question: {}",
-            truncate_str(task_context, 500),
-            truncate_str(recent_output, 500),
-            question
-        );
-
-        let messages = vec![json!({
-            "role": "user",
-            "content": prompt
-        })];
-
-        // Use a fast model for quick responses
-        let models = provider.list_models().await.unwrap_or_default();
-        let model = models.first().map(|m| m.as_str()).unwrap_or("default");
-
-        match provider.chat(model, &messages, &[]).await {
-            Ok(response) => {
-                let answer = response
-                    .content
-                    .as_ref()
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_else(|| "yes".to_string());
-                Some(answer)
-            }
-            Err(_) => {
-                // Fallback: for y/n questions answer "yes", otherwise return None
-                if lower.contains("y/n")
-                    || lower.contains("yes/no")
-                    || lower.contains("confirm")
-                    || lower.ends_with("?")
-                {
-                    Some("yes".to_string())
-                } else {
-                    None
-                }
-            }
         }
     }
 
@@ -4943,7 +4878,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -5001,7 +4936,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6241,7 +6176,7 @@ mod tests {
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6295,7 +6230,7 @@ mod tests {
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6351,7 +6286,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6424,7 +6359,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6591,7 +6526,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),

@@ -15,7 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::ContextWindowConfig;
 use crate::events::EventStore;
-use crate::traits::{ModelProvider, StateStore};
+use crate::providers::ChatJson;
+use crate::traits::StateStore;
 use crate::types::UserRole;
 
 /// Maximum concurrent background extraction LLM calls.
@@ -632,7 +633,7 @@ pub fn should_extract_facts(user_text: &str) -> bool {
 /// Returns `[]` when nothing worth remembering (most interactions).
 /// Rate-limited by a static semaphore (max 2 concurrent calls).
 pub async fn extract_inline_facts(
-    provider: &Arc<dyn ModelProvider>,
+    provider: &crate::llm_runtime::ModelBackend,
     model: &str,
     user_message: &str,
     assistant_response: &str,
@@ -874,7 +875,7 @@ fn duplicates_active_fact_in_other_category(
 /// Spawns a tokio task that extracts facts and stores them immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_progressive_extraction(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     fast_model: String,
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,

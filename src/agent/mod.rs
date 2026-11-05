@@ -29,8 +29,7 @@ use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{
-    AgentRole, ChatOptions, Message, ModelProvider, StateStore, Tool, ToolCall, ToolCapabilities,
-    ToolRole,
+    AgentRole, ChatOptions, Message, StateStore, Tool, ToolCall, ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
@@ -112,6 +111,7 @@ use loop_utils::{
 mod post_task;
 #[path = "runtime/task_outcome.rs"]
 mod task_outcome;
+use crate::providers::ChatJson;
 use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]

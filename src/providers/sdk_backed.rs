@@ -1,13 +1,11 @@
-//! The daemon's [`ModelProvider`] over an SDK [`sdk::Provider`].
+//! Calling an SDK [`sdk::Provider`] with the daemon's chat-completions JSON.
 //!
-//! Every backend now lives in `aidaemon-providers`; this facade keeps the
-//! daemon's call sites and its recovery engine working unchanged while they
-//! move to the SDK interface. It converts chat-completions JSON to SDK
-//! messages and back, maps SDK errors to the daemon's error kinds (so the
-//! recovery routes stay the same), and reports stream progress to the
+//! Every backend lives in `aidaemon-providers` and every model call goes
+//! through the SDK `Provider` trait. Many daemon call sites still assemble
+//! chat-completions messages, so these helpers convert them to SDK messages
+//! and the reply back, map SDK errors to the daemon's classified errors (for
+//! its recovery decisions and telemetry), and report stream progress to the
 //! model-call watchdog.
-
-use std::sync::Arc;
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
@@ -16,12 +14,11 @@ use serde_json::{json, Value};
 
 use super::error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 use crate::traits::{
-    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
-    ToolChoiceMode,
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, ToolCall, ToolChoiceMode,
 };
 
-/// How a facade lists its models: the SDK has no listing call.
-#[derive(Clone)]
+/// How a provider's models are listed: the SDK has no listing call.
+#[derive(Clone, Debug)]
 pub(crate) enum ModelList {
     Fixed(Vec<String>),
     /// `GET {base}/models` with a bearer key (OpenAI-compatible servers).
@@ -31,53 +28,9 @@ pub(crate) enum ModelList {
     },
 }
 
-pub(crate) struct SdkBacked {
-    provider: Arc<dyn sdk::Provider>,
-    models: ModelList,
-}
-
-impl SdkBacked {
-    pub(crate) fn new(provider: Arc<dyn sdk::Provider>, models: ModelList) -> Self {
-        Self { provider, models }
-    }
-}
-
-#[async_trait]
-impl ModelProvider for SdkBacked {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        self.chat_with_options(model, messages, tools, &ChatOptions::default())
-            .await
-    }
-
-    async fn chat_with_options(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-        options: &ChatOptions,
-    ) -> anyhow::Result<ProviderResponse> {
-        let request = to_sdk_request(model, messages, tools, options);
-        let mut events = self.provider.stream(&request);
-        while let Some(event) = events.next().await {
-            super::streaming::note_stream_progress();
-            match event {
-                Ok(sdk::StreamEvent::Done(response)) => {
-                    return Ok(to_provider_response(response, model))
-                }
-                Ok(_) => {}
-                Err(error) => return Err(to_daemon_error(error).into()),
-            }
-        }
-        Err(ProviderError::malformed_shape("provider stream ended without a response").into())
-    }
-
-    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        match &self.models {
+impl ModelList {
+    pub(crate) async fn list(&self) -> anyhow::Result<Vec<String>> {
+        match self {
             ModelList::Fixed(models) => Ok(models.clone()),
             ModelList::OpenAiModels { base_url, api_key } => {
                 let client = super::build_http_client(std::time::Duration::from_secs(30))
@@ -99,6 +52,80 @@ impl ModelProvider for SdkBacked {
             }
         }
     }
+}
+
+/// Chat-completions calls on any SDK provider, for daemon code that builds
+/// chat JSON. Bring it into scope to call `provider.chat(..)`.
+#[async_trait]
+pub(crate) trait ChatJson {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse>;
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse>;
+}
+
+#[async_trait]
+impl<P: sdk::Provider + ?Sized> ChatJson for P {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse> {
+        chat_with_options(self, model, messages, tools, &ChatOptions::default()).await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
+        chat_with_options(self, model, messages, tools, options).await
+    }
+}
+
+/// One model call: `messages` and `tools` in chat-completions JSON. A
+/// provider failure comes back as the daemon's classified [`ProviderError`].
+pub(crate) async fn chat_with_options<P: sdk::Provider + ?Sized>(
+    provider: &P,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    options: &ChatOptions,
+) -> anyhow::Result<ProviderResponse> {
+    let request = to_sdk_request(model, messages, tools, options);
+    send(provider, &request)
+        .await
+        .map(|response| to_provider_response(response, model))
+}
+
+/// Stream `request` to its end, noting progress for the watchdog.
+pub(crate) async fn send<P: sdk::Provider + ?Sized>(
+    provider: &P,
+    request: &sdk::ModelRequest,
+) -> anyhow::Result<sdk::ModelResponse> {
+    let mut events = provider.stream(request);
+    while let Some(event) = events.next().await {
+        super::streaming::note_stream_progress();
+        match event {
+            Ok(sdk::StreamEvent::Done(response)) => return Ok(response),
+            Ok(_) => {}
+            Err(error) => return Err(to_daemon_error(error).into()),
+        }
+    }
+    Err(ProviderError::malformed_shape("provider stream ended without a response").into())
 }
 
 pub(crate) fn to_sdk_request(
@@ -286,6 +313,227 @@ pub(crate) fn to_provider_response(response: sdk::ModelResponse, model: &str) ->
         }),
         thinking: response.reasoning,
         response_note: response.note,
+    }
+}
+
+/// The options a request carries, as daemon [`ChatOptions`] (for logging
+/// and assertions in tests).
+pub(crate) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
+    ChatOptions {
+        response_mode: match &request.options.response_format {
+            sdk::ResponseFormat::Text => ResponseMode::Text,
+            sdk::ResponseFormat::JsonObject => ResponseMode::JsonObject,
+            sdk::ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => ResponseMode::JsonSchema {
+                name: name.clone(),
+                schema: schema.clone(),
+                strict: *strict,
+            },
+        },
+        tool_choice: match &request.tool_choice {
+            sdk::ToolChoice::Auto => ToolChoiceMode::Auto,
+            sdk::ToolChoice::None => ToolChoiceMode::None,
+            sdk::ToolChoice::Required => ToolChoiceMode::Required,
+            sdk::ToolChoice::Specific(name) => ToolChoiceMode::Specific(name.clone()),
+        },
+        max_tokens_override: request.max_output_tokens,
+        reasoning_effort_override: request.options.reasoning_effort.clone(),
+        single_attempt_fail_closed: request.options.single_attempt,
+        ..Default::default()
+    }
+}
+
+/// Tool definitions in the wrapped chat-completions shape.
+pub(crate) fn to_chat_tools(specs: &[sdk::ToolSpec]) -> Vec<Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            json!({"type": "function", "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }})
+        })
+        .collect()
+}
+
+fn image_block(image: &sdk::Image) -> Value {
+    json!({"type": "image_url", "image_url": {"url": image.to_url()}})
+}
+
+/// Text, images and audio as chat content: a plain string with no media,
+/// content parts with it.
+fn chat_content(text: &str, images: &[sdk::Image], audio: &[sdk::Audio]) -> Value {
+    if images.is_empty() && audio.is_empty() {
+        return Value::String(text.to_string());
+    }
+    let mut blocks = Vec::with_capacity(images.len() + audio.len() + 1);
+    if !text.trim().is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    blocks.extend(images.iter().map(image_block));
+    blocks.extend(audio.iter().map(|audio| {
+        json!({"type": "input_audio", "input_audio": {"data": audio.data, "format": audio.format}})
+    }));
+    Value::Array(blocks)
+}
+
+/// SDK messages as chat-completions messages. Images a tool observed cannot
+/// ride on a `tool` message for every backend, so they follow the run of
+/// tool results as a user message; injected user-role directives become
+/// system messages.
+pub(crate) fn to_chat_messages(messages: &[sdk::Message]) -> Vec<Value> {
+    let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(messages.len());
+    let mut pending_images: Vec<Value> = Vec::new();
+    for message in messages {
+        if message.role != sdk::Role::Tool && !pending_images.is_empty() {
+            out.append(&mut pending_images);
+        }
+        match message.role {
+            sdk::Role::System => out.push(json!({"role": "system", "content": message.content})),
+            sdk::Role::User if message.is_injected() => out.push(json!({
+                "role": "system",
+                "content": message.content,
+            })),
+            sdk::Role::User => out.push(json!({
+                "role": "user",
+                "content": chat_content(&message.content, &message.images, &message.audio),
+            })),
+            sdk::Role::Assistant => {
+                let mut value = json!({"role": "assistant", "content": message.content});
+                if !message.tool_calls.is_empty() {
+                    let calls: Vec<Value> = message
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            names.insert(call.id.as_str(), call.name.as_str());
+                            let arguments = match call.arguments.get("_raw").and_then(Value::as_str)
+                            {
+                                Some(raw)
+                                    if call.arguments.as_object().is_some_and(|o| o.len() == 1) =>
+                                {
+                                    raw.to_string()
+                                }
+                                _ => call.arguments.to_string(),
+                            };
+                            let mut value = json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": arguments},
+                            });
+                            // Reasoning signatures and thinking blocks the
+                            // provider needs back on replay.
+                            if let Some(data) = &call.provider_data {
+                                value["extra_content"] = data.clone();
+                            }
+                            value
+                        })
+                        .collect();
+                    value["tool_calls"] = Value::Array(calls);
+                }
+                out.push(value);
+            }
+            sdk::Role::Tool => {
+                let call_id = message.tool_call_id.as_deref().unwrap_or_default();
+                let name = names.get(call_id).copied().unwrap_or("tool");
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": message.content,
+                }));
+                if !message.images.is_empty() {
+                    let label = format!("[Image observed by `{name}`]");
+                    pending_images.push(json!({
+                        "role": "user",
+                        "content": chat_content(&label, &message.images, &[]),
+                    }));
+                }
+            }
+        }
+    }
+    out.append(&mut pending_images);
+    out
+}
+
+/// A daemon [`ChatOptions`]-free reply as an SDK response.
+pub(crate) fn to_sdk_response(response: ProviderResponse) -> sdk::ModelResponse {
+    let usage = response.usage.as_ref();
+    sdk::ModelResponse {
+        text: response.content.unwrap_or_default(),
+        tool_calls: response
+            .tool_calls
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str::<Value>(&call.arguments)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| {
+                        if call.arguments.trim().is_empty() {
+                            json!({})
+                        } else {
+                            json!({ "_raw": call.arguments })
+                        }
+                    });
+                let mut sdk_call = sdk::ToolCall::new(call.id, call.name, arguments);
+                sdk_call.provider_data = call.extra_content.filter(|data| !data.is_null());
+                sdk_call
+            })
+            .collect(),
+        usage: sdk::Usage {
+            input_tokens: usage.map_or(0, |u| u64::from(u.input_tokens)),
+            output_tokens: usage.map_or(0, |u| u64::from(u.output_tokens)),
+            cached_input_tokens: usage
+                .and_then(|u| u.cached_input_tokens)
+                .map_or(0, u64::from),
+            cache_creation_tokens: usage
+                .and_then(|u| u.cache_creation_input_tokens)
+                .map_or(0, u64::from),
+        },
+        reasoning: response.thinking,
+        note: response.response_note,
+    }
+}
+
+/// A daemon classified error as the SDK's typed error (for test providers
+/// that script daemon errors).
+#[cfg(test)]
+pub(crate) fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
+    let detail = match error.status {
+        Some(status) => format!("HTTP {status}: {}", error.message),
+        None => error.message.clone(),
+    };
+    match error.kind {
+        ProviderErrorKind::Auth => sdk::ProviderError::Auth(detail),
+        ProviderErrorKind::Billing => sdk::ProviderError::Billing {
+            message: detail,
+            affordable_tokens: error.affordable_tokens.map(u64::from),
+        },
+        ProviderErrorKind::RateLimit => sdk::ProviderError::RateLimited {
+            retry_after: error.retry_after_secs.map(std::time::Duration::from_secs),
+        },
+        ProviderErrorKind::BadRequest => match super::context_overflow(&error.message) {
+            Some(limit) => sdk::ProviderError::ContextOverflow {
+                message: detail,
+                limit: limit.map(|l| l as u64),
+            },
+            None => sdk::ProviderError::InvalidRequest(detail),
+        },
+        ProviderErrorKind::NotFound => sdk::ProviderError::NotFound(detail),
+        ProviderErrorKind::Timeout => {
+            sdk::ProviderError::Transient(format!("request timed out: {}", error.message))
+        }
+        ProviderErrorKind::Network => sdk::ProviderError::Transient(detail),
+        ProviderErrorKind::ServerError => sdk::ProviderError::Transient(detail),
+        ProviderErrorKind::MalformedResponse => sdk::ProviderError::Malformed {
+            message: detail,
+            parse: error.malformed_reason == Some(MalformedResponseReason::Parse),
+        },
+        ProviderErrorKind::Unknown => sdk::ProviderError::Other(detail),
     }
 }
 

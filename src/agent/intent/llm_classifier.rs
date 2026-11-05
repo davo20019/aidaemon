@@ -36,7 +36,8 @@ use serde_json::{json, Value};
 use tracing::{debug, info};
 
 use crate::events::EventStore;
-use crate::traits::{ChatOptions, ModelProvider, StateStore};
+use crate::providers::ChatJson;
+use crate::traits::{ChatOptions, StateStore};
 use std::sync::Arc;
 
 /// Output cap for classifier calls. A label is a single short word; 20 tokens
@@ -193,7 +194,7 @@ Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", 
 /// Fail-open: empty input, provider error, or timeout yields `RelationalKind::None`.
 #[cfg(test)]
 pub async fn classify_relational_intent(
-    provider: &dyn ModelProvider,
+    provider: &dyn aidaemon_core::Provider,
     fast_model: &str,
     user_text: &str,
 ) -> RelationalIntent {
@@ -254,7 +255,7 @@ pub(crate) fn build_classifier_messages(user_text: &str) -> Vec<Value> {
 /// `background:intent_classifier` key so we can audit shadow-mode cost.
 #[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 pub async fn classify_intent(
-    provider: &dyn ModelProvider,
+    provider: &dyn aidaemon_core::Provider,
     fast_model: &str,
     user_text: &str,
     state: Option<&Arc<dyn StateStore>>,

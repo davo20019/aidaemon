@@ -76,8 +76,7 @@ pub use memory::{
 };
 pub use people::{Person, PersonFact};
 pub use provider::{
-    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
-    ToolChoiceMode,
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 #[allow(unused_imports)]
 pub use tools::{

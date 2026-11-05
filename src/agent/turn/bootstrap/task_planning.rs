@@ -1,8 +1,8 @@
-use crate::traits::{ModelProvider, ProviderResponse};
+use crate::providers::ChatJson;
+use crate::traits::ProviderResponse;
 use crate::utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -1265,7 +1265,7 @@ fn assessment_hedge_delay(observed_latency_ms: Option<u64>, attempt_budget: Dura
 /// One bounded physical assessment call.  Hedged candidates run as separate
 /// instances of this future so each keeps its own deadline and telemetry.
 async fn run_assessment_attempt(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     model: String,
     messages: Vec<Value>,
     options: crate::traits::ChatOptions,
@@ -1531,7 +1531,7 @@ async fn record_auxiliary_model_failure(
 /// Returns None if the assessment call fails, times out, or returns
 /// unparseable JSON. Failure is silent and callers continue without a plan.
 pub(crate) async fn generate_task_plan(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     model_candidates: &[String],
     user_text: &str,
     mode: TaskAssessmentMode,
@@ -1881,7 +1881,7 @@ pub(crate) async fn generate_task_plan(
 /// budgets rather than a seeded latency ledger.
 #[allow(clippy::too_many_arguments)]
 async fn run_assessment_lane(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     specs: Vec<AssessmentAttemptSpec>,
     aggregate_timeout: Duration,
     messages: Vec<Value>,
@@ -2098,7 +2098,7 @@ async fn run_assessment_lane(
 /// exact antecedent against persisted dialogue state before committing it.
 #[cfg(test)]
 pub(crate) async fn generate_task_relationship(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     model: &str,
     user_text: &str,
     conversation_context: &str,
@@ -2121,7 +2121,7 @@ pub(crate) async fn generate_task_relationship(
 /// order, with a bounded fair share so a slow primary cannot starve every
 /// relationship attempt and a fast fallback cannot win by latency alone.
 pub(crate) async fn generate_task_relationship_candidates(
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     model_candidates: &[String],
     user_text: &str,
     conversation_context: &str,
@@ -2360,29 +2360,28 @@ pub(crate) fn planning_skip_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[derive(Default)]
     struct ModelInvariantAuthFailureProvider {
         calls: std::sync::Mutex<Vec<String>>,
     }
 
-    #[async_trait::async_trait]
-    impl ModelProvider for ModelInvariantAuthFailureProvider {
-        async fn chat(
+    crate::testing::chat_json_provider!(ModelInvariantAuthFailureProvider);
+
+    impl ModelInvariantAuthFailureProvider {
+        async fn respond(
             &self,
             model: &str,
             _messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
+            _options: &crate::traits::ChatOptions,
         ) -> anyhow::Result<ProviderResponse> {
             self.calls.lock().unwrap().push(model.to_string());
             Err(
                 crate::providers::ProviderError::from_status(401, "synthetic auth rejection")
                     .into(),
             )
-        }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(Vec::new())
         }
     }
 
@@ -2391,13 +2390,15 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
     }
 
-    #[async_trait::async_trait]
-    impl ModelProvider for ModelPriorityTestProvider {
-        async fn chat(
+    crate::testing::chat_json_provider!(ModelPriorityTestProvider);
+
+    impl ModelPriorityTestProvider {
+        async fn respond(
             &self,
             model: &str,
             _messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
+            _options: &crate::traits::ChatOptions,
         ) -> anyhow::Result<ProviderResponse> {
             self.calls
                 .lock()
@@ -2455,10 +2456,6 @@ mod tests {
                 })
                 .to_string(),
             ))
-        }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(Vec::new())
         }
     }
 
@@ -3471,13 +3468,15 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ModelProvider for ScriptedLatencyProvider {
-        async fn chat(
+    crate::testing::chat_json_provider!(ScriptedLatencyProvider);
+
+    impl ScriptedLatencyProvider {
+        async fn respond(
             &self,
             model: &str,
             _messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
+            _options: &crate::traits::ChatOptions,
         ) -> anyhow::Result<ProviderResponse> {
             self.started
                 .lock()
@@ -3490,10 +3489,6 @@ mod tests {
                 .unwrap_or(std::time::Duration::from_millis(1));
             tokio::time::sleep(latency).await;
             Ok(synthetic_contract_for(model))
-        }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(Vec::new())
         }
     }
 

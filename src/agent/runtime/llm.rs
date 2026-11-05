@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::ChatJson;
 
 /// Telemetry captured during an LLM call with recovery, surfaced to the agent
 /// loop so it can be persisted as an `LlmCall` event. Populated via an out-param
@@ -67,7 +68,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     async fn cascade_fallback(
         &self,
-        provider: &Arc<dyn ModelProvider>,
+        provider: &crate::llm_runtime::ModelBackend,
         router: Option<&Router>,
         failed_model: &str,
         messages: &[Value],
@@ -195,7 +196,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     async fn retry_malformed_response<F>(
         &self,
-        provider: &Arc<dyn ModelProvider>,
+        provider: &crate::llm_runtime::ModelBackend,
         model: &str,
         messages: &[Value],
         tool_defs: &[Value],
@@ -254,7 +255,7 @@ impl Agent {
     /// only strip `image_url` on a second failure so mixed photo+voice turns keep images.
     async fn try_text_only_vision_fallback(
         &self,
-        provider: &Arc<dyn ModelProvider>,
+        provider: &crate::llm_runtime::ModelBackend,
         model: &str,
         messages: &[Value],
         tool_defs: &[Value],
@@ -308,7 +309,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_llm_with_recovery(
         &self,
-        provider: Arc<dyn ModelProvider>,
+        provider: crate::llm_runtime::ModelBackend,
         router: Option<Router>,
         model: &str,
         messages: &[Value],
@@ -749,7 +750,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use async_trait::async_trait;
     use serde_json::Value;
     use tokio::sync::Mutex;
 
@@ -757,9 +757,7 @@ mod tests {
     use crate::providers::ProviderError;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
-    use crate::traits::{
-        ChatOptions, Goal, Mandate, MandateAuthority, ModelProvider, ProviderResponse, Task,
-    };
+    use crate::traits::{ChatOptions, Goal, Mandate, MandateAuthority, ProviderResponse, Task};
 
     struct ScriptedProvider {
         responses: Mutex<Vec<anyhow::Result<ProviderResponse>>>,
@@ -779,19 +777,10 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ModelProvider for ScriptedProvider {
-        async fn chat(
-            &self,
-            model: &str,
-            messages: &[Value],
-            tools: &[Value],
-        ) -> anyhow::Result<ProviderResponse> {
-            self.chat_with_options(model, messages, tools, &ChatOptions::default())
-                .await
-        }
+    crate::testing::chat_json_provider!(ScriptedProvider);
 
-        async fn chat_with_options(
+    impl ScriptedProvider {
+        async fn respond(
             &self,
             model: &str,
             _messages: &[Value],
@@ -804,10 +793,6 @@ mod tests {
                 return Err(ProviderError::from_status(500, "script exhausted").into());
             }
             responses.remove(0)
-        }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(vec!["scripted-model".to_string()])
         }
     }
 
@@ -869,23 +854,24 @@ mod tests {
         )]));
 
         harness.agent.llm_runtime.swap(
-            primary_provider.clone() as Arc<dyn ModelProvider>,
+            primary_provider.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "primary-model".to_string(),
             vec![ProviderRuntimeTarget::new(
-                alternate_provider.clone() as Arc<dyn ModelProvider>,
+                alternate_provider.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
 
         let mut telemetry = super::LlmCallTelemetry::default();
         let resp = harness
             .agent
             .call_llm_with_recovery(
-                primary_provider as Arc<dyn ModelProvider>,
+                primary_provider as crate::llm_runtime::ModelBackend,
                 None,
                 "primary-model",
                 &[],
@@ -1020,7 +1006,7 @@ mod tests {
         let result = harness
             .agent
             .call_llm_with_recovery(
-                provider.clone() as Arc<dyn ModelProvider>,
+                provider.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 "primary-model",
                 &[],
@@ -1055,16 +1041,17 @@ mod tests {
             MockProvider::text_response("fallback must not run"),
         )]));
         harness.agent.llm_runtime.swap(
-            primary.clone() as Arc<dyn ModelProvider>,
+            primary.clone() as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "primary-model".to_string(),
             vec![ProviderRuntimeTarget::new(
-                alternate.clone() as Arc<dyn ModelProvider>,
+                alternate.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
         harness
             .agent
@@ -1082,7 +1069,7 @@ mod tests {
         let result = harness
             .agent
             .call_llm_with_recovery(
-                primary.clone() as Arc<dyn ModelProvider>,
+                primary.clone() as crate::llm_runtime::ModelBackend,
                 None,
                 "primary-model",
                 &[],

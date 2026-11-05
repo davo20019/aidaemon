@@ -11,6 +11,7 @@ use tracing::warn;
 
 pub(crate) use error::ProviderRecoveryRoute;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
+pub(crate) use sdk_backed::ChatJson;
 
 /// Build an HTTP client with a panic-safe fallback when system proxy discovery
 /// is unavailable in the runtime environment.
