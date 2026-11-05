@@ -766,9 +766,15 @@ fn scan(command: &str) -> Scan {
                 }
                 let mut dup = false;
                 if chars.get(j) == Some(&'&') {
-                    dup = chars
-                        .get(j + 1)
-                        .is_some_and(|d| d.is_ascii_digit() || *d == '-');
+                    // `>&WORD` duplicates a descriptor only when WORD is a
+                    // number, `-`, or a number then `-`; any other word
+                    // (`>&1file`) is a file.
+                    let word = redirect_target(&chars, j + 1);
+                    let digits = word.trim_end_matches('-');
+                    dup = word == "-"
+                        || (!digits.is_empty()
+                            && digits.chars().all(|d| d.is_ascii_digit())
+                            && word.len() - digits.len() <= 1);
                     j += 1;
                 }
                 if next == Some('(') {
@@ -1091,27 +1097,36 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
 // What a call does, for the kernel's decline memory and the approval and
 // egress policies. Keys are built only with the kernel constructors.
 //
-// Completeness is earned, never assumed. A shell command is `complete` only
-// when EVERY segment matches a grammar modelled here in full:
+// A shell command is NEVER declared complete. A shell string cannot be
+// proven fully described: each review round found another construct
+// (`>&1file`, `find -follow`, `curl -w @file`, ...). Completeness would only
+// spare the owner one re-ask after a decline, while the declared keys bind
+// declines either way. So `shell_call_effects` always returns
+// `complete: false` and the parser below is best-effort key extraction.
+//
+// The grammar still decides which keys are extracted, and a wrong key is
+// worse than none:
 // - a known observation, or a program from the tables below, in a shape
 //   where every option is listed with its arity (a flag or one value);
-// - every word plain: no unquoted brace, glob, `$`, backtick, backslash or
-//   `~user`, and no expansion inside double quotes;
-// - every URL strict (`scheme://[userinfo@]host[:port][/path][?q][#f]`,
-//   ASCII, one `@` at most, a DNS name or IP literal for host, no curl glob
-//   characters), every bare host a DNS name or IP literal;
-// - every path resolvable physically (see `shell_path_effects`), with no
-//   `cd`, `pushd` or `popd` anywhere in the command.
-// Anything else (scripts, interpreters, wrappers, unknown options, proxies,
-// scheme-less URLs, git commands that run hooks) makes the call incomplete;
-// keys found are kept as a lower bound. An incomplete call costs one owner
-// card after a decline; a wrong `complete` lets a declined effect through,
-// so when in doubt the parser says incomplete.
+//   anything else is opaque and contributes no keys of its own;
+// - an unquoted brace, glob, `$`, backtick, backslash or `~user` (or an
+//   expansion inside double quotes) marks the segment opaque;
+// - a URL is read only in its strict form
+//   (`scheme://[userinfo@]host[:port][/path][?q][#f]`, ASCII, one `@` at
+//   most, a DNS name or IP literal, no curl glob characters) and only with a
+//   known port; a bare host must be a DNS name or IP literal;
+// - a path resolves physically (see `shell_path_effects`); after `cd`,
+//   `pushd` or `popd` no relative path resolves, and a `~` attached to an
+//   option value stays literal, as in the shell.
 //
-// Configuration files a program reads on its own (`~/.curlrc`,
-// `~/.ssh/config` host aliases, git `insteadOf` rewrites) are an accepted
-// residual. Redirects a server returns are re-validated per hop by the
-// destination policy, not declared here.
+// Residuals, ambient to the programs and not modelled: configuration they
+// read themselves (`~/.curlrc`, `~/.ssh/config` host aliases, git
+// `insteadOf`), files they maintain (`~/.wget-hsts`, `~/.ssh/known_hosts`),
+// proxy variables inherited from the daemon's environment, and redirects a
+// server returns (re-validated per hop by the destination policy).
+//
+// `egress_hosts` keeps its own determinable/undeterminable answer for the
+// egress rules: `None` whenever any segment's reach is opaque.
 
 /// An egress effect on `host`, with IPv6 brackets stripped so `[::1]` and
 /// `::1` name one host. `None` for an empty or unreadable host.
@@ -1232,11 +1247,13 @@ fn strict_url(raw: &str) -> Option<reqwest::Url> {
 /// the scheme's default.
 pub(crate) fn url_host_effect(url: &reqwest::Url) -> Option<EffectKey> {
     let scheme = url.scheme();
+    // No key rather than a wrong one: a scheme whose default port is not
+    // known here (`dict`, `ldap`, `telnet`) would otherwise be port 0.
     let port = url
         .port()
         .or_else(|| scheme_default_port(scheme))
-        .or_else(|| url.port_or_known_default());
-    egress_effect(scheme, url.host_str()?, port)
+        .or_else(|| url.port_or_known_default())?;
+    egress_effect(scheme, url.host_str()?, Some(port))
 }
 
 /// A path effect on `raw`, absolute and normalized: `~/` expands to the home
@@ -1423,13 +1440,15 @@ pub(crate) fn egress_hosts(command: &str) -> Option<Vec<String>> {
 /// The typed effects of a shell command run in `cwd` (an absolute directory,
 /// if known): egress hosts from the URL operands of network programs,
 /// deletes, and writes from output redirects, `tee`, `cp`/`mv`
-/// destinations, `touch` and `mkdir`. Complete only when every segment is
-/// determinable.
+/// destinations, `touch` and `mkdir`. NEVER complete: a shell string cannot
+/// be proven fully described (every review round found another construct),
+/// and the keys bind the owner's declines either way. Incompleteness only
+/// means the owner is asked again after a decline.
 pub(crate) fn shell_call_effects(command: &str, cwd: Option<&str>) -> CallEffects {
     let analysis = analyze_shell(command, cwd);
     CallEffects {
         keys: analysis.keys,
-        complete: analysis.complete,
+        complete: false,
     }
 }
 
@@ -1716,7 +1735,7 @@ fn parse_options(spec: &OptionSpec, args: &[String]) -> Option<ParsedOptions> {
                     return None;
                 }
                 let role = lookup(spec.long_valued, name)?;
-                parsed.values.push((role, value.to_string()));
+                parsed.values.push((role, attached_value(value)));
             } else if spec.long_flags.contains(&long) {
                 parsed.long_flags.push(long.to_string());
             } else {
@@ -1743,11 +1762,22 @@ fn parse_options(spec: &OptionSpec, args: &[String]) -> Option<ParsedOptions> {
             } else {
                 rest
             };
-            parsed.values.push((role, value));
+            parsed.values.push((role, attached_value(&value)));
             break;
         }
     }
     Some(parsed)
+}
+
+/// A value attached to its option (`--opt=~/x`, `-o~/x`) is not at the
+/// start of a shell word, so the shell leaves a leading `~` literal: it names
+/// a directory called `~` relative to the working directory.
+fn attached_value(value: &str) -> String {
+    if value.starts_with('~') {
+        format!("./{value}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn lookup(table: &[(&str, OptionValue)], name: &str) -> Option<OptionValue> {
@@ -3212,7 +3242,7 @@ mod tests {
         ];
         for (command, hosts) in cases {
             let effects = shell_call_effects(command, None);
-            assert!(effects.complete, "{command}");
+            assert!(!effects.complete, "{command}");
             let egress: Vec<_> = effects
                 .keys
                 .iter()
@@ -3267,7 +3297,7 @@ mod tests {
         ];
         for (command, expected) in cases {
             let effects = shell_call_effects(&command, None);
-            assert!(effects.complete, "{command}");
+            assert!(!effects.complete, "{command}");
             let mut keys = effects.keys.clone();
             let mut expected = expected.clone();
             keys.sort_by(|a, b| a.target.cmp(&b.target));
@@ -3302,12 +3332,13 @@ mod tests {
         // A relative path resolves against a known working directory.
         let dir = synthetic_dir();
         let resolved = shell_call_effects("rm build", Some(&dir));
-        assert!(resolved.complete);
+        assert!(!resolved.complete);
         assert_eq!(resolved.keys[0].target, canonical(&format!("{dir}/build")));
+        // Even a plain observation is never declared complete.
         for observation in ["ls -la", "echo hi", "cat a | grep b"] {
             assert_eq!(
                 shell_call_effects(observation, None),
-                CallEffects::none(),
+                CallEffects::unknown(),
                 "{observation}"
             );
         }
@@ -3315,10 +3346,13 @@ mod tests {
 
     /// What one corpus command must declare.
     enum Expect {
-        /// `complete: false` (keys are a lower bound).
+        /// No claim on the keys beyond "none is an expanded word".
         Incomplete,
-        /// `complete: true` with exactly these keys.
+        /// Exactly these keys.
         Exact(Vec<EffectKey>),
+        /// Only keys from this set (a correct key or none, never a wrong
+        /// one).
+        Within(Vec<EffectKey>),
     }
 
     fn write(path: &str) -> EffectKey {
@@ -3335,12 +3369,13 @@ mod tests {
         }
     }
 
-    /// Every command from the Task 3 review (C1–C6, I1–I5, M1–M3) and its
-    /// probe list. The contract for later tasks: a command is complete only
-    /// with exactly the keys it can reach.
+    /// Every command from the Task 3 review (C1–C6, I1–I5, M1–M3), its
+    /// probe list and the re-review (N1–N5). The contract for later tasks: a
+    /// shell command is NEVER complete; the keys extracted are exact where
+    /// listed, and never a wrong concrete target.
     #[test]
     fn under_declaration_corpus() {
-        use Expect::{Exact, Incomplete};
+        use Expect::{Exact, Incomplete, Within};
         let w = "/tmp/aidaemon-test/w";
         let cases: Vec<(&str, Expect)> =
             vec![
@@ -3566,20 +3601,67 @@ mod tests {
             ("echo {a,b} > /tmp/aidaemon-test/f", Incomplete),
             ("echo * > /tmp/aidaemon-test/f", Incomplete),
             ("curl -H \"X: $TOKEN\" https://a.example.invalid/", Incomplete),
+            // N1: `>&WORD` is a file unless WORD is a descriptor.
+            ("echo hi >&1file", Exact(vec![write("/tmp/aidaemon-test/w/1file")])),
+            ("echo hi >&2", Exact(vec![])),
+            ("echo hi 2>&-", Exact(vec![])),
+            ("echo hi >&2-", Exact(vec![])),
+            // N2: `find -follow -delete` reaches through symlinks.
+            (
+                "find /tmp/aidaemon-test/w/x -follow -delete",
+                Exact(vec![delete("/tmp/aidaemon-test/w/x")]),
+            ),
+            // N3: `-w @file` reads a format that may write anywhere.
+            (
+                "curl -w @fmt https://a.example.invalid/",
+                Exact(vec![egress("a.example.invalid:443")]),
+            ),
+            (
+                "curl --write-out @fmt https://a.example.invalid/",
+                Exact(vec![egress("a.example.invalid:443")]),
+            ),
+            // N4: a scheme with no known default port gives no key.
+            (
+                "curl dict://h.example.invalid/d:x",
+                Within(vec![egress("h.example.invalid:2628")]),
+            ),
+            ("curl ldap://h.example.invalid/", Within(vec![])),
+            ("curl telnet://h.example.invalid/", Within(vec![])),
+            (
+                "curl gopher://h.example.invalid:70/",
+                Exact(vec![egress("h.example.invalid:70")]),
+            ),
+            // N5: `~` attached with `=` or to a short option is literal.
+            (
+                "wget --output-document=~/x https://a.example.invalid/",
+                Within(vec![
+                    write("/tmp/aidaemon-test/w/~/x"),
+                    egress("a.example.invalid:443"),
+                ]),
+            ),
+            (
+                "curl -o~/x https://a.example.invalid/",
+                Within(vec![
+                    write("/tmp/aidaemon-test/w/~/x"),
+                    egress("a.example.invalid:443"),
+                ]),
+            ),
         ];
         let mut wrong = Vec::new();
         for (command, expect) in cases {
             let effects = shell_call_effects(command, Some(w));
-            let ok = match expect {
-                Incomplete => !effects.complete,
-                Exact(mut expected) => {
-                    let mut keys = effects.keys.clone();
-                    let order = |key: &EffectKey| format!("{} {}", key.class, key.target);
-                    keys.sort_by_key(order);
-                    expected.sort_by_key(order);
-                    effects.complete && keys == expected
-                }
-            };
+            let ok = !effects.complete
+                && match expect {
+                    Incomplete => true,
+                    Exact(mut expected) => {
+                        let mut keys = effects.keys.clone();
+                        let order = |key: &EffectKey| format!("{} {}", key.class, key.target);
+                        keys.sort_by_key(order);
+                        expected.sort_by_key(order);
+                        keys == expected
+                    }
+                    Within(allowed) => effects.keys.iter().all(|key| allowed.contains(key)),
+                };
             // An expanded word never becomes a key.
             let clean = effects
                 .keys
@@ -3616,7 +3698,7 @@ mod tests {
         };
         // `rm -rf link/` deletes the target directory's contents.
         let trailing = shell_call_effects(&format!("rm -rf {w}/link/"), None);
-        assert!(trailing.complete);
+        assert!(!trailing.complete);
         assert!(trailing
             .keys
             .contains(&key(EffectClass::Delete, format!("{w}/a/real"))));
@@ -3625,17 +3707,21 @@ mod tests {
             .contains(&key(EffectClass::Delete, format!("{w}/link"))));
         // `link/..` is the link target's parent, not `w`.
         let climbed = shell_call_effects(&format!("rm -rf {w}/link/../victim"), None);
-        assert!(climbed.complete);
+        assert!(!climbed.complete);
         assert!(climbed
             .keys
             .contains(&key(EffectClass::Delete, format!("{w}/a/victim"))));
         let redirected = shell_call_effects(&format!("echo x > {w}/link/../f"), None);
-        assert!(redirected.complete);
+        assert!(!redirected.complete);
         assert_eq!(
             redirected.keys,
             vec![key(EffectClass::Write, format!("{w}/a/f"))]
         );
-        // A prefix that exists but cannot be canonicalized is undeterminable.
-        assert!(!shell_call_effects(&format!("echo x > {w}/dangling/f"), None).complete);
+        // A prefix that exists but cannot be canonicalized gives no key.
+        assert!(
+            shell_call_effects(&format!("echo x > {w}/dangling/f"), None)
+                .keys
+                .is_empty()
+        );
     }
 }

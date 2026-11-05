@@ -7629,15 +7629,18 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
                 .as_deref()
                 .map(str::trim)
                 .filter(|dir| dir.starts_with('/'));
+            // Never complete (see `shell_call_effects`): the keys are best
+            // effort and bind the owner's declines.
             let mut effects = shell_call_effects(text, cwd);
             // Declared write targets are what a confined run may change.
             for target in args.write_paths.iter().chain(args.write_roots.iter()) {
-                match path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
-                    Some(key) if !effects.keys.contains(&key) => effects.keys.push(key),
-                    Some(_) => {}
-                    None => effects.complete = false,
+                if let Some(key) = path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
+                    if !effects.keys.contains(&key) {
+                        effects.keys.push(key);
+                    }
                 }
             }
+            effects.complete = false;
             if local {
                 effects
             } else {
@@ -13327,14 +13330,14 @@ mod call_effects_tests {
     fn terminal_curl_post_declares_egress_host() {
         let effects = run("curl -X POST https://h.example.invalid:8443/x -d '{}'");
         assert_eq!(effects.keys, vec![egress("h.example.invalid:8443")]);
-        assert!(effects.complete);
+        assert!(!effects.complete);
     }
 
     #[test]
     fn terminal_curl_default_port() {
         let effects = run("curl https://h.example.invalid/x");
         assert_eq!(effects.keys, vec![egress("h.example.invalid:443")]);
-        assert!(effects.complete);
+        assert!(!effects.complete);
     }
 
     #[test]
@@ -13353,7 +13356,7 @@ mod call_effects_tests {
         let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
         let path = format!("{dir}/f");
         let effects = run(&format!("echo x >> {path}"));
-        assert!(effects.complete);
+        assert!(!effects.complete);
         assert_eq!(
             effects.keys,
             vec![
@@ -13371,7 +13374,7 @@ mod call_effects_tests {
             &serde_json::json!({"action": "run", "command": "echo x > out.txt", "working_dir": dir})
                 .to_string(),
         );
-        assert!(effects.complete);
+        assert!(!effects.complete);
         assert_eq!(
             effects.keys,
             vec![crate::tools::command_effects::path_effect(
@@ -13382,7 +13385,7 @@ mod call_effects_tests {
             .unwrap()]
         );
         // Without a working directory the target is undeterminable.
-        assert!(!run("echo x > out.txt").complete);
+        assert!(run("echo x > out.txt").keys.is_empty());
     }
 
     #[test]
@@ -13394,7 +13397,7 @@ mod call_effects_tests {
         })
         .to_string();
         let local = terminal_call_effects_on(&arguments, true);
-        assert!(local.complete);
+        assert!(!local.complete);
         assert_eq!(local.keys.len(), 3);
         // On an SSH or Docker workspace the paths are not on this disk.
         let remote = terminal_call_effects_on(&arguments, false);
