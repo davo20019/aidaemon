@@ -676,6 +676,17 @@ impl Agent {
     ) {
         self.context_window_config.summarize_token_threshold = token_threshold;
         self.context_window_config.summary_recent_tokens = recent_tokens;
+        // The turn's post-reply compaction reads the writer's own copy.
+        self.transcript_writes = memory_plugin::DaemonMemory::new(
+            self.state.clone(),
+            self.event_store.clone(),
+            self.llm_runtime.clone(),
+            self.context_window_config.clone(),
+            0,
+            false,
+            "",
+        )
+        .writes();
     }
 
     /// Shared `EventStore` handle. Returns a borrow of the `Arc`; clone it if

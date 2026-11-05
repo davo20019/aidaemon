@@ -709,7 +709,7 @@ async fn test_compaction_fires_on_window_overflow() {
         .set_context_compaction_tokens_for_test(512, 256);
 
     // Cross the focused test watermark with ordinary-sized synthetic messages.
-    // Production retains its 12k-token default; compaction is intentionally no
+    // Production compacts at 60% of the model's window; compaction is intentionally no
     // longer driven by a fixed number of messages.
     let pressure = "synthetic historical context detail ".repeat(30);
     for i in 1..=7 {

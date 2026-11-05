@@ -118,6 +118,9 @@ pub(crate) fn check_goal_action(arguments: &serde_json::Value) -> Result<(), Str
 pub(crate) struct MemoryTurn {
     pub session_id: String,
     pub task_id: String,
+    /// The conversation turn this run answers. It is over when the run ends,
+    /// before its `task_end` is appended.
+    pub turn_id: String,
     /// The turn's event emitter (decision points, memory telemetry).
     pub emitter: crate::events::EventEmitter,
     /// The persisted user message for the turn.
@@ -307,17 +310,19 @@ impl MemoryWrites for DaemonMemoryInner {
 
     fn summarize(&self, turn: &MemoryTurn) {
         let snapshot = self.llm_runtime.snapshot();
-        let fast_model = fast_model(&snapshot, &turn.model);
+        // The fast model writes the summary; the turn's model is the window
+        // the history has to fit.
         crate::memory::context_window::spawn_incremental_summarization(
             snapshot.provider(),
-            fast_model.clone(),
+            fast_model(&snapshot, &turn.model),
             self.state.clone(),
             self.event_store.clone(),
             turn.session_id.clone(),
+            turn.turn_id.clone(),
             self.context_window_config
-                .summarize_token_threshold_for(&fast_model),
+                .summarize_token_threshold_for(&turn.model),
             self.context_window_config
-                .summary_recent_tokens_for(&fast_model),
+                .summary_recent_tokens_for(&turn.model),
             turn.user_role,
         );
     }
@@ -404,6 +409,7 @@ pub(super) mod test_support {
         MemoryTurn {
             session_id: session_id.to_string(),
             task_id: "task-1".to_string(),
+            turn_id: "turn-1".to_string(),
             emitter: crate::events::EventEmitter::new(events, session_id),
             user_text: user_text.to_string(),
             user_role: UserRole::Owner,

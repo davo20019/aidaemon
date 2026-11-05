@@ -188,8 +188,10 @@ working_memory_cap = 50
 # Optional per-model total context windows (input plus output tokens).
 # Use the exact model identifier configured under [provider.models].
 # [state.context_window]
-# summarize_token_threshold = 12000 # compact when unsummarized whole turns reach this estimate
-# summary_recent_tokens = 4000      # keep at least this much recent raw context
+# Compaction runs after a reply once the history fills 60% of the turn model's
+# window (a turn only waits for it at 80%). Both settings are optional caps.
+# summarize_token_threshold = 12000 # compact earlier than 60% of the window
+# summary_recent_tokens = 4000      # recent raw context kept (default: a quarter of the threshold)
 # [state.context_window.model_budgets]
 # local-model-name = 16384
 

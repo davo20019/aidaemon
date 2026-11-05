@@ -33,6 +33,7 @@
 mod approval;
 mod completion;
 mod context_window;
+mod conversation;
 mod egress;
 mod grants;
 mod instructions;
@@ -46,6 +47,10 @@ mod untrusted;
 pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision};
 pub use completion::{ReceiptCompletionCheck, Requirement};
 pub use context_window::{estimate_tokens, ContextWindow};
+pub use conversation::{
+    ConversationCompaction, ConversationSummary, InMemorySummaries, ProviderSummarizer, Summarizer,
+    SummaryStore,
+};
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, ProjectInstructions};

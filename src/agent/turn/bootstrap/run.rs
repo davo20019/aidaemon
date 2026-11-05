@@ -1533,7 +1533,10 @@ pub(in crate::agent) async fn run_bootstrap(
     // Emergency pre-call compaction is token-driven and happens before the
     // tail/cursor snapshot is built, so this turn can safely use the refreshed
     // state. It is itself a memory read/write pipeline and is therefore gated
-    // by the compiled task policy.
+    // by the compiled task policy. The background pass after each reply
+    // compacts at the normal threshold; the turn waits only when the history
+    // nears this turn's model window (the background pass fell behind, or the
+    // turn moved to a smaller-window model).
     if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && user_role.can_persist_owner_memory()
@@ -1546,10 +1549,10 @@ pub(in crate::agent) async fn run_bootstrap(
             .unwrap_or_else(|| model.clone());
         let token_threshold = agent
             .context_window_config
-            .summarize_token_threshold_for(&compaction_model);
+            .emergency_compaction_threshold_for(&model);
         let recent_tokens = agent
             .context_window_config
-            .summary_recent_tokens_for(&compaction_model);
+            .summary_recent_tokens_for(&model);
         match tokio::time::timeout(
             Duration::from_secs(30),
             crate::memory::context_window::refresh_incremental_summarization(
@@ -1558,6 +1561,7 @@ pub(in crate::agent) async fn run_bootstrap(
                 agent.state.clone(),
                 agent.event_store.clone(),
                 session_id,
+                None,
                 token_threshold,
                 recent_tokens,
             ),
