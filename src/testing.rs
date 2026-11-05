@@ -718,6 +718,47 @@ pub struct TestHarness {
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
+/// Dispatcher facts for a direct tool test: the call's session, nothing else.
+pub fn call_facts(session_id: &str) -> crate::traits::ToolCallContext {
+    crate::traits::ToolCallContext {
+        session_id: session_id.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Call `tool` the way the dispatcher does, beside `facts`, and return its
+/// output.
+pub async fn call_with_facts<T: Tool + ?Sized>(
+    tool: &T,
+    arguments: &str,
+    facts: crate::traits::ToolCallContext,
+) -> anyhow::Result<String> {
+    tool.call_with_execution_context(arguments, None, facts)
+        .await
+        .map(|outcome| outcome.output)
+}
+
+/// `tool.call_with(arguments, facts)`: [`call_with_facts`] as a method.
+#[async_trait]
+pub trait CallWithFacts {
+    async fn call_with(
+        &self,
+        arguments: &str,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<String>;
+}
+
+#[async_trait]
+impl<T: Tool + ?Sized> CallWithFacts for T {
+    async fn call_with(
+        &self,
+        arguments: &str,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<String> {
+        call_with_facts(self, arguments, facts).await
+    }
+}
+
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
 }

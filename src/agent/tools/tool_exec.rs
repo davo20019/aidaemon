@@ -664,6 +664,103 @@ impl Agent {
             }
     }
 
+    /// The dispatcher's typed facts about one call of `name`, taken from
+    /// the turn (`ctx`), this agent, and the store, never from the call's
+    /// arguments. `mandate_preapproved` is left false: the caller sets it
+    /// after revalidating the exact grant.
+    pub(super) async fn tool_call_context(
+        &self,
+        name: &str,
+        ctx: &ToolExecCtx<'_>,
+        under_mandate: bool,
+        trusted: bool,
+        workspace_grant: Option<&WorkspaceGrant>,
+    ) -> crate::traits::ToolCallContext {
+        let mut facts = crate::traits::ToolCallContext {
+            mandate_preapproved: false,
+            mandate_execution: under_mandate,
+            mutation_forbidden: ctx.mutation_forbidden,
+            kernel_approved: ctx
+                .owner_approval_by_kernel
+                .then_some(crate::traits::ApprovalScope::Call),
+            trusted_session: trusted,
+            user_role: Some(ctx.user_role),
+            untrusted_source: is_trigger_session(ctx.session_id),
+            scope_escalation: ctx.scope_escalation.filter(|e| !e.is_empty()).cloned(),
+            session_id: ctx.session_id.to_string(),
+            channel_visibility: Some(ctx.channel_visibility),
+            channel_id: ctx.channel_id.map(str::to_string),
+            task_id: ctx.task_id.map(str::to_string),
+            tool_call_id: ctx.tool_call_id.map(str::to_string),
+            turn_id: self
+                .current_turn_ids
+                .read()
+                .await
+                .get(ctx.session_id)
+                .cloned(),
+            project_scope: ctx.project_scope.map(str::to_string),
+            workspace_collaboration_root: workspace_grant.map(|grant| grant.project_root.clone()),
+            ..Default::default()
+        };
+        // Only the terminal records the trust its launch was judged with.
+        if name == "terminal" {
+            if let Some((roots, cwd)) = ctx.trust_roots {
+                facts.trust_roots = Some(roots.to_vec());
+                facts.trust_cwd = Some(cwd.to_string());
+            }
+        }
+        // A child inherits this turn's authority, not a re-resolution.
+        if name == "spawn_agent" {
+            if let Some(turn_authority) = ctx.turn_authority {
+                facts.extensions.insert(turn_authority.clone());
+            }
+        }
+        // Goal context for the tools that need it. `cli_agent` and
+        // `terminal` route async/timeout notifications to the *origin*
+        // session (goal.session_id), since internal child-agent sessions
+        // are not routable.
+        if matches!(
+            name,
+            "spawn_agent" | "cli_agent" | "terminal" | "manage_mandates" | "manage_goal_tasks"
+        ) {
+            if let Some(ref gid) = self.goal_id {
+                facts.goal_id = Some(gid.clone());
+            } else if matches!(name, "cli_agent" | "terminal") {
+                // Executors typically don't carry goal_id, but do carry
+                // task_id: resolve it via the task so background
+                // notifications stay deliverable.
+                if let Some(ref executor_task_id) = self.task_id {
+                    if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
+                        facts.goal_id = Some(task.goal_id);
+                    }
+                }
+            }
+            if matches!(name, "manage_mandates" | "manage_goal_tasks") {
+                if let Some(fence) = self.mandate_execution.as_ref() {
+                    facts.goal_run_id = Some(fence.goal_run_id.clone());
+                    facts.task_attempt_id = Some(fence.attempt_id.clone());
+                    if name == "manage_goal_tasks" {
+                        facts.mandate_id = Some(fence.mandate_id.clone());
+                        facts.mandate_version = Some(fence.mandate_version);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "computer_use")]
+        if name == "computer_use" {
+            let runtime = self.llm_runtime.snapshot();
+            let current_model =
+                match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => runtime.primary_model(),
+                };
+            facts.model = Some(current_model);
+            facts.provider_kind = Some(format!("{:?}", runtime.provider_kind()));
+            facts.model_chain = runtime.router().map(|router| router.all_models_ordered());
+        }
+        facts
+    }
+
     pub(super) async fn execute_tool_outcome(
         &self,
         name: &str,
@@ -678,15 +775,11 @@ impl Agent {
         let under_mandate = self
             .validate_mandate_dispatch(name, arguments, ctx, false)
             .await?;
-        // A mandate-authorized call must NOT inject `_trusted_session` even if
+        // A mandate-authorized call is never a trusted session, even if
         // ChannelContext.trusted is true or scheduled provenance would ordinarily
         // authorize it; the entire expression short-circuits to false.
         let trusted = !under_mandate && self.session_trusted(ctx.trusted, task_id).await;
         let user_role = ctx.user_role;
-        // The turn's trust facts reach tools only through the typed
-        // execution context; arguments never carry them.
-        let untrusted_source = is_trigger_session(session_id);
-        let scope_escalation = ctx.scope_escalation.filter(|e| !e.is_empty()).cloned();
         let turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
 
         let active_workspace_grant = match user_role {
@@ -703,6 +796,10 @@ impl Agent {
             }
             UserRole::Public => anyhow::bail!("Tool access denied: public users cannot use tools."),
         };
+
+        let call_facts = self
+            .tool_call_context(name, ctx, under_mandate, trusted, active_workspace_grant)
+            .await;
 
         let scoped_args = if let Some(grant) = active_workspace_grant {
             Some(scoped_workspace_arguments(name, arguments, grant).await?)
@@ -857,19 +954,8 @@ impl Agent {
             } else {
                 false
             };
-            let exec_ctx = crate::traits::ToolCallContext {
-                mandate_preapproved,
-                mandate_execution: under_mandate,
-                mutation_forbidden: ctx.mutation_forbidden,
-                kernel_approved: ctx
-                    .owner_approval_by_kernel
-                    .then_some(crate::traits::ApprovalScope::Call),
-                trusted_session: trusted,
-                user_role: Some(user_role),
-                untrusted_source,
-                scope_escalation: scope_escalation.clone(),
-                ..Default::default()
-            };
+            let mut exec_ctx = call_facts.clone();
+            exec_ctx.mandate_preapproved = mandate_preapproved;
             let result = call_scoped_builtin_file_tool(
                 name,
                 &enriched_args,
@@ -917,19 +1003,8 @@ impl Agent {
                 } else {
                     false
                 };
-                let exec_ctx = crate::traits::ToolCallContext {
-                    mandate_preapproved,
-                    mandate_execution: under_mandate,
-                    mutation_forbidden: ctx.mutation_forbidden,
-                    kernel_approved: ctx
-                        .owner_approval_by_kernel
-                        .then_some(crate::traits::ApprovalScope::Call),
-                    trusted_session: trusted,
-                    user_role: Some(user_role),
-                    untrusted_source,
-                    scope_escalation: scope_escalation.clone(),
-                    ..Default::default()
-                };
+                let mut exec_ctx = call_facts.clone();
+                exec_ctx.mandate_preapproved = mandate_preapproved;
                 let result = tool
                     .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
                     .await
@@ -976,19 +1051,8 @@ impl Agent {
                 } else {
                     false
                 };
-                let exec_ctx = crate::traits::ToolCallContext {
-                    mandate_preapproved,
-                    mandate_execution: under_mandate,
-                    mutation_forbidden: ctx.mutation_forbidden,
-                    kernel_approved: ctx
-                        .owner_approval_by_kernel
-                        .then_some(crate::traits::ApprovalScope::Call),
-                    trusted_session: trusted,
-                    user_role: Some(user_role),
-                    untrusted_source,
-                    scope_escalation: scope_escalation.clone(),
-                    ..Default::default()
-                };
+                let mut exec_ctx = call_facts.clone();
+                exec_ctx.mandate_preapproved = mandate_preapproved;
                 return tool
                     .call_with_execution_context(
                         &prepared.canonical_arguments,
