@@ -371,6 +371,7 @@ dependencies = [
  "aidaemon-core",
  "anyhow",
  "async-trait",
+ "chrono",
  "globset",
  "htmd",
  "ignore",

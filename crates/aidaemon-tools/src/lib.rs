@@ -47,6 +47,7 @@ mod exec;
 mod fs;
 mod search;
 pub mod semantics;
+pub mod services;
 mod shell;
 mod util;
 mod web;

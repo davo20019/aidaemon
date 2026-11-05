@@ -1,31 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// An OAuth connection to an external service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthConnection {
-    pub id: i64,
-    pub service: String,
-    pub auth_type: String,
-    pub username: Option<String>,
-    /// Stable remote account identifier proven through an authenticated
-    /// identity endpoint. Mandate execution binds to this value rather than a
-    /// mutable provider alias or display name.
-    pub account_id: Option<String>,
-    pub scopes: String,
-    pub token_expires_at: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// A pending interactive OAuth flow awaiting browser callback completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingOAuthFlow {
-    pub state: String,
-    pub service: String,
-    pub code_verifier: Option<String>,
-    pub session_id: String,
-    pub created_at: String,
-}
+pub use aidaemon_tools::services::{OAuthConnection, PendingOAuthFlow};
 
 /// A dynamically added skill (stored in database).
 /// Deprecated: kept for migration compatibility. Use filesystem skills instead.
