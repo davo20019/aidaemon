@@ -196,11 +196,33 @@ impl ToolContext {
 /// with [`crate::RunStatus::Finished`] and `reply` as its final text, without
 /// another model call and without consulting `on_stop` hooks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Finish {
     /// The run's final text, if the tool has one for the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
     pub outcome: FinishOutcome,
+}
+
+impl Finish {
+    pub fn new(outcome: FinishOutcome, reply: Option<String>) -> Self {
+        Self { reply, outcome }
+    }
+
+    /// The work is done; `reply` is the run's final text.
+    pub fn succeeded(reply: impl Into<String>) -> Self {
+        Self::new(FinishOutcome::Succeeded, Some(reply.into()))
+    }
+
+    /// Some of the work is done; `reply` says what is left.
+    pub fn partial(reply: impl Into<String>) -> Self {
+        Self::new(FinishOutcome::Partial, Some(reply.into()))
+    }
+
+    /// The work cannot go on without someone else; `reply` says why.
+    pub fn blocked(reply: impl Into<String>) -> Self {
+        Self::new(FinishOutcome::Blocked, Some(reply.into()))
+    }
 }
 
 /// What a tool hands back to the model, plus structured details for receipts.

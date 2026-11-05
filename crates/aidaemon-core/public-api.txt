@@ -417,9 +417,14 @@ pub fn aidaemon_core::FailoverStep::deadline(self, core::time::Duration) -> Self
 pub fn aidaemon_core::FailoverStep::from_arc(alloc::sync::Arc<dyn aidaemon_core::Provider>) -> Self
 pub fn aidaemon_core::FailoverStep::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::FailoverStep::new(impl aidaemon_core::Provider + 'static) -> Self
-pub struct aidaemon_core::Finish
+#[non_exhaustive] pub struct aidaemon_core::Finish
 pub aidaemon_core::Finish::outcome: aidaemon_core::FinishOutcome
 pub aidaemon_core::Finish::reply: core::option::Option<alloc::string::String>
+impl aidaemon_core::Finish
+pub fn aidaemon_core::Finish::blocked(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn aidaemon_core::Finish::new(aidaemon_core::FinishOutcome, core::option::Option<alloc::string::String>) -> Self
+pub fn aidaemon_core::Finish::partial(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn aidaemon_core::Finish::succeeded(impl core::convert::Into<alloc::string::String>) -> Self
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self
@@ -523,6 +528,9 @@ pub aidaemon_core::Pending::calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::Pending::hook_index: core::option::Option<usize>
 pub aidaemon_core::Pending::interruption: aidaemon_core::Interruption
 pub aidaemon_core::Pending::next: usize
+pub struct aidaemon_core::PendingFinish
+pub aidaemon_core::PendingFinish::finish: aidaemon_core::Finish
+pub aidaemon_core::PendingFinish::tool: alloc::string::String
 pub struct aidaemon_core::ProviderSwitch
 pub aidaemon_core::ProviderSwitch::from: alloc::string::String
 pub aidaemon_core::ProviderSwitch::reason: aidaemon_core::SwitchReason
@@ -582,6 +590,7 @@ pub struct aidaemon_core::RunState
 pub aidaemon_core::RunState::agent_id: alloc::string::String
 pub aidaemon_core::RunState::declined: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::RunState::elapsed_ms: u64
+pub aidaemon_core::RunState::finishing: core::option::Option<aidaemon_core::PendingFinish>
 pub aidaemon_core::RunState::in_flight: core::option::Option<aidaemon_core::InFlight>
 pub aidaemon_core::RunState::messages: alloc::vec::Vec<aidaemon_core::Message>
 pub aidaemon_core::RunState::nudges: u32

@@ -8,6 +8,7 @@ use crate::message::{Message, ToolCall};
 use crate::provider::Usage;
 use crate::receipt::Receipt;
 use crate::stuck::StuckState;
+use crate::tool::Finish;
 
 /// Version of the [`RunState`] serialization format this kernel writes and
 /// can resume. State saved before the field existed reads as version 1.
@@ -79,6 +80,15 @@ pub struct InFlight {
     pub done: Vec<String>,
 }
 
+/// A finish a dispatched call returned in the current batch, kept until the
+/// batch ends (across an interruption or a restart) and then applied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFinish {
+    pub finish: Finish,
+    /// The name of the tool whose call returned it.
+    pub tool: String,
+}
+
 /// Everything needed to continue a run, as plain serializable data.
 ///
 /// Persist it anywhere (a database row, a file, a queue message) and hand it
@@ -127,6 +137,10 @@ pub struct RunState {
     /// run ([`RunState::with_user_message`]) starts with none.
     #[serde(default)]
     pub declined: Vec<EffectKey>,
+    /// The first finish a call returned in the unfinished batch; the run
+    /// ends with it once the batch ends (see [`crate::ToolOutput::finish`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finishing: Option<PendingFinish>,
 }
 
 impl RunState {
@@ -152,6 +166,7 @@ impl RunState {
             untrusted_seen: false,
             stuck: StuckState::default(),
             declined: Vec::new(),
+            finishing: None,
         }
     }
 
@@ -178,6 +193,7 @@ impl RunState {
         self.in_flight = None;
         self.stuck.reset();
         self.declined.clear();
+        self.finishing = None;
         self
     }
 

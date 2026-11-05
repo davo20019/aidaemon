@@ -20,11 +20,9 @@ use crate::message::{Message, MessageOrigin, ToolCall};
 use crate::outcome::{RunOutcome, RunStatus};
 use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
-use crate::state::{InFlight, Interruption, Pending, RunId, RunState};
+use crate::state::{InFlight, Interruption, Pending, PendingFinish, RunId, RunState};
 use crate::stuck::StuckSignal;
-use crate::tool::{
-    Finish, SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput,
-};
+use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -35,9 +33,6 @@ pub(crate) struct Driver<'a> {
     /// Whether this segment's end is the run's end for hooks. A segment
     /// driven by `run_resolving` is not: the caller reports the final one.
     report_run_end: bool,
-    /// The first finish a dispatched call returned in the current batch,
-    /// with its tool's name. It ends the run when the batch completes.
-    finishing: Option<(Finish, String)>,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -50,8 +45,9 @@ enum BatchEnd {
     Stuck(StuckSignal),
     Limit(LimitKind),
     Cancelled,
-    /// A call asked to end the run and the whole batch ran.
-    Finished(Finish, String),
+    /// A call asked to end the run and its batch ended (see
+    /// `execute_batch`).
+    Finished(PendingFinish),
 }
 
 /// What the stuck policy asked for while recording a result.
@@ -91,7 +87,6 @@ impl<'a> Driver<'a> {
             segment_start: Instant::now(),
             base_elapsed_ms,
             report_run_end: true,
-            finishing: None,
         }
     }
 
@@ -291,10 +286,41 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// Run `calls[start..]` and apply a finish a call returned
+    /// (`RunState::finishing`, which survives interruptions and restarts).
+    /// A finish whose tool already ran ends the run once the batch ends,
+    /// whether it ran to the end or stopped on a limit or the stuck
+    /// detector. A cancel drops it: the owner's cancel wins. An
+    /// interruption keeps it for the resumed batch.
+    async fn execute_batch(
+        &mut self,
+        calls: &[ToolCall],
+        start: usize,
+        resolution: Option<Resolution>,
+        resume_after: Option<usize>,
+    ) -> Result<BatchEnd, CoreError> {
+        let end = self
+            .run_batch(calls, start, resolution, resume_after)
+            .await?;
+        Ok(match end {
+            BatchEnd::Done | BatchEnd::Limit(_) | BatchEnd::Stuck(_) => {
+                match self.state.finishing.take() {
+                    Some(finishing) => BatchEnd::Finished(finishing),
+                    None => end,
+                }
+            }
+            BatchEnd::Cancelled => {
+                self.state.finishing = None;
+                end
+            }
+            BatchEnd::Interrupted(_) | BatchEnd::Finished(_) => end,
+        })
+    }
+
     /// Run `calls[start..]`. Consecutive approved read-only calls run
     /// concurrently; anything else runs alone, in order. Results are always
     /// appended in call order.
-    async fn execute_batch(
+    async fn run_batch(
         &mut self,
         calls: &[ToolCall],
         start: usize,
@@ -489,10 +515,10 @@ impl<'a> Driver<'a> {
         self.flush(&mut group, &mut nudge, &mut stop).await?;
         self.state.in_flight = None;
 
-        // Every call ran: a tool's finish now ends the run, ahead of any
-        // stuck verdict or nudge about the batch.
-        if let Some((finish, tool)) = self.finishing.take() {
-            return Ok(BatchEnd::Finished(finish, tool));
+        // Every call ran: a tool's finish ends the run (`execute_batch`),
+        // ahead of any stuck verdict or nudge about the batch.
+        if self.state.finishing.is_some() {
+            return Ok(BatchEnd::Done);
         }
         if let Some(signal) = stop {
             return Ok(BatchEnd::Stuck(signal));
@@ -758,9 +784,12 @@ impl<'a> Driver<'a> {
         );
         // Results are appended in call order, so the first finish kept is
         // the first in call order.
-        if receipt.stage == InvocationStage::Dispatched && self.finishing.is_none() {
+        if receipt.stage == InvocationStage::Dispatched && self.state.finishing.is_none() {
             if let Some(finish) = output.finish.clone() {
-                self.finishing = Some((finish, receipt.tool.clone()));
+                self.state.finishing = Some(PendingFinish {
+                    finish,
+                    tool: receipt.tool.clone(),
+                });
             }
         }
         if receipt.stage == InvocationStage::Dispatched && receipt.source == SourceTrust::Untrusted
@@ -998,7 +1027,7 @@ impl<'a> Driver<'a> {
             BatchEnd::Stuck(signal) => (RunStatus::Stuck { signal }, None),
             BatchEnd::Limit(limit) => (RunStatus::LimitReached { limit }, None),
             BatchEnd::Cancelled => (RunStatus::Cancelled, None),
-            BatchEnd::Finished(finish, tool) => (
+            BatchEnd::Finished(PendingFinish { finish, tool }) => (
                 RunStatus::Finished {
                     outcome: finish.outcome,
                     tool,

@@ -61,7 +61,9 @@ pub use provider::{
 };
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
 pub use safeguard::Safeguard;
-pub use state::{InFlight, Interruption, Pending, RunId, RunState, RUN_STATE_SCHEMA};
+pub use state::{
+    InFlight, Interruption, Pending, PendingFinish, RunId, RunState, RUN_STATE_SCHEMA,
+};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
