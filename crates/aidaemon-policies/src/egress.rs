@@ -1,6 +1,8 @@
 //! Outbound secret scan as a `before_tool` hook.
 
-use aidaemon_core::{EffectClass, Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
+use aidaemon_core::{
+    EffectClass, Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo, EGRESS_BLOCKED,
+};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
@@ -112,7 +114,7 @@ impl Hook for EgressGuard {
         match self.scan(&call.arguments) {
             Some(kind) => ToolDecision::Deny {
                 reason: format!(
-                    "[EGRESS BLOCKED] Outbound data appears to contain a {kind}. Remove it; \
+                    "{EGRESS_BLOCKED} Outbound data appears to contain a {kind}. Remove it; \
                      never send credentials."
                 ),
             },
@@ -166,7 +168,10 @@ mod tests {
     fn blocked(decision: &ToolDecision, kind: &str) {
         match decision {
             ToolDecision::Deny { reason } => {
-                assert!(reason.starts_with("[EGRESS BLOCKED] "), "{reason}");
+                assert!(
+                    reason.starts_with(&format!("{EGRESS_BLOCKED} ")),
+                    "{reason}"
+                );
                 assert!(reason.contains(kind), "{reason}");
                 assert!(reason.contains("never send credentials"), "{reason}");
             }

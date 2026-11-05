@@ -49,7 +49,10 @@ async fn secret_in_web_fetch_url_is_egress_blocked() {
         .find(|m| m.role == Role::Tool)
         .map(|m| m.content.clone())
         .expect("a tool result");
-    assert!(tool_result.contains("[EGRESS BLOCKED]"), "{tool_result}");
+    assert!(
+        tool_result.contains(aidaemon_sdk::EGRESS_BLOCKED),
+        "{tool_result}"
+    );
     assert!(
         !tool_result.contains("request to"),
         "nothing was sent: {tool_result}"

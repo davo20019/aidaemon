@@ -3950,7 +3950,7 @@ mod tests {
     fn egress_blocked(decision: &aidaemon_core::ToolDecision) -> bool {
         matches!(
             decision,
-            aidaemon_core::ToolDecision::Deny { reason } if reason.starts_with("[EGRESS BLOCKED]")
+            aidaemon_core::ToolDecision::Deny { reason } if reason.starts_with(aidaemon_core::EGRESS_BLOCKED)
         )
     }
 

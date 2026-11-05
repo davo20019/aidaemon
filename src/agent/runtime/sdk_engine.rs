@@ -93,8 +93,6 @@ const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
 /// The run ended on a terminal tool result (background handoff, executor
 /// blocker, direct response) whose reply ships as is.
 const TERMINAL_REPLY_STOP: &str = "terminal tool result";
-/// Prefix of the outbound secret scan's refusals (`EgressGuard`).
-const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,7 +698,7 @@ impl Agent {
             let authority_denial = reason.starts_with("[AUTHORITY BLOCKED]");
             let untrusted_denial = reason.starts_with(crate::agent::untrusted::UNTRUSTED_BLOCKED);
             let owner_declined = reason.starts_with(sdk::OWNER_DECLINED);
-            let egress_blocked = reason.starts_with(EGRESS_BLOCKED);
+            let egress_blocked = reason.starts_with(sdk::EGRESS_BLOCKED);
             if authority_denial {
                 if !receipt.read_only {
                     self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())

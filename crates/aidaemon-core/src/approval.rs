@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 /// Prefix of the reason recorded when the owner declines an approval.
 pub const OWNER_DECLINED: &str = "[OWNER DECLINED]";
 
+/// Prefix of the reason an outbound secret scan (the
+/// [`crate::Safeguard::Egress`] hook) gives when it refuses a call.
+pub const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
+
 /// What kind of thing a call does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

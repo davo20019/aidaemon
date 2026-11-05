@@ -670,6 +670,7 @@ pub aidaemon_core::Usage::output_tokens: u64
 impl aidaemon_core::Usage
 pub fn aidaemon_core::Usage::add(&mut self, aidaemon_core::Usage)
 pub fn aidaemon_core::Usage::billable_tokens(&self) -> u64
+pub const aidaemon_core::EGRESS_BLOCKED: &str
 pub const aidaemon_core::HARD_TURN_CAP: u32
 pub const aidaemon_core::OWNER_DECLINED: &str
 pub const aidaemon_core::RUN_STATE_SCHEMA: u32

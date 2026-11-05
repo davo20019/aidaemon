@@ -362,7 +362,7 @@ async fn egress_guard_blocks_secret_in_http_body_and_curl() {
     let results = tool_results(&harness).await;
     assert_eq!(results.len(), 2, "{results:?}");
     for result in &results {
-        assert!(result.contains("[EGRESS BLOCKED]"), "{results:?}");
+        assert!(result.contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
         assert!(!result.contains(SYNTHETIC_AWS_KEY), "{results:?}");
     }
     let decisions = approval_conditions(&harness).await;
@@ -416,7 +416,7 @@ async fn egress_guard_allows_local_port_url() {
     assert_eq!(approver.card_count(), 0, "a plain GET needs no card");
     assert_eq!(requests_sent(&sent), 1);
     let results = tool_results(&harness).await;
-    assert!(!results[0].contains("[EGRESS BLOCKED]"), "{results:?}");
+    assert!(!results[0].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
 }
 
 #[tokio::test]
