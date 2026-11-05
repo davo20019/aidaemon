@@ -201,6 +201,18 @@ Order:
       `Redactor`'s patterns. Plan:
       `docs/superpowers/plans/2026-11-04-authority-phase-3a-effects-and-approvals.md`
       (local; `docs/` is gitignored).
+- [ ] 8.1b Provider failover in the kernel. Today the daemon's
+      `sdk_engine/model_call.rs` runs the router and its fallbacks, and the
+      whole call sits under one 90 s cap (`FOREGROUND_MAX_MODEL_CALL`), so
+      a fallback inherits whatever time the failing provider left and can
+      be cut off. Add a kernel `Failover` provider next to `Retry`:
+      - each attempt gets its own deadline;
+      - each switch is a typed event the run can see and tests can assert;
+      - a test where the primary hangs and the fallback answers within its
+        own budget.
+
+      The daemon's router keeps choosing which models form the chain (app
+      policy).
 - [ ] 8.2 Tool contract. Decide where each fact of the daemon's tool
       trait (27 methods: call semantics, receipt kinds, durable replay,
       owner control plane, output trust, ...) lives: the kernel `Tool`, an
@@ -215,7 +227,10 @@ Order:
       which does about ten steps per call: idempotency and replay, ledger
       events, result fitting, instruction deferral, the mandate gate,
       `send_file` dedupe and more. Until these are hooks, the daemon is not
-      really built on the SDK.
+      really built on the SDK. Working-directory injection must become a
+      kernel `Rewrite` hook that runs before call effects are computed
+      (today a terminal call's relative paths are declared incomplete
+      because the directory is injected after the kernel judged it).
 - [ ] 8.4 Tools converge into `aidaemon-tools`.
 - [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
@@ -226,6 +241,12 @@ Order:
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
       assessor is retired).
+- [ ] 8.7b Services: an SDK extension point for background work. It
+      covers start and stop, scheduled ticks, and every agent run built
+      through `AgentBuilder`, so background runs carry the same safeguards.
+      The daemon's heartbeat, schedules and mandate reviews become
+      services. It comes before 8.8 because channel runners are services
+      too.
 - [ ] 8.8 Channels, providers, MCP and store, each promoted into its SDK
       crate.
 
