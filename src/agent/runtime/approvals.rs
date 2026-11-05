@@ -764,8 +764,22 @@ impl sdk::InterruptResolver for DaemonInterruptResolver<'_> {
                     .resolve(state.run_id, interruption, request)
                     .await,
             ),
-            _ => sdk::InterruptResolver::resolve(&self.untrusted, state, interruption).await,
+            sdk::InterruptKind::Untrusted => {
+                sdk::InterruptResolver::resolve(&self.untrusted, state, interruption).await
+            }
+            _ => Some(unknown_interrupt_kind(interruption)),
         }
+    }
+}
+
+/// The refusal for an interruption of a kind this daemon cannot resolve:
+/// fail closed rather than hand it to a resolver built for another kind.
+fn unknown_interrupt_kind(interruption: &sdk::Interruption) -> sdk::Resolution {
+    sdk::Resolution::Deny {
+        reason: format!(
+            "`{}` was not run: it is waiting on a check this daemon cannot resolve ({}).",
+            interruption.call.name, interruption.reason
+        ),
     }
 }
 
@@ -788,6 +802,26 @@ mod tests {
             run_usage: sdk::Usage::default(),
             untrusted_seen: false,
             declined: &[],
+        }
+    }
+
+    /// An interruption of a kind the daemon does not know is refused, never
+    /// handed to a resolver built for another kind. (`InterruptKind` is
+    /// `non_exhaustive` with no third variant yet, so the refusal itself is
+    /// pinned here.)
+    #[test]
+    fn unknown_interrupt_kind_fails_closed() {
+        let interruption = sdk::Interruption {
+            call: sdk::ToolCall::new("c1", "future_tool", json!({})),
+            reason: "a future check".to_string(),
+            kind: sdk::InterruptKind::Untrusted,
+        };
+        match unknown_interrupt_kind(&interruption) {
+            sdk::Resolution::Deny { reason } => {
+                assert!(reason.contains("future_tool"), "{reason}");
+                assert!(reason.contains("not run"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
