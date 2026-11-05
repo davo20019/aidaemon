@@ -91,31 +91,46 @@ static DAEMON_PROTECTED_PATHS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLo
 /// Register the daemon's own config and env files (set at startup). These are
 /// changed only through `manage_config`, never by the file tools.
 pub fn set_daemon_protected_paths(paths: Vec<PathBuf>) {
-    if let Ok(mut guard) = DAEMON_PROTECTED_PATHS.write() {
-        *guard = paths;
-    }
+    let mut guard = DAEMON_PROTECTED_PATHS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = paths;
 }
 
 /// Test helper: protect `paths` as the daemon's own files until dropped.
 #[cfg(test)]
-pub(crate) struct DaemonPathsGuard(Vec<PathBuf>);
+pub(crate) struct DaemonPathsGuard(
+    Vec<PathBuf>,
+    // Held for the guard's lifetime so parallel tests cannot clobber the
+    // process-wide list.
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+static DAEMON_PATHS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 impl DaemonPathsGuard {
     pub(crate) fn set(paths: Vec<PathBuf>) -> Self {
+        let lock = DAEMON_PATHS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = DAEMON_PROTECTED_PATHS
             .read()
             .map(|g| g.clone())
             .unwrap_or_default();
         set_daemon_protected_paths(paths);
-        Self(previous)
+        Self(previous, lock)
     }
 }
 
 #[cfg(test)]
 impl Drop for DaemonPathsGuard {
     fn drop(&mut self) {
-        set_daemon_protected_paths(std::mem::take(&mut self.0));
+        // Restore through the raw lock; `self.1` is still held.
+        if let Ok(mut guard) = DAEMON_PROTECTED_PATHS.write() {
+            *guard = std::mem::take(&mut self.0);
+        }
     }
 }
 
@@ -128,9 +143,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 fn is_daemon_protected(path: &Path) -> bool {
-    DAEMON_PROTECTED_PATHS
-        .read()
-        .is_ok_and(|guard| guard.iter().any(|p| same_file(p, path)))
+    is_protected_in(&DAEMON_PROTECTED_PATHS, path)
+}
+
+/// A poisoned lock fails closed: the path counts as protected.
+fn is_protected_in(list: &std::sync::RwLock<Vec<PathBuf>>, path: &Path) -> bool {
+    list.read()
+        .map_or(true, |guard| guard.iter().any(|p| same_file(p, path)))
 }
 
 /// Env files named by the daemon's own environment variables
@@ -898,10 +917,15 @@ fn matches_patterns(path: &Path, patterns: &[&str]) -> bool {
 /// True for files that hold secrets (keys, credentials, env files, the
 /// daemon's own config). Used by `read_file`.
 pub fn is_secret_path(path: &Path) -> bool {
+    is_secret_path_ignoring_name_shape(path) || has_secret_name_shape(path)
+}
+
+/// Like `is_secret_path` but without the `.env.*` / `*.key` name-shape rules,
+/// so a template file is judged by where it lives alone.
+pub fn is_secret_path_ignoring_name_shape(path: &Path) -> bool {
     matches_patterns(path, SECRET_READ_PATTERNS)
         || is_configured_env_file(path)
         || is_daemon_protected(path)
-        || has_secret_name_shape(path)
 }
 
 pub fn is_sensitive_path(path: &Path) -> bool {
@@ -1167,6 +1191,23 @@ pub fn contains_shell_operator(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poisoned_protected_list_fails_closed() {
+        let list = std::sync::Arc::new(std::sync::RwLock::new(Vec::<PathBuf>::new()));
+        let l2 = list.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = l2.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(is_protected_in(&list, Path::new("/synthetic/anything.txt")));
+        let healthy = std::sync::RwLock::new(Vec::<PathBuf>::new());
+        assert!(!is_protected_in(
+            &healthy,
+            Path::new("/synthetic/anything.txt")
+        ));
+    }
+
     use super::*;
     use std::io::Write;
 
