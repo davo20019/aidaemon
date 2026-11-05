@@ -115,6 +115,7 @@ impl Tool for SetReminderTool {
                 outcome_status: Some(outcome_status),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

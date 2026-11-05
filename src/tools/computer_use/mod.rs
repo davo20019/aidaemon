@@ -456,6 +456,7 @@ impl ComputerUseTool {
         Ok(ToolCallOutcome {
             output: format!("{text}{GUI_TASK_ANCHOR}"),
             metadata,
+            finish: None,
         })
     }
 

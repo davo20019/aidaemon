@@ -87,16 +87,20 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
             TaskStatus::Interrupted,
             TaskOutcome::Partial,
         ),
-        // A tool ended the run. Until tool-driven finishes are wired in
-        // (Phase 8.2), a successful one reads as a completed run and any
-        // other as partial work.
-        sdk::RunStatus::Finished { outcome, .. } => (
-            text.unwrap_or_default(),
+        // A tool ended the run with its own typed finish: the run completed,
+        // and its outcome is the tool's. Work left for someone else (a
+        // blocker, a background job) is partial. A finish that carried no
+        // reply ships the finishing call's own output.
+        sdk::RunStatus::Finished {
+            outcome: finish,
+            tool,
+        } => (
+            text.or_else(|| finishing_call_output(outcome, tool))
+                .unwrap_or_else(|| format!("`{tool}` ended the run.")),
             TaskStatus::Completed,
-            if matches!(outcome, sdk::FinishOutcome::Succeeded) {
-                TaskOutcome::Succeeded
-            } else {
-                TaskOutcome::Partial
+            match finish {
+                sdk::FinishOutcome::Succeeded => TaskOutcome::Succeeded,
+                _ => TaskOutcome::Partial,
             },
         ),
         sdk::RunStatus::Cancelled => (
@@ -131,6 +135,24 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
             TaskOutcome::Failed,
         ),
     }
+}
+
+/// The model-visible output of the latest dispatched call of `tool`, the
+/// untrusted-data wrapper removed.
+fn finishing_call_output(outcome: &sdk::RunOutcome, tool: &str) -> Option<String> {
+    let receipt = outcome.state.receipts.iter().rev().find(|receipt| {
+        receipt.tool == tool && receipt.stage == sdk::InvocationStage::Dispatched
+    })?;
+    outcome
+        .state
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(receipt.call_id.as_str()))
+        .map(|message| {
+            crate::agent::completion_checks::strip_untrusted_wrapper(&message.content).to_string()
+        })
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// What a run settled, beyond its kernel status, that decides the turn's
@@ -261,6 +283,16 @@ impl TurnVerdict {
                 TaskOutcome::Succeeded,
             ),
             _ => (reply, status, task_outcome),
+        };
+        // The owner declined part of what the run set out to do: a tool's
+        // finish cannot call it succeeded.
+        let task_outcome = match (&outcome.status, task_outcome) {
+            (sdk::RunStatus::Finished { .. }, TaskOutcome::Succeeded)
+                if !outcome.state.declined.is_empty() =>
+            {
+                TaskOutcome::Partial
+            }
+            (_, task_outcome) => task_outcome,
         };
         if self.run_failure().is_some() {
             (reply, TaskStatus::Failed, TaskOutcome::Failed)

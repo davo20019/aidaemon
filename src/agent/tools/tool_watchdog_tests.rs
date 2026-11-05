@@ -405,6 +405,7 @@ fn mandate_tool_ctx<'a>(
         scope_escalation: None,
         turn_authority: None,
         trust_roots: None,
+        lone_root_call: false,
     }
 }
 
@@ -488,6 +489,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 scope_escalation: None,
                 turn_authority: None,
                 trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -535,6 +537,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 scope_escalation: None,
                 turn_authority: None,
                 trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -574,6 +577,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 scope_escalation: None,
                 turn_authority: None,
                 trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -614,6 +618,7 @@ async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
                 scope_escalation: None,
                 turn_authority: None,
                 trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -677,6 +682,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         scope_escalation: None,
         turn_authority: None,
         trust_roots: None,
+        lone_root_call: false,
     };
 
     let executor_read = harness
@@ -960,6 +966,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
                 scope_escalation: None,
                 turn_authority: None,
                 trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await

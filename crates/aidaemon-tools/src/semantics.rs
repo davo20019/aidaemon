@@ -1318,6 +1318,13 @@ pub struct ToolCallMetadata {
     /// turn directly from the tool result instead of running another LLM pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct_response: Option<String>,
+    /// The call handed the rest of the turn's work to a background job whose
+    /// result reaches the session later (a launch moved to background
+    /// tracking, a background sub-agent). Set with the call's finish by
+    /// [`ToolCallOutcome::handed_to_background`]; unlike
+    /// `background_started` it says nothing about the receipt's status.
+    #[serde(default)]
+    pub background_handoff: bool,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
@@ -1379,6 +1386,12 @@ pub struct ToolCallOutcome {
     pub output: String,
     #[serde(default)]
     pub metadata: ToolCallMetadata,
+    /// The tool ends the run on this call, from its own typed outcome (never
+    /// from argument or output text). The dispatcher hands it to the kernel
+    /// as [`aidaemon_core::ToolOutput::finish`]; a finish without a reply
+    /// ships the call's own output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<aidaemon_core::Finish>,
 }
 
 /// A failure of the runtime's own pre-dispatch preparation, attributed to the
@@ -1400,6 +1413,7 @@ impl ToolCallOutcome {
         Self {
             output,
             metadata: ToolCallMetadata::default(),
+            finish: None,
         }
     }
 
@@ -1421,6 +1435,7 @@ impl ToolCallOutcome {
                     .with_verification_mode(ToolVerificationMode::ResultContent),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         }
     }
 
@@ -1431,6 +1446,7 @@ impl ToolCallOutcome {
                 outcome_status: Some(ToolOutcomeStatus::Blocked),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         }
     }
 
@@ -1461,6 +1477,7 @@ impl ToolCallOutcome {
                 })),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         }
     }
 
@@ -1471,7 +1488,27 @@ impl ToolCallOutcome {
                 outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         }
+    }
+
+    /// End the run on this call (see [`Self::finish`]).
+    pub fn with_finish(mut self, finish: aidaemon_core::Finish) -> Self {
+        self.finish = Some(finish);
+        self
+    }
+
+    /// The call moved the rest of the work to the background: the run ends
+    /// on it as partial work, and the dispatcher writes the handoff reply
+    /// (it knows the user's request and whether completion notifications
+    /// reach them).
+    pub fn handed_to_background(mut self) -> Self {
+        self.metadata.background_handoff = true;
+        self.finish = Some(aidaemon_core::Finish::new(
+            aidaemon_core::FinishOutcome::Partial,
+            None,
+        ));
+        self
     }
 
     pub fn with_semantics(mut self, semantics: ToolCallSemantics) -> Self {
@@ -1744,6 +1781,9 @@ pub struct ToolCallContext {
     pub task_id: Option<String>,
     /// The model's id for this tool call.
     pub tool_call_id: Option<String>,
+    /// The call is the only one in a root turn's model response, so a reply
+    /// the tool finishes the run with answers the user's request directly.
+    pub lone_root_call: bool,
     /// The session's current turn.
     pub turn_id: Option<String>,
     /// The goal the call serves: the agent's goal, or (for `cli_agent` and
@@ -1795,6 +1835,7 @@ impl std::fmt::Debug for ToolCallContext {
             .field("channel_id", &self.channel_id)
             .field("task_id", &self.task_id)
             .field("tool_call_id", &self.tool_call_id)
+            .field("lone_root_call", &self.lone_root_call)
             .field("turn_id", &self.turn_id)
             .field("goal_id", &self.goal_id)
             .field("goal_run_id", &self.goal_run_id)

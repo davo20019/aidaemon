@@ -609,6 +609,7 @@ impl Agent {
             scope_escalation: scope_escalation.as_ref(),
             turn_authority: turn_authority.as_ref(),
             trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
+            lone_root_call: self.depth == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
         };
         let started = Instant::now();
         let call_semantics = self
@@ -788,7 +789,7 @@ impl Agent {
                 let _ = status_tx.try_send(StatusUpdate::ToolStart { name, summary });
             }
         }
-        let (output, images, metadata, receipt) = match self
+        let (output, images, metadata, receipt, finish) = match self
             .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
         {
@@ -965,7 +966,34 @@ impl Agent {
                         scope.end_with(reply, TaskOutcome::Succeeded);
                     }
                 }
-                (output, images, Some(outcome.metadata), Some(receipt))
+                // The tool's own typed finish ends the run once the batch
+                // completes. One without a reply ships the call's output, the
+                // untrusted-data wrapper removed so reply sanitization does not
+                // empty it.
+                let finish = outcome
+                    .finish
+                    .take()
+                    .filter(|_| satisfied)
+                    .map(|mut finish| {
+                        if finish
+                            .reply
+                            .as_deref()
+                            .is_none_or(|reply| reply.trim().is_empty())
+                        {
+                            finish.reply = Some(
+                                crate::agent::completion_checks::strip_untrusted_wrapper(&output)
+                                    .to_string(),
+                            );
+                        }
+                        finish
+                    });
+                (
+                    output,
+                    images,
+                    Some(outcome.metadata),
+                    Some(receipt),
+                    finish,
+                )
             }
             Err(error) => {
                 // A tool that returns `Err` made an explicit typed failure: it
@@ -1039,7 +1067,7 @@ impl Agent {
                         status,
                     );
                 }
-                (fitted, Vec::new(), Some(metadata), Some(receipt))
+                (fitted, Vec::new(), Some(metadata), Some(receipt), None)
             }
         };
         let failed = receipt
@@ -1217,11 +1245,15 @@ impl Agent {
                 warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
             }
         }
-        sdk::ToolOutput {
+        let output = sdk::ToolOutput {
             is_error: failed,
             ..sdk::ToolOutput::text(model_view).with_images(images)
         }
-        .with_trust(trust)
+        .with_trust(trust);
+        match finish {
+            Some(finish) if !failed => output.finish(finish),
+            _ => output,
+        }
     }
 
     /// Record an assistant message that calls tools before the calls run, so

@@ -5228,6 +5228,7 @@ impl TerminalTool {
                     semantics: command_semantics,
                     ..ToolCallMetadata::default()
                 },
+                finish: None,
             });
         }
 
@@ -5449,7 +5450,11 @@ impl TerminalTool {
                     }
                 }
                 metadata.access_denial = sandbox_access_denial(stderr.as_ref(), exit_code);
-                Ok(ToolCallOutcome { metadata, output })
+                Ok(ToolCallOutcome {
+                    metadata,
+                    output,
+                    finish: None,
+                })
             }
             Err(_) => {
                 // Timeout — check if this is a daemon/background command where the
@@ -5491,6 +5496,7 @@ impl TerminalTool {
                             ..ToolCallMetadata::default()
                         },
                         output,
+                        finish: None,
                     });
                 }
 
@@ -6624,6 +6630,7 @@ impl TerminalTool {
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
+                    finish: None,
                 })
             }
         }
@@ -6640,6 +6647,7 @@ impl TerminalTool {
                 return Ok(ToolCallOutcome {
                     output: done.output,
                     metadata: done.metadata,
+                    finish: None,
                 });
             }
             return Ok(ToolCallOutcome::completed_negative_result(format!(
@@ -6672,7 +6680,11 @@ impl TerminalTool {
             let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
             metadata.semantics = semantics;
-            Ok(ToolCallOutcome { output, metadata })
+            Ok(ToolCallOutcome {
+                output,
+                metadata,
+                finish: None,
+            })
         } else {
             // Still running — return tail of buffer.
             let elapsed = proc.started_at.elapsed().as_secs();
@@ -6713,7 +6725,11 @@ impl TerminalTool {
                 proc.notifier_active && !proc.detached,
             );
             metadata.semantics = proc.semantics.clone();
-            Ok(ToolCallOutcome { output, metadata })
+            Ok(ToolCallOutcome {
+                output,
+                metadata,
+                finish: None,
+            })
         }
     }
 
@@ -6738,7 +6754,11 @@ impl TerminalTool {
         let mut metadata =
             background_observation_metadata(ToolOutcomeStatus::Succeeded, detached, false);
         metadata.truncation = truncation;
-        Ok(ToolCallOutcome { output, metadata })
+        Ok(ToolCallOutcome {
+            output,
+            metadata,
+            finish: None,
+        })
     }
 
     /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.

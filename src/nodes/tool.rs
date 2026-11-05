@@ -274,6 +274,7 @@ impl Tool for ReadNodeSensorsTool {
                 semantics: self.call_semantics(arguments),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -408,6 +409,7 @@ impl Tool for ReadNodeHealthTool {
                 semantics: self.call_semantics(arguments),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -539,6 +541,7 @@ impl Tool for SendNodeAudioTool {
                 semantics: node_audio_receipt_semantics(),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

@@ -188,6 +188,7 @@ impl Tool for SendFileTool {
                 ..ToolCallMetadata::default()
             },
             output,
+            finish: None,
         })
     }
 }

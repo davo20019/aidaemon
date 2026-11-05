@@ -615,6 +615,7 @@ mod tests {
             scope_escalation: None,
             turn_authority: None,
             trust_roots: None,
+            lone_root_call: false,
         };
         let error = harness
             .agent

@@ -1205,6 +1205,7 @@ impl Tool for PlayedNodeAudioTool {
                 semantics: Self::receipt_semantics(),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -1274,6 +1275,7 @@ impl Tool for BackgroundDetachTool {
                 completion_notifications_enabled: true,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

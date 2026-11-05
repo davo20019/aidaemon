@@ -1160,6 +1160,7 @@ impl Tool for ManageHttpAuthTool {
                 collection_observations: collections,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

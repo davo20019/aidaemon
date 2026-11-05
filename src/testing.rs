@@ -1266,6 +1266,7 @@ pub struct MockTool {
     role: ToolRole,
     available: bool,
     return_metadata: crate::traits::ToolCallMetadata,
+    return_finish: Option<aidaemon_core::Finish>,
 }
 
 #[allow(dead_code)]
@@ -1278,7 +1279,14 @@ impl MockTool {
             role: ToolRole::Action,
             available: true,
             return_metadata: Default::default(),
+            return_finish: None,
         }
+    }
+
+    /// End the run on this tool's call, as a tool's own typed finish.
+    pub fn with_finish(mut self, finish: aidaemon_core::Finish) -> Self {
+        self.return_finish = Some(finish);
+        self
     }
 
     pub fn with_role(mut self, role: ToolRole) -> Self {
@@ -1332,6 +1340,7 @@ impl Tool for MockTool {
         Ok(crate::traits::ToolCallOutcome {
             output,
             metadata: self.return_metadata.clone(),
+            finish: self.return_finish.clone(),
         })
     }
 }

@@ -1215,6 +1215,7 @@ impl Tool for ManageOAuthTool {
                     )],
                     ..ToolCallMetadata::default()
                 },
+                finish: None,
             });
         }
         let output = self.run(arguments, status_tx, &facts).await?;

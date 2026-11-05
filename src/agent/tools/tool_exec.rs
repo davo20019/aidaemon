@@ -161,6 +161,9 @@ pub(super) struct ToolExecCtx<'a> {
     /// a run moved to the background records the trust its launch was
     /// judged with.
     pub trust_roots: Option<(&'a [String], &'a str)>,
+    /// The call is the only one in a root turn's model response (passed on
+    /// as `ToolCallContext::lone_root_call`).
+    pub lone_root_call: bool,
 }
 
 async fn scoped_workspace_arguments(
@@ -624,6 +627,7 @@ impl Agent {
                             timed_out: true,
                             ..crate::traits::ToolCallMetadata::default()
                         },
+                        finish: None,
                     })
                 }
             }
@@ -693,6 +697,7 @@ impl Agent {
             channel_id: ctx.channel_id.map(str::to_string),
             task_id: ctx.task_id.map(str::to_string),
             tool_call_id: ctx.tool_call_id.map(str::to_string),
+            lone_root_call: ctx.lone_root_call,
             turn_id: self
                 .current_turn_ids
                 .read()

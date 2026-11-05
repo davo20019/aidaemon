@@ -2289,6 +2289,7 @@ impl Tool for BrowserTool {
                 attachments: result.attachments,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

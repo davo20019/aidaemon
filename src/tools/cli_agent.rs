@@ -4473,7 +4473,11 @@ fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolC
             ..ToolCallMetadata::default()
         }
     };
-    ToolCallOutcome { output, metadata }
+    ToolCallOutcome {
+        output,
+        metadata,
+        finish: None,
+    }
 }
 
 impl CliAgentTool {

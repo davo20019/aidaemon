@@ -2036,6 +2036,7 @@ impl Tool for HttpRequestTool {
                 truncation,
                 ..Default::default()
             },
+            finish: None,
         })
     }
 
@@ -2115,6 +2116,7 @@ impl Tool for HttpRequestTool {
                     authorization_preflight,
                     ..Default::default()
                 },
+                finish: None,
             });
         }
         let (output, http_status, truncation) = self
@@ -2136,6 +2138,7 @@ impl Tool for HttpRequestTool {
                 authorization_preflight,
                 ..Default::default()
             },
+            finish: None,
         })
     }
 }

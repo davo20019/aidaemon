@@ -436,6 +436,7 @@ impl RunCommandTool {
                 access_enforcement: crate::tools::terminal::confined_process_access_enforcement(),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -457,6 +458,7 @@ fn routing_rejection(message: String, route_to: &str) -> ToolCallOutcome {
             access_enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
             ..ToolCallMetadata::default()
         },
+        finish: None,
     }
 }
 

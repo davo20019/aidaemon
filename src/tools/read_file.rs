@@ -334,6 +334,7 @@ impl ReadFileTool {
                     read_file: Some(read_metadata),
                     ..ToolCallMetadata::default()
                 },
+                finish: None,
             });
         }
 
@@ -351,6 +352,7 @@ impl ReadFileTool {
                 read_file: Some(read_metadata),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -727,6 +729,7 @@ async fn image_file_outcome(
             }],
             ..ToolCallMetadata::default()
         },
+        finish: None,
     })
 }
 

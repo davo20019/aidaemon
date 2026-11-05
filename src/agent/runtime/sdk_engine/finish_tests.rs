@@ -199,6 +199,7 @@ impl Tool for Connector {
                 direct_response: Some(CONNECTOR_REPLY.to_string()),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -231,4 +232,93 @@ async fn ledger_closeout_runs_on_finish() {
     assert_eq!(reconciled.metadata["requested_outcome"], "succeeded");
     assert_eq!(reconciled.metadata["requested_status"], "completed");
     assert_eq!(reconciled.metadata["tool_calls_count"], 1);
+}
+
+/// A run in which the owner declined something never ends `Succeeded`, even
+/// when a tool finishes it as succeeded.
+#[test]
+fn declined_run_never_finishes_succeeded() {
+    use super::TurnVerdict;
+    use aidaemon_core as sdk;
+    let mut state = sdk::RunState::new("aidaemon", "s", "hi");
+    state.declined =
+        vec![sdk::EffectKey::path(sdk::EffectClass::Delete, "/tmp/synthetic").unwrap()];
+    let outcome = sdk::RunOutcome {
+        status: sdk::RunStatus::Finished {
+            outcome: sdk::FinishOutcome::Succeeded,
+            tool: "synthetic_connector".into(),
+        },
+        final_text: Some("All connected.".into()),
+        state,
+    };
+    let (reply, status, task_outcome) = TurnVerdict::default().resolve(&outcome);
+    assert_eq!(reply, "All connected.");
+    assert_eq!(status, TaskStatus::Completed);
+    assert_ne!(task_outcome, TaskOutcome::Succeeded);
+}
+
+/// A finish without a reply never ships an empty answer: the finishing
+/// call's own output is the reply.
+#[tokio::test]
+async fn finish_without_a_reply_ships_the_tool_output() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_finisher", "{}"),
+        MockProvider::text_response("UNREACHED model narration"),
+    ]);
+    let finisher = MockTool::new(
+        "synthetic_finisher",
+        "Finishes the synthetic task",
+        "Synthetic task filed for review.",
+    )
+    .with_finish(aidaemon_core::Finish::new(
+        aidaemon_core::FinishOutcome::Partial,
+        None,
+    ));
+    let harness = root(provider, vec![Arc::new(finisher)]).await;
+    let reply = ask(&harness, "finish-no-reply", "File the synthetic task").await;
+
+    assert_eq!(reply, "Synthetic task filed for review.");
+    assert_eq!(harness.provider.call_count().await, 1);
+    let end = task_end(&harness, "finish-no-reply").await;
+    assert_eq!(end.status, TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+}
+
+/// The kernel-side fallback for a finish with no reply (a tool outside the
+/// daemon dispatcher): the finishing call's output, never an empty reply.
+#[test]
+fn finished_run_without_text_falls_back_to_the_finishing_output() {
+    use aidaemon_core as sdk;
+    let mut state = sdk::RunState::new("aidaemon", "s", "hi");
+    state.messages.push(sdk::Message::tool_result(
+        "c1",
+        "Remembered: the synthetic preference.",
+    ));
+    state.receipts.push(sdk::Receipt {
+        run_id: state.run_id,
+        call_id: "c1".into(),
+        tool: "remember".into(),
+        arguments: serde_json::json!({}),
+        turn: 1,
+        stage: sdk::InvocationStage::Dispatched,
+        status: sdk::ReceiptStatus::Succeeded,
+        read_only: false,
+        duration_ms: 1,
+        reason: None,
+        details: serde_json::Value::Null,
+        source: sdk::SourceTrust::Trusted,
+        after_untrusted: false,
+    });
+    let outcome = sdk::RunOutcome {
+        status: sdk::RunStatus::Finished {
+            outcome: sdk::FinishOutcome::Succeeded,
+            tool: "remember".into(),
+        },
+        final_text: None,
+        state,
+    };
+    let (reply, status, task_outcome) = super::TurnVerdict::default().resolve(&outcome);
+    assert_eq!(reply, "Remembered: the synthetic preference.");
+    assert_eq!(status, TaskStatus::Completed);
+    assert_eq!(task_outcome, TaskOutcome::Succeeded);
 }

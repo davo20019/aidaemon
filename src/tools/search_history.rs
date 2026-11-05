@@ -369,6 +369,7 @@ impl SearchHistoryTool {
                 suppress_activity_result: true,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }

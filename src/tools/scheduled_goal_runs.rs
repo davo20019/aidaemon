@@ -1268,6 +1268,7 @@ impl Tool for ScheduledGoalRunsTool {
                 internal_identifiers,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         };
         if let Some((observations, collections)) = objective_evidence {
             outcome = outcome.with_observation_evidence(observations, collections);

@@ -583,6 +583,7 @@ impl Tool for WebFetchTool {
                 truncation,
                 ..Default::default()
             },
+            finish: None,
         })
     }
 
@@ -600,6 +601,7 @@ impl Tool for WebFetchTool {
                 truncation,
                 ..Default::default()
             },
+            finish: None,
         })
     }
 }

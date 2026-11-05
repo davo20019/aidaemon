@@ -718,6 +718,7 @@ impl GenerateImageTool {
                 attachments: vec![attachment],
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -740,6 +741,7 @@ fn error_outcome(error: ImageGenerationError, semantics: ToolCallSemantics) -> T
             semantics,
             ..ToolCallMetadata::default()
         },
+        finish: None,
     }
 }
 

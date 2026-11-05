@@ -2574,6 +2574,7 @@ impl Tool for ManageMandatesTool {
                 outcome_status: Some(outcome_status),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         };
         if let Some((observations, collections)) = objective_evidence {
             outcome = outcome.with_observation_evidence(observations, collections);
