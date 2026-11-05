@@ -196,6 +196,10 @@ pub aidaemon_core::ProviderError::Malformed::message: alloc::string::String
 pub aidaemon_core::ProviderError::Malformed::parse: bool
 pub aidaemon_core::ProviderError::NotFound(alloc::string::String)
 pub aidaemon_core::ProviderError::Other(alloc::string::String)
+pub aidaemon_core::ProviderError::QuotaExhausted
+pub aidaemon_core::ProviderError::QuotaExhausted::message: alloc::string::String
+pub aidaemon_core::ProviderError::QuotaExhausted::per_model: bool
+pub aidaemon_core::ProviderError::QuotaExhausted::resets_at: core::option::Option<std::time::SystemTime>
 pub aidaemon_core::ProviderError::RateLimited
 pub aidaemon_core::ProviderError::RateLimited::retry_after: core::option::Option<core::time::Duration>
 pub aidaemon_core::ProviderError::Transient(alloc::string::String)
@@ -379,6 +383,10 @@ pub aidaemon_core::CallEffects::keys: alloc::vec::Vec<aidaemon_core::EffectKey>
 impl aidaemon_core::CallEffects
 pub fn aidaemon_core::CallEffects::none() -> Self
 pub fn aidaemon_core::CallEffects::unknown() -> Self
+pub struct aidaemon_core::Cooldown
+pub aidaemon_core::Cooldown::error: aidaemon_core::ProviderError
+pub aidaemon_core::Cooldown::model: core::option::Option<alloc::string::String>
+pub aidaemon_core::Cooldown::until: std::time::SystemTime
 pub struct aidaemon_core::DefaultFailover
 pub aidaemon_core::DefaultFailover::base_delay: core::time::Duration
 impl aidaemon_core::FailoverPolicy for aidaemon_core::DefaultFailover
@@ -535,6 +543,16 @@ pub struct aidaemon_core::ProviderSwitch
 pub aidaemon_core::ProviderSwitch::from: alloc::string::String
 pub aidaemon_core::ProviderSwitch::reason: aidaemon_core::SwitchReason
 pub aidaemon_core::ProviderSwitch::to: alloc::string::String
+pub struct aidaemon_core::QuotaGuard
+impl aidaemon_core::QuotaGuard
+pub fn aidaemon_core::QuotaGuard::active(&self) -> alloc::vec::Vec<aidaemon_core::Cooldown>
+pub fn aidaemon_core::QuotaGuard::clear(&self)
+pub fn aidaemon_core::QuotaGuard::from_arc(alloc::sync::Arc<dyn aidaemon_core::Provider>) -> Self
+pub fn aidaemon_core::QuotaGuard::new(impl aidaemon_core::Provider + 'static) -> Self
+impl aidaemon_core::Provider for aidaemon_core::QuotaGuard
+pub fn aidaemon_core::QuotaGuard::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::QuotaGuard::name(&self) -> &str
+pub fn aidaemon_core::QuotaGuard::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 pub struct aidaemon_core::Receipt
 pub aidaemon_core::Receipt::after_untrusted: bool
 pub aidaemon_core::Receipt::arguments: serde_json::value::Value
@@ -751,6 +769,10 @@ impl aidaemon_core::Provider for aidaemon_core::Failover
 pub fn aidaemon_core::Failover::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::Failover::name(&self) -> &str
 pub fn aidaemon_core::Failover::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
+impl aidaemon_core::Provider for aidaemon_core::QuotaGuard
+pub fn aidaemon_core::QuotaGuard::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::QuotaGuard::name(&self) -> &str
+pub fn aidaemon_core::QuotaGuard::stream<'a>(&'a self, &'a aidaemon_core::ModelRequest) -> futures_core::stream::BoxStream<'a, core::result::Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>>
 impl aidaemon_core::Provider for aidaemon_core::testing::ScriptedProvider
 pub fn aidaemon_core::testing::ScriptedProvider::complete<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::testing::ScriptedProvider::name(&self) -> &str

@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Used-up quotas fall over to other providers at once.** A ChatGPT plan's usage limit, a Gemini daily quota, an account out of credit (OpenAI `insufficient_quota`, Anthropic "credit balance is too low") or a rejected key now skips that account's other models without sending them and moves to the next `[[provider.fallbacks]]` entry, instead of retrying each model with backoff (about 90 seconds on a capped ChatGPT plan). The account stays skipped by every caller until the quota's stated reset (a few minutes when none is stated). When every provider fails, the reply names the limit and when it resets instead of the last fallback's error.
+
 - **Swappable long-term memory.** Agent turns reach memory only through a memory plugin: recall is injected by a `before_model` hook, extraction and learning run at run end, and the plugin owns its tools. `[memory] backend = "sdk"` (with the `sdk-memory` cargo feature) uses the `aidaemon-memory` crate instead of the daemon's own memory (`remember` / `recall` tools, a separate SQLite file at `[memory] path`). Default `daemon`. Background memory jobs (consolidation, retention, people intelligence, `/memory`) still use the daemon store.
 
 ### Changed
+
+- **A rejected key moves on to the fallback providers.** Authentication failures used to end the call; other configured providers are now tried.
 
 - **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.
 - **`[state] daily_token_budget` is ignored** (logged once at startup). The SDK kernel never enforced it; per-goal daily budgets and `subagents.task_token_budget` still apply. Cap total spend with a provider spend limit.

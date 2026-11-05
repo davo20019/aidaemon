@@ -30,6 +30,10 @@ pub(super) fn reconcile_plan_projection(plan: &mut crate::plans::TaskPlan) -> bo
     changed
 }
 
+/// How the kernel writes a used-up quota into `RunStatus::ProviderFailed`
+/// (the `Display` of `ProviderError::QuotaExhausted`).
+const QUOTA_EXHAUSTED_PREFIX: &str = "quota exhausted: ";
+
 /// The user-facing reply for a run that did not end with a final answer.
 pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
     let text = outcome
@@ -102,13 +106,22 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
         ),
         sdk::RunStatus::ProviderFailed { error } => (
             // Provider errors can carry paths and credentials: the user gets
-            // the key line, redacted.
-            format!(
-                "I couldn't finish because the model provider returned an error: {}",
-                crate::agent::post_task::redact_error_line_for_summary(
-                    error.to_string().lines().next().unwrap_or_default()
-                )
-            ),
+            // the key line, redacted. A used-up quota's line already says
+            // what happened and when it ends.
+            match error.strip_prefix(QUOTA_EXHAUSTED_PREFIX) {
+                Some(quota) => format!(
+                    "I couldn't finish: {}",
+                    crate::agent::post_task::redact_error_line_for_summary(
+                        quota.lines().next().unwrap_or_default()
+                    )
+                ),
+                None => format!(
+                    "I couldn't finish because the model provider returned an error: {}",
+                    crate::agent::post_task::redact_error_line_for_summary(
+                        error.to_string().lines().next().unwrap_or_default()
+                    )
+                ),
+            },
             TaskStatus::Failed,
             TaskOutcome::Failed,
         ),

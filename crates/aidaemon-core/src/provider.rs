@@ -136,6 +136,17 @@ pub enum ProviderError {
         message: String,
         affordable_tokens: Option<u64>,
     },
+    /// A usage quota (a subscription plan's cap, a daily allowance) is
+    /// used up until `resets_at`, when the provider says. Unlike
+    /// [`ProviderError::RateLimited`], waiting seconds does not help.
+    /// `per_model` is true when the quota covers only the requested model;
+    /// otherwise it covers every model on the account.
+    #[error("quota exhausted: {message}")]
+    QuotaExhausted {
+        message: String,
+        resets_at: Option<std::time::SystemTime>,
+        per_model: bool,
+    },
     /// The model or endpoint does not exist here.
     #[error("not found: {0}")]
     NotFound(String),

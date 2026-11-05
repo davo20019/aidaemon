@@ -234,8 +234,21 @@ impl Provider for GoogleGenai {
 
 /// Map a rejected call. Gemini states a 429's wait in the body
 /// (`RetryInfo.retryDelay`) and answers a bad key with 400
-/// `API_KEY_INVALID`; everything else follows the shared mapping.
+/// `API_KEY_INVALID`; everything else follows the shared mapping. A 429
+/// whose `QuotaFailure` names a daily quota is a used-up quota, not
+/// throttling: its `retryDelay` is seconds while the quota resets once a
+/// day, so no reset is claimed.
 fn gemini_error(status: StatusCode, headers: &HeaderMap, body: &str) -> ProviderError {
+    let daily = (status.as_u16() == 429)
+        .then(|| daily_quota(body))
+        .flatten();
+    if let Some(per_model) = daily {
+        return ProviderError::QuotaExhausted {
+            message: format!("Gemini daily quota used up: {}", body_excerpt(body)),
+            resets_at: None,
+            per_model,
+        };
+    }
     match status.as_u16() {
         429 => ProviderError::RateLimited {
             retry_after: retry_after(headers).or_else(|| body_retry_delay(body)),
@@ -245,6 +258,22 @@ fn gemini_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Provider
         }
         _ => map_status(status, headers, body),
     }
+}
+
+/// Whether a 429 names a used-up daily quota (a `QuotaFailure` violation
+/// whose `quotaId` counts per day), and whether that quota is per model.
+fn daily_quota(body: &str) -> Option<bool> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let ids: Vec<&str> = value
+        .pointer("/error/details")?
+        .as_array()?
+        .iter()
+        .filter_map(|detail| detail.get("violations")?.as_array())
+        .flatten()
+        .filter_map(|violation| violation.get("quotaId")?.as_str())
+        .filter(|id| id.contains("PerDay"))
+        .collect();
+    (!ids.is_empty()).then(|| ids.iter().all(|id| id.contains("PerModel")))
 }
 
 /// `retryDelay` (`"30s"`, `"1.5s"`) from a google.rpc.RetryInfo detail.
@@ -1448,6 +1477,28 @@ mod tests {
             gemini_error(status(429), &headers, quota),
             ProviderError::RateLimited {
                 retry_after: Some(Duration::from_secs(2))
+            }
+        );
+
+        let daily = r#"{"error":{"code":429,"message":"You exceeded your current quota.","status":"RESOURCE_EXHAUSTED",
+            "details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{
+                "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                "quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "quotaDimensions":{"location":"global","model":"gemini-pro-synthetic"},"quotaValue":"50"}]},
+              {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"23s"}]}}"#;
+        assert!(matches!(
+            gemini_error(status(429), &none, daily),
+            ProviderError::QuotaExhausted {
+                resets_at: None,
+                per_model: true,
+                ..
+            }
+        ));
+        let per_minute = daily.replace("PerDayPerProjectPerModel", "PerMinutePerProjectPerModel");
+        assert_eq!(
+            gemini_error(status(429), &none, &per_minute),
+            ProviderError::RateLimited {
+                retry_after: Some(Duration::from_secs(23))
             }
         );
 

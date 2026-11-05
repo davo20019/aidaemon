@@ -13,6 +13,8 @@ pub struct ProviderError {
     /// For 402 Billing errors: the max tokens the account can actually afford,
     /// parsed from messages like "can only afford 6917".
     pub affordable_tokens: Option<u32>,
+    /// For a used-up quota: when the provider says it resets.
+    pub resets_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,9 @@ pub enum ProviderErrorKind {
     Billing,
     /// 429 — rate limited; check retry_after_secs.
     RateLimit,
+    /// A usage quota (a subscription plan's cap, a daily allowance) is used
+    /// up until `resets_at`; waiting seconds does not help.
+    QuotaExhausted,
     /// 400 — malformed request (e.g. missing thought_signature, invalid schema).
     BadRequest,
     /// 404 or "model not found" — bad model name.
@@ -78,7 +83,11 @@ impl ProviderError {
             return Fail;
         }
         match self.kind {
-            ProviderErrorKind::Auth | ProviderErrorKind::Unknown => Fail,
+            ProviderErrorKind::Unknown => Fail,
+            // The account's other models are skipped without a request
+            // (each backend sits behind a `QuotaGuard`); another provider
+            // may still answer.
+            ProviderErrorKind::Auth => Fallback,
             ProviderErrorKind::Billing => RetryReducedBudgetThenFallback,
             ProviderErrorKind::BadRequest => AdaptRequestOnce,
             ProviderErrorKind::RateLimit => RetryRateLimitThenFallback,
@@ -91,7 +100,7 @@ impl ProviderError {
                 RetryMalformedThenFallback
             }
             ProviderErrorKind::MalformedResponse => RetryMalformedThenFail,
-            ProviderErrorKind::NotFound => Fallback,
+            ProviderErrorKind::NotFound | ProviderErrorKind::QuotaExhausted => Fallback,
         }
     }
 
@@ -129,6 +138,7 @@ impl ProviderError {
             malformed_reason: None,
             retry_after_secs,
             affordable_tokens,
+            resets_at: None,
         }
     }
 
@@ -141,6 +151,7 @@ impl ProviderError {
             malformed_reason: Some(MalformedResponseReason::Parse),
             retry_after_secs: None,
             affordable_tokens: None,
+            resets_at: None,
         }
     }
 
@@ -152,6 +163,7 @@ impl ProviderError {
             malformed_reason: Some(MalformedResponseReason::Shape),
             retry_after_secs: None,
             affordable_tokens: None,
+            resets_at: None,
         }
     }
 
@@ -164,6 +176,14 @@ impl ProviderError {
             ProviderErrorKind::Billing => {
                 "LLM API billing error — your account quota may be exhausted.".to_string()
             }
+            ProviderErrorKind::QuotaExhausted => match self.resets_at {
+                Some(at) => format!(
+                    "The LLM plan's usage limit has been reached; it resets {}.",
+                    describe_reset(at, std::time::SystemTime::now())
+                ),
+                None => "The LLM plan's usage limit has been reached; the provider did not say when it resets."
+                    .to_string(),
+            },
             ProviderErrorKind::RateLimit => {
                 if let Some(secs) = self.retry_after_secs {
                     format!("Rate limited. Retrying in {}s...", secs)
@@ -243,6 +263,7 @@ impl ProviderErrorKind {
             self,
             Self::Auth
                 | Self::Billing
+                | Self::QuotaExhausted
                 | Self::RateLimit
                 | Self::NotFound
                 | Self::Timeout
@@ -267,6 +288,31 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+/// When a quota resets, for the user: the UTC time and how long until then
+/// ("at 14:05 UTC (in 2h 10m)"), with the date when it is not today.
+pub(crate) fn describe_reset(at: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let when = chrono::DateTime::<chrono::Utc>::from(at);
+    let today = chrono::DateTime::<chrono::Utc>::from(now).date_naive();
+    let clock = if when.date_naive() == today {
+        when.format("at %H:%M UTC").to_string()
+    } else {
+        when.format("on %b %-d at %H:%M UTC").to_string()
+    };
+    match at.duration_since(now) {
+        Ok(left) => {
+            let minutes = left.as_secs().div_ceil(60);
+            let (days, hours, mins) = (minutes / 1440, minutes % 1440 / 60, minutes % 60);
+            let left = match (days, hours) {
+                (0, 0) => format!("{mins}m"),
+                (0, _) => format!("{hours}h {mins}m"),
+                _ => format!("{days}d {hours}h"),
+            };
+            format!("{clock} (in {left})")
+        }
+        Err(_) => clock,
+    }
+}
 
 /// Try to parse retry_after from a JSON response body.
 /// Handles: {"error": {"retry_after": 5}} and {"retry_after": 5}

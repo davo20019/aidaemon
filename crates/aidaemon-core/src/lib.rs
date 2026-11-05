@@ -25,6 +25,7 @@ mod limits;
 mod message;
 mod outcome;
 mod provider;
+mod quota;
 mod receipt;
 mod run_loop;
 mod safeguard;
@@ -59,6 +60,7 @@ pub use provider::{
     collect_stream, ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions,
     ResponseFormat, Retry, StreamEvent, ToolChoice, ToolSpec, Usage,
 };
+pub use quota::{Cooldown, QuotaGuard};
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
 pub use safeguard::Safeguard;
 pub use state::{

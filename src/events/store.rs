@@ -462,6 +462,7 @@ impl ProviderReadiness {
                 Some(
                     crate::providers::ProviderErrorKind::Auth
                         | crate::providers::ProviderErrorKind::Billing
+                        | crate::providers::ProviderErrorKind::QuotaExhausted
                 )
             ) || self.consecutive_failures >= 3)
     }

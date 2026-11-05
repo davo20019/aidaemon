@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aidaemon_core::{
     collect_stream, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat,
@@ -265,11 +265,7 @@ impl ChatGpt {
         if !status.is_success() {
             let headers = response.headers().clone();
             let body = response.text().await.unwrap_or_default();
-            return Err(map_status(
-                status,
-                &headers,
-                &annotate(status.as_u16(), &body),
-            ));
+            return Err(chatgpt_error(status, &headers, &body));
         }
         Ok(response)
     }
@@ -298,19 +294,92 @@ impl Provider for ChatGpt {
     }
 }
 
-/// Make usage-limit and auth rejections legible: the backend's own message
-/// is terse, and the difference (plan cap vs bad token) decides what the
-/// user should do.
+/// Make an auth rejection legible: the backend's own message is terse, and
+/// a bad token needs the user to sign in again.
 fn annotate(status: u16, body: &str) -> String {
     let body = body_excerpt(body);
     match status {
-        429 => format!(
-            "ChatGPT subscription usage limit reached (or requests are being throttled). \
-             Details: {body}"
-        ),
         401 => format!("ChatGPT subscription auth rejected; sign in again. Details: {body}"),
         _ => body,
     }
+}
+
+/// A rejected call. A 429 is either throttling (worth a short wait) or the
+/// plan's usage limit (`usage_limit_reached`, or a rate-limit window at
+/// 100%), which only its reset cures; the plan not covering Codex at all
+/// (`usage_not_included`) is a billing failure.
+fn chatgpt_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ProviderError {
+    if status.as_u16() == 429 {
+        if let Some(error) = plan_limit(headers, body, SystemTime::now()) {
+            tracing::warn!(%error, "ChatGPT plan limit");
+            return error;
+        }
+    }
+    map_status(status, headers, body)
+}
+
+/// The plan-limit error a 429 states, if it is one. The reset comes from the
+/// body (`resets_at`, epoch seconds, or `resets_in_seconds`), else from the
+/// exhausted window's `x-codex-<window>-reset-at` header.
+fn plan_limit(
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    now: SystemTime,
+) -> Option<ProviderError> {
+    let value: Option<Value> = serde_json::from_str(body).ok();
+    let error = value.as_ref().and_then(|v| v.get("error"));
+    let field = |name: &str| error.and_then(|e| e.get(name));
+    let kind = field("type")
+        .or_else(|| field("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = body_excerpt(body);
+    if kind == "usage_not_included" {
+        return Some(ProviderError::Billing {
+            message: format!("This ChatGPT plan does not include Codex usage: {message}"),
+            affordable_tokens: None,
+        });
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let epoch =
+        |secs: f64| (secs > 0.0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs));
+    // The window that is used up, and when it resets.
+    let exhausted_window = ["primary", "secondary"].iter().find_map(|window| {
+        let used = header(&format!("x-codex-{window}-used-percent"))?;
+        (used >= 100.0).then(|| header(&format!("x-codex-{window}-reset-at")).and_then(epoch))
+    });
+    if kind != "usage_limit_reached" && exhausted_window.is_none() {
+        return None;
+    }
+    let resets_at = field("resets_at")
+        .and_then(Value::as_f64)
+        .and_then(epoch)
+        .or_else(|| {
+            field("resets_in_seconds")
+                .and_then(Value::as_f64)
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                .map(|secs| now + Duration::from_secs_f64(secs))
+        })
+        .or(exhausted_window.flatten());
+    let plan = field("plan_type")
+        .and_then(Value::as_str)
+        .map(|plan| format!(" ({plan} plan)"))
+        .unwrap_or_default();
+    Some(ProviderError::QuotaExhausted {
+        message: format!("ChatGPT usage limit reached{plan}: {message}"),
+        resets_at,
+        per_model: false,
+    })
 }
 
 /// A stable cache-routing key for a set of instructions.
@@ -601,6 +670,17 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
         // Some failure events carry neither status nor code; the overload
         // marker is then the only infrastructure signal.
         || (code.is_empty() && status.is_none() && message.to_ascii_lowercase().contains("overload"));
+    if code == "usage_limit_reached" {
+        let resets_at = field("resets_at")
+            .and_then(Value::as_f64)
+            .filter(|secs| *secs > 0.0)
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs));
+        return ProviderError::QuotaExhausted {
+            message,
+            resets_at,
+            per_model: false,
+        };
+    }
     match status {
         Some(429) => ProviderError::RateLimited { retry_after: None },
         Some(408 | 500 | 502 | 503 | 504) => ProviderError::Transient(message),
@@ -848,9 +928,106 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_rejections_are_explained() {
-        assert!(annotate(429, "{}").contains("usage limit"));
+    fn auth_rejections_are_explained() {
         assert!(annotate(401, "{}").contains("sign in again"));
         assert_eq!(annotate(500, "boom"), "boom");
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, reqwest::header::HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).unwrap()
+    }
+
+    /// The Codex backend's plan-limit body: the reset is epoch seconds.
+    #[test]
+    fn a_plan_limit_is_a_used_up_quota_with_its_reset() {
+        let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1800000000}}"#;
+        match chatgpt_error(status(429), &headers(&[]), body) {
+            ProviderError::QuotaExhausted {
+                message,
+                resets_at,
+                per_model,
+            } => {
+                assert_eq!(
+                    resets_at,
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+                );
+                assert!(!per_model);
+                assert!(message.contains("plus plan"), "{message}");
+                assert!(message.contains("The usage limit has been reached"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plan_limit_without_a_body_reset_takes_the_exhausted_window() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let window = headers(&[
+            ("x-codex-primary-used-percent", "42"),
+            ("x-codex-primary-reset-at", "1700000100"),
+            ("x-codex-secondary-used-percent", "100"),
+            ("x-codex-secondary-reset-at", "1700050000"),
+        ]);
+        let reset = |error: Option<ProviderError>| match error {
+            Some(ProviderError::QuotaExhausted { resets_at, .. }) => resets_at,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            reset(plan_limit(&window, "{}", now)),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_050_000))
+        );
+        let relative = r#"{"error":{"code":"usage_limit_reached","resets_in_seconds":600}}"#;
+        assert_eq!(
+            reset(plan_limit(&headers(&[]), relative, now)),
+            Some(now + Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn throttling_and_an_uncovered_plan_are_not_a_used_up_quota() {
+        let throttled = headers(&[("retry-after", "3"), ("x-codex-primary-used-percent", "60")]);
+        assert_eq!(
+            chatgpt_error(
+                status(429),
+                &throttled,
+                r#"{"error":{"message":"slow down"}}"#
+            ),
+            ProviderError::RateLimited {
+                retry_after: Some(Duration::from_secs(3))
+            }
+        );
+        assert!(matches!(
+            chatgpt_error(
+                status(429),
+                &headers(&[]),
+                r#"{"error":{"type":"usage_not_included","message":"Upgrade"}}"#
+            ),
+            ProviderError::Billing {
+                affordable_tokens: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_plan_limit_failure_event_is_a_used_up_quota() {
+        let capped = decode(&[json!({"type": "response.failed", "response": {"error": {
+            "code": "usage_limit_reached", "message": "limit", "resets_at": 1800000000
+        }}})]);
+        assert!(matches!(
+            capped,
+            Err(ProviderError::QuotaExhausted {
+                resets_at: Some(_),
+                ..
+            })
+        ));
     }
 }

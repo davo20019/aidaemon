@@ -87,8 +87,8 @@ const RUNTIME_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 const RUNTIME_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
 /// Recovery for background calls: rate limits, transient errors and parse
-/// failures retry with backoff, billing and not-found move to the next
-/// model, anything else fails. Records the models it attempted.
+/// failures retry with backoff; billing, not-found, a rejected key and a
+/// used-up quota move to the next model; anything else fails. Records the models it attempted.
 #[derive(Default)]
 struct BackgroundRecovery {
     attempted: std::sync::Mutex<Vec<String>>,
@@ -507,8 +507,25 @@ mod tests {
             after(ProviderError::NotFound("HTTP 404".into()), 1),
             FailoverAction::Next
         );
+        // The account's other models are skipped by its QuotaGuard; a
+        // used-up quota and a rejected key move on.
         assert_eq!(
             after(ProviderError::Auth("HTTP 401".into()), 1),
+            FailoverAction::Next
+        );
+        assert_eq!(
+            after(
+                ProviderError::QuotaExhausted {
+                    message: "HTTP 429: plan cap".into(),
+                    resets_at: None,
+                    per_model: false,
+                },
+                1
+            ),
+            FailoverAction::Next
+        );
+        assert_eq!(
+            after(ProviderError::InvalidRequest("HTTP 400: bad".into()), 1),
             FailoverAction::Stop
         );
     }

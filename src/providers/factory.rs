@@ -103,7 +103,8 @@ fn configured_models(config: &ProviderConfig) -> Vec<String> {
     out
 }
 
-/// The SDK backend for `config`'s kind, and how its models are listed.
+/// The SDK backend for `config`'s kind (behind a [`aidaemon_core::QuotaGuard`]),
+/// and how its models are listed.
 pub(crate) fn build_provider(
     config: &ProviderConfig,
 ) -> anyhow::Result<(crate::llm_runtime::ModelBackend, ModelList)> {
@@ -209,6 +210,11 @@ pub(crate) fn build_provider(
             )?)
         }
     };
+    // One guard per configured account: once the account's quota, credit
+    // or credential fails, every caller skips it until that can have
+    // changed, instead of sending each model and waiting out its retries.
+    let backend: Arc<dyn aidaemon_core::Provider> =
+        Arc::new(aidaemon_core::QuotaGuard::from_arc(backend));
     Ok((backend, models))
 }
 

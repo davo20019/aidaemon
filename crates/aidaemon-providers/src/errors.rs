@@ -54,8 +54,33 @@ pub fn affordable_tokens(body: &str) -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+/// Whether a rejection says the account cannot pay, by the provider's own
+/// error code or fixed message: OpenAI's `insufficient_quota` (sent as a
+/// 429) and Anthropic's "credit balance is too low" (sent as a 400). Neither
+/// is cured by retrying, and neither is the request's fault.
+pub fn out_of_credit(body: &str) -> bool {
+    let value: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let code = |name: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.pointer(&format!("/error/{name}")))
+            .and_then(serde_json::Value::as_str)
+    };
+    code("code") == Some("insufficient_quota")
+        || code("type") == Some("insufficient_quota")
+        || body
+            .to_ascii_lowercase()
+            .contains("credit balance is too low")
+}
+
 /// The typed error for a non-success HTTP status and its body.
 pub fn error_for_status(status: u16, body: &str, detail: String) -> ProviderError {
+    if out_of_credit(body) {
+        return ProviderError::Billing {
+            message: detail,
+            affordable_tokens: None,
+        };
+    }
     if let Some(limit) = context_overflow(body) {
         return ProviderError::ContextOverflow {
             message: detail,
@@ -130,5 +155,20 @@ mod tests {
             error_for_status(503, "", "d".into()),
             ProviderError::Transient(_)
         ));
+    }
+
+    #[test]
+    fn an_account_out_of_credit_is_billing_whatever_its_status() {
+        let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        assert!(matches!(
+            error_for_status(400, anthropic, "d".into()),
+            ProviderError::Billing {
+                affordable_tokens: None,
+                ..
+            }
+        ));
+        let openai = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert!(out_of_credit(openai));
+        assert!(!out_of_credit(r#"{"error":{"type":"rate_limit_error"}}"#));
     }
 }

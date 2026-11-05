@@ -216,6 +216,12 @@ Order:
         policy). The first attempt's deadline sits under the call's idle
         watchdog, so a hung primary hands over to the fallbacks instead of
         the watchdog cancelling the call.
+      - `bbd2603`, `9e4bfd0`: `ProviderError::QuotaExhausted` and a
+        `QuotaGuard` provider wrapper (one per configured account) that
+        remembers a used-up quota until its reset, an account that cannot
+        pay, or a rejected key, and fails later calls without sending them.
+        A chain moves past the account's other models at once; backends
+        classify plan caps, daily quotas and out-of-credit errors.
 - [ ] 8.2 Tool contract. Decide where each fact of the daemon's tool
       trait (27 methods: call semantics, receipt kinds, durable replay,
       owner control plane, output trust, ...) lives: the kernel `Tool`, an

@@ -116,6 +116,10 @@ smart = "anthropic/claude-sonnet-4"
 
 # Optional direct-provider fallback chain. These entries are tried in order
 # after the primary provider's own model fallback list is exhausted.
+# A provider whose account cannot answer (a subscription plan's usage
+# limit, a daily quota, no credit left, a rejected key) is skipped at once
+# for its other models, and stays skipped until its stated reset (or for a
+# few minutes when it states none), so the next entry here answers instead.
 # Keychain secret names use `provider_fallback_<index>_...`, for example:
 # `provider_fallback_0_api_key`, `provider_fallback_0_gateway_token`.
 #

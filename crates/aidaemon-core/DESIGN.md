@@ -37,7 +37,7 @@ hooks or the tool batch.
 | Primitive | File | What it is |
 |---|---|---|
 | `Agent` / `AgentBuilder` | `agent.rs` | Configuration as data with a stable id. No per-run state, cheap to clone. |
-| `Provider` | `provider.rs` | `complete(&ModelRequest) -> ModelResponse`. Retries are a wrapper (`Retry`), not loop logic. |
+| `Provider` | `provider.rs` | `complete(&ModelRequest) -> ModelResponse`. Retries are a wrapper (`Retry`), not loop logic; so are failover (`Failover`, `failover.rs`) and remembering an account that cannot answer until its quota resets (`QuotaGuard`, `quota.rs`). |
 | `Tool` | `tool.rs` | `spec` + `call` required. `annotations` default to destructive; `validate` defaults to a `required`-keys check; `effects` declares what a call does (`CallEffects`). |
 | `ToolContext` | `tool.rs` | Trusted run/session/call ids, a cancel token, and the agent's typed `Extensions` (application values keyed by type, set with `AgentBuilder::tool_extensions`), passed *beside* the model's arguments. |
 | `Hook` | `hook.rs` | `before_model`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`. All default to no-ops. |
