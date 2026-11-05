@@ -131,6 +131,9 @@ pub aidaemon_core::Event::TurnStarted::turn: u32
 pub enum aidaemon_core::FailoverAction
 pub aidaemon_core::FailoverAction::Next
 pub aidaemon_core::FailoverAction::Retry(core::time::Duration)
+pub aidaemon_core::FailoverAction::RetryWith
+pub aidaemon_core::FailoverAction::RetryWith::delay: core::time::Duration
+pub aidaemon_core::FailoverAction::RetryWith::request: alloc::boxed::Box<aidaemon_core::ModelRequest>
 pub aidaemon_core::FailoverAction::Stop
 pub enum aidaemon_core::Image
 pub aidaemon_core::Image::Base64
@@ -345,7 +348,8 @@ pub fn aidaemon_core::AuthorityHook::fmt(&self, &mut core::fmt::Formatter<'_>) -
 pub struct aidaemon_core::DefaultFailover
 pub aidaemon_core::DefaultFailover::base_delay: core::time::Duration
 impl aidaemon_core::FailoverPolicy for aidaemon_core::DefaultFailover
-pub fn aidaemon_core::DefaultFailover::after_error(&self, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::DefaultFailover::after_error(&self, &aidaemon_core::ModelRequest, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::DefaultFailover::before_attempt(&self, &aidaemon_core::ModelRequest) -> core::result::Result<(), aidaemon_core::ProviderError>
 impl core::default::Default for aidaemon_core::DefaultFailover
 pub fn aidaemon_core::DefaultFailover::default() -> Self
 pub struct aidaemon_core::Failover
@@ -631,9 +635,11 @@ pub fn aidaemon_core::EventSink::emit(&self, aidaemon_core::RunId, &aidaemon_cor
 impl<F> aidaemon_core::EventSink for F where F: core::ops::function::Fn(aidaemon_core::RunId, &aidaemon_core::Event) + core::marker::Send + core::marker::Sync
 pub fn F::emit(&self, aidaemon_core::RunId, &aidaemon_core::Event)
 pub trait aidaemon_core::FailoverPolicy: core::marker::Send + core::marker::Sync
-pub fn aidaemon_core::FailoverPolicy::after_error(&self, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::FailoverPolicy::after_error(&self, &aidaemon_core::ModelRequest, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::FailoverPolicy::before_attempt(&self, &aidaemon_core::ModelRequest) -> core::result::Result<(), aidaemon_core::ProviderError>
 impl aidaemon_core::FailoverPolicy for aidaemon_core::DefaultFailover
-pub fn aidaemon_core::DefaultFailover::after_error(&self, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::DefaultFailover::after_error(&self, &aidaemon_core::ModelRequest, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
+pub fn aidaemon_core::DefaultFailover::before_attempt(&self, &aidaemon_core::ModelRequest) -> core::result::Result<(), aidaemon_core::ProviderError>
 pub trait aidaemon_core::Hook: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::Hook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::Hook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait

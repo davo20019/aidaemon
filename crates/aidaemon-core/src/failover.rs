@@ -98,10 +98,17 @@ pub struct ProviderSwitch {
 }
 
 /// What a [`Failover`] does after a failed attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FailoverAction {
     /// Try the same step again after this delay.
     Retry(Duration),
+    /// Try the same step again after `delay` with `request` instead (fewer
+    /// output tokens, no images, default options). Later attempts on the
+    /// step keep it; the next step starts from the original request.
+    RetryWith {
+        delay: Duration,
+        request: Box<ModelRequest>,
+    },
     /// Move to the next step.
     Next,
     /// Give up: no other step would do better.
@@ -116,8 +123,22 @@ pub enum FailoverAction {
 /// A request with [`crate::RequestOptions::single_attempt`] stops at its
 /// first error whatever the policy says.
 pub trait FailoverPolicy: Send + Sync {
-    /// `attempt` counts from 1; `attempts` is the step's limit.
-    fn after_error(&self, error: &ProviderError, attempt: u32, attempts: u32) -> FailoverAction;
+    /// Whether to send `request` on this step at all. An error skips the
+    /// attempt and is handled as its failure (for example, a model the app
+    /// knows is out of credit). Default: send it.
+    fn before_attempt(&self, _request: &ModelRequest) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// `request` is what the failed attempt sent; `attempt` counts from 1;
+    /// `attempts` is the step's limit.
+    fn after_error(
+        &self,
+        request: &ModelRequest,
+        error: &ProviderError,
+        attempt: u32,
+        attempts: u32,
+    ) -> FailoverAction;
 }
 
 /// The default [`FailoverPolicy`].
@@ -135,7 +156,13 @@ impl Default for DefaultFailover {
 }
 
 impl FailoverPolicy for DefaultFailover {
-    fn after_error(&self, error: &ProviderError, attempt: u32, attempts: u32) -> FailoverAction {
+    fn after_error(
+        &self,
+        _request: &ModelRequest,
+        error: &ProviderError,
+        attempt: u32,
+        attempts: u32,
+    ) -> FailoverAction {
         match error {
             error if error.is_retryable() && attempt < attempts => {
                 let delay = match error {
@@ -196,20 +223,25 @@ impl Failover {
         &self.steps
     }
 
-    /// What follows a failed attempt: `Some(delay)` to retry the same step,
-    /// `None` to move on, or the error to give up with.
+    /// What follows a failed attempt that sent `sent`: retry the step
+    /// (`Some`, possibly with a rewritten request), move on (`None`), or the
+    /// error to give up with.
     fn next_move(
         &self,
-        request: &ModelRequest,
+        sent: &ModelRequest,
         step: &FailoverStep,
         attempt: u32,
         error: ProviderError,
-    ) -> Result<Option<Duration>, ProviderError> {
-        if request.options.single_attempt {
+    ) -> Result<Option<(Duration, Option<ModelRequest>)>, ProviderError> {
+        if sent.options.single_attempt {
             return Err(error);
         }
-        match self.policy.after_error(&error, attempt, step.attempts) {
-            FailoverAction::Retry(delay) => Ok(Some(delay)),
+        match self
+            .policy
+            .after_error(sent, &error, attempt, step.attempts)
+        {
+            FailoverAction::Retry(delay) => Ok(Some((delay, None))),
+            FailoverAction::RetryWith { delay, request } => Ok(Some((delay, Some(*request)))),
             FailoverAction::Next => Ok(None),
             FailoverAction::Stop => Err(error),
         }
@@ -245,22 +277,30 @@ impl Provider for Failover {
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
         let mut last = None;
         for step in &self.steps {
-            let step_request = step.request(request);
+            let mut step_request = step.request(request);
             let mut attempt = 0;
             let error = loop {
                 attempt += 1;
-                let error = match tokio::time::timeout(
-                    step.deadline,
-                    step.provider.complete(&step_request),
-                )
-                .await
-                {
-                    Ok(Ok(response)) => return Ok(response),
-                    Ok(Err(error)) => error,
-                    Err(_) => timed_out(step.deadline),
+                let error = match self.policy.before_attempt(&step_request) {
+                    Err(error) => error,
+                    Ok(()) => match tokio::time::timeout(
+                        step.deadline,
+                        step.provider.complete(&step_request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => return Ok(response),
+                        Ok(Err(error)) => error,
+                        Err(_) => timed_out(step.deadline),
+                    },
                 };
-                match self.next_move(request, step, attempt, error.clone())? {
-                    Some(delay) => tokio::time::sleep(delay).await,
+                match self.next_move(&step_request, step, attempt, error.clone())? {
+                    Some((delay, rewritten)) => {
+                        tokio::time::sleep(delay).await;
+                        if let Some(rewritten) = rewritten {
+                            step_request = rewritten;
+                        }
+                    }
                     None => break error,
                 }
             };
@@ -279,33 +319,42 @@ impl Provider for Failover {
         let driver = async move {
             let mut last = None;
             for (index, step) in self.steps.iter().enumerate() {
-                let step_request = step.request(request);
+                let mut step_request = step.request(request);
                 let mut attempt = 0;
                 let error = loop {
                     attempt += 1;
-                    let mut events = step.provider.stream(&step_request);
-                    let error = match tokio::time::timeout(step.deadline, events.next()).await {
-                        Ok(Some(Ok(first))) => {
-                            // Committed to this step: forward everything.
-                            if tx.unbounded_send(Ok(first)).is_err() {
-                                return;
-                            }
-                            while let Some(event) = events.next().await {
-                                if tx.unbounded_send(event).is_err() {
+                    let error = match self.policy.before_attempt(&step_request) {
+                        Err(error) => error,
+                        Ok(()) => {
+                            let mut events = step.provider.stream(&step_request);
+                            match tokio::time::timeout(step.deadline, events.next()).await {
+                                Ok(Some(Ok(first))) => {
+                                    // Committed to this step: forward everything.
+                                    if tx.unbounded_send(Ok(first)).is_err() {
+                                        return;
+                                    }
+                                    while let Some(event) = events.next().await {
+                                        if tx.unbounded_send(event).is_err() {
+                                            return;
+                                        }
+                                    }
                                     return;
                                 }
+                                Ok(Some(Err(error))) => error,
+                                Ok(None) => ProviderError::Other(
+                                    "provider stream ended without a response".into(),
+                                ),
+                                Err(_) => timed_out(step.deadline),
                             }
-                            return;
                         }
-                        Ok(Some(Err(error))) => error,
-                        Ok(None) => {
-                            ProviderError::Other("provider stream ended without a response".into())
-                        }
-                        Err(_) => timed_out(step.deadline),
                     };
-                    drop(events);
-                    match self.next_move(request, step, attempt, error.clone()) {
-                        Ok(Some(delay)) => tokio::time::sleep(delay).await,
+                    match self.next_move(&step_request, step, attempt, error.clone()) {
+                        Ok(Some((delay, rewritten))) => {
+                            tokio::time::sleep(delay).await;
+                            if let Some(rewritten) = rewritten {
+                                step_request = rewritten;
+                            }
+                        }
                         Ok(None) => break error,
                         Err(error) => {
                             let _ = tx.unbounded_send(Err(error));
@@ -493,6 +542,83 @@ mod tests {
         )));
     }
 
+    /// Retries once with an output cap after a billing error, and skips a
+    /// model it knows is out of credit without calling it.
+    struct CapThenSkip;
+
+    impl FailoverPolicy for CapThenSkip {
+        fn before_attempt(&self, request: &ModelRequest) -> Result<(), ProviderError> {
+            if request.model == "broke-model" {
+                return Err(ProviderError::Billing {
+                    message: "cached".into(),
+                    affordable_tokens: None,
+                });
+            }
+            Ok(())
+        }
+
+        fn after_error(
+            &self,
+            request: &ModelRequest,
+            error: &ProviderError,
+            _attempt: u32,
+            _attempts: u32,
+        ) -> FailoverAction {
+            match error {
+                ProviderError::Billing {
+                    affordable_tokens: Some(tokens),
+                    ..
+                } if request.max_output_tokens.is_none() => {
+                    let mut capped = request.clone();
+                    capped.max_output_tokens = Some(*tokens as u32);
+                    FailoverAction::RetryWith {
+                        delay: Duration::ZERO,
+                        request: Box::new(capped),
+                    }
+                }
+                _ => FailoverAction::Next,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_policy_can_retry_with_a_rewritten_request() {
+        let primary = Arc::new(ScriptedProvider::with_results(vec![
+            Err(ProviderError::Billing {
+                message: "402".into(),
+                affordable_tokens: Some(600),
+            }),
+            Ok(text("capped answer")),
+        ]));
+        let chain = Failover::new(vec![FailoverStep::from_arc(primary.clone()).attempts(3)])
+            .policy(CapThenSkip);
+        let events = collect(&chain).await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "capped answer")
+        );
+        let sent = primary.requests();
+        assert_eq!(sent[0].max_output_tokens, None);
+        assert_eq!(sent[1].max_output_tokens, Some(600));
+    }
+
+    #[tokio::test]
+    async fn a_policy_can_skip_an_attempt_without_sending_it() {
+        let broke = Arc::new(ScriptedProvider::new(vec![text("never")]));
+        let chain = Failover::new(vec![
+            FailoverStep::from_arc(broke.clone()).model("broke-model"),
+            FailoverStep::new(ScriptedProvider::new(vec![text("from the fallback")])),
+        ])
+        .policy(CapThenSkip);
+        let events = collect(&chain).await;
+        assert!(broke.requests().is_empty());
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::Switched(s)) if s.from == "scripted:broke-model")
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "from the fallback")
+        );
+    }
+
     #[test]
     fn the_default_policy_caps_backoff_and_honours_retry_after() {
         let policy = DefaultFailover::default();
@@ -500,13 +626,16 @@ mod tests {
             retry_after: Some(Duration::from_secs(120)),
         };
         assert_eq!(
-            policy.after_error(&limited, 1, 3),
+            policy.after_error(&request(), &limited, 1, 3),
             FailoverAction::Retry(MAX_BACKOFF)
         );
-        assert_eq!(policy.after_error(&limited, 3, 3), FailoverAction::Next);
+        assert_eq!(
+            policy.after_error(&request(), &limited, 3, 3),
+            FailoverAction::Next
+        );
         let blip = ProviderError::Transient("x".into());
         assert_eq!(
-            policy.after_error(&blip, 2, 3),
+            policy.after_error(&request(), &blip, 2, 3),
             FailoverAction::Retry(Duration::from_secs(1))
         );
     }
