@@ -509,8 +509,19 @@ struct BudgetGoal {
 }
 
 /// Everything a dispatched call needs from the turn.
+/// The kernel's tool-name rule: 1-64 characters from `[a-zA-Z0-9_-]`.
+fn kernel_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
+    /// The MCP-registry tools bridged for this turn (daemon tools are
+    /// `Agent::tools`); see [`Agent::turn_tool`].
+    mcp_tools: Vec<Arc<dyn crate::traits::Tool>>,
     /// Redacts secrets (the SDK's shapes and the configured literals) from
     /// the arguments of calls the kernel refused before they are written to
     /// the ledger.
@@ -943,6 +954,43 @@ impl Agent {
                 });
             }
         }
+        // The offered MCP-registry tools, bridged the same way so every
+        // kernel hook judges them. A daemon tool of the same name wins (the
+        // dispatcher resolves it first). The set is fixed at turn start: a
+        // server added mid-run is offered from the next turn.
+        let mut mcp_tools: Vec<Arc<dyn crate::traits::Tool>> = Vec::new();
+        if user_role != UserRole::Public {
+            if let Some(registry) = self.mcp_registry.as_ref() {
+                let mut names: Vec<&String> = offered_tools
+                    .iter()
+                    .filter(|name| !self.tools.iter().any(|tool| tool.name() == name.as_str()))
+                    .collect();
+                names.sort();
+                for name in names {
+                    let Some(tool) = registry.find_tool(name).await else {
+                        continue;
+                    };
+                    if !tool.is_available() {
+                        continue;
+                    }
+                    // A server may advertise a name the kernel cannot take
+                    // (dots, over 64 characters): that tool is left out
+                    // rather than failing the turn.
+                    if !kernel_tool_name(name) {
+                        warn!(tool = %name, "MCP tool name is not a valid kernel tool name; not offered");
+                        continue;
+                    }
+                    builder = builder.tool(BridgedTool {
+                        spec: tool_spec(tool.as_ref()),
+                        tool: tool.clone(),
+                        goal_actions_only: false,
+                        calls: calls_tx.clone(),
+                        trust_roots: bridge_roots.clone(),
+                    });
+                    mcp_tools.push(tool);
+                }
+            }
+        }
         // Memory hooks run after the ledger stop, so a rejected final answer
         // never reaches a memory writer. Summarization and learning belong to
         // the turn, so they run whatever the memory plugin.
@@ -1165,6 +1213,7 @@ impl Agent {
                 && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
             session_id,
+            mcp_tools,
             ledger_redactor,
             user_text,
             task_id: &task_id,

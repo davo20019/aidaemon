@@ -1339,3 +1339,143 @@ async fn dispatcher_executes_with_the_judged_scope() {
         1
     );
 }
+
+// ==================== MCP registry tools on the SDK path ====================
+
+/// [`approvals_harness`] with the synthetic `fake` MCP server registered.
+async fn mcp_approvals_harness(
+    script: Vec<crate::traits::ProviderResponse>,
+    answers: Vec<Option<crate::types::ApprovalResponse>>,
+) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+    mcp_approvals_harness_with(script, answers, Vec::new()).await
+}
+
+/// [`mcp_approvals_harness`] with `extra` daemon tools.
+async fn mcp_approvals_harness_with(
+    script: Vec<crate::traits::ProviderResponse>,
+    answers: Vec<Option<crate::types::ApprovalResponse>>,
+    extra: Vec<Arc<dyn crate::traits::Tool>>,
+) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+    let (mut harness, approver) = approvals_harness_with(script, answers, None, extra).await;
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    harness.agent.set_test_mcp_registry(registry);
+    // The policy profile prunes destructive tools for a cheap model; these
+    // tests are about the kernel hooks, so every MCP tool is offered.
+    harness.agent.set_test_tool_filter_enforce(false);
+    (harness, approver)
+}
+
+/// An owner turn that names the fake MCP server, so its tools are offered.
+async fn run_mcp_owner_turn(harness: &crate::testing::TestHarness) {
+    use crate::runtime_ports::AgentIngress;
+    harness
+        .agent
+        .handle_inbound_message(crate::runtime_ports::InboundMessageRequest {
+            session_id: APPROVALS_SESSION.to_string(),
+            user_text: "Use mcp:fake for the synthetic report".to_string(),
+            attachments: Vec::new(),
+            status_tx: None,
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("telegram"),
+            heartbeat: None,
+            ingress_timing: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// An MCP-registry tool the turn offers is bridged into the kernel and runs.
+#[tokio::test]
+async fn mcp_tool_is_offered_and_runs_on_sdk_path() {
+    let (harness, approver) = mcp_approvals_harness(
+        vec![
+            MockProvider::tool_call_response("fake__echo", r#"{"text":"synthetic hello"}"#),
+            MockProvider::text_response("Echoed."),
+        ],
+        vec![],
+    )
+    .await;
+    run_mcp_owner_turn(&harness).await;
+
+    let offered = {
+        let calls = harness.provider.call_log.lock().await;
+        serde_json::Value::Array(calls[0].tools.clone()).to_string()
+    };
+    assert!(offered.contains("fake__echo"), "{offered}");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("synthetic hello"), "{results:?}");
+    assert_eq!(approver.card_count(), 0);
+}
+
+/// Every kernel hook judges a bridged MCP call: a read-only session refuses
+/// a mutating one, the egress guard refuses a secret in an open-world one,
+/// and after a decline a call with unknown effects is asked again.
+#[tokio::test]
+async fn mcp_tool_call_passes_kernel_hooks() {
+    // The chat turns read-only mid-run: the kernel's authority hook refuses
+    // the mutating MCP tool, the read-only one still runs.
+    let state_cell = Arc::new(std::sync::OnceLock::new());
+    let (harness, approver) = mcp_approvals_harness_with(
+        vec![
+            MockProvider::tool_call_response("mode_flip_probe", "{}"),
+            MockProvider::tool_call_response("fake__no_annotations", "{}"),
+            MockProvider::tool_call_response("fake__echo", r#"{"text":"synthetic read"}"#),
+            MockProvider::text_response("Done."),
+        ],
+        vec![],
+        vec![Arc::new(ModeFlipProbe {
+            state: state_cell.clone(),
+            session: APPROVALS_SESSION.to_string(),
+        })],
+    )
+    .await;
+    let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
+    let _ = state_cell.set(state);
+    run_mcp_owner_turn(&harness).await;
+    let results = tool_results(&harness).await;
+    assert!(
+        results[1].contains("[AUTHORITY BLOCKED] `fake__no_annotations`"),
+        "{results:?}"
+    );
+    assert!(results[2].contains("synthetic read"), "{results:?}");
+    assert_eq!(approver.card_count(), 0);
+
+    // A secret in an open-world MCP call never leaves.
+    let (harness, approver) = mcp_approvals_harness(
+        vec![
+            MockProvider::tool_call_response(
+                "fake__echo",
+                &json!({"text": format!("key {SYNTHETIC_AWS_KEY}")}).to_string(),
+            ),
+            MockProvider::text_response("Not sent."),
+        ],
+        vec![],
+    )
+    .await;
+    run_mcp_owner_turn(&harness).await;
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("[EGRESS BLOCKED]"), "{results:?}");
+    assert!(!results[0].contains(SYNTHETIC_AWS_KEY), "{results:?}");
+    assert_eq!(approver.card_count(), 0);
+
+    // After the owner declines a POST, an MCP call with unknown effects is
+    // asked again instead of running.
+    let (harness, approver) = mcp_approvals_harness(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::tool_call_response("fake__no_annotations", "{}"),
+            MockProvider::text_response("The owner declined."),
+        ],
+        vec![
+            Some(crate::types::ApprovalResponse::Deny),
+            Some(crate::types::ApprovalResponse::Deny),
+        ],
+    )
+    .await;
+    run_mcp_owner_turn(&harness).await;
+    let results = tool_results(&harness).await;
+    assert_eq!(approver.card_count(), 2, "{results:?}");
+    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
+}

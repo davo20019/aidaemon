@@ -759,6 +759,63 @@ impl<T: Tool + ?Sized> CallWithFacts for T {
     }
 }
 
+/// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
+/// process into its own target directory (so it never waits on the build
+/// lock of the running `cargo test`).
+pub fn fake_mcp_server_path() -> PathBuf {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let exe = std::env::current_exe().expect("test binary path");
+        // target/<profile>/deps/<test binary>
+        let target = exe
+            .ancestors()
+            .nth(3)
+            .expect("test binary under a target directory")
+            .join("fake-mcp");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--quiet",
+                "-p",
+                "aidaemon-mcp",
+                "--features",
+                "test-server",
+                "--bin",
+                "fake_mcp_server",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("run cargo build for fake_mcp_server");
+        assert!(status.success(), "building fake_mcp_server failed");
+        target
+            .join("debug")
+            .join(format!("fake_mcp_server{}", std::env::consts::EXE_SUFFIX))
+    })
+    .clone()
+}
+
+/// An MCP registry with the synthetic `fake` server (`fake_mcp_server`)
+/// running: its tools are named `fake__<tool>` and offered on `mcp:fake`.
+pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpRegistry {
+    let registry = crate::mcp::McpRegistry::new(state);
+    registry
+        .add_server(
+            "fake",
+            crate::config::McpServerConfig {
+                command: fake_mcp_server_path().to_string_lossy().into_owned(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+            false,
+        )
+        .await
+        .expect("start the fake MCP server");
+    registry
+}
+
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
 }

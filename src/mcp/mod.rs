@@ -255,6 +255,29 @@ impl crate::traits::ToolSemantics for McpTool {
         aidaemon_core::SourceTrust::Untrusted
     }
 
+    /// An MCP server is opaque: whatever a call does, its effects are not
+    /// declared, so a decline in the run always asks again.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
+    /// The server's hints, except that a call is egress unless the server
+    /// marks the tool read-only and closed-world.
+    fn call_annotations_in(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        let capabilities = self.capabilities;
+        aidaemon_core::ToolAnnotations {
+            read_only: capabilities.read_only,
+            destructive: capabilities.high_impact_write,
+            idempotent: capabilities.idempotent,
+            // `external_side_effect` is open-world or mutating.
+            egress: capabilities.external_side_effect || !capabilities.read_only,
+        }
+    }
+
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         if self.capabilities.read_only {
             return ToolCallSemantics::observation()
@@ -325,6 +348,41 @@ pub async fn discover_mcp_tools(
 #[cfg(test)]
 mod annotation_tests {
     use super::*;
+
+    fn mcp_tool(annotations: Value) -> McpTool {
+        McpTool::new(
+            "synthetic_tool".to_string(),
+            serde_json::json!({"name": "synthetic_tool", "description": "", "parameters": {"type": "object"}}),
+            Arc::new(McpClient::idle_for_test()),
+            capabilities_from_tool_definition(&serde_json::json!({"annotations": annotations})),
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_kernel_semantics_follow_the_server_hints() {
+        use crate::traits::ToolSemantics;
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let closed = mcp_tool(serde_json::json!({"readOnlyHint": true, "openWorldHint": false}));
+        let open = mcp_tool(serde_json::json!({"readOnlyHint": true}));
+        let mutating = mcp_tool(serde_json::json!({}));
+        let closed_annotations = closed.call_annotations_in("{}", &roots);
+        assert!(closed_annotations.read_only && !closed_annotations.egress);
+        let open_annotations = open.call_annotations_in("{}", &roots);
+        assert!(open_annotations.read_only && open_annotations.egress);
+        let mutating_annotations = mutating.call_annotations_in("{}", &roots);
+        assert!(!mutating_annotations.read_only && mutating_annotations.egress);
+        assert!(mutating_annotations.destructive);
+        for tool in [&closed, &open, &mutating] {
+            assert_eq!(
+                tool.call_effects("{}"),
+                aidaemon_core::CallEffects::unknown()
+            );
+            assert_eq!(
+                tool.output_trust("{}", &roots),
+                aidaemon_core::SourceTrust::Untrusted
+            );
+        }
+    }
 
     #[test]
     fn mcp_annotations_map_to_typed_capabilities_without_name_guessing() {

@@ -383,6 +383,19 @@ pub(super) fn learning_tool_summary(
 }
 
 impl Agent {
+    /// The tool this turn runs under `name`: a daemon tool, else an
+    /// MCP-registry tool bridged for the turn.
+    pub(super) fn turn_tool<'s>(
+        &'s self,
+        scope: &'s TurnScope<'_>,
+        name: &str,
+    ) -> Option<&'s Arc<dyn crate::traits::Tool>> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .or_else(|| scope.mcp_tools.iter().find(|tool| tool.name() == name))
+    }
+
     /// Judge the call's access manifest against the task's filesystem
     /// authority. `None`: in scope (or not a known tool).
     pub(super) fn sdk_scope_check(
@@ -391,7 +404,7 @@ impl Agent {
         tool_name: &str,
         arguments: &str,
     ) -> Option<crate::agent::tool_execution::ScopeCheck> {
-        let tool = self.tools.iter().find(|tool| tool.name() == tool_name)?;
+        let tool = self.turn_tool(scope, tool_name)?;
         let known = scope
             .known_project_dir
             .lock()
@@ -414,11 +427,7 @@ impl Agent {
         scope: &TurnScope<'_>,
         mut request: ToolRequest,
     ) {
-        let tool = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
-            .cloned();
+        let tool = self.turn_tool(scope, &request.name).cloned();
         let (injected_dir, judgment) =
             canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
@@ -446,14 +455,10 @@ impl Agent {
         tool_name: &str,
         arguments: &str,
     ) {
-        let read_only = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == tool_name)
-            .map(|tool| {
-                tool.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
-                    .read_only
-            });
+        let read_only = self.turn_tool(scope, tool_name).map(|tool| {
+            tool.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        });
         let assessed = crate::agent::closeout::ClosingAuthority::from_authority(
             scope.contract.authority_as_assessed(),
         );
@@ -490,17 +495,13 @@ impl Agent {
         {
             return;
         }
-        let egress = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == tool_name)
-            .is_some_and(|tool| {
-                tool.call_annotations_in(
-                    arguments,
-                    &crate::traits::TrustRoots::new(&scope.trust_roots),
-                )
-                .egress
-            });
+        let egress = self.turn_tool(scope, tool_name).is_some_and(|tool| {
+            tool.call_annotations_in(
+                arguments,
+                &crate::traits::TrustRoots::new(&scope.trust_roots),
+            )
+            .egress
+        });
         if !egress {
             return;
         }
@@ -625,9 +626,7 @@ impl Agent {
         // authority check, so the mode is judged again for every call.
         let ceiling_denial = ceiling.as_ref().and_then(|ceiling| {
             let annotations = self
-                .tools
-                .iter()
-                .find(|tool| tool.name() == request.name)
+                .turn_tool(scope, &request.name)
                 .map(|tool| {
                     tool.call_annotations_in(
                         arguments,
@@ -965,13 +964,9 @@ impl Agent {
             Err(error) => {
                 // A tool that returns `Err` made an explicit typed failure: it
                 // gets a `FailedPermanent` receipt, so the run ledger and the task outcome see it.
-                let prepared = self
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name() == request.name)
-                    .and_then(|tool| {
-                        crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
-                    });
+                let prepared = self.turn_tool(scope, &request.name).and_then(|tool| {
+                    crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
+                });
                 let mut metadata = crate::traits::ToolCallMetadata {
                     outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
                     transport_error: Some(error.to_string()),
@@ -1094,9 +1089,7 @@ impl Agent {
             metadata.semantics.mutates_state()
                 && !(metadata.background_started || metadata.detached)
         }) && self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
+            .turn_tool(scope, &request.name)
             .is_some_and(|tool| tool.capabilities().external_side_effect);
         if external_mutation {
             if let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
@@ -1178,9 +1171,7 @@ impl Agent {
         // output); every other output is the daemon's.
         let reported = metadata.as_ref().and_then(|metadata| metadata.output_trust);
         let trust = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
+            .turn_tool(scope, &request.name)
             .map(|tool| {
                 reported.unwrap_or_else(|| {
                     tool.output_trust(
@@ -1264,9 +1255,7 @@ impl Agent {
         semantics: &crate::traits::ToolCallSemantics,
     ) -> Option<String> {
         let capabilities = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
+            .turn_tool(scope, &request.name)
             .map(|tool| tool.capabilities())?;
         let pure_observation = semantics.observes_state() && !semantics.mutates_state();
         let needs_key = !pure_observation

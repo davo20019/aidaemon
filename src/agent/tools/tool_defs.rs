@@ -120,7 +120,11 @@ impl Agent {
             let mcp_tools = registry.match_tools(user_message).await;
             for tool in mcp_tools {
                 let name = tool.name().to_string();
-                capabilities.entry(name.clone()).or_default();
+                // The server's own hints, as for a daemon tool (a daemon tool
+                // of the same name keeps its capabilities).
+                capabilities
+                    .entry(name.clone())
+                    .or_insert_with(|| tool.capabilities());
                 let candidate = json!({
                     "type": "function",
                     "function": tool.schema()

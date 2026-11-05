@@ -319,6 +319,18 @@ impl Agent {
         self.limits.task_timeout = timeout;
     }
 
+    /// Offer and run the tools of `registry`'s MCP servers.
+    #[cfg(test)]
+    pub(crate) fn set_test_mcp_registry(&mut self, registry: crate::mcp::McpRegistry) {
+        self.mcp_registry = Some(registry);
+    }
+
+    /// Offer every authorized tool, whatever the policy profile would prune.
+    #[cfg(test)]
+    pub(crate) fn set_test_tool_filter_enforce(&mut self, enforce: bool) {
+        self.policy_config.tool_filter_enforce = enforce;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_inherited_authority(
         &mut self,
