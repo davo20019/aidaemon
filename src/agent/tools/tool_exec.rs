@@ -944,7 +944,9 @@ impl Agent {
         if let Some(grant) = active_workspace_grant {
             if !under_mandate && matches!(name, "write_file" | "edit_file") {
                 if let Some(manager) = crate::checkpoints::active_manager() {
-                    manager.begin_for_tool(name, &enriched_args).await?;
+                    manager
+                        .begin_for_tool(name, &enriched_args, &call_facts)
+                        .await?;
                 }
             }
             let mandate_preapproved = if under_mandate {
@@ -988,11 +990,7 @@ impl Agent {
                 {
                     if let Some(manager) = crate::checkpoints::active_manager() {
                         manager
-                            .begin_for_access_manifest(
-                                name,
-                                prepared_args,
-                                &prepared.access_manifest,
-                            )
+                            .begin_for_access_manifest(name, &prepared.access_manifest, &call_facts)
                             .await?;
                     }
                 }

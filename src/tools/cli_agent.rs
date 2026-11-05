@@ -34,8 +34,8 @@ use crate::traits::{
     ToolCallAccessManifest, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
+use crate::types::{ApprovalResponse, UserRole};
 use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
@@ -1171,8 +1171,8 @@ impl CliAgentTool {
         compatible.into_iter().next()
     }
 
-    fn is_owner_role(user_role: Option<&str>) -> bool {
-        user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
+    fn is_owner_role(user_role: Option<UserRole>) -> bool {
+        user_role == Some(UserRole::Owner)
     }
 
     /// Normalize a working directory for lock/key comparisons.
@@ -3695,18 +3695,18 @@ struct CliAgentArgs {
     /// If true, start the task in background and return immediately with task_id
     #[serde(default)]
     async_mode: Option<bool>,
-    /// Injected by agent - session ID for cancel_all filtering
-    #[serde(default)]
-    _session_id: Option<String>,
-    /// Injected by agent - goal context for routing async/timeout notifications.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Injected by agent - current task context for delegated task recovery.
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Injected by agent for role-aware safeguards.
-    #[serde(default)]
-    _user_role: Option<String>,
+    /// The dispatcher's facts ([`Self::bind_facts`]), never arguments: the
+    /// session for cancel_all filtering, the goal for routing async/timeout
+    /// notifications, the task for delegated task recovery, and the role
+    /// for role-aware safeguards.
+    #[serde(skip)]
+    call_session: Option<String>,
+    #[serde(skip)]
+    call_goal_id: Option<String>,
+    #[serde(skip)]
+    call_task_id: Option<String>,
+    #[serde(skip)]
+    call_role: Option<UserRole>,
 }
 
 fn non_empty_prompt_field(value: Option<&str>) -> Option<String> {
@@ -3734,6 +3734,14 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
 }
 
 impl CliAgentArgs {
+    /// Take the caller's session, goal, task and role from the dispatcher.
+    fn bind_facts(&mut self, facts: &ToolCallContext) {
+        self.call_session = Some(facts.session_id.clone());
+        self.call_goal_id = facts.goal_id.clone();
+        self.call_task_id = facts.task_id.clone();
+        self.call_role = facts.user_role;
+    }
+
     fn run_prompt(&self) -> Option<String> {
         if let Some(prompt) = non_empty_prompt_field(self.prompt.as_deref()) {
             return Some(prompt);
@@ -3766,14 +3774,14 @@ impl CliAgentArgs {
     }
 
     async fn contextual_run_prompt(&self, state: &Arc<dyn StateStore>) -> Option<String> {
-        let delegated_task = match self._task_id.as_deref() {
+        let delegated_task = match self.call_task_id.as_deref() {
             Some(task_id) if !task_id.trim().is_empty() => {
                 state.get_task(task_id).await.ok().flatten()
             }
             _ => None,
         };
         let delegated_goal_id = self
-            ._goal_id
+            .call_goal_id
             .clone()
             .or_else(|| delegated_task.as_ref().map(|task| task.goal_id.clone()));
         let delegated_goal = match delegated_goal_id.as_deref() {
@@ -4211,19 +4219,8 @@ impl Tool for CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && parsed
-                .as_ref()
-                .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
-        let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, false, false)
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
+        self.outcome_with_facts(arguments, status_tx, false, &ToolCallContext::default())
+            .await
     }
 
     async fn call_with_execution_context(
@@ -4232,26 +4229,8 @@ impl Tool for CliAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         exec_ctx: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && (exec_ctx.mutation_forbidden
-                || parsed
-                    .as_ref()
-                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let output = self
-            .call_with_status_under_contract(
-                arguments,
-                status_tx,
-                read_only_run,
-                true,
-                exec_ctx.trusted_session,
-            )
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
+        self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
+            .await
     }
 
     async fn call_with_status(
@@ -4259,8 +4238,14 @@ impl Tool for CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        self.call_with_status_under_contract(arguments, status_tx, false, false, false)
-            .await
+        self.call_with_status_under_contract(
+            arguments,
+            status_tx,
+            false,
+            false,
+            &ToolCallContext::default(),
+        )
+        .await
     }
 }
 
@@ -4492,16 +4477,49 @@ fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolC
 }
 
 impl CliAgentTool {
+    /// One call's typed outcome with the dispatcher's `facts`. Only the
+    /// dispatcher's path enforces the native access contract.
+    async fn outcome_with_facts(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        enforce_native_access: bool,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
+            .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && (facts.mutation_forbidden
+                || parsed
+                    .as_ref()
+                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
+        let output = self
+            .call_with_status_under_contract(
+                arguments,
+                status_tx,
+                read_only_run,
+                enforce_native_access,
+                facts,
+            )
+            .await?;
+        Ok(cli_agent_outcome(&action, output, read_only_run))
+    }
+
     async fn call_with_status_under_contract(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         read_only_run: bool,
         enforce_native_access: bool,
-        // From the dispatcher's typed context only, never the arguments.
-        trusted_session: bool,
+        // The dispatcher's typed facts; never the arguments.
+        facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
-        let args: CliAgentArgs = serde_json::from_str(arguments)?;
+        let mut args: CliAgentArgs = serde_json::from_str(arguments)?;
+        args.bind_facts(facts);
+        let trusted_session = facts.trusted_session;
 
         // Reap any finished tasks
         self.reap_finished().await;
@@ -4512,8 +4530,8 @@ impl CliAgentTool {
         // If this CLI agent is running in the context of an orchestration goal,
         // route background notifications and cancel_all scoping to the *origin*
         // session_id (goal.session_id), which is routable via the ChannelHub.
-        let mut session_id = args._session_id.clone().unwrap_or_default();
-        if let Some(ref goal_id) = args._goal_id {
+        let mut session_id = args.call_session.clone().unwrap_or_default();
+        if let Some(ref goal_id) = args.call_goal_id {
             if let Ok(Some(goal)) = self.state.get_goal(goal_id).await {
                 if !goal.session_id.trim().is_empty() {
                     session_id = goal.session_id;
@@ -4549,16 +4567,16 @@ impl CliAgentTool {
                     prompt
                 } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
                     warn!(
-                        task_id = ?args._task_id,
-                        goal_id = ?args._goal_id,
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
                         working_dir = ?args.working_dir,
                         "cli_agent run omitted prompt; synthesized delegated prompt from stored task/goal context"
                     );
                     prompt
                 } else {
                     warn!(
-                        task_id = ?args._task_id,
-                        goal_id = ?args._goal_id,
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
                         has_prompt = args.prompt.as_ref().is_some_and(|s| !s.trim().is_empty()),
                         has_mission = args.mission.as_ref().is_some_and(|s| !s.trim().is_empty()),
                         has_task = args.task.as_ref().is_some_and(|s| !s.trim().is_empty()),
@@ -4604,7 +4622,7 @@ impl CliAgentTool {
                     }
                 }
                 if !daemon_hits.is_empty() {
-                    if !Self::is_owner_role(args._user_role.as_deref()) {
+                    if !Self::is_owner_role(args.call_role) {
                         return Ok(format!(
                             "Blocked: daemonization primitives detected in cli_agent prompt ({}) and only owners can approve detached/background execution.",
                             daemon_hits.join(", ")
@@ -4644,7 +4662,7 @@ impl CliAgentTool {
                 // Goal-scoped cli_agent runs should not detach immediately:
                 // the goal/task lead is already running in the background, and
                 // returning early makes results easy to drop.
-                let async_mode = if args._goal_id.is_some() {
+                let async_mode = if args.call_goal_id.is_some() {
                     false
                 } else {
                     args.async_mode.unwrap_or(false)
@@ -4658,8 +4676,8 @@ impl CliAgentTool {
                             &prompt,
                             args.working_dir.as_deref(),
                             &session_id,
-                            args._goal_id.as_deref(),
-                            args._task_id.as_deref(),
+                            args.call_goal_id.as_deref(),
+                            args.call_task_id.as_deref(),
                             args.system_instruction.as_deref(),
                             if read_only_run {
                                 CliWorkspaceMode::ReadOnly
@@ -4690,7 +4708,7 @@ impl CliAgentTool {
                                 for (name, detail) in &unavailable {
                                     message.push_str(&format!("\n- {name}: {detail}"));
                                 }
-                                if let Some(task_id) = args._task_id.as_deref() {
+                                if let Some(task_id) = args.call_task_id.as_deref() {
                                     self.persist_delegated_cli_result(
                                         task_id,
                                         None,
@@ -5304,8 +5322,16 @@ mod tests {
     async fn test_run_daemonization_prompt_blocked_for_non_owner() {
         let (tool, _db) = setup_echo_tool().await;
         let result = tool
-            .call(
-                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &","_session_id":"sess1","_user_role":"Guest"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#,
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "sess1".into(),
+                    user_role: Some(crate::types::UserRole::Guest),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -5964,10 +5990,20 @@ mod tests {
         tool.state.create_task(&task).await.unwrap();
 
         let result = tool
-            .call(&format!(
-                r#"{{"action":"run","tool":"echo","working_dir":"{}","_goal_id":"{}","_task_id":"{}"}}"#,
-                working_dir, goal.id, task.id
-            ))
+            .call_with_status_under_contract(
+                &format!(
+                    r#"{{"action":"run","tool":"echo","working_dir":"{}"}}"#,
+                    working_dir
+                ),
+                None,
+                false,
+                false,
+                &ToolCallContext {
+                    goal_id: Some(goal.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -6628,9 +6664,18 @@ mod tests {
         };
 
         // Run a command
-        tool.call(r#"{"action":"run","tool":"echo","prompt":"log test","_session_id":"sess1"}"#)
-            .await
-            .unwrap();
+        tool.call_with_status_under_contract(
+            r#"{"action":"run","tool":"echo","prompt":"log test"}"#,
+            None,
+            false,
+            false,
+            &crate::traits::ToolCallContext {
+                session_id: "sess1".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // Check invocations were logged
         let invocations = state_clone.get_cli_agent_invocations(10).await.unwrap();
@@ -6703,8 +6748,15 @@ mod tests {
         // Run a command that will exceed the short timeout and be moved to background,
         // but should still eventually be logged as completed in the DB.
         let resp = tool
-            .call(
-                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo done","_session_id":"sess1"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo done"}"#,
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "sess1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -6770,10 +6822,11 @@ mod tests {
         tool.state.create_task(&task).await.unwrap();
 
         let resp = tool
-            .call(&format!(
-                r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok","_session_id":"sess-bg","_goal_id":"{}","_task_id":"{}"}}"#,
-                goal.id, task.id
-            ))
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok"}"#, None, false, false, &ToolCallContext {
+                    goal_id: Some(goal.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    ..crate::testing::call_facts("sess-bg")
+                })
             .await
             .unwrap();
         assert!(
@@ -6868,8 +6921,15 @@ mod tests {
         };
 
         let resp = tool
-            .call(
-                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo cli-reap-ok","_session_id":"sess1"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo cli-reap-ok"}"#,
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "sess1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -6879,10 +6939,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","task_id":"{}","_session_id":"sess1"}}"#,
-                task_id
-            ))
+            .call_with_status_under_contract(
+                &format!(r#"{{"action":"check","task_id":"{}"}}"#, task_id),
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("sess1"),
+            )
             .await
             .unwrap();
         assert!(check.contains("cli-reap-ok"));
@@ -6893,18 +6956,20 @@ mod tests {
     async fn check_with_wrong_id_recovers_only_session_task() {
         let (tool, _db) = setup_bash_tool().await;
         let started = tool
-            .call(
-                r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true,"_session_id":"session-recover"}"#,
-            )
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &crate::traits::ToolCallContext { session_id: "session-recover".into(), ..Default::default() })
             .await
             .unwrap();
         let real_task_id = extract_task_id_from_background_message(&started);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let recovered = tool
-            .call(&format!(
-                r#"{{"action":"check","task_id":"provider-thread-uuid","_session_id":"session-recover"}}"#
-            ))
+            .call_with_status_under_contract(
+                r#"{"action":"check","task_id":"provider-thread-uuid"}"#,
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("session-recover"),
+            )
             .await
             .unwrap();
 
@@ -6917,9 +6982,11 @@ mod tests {
     async fn missing_check_is_a_typed_negative_result() {
         let (tool, _db) = setup_echo_tool().await;
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"check","task_id":"missing","_session_id":"empty-session"}"#,
+            .outcome_with_facts(
+                r#"{"action":"check","task_id":"missing"}"#,
                 None,
+                false,
+                &crate::testing::call_facts("empty-session"),
             )
             .await
             .unwrap();
@@ -6937,9 +7004,11 @@ mod tests {
     async fn async_run_reports_background_metadata_and_notifications() {
         let (tool, _db) = setup_bash_tool().await;
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true,"_session_id":"session-background"}"#,
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true}"#,
                 None,
+                false,
+                &crate::testing::call_facts("session-background"),
             )
             .await
             .unwrap();
@@ -6958,8 +7027,15 @@ mod tests {
     async fn async_run_queues_chat_visible_progress_while_still_running() {
         let (tool, _db) = setup_bash_tool().await;
         let state = tool.state.clone();
-        tool.call(
-            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true,"_session_id":"session-progress"}"#,
+        tool.call_with_status_under_contract(
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true}"#,
+            None,
+            false,
+            false,
+            &crate::traits::ToolCallContext {
+                session_id: "session-progress".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -7001,7 +7077,7 @@ mod tests {
             "Build locally but do not deploy",
             "Inspect the code and return a report",
         ] {
-            let args = serde_json::json!({
+            let args = json!({
                 "action": "run",
                 "tool": "echo",
                 "prompt": prompt,
@@ -7009,7 +7085,16 @@ mod tests {
             // A trusted session, as the dispatcher's typed context says
             // (`ToolCallContext::trusted_session`).
             let result = tool
-                .call_with_status_under_contract(&args.to_string(), None, false, false, true)
+                .call_with_status_under_contract(
+                    &args.to_string(),
+                    None,
+                    false,
+                    false,
+                    &ToolCallContext {
+                        trusted_session: true,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             assert!(
@@ -7025,7 +7110,7 @@ mod tests {
     #[tokio::test]
     async fn trusted_session_argument_bypasses_nothing() {
         let (tool, _db) = setup_echo_tool().await;
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "echo",
             "prompt": "Inspect the code and return a report",
@@ -7224,13 +7309,24 @@ mod tests {
         let user_prompt = "I need to create a new website about cars. We should push it to cars.example.com. make it modern.";
 
         let start = Instant::now();
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": format!("echo 'Received prompt: {}'; echo 'Task complete'", user_prompt),
-            "_session_id": "telegram_12345"
         });
-        let result = tool.call(&args.to_string()).await.unwrap();
+        let result = tool
+            .call_with_status_under_contract(
+                &args.to_string(),
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "telegram_12345".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -7252,14 +7348,25 @@ mod tests {
         let (tool, _db) = setup_bash_tool().await;
 
         let start = Instant::now();
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "echo 'Building website...'; echo 'Created index.html'; echo 'Done'",
             "system_instruction": "You are a senior web developer. Create a modern, responsive website.",
-            "_session_id": "telegram_12345"
         });
-        let result = tool.call(&args.to_string()).await.unwrap();
+        let result = tool
+            .call_with_status_under_contract(
+                &args.to_string(),
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "telegram_12345".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -7286,7 +7393,7 @@ echo '{"type":"tool_result","content":"Directory created"}'
 echo '{"type":"result","result":"Website created successfully with index.html, style.css, and script.js"}'
 "#;
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": stream_json.trim()
@@ -7328,7 +7435,7 @@ echo '{"type":"result","result":"Website created successfully with index.html, s
     async fn test_stderr_captured_in_error_output() {
         let (tool, _db) = setup_bash_tool().await;
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "echo 'some stdout'; echo 'error detail 1' >&2; echo 'error detail 2' >&2; exit 1"
@@ -7353,7 +7460,7 @@ echo '{"type":"result","result":"Website created successfully with index.html, s
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "pwd",

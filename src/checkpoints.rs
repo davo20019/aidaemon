@@ -31,7 +31,7 @@ use crate::config::CheckpointConfig;
 use crate::events::{Event, EventStore, EventType};
 use crate::execution::{BackendKind, SharedExecutionBackend};
 use crate::tools::fs_utils;
-use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+use crate::traits::{ToolCallAccessManifest, ToolCallContext, ToolTargetHint, ToolTargetHintKind};
 
 static ACTIVE_MANAGER: Lazy<RwLock<Option<Arc<CheckpointManager>>>> =
     Lazy::new(|| RwLock::new(None));
@@ -291,29 +291,30 @@ impl CheckpointManager {
         &self,
         tool: &str,
         arguments: &str,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<Option<String>> {
-        let manifest = checkpoint_access_manifest(tool, arguments);
-        self.begin_for_access_manifest(tool, arguments, &manifest)
-            .await
+        let manifest = checkpoint_access_manifest(tool, arguments, facts.project_scope.as_deref());
+        self.begin_for_access_manifest(tool, &manifest, facts).await
     }
 
     /// Begin a checkpoint from the invocation's validated access contract.
     /// Shell source is intentionally absent: only typed write targets can
-    /// authorize and scope a filesystem snapshot.
+    /// authorize and scope a filesystem snapshot. The session, task and turn
+    /// it is recorded under are the dispatcher's `facts` about the call.
     pub(crate) async fn begin_for_access_manifest(
         &self,
         tool: &str,
-        arguments: &str,
         manifest: &ToolCallAccessManifest,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<Option<String>> {
         if !self.config.enabled || manifest.write_targets.is_empty() {
             return Ok(None);
         }
 
-        let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
-        let session_id = internal_string(&args, "_session_id").unwrap_or_else(|| "unknown".into());
-        let task_id = internal_string(&args, "_task_id");
-        let turn_id = internal_string(&args, "_turn_id");
+        let session_id =
+            fact_string(Some(facts.session_id.as_str())).unwrap_or_else(|| "unknown".into());
+        let task_id = fact_string(facts.task_id.as_deref());
+        let turn_id = fact_string(facts.turn_id.as_deref());
         let scope_id = if let Some(turn_id) = turn_id.as_deref() {
             format!("turn:{turn_id}")
         } else if let Some(task_id) = task_id.as_deref() {
@@ -1515,27 +1516,31 @@ fn confirmation_token() -> String {
     Uuid::new_v4().simple().to_string()[..10].to_ascii_uppercase()
 }
 
-fn internal_string(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(Value::as_str)
+fn fact_string(value: Option<&str>) -> Option<String> {
+    value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
-fn checkpoint_access_manifest(tool: &str, arguments: &str) -> ToolCallAccessManifest {
+/// A write tool's checkpoint manifest: its write target, under the call's
+/// working directory, else the turn's project scope.
+fn checkpoint_access_manifest(
+    tool: &str,
+    arguments: &str,
+    project_scope: Option<&str>,
+) -> ToolCallAccessManifest {
     let parsed = serde_json::from_str::<Value>(arguments).ok();
-    let execution_cwd = parsed
+    let execution_cwd = match parsed
         .as_ref()
-        .and_then(|args| {
-            args.get("working_dir")
-                .or_else(|| args.get("cwd"))
-                .or_else(|| args.get("_project_scope"))
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .and_then(|args| args.get("working_dir").or_else(|| args.get("cwd")))
+    {
+        Some(value) => value.as_str(),
+        None => project_scope,
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string);
     let mut write_targets = Vec::new();
     if matches!(tool, "write_file" | "edit_file") {
         if let Some(path) = parsed.as_ref().and_then(|args| {
@@ -2240,10 +2245,12 @@ mod tests {
         let observational = checkpoint_access_manifest(
             "terminal",
             &json!({ "action": "run", "command": "node --version" }).to_string(),
+            None,
         );
         let mutation_claim = checkpoint_access_manifest(
             "terminal",
             &json!({ "action": "run", "command": "touch generated.txt" }).to_string(),
+            None,
         );
         assert!(observational.write_targets.is_empty());
         assert_eq!(observational, mutation_claim);
@@ -2287,7 +2294,10 @@ mod tests {
             let arguments = json!({ "action": "run", "command": command }).to_string();
             for tool in ["terminal", "run_command"] {
                 assert_eq!(
-                    manager.begin_for_tool(tool, &arguments).await.unwrap(),
+                    manager
+                        .begin_for_tool(tool, &arguments, &ToolCallContext::default())
+                        .await
+                        .unwrap(),
                     None,
                     "{tool}: {command} must bypass checkpoint root resolution"
                 );
@@ -2327,14 +2337,17 @@ mod tests {
         let target = project.join("package.json");
         let args = json!({
             "path": target,
-            "_session_id": "telegram:owner",
-            "_task_id": "task-new-site",
-            "_turn_id": "turn-new-site"
         })
         .to_string();
+        let args_facts = ToolCallContext {
+            session_id: "telegram:owner".into(),
+            task_id: Some("task-new-site".into()),
+            turn_id: Some("turn-new-site".into()),
+            ..Default::default()
+        };
 
         let checkpoint = manager
-            .begin_for_tool("write_file", &args)
+            .begin_for_tool("write_file", &args, &args_facts)
             .await
             .unwrap()
             .expect("new project should receive a checkpoint");
@@ -2386,15 +2399,13 @@ mod tests {
         .await
         .unwrap();
         let project = workspace_container.path().join("prompting-studio");
-        let args = json!({
-            "action": "run",
-            "command": "opaque shell payload",
-            "_project_scope": workspace_container.path(),
-            "_session_id": "telegram:synthetic-user-1",
-            "_task_id": "task-prompting-studio",
-            "_turn_id": "turn-prompting-studio"
-        })
-        .to_string();
+        let args_facts = ToolCallContext {
+            project_scope: Some(workspace_container.path().to_string_lossy().into_owned()),
+            session_id: "telegram:synthetic-user-1".into(),
+            task_id: Some("task-prompting-studio".into()),
+            turn_id: Some("turn-prompting-studio".into()),
+            ..Default::default()
+        };
         let manifest = ToolCallAccessManifest {
             execution_cwd: Some(workspace_container.path().to_string_lossy().into_owned()),
             read_targets: Vec::new(),
@@ -2407,7 +2418,7 @@ mod tests {
         };
 
         let checkpoint = manager
-            .begin_for_access_manifest("terminal", &args, &manifest)
+            .begin_for_access_manifest("terminal", &manifest, &args_facts)
             .await
             .unwrap()
             .expect("the command child should receive a bounded checkpoint");
@@ -2450,14 +2461,12 @@ mod tests {
         .unwrap();
         let first = workspace_container.path().join("first-project");
         let second = workspace_container.path().join("second-project");
-        let args = json!({
-            "action": "run",
-            "command": "opaque shell payload",
-            "_project_scope": workspace_container.path(),
-            "_session_id": "telegram:synthetic-user-1",
-            "_task_id": "task-multi-root"
-        })
-        .to_string();
+        let args_facts = ToolCallContext {
+            project_scope: Some(workspace_container.path().to_string_lossy().into_owned()),
+            session_id: "telegram:synthetic-user-1".into(),
+            task_id: Some("task-multi-root".into()),
+            ..Default::default()
+        };
         let manifest = ToolCallAccessManifest {
             execution_cwd: Some(workspace_container.path().to_string_lossy().into_owned()),
             read_targets: Vec::new(),
@@ -2472,7 +2481,7 @@ mod tests {
         };
 
         let error = manager
-            .begin_for_access_manifest("terminal", &args, &manifest)
+            .begin_for_access_manifest("terminal", &manifest, &args_facts)
             .await
             .expect_err("one checkpoint must not cover two project roots");
         assert!(error.to_string().contains("multiple project roots"));
@@ -2632,19 +2641,22 @@ mod tests {
         .unwrap();
         let args = json!({
             "path": source,
-            "_session_id": "telegram:owner",
-            "_task_id": "task-1",
-            "_turn_id": "turn-1"
         })
         .to_string();
+        let args_facts = ToolCallContext {
+            session_id: "telegram:owner".into(),
+            task_id: Some("task-1".into()),
+            turn_id: Some("turn-1".into()),
+            ..Default::default()
+        };
 
         let first = manager
-            .begin_for_tool("write_file", &args)
+            .begin_for_tool("write_file", &args, &args_facts)
             .await
             .unwrap()
             .unwrap();
         let duplicate = manager
-            .begin_for_tool("edit_file", &args)
+            .begin_for_tool("edit_file", &args, &args_facts)
             .await
             .unwrap()
             .unwrap();
@@ -2707,13 +2719,16 @@ mod tests {
 
         let second_args = json!({
             "path": source,
-            "_session_id": "telegram:owner",
-            "_task_id": "task-2",
-            "_turn_id": "turn-2"
         })
         .to_string();
+        let second_args_facts = ToolCallContext {
+            session_id: "telegram:owner".into(),
+            task_id: Some("task-2".into()),
+            turn_id: Some("turn-2".into()),
+            ..Default::default()
+        };
         let second = manager
-            .begin_for_tool("write_file", &second_args)
+            .begin_for_tool("write_file", &second_args, &second_args_facts)
             .await
             .unwrap()
             .unwrap();

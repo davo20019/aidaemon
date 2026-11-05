@@ -6771,8 +6771,8 @@ impl TerminalTool {
 
         // Route background completion notifications to the origin session
         // when this terminal run is tied to a goal/task lead.
-        let mut notify_session_id = args._session_id.clone();
-        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), args._goal_id.as_deref()) {
+        let mut notify_session_id = exec_ctx.session_id.clone();
+        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), exec_ctx.goal_id.as_deref()) {
             if let Ok(Some(goal)) = state.get_goal(goal_id).await {
                 if !goal.session_id.trim().is_empty() {
                     notify_session_id = goal.session_id;
@@ -6833,7 +6833,7 @@ impl TerminalTool {
                     return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command is not proven observation-only. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                 }
 
-                let trust = TerminalTrust::from_execution_context(&args._session_id, exec_ctx);
+                let trust = TerminalTrust::from_execution_context(&exec_ctx.session_id, exec_ctx);
                 if let Some(block) = self.pre_approval_block(&args, command, &trust) {
                     return Ok(ToolCallOutcome::blocked(block));
                 }
@@ -6858,7 +6858,7 @@ impl TerminalTool {
                 if let Some(manager) = crate::checkpoints::active_manager() {
                     let access_manifest = terminal_access_manifest(arguments);
                     manager
-                        .begin_for_access_manifest("terminal", arguments, &access_manifest)
+                        .begin_for_access_manifest("terminal", &access_manifest, exec_ctx)
                         .await?;
                 }
 
@@ -6934,10 +6934,11 @@ impl TerminalTool {
                     }
                 }
 
-                let launch_trust = match args._trust_roots.as_deref() {
+                let launch_trust = match exec_ctx.trust_roots.as_deref() {
                     Some(roots) => self.output_trust(
                         arguments,
-                        &crate::traits::TrustRoots::new(roots).with_cwd(args._trust_cwd.as_deref()),
+                        &crate::traits::TrustRoots::new(roots)
+                            .with_cwd(exec_ctx.trust_cwd.as_deref()),
                     ),
                     None => aidaemon_core::SourceTrust::Untrusted,
                 };
@@ -6950,9 +6951,9 @@ impl TerminalTool {
                         write_paths: &declared_write_paths,
                         write_roots: &declared_write_roots,
                         notify_session_id: &notify_session_id,
-                        notify_goal_id: args._goal_id.as_deref(),
-                        task_id: args._task_id.as_deref(),
-                        tool_call_id: args._tool_call_id.as_deref(),
+                        notify_goal_id: exec_ctx.goal_id.as_deref(),
+                        task_id: exec_ctx.task_id.as_deref(),
+                        tool_call_id: exec_ctx.tool_call_id.as_deref(),
                         detach: args.detach,
                         network: args.network,
                         confined: run_is_confined(self.confinement),
@@ -7132,23 +7133,6 @@ struct TerminalArgs {
     /// capability grant for the command.
     #[serde(default)]
     network: bool,
-    #[serde(default)]
-    _session_id: String,
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Injected by the dispatcher; never accepted from model-supplied input.
-    #[serde(default)]
-    _tool_call_id: Option<String>,
-    /// Injected by agent - goal context for routing background notifications.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Injected by the dispatcher: the turn's trusted roots and the cwd
-    /// relative paths resolve against, so a run moved to the background
-    /// records the trust its output was judged with. Never model-supplied.
-    #[serde(default)]
-    _trust_roots: Option<Vec<String>>,
-    #[serde(default)]
-    _trust_cwd: Option<String>,
 }
 
 /// The turn's facts the terminal's approval ladder and hard blocks read:
@@ -8085,6 +8069,7 @@ mod tests {
     use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::CallWithFacts;
     use crate::testing::MockProvider;
     use crate::traits::ToolSemantics;
     use crate::traits::{NotificationStore, StateStore, Tool};
@@ -9510,8 +9495,12 @@ mod tests {
         tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
 
         let output = tool
-            .call(
-                r#"{"action":"run","command":"echo semantic-ok","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo semantic-ok"}"#,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -9568,12 +9557,16 @@ mod tests {
             "action": "run",
             "command": format!("printf SYNTHETIC_LONE_OK > '{}'", file.display()),
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [file.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
+            "write_roots": [file.to_string_lossy()]});
         let output = tool
-            .call_with_execution_context(&args.to_string(), None, kernel_owner_ctx())
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
             .await
             .unwrap()
             .output;
@@ -9596,12 +9589,16 @@ mod tests {
             "action": "run",
             "command": "exit 7",
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [failed_leaf.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
+            "write_roots": [failed_leaf.to_string_lossy()]});
         let _ = tool
-            .call_with_execution_context(&args.to_string(), None, kernel_owner_ctx())
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
             .await
             .unwrap()
             .output;
@@ -9653,12 +9650,16 @@ mod tests {
             "action": "run",
             "command": "printf SYNTHETIC_NEVER_RUNS",
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [impossible_root.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
+            "write_roots": [impossible_root.to_string_lossy()]});
         let outcome = tool
-            .execute_terminal(&args.to_string(), None, &kernel_owner_ctx())
+            .execute_terminal(
+                &args.to_string(),
+                None,
+                &ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
             .await
             .expect("typed outcome, not a transport error");
         let failure = outcome
@@ -9742,8 +9743,6 @@ mod tests {
         let args = serde_json::json!({
             "action": "run",
             "command": format!("ls {} > {}", dir.display(), target.display()),
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
         })
         .to_string();
         let outcome = tool
@@ -9752,7 +9751,7 @@ mod tests {
                 None,
                 ToolCallContext {
                     mutation_forbidden: true,
-                    ..Default::default()
+                    ..crate::testing::call_facts("telegram:synthetic-owner")
                 },
             )
             .await
@@ -10313,11 +10312,14 @@ mod tests {
 
         let outcome = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"seq 1 3","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"seq 1 3"}"#,
                 None,
                 ToolCallContext {
-                    mutation_forbidden: true,
-                    ..Default::default()
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..ToolCallContext {
+                        mutation_forbidden: true,
+                        ..Default::default()
+                    }
                 },
             )
             .await
@@ -10359,8 +10361,6 @@ mod tests {
         let args = serde_json::json!({
             "action": "run",
             "command": format!("touch {}", target.display()),
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
         })
         .to_string();
 
@@ -10370,7 +10370,7 @@ mod tests {
                 None,
                 ToolCallContext {
                     mutation_forbidden: false,
-                    ..Default::default()
+                    ..crate::testing::call_facts("telegram:synthetic-owner")
                 },
             )
             .await
@@ -10723,11 +10723,16 @@ mod tests {
             "action": "run",
             "command": format!("rm -rf {}", root.to_string_lossy()),
             "write_roots": [root.to_string_lossy()],
-            "_session_id": "sess_del_receipt",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "sess_del_receipt".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -10754,11 +10759,16 @@ mod tests {
             "action": "run",
             "command": format!("ls {}", keep.to_string_lossy()),
             "write_roots": [keep.to_string_lossy()],
-            "_session_id": "sess_del_receipt",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "sess_del_receipt".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -10817,9 +10827,13 @@ mod tests {
         .with_state(state as Arc<dyn StateStore>);
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo notify-meta","_session_id":"sess_meta","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo notify-meta"}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_meta".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -10858,10 +10872,7 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true,"_session_id":"sess_service","_user_role":"Owner"}"#,
-                None,
-            )
+            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, ToolCallContext { session_id: "sess_service".into(), ..Default::default() })
             .await
             .unwrap();
         assert!(outcome.metadata.detached);
@@ -10894,9 +10905,13 @@ mod tests {
             .copied()
             .next()
             .expect("tracked pid");
-        tool.call_with_status_outcome(
-            &format!(r#"{{"action":"kill","pid":{pid},"_session_id":"sess_service","_user_role":"Owner"}}"#),
+        tool.call_with_execution_context(
+            &format!(r#"{{"action":"kill","pid":{pid}}}"#),
             None,
+            ToolCallContext {
+                session_id: "sess_service".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -10931,9 +10946,13 @@ mod tests {
 
         let started = Instant::now();
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 5","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 5","detach":true}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_detach".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -10962,9 +10981,13 @@ mod tests {
 
         // An immediate failure inside the startup check is still synchronous.
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"exit 3","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"exit 3","detach":true}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_detach".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -10997,9 +11020,13 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo done-marker","_session_id":"sess_check_done","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo done-marker"}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_check_done".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11059,9 +11086,13 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo reap-marker","_session_id":"sess_reap_done","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo reap-marker"}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_reap_done".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11119,9 +11150,13 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 30","_session_id":"sess_check_kill","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 30"}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_check_kill".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11186,11 +11221,16 @@ mod tests {
             "action": "run",
             "command": format!("mkdir {}", root_str),
             "write_roots": [root_str],
-            "_session_id": "sess_own_root",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "sess_own_root".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -11242,11 +11282,16 @@ mod tests {
             "command": "pwd",
             "working_dir": root_str,
             "write_roots": [root_str],
-            "_session_id": "sess_cwd_root",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "sess_cwd_root".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -11279,9 +11324,13 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo no-notify-meta","_session_id":"sess_meta2","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo no-notify-meta"}"#,
                 None,
+                ToolCallContext {
+                    session_id: "sess_meta2".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11705,8 +11754,12 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"nohup sleep 1 &","_session_id":"s1","_user_role":"Guest"}"#,
+            .call_with(
+                r#"{"action":"run","command":"nohup sleep 1 &"}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11734,9 +11787,12 @@ mod tests {
 
         let outcome = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"find / -delete"}"#,
                 None,
-                ToolCallContext::default(),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..ToolCallContext::default()
+                },
             )
             .await
             .unwrap();
@@ -11768,8 +11824,12 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"grep -rc \"async fn\" .","_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"grep -rc \"async fn\" ."}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11804,8 +11864,12 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok","_session_id":"sess_notify","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok"}"#,
+                ToolCallContext {
+                    session_id: "sess_notify".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -11858,9 +11922,7 @@ mod tests {
         // Emit output early so a periodic ping has something NEW to report —
         // no-output commands are now intentionally quiet until completion.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok","_session_id":"sess_seq","_user_role":"Owner"}"#,
-            )
+            .call_with(r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok"}"#, ToolCallContext { session_id: "sess_seq".into(), ..Default::default() })
             .await
             .unwrap();
         assert!(
@@ -11943,8 +12005,12 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3","_session_id":"sess_quiet","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3"}"#,
+                ToolCallContext {
+                    session_id: "sess_quiet".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12280,8 +12346,12 @@ mod tests {
         // No-output, long-running command — stands in for a whole-disk scan that
         // never exits. It is moved to background after the 1s initial timeout.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 120"}"#,
+                ToolCallContext {
+                    session_id: "sess_reap".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12360,9 +12430,7 @@ mod tests {
         // Emits a line roughly every 0.2s for a while — a stand-in for a dev server
         // or a scan that is genuinely making progress.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done","_session_id":"sess_stream","_user_role":"Owner"}"#,
-            )
+            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, ToolCallContext { session_id: "sess_stream".into(), ..Default::default() })
             .await
             .unwrap();
         assert!(response.contains("Moved to background (pid="));
@@ -12453,8 +12521,12 @@ mod tests {
         // Output "42" (2 chars) — the command text contains 40 and 2 but not 42,
         // so finding "42" in a notification proves the OUTPUT was delivered.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo $((40 + 2))","_session_id":"sess_short","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo $((40 + 2))"}"#,
+                ToolCallContext {
+                    session_id: "sess_short".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12510,16 +12582,24 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let first = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo duplicate-result"}"#,
+                ToolCallContext {
+                    session_id: "sess_dupe_result".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         assert!(first.contains("Moved to background (pid="));
 
         let second = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result"}"#,
+                ToolCallContext {
+                    session_id: "sess_dupe_result".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12591,8 +12671,12 @@ mod tests {
         // Stay alive past the frequent-ping budget, then finish. The final
         // output must still arrive after the one-time monitoring transition.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished","_session_id":"sess_server","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished"}"#,
+                ToolCallContext {
+                    session_id: "sess_server".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12653,18 +12737,25 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 10","_session_id":"sess_kill","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 10"}"#,
+                ToolCallContext {
+                    session_id: "sess_kill".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         let pid = extract_pid_from_background_message(&response);
 
         let kill_response = tool
-            .call(&format!(
-                r#"{{"action":"kill","pid":{},"_session_id":"sess_kill","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "sess_kill".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(kill_response.contains("stopped"));
@@ -12701,8 +12792,12 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo post-reap-ok","_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo post-reap-ok"}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12711,10 +12806,13 @@ mod tests {
 
         // This call will reap finished processes first; check must still return final output.
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(check.contains("post-reap-ok"));
@@ -12755,21 +12853,24 @@ mod tests {
                 "action": "run",
                 "command": command,
                 "working_dir": project_dir,
-                "_session_id": "s1",
-                "_user_role": "Owner",
-                "_trust_roots": [project_dir],
-                "_trust_cwd": project_dir,
             })
             .to_string()
         };
-        let check = |pid: u32| {
-            serde_json::json!({"action": "check", "pid": pid, "_session_id": "s1"}).to_string()
+        // The dispatcher's facts for the launch: the turn's trust roots.
+        let launch_facts = ToolCallContext {
+            trust_roots: Some(vec![project_dir.clone()]),
+            trust_cwd: Some(project_dir.clone()),
+            ..crate::testing::call_facts("s1")
         };
+        let check = |pid: u32| serde_json::json!({"action": "check", "pid": pid}).to_string();
         for (command, expected) in [
             ("python3 slow_build.py", Trusted),
             ("sleep 3; curl -s https://example.invalid/x", Untrusted),
         ] {
-            let response = tool.call(&launch(command)).await.unwrap();
+            let response = tool
+                .call_with(&launch(command), launch_facts.clone())
+                .await
+                .unwrap();
             assert!(response.contains("Moved to background (pid="), "{response}");
             let pid = extract_pid_from_background_message(&response);
             assert_eq!(
@@ -12804,8 +12905,13 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 10","_session_id":"s1","_task_id":"task-clean","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 10"}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    task_id: Some("task-clean".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12816,10 +12922,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -12855,8 +12964,13 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3; echo disown-ok","_session_id":"sess_disown","_task_id":"task-disown","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3; echo disown-ok"}"#,
+                ToolCallContext {
+                    session_id: "sess_disown".into(),
+                    task_id: Some("task-disown".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12871,10 +12985,13 @@ mod tests {
 
         // Process should still be tracked (disowned, not removed).
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"sess_disown","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "sess_disown".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -12921,16 +13038,28 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let first = tool
-            .call(
-                r#"{"action":"run","command":"sleep 5","_session_id":"sub-a","_task_id":"task-a","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 5"}"#,
+                ToolCallContext {
+                    session_id: "sub-a".into(),
+                    task_id: Some("task-a".into()),
+                    goal_id: Some("goal-1".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         let pid = extract_pid_from_background_message(&first);
 
         let second = tool
-            .call(
-                r#"{"action":"run","command":"sleep   5","_session_id":"sub-b","_task_id":"task-b","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep   5"}"#,
+                ToolCallContext {
+                    session_id: "sub-b".into(),
+                    task_id: Some("task-b".into()),
+                    goal_id: Some("goal-1".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12975,8 +13104,13 @@ mod tests {
         });
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3","detach":true,"_session_id":"s1","_task_id":"task-detach","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3","detach":true}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    task_id: Some("task-detach".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12986,10 +13120,13 @@ mod tests {
 
         tool.on_task_end("task-detach", "s1").await.unwrap();
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -12998,10 +13135,13 @@ mod tests {
         );
 
         let _ = tool
-            .call(&format!(
-                r#"{{"action":"kill","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
             .await;
     }
 
@@ -13043,9 +13183,12 @@ mod tests {
         // The owner approved the daemonization card in the kernel.
         let response = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true,"_session_id":"s1"}"#,
+                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true}"#,
                 None,
-                kernel_owner_ctx(),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..kernel_owner_ctx()
+                },
             )
             .await
             .unwrap()
@@ -13095,12 +13238,18 @@ mod tests {
         let command = format!("cat > /tmp/test.html << EOF\n{}\nEOF", large_content);
         let args = serde_json::json!({
             "action": "run",
-            "command": command,
-            "_session_id": "s1",
-            "_user_role": "Owner"
-        });
+            "command": command});
 
-        let response = tool.call(&args.to_string()).await.unwrap();
+        let response = tool
+            .call_with(
+                &args.to_string(),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(
             response.contains("write_file"),
             "expected heredoc soft-block to recommend write_file, got: {}",
@@ -13140,12 +13289,18 @@ mod tests {
         );
         let args = serde_json::json!({
             "action": "run",
-            "command": command,
-            "_session_id": "s1",
-            "_user_role": "Owner"
-        });
+            "command": command});
 
-        let response = tool.call(&args.to_string()).await.unwrap();
+        let response = tool
+            .call_with(
+                &args.to_string(),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(
             !response.contains("unreliable"),
             "quoted heredoc should NOT be soft-blocked, got: {}",
@@ -13380,8 +13535,12 @@ mod tests {
         std::mem::forget(db_file);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo hi","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo hi","detach":true}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -13471,7 +13630,13 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let resp = tool
-            .call(r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10","_session_id":"s","_user_role":"Owner"}"#)
+            .call_with(
+                r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10"}"#,
+                ToolCallContext {
+                    session_id: "s".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -13488,7 +13653,13 @@ mod tests {
 
         // A scoped command is NOT blocked by this guard (it may still run/echo).
         let ok = tool
-            .call(r#"{"action":"run","command":"echo scoped-ok","_session_id":"s","_user_role":"Owner"}"#)
+            .call_with(
+                r#"{"action":"run","command":"echo scoped-ok"}"#,
+                ToolCallContext {
+                    session_id: "s".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(ok.contains("scoped-ok"));
@@ -13537,9 +13708,12 @@ mod tests {
         };
         let error = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"echo ordinary-unsafe","_session_id":"p25-sess"}"#,
+                r#"{"action":"run","command":"echo ordinary-unsafe"}"#,
                 None,
-                ctx,
+                ToolCallContext {
+                    session_id: "p25-sess".into(),
+                    ..ctx
+                },
             )
             .await
             .expect_err("an untrusted-source run needs the kernel's approval");
