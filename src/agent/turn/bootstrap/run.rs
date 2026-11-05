@@ -120,7 +120,7 @@ fn build_tool_filter_gate_telemetry(
 }
 
 /// A request assessment's tool narrowing keeps the owner's control-plane
-/// tools offered (see `Tool::owner_control_plane`), recorded apart from the
+/// tools offered (see `ToolSemantics::owner_control_plane`), recorded apart from the
 /// assessor's allowlist so the per-call gate admits only their gated calls.
 /// Never when the request forbids tool use, never for a forbidden scope, and
 /// only tools the turn already offers. Each entry is a name and its scope.

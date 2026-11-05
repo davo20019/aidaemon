@@ -45,15 +45,17 @@ impl Tool for RejectingArgumentTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.io_calls.fetch_add(1, Ordering::SeqCst);
+        Ok("unexpected I/O".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for RejectingArgumentTool {
     fn validate_arguments(&self, _arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         Err(ToolArgumentContractViolation::new(
             "synthetic mode is rejected before I/O",
         ))
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.io_calls.fetch_add(1, Ordering::SeqCst);
-        Ok("unexpected I/O".to_string())
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
@@ -1013,7 +1015,9 @@ impl Tool for RecordingSearchFilesTool {
         let path = args["path"].as_str().unwrap_or(".");
         Ok(format!("No matches found (0 files scanned in {})", path))
     }
+}
 
+impl crate::traits::ToolSemantics for RecordingSearchFilesTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -1071,7 +1075,9 @@ impl Tool for RecordingProjectInspectTool {
             primary
         ))
     }
+}
 
+impl crate::traits::ToolSemantics for RecordingProjectInspectTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -1118,7 +1124,9 @@ impl Tool for MockProjectInspectTool {
             path
         ))
     }
+}
 
+impl crate::traits::ToolSemantics for MockProjectInspectTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -1197,7 +1205,9 @@ impl Tool for PlayedNodeAudioTool {
             },
         })
     }
+}
 
+impl crate::traits::ToolSemantics for PlayedNodeAudioTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -1264,7 +1274,9 @@ impl Tool for BackgroundDetachTool {
             },
         })
     }
+}
 
+impl crate::traits::ToolSemantics for BackgroundDetachTool {
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::PROCESS_STATE)
     }
@@ -1302,7 +1314,9 @@ impl Tool for MockRemoteMutationTool {
         let url = args["url"].as_str().unwrap_or("https://example.com/status");
         Ok(format!("Updated {}", url))
     }
+}
 
+impl crate::traits::ToolSemantics for MockRemoteMutationTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
         let url = args["url"].as_str().unwrap_or("https://example.com/status");
@@ -1342,7 +1356,9 @@ impl Tool for MockRemoteObservationTool {
         let url = args["url"].as_str().unwrap_or("https://example.com/status");
         Ok(format!("Verified {} shows the updated status.", url))
     }
+}
 
+impl crate::traits::ToolSemantics for MockRemoteObservationTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
         let url = args["url"].as_str().unwrap_or("https://example.com/status");
@@ -1404,7 +1420,9 @@ impl Tool for CountingLocalWriteTool {
         std::fs::write(path, content)?;
         Ok(format!("Successfully wrote file: {path}"))
     }
+}
 
+impl crate::traits::ToolSemantics for CountingLocalWriteTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,

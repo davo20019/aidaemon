@@ -54,61 +54,6 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            // Not high-impact: creates backups before overwriting, user-scoped
-            // file system only, and dedicated file tools are intentionally
-            // available without terminal approval. Sensitive paths are blocked
-            // before writing.
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                for key in ["path", "file_path", "file", "filename"] {
-                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
-                        return Some(path.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_default();
-
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
-            .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
-    /// A write of the target path (absolute; a relative path resolves where
-    /// the execution backend puts it, which is not known here).
-    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
-        super::command_effects::file_tool_write_effects(arguments)
-    }
-
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
-        let semantics = self.call_semantics(arguments);
-        let mut annotations =
-            crate::traits::default_call_annotations(self.capabilities(), &semantics);
-        // A write that can plant git configuration changes what later
-        // "read-only" git commands execute: treat it as a configuration change.
-        let plants_git_config = semantics
-            .target_hints
-            .iter()
-            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
-        annotations.egress |= plants_git_config;
-        annotations
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         // Parameter aliasing: models often use "file_path" or "file" instead of "path"
@@ -227,6 +172,64 @@ impl Tool for WriteFileTool {
             action, path_str, new_size, line_count, size_info, diagnostics
         ))
     }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for WriteFileTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            // Not high-impact: creates backups before overwriting, user-scoped
+            // file system only, and dedicated file tools are intentionally
+            // available without terminal approval. Sensitive paths are blocked
+            // before writing.
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                for key in ["path", "file_path", "file", "filename"] {
+                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
+                        return Some(path.to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .with_target_hint(ToolTargetHintKind::Path, path)
+    }
+
+    /// A write of the target path (absolute; a relative path resolves where
+    /// the execution backend puts it, which is not known here).
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        super::command_effects::file_tool_write_effects(arguments)
+    }
+
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        let semantics = self.call_semantics(arguments);
+        let mut annotations =
+            crate::traits::default_call_annotations(self.capabilities(), &semantics);
+        // A write that can plant git configuration changes what later
+        // "read-only" git commands execute: treat it as a configuration change.
+        let plants_git_config = semantics
+            .target_hints
+            .iter()
+            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
+        annotations.egress |= plants_git_config;
+        annotations
+    }
 
     async fn durable_replay_decision(&self, arguments: &str) -> DurableReplayDecision {
         let Ok(args) = serde_json::from_str::<Value>(arguments) else {
@@ -306,6 +309,7 @@ impl Tool for WriteFileTool {
 #[cfg(test)]
 mod durable_replay_tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     #[tokio::test]
     async fn overwrite_receipt_reconciles_exact_current_file_state() {
@@ -356,6 +360,7 @@ mod durable_replay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     #[test]
     fn git_config_targets_are_configuration_egress() {

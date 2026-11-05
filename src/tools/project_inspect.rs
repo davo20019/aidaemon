@@ -48,6 +48,48 @@ impl Tool for ProjectInspectTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments)?;
+        let paths = parse_project_paths(&args)?;
+
+        let mut reports = Vec::new();
+        let mut failures = Vec::new();
+        for path in &paths {
+            match inspect_project(path).await {
+                Ok(report) => reports.push(report),
+                Err(err) => failures.push((path.clone(), err.to_string())),
+            }
+        }
+
+        if reports.is_empty() {
+            let details = failures
+                .iter()
+                .map(|(path, err)| format!("{}: {}", path, err))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "project_inspect could not inspect any requested path. {}",
+                details
+            );
+        }
+
+        if reports.len() == 1 && failures.is_empty() {
+            return Ok(reports.remove(0));
+        }
+
+        let mut output = String::new();
+        output.push_str(&reports.join("\n\n---\n\n"));
+        if !failures.is_empty() {
+            output.push_str("\n\n## Skipped paths\n");
+            for (path, err) in failures {
+                output.push_str(&format!("- `{}`: {}\n", path, err));
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl crate::traits::ToolSemantics for ProjectInspectTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }
@@ -101,46 +143,6 @@ impl Tool for ProjectInspectTool {
             }
         }
         semantics
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let paths = parse_project_paths(&args)?;
-
-        let mut reports = Vec::new();
-        let mut failures = Vec::new();
-        for path in &paths {
-            match inspect_project(path).await {
-                Ok(report) => reports.push(report),
-                Err(err) => failures.push((path.clone(), err.to_string())),
-            }
-        }
-
-        if reports.is_empty() {
-            let details = failures
-                .iter()
-                .map(|(path, err)| format!("{}: {}", path, err))
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::bail!(
-                "project_inspect could not inspect any requested path. {}",
-                details
-            );
-        }
-
-        if reports.len() == 1 && failures.is_empty() {
-            return Ok(reports.remove(0));
-        }
-
-        let mut output = String::new();
-        output.push_str(&reports.join("\n\n---\n\n"));
-        if !failures.is_empty() {
-            output.push_str("\n\n## Skipped paths\n");
-            for (path, err) in failures {
-                output.push_str(&format!("- `{}`: {}\n", path, err));
-            }
-        }
-        Ok(output)
     }
 }
 
@@ -486,6 +488,7 @@ fn get_directory_structure(
 #[cfg(test)]
 mod tests {
 
+    use crate::traits::ToolSemantics;
     /// Every inspected path decides: one outside the trusted roots makes
     /// the whole output someone else's.
     #[test]

@@ -667,41 +667,6 @@ impl Tool for WebSearchTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
-    /// The query goes to every configured backend's host, so the egress
-    /// policy scans it and a declined host binds the search.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        let mut keys = Vec::new();
-        for backend in &self.backends {
-            let Some(key) = backend
-                .endpoint()
-                .and_then(|endpoint| reqwest::Url::parse(endpoint).ok())
-                .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
-            else {
-                return aidaemon_core::CallEffects::unknown();
-            };
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-        if keys.is_empty() {
-            return aidaemon_core::CallEffects::unknown();
-        }
-        aidaemon_core::CallEffects {
-            keys,
-            complete: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let query = args["query"]
@@ -761,6 +726,43 @@ impl Tool for WebSearchTool {
 
         let multi_source = self.backends.len() > 1;
         Ok(format_search_output(&merged, multi_source, &failures))
+    }
+}
+
+impl crate::traits::ToolSemantics for WebSearchTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// The query goes to every configured backend's host, so the egress
+    /// policy scans it and a declined host binds the search.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        let mut keys = Vec::new();
+        for backend in &self.backends {
+            let Some(key) = backend
+                .endpoint()
+                .and_then(|endpoint| reqwest::Url::parse(endpoint).ok())
+                .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            else {
+                return aidaemon_core::CallEffects::unknown();
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return aidaemon_core::CallEffects::unknown();
+        }
+        aidaemon_core::CallEffects {
+            keys,
+            complete: true,
+        }
     }
 }
 
@@ -1006,6 +1008,7 @@ mod tests {
 #[cfg(test)]
 mod format_output_tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     fn merged(title: &str, snippet: &str) -> MergedResult {
         MergedResult {

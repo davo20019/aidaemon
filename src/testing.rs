@@ -1270,7 +1270,9 @@ impl Tool for MockTool {
             metadata: self.return_metadata.clone(),
         })
     }
+}
 
+impl crate::traits::ToolSemantics for MockTool {
     fn tool_role(&self) -> ToolRole {
         self.role
     }

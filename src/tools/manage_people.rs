@@ -105,14 +105,6 @@ impl Tool for ManagePeopleTool {
         manage_people_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &["status", "list", "view", "brief", "upcoming", "audit"],
-            ToolMutationEffects::NONE,
-        )
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
@@ -149,6 +141,16 @@ impl Tool for ManagePeopleTool {
             "confirm" => self.handle_confirm(&args).await,
             other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
         }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManagePeopleTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["status", "list", "view", "brief", "upcoming", "audit"],
+            ToolMutationEffects::NONE,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -863,6 +865,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolSemantics;
 
     #[test]
     fn schema_fits_payload_budget() {

@@ -158,6 +158,8 @@ impl crate::traits::Tool for RecordingTerminal {
     }
 }
 
+impl crate::traits::ToolSemantics for RecordingTerminal {}
+
 /// A call without a directory runs in the request's project directory, not
 /// the daemon's cwd (the R52 failure: a bound goal's commands ran elsewhere).
 #[tokio::test]
@@ -728,6 +730,8 @@ impl crate::traits::Tool for GuiStandIn {
         }
     }
 }
+
+impl crate::traits::ToolSemantics for GuiStandIn {}
 
 /// A GUI success claim does not ship while the last coordinate click is
 /// unverified, and the task's pinned vision model serves its later calls.

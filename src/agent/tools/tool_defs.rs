@@ -502,7 +502,9 @@ mod tests {
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
+    }
 
+    impl crate::traits::ToolSemantics for UnavailableMockTool {
         fn is_available(&self) -> bool {
             false
         }

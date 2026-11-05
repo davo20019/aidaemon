@@ -3,6 +3,7 @@
 //! manifests, receipt metadata, execution facts) and the helpers that derive
 //! the conservative defaults.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1574,8 +1575,7 @@ fn collect_common_target_hints(arguments: &str) -> Vec<ToolTargetHint> {
     hints
 }
 
-#[doc(hidden)]
-pub fn default_access_manifest(
+fn default_access_manifest(
     arguments: &str,
     semantics: &ToolCallSemantics,
 ) -> ToolCallAccessManifest {
@@ -1661,13 +1661,7 @@ pub fn semantics_for_exact_read_actions(
     semantics
 }
 
-#[doc(hidden)]
-pub fn default_semantics_from_identity(
-    _name: &str,
-    _description: &str,
-    arguments: &str,
-    caps: ToolCapabilities,
-) -> ToolCallSemantics {
+fn default_semantics_from_identity(arguments: &str, caps: ToolCapabilities) -> ToolCallSemantics {
     let mut semantics = if caps.read_only {
         ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
     } else {
@@ -1791,6 +1785,189 @@ impl ToolArgumentContractViolation {
     pub fn with_recovery_hint(mut self, hint: impl Into<String>) -> Self {
         self.recovery_hint = Some(hint.into());
         self
+    }
+}
+
+/// What a tool says about a call without executing it: its capabilities,
+/// typed semantics, access manifest, receipt protocol, effects and trust.
+/// Every method has a conservative default; a tool overrides only what it
+/// can state exactly.
+#[async_trait]
+pub trait ToolSemantics: Send + Sync {
+    /// Canonicalize provider argument projections before any semantics,
+    /// authority, retry, or access decision is made. The default is identity;
+    /// adapters with representational aliases or optional-empty projection
+    /// quirks can normalize them without teaching the orchestration layer
+    /// adapter-specific rules.
+    fn canonicalize_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<String, ToolArgumentContractViolation> {
+        Ok(arguments.to_string())
+    }
+
+    /// Adapter-owned, deterministic argument invariants evaluated by the
+    /// common dispatcher before any tool I/O. The default accepts all schema-
+    /// valid calls. Rejections become typed `contract_rejected` receipts.
+    fn validate_arguments(&self, _arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        Ok(())
+    }
+
+    /// Task lifecycle callback fired after the agent emits `TaskEnd`.
+    /// Tools that spawn background activity can use this to clean up
+    /// task-scoped resources.
+    async fn on_task_end(&self, _task_id: &str, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Live state this tool holds for a session that outlives a turn (for
+    /// example background processes still running), rendered for the next
+    /// turn's task context so a follow-up sees it instead of guessing.
+    async fn session_context_note(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Categorize this tool for role-based scoping.
+    /// Default: Action (most tools are action tools).
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    /// Capability metadata used by the execution policy and risk gate.
+    /// Defaults are intentionally conservative.
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
+
+    /// The tool only manages the owner's own durable policy (mandates). A
+    /// request assessment that narrows a turn's tools still offers it to the
+    /// owner in a private chat, but only calls `owner_control_plane_call`
+    /// accepts are admitted there.
+    fn owner_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Whether this exact call is safe on a turn whose assessment did not
+    /// name the tool: read-only, or committing only through an explicit
+    /// owner confirmation. Decided from the tool's own schema enum.
+    fn owner_control_plane_call(&self, _arguments: &str) -> bool {
+        false
+    }
+
+    /// The owner approval this exact call needs before it runs, built from
+    /// the dispatcher's facts for the call. The default asks for none.
+    fn owner_approval_request(
+        &self,
+        _arguments: &str,
+        _facts: &ToolExecutionContext,
+    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
+        None
+    }
+
+    /// Machine-receipt protocol emitted by this adapter.
+    ///
+    /// Keep this independent from natural-language descriptions and call
+    /// semantics: it exists solely to type-check completion predicates.
+    fn receipt_kind(&self, _arguments: &str) -> ToolReceiptKind {
+        ToolReceiptKind::Generic
+    }
+
+    /// Structured completion semantics for a specific call.
+    ///
+    /// Default behavior derives a conservative fallback from `capabilities()`.
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        default_semantics_from_identity(arguments, self.capabilities())
+    }
+
+    /// Filesystem access roles for this exact call. Open-ended adapters should
+    /// override this when their schema exposes explicit read/write grants.
+    fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
+        let semantics = self.call_semantics(arguments);
+        default_access_manifest(arguments, &semantics)
+    }
+
+    /// Capabilities supplied by the adapter rather than requested as task
+    /// data.  The common dispatcher uses this typed lane when attenuating the
+    /// call against the task manifest.  The default is empty so an adapter
+    /// cannot accidentally widen authority by inheriting a generic grant.
+    fn adapter_owned_access_manifest(&self, _arguments: &str) -> ToolCallAccessManifest {
+        ToolCallAccessManifest::default()
+    }
+
+    /// Reconcile a successful durable receipt with current state before replay.
+    ///
+    /// The conservative default always replays. An override may return
+    /// `Reexecute` only when repeating the exact same invocation is safe after
+    /// the observed state transition, and `Block` when current state cannot be
+    /// reconciled safely.
+    async fn durable_replay_decision(&self, _arguments: &str) -> DurableReplayDecision {
+        DurableReplayDecision::Replay
+    }
+
+    /// Exact receipt subjects this adapter reports verbatim: fixed collection
+    /// IDs and the namespaces of member identities it mints. The checklist
+    /// tool publishes the union so declared targets bind only to identities a
+    /// receipt can carry. The default advertises nothing.
+    fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
+        Vec::new()
+    }
+
+    /// Authority annotations for this exact call: read-only, destructive,
+    /// idempotent, and whether it sends data or acts outside the owner's
+    /// machine and workspace (`egress`). Derived from the call's typed
+    /// semantics, never from the tool's name.
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        default_call_annotations(self.capabilities(), &self.call_semantics(arguments))
+    }
+
+    /// The typed effects of this exact call (effect class and normalized
+    /// target), which the kernel checks against the owner's declines and
+    /// hands the approval and egress policies. Build keys only with the
+    /// kernel constructors, through `command_effects::{path_effect,
+    /// egress_effect, url_effect}`. The default is `CallEffects::none()` for a
+    /// tool whose capabilities are read-only and `CallEffects::unknown()`
+    /// otherwise; a tool that can name what a call does overrides it.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        if self.capabilities().read_only {
+            aidaemon_core::CallEffects::none()
+        } else {
+            aidaemon_core::CallEffects::unknown()
+        }
+    }
+
+    /// `call_annotations` judged against the turn's trusted roots, for
+    /// effects whose class depends on where they land (a delete inside the
+    /// owner's roots is not egress). The default ignores the roots.
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        self.call_annotations(arguments)
+    }
+
+    /// Who authored what this exact call returns. The default is
+    /// `Untrusted` iff the tool reaches outside the machine
+    /// (`external_side_effect`); local tools override with the owner's
+    /// trusted roots.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        if self.capabilities().external_side_effect {
+            aidaemon_core::SourceTrust::Untrusted
+        } else {
+            aidaemon_core::SourceTrust::Trusted
+        }
+    }
+
+    /// Whether this tool is currently operational.
+    ///
+    /// Default: true. Override for tools with dynamic backends that may be
+    /// temporarily unavailable at runtime.
+    fn is_available(&self) -> bool {
+        true
     }
 }
 

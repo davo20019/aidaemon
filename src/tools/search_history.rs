@@ -484,6 +484,20 @@ impl Tool for SearchHistoryTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.execute(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute(arguments).await
+    }
+}
+
+impl crate::traits::ToolSemantics for SearchHistoryTool {
     /// Retained messages include other people's (group chats, guests) and
     /// assistant turns that echoed pages: someone else's words.
     fn output_trust(
@@ -522,18 +536,6 @@ impl Tool for SearchHistoryTool {
             ToolCallSemantics::observation()
                 .with_verification_mode(ToolVerificationMode::ResultContent)
         }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.execute(arguments).await?.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(arguments).await
     }
 }
 

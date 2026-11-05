@@ -259,20 +259,6 @@ impl Tool for ManageMcpTool {
         manage_mcp_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageMcpArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
@@ -338,6 +324,22 @@ impl Tool for ManageMcpTool {
                 "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart, enable, disable",
                 other
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageMcpTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

@@ -91,8 +91,8 @@ pub use tools::{
     ToolExecutionContext, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
     ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
     ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
-    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo, TrustRoots, EGRESS_EFFECTS,
+    ToolSemanticFacet, ToolSemanticScope, ToolSemantics, ToolTargetHint, ToolTargetHintKind,
+    ToolVerificationMode, TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 

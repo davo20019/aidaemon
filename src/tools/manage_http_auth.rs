@@ -1095,74 +1095,6 @@ impl Tool for ManageHttpAuthTool {
         manage_http_auth_schema()
     }
 
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
-        vec![crate::traits::StableObservationSubject::collection(
-            Self::AUTH_PROFILE_COLLECTION_ID,
-            &[ToolSemanticFacet::Authorization],
-            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
-            "every configured API auth profile, manual or OAuth-backed",
-        )]
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let mut semantics = semantics_for_exact_read_actions(
-            arguments,
-            &["list", "describe", "verify"],
-            ToolMutationEffects::CONFIGURATION,
-        );
-        if let Ok(args) = serde_json::from_str::<ManageHttpAuthArgs>(arguments) {
-            if args.action == "list" {
-                semantics = semantics.with_target_hint(
-                    ToolTargetHintKind::ResourceId,
-                    Self::AUTH_PROFILE_COLLECTION_ID,
-                );
-            }
-            if let Some(profile) = args.profile.as_deref() {
-                if let Ok(profile) = Self::validate_profile_name(profile) {
-                    semantics = semantics.with_target_hint(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&profile),
-                    );
-                }
-            }
-        }
-        semantics
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    /// Results are the daemon's own status text, except `verify` with a
-    /// url: it previews the remote body, which someone else may have written.
-    fn output_trust(
-        &self,
-        arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        let previews_remote_body = serde_json::from_str::<ManageHttpAuthArgs>(arguments)
-            .map(|args| {
-                args.action == "verify"
-                    && args
-                        .url
-                        .as_deref()
-                        .is_some_and(|url| !url.trim().is_empty())
-            })
-            // Unreadable arguments: assume the worst.
-            .unwrap_or(true);
-        if previews_remote_body {
-            aidaemon_core::SourceTrust::Untrusted
-        } else {
-            aidaemon_core::SourceTrust::Trusted
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
         match args.action.as_str() {
@@ -1270,9 +1202,80 @@ impl Tool for ManageHttpAuthTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ManageHttpAuthTool {
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::traits::StableObservationSubject::collection(
+            Self::AUTH_PROFILE_COLLECTION_ID,
+            &[ToolSemanticFacet::Authorization],
+            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
+            "every configured API auth profile, manual or OAuth-backed",
+        )]
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let mut semantics = semantics_for_exact_read_actions(
+            arguments,
+            &["list", "describe", "verify"],
+            ToolMutationEffects::CONFIGURATION,
+        );
+        if let Ok(args) = serde_json::from_str::<ManageHttpAuthArgs>(arguments) {
+            if args.action == "list" {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    Self::AUTH_PROFILE_COLLECTION_ID,
+                );
+            }
+            if let Some(profile) = args.profile.as_deref() {
+                if let Ok(profile) = Self::validate_profile_name(profile) {
+                    semantics = semantics.with_target_hint(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&profile),
+                    );
+                }
+            }
+        }
+        semantics
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// Results are the daemon's own status text, except `verify` with a
+    /// url: it previews the remote body, which someone else may have written.
+    fn output_trust(
+        &self,
+        arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let previews_remote_body = serde_json::from_str::<ManageHttpAuthArgs>(arguments)
+            .map(|args| {
+                args.action == "verify"
+                    && args
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty())
+            })
+            // Unreadable arguments: assume the worst.
+            .unwrap_or(true);
+        if previews_remote_body {
+            aidaemon_core::SourceTrust::Untrusted
+        } else {
+            aidaemon_core::SourceTrust::Trusted
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use tempfile::{NamedTempFile, TempDir};
 
     use crate::memory::embeddings::EmbeddingService;

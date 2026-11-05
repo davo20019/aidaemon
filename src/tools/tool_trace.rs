@@ -71,6 +71,21 @@ impl Tool for ToolTraceTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: ToolTraceArgs = serde_json::from_str(arguments)?;
+
+        let delegated = json!({
+            "action": "tool_trace",
+            "goal_id": args.goal_id,
+            "task_id": args.task_id,
+            "tool_name": args.tool_name,
+            "limit": args.limit
+        });
+        self.inner.call(&delegated.to_string()).await
+    }
+}
+
+impl crate::traits::ToolSemantics for ToolTraceTool {
     /// Past tool results replay content the tools read, whoever wrote it.
     fn output_trust(
         &self,
@@ -88,19 +103,6 @@ impl Tool for ToolTraceTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ToolTraceArgs = serde_json::from_str(arguments)?;
-
-        let delegated = json!({
-            "action": "tool_trace",
-            "goal_id": args.goal_id,
-            "task_id": args.task_id,
-            "tool_name": args.tool_name,
-            "limit": args.limit
-        });
-        self.inner.call(&delegated.to_string()).await
     }
 }
 

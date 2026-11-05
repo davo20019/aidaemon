@@ -69,6 +69,20 @@ impl Tool for ReadFileTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.read_outcome(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.read_outcome(arguments).await
+    }
+}
+
+impl crate::traits::ToolSemantics for ReadFileTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -111,18 +125,6 @@ impl Tool for ReadFileTool {
         ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent)
             .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.read_outcome(arguments).await?.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.read_outcome(arguments).await
     }
 }
 

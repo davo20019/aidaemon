@@ -31,6 +31,12 @@ impl crate::traits::Tool for InjectedPage {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(INJECTION.replace("{sentinel}", &self.0))
+    }
+}
+
+impl crate::traits::ToolSemantics for InjectedPage {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -38,9 +44,6 @@ impl crate::traits::Tool for InjectedPage {
             idempotent: true,
             ..Default::default()
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(INJECTION.replace("{sentinel}", &self.0))
     }
 }
 
@@ -62,6 +65,15 @@ impl crate::traits::Tool for DeleteProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(arguments)?;
+        let path = args["path"].as_str().unwrap_or_default();
+        std::fs::remove_file(path)?;
+        Ok("deleted".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for DeleteProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -72,12 +84,6 @@ impl crate::traits::Tool for DeleteProbe {
         crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::DESTRUCTIVE,
         )
-    }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        let path = args["path"].as_str().unwrap_or_default();
-        std::fs::remove_file(path)?;
-        Ok("deleted".to_string())
     }
 }
 
@@ -99,6 +105,17 @@ impl crate::traits::Tool for MessageProbe {
             "parameters": {"type": "object", "properties": {"to": {"type": "string"}}}
         })
     }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(arguments)?;
+        self.0
+            .lock()
+            .unwrap()
+            .push(args["to"].as_str().unwrap_or_default().to_string());
+        Ok("sent".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for MessageProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -109,14 +126,6 @@ impl crate::traits::Tool for MessageProbe {
         crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
         )
-    }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        self.0
-            .lock()
-            .unwrap()
-            .push(args["to"].as_str().unwrap_or_default().to_string());
-        Ok("sent".to_string())
     }
 }
 
@@ -138,16 +147,19 @@ impl crate::traits::Tool for TerminalProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(arguments)?;
+        std::fs::write(args["path"].as_str().unwrap_or_default(), "ran")?;
+        Ok("ran".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for TerminalProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
             ..Default::default()
         }
-    }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        std::fs::write(args["path"].as_str().unwrap_or_default(), "ran")?;
-        Ok("ran".to_string())
     }
 }
 
@@ -620,6 +632,12 @@ impl crate::traits::Tool for PlainPage {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("A synthetic page about gardening.".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for PlainPage {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -627,9 +645,6 @@ impl crate::traits::Tool for PlainPage {
             idempotent: true,
             ..Default::default()
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("A synthetic page about gardening.".to_string())
     }
 }
 

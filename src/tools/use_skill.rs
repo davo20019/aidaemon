@@ -45,16 +45,6 @@ impl Tool for UseSkillTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
@@ -81,6 +71,18 @@ impl Tool for UseSkillTool {
                 skill_name,
                 available.join(", ")
             ))
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for UseSkillTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
         }
     }
 }

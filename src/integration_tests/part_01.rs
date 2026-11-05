@@ -483,6 +483,13 @@ impl crate::traits::Tool for IdempotencyProbeTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("mutation applied".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for IdempotencyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -507,11 +514,6 @@ impl crate::traits::Tool for IdempotencyProbeTool {
             crate::traits::ToolMutationEffects::CONFIGURATION,
         )
         .with_target_hint(crate::traits::ToolTargetHintKind::ResourceId, value)
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok("mutation applied".to_string())
     }
 }
 
@@ -538,6 +540,14 @@ impl crate::traits::Tool for ReconciledIdempotencyProbeTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("mutation applied".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for ReconciledIdempotencyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -576,11 +586,6 @@ impl crate::traits::Tool for ReconciledIdempotencyProbeTool {
         } else {
             crate::traits::DurableReplayDecision::Replay
         }
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok("mutation applied".to_string())
     }
 }
 
@@ -1046,7 +1051,9 @@ impl crate::traits::Tool for SpawnAgentMock {
                 .to_string(),
         )
     }
+}
 
+impl crate::traits::ToolSemantics for SpawnAgentMock {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -1715,6 +1722,9 @@ impl crate::traits::Tool for SlowReadTool {
             .push((start, std::time::Instant::now()));
         Ok("slow data".to_string())
     }
+}
+
+impl crate::traits::ToolSemantics for SlowReadTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -1761,7 +1771,9 @@ impl crate::traits::Tool for FlakyProbeTool {
         self.successes.fetch_add(1, Ordering::SeqCst);
         Ok("probe data recovered".to_string())
     }
+}
 
+impl crate::traits::ToolSemantics for FlakyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,

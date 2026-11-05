@@ -47,42 +47,6 @@ impl Tool for GitCommitTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Trusted
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| ".".to_string());
-        ToolCallSemantics::mutation_with(ToolMutationEffects::REPOSITORY_WRITE)
-            .with_target_hint(ToolTargetHintKind::ProjectScope, path)
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let message = args["message"]
@@ -164,6 +128,44 @@ impl Tool for GitCommitTool {
         output.push_str(&format!("\nStaged: {}", staged_files));
 
         Ok(output)
+    }
+}
+
+impl crate::traits::ToolSemantics for GitCommitTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| ".".to_string());
+        ToolCallSemantics::mutation_with(ToolMutationEffects::REPOSITORY_WRITE)
+            .with_target_hint(ToolTargetHintKind::ProjectScope, path)
     }
 }
 

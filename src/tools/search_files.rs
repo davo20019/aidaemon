@@ -62,53 +62,6 @@ impl Tool for SearchFilesTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
-    fn output_trust(
-        &self,
-        arguments: &str,
-        roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        // A search with no `path` runs in the working directory.
-        let args = serde_json::from_str::<Value>(arguments).ok();
-        let path = match args.as_ref().map(|args| args.get("path")) {
-            Some(None) | Some(Some(Value::Null)) => Some("."),
-            Some(Some(value)) => value.as_str(),
-            None => None,
-        };
-        match path {
-            Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
-            _ => aidaemon_core::SourceTrust::Untrusted,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                args.get("path")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-
-        ToolCallSemantics::observation()
-            .with_verification_mode(ToolVerificationMode::ResultContent)
-            .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let content_pattern = args["pattern"].as_str();
@@ -276,6 +229,55 @@ impl Tool for SearchFilesTool {
         }
 
         Ok(output)
+    }
+}
+
+impl crate::traits::ToolSemantics for SearchFilesTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        // A search with no `path` runs in the working directory.
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let path = match args.as_ref().map(|args| args.get("path")) {
+            Some(None) | Some(Some(Value::Null)) => Some("."),
+            Some(Some(value)) => value.as_str(),
+            None => None,
+        };
+        match path {
+            Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 }
 

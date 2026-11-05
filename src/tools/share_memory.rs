@@ -107,16 +107,6 @@ impl Tool for ShareMemoryTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ShareArgs = serde_json::from_str(arguments)?;
 
@@ -157,6 +147,18 @@ impl Tool for ShareMemoryTool {
                 "No active fact found with category '{}' and key '{}'.",
                 args.category, args.key
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ShareMemoryTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

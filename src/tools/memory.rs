@@ -229,10 +229,6 @@ impl Tool for RememberFactTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
         let channel_id = self.current_channel_id.read().await.clone();
@@ -453,6 +449,12 @@ impl Tool for RememberFactTool {
 
         Ok(results.join("\n"))
     }
+}
+
+impl crate::traits::ToolSemantics for RememberFactTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
 
     /// Memory is persistent agent state: a write is typed `configuration`
     /// and a deletion is also `destructive`, so the receipt can prove a
@@ -491,6 +493,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolSemantics;
 
     async fn setup() -> (
         RememberFactTool,

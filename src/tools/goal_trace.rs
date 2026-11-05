@@ -543,25 +543,6 @@ impl Tool for GoalTraceTool {
         goal_trace_schema()
     }
 
-    /// Goal traces replay past tool results and messages, whoever wrote them.
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Untrusted
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: GoalTraceArgs = serde_json::from_str(arguments)?;
         match args.action.as_str() {
@@ -594,6 +575,27 @@ impl Tool for GoalTraceTool {
                 "Unknown action: '{}'. Use goal_trace or tool_trace.",
                 other
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for GoalTraceTool {
+    /// Goal traces replay past tool results and messages, whoever wrote them.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
         }
     }
 }

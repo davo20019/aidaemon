@@ -546,6 +546,8 @@ impl crate::traits::Tool for TrustProbeTool {
     }
 }
 
+impl crate::traits::ToolSemantics for TrustProbeTool {}
+
 #[tokio::test]
 async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
     let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));

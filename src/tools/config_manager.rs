@@ -1517,29 +1517,6 @@ impl Tool for ConfigManagerTool {
         manage_config_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &[
-                "read",
-                "get",
-                "list_provider_presets",
-                "list_failover_providers",
-            ],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ConfigArgs = serde_json::from_str(arguments)?;
 
@@ -1656,6 +1633,31 @@ impl Tool for ConfigManagerTool {
                 "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', or 'enable_stt'.",
                 args.action
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ConfigManagerTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &[
+                "read",
+                "get",
+                "list_provider_presets",
+                "list_failover_providers",
+            ],
+            ToolMutationEffects::CONFIGURATION,
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

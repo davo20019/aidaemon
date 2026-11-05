@@ -4,6 +4,7 @@
 //! request into each provider's API, so image generation is independent of the
 //! provider handling the surrounding conversation.
 
+use crate::traits::ToolSemantics;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -793,7 +794,9 @@ impl Tool for GenerateImageTool {
     ) -> anyhow::Result<ToolCallOutcome> {
         self.generate_outcome(arguments, status_tx).await
     }
+}
 
+impl crate::traits::ToolSemantics for GenerateImageTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -821,6 +824,7 @@ impl Tool for GenerateImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use std::sync::Mutex as StdMutex;
 
     use axum::extract::State;

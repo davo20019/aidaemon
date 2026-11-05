@@ -65,7 +65,7 @@ impl<'a> ClosingAuthority<'a> {
 
     /// The tool is admitted only because the runtime kept it as an owner
     /// control-plane tool; the caller must also check the exact call
-    /// (`Tool::owner_control_plane_call`).
+    /// (`ToolSemantics::owner_control_plane_call`).
     pub(in crate::agent) fn admits_only_as_control_plane(&self, tool: &str) -> bool {
         !self.allowed_tool_names.is_empty()
             && !self.allowed_tool_names.iter().any(|name| name == tool)

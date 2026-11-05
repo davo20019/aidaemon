@@ -438,6 +438,29 @@ impl Tool for ManageMemoriesTool {
         manage_memories_schema()
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, false).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, false).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        exec_ctx: crate::traits::ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, exec_ctx.trusted_session).await
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageMemoriesTool {
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         const ACTIONS_REQUIRING_GOAL_ID: &[&str] = &[
             "add_schedule",
@@ -485,27 +508,6 @@ impl Tool for ManageMemoriesTool {
             ],
             memory_action_effects(arguments),
         )
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, false).await
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.outcome(arguments, false).await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.outcome(arguments, exec_ctx.trusted_session).await
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -2435,6 +2437,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::traits::ToolSemantics;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -207,6 +208,20 @@ impl Tool for RunCommandTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.run_outcome(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.run_outcome(arguments).await
+    }
+}
+
+impl crate::traits::ToolSemantics for RunCommandTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -231,18 +246,6 @@ impl Tool for RunCommandTool {
 
     fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
         run_command_access_manifest(arguments)
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run_outcome(arguments).await?.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.run_outcome(arguments).await
     }
 }
 

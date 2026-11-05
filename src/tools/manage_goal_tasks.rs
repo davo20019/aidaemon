@@ -402,14 +402,6 @@ impl Tool for ManageGoalTasksTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Management
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(arguments, &["list_tasks"], ToolMutationEffects::NONE)
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageGoalTasksArgs = serde_json::from_str(arguments)?;
 
@@ -442,6 +434,16 @@ impl Tool for ManageGoalTasksTool {
             "fail_goal" => self.fail_goal(&args).await,
             other => Ok(format!("Unknown action: {}. Use: create_task, list_tasks, update_task, claim_task, retry_task, resolve_blocker, complete_goal, fail_goal", other)),
         }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageGoalTasksTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Management
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(arguments, &["list_tasks"], ToolMutationEffects::NONE)
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1480,6 +1482,7 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
     use crate::traits::Goal;
+    use crate::traits::ToolSemantics;
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String) {
         let db_file = tempfile::NamedTempFile::new().unwrap();

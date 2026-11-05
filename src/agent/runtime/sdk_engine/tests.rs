@@ -820,6 +820,13 @@ impl crate::traits::Tool for ShellProbe {
             "parameters": {"type": "object", "properties": {"write": {"type": "boolean"}}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok("acme.md\nmia.txt".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for ShellProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -839,10 +846,6 @@ impl crate::traits::Tool for ShellProbe {
         } else {
             crate::traits::ToolCallSemantics::observation()
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("acme.md\nmia.txt".to_string())
     }
 }
 
@@ -864,6 +867,12 @@ impl crate::traits::Tool for EffectsProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("sent".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for EffectsProbe {
     fn call_effects(&self, arguments: &str) -> sdk::CallEffects {
         let args = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
         let path = args["path"].as_str().unwrap_or_default();
@@ -875,9 +884,6 @@ impl crate::traits::Tool for EffectsProbe {
             ],
             complete: true,
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("sent".to_string())
     }
 }
 
@@ -927,11 +933,14 @@ impl crate::traits::Tool for DownProbe {
             "parameters": {"type": "object", "properties": {}}
         })
     }
-    fn is_available(&self) -> bool {
-        false
-    }
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         Ok("unreachable".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for DownProbe {
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
@@ -1892,7 +1901,7 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
 
 #[tokio::test]
 async fn tools_declare_their_source_class() {
-    use crate::traits::{Tool as _, TrustRoots};
+    use crate::traits::{ToolSemantics as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
     let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
     let roots = TrustRoots::new(&roots);
@@ -1943,7 +1952,7 @@ async fn tools_declare_their_source_class() {
 /// resolve against the turn's working directory, which is always a root.
 #[test]
 fn relative_reads_under_the_working_directory_are_trusted() {
-    use crate::traits::{Tool as _, TrustRoots};
+    use crate::traits::{ToolSemantics as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
     let cwd = "/tmp/aidaemon-test/ws";
     let roots = cwd_roots(cwd);
@@ -2017,7 +2026,7 @@ fn cwd_roots(cwd: &str) -> Vec<String> {
 }
 
 fn read_trust(roots: &[String], path: &std::path::Path) -> aidaemon_core::SourceTrust {
-    use crate::traits::{Tool as _, TrustRoots};
+    use crate::traits::{ToolSemantics as _, TrustRoots};
     let args = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
     crate::tools::ReadFileTool.output_trust(&args, &TrustRoots::new(roots))
 }
@@ -2266,7 +2275,7 @@ async fn reading_an_ungranted_named_file_checks_the_first_egress() {
 /// output; skill resources are files a skill's author wrote.
 #[tokio::test]
 async fn history_traces_and_skill_resources_are_untrusted() {
-    use crate::traits::{Tool as _, TrustRoots};
+    use crate::traits::{ToolSemantics as _, TrustRoots};
     use aidaemon_core::SourceTrust::Untrusted;
     let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
         .await
@@ -2291,7 +2300,7 @@ async fn history_traces_and_skill_resources_are_untrusted() {
 
 #[tokio::test]
 async fn http_request_with_owner_credentials_is_egress_even_for_get() {
-    use crate::traits::Tool as _;
+    use crate::traits::ToolSemantics as _;
     let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
         std::collections::HashMap::new(),
     )));
@@ -2352,6 +2361,12 @@ impl crate::traits::Tool for PageProbe {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(INJECTED_PAGE.to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for PageProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -2360,9 +2375,6 @@ impl crate::traits::Tool for PageProbe {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(INJECTED_PAGE.to_string())
     }
 }
 
@@ -2387,6 +2399,13 @@ impl crate::traits::Tool for SendProbe {
             }
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok("sent".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for SendProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -2400,10 +2419,6 @@ impl crate::traits::Tool for SendProbe {
         crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
         )
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("sent".to_string())
     }
 }
 
@@ -2872,6 +2887,17 @@ impl crate::traits::Tool for TaintRecordProbe {
             "parameters": {"type": "object", "properties": {}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        let state = self.state.get().expect("store set").clone();
+        let turns =
+            crate::agent::untrusted::tainted_turns(state.as_ref(), "telegram:synthetic-user-1")
+                .await?;
+        *self.seen.lock().unwrap() = Some(turns.len());
+        Ok("ok".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for TaintRecordProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -2880,14 +2906,6 @@ impl crate::traits::Tool for TaintRecordProbe {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let state = self.state.get().expect("store set").clone();
-        let turns =
-            crate::agent::untrusted::tainted_turns(state.as_ref(), "telegram:synthetic-user-1")
-                .await?;
-        *self.seen.lock().unwrap() = Some(turns.len());
-        Ok("ok".to_string())
     }
 }
 
@@ -2947,19 +2965,22 @@ impl crate::traits::Tool for SpawnRecorder {
             }
         })
     }
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            idempotent: true,
-            ..Default::default()
-        }
-    }
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.0
             .lock()
             .unwrap()
             .push(serde_json::from_str(arguments)?);
         Ok("delegated".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for SpawnRecorder {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -3124,19 +3145,22 @@ impl crate::traits::Tool for ArgsRecorder {
             "parameters": {"type": "object", "properties": {"mission": {"type": "string"}}}
         })
     }
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            idempotent: true,
-            ..Default::default()
-        }
-    }
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.seen
             .lock()
             .unwrap()
             .push(serde_json::from_str(arguments)?);
         Ok("recorded".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for ArgsRecorder {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -3234,17 +3258,20 @@ impl crate::traits::Tool for OfferedGoalRuns {
     fn schema(&self) -> serde_json::Value {
         crate::traits::Tool::schema(&self.0)
     }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        crate::traits::Tool::call(&self.0, arguments).await
+    }
+}
+
+impl crate::traits::ToolSemantics for OfferedGoalRuns {
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
-        crate::traits::Tool::call_semantics(&self.0, arguments)
+        crate::traits::ToolSemantics::call_semantics(&self.0, arguments)
     }
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             high_impact_write: false,
-            ..crate::traits::Tool::capabilities(&self.0)
+            ..crate::traits::ToolSemantics::capabilities(&self.0)
         }
-    }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        crate::traits::Tool::call(&self.0, arguments).await
     }
 }
 

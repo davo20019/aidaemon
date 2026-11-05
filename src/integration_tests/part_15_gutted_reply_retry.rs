@@ -252,6 +252,8 @@ async fn test_typed_failed_operation_requires_recovery_before_completion() {
         }
     }
 
+    impl crate::traits::ToolSemantics for FailingProbeTool {}
+
     let promissory_after_work =
         "I am currently refining the API query to only get recruiting trials now...";
     let real_answer = "The registries I could reach show no additional matches.";

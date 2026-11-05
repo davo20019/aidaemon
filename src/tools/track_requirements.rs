@@ -26,7 +26,7 @@ pub const UNBOUND_TARGETS_KEY: &str = "_unbound_targets";
 pub const CHECKLIST_HEADER: &str = "Checklist updated";
 
 /// Union of the exact receipt subjects every registered tool advertises via
-/// `Tool::stable_observation_subjects`. Checklist resource-ID targets are bound
+/// `ToolSemantics::stable_observation_subjects`. Checklist resource-ID targets are bound
 /// against it: a value outside every advertised ID and member namespace can
 /// never be credited by a receipt, so it is never compiled into an obligation.
 #[derive(Debug, Clone, Default)]
@@ -518,29 +518,6 @@ impl Tool for TrackRequirementsTool {
         })
     }
 
-    fn canonicalize_arguments(
-        &self,
-        arguments: &str,
-    ) -> Result<String, ToolArgumentContractViolation> {
-        bind_checklist_targets(arguments, &self.vocabulary)
-    }
-
-    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
-        let value: Value = serde_json::from_str(arguments).map_err(|error| {
-            ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
-        })?;
-        if let Some(items) = value.get("items").and_then(Value::as_array) {
-            for (index, item) in items.iter().enumerate() {
-                parse_expectation_targets(item.get("targets")).map_err(|error| {
-                    ToolArgumentContractViolation::new(format!(
-                        "item {index} has invalid evidence targets: {error}"
-                    ))
-                })?;
-            }
-        }
-        Ok(())
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let v: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         let session_id = match v.get("_session_id").and_then(Value::as_str) {
@@ -677,6 +654,31 @@ impl Tool for TrackRequirementsTool {
         ));
         Ok(output)
     }
+}
+
+impl crate::traits::ToolSemantics for TrackRequirementsTool {
+    fn canonicalize_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<String, ToolArgumentContractViolation> {
+        bind_checklist_targets(arguments, &self.vocabulary)
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let value: Value = serde_json::from_str(arguments).map_err(|error| {
+            ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
+        })?;
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                parse_expectation_targets(item.get("targets")).map_err(|error| {
+                    ToolArgumentContractViolation::new(format!(
+                        "item {index} has invalid evidence targets: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         // Checklist bookkeeping cannot prove a requested mutation occurred.
@@ -697,6 +699,7 @@ impl Tool for TrackRequirementsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_tool() -> (TrackRequirementsTool, Arc<PlanStore>) {

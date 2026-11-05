@@ -1211,68 +1211,6 @@ impl Tool for ScheduledGoalRunsTool {
         scheduled_goal_runs_schema()
     }
 
-    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
-        let parsed = serde_json::from_str::<Value>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|value| value.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        if action == "overview" {
-            return Ok(());
-        }
-        let has_goal_id = parsed
-            .as_ref()
-            .and_then(|value| value.get("goal_id"))
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty());
-        if has_goal_id {
-            return Ok(());
-        }
-        Err(ToolArgumentContractViolation::new(format!(
-            "action `{action}` requires `goal_id` for `scheduled_goal_runs`"
-        ))
-        .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
-    }
-
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
-        vec![crate::tools::objective_status::ObjectiveCollection::ScheduledGoals.stable_subject()]
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        // `bind_workspace` writes the goal's workspace binding, a trusted
-        // root for every later run: a configuration change, so egress after
-        // untrusted content.
-        let binds_workspace = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                args.get("action")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .map(str::to_string)
-            })
-            .is_some_and(|action| action == "bind_workspace");
-        semantics_for_exact_read_actions(
-            arguments,
-            &["overview", "run_history", "last_failure", "unblock_hints"],
-            if binds_workspace {
-                ToolMutationEffects::CONFIGURATION
-            } else {
-                ToolMutationEffects::NONE
-            },
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
@@ -1427,11 +1365,76 @@ impl Tool for ScheduledGoalRunsTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ScheduledGoalRunsTool {
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if action == "overview" {
+            return Ok(());
+        }
+        let has_goal_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("goal_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_goal_id {
+            return Ok(());
+        }
+        Err(ToolArgumentContractViolation::new(format!(
+            "action `{action}` requires `goal_id` for `scheduled_goal_runs`"
+        ))
+        .with_recovery_hint("Obtain a concrete scheduled goal identifier before retrying."))
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::tools::objective_status::ObjectiveCollection::ScheduledGoals.stable_subject()]
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        // `bind_workspace` writes the goal's workspace binding, a trusted
+        // root for every later run: a configuration change, so egress after
+        // untrusted content.
+        let binds_workspace = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("action")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .is_some_and(|action| action == "bind_workspace");
+        semantics_for_exact_read_actions(
+            arguments,
+            &["overview", "run_history", "last_failure", "unblock_hints"],
+            if binds_workspace {
+                ToolMutationEffects::CONFIGURATION
+            } else {
+                ToolMutationEffects::NONE
+            },
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task};
 
     async fn setup_state() -> Arc<dyn StateStore> {

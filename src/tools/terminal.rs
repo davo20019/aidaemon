@@ -1,3 +1,4 @@
+use crate::traits::ToolSemantics;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7826,6 +7827,42 @@ impl Tool for TerminalTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender.
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute_terminal(arguments, status_tx, &ToolExecutionContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute_terminal(arguments, status_tx, &exec_ctx).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for TerminalTool {
     fn canonicalize_arguments(
         &self,
         arguments: &str,
@@ -7985,39 +8022,6 @@ impl Tool for TerminalTool {
         }
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender.
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_outcome(arguments, status_tx)
-            .await
-            .map(|outcome| outcome.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, &ToolExecutionContext::default())
-            .await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, &exec_ctx).await
-    }
-
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
         let cleaned = self.cleanup_task_processes(task_id).await?;
         if cleaned > 0 {
@@ -8081,6 +8085,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
+    use crate::traits::ToolSemantics;
     use crate::traits::{NotificationStore, StateStore, Tool};
     use sqlx::SqlitePool;
     use std::sync::Arc;

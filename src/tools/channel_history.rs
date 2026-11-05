@@ -394,29 +394,6 @@ impl Tool for ReadChannelHistoryTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
-    /// The channel API host (Slack's Web API) the history is read from.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        reqwest::Url::parse(&self.base_url)
-            .ok()
-            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
-            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
-                aidaemon_core::CallEffects {
-                    keys: vec![key],
-                    complete: true,
-                }
-            })
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -560,6 +537,31 @@ impl Tool for ReadChannelHistoryTool {
         );
 
         Ok(format!("{}\n{}", header, formatted.join("\n\n")))
+    }
+}
+
+impl crate::traits::ToolSemantics for ReadChannelHistoryTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// The channel API host (Slack's Web API) the history is read from.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            })
     }
 }
 
@@ -807,7 +809,7 @@ mod tests {
 
     #[test]
     fn channel_history_declares_the_api_host() {
-        use crate::traits::Tool as _;
+        use crate::traits::ToolSemantics as _;
         let tool = ReadChannelHistoryTool::new(vec!["xoxb-synthetic".to_string()]);
         let effects = tool.call_effects(r#"{"channel_id":"C123"}"#);
         assert!(effects.complete);

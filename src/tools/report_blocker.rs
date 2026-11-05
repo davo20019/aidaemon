@@ -430,29 +430,6 @@ impl Tool for ReportBlockerTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::administrative()
-    }
-
-    /// Records the blocker in the agent's own task state; nothing else.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        aidaemon_core::CallEffects::none()
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let mut args: ReportBlockerArgs = serde_json::from_str(arguments)?;
         if self.mandate_execution {
@@ -665,6 +642,31 @@ impl Tool for ReportBlockerTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ReportBlockerTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        ToolCallSemantics::administrative()
+    }
+
+    /// Records the blocker in the agent's own task state; nothing else.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::none()
+    }
+}
+
 fn classify_blocker_outcome(args: &ReportBlockerArgs) -> TaskValidationOutcome {
     match args.outcome.as_deref() {
         Some("needs_approval") => TaskValidationOutcome::NeedsApproval,
@@ -683,6 +685,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolSemantics;
     use crate::traits::{Goal, Task};
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String, String) {

@@ -870,16 +870,6 @@ impl Tool for ManageApiTool {
         self.call_with_status(arguments, None).await
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call_with_status(
         &self,
         arguments: &str,
@@ -897,6 +887,18 @@ impl Tool for ManageApiTool {
         self.dispatch(arguments, status_tx, exec_ctx.kernel_approved.as_ref())
             .await
             .map(ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageApiTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     /// The learning source's host (where the derived probe is expected),

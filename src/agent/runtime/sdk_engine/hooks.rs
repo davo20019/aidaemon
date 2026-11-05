@@ -283,7 +283,7 @@ impl sdk::Tool for BridgedTool {
     }
 
     /// Fallback only: the dispatcher stamps each result with the exact
-    /// call's trust (`Tool::output_trust`).
+    /// call's trust (`ToolSemantics::output_trust`).
     fn source_trust(&self, _arguments: &Value) -> sdk::SourceTrust {
         sdk::SourceTrust::Untrusted
     }

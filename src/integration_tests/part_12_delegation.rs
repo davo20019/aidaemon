@@ -39,7 +39,9 @@ impl crate::traits::Tool for StructuredPatchTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         Ok(format!("Synthetic patch applied: {arguments}"))
     }
+}
 
+impl crate::traits::ToolSemantics for StructuredPatchTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -89,7 +91,9 @@ impl crate::traits::Tool for HighImpactCliAgentMock {
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         Ok("cli agent executed".to_string())
     }
+}
 
+impl crate::traits::ToolSemantics for HighImpactCliAgentMock {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,

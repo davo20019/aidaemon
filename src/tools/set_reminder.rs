@@ -77,10 +77,6 @@ impl Tool for SetReminderTool {
         })
     }
 
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::mutation()
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.scheduler.call(&scheduler_arguments(arguments)?).await
     }
@@ -104,6 +100,12 @@ impl Tool for SetReminderTool {
                 ..ToolCallMetadata::default()
             },
         })
+    }
+}
+
+impl crate::traits::ToolSemantics for SetReminderTool {
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        ToolCallSemantics::mutation()
     }
 
     fn capabilities(&self) -> ToolCapabilities {

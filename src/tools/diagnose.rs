@@ -1925,16 +1925,6 @@ impl Tool for DiagnoseTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: DiagnoseArgs = serde_json::from_str(arguments)?;
         let session_id = args
@@ -1975,6 +1965,18 @@ impl Tool for DiagnoseTool {
                 "Unknown action: '{}'. Use list_tasks, timeline, diagnose, or compare.",
                 other
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for DiagnoseTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
         }
     }
 }

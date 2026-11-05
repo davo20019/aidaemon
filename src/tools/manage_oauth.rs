@@ -1165,61 +1165,6 @@ impl Tool for ManageOAuthTool {
         manage_oauth_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let mut semantics = semantics_for_exact_read_actions(
-            arguments,
-            &["list", "providers", "describe_provider"],
-            ToolMutationEffects::CONFIGURATION,
-        );
-        if let Ok(args) = serde_json::from_str::<ManageOAuthArgs>(arguments) {
-            if args.action == "list" {
-                semantics = semantics.with_target_hint(
-                    ToolTargetHintKind::ResourceId,
-                    Self::OAUTH_CONNECTION_COLLECTION_ID,
-                );
-            }
-            if let Some(service) = args.service.as_deref() {
-                if let Ok(service) = Self::validate_service_name(service) {
-                    semantics = semantics.with_target_hint(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&service),
-                    );
-                }
-            }
-        }
-        semantics
-    }
-
-    fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
-        vec![StableObservationSubject::collection(
-            Self::OAUTH_CONNECTION_COLLECTION_ID,
-            &[ToolSemanticFacet::Authorization],
-            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
-            "every connected OAuth service",
-        )]
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    /// Results are the daemon's own status text, never a third party's.
-    /// Failure messages may quote a token endpoint's body; those endpoints
-    /// are owner-configured, so they stay trusted.
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Trusted
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.call_with_status(arguments, None).await
     }
@@ -1390,9 +1335,67 @@ impl Tool for ManageOAuthTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ManageOAuthTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let mut semantics = semantics_for_exact_read_actions(
+            arguments,
+            &["list", "providers", "describe_provider"],
+            ToolMutationEffects::CONFIGURATION,
+        );
+        if let Ok(args) = serde_json::from_str::<ManageOAuthArgs>(arguments) {
+            if args.action == "list" {
+                semantics = semantics.with_target_hint(
+                    ToolTargetHintKind::ResourceId,
+                    Self::OAUTH_CONNECTION_COLLECTION_ID,
+                );
+            }
+            if let Some(service) = args.service.as_deref() {
+                if let Ok(service) = Self::validate_service_name(service) {
+                    semantics = semantics.with_target_hint(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&service),
+                    );
+                }
+            }
+        }
+        semantics
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
+        vec![StableObservationSubject::collection(
+            Self::OAUTH_CONNECTION_COLLECTION_ID,
+            &[ToolSemanticFacet::Authorization],
+            HttpRequestTool::AUTH_PROFILE_NAMESPACE,
+            "every connected OAuth service",
+        )]
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// Results are the daemon's own status text, never a third party's.
+    /// Failure messages may quote a token endpoint's body; those endpoints
+    /// are owner-configured, so they stay trusted.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Duration;

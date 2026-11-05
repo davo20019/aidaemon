@@ -564,6 +564,47 @@ impl Tool for WebFetchTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.execute(arguments, false)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments, false).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+impl crate::traits::ToolSemantics for WebFetchTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -604,45 +645,6 @@ impl Tool for WebFetchTool {
                     complete: true,
                 }
             })
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments, false)
-            .await
-            .map(|(output, _)| output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = status_tx;
-        let (output, truncation) = self.execute(arguments, false).await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                truncation,
-                ..Default::default()
-            },
-        })
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = status_tx;
-        let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                truncation,
-                ..Default::default()
-            },
-        })
     }
 }
 
@@ -1111,6 +1113,7 @@ mod format_tests {
 #[cfg(test)]
 mod extraction_tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     /// Mimics the observed Wikipedia failure: a large inline <script> block
     /// ahead of the real content leaked into the "extracted" text and

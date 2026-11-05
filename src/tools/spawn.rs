@@ -467,16 +467,6 @@ impl Tool for SpawnAgentTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.call_with_status(arguments, None).await
     }
@@ -489,16 +479,6 @@ impl Tool for SpawnAgentTool {
         self.call_with_status_outcome(arguments, status_tx)
             .await
             .map(|outcome| outcome.output)
-    }
-
-    /// A child's result carries the child's taint; anything the call does
-    /// not report (errors) counts as untrusted.
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> SourceTrust {
-        SourceTrust::Untrusted
     }
 
     async fn call_with_status_outcome(
@@ -870,6 +850,28 @@ impl Tool for SpawnAgentTool {
             ),
             SourceTrust::Trusted,
         ))
+    }
+}
+
+impl crate::traits::ToolSemantics for SpawnAgentTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// A child's result carries the child's taint; anything the call does
+    /// not report (errors) counts as untrusted.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> SourceTrust {
+        SourceTrust::Untrusted
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::traits::ToolSemantics;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -148,52 +149,6 @@ impl Tool for SendFileTool {
                 "additionalProperties": false
             }
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
-        vec![crate::traits::StableObservationSubject::namespace(
-            crate::channels::attachments::RESOURCE_ID_PREFIX,
-            "session resource handles returned by tools",
-        )]
-    }
-
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Trusted
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let args = serde_json::from_str::<Value>(arguments).ok();
-        let resource_id = args
-            .as_ref()
-            .and_then(|args| args.get("resource_id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let path = args
-            .as_ref()
-            .and_then(|args| args.get("file_path"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let semantics = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
-        if resource_id.is_empty() {
-            semantics.with_target_hint(ToolTargetHintKind::Path, path)
-        } else {
-            semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
-        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -430,6 +385,54 @@ impl Tool for SendFileTool {
             },
             output,
         })
+    }
+}
+
+impl crate::traits::ToolSemantics for SendFileTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::traits::StableObservationSubject::namespace(
+            crate::channels::attachments::RESOURCE_ID_PREFIX,
+            "session resource handles returned by tools",
+        )]
+    }
+
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let resource_id = args
+            .as_ref()
+            .and_then(|args| args.get("resource_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = args
+            .as_ref()
+            .and_then(|args| args.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let semantics = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
+        if resource_id.is_empty() {
+            semantics.with_target_hint(ToolTargetHintKind::Path, path)
+        } else {
+            semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
+        }
     }
 }
 

@@ -4170,6 +4170,70 @@ impl Tool for CliAgentTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
+            .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && parsed
+                .as_ref()
+                .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
+        let output = self
+            .call_with_status_under_contract(arguments, status_tx, read_only_run, false, false)
+            .await?;
+        Ok(cli_agent_outcome(&action, output, read_only_run))
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
+            .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && (exec_ctx.mutation_forbidden
+                || parsed
+                    .as_ref()
+                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
+        let output = self
+            .call_with_status_under_contract(
+                arguments,
+                status_tx,
+                read_only_run,
+                true,
+                exec_ctx.trusted_session,
+            )
+            .await?;
+        Ok(cli_agent_outcome(&action, output, read_only_run))
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_under_contract(arguments, status_tx, false, false, false)
+            .await
+    }
+}
+
+impl crate::traits::ToolSemantics for CliAgentTool {
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
             return Ok(());
@@ -4229,11 +4293,6 @@ impl Tool for CliAgentTool {
 
     fn is_available(&self) -> bool {
         self.has_tools()
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender
-        self.call_with_status(arguments, None).await
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -4347,63 +4406,6 @@ impl Tool for CliAgentTool {
             write_targets,
             adapter_read_targets: Vec::new(),
         }
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && parsed
-                .as_ref()
-                .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
-        let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, false, false)
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && (exec_ctx.mutation_forbidden
-                || parsed
-                    .as_ref()
-                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let output = self
-            .call_with_status_under_contract(
-                arguments,
-                status_tx,
-                read_only_run,
-                true,
-                exec_ctx.trusted_session,
-            )
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
-    }
-
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_under_contract(arguments, status_tx, false, false, false)
-            .await
     }
 }
 
@@ -4702,6 +4704,7 @@ impl CliAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     /// The bypass flags in the defaults are stripped at launch, so the
     /// model-facing descriptions must not promise an auto-approve mode.
@@ -7060,12 +7063,12 @@ mod tests {
     async fn test_has_tools() {
         let (tool, _db) = setup_echo_tool().await;
         assert!(tool.has_tools());
-        assert!(Tool::is_available(&tool));
+        assert!(ToolSemantics::is_available(&tool));
 
         // Clear all tools
         tool.tools.write().unwrap().clear();
         assert!(!tool.has_tools());
-        assert!(!Tool::is_available(&tool));
+        assert!(!ToolSemantics::is_available(&tool));
     }
 
     #[tokio::test]

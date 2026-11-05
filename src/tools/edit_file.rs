@@ -50,60 +50,6 @@ impl Tool for EditFileTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            // Not high-impact: find-and-replace with safe failure on ambiguity.
-            // Dedicated file tools are intentionally available without terminal
-            // approval. Sensitive paths are blocked before editing.
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                for key in ["path", "file_path", "file", "filename"] {
-                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
-                        return Some(path.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_default();
-
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
-            .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
-    /// A write of the target path (absolute; a relative path resolves where
-    /// the execution backend puts it, which is not known here).
-    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
-        super::command_effects::file_tool_write_effects(arguments)
-    }
-
-    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
-        let semantics = self.call_semantics(arguments);
-        let mut annotations =
-            crate::traits::default_call_annotations(self.capabilities(), &semantics);
-        // A write that can plant git configuration changes what later
-        // "read-only" git commands execute: treat it as a configuration change.
-        let plants_git_config = semantics
-            .target_hints
-            .iter()
-            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
-        annotations.egress |= plants_git_config;
-        annotations
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -219,6 +165,62 @@ impl Tool for EditFileTool {
     }
 }
 
+impl crate::traits::ToolSemantics for EditFileTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            // Not high-impact: find-and-replace with safe failure on ambiguity.
+            // Dedicated file tools are intentionally available without terminal
+            // approval. Sensitive paths are blocked before editing.
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                for key in ["path", "file_path", "file", "filename"] {
+                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
+                        return Some(path.to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .with_target_hint(ToolTargetHintKind::Path, path)
+    }
+
+    /// A write of the target path (absolute; a relative path resolves where
+    /// the execution backend puts it, which is not known here).
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        super::command_effects::file_tool_write_effects(arguments)
+    }
+
+    fn call_annotations(&self, arguments: &str) -> aidaemon_core::ToolAnnotations {
+        let semantics = self.call_semantics(arguments);
+        let mut annotations =
+            crate::traits::default_call_annotations(self.capabilities(), &semantics);
+        // A write that can plant git configuration changes what later
+        // "read-only" git commands execute: treat it as a configuration change.
+        let plants_git_config = semantics
+            .target_hints
+            .iter()
+            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
+        annotations.egress |= plants_git_config;
+        annotations
+    }
+}
+
 fn detect_newline_style(content: &str) -> &'static str {
     let crlf_count = content.matches("\r\n").count();
     let lf_total = content.matches('\n').count();
@@ -318,6 +320,7 @@ fn get_change_context(content: &str, new_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     #[test]
     fn git_config_targets_are_configuration_egress() {

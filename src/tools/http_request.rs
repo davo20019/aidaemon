@@ -2139,7 +2139,9 @@ impl Tool for HttpRequestTool {
             },
         })
     }
+}
 
+impl crate::traits::ToolSemantics for HttpRequestTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -2312,6 +2314,7 @@ impl Tool for HttpRequestTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     /// The schema the model reads must state the localhost exception the
     /// URL check enforces; a mandate executor once refused an authorized
@@ -4122,6 +4125,7 @@ mod tests {
 
     mod call_effects {
         use super::*;
+        use crate::traits::ToolSemantics;
         use aidaemon_core::{EffectClass, EffectKey};
 
         fn tool() -> HttpRequestTool {

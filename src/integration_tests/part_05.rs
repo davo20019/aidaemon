@@ -360,6 +360,12 @@ impl crate::traits::Tool for ExternalActionTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("Created remote record id=abc123".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for ExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -368,10 +374,6 @@ impl crate::traits::Tool for ExternalActionTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("Created remote record id=abc123".to_string())
     }
 }
 
@@ -398,6 +400,15 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(crate::tools::sanitize::wrap_untrusted_output(
+            "prewrapped_external_action",
+            "Created remote record id=wrapped123",
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for PreWrappedExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -406,13 +417,6 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(crate::tools::sanitize::wrap_untrusted_output(
-            "prewrapped_external_action",
-            "Created remote record id=wrapped123",
-        ))
     }
 }
 
@@ -440,16 +444,6 @@ impl crate::traits::Tool for StructuredExternalActionTool {
         })
     }
 
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         Ok(
             r#"HTTP 201 Created
@@ -469,6 +463,18 @@ Top-level keys: data
 }"#
             .to_string(),
         )
+    }
+}
+
+impl crate::traits::ToolSemantics for StructuredExternalActionTool {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
@@ -548,16 +554,6 @@ impl crate::traits::Tool for UrlProbeTool {
         })
     }
 
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         let url = args
@@ -568,6 +564,18 @@ impl crate::traits::Tool for UrlProbeTool {
             "Checked {} and confirmed the posts are visible.",
             url
         ))
+    }
+}
+
+impl crate::traits::ToolSemantics for UrlProbeTool {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
@@ -788,6 +796,13 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             })
         }
 
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("File sent by counting send_file tool".to_string())
+        }
+    }
+
+    impl crate::traits::ToolSemantics for CountingSendFileTool {
         // Like the real `send_file`: its result is the daemon's own words.
         fn output_trust(
             &self,
@@ -795,11 +810,6 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             _roots: &crate::traits::TrustRoots<'_>,
         ) -> aidaemon_core::SourceTrust {
             aidaemon_core::SourceTrust::Trusted
-        }
-
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("File sent by counting send_file tool".to_string())
         }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
@@ -926,6 +936,13 @@ async fn test_repeated_send_file_executes_once() {
             })
         }
 
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("File sent by counting send_file tool".to_string())
+        }
+    }
+
+    impl crate::traits::ToolSemantics for CountingSendFileTool {
         // Like the real `send_file`: its result is the daemon's own words.
         fn output_trust(
             &self,
@@ -933,11 +950,6 @@ async fn test_repeated_send_file_executes_once() {
             _roots: &crate::traits::TrustRoots<'_>,
         ) -> aidaemon_core::SourceTrust {
             aidaemon_core::SourceTrust::Trusted
-        }
-
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("File sent by counting send_file tool".to_string())
         }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
@@ -1260,6 +1272,12 @@ impl crate::traits::Tool for FailingExternalActionTool {
             "parameters": {"type": "object", "properties": {}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("synthetic external action failure")
+    }
+}
+
+impl crate::traits::ToolSemantics for FailingExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -1280,9 +1298,6 @@ impl crate::traits::Tool for FailingExternalActionTool {
         _roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         aidaemon_core::SourceTrust::Trusted
-    }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("synthetic external action failure")
     }
 }
 

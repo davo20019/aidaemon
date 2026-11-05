@@ -141,30 +141,6 @@ impl Tool for McpTool {
         self.tool_schema.clone()
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        self.capabilities
-    }
-
-    fn output_trust(
-        &self,
-        _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
-    ) -> aidaemon_core::SourceTrust {
-        aidaemon_core::SourceTrust::Untrusted
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        if self.capabilities.read_only {
-            return ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent);
-        }
-        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
-        if self.capabilities.high_impact_write {
-            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
-        }
-        ToolCallSemantics::mutation_with(effects)
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value =
             serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
@@ -263,6 +239,32 @@ impl Tool for McpTool {
         }
 
         result
+    }
+}
+
+impl crate::traits::ToolSemantics for McpTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        self.capabilities
+    }
+
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        if self.capabilities.read_only {
+            return ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent);
+        }
+        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
+        if self.capabilities.high_impact_write {
+            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
+        }
+        ToolCallSemantics::mutation_with(effects)
     }
 }
 

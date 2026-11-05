@@ -1,3 +1,4 @@
+use crate::traits::ToolSemantics;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -255,26 +256,6 @@ impl Tool for ReadNodeSensorsTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
-    /// The request travels to an enrolled Node over the network, whose
-    /// address is not known from the arguments.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        aidaemon_core::CallEffects::unknown()
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ReadNodeSensorsArgs = serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
@@ -343,6 +324,28 @@ impl Tool for ReadNodeSensorsTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ReadNodeSensorsTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// The request travels to an enrolled Node over the network, whose
+    /// address is not known from the arguments.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
+    }
+}
+
 #[async_trait]
 impl Tool for ReadNodeHealthTool {
     fn name(&self) -> &str {
@@ -368,26 +371,6 @@ impl Tool for ReadNodeHealthTool {
                 "additionalProperties": false
             }
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
-    /// The request travels to an enrolled Node over the network, whose
-    /// address is not known from the arguments.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        aidaemon_core::CallEffects::unknown()
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -446,6 +429,28 @@ impl Tool for ReadNodeHealthTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ReadNodeHealthTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// The request travels to an enrolled Node over the network, whose
+    /// address is not known from the arguments.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
+    }
+}
+
 #[async_trait]
 impl Tool for SendNodeAudioTool {
     fn name(&self) -> &str {
@@ -478,20 +483,6 @@ impl Tool for SendNodeAudioTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        node_audio_receipt_semantics()
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         Ok(self.execute_delivery(arguments).await?.0)
     }
@@ -510,6 +501,22 @@ impl Tool for SendNodeAudioTool {
                 ..ToolCallMetadata::default()
             },
         })
+    }
+}
+
+impl crate::traits::ToolSemantics for SendNodeAudioTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        node_audio_receipt_semantics()
     }
 }
 
@@ -560,35 +567,6 @@ impl Tool for ManageNodeMonitorsTool {
                 "additionalProperties": false
             }
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Management
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let action = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-        match action.as_deref() {
-            Some("list" | "get" | "history") => ToolCallSemantics::observation(),
-            _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
-        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -668,6 +646,37 @@ impl Tool for ManageNodeMonitorsTool {
             other => anyhow::bail!("unknown manage_node_monitors action `{other}`"),
         };
         Ok(serde_json::to_string_pretty(&output)?)
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageNodeMonitorsTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Management
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        match action.as_deref() {
+            Some("list" | "get" | "history") => ToolCallSemantics::observation(),
+            _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
+        }
     }
 }
 

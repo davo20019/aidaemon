@@ -3125,36 +3125,6 @@ impl Tool for ManageSkillsTool {
         })
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let parsed = serde_json::from_str::<Value>(arguments).ok();
-        let review_without_decision = parsed.as_ref().is_some_and(|args| {
-            args.get("action").and_then(Value::as_str) == Some("review")
-                && args.get("approve").and_then(Value::as_bool).is_none()
-        });
-        if review_without_decision {
-            return semantics_for_exact_read_actions(
-                r#"{"action":"review"}"#,
-                &["review"],
-                ToolMutationEffects::CONFIGURATION,
-            );
-        }
-        semantics_for_exact_read_actions(
-            arguments,
-            &["list", "browse"],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageSkillsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
@@ -3287,6 +3257,38 @@ impl Tool for ManageSkillsTool {
                 self.handle_review(args.draft_id, args.approve).await
             }
             other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review", other)),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageSkillsTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let review_without_decision = parsed.as_ref().is_some_and(|args| {
+            args.get("action").and_then(Value::as_str) == Some("review")
+                && args.get("approve").and_then(Value::as_bool).is_none()
+        });
+        if review_without_decision {
+            return semantics_for_exact_read_actions(
+                r#"{"action":"review"}"#,
+                &["review"],
+                ToolMutationEffects::CONFIGURATION,
+            );
+        }
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "browse"],
+            ToolMutationEffects::CONFIGURATION,
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

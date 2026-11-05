@@ -32,6 +32,8 @@ impl Tool for SlowTool {
     }
 }
 
+impl crate::traits::ToolSemantics for SlowTool {}
+
 struct SlowCliAgentTool;
 
 #[async_trait::async_trait]
@@ -60,6 +62,8 @@ impl Tool for SlowCliAgentTool {
         Ok("ok".to_string())
     }
 }
+
+impl crate::traits::ToolSemantics for SlowCliAgentTool {}
 
 struct EchoSpawnAgentTool;
 
@@ -98,16 +102,6 @@ impl Tool for MandateMutationSpy {
         })
     }
 
-    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
-        crate::traits::ToolCallSemantics::mutation_with(
-            crate::traits::ToolMutationEffects::REMOTE_MUTATION,
-        )
-        .with_target_hint(
-            crate::traits::ToolTargetHintKind::Url,
-            "https://api.x.com/2/tweets",
-        )
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         self.calls.fetch_add(1, AtomicOrdering::SeqCst);
         Ok("mutated".to_string())
@@ -124,6 +118,18 @@ impl Tool for MandateMutationSpy {
         self.call(arguments)
             .await
             .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::traits::ToolSemantics for MandateMutationSpy {
+    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::REMOTE_MUTATION,
+        )
+        .with_target_hint(
+            crate::traits::ToolTargetHintKind::Url,
+            "https://api.x.com/2/tweets",
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -431,6 +437,8 @@ impl Tool for EchoSpawnAgentTool {
         Ok(arguments.to_string())
     }
 }
+
+impl crate::traits::ToolSemantics for EchoSpawnAgentTool {}
 
 #[tokio::test]
 async fn execute_tool_watchdog_times_out_slow_tool() {

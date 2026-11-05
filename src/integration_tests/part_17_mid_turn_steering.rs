@@ -40,6 +40,8 @@ impl crate::traits::Tool for QueueOnCall {
     }
 }
 
+impl crate::traits::ToolSemantics for QueueOnCall {}
+
 #[tokio::test]
 async fn test_sdk_message_sent_mid_turn_reaches_the_next_model_call() {
     let session = "tg_mid_turn_steering";

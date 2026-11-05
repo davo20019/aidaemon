@@ -31,20 +31,6 @@ impl Tool for SystemInfoTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         let backend = active_execution_backend();
         let mut info = format!(
@@ -88,6 +74,22 @@ impl Tool for SystemInfoTool {
         }
 
         Ok(info)
+    }
+}
+
+impl crate::traits::ToolSemantics for SystemInfoTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 

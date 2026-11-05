@@ -1361,7 +1361,10 @@ impl Tool for ComputerUseTool {
             }
         }
     }
+}
 
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for ComputerUseTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let Ok(args) = serde_json::from_str::<Value>(arguments) else {
             return ToolCallSemantics::default();

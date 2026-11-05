@@ -275,6 +275,9 @@ impl crate::traits::Tool for OfferedConfigTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.0.call(arguments).await
     }
+}
+
+impl crate::traits::ToolSemantics for OfferedConfigTool {
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
         self.0.call_semantics(arguments)
     }

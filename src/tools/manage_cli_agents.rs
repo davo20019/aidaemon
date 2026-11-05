@@ -242,24 +242,6 @@ impl Tool for ManageCliAgentsTool {
         manage_cli_agents_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &["list", "history"],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageCliAgentsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
@@ -318,6 +300,26 @@ impl Tool for ManageCliAgentsTool {
                 "Unknown action '{}'. Valid actions: add, remove, list, enable, disable, history",
                 other
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageCliAgentsTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "history"],
+            ToolMutationEffects::CONFIGURATION,
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

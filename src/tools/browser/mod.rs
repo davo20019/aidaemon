@@ -2276,7 +2276,9 @@ impl Tool for BrowserTool {
             },
         })
     }
+}
 
+impl crate::traits::ToolSemantics for BrowserTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
