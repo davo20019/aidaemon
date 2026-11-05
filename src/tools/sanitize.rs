@@ -188,52 +188,51 @@ pub fn strip_model_identity_leaks(content: &str) -> String {
     result
 }
 
-/// Secret/credential patterns for output sanitization.
-struct SecretPattern {
-    regex: Regex,
-    label: &'static str,
-}
-
-static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
+/// Shapes that are not secrets but stay out of public replies and activity
+/// logs: local paths and `IP:port` endpoints. Secrets are the SDK's one list
+/// ([`aidaemon_policies::secret_patterns`]), shared with the redactor and the
+/// kernel's outbound secret scan.
+static PRIVACY_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     vec![
-        SecretPattern {
-            regex: Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap(),
-            label: "API key",
-        },
-        SecretPattern {
-            regex: Regex::new(r"xox[bprs]-[a-zA-Z0-9\-]{10,}").unwrap(),
-            label: "Slack token",
-        },
-        SecretPattern {
-            regex: Regex::new(r"ghp_[a-zA-Z0-9]{36,}").unwrap(),
-            label: "GitHub token",
-        },
-        SecretPattern {
-            regex: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-            label: "AWS key",
-        },
-        SecretPattern {
-            regex: Regex::new(r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*").unwrap(),
-            label: "Bearer token",
-        },
-        SecretPattern {
-            regex: Regex::new(r"(?:postgres|mysql|mongodb|redis)://[^\s]+").unwrap(),
-            label: "Connection string",
-        },
-        SecretPattern {
-            regex: Regex::new(r"/(?:Users|home|etc)/[^\s]{5,}").unwrap(),
-            label: "File path",
-        },
-        SecretPattern {
-            regex: Regex::new(r"[A-Z][:\\]/[^\s]{5,}").unwrap(),
-            label: "Windows path",
-        },
-        SecretPattern {
-            regex: Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+").unwrap(),
-            label: "IP:port",
-        },
+        (
+            Regex::new(r"/(?:Users|home|etc)/[^\s]{5,}").unwrap(),
+            "File path",
+        ),
+        (Regex::new(r"[A-Z][:\\]/[^\s]{5,}").unwrap(), "Windows path"),
+        (
+            Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+").unwrap(),
+            "IP:port",
+        ),
     ]
 });
+
+/// The label a redaction placeholder shows for an SDK secret kind.
+fn secret_label(kind: &str) -> &'static str {
+    match kind {
+        "api_key" => "API key",
+        "slack_token" => "Slack token",
+        "github_token" => "GitHub token",
+        "aws_access_key" => "AWS key",
+        "bearer_token" => "Bearer token",
+        "connection_string" => "Connection string",
+        "private_key" => "Private key",
+        "google_api_key" => "Google API key",
+        _ => "Secret",
+    }
+}
+
+/// Every redaction pattern with its label: the SDK's secret shapes first,
+/// then the privacy shapes.
+fn redaction_patterns() -> impl Iterator<Item = (&'static Regex, &'static str)> {
+    aidaemon_policies::secret_patterns()
+        .iter()
+        .map(|(kind, regex)| (regex, secret_label(kind)))
+        .chain(
+            PRIVACY_PATTERNS
+                .iter()
+                .map(|(regex, label)| (regex, *label)),
+        )
+}
 
 /// Sanitize external content by stripping injection patterns and invisible characters.
 pub fn sanitize_external_content(content: &str) -> String {
@@ -478,11 +477,11 @@ pub fn sanitize_output(response: &str) -> (String, bool) {
     let mut result = response.to_string();
     let mut had_redactions = false;
 
-    for pattern in SECRET_PATTERNS.iter() {
-        if pattern.regex.is_match(&result) {
-            result = pattern.regex.replace_all(&result, "[REDACTED]").to_string();
+    for (regex, label) in redaction_patterns() {
+        if regex.is_match(&result) {
+            result = regex.replace_all(&result, "[REDACTED]").to_string();
             had_redactions = true;
-            tracing::warn!("Output sanitization: redacted {} pattern", pattern.label);
+            tracing::warn!("Output sanitization: redacted {} pattern", label);
         }
     }
 
@@ -500,13 +499,10 @@ pub fn wrap_untrusted_output(tool_name: &str, output: &str) -> String {
 /// Unlike `sanitize_output`, this replaces each match with a label like `[REDACTED:API key]`.
 pub fn redact_secrets(text: &str) -> String {
     let mut result = text.to_string();
-    for pattern in SECRET_PATTERNS.iter() {
-        if pattern.regex.is_match(&result) {
-            let replacement = format!("[REDACTED:{}]", pattern.label);
-            result = pattern
-                .regex
-                .replace_all(&result, replacement.as_str())
-                .to_string();
+    for (regex, label) in redaction_patterns() {
+        if regex.is_match(&result) {
+            let replacement = format!("[REDACTED:{label}]");
+            result = regex.replace_all(&result, replacement.as_str()).to_string();
         }
     }
     result
@@ -1055,6 +1051,21 @@ mod tests {
         let input = "Connect to postgres://admin:pass@host:5432/db";
         let result = redact_secrets(input);
         assert!(result.contains("[REDACTED:Connection string]"));
+    }
+
+    #[test]
+    fn redaction_uses_every_sdk_secret_shape() {
+        // Shapes only the SDK list had before the lists were merged.
+        let input = "pat=github_pat_abcdefghijklmnopqrstuvwxyz0123 \
+                     google=AIzaabcdefghijklmnopqrstuvwxyz0123456789";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED:GitHub token]"), "{result}");
+        assert!(result.contains("[REDACTED:Google API key]"), "{result}");
+        assert!(!result.contains("github_pat_"), "{result}");
+        // Every SDK kind has a label of its own.
+        for (kind, _) in aidaemon_policies::secret_patterns() {
+            assert_ne!(secret_label(kind), "Secret", "{kind}");
+        }
     }
 
     #[test]

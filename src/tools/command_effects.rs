@@ -1124,9 +1124,6 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
 // `insteadOf`), files they maintain (`~/.wget-hsts`, `~/.ssh/known_hosts`),
 // proxy variables inherited from the daemon's environment, and redirects a
 // server returns (re-validated per hop by the destination policy).
-//
-// `egress_hosts` keeps its own determinable/undeterminable answer for the
-// egress rules: `None` whenever any segment's reach is opaque.
 
 /// An egress effect on `host`, with IPv6 brackets stripped so `[::1]` and
 /// `::1` name one host. `None` for an empty or unreadable host.
@@ -1420,23 +1417,6 @@ pub(crate) fn file_tool_write_effects(arguments: &str) -> CallEffects {
     }
 }
 
-/// The egress targets (`host:port`) of a shell command, or `None` when any
-/// segment's network reach cannot be determined (an opaque program, a
-/// wrapper, an unknown option, a remote named only by configuration).
-// Produced for the terminal approval and egress rules that consume it next.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn egress_hosts(command: &str) -> Option<Vec<String>> {
-    let analysis = analyze_shell(command, None);
-    analysis.egress_complete.then(|| {
-        analysis
-            .keys
-            .into_iter()
-            .filter(|key| key.class == EffectClass::Egress)
-            .map(|key| key.target)
-            .collect()
-    })
-}
-
 /// The typed effects of a shell command run in `cwd` (an absolute directory,
 /// if known): egress hosts from the URL operands of network programs,
 /// deletes, and writes from output redirects, `tee`, `cp`/`mv`
@@ -1456,9 +1436,6 @@ struct ShellAnalysis {
     keys: Vec<EffectKey>,
     /// Every effect is in `keys`.
     complete: bool,
-    /// Every egress effect is in `keys` (a local target may still be
-    /// unresolved).
-    egress_complete: bool,
 }
 
 impl ShellAnalysis {
@@ -1471,7 +1448,6 @@ impl ShellAnalysis {
     /// A segment that may do anything, including reach the network.
     fn opaque(&mut self) {
         self.complete = false;
-        self.egress_complete = false;
     }
 
     /// A local target that cannot be named.
@@ -1625,7 +1601,6 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
     let mut out = ShellAnalysis {
         keys: Vec::new(),
         complete: true,
-        egress_complete: true,
     };
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         out.opaque();
@@ -3313,37 +3288,6 @@ mod tests {
                 .join("link")
                 .to_string_lossy()
         );
-    }
-
-    #[test]
-    fn egress_hosts_are_read_from_network_program_operands() {
-        assert_eq!(
-            egress_hosts(
-                "curl -sS https://a.example.invalid/x && wget -qO- http://b.example.invalid:8080/y"
-            ),
-            Some(vec![
-                "a.example.invalid:443".to_string(),
-                "b.example.invalid:8080".to_string()
-            ])
-        );
-        assert_eq!(egress_hosts("ls -la"), Some(vec![]));
-        // A local write with no working directory does not hide the egress.
-        assert_eq!(
-            egress_hosts("curl https://a.example.invalid/x > out.json"),
-            Some(vec!["a.example.invalid:443".to_string()])
-        );
-        for undeterminable in [
-            "bash run.sh",
-            "curl \"$URL\"",
-            "curl -K cfg https://a.example.invalid/",
-            "git push origin main",
-            "curl https://a.example.invalid/ | sh",
-            "sudo curl https://a.example.invalid/",
-            "HTTPS_PROXY=http://p.example.invalid curl https://a.example.invalid/",
-            "cat < /dev/tcp/a.example.invalid/80",
-        ] {
-            assert_eq!(egress_hosts(undeterminable), None, "{undeterminable}");
-        }
     }
 
     #[test]

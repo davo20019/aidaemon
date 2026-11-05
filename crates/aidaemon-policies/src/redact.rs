@@ -15,9 +15,10 @@ pub(crate) const MIN_LITERAL_LEN: usize = 6;
 /// Built-in patterns cover common credential *shapes*: OpenAI/Anthropic
 /// style `sk-...` keys, GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`,
 /// `ghr_`, `github_pat_`), AWS access key ids (`AKIA`/`ASIA`), Slack tokens
-/// (`xox?-`), Google API keys (`AIza...`), `Bearer` tokens and PEM private
-/// key blocks. Add exact values with [`Redactor::secret`] (for example the
-/// API keys from your own config).
+/// (`xox?-`), Google API keys (`AIza...`), `Bearer` tokens, PEM private
+/// key blocks and database or broker URLs that carry a password. Add exact
+/// values with [`Redactor::secret`] (for example the API keys from your own
+/// config).
 ///
 /// Only `ToolOutput::content` changes. Receipts are final before
 /// `after_tool` runs, and this hook never edits them; keep secrets out of
@@ -52,6 +53,11 @@ pub fn secret_patterns() -> &'static [(&'static str, Regex)] {
             ("aws_access_key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
             ("slack_token", r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
             ("google_api_key", r"\bAIza[0-9A-Za-z_\-]{35}"),
+            // A database or broker URL that carries a password.
+            (
+                "connection_string",
+                r"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]*:[^\s/@]+@[^\s]+",
+            ),
         ];
         raw.iter()
             .map(|(kind, re)| (*kind, Regex::new(re).expect("built-in pattern compiles")))
@@ -172,5 +178,19 @@ mod tests {
         let r = Redactor::new();
         let text = "task-sk-1 and the word bearer alone, AKIA123";
         assert_eq!(r.redact(text), text);
+    }
+
+    #[test]
+    fn connection_strings_with_credentials_are_redacted() {
+        let r = Redactor::new();
+        let out = r.redact(
+            "db=postgres://admin:synthetic-pass@db.example.invalid:5432/app and \
+             cache=redis://:synthetic-pass@cache.example.invalid:6379",
+        );
+        assert!(!out.contains("synthetic-pass"), "{out}");
+        assert!(out.contains("[REDACTED:connection_string]"), "{out}");
+        // Without a password there is no credential to leak.
+        let plain = "postgres://db.example.invalid:5432/app";
+        assert_eq!(r.redact(plain), plain);
     }
 }
