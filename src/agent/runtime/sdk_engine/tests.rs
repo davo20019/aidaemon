@@ -2407,7 +2407,7 @@ async fn http_request_with_owner_credentials_is_egress_even_for_get() {
 }
 
 #[tokio::test]
-async fn bridged_tool_annotations_follow_call_annotations() {
+async fn bridged_tool_annotations_follow_call_annotations_in() {
     use aidaemon_core::Tool as _;
     let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
     let (calls, _rx) = mpsc::channel(1);
