@@ -1,12 +1,14 @@
 //! Secret redaction as an `after_tool` hook.
 
+use std::sync::OnceLock;
+
 use aidaemon_core::{Hook, HookContext, Receipt, ToolOutput};
 use async_trait::async_trait;
 use regex::Regex;
 
 /// Literal secrets shorter than this are ignored: redacting every `abc`
 /// would destroy output without protecting anything.
-const MIN_LITERAL_LEN: usize = 6;
+pub(crate) const MIN_LITERAL_LEN: usize = 6;
 
 /// Replaces secrets in tool output before the model sees it.
 ///
@@ -32,8 +34,12 @@ impl Default for Redactor {
     }
 }
 
-impl Redactor {
-    pub fn new() -> Self {
+/// The built-in secret shapes, as `(kind, pattern)`. [`Redactor`] hides
+/// them in tool output and [`crate::egress::EgressGuard`] refuses outbound
+/// calls that carry them; both use this one list.
+pub fn secret_patterns() -> &'static [(&'static str, Regex)] {
+    static PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
         let raw: &[(&'static str, &str)] = &[
             (
                 "private_key",
@@ -47,13 +53,27 @@ impl Redactor {
             ("slack_token", r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
             ("google_api_key", r"\bAIza[0-9A-Za-z_\-]{35}"),
         ];
+        raw.iter()
+            .map(|(kind, re)| (*kind, Regex::new(re).expect("built-in pattern compiles")))
+            .collect()
+    })
+}
+
+impl Redactor {
+    pub fn new() -> Self {
         Self {
-            patterns: raw
-                .iter()
-                .map(|(kind, re)| (*kind, Regex::new(re).expect("built-in pattern compiles")))
-                .collect(),
+            patterns: secret_patterns().to_vec(),
             literals: Vec::new(),
         }
+    }
+
+    /// The `(kind, pattern)` sources in use, for tests.
+    #[cfg(test)]
+    pub(crate) fn pattern_sources(&self) -> Vec<(&'static str, &str)> {
+        self.patterns
+            .iter()
+            .map(|(kind, re)| (*kind, re.as_str()))
+            .collect()
     }
 
     /// Also redact this exact value wherever it appears.

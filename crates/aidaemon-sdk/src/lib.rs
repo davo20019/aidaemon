@@ -23,14 +23,17 @@
 //! # #[cfg(all(feature = "providers", feature = "tools", feature = "policies"))]
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use aidaemon_sdk::prelude::*;
+//! use aidaemon_sdk::{Authority, AuthorityHook};
 //!
 //! let workspace = tools::Workspace::new(".")?;
 //! let mut builder = Agent::builder("helper")
 //!     .model("claude-sonnet-5-5")
 //!     .instructions("You maintain this repository. Verify changes with tests.")
 //!     .provider(providers::Anthropic::builder().api_key("<key>").build()?)
-//!     .hook(policies::ApprovalPolicy::new(policies::ApprovalMode::DestructiveOnly))
+//!     .hook(AuthorityHook::new(Authority::full()))
 //!     .hook(policies::ScopeGuard::new([workspace.root()]))
+//!     .hook(policies::EgressGuard::new())
+//!     .hook(policies::ApprovalPolicy::new(policies::ApprovalMode::DestructiveOnly))
 //!     .hook(policies::UntrustedOutput::default());
 //! for tool in tools::default_tools(workspace) {
 //!     builder = builder.tool_arc(tool);

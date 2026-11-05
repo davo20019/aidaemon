@@ -14,13 +14,14 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use aidaemon_sdk::policies::{
-    ApprovalMode, ApprovalPolicy, ContextWindow, ProjectInstructions, ReceiptCompletionCheck,
-    Redactor, Requirement, ScopeGuard, UntrustedOutput,
+    ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, ProjectInstructions,
+    ReceiptCompletionCheck, Redactor, Requirement, ScopeGuard, UntrustedOutput,
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
 use aidaemon_sdk::store::SqliteStore;
 use aidaemon_sdk::tools::{default_tools, Workspace};
+use aidaemon_sdk::{Authority, AuthorityHook};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,8 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .hook(ProjectInstructions::discover(workspace.root())?)
         .hook(ContextWindow::new(120_000))
-        .hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))
+        // The owner of this example grants full authority; the approval
+        // policy asks before destructive actions.
+        .hook(AuthorityHook::new(Authority::full()))
         .hook(ScopeGuard::new([workspace.root()]))
+        .hook(EgressGuard::new())
+        .hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))
         .hook(Redactor::default())
         .hook(UntrustedOutput::default())
         .hook(ReceiptCompletionCheck::new([
