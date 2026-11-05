@@ -1409,12 +1409,12 @@ async fn mcp_tool_is_offered_and_runs_on_sdk_path() {
 }
 
 /// Every kernel hook judges a bridged MCP call: a read-only session refuses
-/// a mutating one, the egress guard refuses a secret in an open-world one,
+/// it even when the server hints it is read-only, the egress guard refuses a secret in an open-world one,
 /// and after a decline a call with unknown effects is asked again.
 #[tokio::test]
 async fn mcp_tool_call_passes_kernel_hooks() {
     // The chat turns read-only mid-run: the kernel's authority hook refuses
-    // the mutating MCP tool, the read-only one still runs.
+    // every MCP tool, including one whose server hints it is read-only.
     let state_cell = Arc::new(std::sync::OnceLock::new());
     let (harness, approver) = mcp_approvals_harness_with(
         vec![
@@ -1438,7 +1438,10 @@ async fn mcp_tool_call_passes_kernel_hooks() {
         results[1].contains("[AUTHORITY BLOCKED] `fake__no_annotations`"),
         "{results:?}"
     );
-    assert!(results[2].contains("synthetic read"), "{results:?}");
+    assert!(
+        results[2].contains("[AUTHORITY BLOCKED] `fake__echo`"),
+        "{results:?}"
+    );
     assert_eq!(approver.card_count(), 0);
 
     // A secret in an open-world MCP call never leaves.
