@@ -1,8 +1,10 @@
 # aidaemon-core: design sketch
 
-Status: **experimental**. Not published, not used by the daemon yet. The
-kernel and the SDK crates around it are implemented and tested; the daemon
-still runs its own loop (see `PLAN.md`, Phase 7).
+Status: **experimental**, not published. The kernel is the daemon's only
+agent loop (`PLAN.md`, Phase 7). Most other SDK crates (tools, channels,
+providers, MCP, store, agents) are not yet used by the daemon, which still
+has its own larger copies; making the daemon a thin composition of the SDK
+crates is `PLAN.md`, Phase 8.
 
 The reasoning behind each choice comes from the Harness Field Guide, a survey
 of 14 harness concepts across Claude Code, Codex, OpenHands, SWE-agent, Aider,

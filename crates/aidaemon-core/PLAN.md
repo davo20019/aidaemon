@@ -83,7 +83,7 @@ SQLite store with versioned migrations; crash recovery without repeating
 non-idempotent calls, tested by killing a run mid-tool and reopening the
 database.
 
-### Phase 4: measurement  ← Next up
+### Phase 4: measurement
 - [x] `aidaemon-eval`: scenarios, trajectory assertions, N-of-M reports,
       baseline comparison, 5 scripted scenarios.
 - [ ] Live runs: run `crates/aidaemon-eval/scenarios` and the
@@ -175,6 +175,59 @@ adapters, tested against local mock servers.
       by that run budget alone; the task budget no longer stacks on top
       (`sdk_engine/budgets.rs`, `task_token_budget`).
 - [ ] Whole-branch review, then live N-of-M runs on goals and mandates.
+
+### Phase 8: the daemon is built on the SDK  ← Next up
+
+Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
+never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
+in `aidaemon-policies`, extending what is there (`ApprovalPolicy`,
+`Redactor`, `shell`) rather than adding parallel types. The daemon supplies
+only facts specific to it (its tools' effects, the owner's rules, the
+channel that asks the owner) and deletes the logic it duplicates.
+
+Where duplication comes from: the daemon uses `aidaemon-core`, and uses
+`aidaemon-policies` and `aidaemon-memory` only a little. It does not use
+`aidaemon-tools`, the channel crates, `aidaemon-providers`, `aidaemon-mcp`,
+`aidaemon-store-sqlite` or `aidaemon-agents`, because it has larger copies
+of each in `src/`.
+
+Direction (owner): promote the daemon's implementations into the SDK
+crates, replacing the thinner SDK versions, one domain per plan.
+
+Order:
+- [ ] 8.1 Authority Phase 3a: typed call effects, owner approvals as typed
+      kernel interrupts, a decline binds the run across tools (kernel
+      run-loop invariant), and `aidaemon_policies::EgressGuard` sharing
+      `Redactor`'s patterns. Plan:
+      `docs/superpowers/plans/2026-11-04-authority-phase-3a-effects-and-approvals.md`
+      (local; `docs/` is gitignored).
+- [ ] 8.2 Tool contract. Decide where each fact of the daemon's tool
+      trait (27 methods: call semantics, receipt kinds, durable replay,
+      owner control plane, output trust, ...) lives: the kernel `Tool`, an
+      SDK extension trait in `aidaemon-tools`, or SDK hooks. Tools get a
+      typed context with handles to config and state services, instead of
+      reading daemon config (22 tool files) and state (21) directly. Add a
+      typed way for a tool result to end a run (`ToolOutput::finish`),
+      replacing the `TERMINAL_REPLY_STOP` / `end_with` workaround, so the
+      memory writer no longer skips those runs.
+- [ ] 8.3 The dispatcher bridge becomes SDK hooks. Today every call goes
+      back over a channel to `src/agent/runtime/sdk_engine/tool_calls.rs`,
+      which does about ten steps per call: idempotency and replay, ledger
+      events, result fitting, instruction deferral, the mandate gate,
+      `send_file` dedupe and more. Until these are hooks, the daemon is not
+      really built on the SDK.
+- [ ] 8.4 Tools converge into `aidaemon-tools`.
+- [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
+      scope, sensitive paths, SSRF, destructive deletes, the remaining
+      in-tool approvals, one output-wrapping layer.
+- [ ] 8.6 Authority Phase 3d: children assembled on request through
+      `AgentBuilder`.
+- [ ] 8.7 Authority Phase 4 (end check, typed final outcome, budgets) and
+      Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
+      default memory instead of the opt-in `sdk-memory` feature; the
+      assessor is retired).
+- [ ] 8.8 Channels, providers, MCP and store, each promoted into its SDK
+      crate.
 
 ## Parallel track: fixes found in the daemon
 
