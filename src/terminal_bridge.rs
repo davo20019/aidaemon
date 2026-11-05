@@ -783,7 +783,8 @@ fn default_review_profiles() -> HashMap<String, ReviewProfile> {
             args: vec![
                 "exec".to_string(),
                 "--json".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
             ],
             timeout_secs: REVIEW_DEFAULT_TIMEOUT_SECS,
             max_output_chars: REVIEW_MAX_OUTPUT_CHARS,
@@ -795,7 +796,8 @@ fn default_review_profiles() -> HashMap<String, ReviewProfile> {
             command: "claude".to_string(),
             args: vec![
                 "-p".to_string(),
-                "--dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "plan".to_string(),
                 "--output-format".to_string(),
                 "json".to_string(),
             ],
@@ -807,12 +809,9 @@ fn default_review_profiles() -> HashMap<String, ReviewProfile> {
         "gemini".to_string(),
         ReviewProfile {
             command: "gemini".to_string(),
-            args: vec![
-                "--sandbox=false".to_string(),
-                "--yolo".to_string(),
-                "--output-format".to_string(),
-                "json".to_string(),
-            ],
+            // gemini has no read-only mode; without --yolo it cannot run
+            // mutating tools unattended.
+            args: vec!["--output-format".to_string(), "json".to_string()],
             timeout_secs: REVIEW_DEFAULT_TIMEOUT_SECS,
             max_output_chars: REVIEW_MAX_OUTPUT_CHARS,
         },
@@ -1012,6 +1011,18 @@ fn normalize_relay_session_id(raw: Option<&str>) -> Option<String> {
         return None;
     }
     Some(value.to_string())
+}
+
+/// Reviewers only read: whatever the profile says, auto-approve flags are
+/// removed (the prompt carries terminal replay text that may be injected).
+fn review_launch_args(reviewer: &str, args: &[String]) -> Vec<String> {
+    let mut args = args.to_vec();
+    // A flag that cannot be removed cannot be launched with; fail closed to
+    // an empty list rather than run with it.
+    if crate::tools::cli_agent::strip_permission_bypass_flags(&mut args, reviewer).is_err() {
+        return Vec::new();
+    }
+    normalize_review_profile_args(reviewer, &args)
 }
 
 fn normalize_review_profile_args(reviewer: &str, args: &[String]) -> Vec<String> {
@@ -2581,7 +2592,7 @@ async fn run_review_job(
         &format!("Running {} reviewer...", reviewer),
     );
 
-    let mut args = normalize_review_profile_args(&reviewer, &profile.args);
+    let mut args = review_launch_args(&reviewer, &profile.args);
     args.push(prompt);
     let timeout = Duration::from_secs(profile.timeout_secs.clamp(30, 30 * 60));
     let (status, raw_combined) = match run_streaming_capture_command(
@@ -7213,6 +7224,47 @@ mod tests {
             "fresh_start": "maybe",
         });
         assert!(!requested_fresh_start_from_client_hello(&frame));
+    }
+
+    #[test]
+    fn review_launch_args_never_contain_bypass_flags() {
+        use crate::tools::cli_agent::PERMISSION_BYPASS_FLAGS;
+        let has_bypass = |args: &[String]| {
+            args.iter().any(|a| {
+                PERMISSION_BYPASS_FLAGS.contains(&a.as_str())
+                    || a == "-y"
+                    || a == "--sandbox=false"
+                    || a == "--approval-mode=yolo"
+            })
+        };
+        for (name, profile) in default_review_profiles() {
+            let args = review_launch_args(&name, &profile.args);
+            assert!(!has_bypass(&args), "{name}: {args:?}");
+        }
+        // User-configured review profiles go through the same strip list.
+        let configured: Vec<String> = ["--yolo", "-y", "--sandbox=false", "--keep-synthetic"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let args = review_launch_args("gemini", &configured);
+        assert!(!has_bypass(&args), "{args:?}");
+        assert!(args.contains(&"--keep-synthetic".to_string()));
+        let claude = review_launch_args(
+            "claude",
+            &["-p".into(), "--dangerously-skip-permissions".into()],
+        );
+        assert!(!has_bypass(&claude), "{claude:?}");
+    }
+
+    #[test]
+    fn default_review_profiles_use_read_only_modes() {
+        let profiles = default_review_profiles();
+        let codex = review_launch_args("codex", &profiles["codex"].args);
+        assert!(codex.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        let claude = review_launch_args("claude", &profiles["claude"].args);
+        assert!(claude
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "plan"]));
     }
 
     #[test]
