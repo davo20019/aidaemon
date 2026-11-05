@@ -468,6 +468,14 @@ impl ManageGoalTasksTool {
 }
 
 impl crate::traits::ToolSemantics for ManageGoalTasksTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Management
     }

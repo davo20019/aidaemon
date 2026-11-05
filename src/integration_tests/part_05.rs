@@ -803,6 +803,13 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
     }
 
     impl crate::traits::ToolSemantics for CountingSendFileTool {
+        fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+            crate::traits::ToolDispatchFacts {
+                delivers_files: true,
+                ..Default::default()
+            }
+        }
+
         // Like the real `send_file`: its result is the daemon's own words.
         fn output_trust(
             &self,
@@ -943,6 +950,13 @@ async fn test_repeated_send_file_executes_once() {
     }
 
     impl crate::traits::ToolSemantics for CountingSendFileTool {
+        fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+            crate::traits::ToolDispatchFacts {
+                delivers_files: true,
+                ..Default::default()
+            }
+        }
+
         // Like the real `send_file`: its result is the daemon's own words.
         fn output_trust(
             &self,

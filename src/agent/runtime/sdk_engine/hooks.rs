@@ -42,9 +42,10 @@ impl sdk::Hook for LedgerStop {
 
 /// Whether `tool` with `arguments`, after the run's earlier `previous` calls,
 /// continues a same-tool loop: 8 consecutive calls
-/// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for versatile and
-/// research tools, 40 for `computer_use`; diverse arguments get the higher
-/// limit as a bonus, not a bypass.
+/// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for a tool whose `streak` is
+/// `Versatile` (versatile and research tools), 40 for a `Stepwise` one
+/// (computer use); diverse arguments get the higher limit as a bonus, not a
+/// bypass.
 /// `read_only` is the tool's typed annotation: a read-only streak in which
 /// every call has different arguments (paging through files, distinct
 /// lookups) observes something new each time, so it is progress, not a
@@ -54,6 +55,7 @@ pub(super) fn same_tool_loop(
     tool: &str,
     arguments: &Value,
     read_only: bool,
+    allowance: crate::traits::SameToolStreak,
 ) -> bool {
     let mut streak: Vec<&Value> = previous
         .iter()
@@ -63,20 +65,10 @@ pub(super) fn same_tool_loop(
         .collect();
     streak.push(arguments);
     let total = streak.len();
-    let computer_use = tool == "computer_use";
-    let versatile = matches!(
-        tool,
-        "read_file"
-            | "search_files"
-            | "manage_goal_tasks"
-            | "check_environment"
-            | "web_search"
-            | "web_fetch"
-            | "terminal"
-    );
-    let limit = if computer_use {
+    let stepwise = allowance == crate::traits::SameToolStreak::Stepwise;
+    let limit = if stepwise {
         40
-    } else if versatile {
+    } else if allowance == crate::traits::SameToolStreak::Versatile {
         crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8
     } else {
         crate::agent::MAX_CONSECUTIVE_SAME_TOOL
@@ -90,11 +82,11 @@ pub(super) fn same_tool_loop(
             unique.push(args);
         }
     }
-    if read_only && tool != "computer_use" && unique.len() == total {
+    if read_only && !stepwise && unique.len() == total {
         return false;
     }
     let diverse = unique.len() * 2 > total;
-    let diverse_limit = if computer_use {
+    let diverse_limit = if stepwise {
         40
     } else {
         crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8
@@ -111,6 +103,23 @@ pub(super) fn same_tool_loop(
 /// such as `terminal` types most calls read-only, and must stay limited.
 pub(super) struct SameToolLimit {
     pub(super) read_only_tools: std::collections::HashSet<String>,
+    /// Each tool's consecutive-call allowance, from its dispatch facts.
+    pub(super) streaks: std::collections::HashMap<String, crate::traits::SameToolStreak>,
+}
+
+/// Each tool's consecutive-call allowance (`dispatch_facts().same_tool_streak`).
+pub(super) fn same_tool_streaks<'a>(
+    tools: impl IntoIterator<Item = &'a Arc<dyn crate::traits::Tool>>,
+) -> std::collections::HashMap<String, crate::traits::SameToolStreak> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            (
+                tool.name().to_string(),
+                tool.dispatch_facts().same_tool_streak,
+            )
+        })
+        .collect()
 }
 
 /// Names of the tools that are read-only for every call.
@@ -141,6 +150,7 @@ impl sdk::Hook for SameToolLimit {
             &call.name,
             &call.arguments,
             self.read_only_tools.contains(&call.name),
+            self.streaks.get(&call.name).copied().unwrap_or_default(),
         ) {
             return sdk::ToolDecision::Allow;
         }
@@ -252,11 +262,11 @@ impl sdk::Tool for BridgedTool {
 
     /// The declared effects as the kernel's access manifest: egress
     /// targets as hosts, path effects as writes, and the terminal's command
-    /// line, given as `command` or `script` (so the approval policy's
-    /// catastrophic-command check sees it).
+    /// line of a `shell_command_line` tool, given as `command` or `script`
+    /// (so the approval policy's catastrophic-command check sees it).
     fn access(&self, arguments: &Value) -> sdk::AccessManifest {
         let mut manifest = sdk::AccessManifest::default();
-        if self.spec.name == "terminal" {
+        if self.tool.dispatch_facts().shell_command_line {
             for field in ["command", "script"] {
                 if let Some(text) = arguments
                     .get(field)

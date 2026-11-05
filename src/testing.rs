@@ -1324,6 +1324,7 @@ pub struct MockTool {
     available: bool,
     return_metadata: crate::traits::ToolCallMetadata,
     return_finish: Option<aidaemon_core::Finish>,
+    dispatch_facts: crate::traits::ToolDispatchFacts,
 }
 
 #[allow(dead_code)]
@@ -1337,7 +1338,14 @@ impl MockTool {
             available: true,
             return_metadata: Default::default(),
             return_finish: None,
+            dispatch_facts: Default::default(),
         }
+    }
+
+    /// State these dispatch facts, as the real tool of this name does.
+    pub fn with_dispatch_facts(mut self, facts: crate::traits::ToolDispatchFacts) -> Self {
+        self.dispatch_facts = facts;
+        self
     }
 
     /// End the run on this tool's call, as a tool's own typed finish.
@@ -1405,6 +1413,10 @@ impl Tool for MockTool {
 impl crate::traits::ToolSemantics for MockTool {
     fn tool_role(&self) -> ToolRole {
         self.role
+    }
+
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        self.dispatch_facts
     }
 
     fn is_available(&self) -> bool {

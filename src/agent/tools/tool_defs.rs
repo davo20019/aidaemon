@@ -297,34 +297,22 @@ impl Agent {
             })
             .collect();
 
-        // Essential tools that must always be available regardless of profile/approval filters.
-        // Without these, the agent can read files but never write them — rendering coding useless.
-        // Memory tools are included because the agent's core personal-assistant function
-        // depends on being able to store and manage facts/people at any risk level.
-        // Web tools are essential because a personal assistant must be able to search the web
-        // and fetch URLs — without these, the model resorts to terminal curl/grep workarounds.
-        const ESSENTIAL_TOOLS: &[&str] = &[
-            "write_file",
-            "edit_file",
-            "terminal",
-            "remember_fact",
-            "manage_memories",
-            "set_reminder",
-            "manage_mandates",
-            "search_history",
-            "manage_people",
-            "web_search",
-            "web_fetch",
-            "http_request",
-            "send_file",
-        ];
-        let role_required_tools: &[&str] = match self.role() {
-            // Task leads must retain their delegation surface after policy pruning.
-            AgentRole::TaskLead => &["spawn_agent", "cli_agent", "manage_goal_tasks"],
-            _ => &[],
-        };
-        let is_policy_essential =
-            |name: &str| ESSENTIAL_TOOLS.contains(&name) || role_required_tools.contains(&name);
+        // Essential tools (`dispatch_facts().always_offered`) survive every
+        // profile and approval filter: without them the agent can read files
+        // but never write them, cannot keep memory or reach the web (the
+        // model then resorts to terminal curl/grep workarounds). Task leads
+        // also keep their delegation surface (`task_lead_delegation`).
+        let task_lead = matches!(self.role(), AgentRole::TaskLead);
+        let essential: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .filter(|tool| {
+                let facts = tool.dispatch_facts();
+                facts.always_offered || (task_lead && facts.task_lead_delegation)
+            })
+            .map(|tool| tool.name())
+            .collect();
+        let is_policy_essential = |name: &str| essential.contains(name);
 
         // Stable prioritization: essential tools first, then read-only + idempotent.
         // Essential tools must sort before truncation cuts them off.
@@ -839,9 +827,27 @@ mod tests {
 
     #[tokio::test]
     async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
-        let mut harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
+        // The delegation surface, stating the fact the real tools state.
+        let delegation = |name: &str| -> Arc<dyn crate::traits::Tool> {
+            Arc::new(
+                crate::testing::MockTool::new(name, "delegation", "ok").with_dispatch_facts(
+                    crate::traits::ToolDispatchFacts {
+                        task_lead_delegation: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+        };
+        let mut harness = setup_full_stack_test_agent_with_extra_tools(
+            MockProvider::new(),
+            vec![
+                delegation("manage_goal_tasks"),
+                delegation("cli_agent"),
+                delegation("spawn_agent"),
+            ],
+        )
+        .await
+        .unwrap();
         harness.agent.set_test_task_lead_mode();
 
         let defs = vec![

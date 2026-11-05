@@ -1367,6 +1367,13 @@ impl Tool for ComputerUseTool {
 
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for ComputerUseTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            same_tool_streak: crate::traits::SameToolStreak::Stepwise,
+            ..Default::default()
+        }
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let Ok(args) = serde_json::from_str::<Value>(arguments) else {
             return ToolCallSemantics::default();

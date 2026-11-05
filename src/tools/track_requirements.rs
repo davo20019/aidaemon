@@ -676,6 +676,13 @@ impl TrackRequirementsTool {
 }
 
 impl crate::traits::ToolSemantics for TrackRequirementsTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            requirement_checklist: true,
+            ..Default::default()
+        }
+    }
+
     fn canonicalize_arguments(
         &self,
         arguments: &str,

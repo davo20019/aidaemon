@@ -7916,6 +7916,9 @@ impl crate::traits::ToolSemantics for TerminalTool {
         crate::traits::ToolDispatchFacts {
             runs_as_judged: true,
             keeps_own_grants: true,
+            shell_command_line: true,
+            always_offered: true,
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
             ..Default::default()
         }
     }

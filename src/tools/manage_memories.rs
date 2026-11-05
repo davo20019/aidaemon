@@ -453,6 +453,13 @@ impl Tool for ManageMemoriesTool {
 }
 
 impl crate::traits::ToolSemantics for ManageMemoriesTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         const ACTIONS_REQUIRING_GOAL_ID: &[&str] = &[
             "add_schedule",

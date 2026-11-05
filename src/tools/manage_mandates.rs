@@ -2636,6 +2636,13 @@ impl ManageMandatesTool {
 }
 
 impl crate::traits::ToolSemantics for ManageMandatesTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn owner_control_plane(&self) -> bool {
         true
     }

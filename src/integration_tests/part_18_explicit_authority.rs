@@ -557,6 +557,13 @@ impl crate::traits::Tool for OfferedSpawnAgent {
 }
 
 impl crate::traits::ToolSemantics for OfferedSpawnAgent {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
     fn output_trust(
         &self,
         arguments: &str,
@@ -1161,6 +1168,13 @@ impl crate::traits::Tool for SpawnRecorder {
 }
 
 impl crate::traits::ToolSemantics for SpawnRecorder {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,

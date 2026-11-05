@@ -4250,6 +4250,13 @@ impl Tool for CliAgentTool {
 }
 
 impl crate::traits::ToolSemantics for CliAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            ..Default::default()
+        }
+    }
+
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
             return Ok(());

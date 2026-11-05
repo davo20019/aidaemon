@@ -508,6 +508,13 @@ impl Tool for SearchHistoryTool {
 }
 
 impl crate::traits::ToolSemantics for SearchHistoryTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     /// Retained messages include other people's (group chats, guests) and
     /// assistant turns that echoed pages: someone else's words.
     fn output_trust(

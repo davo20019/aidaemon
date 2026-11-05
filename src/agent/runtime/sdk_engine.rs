@@ -1087,6 +1087,7 @@ impl Agent {
             authority: authority_hook,
             same_tool: SameToolLimit {
                 read_only_tools: read_only_tool_names(self.tools.iter()),
+                streaks: same_tool_streaks(self.tools.iter()),
             },
             ledger: LedgerStop {
                 calls: calls_tx.clone(),

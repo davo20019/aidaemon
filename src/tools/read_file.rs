@@ -89,6 +89,13 @@ impl Tool for ReadFileTool {
 }
 
 impl crate::traits::ToolSemantics for ReadFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }

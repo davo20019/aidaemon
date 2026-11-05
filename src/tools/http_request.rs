@@ -2145,6 +2145,13 @@ impl Tool for HttpRequestTool {
 
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for HttpRequestTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     /// H7: a trusted scheduled session or a mandate run (whose exact action
     /// grant the dispatcher checks) needs no card; otherwise a GET, HEAD or
     /// OPTIONS without a body or override header runs and anything else

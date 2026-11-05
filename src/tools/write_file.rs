@@ -184,6 +184,13 @@ impl Tool for WriteFileTool {
 
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for WriteFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }

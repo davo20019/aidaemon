@@ -846,6 +846,14 @@ fn background_spawn_outcome(mission: &str) -> ToolCallOutcome {
 }
 
 impl crate::traits::ToolSemantics for SpawnAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

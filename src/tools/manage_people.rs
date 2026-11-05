@@ -145,6 +145,13 @@ impl Tool for ManagePeopleTool {
 }
 
 impl crate::traits::ToolSemantics for ManagePeopleTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,

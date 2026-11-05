@@ -452,6 +452,13 @@ impl Tool for RememberFactTool {
 }
 
 impl crate::traits::ToolSemantics for RememberFactTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }

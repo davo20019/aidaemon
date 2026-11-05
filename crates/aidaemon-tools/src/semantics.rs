@@ -96,6 +96,44 @@ pub struct ToolDispatchFacts {
     /// stores, consulted by its own ladder (the terminal's command
     /// prefixes), instead of the kernel's session grants.
     pub keeps_own_grants: bool,
+    /// The call's `command` or `script` is a shell command line, which the
+    /// kernel's access manifest carries so the approval policy's
+    /// catastrophic-command check sees it (the terminal).
+    pub shell_command_line: bool,
+    /// The tool survives every profile and approval pruning of the offered
+    /// tools: without it the agent cannot do its core work (write and edit
+    /// files, run commands, keep memory, reach the web, deliver files).
+    pub always_offered: bool,
+    /// A task lead keeps the tool through pruning: it is its delegation
+    /// surface (`spawn_agent`, `cli_agent`, `manage_goal_tasks`).
+    pub task_lead_delegation: bool,
+    /// How long a run may call the tool consecutively before the
+    /// same-tool guard treats it as a loop.
+    pub same_tool_streak: SameToolStreak,
+    /// The tool delivers a file to the user; the same file and caption go
+    /// out once per task.
+    pub delivers_files: bool,
+    /// The tool spawns child agents, which inherit the turn's authority as
+    /// it is when the call runs.
+    pub spawns_child_agents: bool,
+    /// The tool is the executor's requirement checklist: the status line
+    /// shows the checklist, and its items become ledger expectations.
+    pub requirement_checklist: bool,
+}
+
+/// The consecutive-call allowance of a tool (see
+/// [`ToolDispatchFacts::same_tool_streak`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SameToolStreak {
+    /// The default allowance.
+    #[default]
+    Standard,
+    /// A versatile or research tool whose calls naturally repeat (reading
+    /// files, searching, running commands): a longer allowance.
+    Versatile,
+    /// A step-wise tool driven one small action at a time (computer use):
+    /// the longest allowance, and no exemption for distinct arguments.
+    Stepwise,
 }
 
 /// Safety and execution metadata for policy-driven tool selection.

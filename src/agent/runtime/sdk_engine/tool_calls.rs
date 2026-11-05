@@ -97,7 +97,7 @@ pub(super) fn canonicalize_call(
     raw: &Value,
     facts: &CanonFacts<'_>,
 ) -> crate::agent::approvals::CanonicalCall {
-    let terminal = name == "terminal";
+    let terminal = tool.is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
     let mut call = if terminal {
         crate::agent::approvals::CanonicalCall::stripped(tool, raw)
     } else {
@@ -395,6 +395,18 @@ impl Agent {
             .or_else(|| scope.mcp_tools.iter().find(|tool| tool.name() == name))
     }
 
+    /// The dispatch facts of the tool this turn runs under `name` (nothing
+    /// special for an unknown tool).
+    pub(super) fn turn_tool_facts(
+        &self,
+        scope: &TurnScope<'_>,
+        name: &str,
+    ) -> crate::traits::ToolDispatchFacts {
+        self.turn_tool(scope, name)
+            .map(|tool| tool.dispatch_facts())
+            .unwrap_or_default()
+    }
+
     /// Judge the call's access manifest against the task's filesystem
     /// authority. `None`: in scope (or not a known tool).
     pub(super) fn sdk_scope_check(
@@ -586,9 +598,12 @@ impl Agent {
             }
             _ => None,
         };
+        // How the dispatcher treats this tool (typed, never by name).
+        let facts = self.turn_tool_facts(scope, &request.name);
         // A child spawned by this call inherits what this turn has now.
-        let turn_authority =
-            (request.name == "spawn_agent").then(|| self.turn_authority_for_children(scope));
+        let turn_authority = facts
+            .spawns_child_agents
+            .then(|| self.turn_authority_for_children(scope));
         // The session's mode as of now (`/readonly` can arrive mid-turn).
         let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
         let mut ctx = ToolExecCtx {
@@ -726,7 +741,8 @@ impl Agent {
         }
 
         // The same file and caption go out once per task.
-        let send_file_key = (request.name == "send_file")
+        let send_file_key = facts
+            .delivers_files
             .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
             .flatten();
         if let Some(key) = &send_file_key {
@@ -777,7 +793,7 @@ impl Agent {
 
         // User-facing activity labels for the channel's status line;
         // `track_requirements` shows its checklist instead.
-        if request.name != "track_requirements" {
+        if !facts.requirement_checklist {
             let (name, summary) = crate::tools::sanitize::user_facing_tool_activity(
                 &request.name,
                 &crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments),
@@ -1061,7 +1077,7 @@ impl Agent {
             }
         }
         if let Some(status_tx) = &scope.status_tx {
-            let update = if request.name == "track_requirements" {
+            let update = if facts.requirement_checklist {
                 crate::agent::tool_execution::parse_checklist_from_result(&output)
                     .map(|text| StatusUpdate::Checklist { text })
             } else {
@@ -1141,7 +1157,7 @@ impl Agent {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a tool result");
         }
         // The executor's own checklist becomes ledger expectations.
-        if request.name == "track_requirements" && !failed {
+        if facts.requirement_checklist && !failed {
             if let Some(declared) =
                 crate::tools::track_requirements::executor_expectations_from_checklist_arguments(
                     scope.task_id,

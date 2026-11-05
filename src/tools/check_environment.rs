@@ -167,6 +167,13 @@ impl Tool for CheckEnvironmentTool {
 }
 
 impl crate::traits::ToolSemantics for CheckEnvironmentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }

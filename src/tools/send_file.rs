@@ -416,6 +416,14 @@ impl SendFileTool {
 }
 
 impl crate::traits::ToolSemantics for SendFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            delivers_files: true,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

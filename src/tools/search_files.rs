@@ -259,6 +259,13 @@ impl SearchFilesTool {
 }
 
 impl crate::traits::ToolSemantics for SearchFilesTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }

@@ -1259,6 +1259,7 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
     };
     let hook = SameToolLimit {
         read_only_tools: Default::default(),
+        streaks: Default::default(),
     };
     match hook.before_tool(&ctx, &call, &info).await {
         sdk::ToolDecision::Deny { reason } => {
@@ -1297,13 +1298,15 @@ fn same_tool_streaks_follow_the_guard_limits() {
         &calls("remember_fact", 6, false),
         "remember_fact",
         &same,
-        false
+        false,
+        crate::traits::SameToolStreak::Standard
     ));
     assert!(same_tool_loop(
         &calls("remember_fact", 7, false),
         "remember_fact",
         &same,
-        false
+        false,
+        crate::traits::SameToolStreak::Standard
     ));
     // Diverse arguments earn the +8 bonus, not a bypass.
     let next = serde_json::json!({ "i": 99 });
@@ -1311,55 +1314,74 @@ fn same_tool_streaks_follow_the_guard_limits() {
         &calls("remember_fact", 7, true),
         "remember_fact",
         &next,
-        false
+        false,
+        crate::traits::SameToolStreak::Standard
     ));
     assert!(same_tool_loop(
         &calls("remember_fact", 15, true),
         "remember_fact",
         &next,
-        false
+        false,
+        crate::traits::SameToolStreak::Standard
     ));
     // Versatile and research tools start at 16.
     assert!(!same_tool_loop(
         &calls("read_file", 14, true),
         "read_file",
         &next,
-        false
+        false,
+        crate::traits::SameToolStreak::Versatile
     ));
     assert!(same_tool_loop(
         &calls("read_file", 15, true),
         "read_file",
         &next,
-        false
+        false,
+        crate::traits::SameToolStreak::Versatile
     ));
     // computer_use is bounded at 40.
     assert!(!same_tool_loop(
         &calls("computer_use", 38, false),
         "computer_use",
         &same,
-        false
+        false,
+        crate::traits::SameToolStreak::Stepwise
     ));
     assert!(same_tool_loop(
         &calls("computer_use", 39, false),
         "computer_use",
         &same,
-        false
+        false,
+        crate::traits::SameToolStreak::Stepwise
     ));
     // Another tool breaks the streak.
     let mut mixed = calls("remember_fact", 7, false);
     mixed.push(("system_info".to_string(), same.clone()));
-    assert!(!same_tool_loop(&mixed, "remember_fact", &same, false));
+    assert!(!same_tool_loop(
+        &mixed,
+        "remember_fact",
+        &same,
+        false,
+        crate::traits::SameToolStreak::Standard
+    ));
     // A read-only streak of distinct calls (paging) is progress at any
     // length; an exact repeat in it still counts toward the limit.
     assert!(!same_tool_loop(
         &calls("read_file", 40, true),
         "read_file",
         &next,
-        true
+        true,
+        crate::traits::SameToolStreak::Versatile
     ));
     let mut paging = calls("read_file", 15, true);
     paging.push(("read_file".to_string(), serde_json::json!({ "i": 3 })));
-    assert!(same_tool_loop(&paging, "read_file", &next, true));
+    assert!(same_tool_loop(
+        &paging,
+        "read_file",
+        &next,
+        true,
+        crate::traits::SameToolStreak::Versatile
+    ));
 }
 
 #[test]
@@ -1988,7 +2010,8 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
         &streak(40),
         "terminal",
         &next,
-        read_only.contains("terminal")
+        read_only.contains("terminal"),
+        same_tool_streaks(tools.iter())["terminal"]
     ));
 }
 
@@ -3102,6 +3125,13 @@ impl crate::traits::Tool for SpawnRecorder {
 }
 
 impl crate::traits::ToolSemantics for SpawnRecorder {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: true,
@@ -3667,6 +3697,7 @@ fn hook_order_is_pinned() {
         authority: sdk::AuthorityHook::new(sdk::Authority::full()),
         same_tool: SameToolLimit {
             read_only_tools: HashSet::new(),
+            streaks: Default::default(),
         },
         ledger: LedgerStop { calls },
         memory: vec![Arc::new(NoopMemoryHook)],
@@ -4175,4 +4206,56 @@ async fn dispatcher_keeps_the_judged_scope() {
     // The judged arguments are anchored where they were judged.
     assert_eq!(taken.call.arguments["working_dir"], project_dir.as_str());
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The dispatcher, the engine and the approval rules decide nothing by a
+/// tool's name: every special case is a typed fact the tool states about
+/// itself (`ToolSemantics::dispatch_facts`, `owner_approval_request`).
+#[test]
+fn no_name_keyed_dispatch_remains() {
+    let sources = [
+        ("tool_calls.rs", include_str!("tool_calls.rs")),
+        ("hooks.rs", include_str!("hooks.rs")),
+        ("sdk_engine.rs", include_str!("../sdk_engine.rs")),
+        ("approvals.rs", include_str!("../approvals.rs")),
+        ("tool_defs.rs", include_str!("../../tools/tool_defs.rs")),
+    ];
+    let names = [
+        "send_file",
+        "spawn_agent",
+        "track_requirements",
+        "terminal",
+        "http_request",
+        "manage_api",
+        "computer_use",
+        "read_file",
+        "search_files",
+        "manage_goal_tasks",
+        "check_environment",
+        "web_search",
+        "web_fetch",
+        "cli_agent",
+    ];
+    let mut found = Vec::new();
+    for (file, source) in sources {
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for name in names {
+            let quoted = format!("\"{name}\"");
+            for pattern in [
+                format!("== {quoted}"),
+                format!("!= {quoted}"),
+                format!("{quoted} =>"),
+                format!("{quoted} |"),
+                format!("| {quoted}"),
+            ] {
+                if flat.contains(&pattern) {
+                    found.push(format!("{file}: `{pattern}`"));
+                }
+            }
+        }
+        if flat.contains("ESSENTIAL_TOOLS") {
+            found.push(format!("{file}: ESSENTIAL_TOOLS name list"));
+        }
+    }
+    assert!(found.is_empty(), "name-keyed dispatch remains: {found:#?}");
 }

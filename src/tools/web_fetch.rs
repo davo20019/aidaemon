@@ -607,6 +607,14 @@ impl Tool for WebFetchTool {
 }
 
 impl crate::traits::ToolSemantics for WebFetchTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,

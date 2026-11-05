@@ -174,6 +174,13 @@ impl Tool for EditFileTool {
 }
 
 impl crate::traits::ToolSemantics for EditFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }

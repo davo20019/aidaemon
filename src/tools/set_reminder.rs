@@ -121,6 +121,13 @@ impl Tool for SetReminderTool {
 }
 
 impl crate::traits::ToolSemantics for SetReminderTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         ToolCallSemantics::mutation()
     }
