@@ -889,21 +889,26 @@ impl Agent {
                          (vision is off, unsupported, or the file is too large or unreadable).",
                     );
                 }
+                // The tool's own typed finish, applied once the batch
+                // completes.
+                let mut finish = outcome.finish.take();
                 // The detach transition, decided at the typed receipt. A
                 // launch the model asked to detach is a long-lived service
                 // (server, tunnel, watcher) that never "finishes": its useful
                 // result is its startup output, so the run continues and the
-                // model reports it. Work the daemon pushed to the background
-                // is the handoff unless the assessed task shape keeps
+                // model reports it. Work a tool handed to the background ends
+                // the run on its finish, unless the assessed task shape keeps
                 // independent inline work going.
                 if crate::agent::tool_execution::tool_result_indicates_background_detach(
                     &request.name,
                     &output,
                     &outcome.metadata,
-                ) {
+                ) || outcome.metadata.background_handoff
+                {
                     let directive = if scope.continue_inline_after_background
                         || outcome.metadata.detached
                     {
+                        finish = None;
                         crate::agent::system_directives::SystemDirective::BackgroundProcessContinue
                     } else {
                         // With notifications on, the result follows by
@@ -920,7 +925,10 @@ impl Agent {
                                 &outcome.metadata,
                             )
                         };
-                        scope.end_with(reply, TaskOutcome::Partial);
+                        match finish.as_mut() {
+                            Some(finish) => finish.reply = Some(reply),
+                            None => scope.end_with(reply, TaskOutcome::Partial),
+                        }
                         if outcome.metadata.completion_notifications_enabled {
                             scope.background_handoff.store(true, Ordering::Relaxed);
                         }
@@ -970,23 +978,19 @@ impl Agent {
                 // completes. One without a reply ships the call's output, the
                 // untrusted-data wrapper removed so reply sanitization does not
                 // empty it.
-                let finish = outcome
-                    .finish
-                    .take()
-                    .filter(|_| satisfied)
-                    .map(|mut finish| {
-                        if finish
-                            .reply
-                            .as_deref()
-                            .is_none_or(|reply| reply.trim().is_empty())
-                        {
-                            finish.reply = Some(
-                                crate::agent::completion_checks::strip_untrusted_wrapper(&output)
-                                    .to_string(),
-                            );
-                        }
-                        finish
-                    });
+                let finish = finish.filter(|_| satisfied).map(|mut finish| {
+                    if finish
+                        .reply
+                        .as_deref()
+                        .is_none_or(|reply| reply.trim().is_empty())
+                    {
+                        finish.reply = Some(
+                            crate::agent::completion_checks::strip_untrusted_wrapper(&output)
+                                .to_string(),
+                        );
+                    }
+                    finish
+                });
                 (
                     output,
                     images,

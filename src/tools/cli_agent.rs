@@ -4473,10 +4473,17 @@ fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolC
             ..ToolCallMetadata::default()
         }
     };
-    ToolCallOutcome {
+    // A run the agent moved to background tracking hands the turn off to it.
+    let handed_off = metadata.background_started;
+    let outcome = ToolCallOutcome {
         output,
         metadata,
         finish: None,
+    };
+    if handed_off {
+        outcome.handed_to_background()
+    } else {
+        outcome
     }
 }
 

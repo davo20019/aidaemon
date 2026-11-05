@@ -12,7 +12,7 @@ use crate::agent::{
 };
 use crate::traits::{
     HandoffArtifact, ReportBlockerStore, StateStore, TaskAttempt, TaskAttemptPatch, TaskHandoff,
-    Tool, ToolCallSemantics, ToolCapabilities, ToolRole,
+    Tool, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
 };
 
 /// Tool for executors to report they are blocked and cannot proceed.
@@ -431,6 +431,23 @@ impl Tool for ReportBlockerTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.report(arguments).await.map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.report(arguments).await
+    }
+}
+
+impl ReportBlockerTool {
+    /// Record the blocker. A recorded blocker ends the executor's run as
+    /// partial work, its summary the reply; a rejected report changes nothing
+    /// and the run goes on.
+    async fn report(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let mut args: ReportBlockerArgs = serde_json::from_str(arguments)?;
         if self.mandate_execution {
             anyhow::ensure!(
@@ -442,9 +459,9 @@ impl Tool for ReportBlockerTool {
 
         let causal_local_repair_is_proven = self.causal_local_repair_is_proven(&args).await;
         if let Err(reason) = validate_blocker_boundary(&args, causal_local_repair_is_proven) {
-            return Ok(format!(
+            return Ok(ToolCallOutcome::from_output(format!(
                 "Error: blocker report rejected because {reason}. No task state changed. Continue the task autonomously: inspect current state, choose a safe in-scope RETRY, REPAIR, SUBSTITUTE, or RECONCILE action, and rerun the original verification before reporting a blocker."
-            ));
+            )));
         }
 
         let outcome = classify_blocker_outcome(&args);
@@ -638,7 +655,12 @@ impl Tool for ReportBlockerTool {
             }
         }
 
-        Ok(executor_result.render_task_lead_summary())
+        // The dispatcher ships the summary the model saw as the reply.
+        Ok(
+            ToolCallOutcome::from_output(executor_result.render_task_lead_summary()).with_finish(
+                aidaemon_core::Finish::new(aidaemon_core::FinishOutcome::Partial, None),
+            ),
+        )
     }
 }
 
@@ -763,6 +785,51 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("\"executor_result\""));
+    }
+
+    /// A recorded blocker ends the executor's run as partial work, from the
+    /// tool's own outcome; the dispatcher ships the summary as the reply. A
+    /// rejected report ends nothing.
+    #[tokio::test]
+    async fn report_blocker_finishes_partial() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let tool = ReportBlockerTool::new(task_id.clone(), state.clone());
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "reason": "Missing API credentials",
+                    "blocker_class": "external_dependency",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [],
+                    "exact_need": "Provide credentials for the requested API."
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("Executor outcome: blocked"));
+        let finish = outcome.finish.expect("a recorded blocker finishes the run");
+        assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Partial);
+        assert_eq!(finish.reply, None, "the reply is the summary the model saw");
+
+        let rejected = tool
+            .call_with_status_outcome(
+                &json!({
+                    "reason": "The upload may have gone through",
+                    "blocker_class": "ambiguous_external_effect",
+                    "external_effect_state": "none",
+                    "recovery_attempts": []
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(rejected
+            .output
+            .starts_with("Error: blocker report rejected"));
+        assert!(rejected.finish.is_none());
     }
 
     #[tokio::test]

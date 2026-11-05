@@ -69,10 +69,21 @@ fn launcher(notifications: bool) -> MockTool {
     .with_metadata(ToolCallMetadata {
         outcome_status: Some(crate::traits::ToolOutcomeStatus::Backgrounded),
         background_started: true,
+        background_handoff: true,
         timed_out: true,
         completion_notifications_enabled: notifications,
         ..ToolCallMetadata::default()
     })
+    .with_finish(handoff())
+}
+
+/// The finish a tool hands the turn to the background with
+/// (`ToolCallOutcome::handed_to_background`).
+fn handoff() -> aidaemon_core::Finish {
+    crate::traits::ToolCallOutcome::from_output(String::new())
+        .handed_to_background()
+        .finish
+        .unwrap()
 }
 
 /// A background launch without completion notifications ends the run with
@@ -117,7 +128,7 @@ async fn background_launch_with_notifications_ends_with_the_friendly_handoff() {
 /// A tool's direct response answers a root turn's lone call: it is the
 /// reply, the task succeeds, and no model call follows.
 #[tokio::test]
-async fn lone_direct_response_is_the_reply() {
+async fn oauth_direct_response_is_final_text() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("synthetic_connector", "{}"),
         MockProvider::text_response("UNREACHED model narration"),
@@ -190,16 +201,22 @@ impl Tool for Connector {
         &self,
         _arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        _facts: crate::traits::ToolCallContext,
+        facts: crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        Ok(crate::traits::ToolCallOutcome {
+        let outcome = crate::traits::ToolCallOutcome {
             output: CONNECTOR_REPLY.to_string(),
             metadata: ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
-                direct_response: Some(CONNECTOR_REPLY.to_string()),
                 ..ToolCallMetadata::default()
             },
             finish: None,
+        };
+        // As `manage_oauth connect`: the answer when it is the lone call of
+        // a root turn.
+        Ok(if facts.lone_root_call {
+            outcome.with_finish(aidaemon_core::Finish::succeeded(CONNECTOR_REPLY))
+        } else {
+            outcome
         })
     }
 }
@@ -321,4 +338,62 @@ fn finished_run_without_text_falls_back_to_the_finishing_output() {
     assert_eq!(reply, "Remembered: the synthetic preference.");
     assert_eq!(status, TaskStatus::Completed);
     assert_eq!(task_outcome, TaskOutcome::Succeeded);
+}
+
+/// A tool that hands the turn to a background job ends the run from its
+/// typed outcome, whatever its output says: no "moved to background" wording
+/// is needed. As `spawn_agent` does, it sets no process-launch receipt.
+#[tokio::test]
+async fn background_detach_finishes_without_text_match() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_delegate", "{}"),
+        MockProvider::text_response("UNREACHED model narration"),
+    ]);
+    let delegate = MockTool::new(
+        "synthetic_delegate",
+        "Hands a synthetic report to a helper",
+        "A helper is preparing the synthetic report; it will arrive here when ready.",
+    )
+    .with_metadata(ToolCallMetadata {
+        background_handoff: true,
+        ..ToolCallMetadata::default()
+    })
+    .with_finish(handoff());
+    let harness = root(provider, vec![Arc::new(delegate)]).await;
+    let reply = ask(&harness, "finish-delegate", "Prepare the synthetic report").await;
+
+    assert_eq!(
+        reply,
+        "A helper is preparing the synthetic report; it will arrive here when ready."
+    );
+    assert_eq!(harness.provider.call_count().await, 1);
+    let end = task_end(&harness, "finish-delegate").await;
+    assert_eq!(end.status, TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+}
+
+/// When the assessed task shape keeps inline work going, a background
+/// handoff does not end the run: the model carries on.
+#[tokio::test]
+async fn background_handoff_with_inline_work_lets_the_model_continue() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_launcher", "{}"),
+        MockProvider::text_response("The job is running and the rest is done."),
+    ])
+    .with_task_assessments(vec![
+        MockProvider::semantic_task_assessment_with_inline_continuation(
+            "change",
+            true,
+            false,
+            &["process_state"],
+            "new_request",
+            "host_local",
+            true,
+        ),
+    ]);
+    let harness = root(provider, vec![Arc::new(launcher(false))]).await;
+    let reply = ask(&harness, "finish-inline", "Start the job, then tidy up").await;
+
+    assert_eq!(reply, "The job is running and the rest is done.");
+    assert_eq!(harness.provider.call_count().await, 2);
 }

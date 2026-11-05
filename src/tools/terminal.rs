@@ -5216,6 +5216,8 @@ impl TerminalTool {
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
+            // The work is already running in the background: the run hands
+            // off to it.
             return Ok(ToolCallOutcome {
                 output: format!(
                     "Equivalent command is already running in this scope (pid={}). \
@@ -5229,7 +5231,8 @@ impl TerminalTool {
                     ..ToolCallMetadata::default()
                 },
                 finish: None,
-            });
+            }
+            .handed_to_background());
         }
 
         let capabilities = ConfinedCapabilities { network };
@@ -6619,7 +6622,7 @@ impl TerminalTool {
                     msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_output));
                 }
                 let background_semantics = background_process_semantics(&command_semantics);
-                Ok(ToolCallOutcome {
+                let outcome = ToolCallOutcome {
                     metadata: ToolCallMetadata {
                         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
                         background_started: true,
@@ -6631,6 +6634,14 @@ impl TerminalTool {
                     },
                     output: msg,
                     finish: None,
+                };
+                // Work the daemon moved to background tracking hands the run
+                // off; a launch the model detached on purpose is a running
+                // service whose startup output the model reports.
+                Ok(if detach {
+                    outcome
+                } else {
+                    outcome.handed_to_background()
                 })
             }
         }

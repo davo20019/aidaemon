@@ -183,24 +183,7 @@ pub(in crate::agent) async fn committed_non_action_mandate_summary(
     {
         return None;
     }
-    match decision.outcome {
-        crate::traits::MandateDecisionOutcome::Act => None,
-        crate::traits::MandateDecisionOutcome::Wait => Some(format!(
-            "WAIT recorded: {} Review again at {}.",
-            decision.rationale,
-            decision
-                .reconsider_at
-                .as_deref()
-                .unwrap_or("the bounded default")
-        )),
-        crate::traits::MandateDecisionOutcome::Ask => Some(format!(
-            "ASK recorded: {}",
-            decision.question.as_deref().unwrap_or(&decision.rationale)
-        )),
-        crate::traits::MandateDecisionOutcome::Stop => {
-            Some(format!("STOP recorded: {}", decision.rationale))
-        }
-    }
+    decision.non_action_summary()
 }
 
 const CAPACITY_RECOVERY_WAIT_RATIONALE: &str = "This review reached its internal runaway-protection ceiling before another model turn could be admitted. No new action was authorized; the controller will retry automatically at the earliest bounded review time.";

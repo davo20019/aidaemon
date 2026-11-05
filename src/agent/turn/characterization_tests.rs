@@ -1266,7 +1266,7 @@ impl Tool for BackgroundDetachTool {
         status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = (arguments, status_tx);
-        Ok(ToolCallOutcome {
+        let outcome = ToolCallOutcome {
             output: "Background job started.".to_string(),
             metadata: ToolCallMetadata {
                 background_started: true,
@@ -1276,6 +1276,13 @@ impl Tool for BackgroundDetachTool {
                 ..ToolCallMetadata::default()
             },
             finish: None,
+        };
+        // As `terminal`: work moved to background tracking hands the turn
+        // off; a detached service launch does not.
+        Ok(if self.detached {
+            outcome
+        } else {
+            outcome.handed_to_background()
         })
     }
 }

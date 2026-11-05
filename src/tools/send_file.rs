@@ -180,7 +180,7 @@ impl Tool for SendFileTool {
         } else {
             ToolOutcomeStatus::FailedPermanent
         };
-        Ok(ToolCallOutcome {
+        let outcome = ToolCallOutcome {
             metadata: ToolCallMetadata {
                 outcome_status: Some(outcome_status),
                 background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
@@ -189,6 +189,12 @@ impl Tool for SendFileTool {
             },
             output,
             finish: None,
+        };
+        // A file queued for later delivery hands the turn off to the queue.
+        Ok(if outcome_status == ToolOutcomeStatus::Backgrounded {
+            outcome.handed_to_background()
+        } else {
+            outcome
         })
     }
 }

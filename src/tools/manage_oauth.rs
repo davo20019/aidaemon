@@ -1220,11 +1220,10 @@ impl Tool for ManageOAuthTool {
         }
         let output = self.run(arguments, status_tx, &facts).await?;
         let mut outcome = ToolCallOutcome::from_output(output.clone());
-        if args.action == "connect" {
-            outcome.metadata = ToolCallMetadata {
-                direct_response: Some(output),
-                ..ToolCallMetadata::default()
-            };
+        // A connect that is the whole of a root turn's answer ends the run
+        // with its own message (the dispatcher drops it if the call failed).
+        if args.action == "connect" && facts.lone_root_call {
+            outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(output));
         }
         Ok(outcome)
     }
@@ -1552,7 +1551,7 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.output.contains("twitter"));
-        assert!(outcome.metadata.direct_response.is_none());
+        assert!(outcome.finish.is_none());
         assert!(outcome.metadata.observations.iter().any(|observation| {
             observation.subject.kind == ToolTargetHintKind::ResourceId
                 && observation.subject.value == resource_id
@@ -1871,7 +1870,10 @@ allowed_domains = ["api.linear.app"]
                 tool.call_with_execution_context(
                     r#"{"action":"connect","service":"linear"}"#,
                     Some(status_tx),
-                    crate::testing::call_facts("telegram:123"),
+                    crate::traits::ToolCallContext {
+                        lone_root_call: true,
+                        ..crate::testing::call_facts("telegram:123")
+                    },
                 )
                 .await
             })
@@ -1919,9 +1921,12 @@ allowed_domains = ["api.linear.app"]
         let tool_outcome = tool_task.await.unwrap().unwrap();
 
         assert!(tool_outcome.output.contains("Connected to Linear"));
+        // The connect message is the turn's final answer.
         assert_eq!(
-            tool_outcome.metadata.direct_response,
-            Some(tool_outcome.output)
+            tool_outcome.finish,
+            Some(aidaemon_core::Finish::succeeded(
+                tool_outcome.output.clone()
+            ))
         );
     }
 

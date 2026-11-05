@@ -65,6 +65,13 @@ fn sanitize_workspace_tool_outcome(
     if let Some(response) = outcome.metadata.direct_response.as_mut() {
         *response = sanitize_workspace_tool_text(response, grant);
     }
+    if let Some(reply) = outcome
+        .finish
+        .as_mut()
+        .and_then(|finish| finish.reply.as_mut())
+    {
+        *reply = sanitize_workspace_tool_text(reply, grant);
+    }
     if let Some(persistent) = outcome.metadata.persistent_output.as_mut() {
         *persistent = sanitize_workspace_tool_text(persistent, grant);
     }
@@ -745,10 +752,8 @@ impl Agent {
                 if let Some(fence) = self.mandate_execution.as_ref() {
                     facts.goal_run_id = Some(fence.goal_run_id.clone());
                     facts.task_attempt_id = Some(fence.attempt_id.clone());
-                    if name == "manage_goal_tasks" {
-                        facts.mandate_id = Some(fence.mandate_id.clone());
-                        facts.mandate_version = Some(fence.mandate_version);
-                    }
+                    facts.mandate_id = Some(fence.mandate_id.clone());
+                    facts.mandate_version = Some(fence.mandate_version);
                 }
             }
         }

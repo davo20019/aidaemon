@@ -1452,6 +1452,26 @@ pub struct MandateDecisionCycle {
 }
 
 impl MandateDecisionCycle {
+    /// The durable summary a committed non-action decision (WAIT, ASK,
+    /// STOP) closes its review with; `None` for ACT, whose review goes on.
+    pub fn non_action_summary(&self) -> Option<String> {
+        match self.outcome {
+            MandateDecisionOutcome::Act => None,
+            MandateDecisionOutcome::Wait => Some(format!(
+                "WAIT recorded: {} Review again at {}.",
+                self.rationale,
+                self.reconsider_at
+                    .as_deref()
+                    .unwrap_or("the bounded default")
+            )),
+            MandateDecisionOutcome::Ask => Some(format!(
+                "ASK recorded: {}",
+                self.question.as_deref().unwrap_or(&self.rationale)
+            )),
+            MandateDecisionOutcome::Stop => Some(format!("STOP recorded: {}", self.rationale)),
+        }
+    }
+
     pub fn new(
         mandate_id: &str,
         goal_run_id: &str,

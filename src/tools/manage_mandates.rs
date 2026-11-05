@@ -2579,7 +2579,35 @@ impl Tool for ManageMandatesTool {
         if let Some((observations, collections)) = objective_evidence {
             outcome = outcome.with_observation_evidence(observations, collections);
         }
+        // A committed non-action decision (WAIT, ASK, STOP) completes the
+        // fenced review: the run ends on the durable decision's summary,
+        // without another model call.
+        if args.action == "record_decision" && outcome_status == ToolOutcomeStatus::Succeeded {
+            if let Some(summary) = self.committed_non_action_summary(&facts).await {
+                outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(summary));
+            }
+        }
         Ok(outcome)
+    }
+}
+
+impl ManageMandatesTool {
+    /// The summary of the committed decision of the review this call is
+    /// fenced to, when that decision is WAIT, ASK or STOP.
+    async fn committed_non_action_summary(&self, facts: &ToolCallContext) -> Option<String> {
+        let goal_run_id = facts.goal_run_id.as_deref()?;
+        let decision = self
+            .state
+            .get_mandate_decision_for_run(goal_run_id)
+            .await
+            .ok()
+            .flatten()?;
+        if Some(decision.mandate_id.as_str()) != facts.mandate_id.as_deref()
+            || Some(decision.mandate_version) != facts.mandate_version
+        {
+            return None;
+        }
+        decision.non_action_summary()
     }
 }
 
@@ -4185,6 +4213,58 @@ mod tests {
             decision.evidence_receipt_ids,
             vec!["call_read_acme_feed".to_string()]
         );
+    }
+
+    /// A committed WAIT under the review's fence finishes the run as
+    /// succeeded with the durable decision's summary; an ACT does not, and
+    /// neither does a decision recorded without the fence's mandate facts.
+    #[tokio::test]
+    async fn mandate_decision_finishes_succeeded() {
+        let wait = json!({
+            "action": "record_decision",
+            "outcome": "wait",
+            "rationale": "Nothing new is worth saying yet"
+        });
+        let fenced = |run: &ReviewRun| crate::traits::ToolCallContext {
+            mandate_id: Some(run.mandate.id.clone()),
+            mandate_version: Some(run.mandate.version),
+            ..lead_facts(run)
+        };
+
+        let run = review_run(false).await;
+        let outcome = tool_for(&run)
+            .call_with_execution_context(&lead_args(&run, wait.clone()), None, fenced(&run))
+            .await
+            .unwrap();
+        let decision = run
+            .state
+            .get_mandate_decision_for_run(&run.run_id)
+            .await
+            .unwrap()
+            .expect("durable decision");
+        let finish = outcome.finish.expect("a committed WAIT ends the review");
+        assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Succeeded);
+        assert_eq!(finish.reply, decision.non_action_summary());
+        assert!(finish.reply.as_deref().is_some_and(
+            |reply| reply.starts_with("WAIT recorded: Nothing new is worth saying yet")
+        ));
+
+        let unfenced = review_run(false).await;
+        let outcome = tool_for(&unfenced)
+            .call_with_execution_context(&lead_args(&unfenced, wait), None, lead_facts(&unfenced))
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("WAIT recorded"));
+        assert!(outcome.finish.is_none(), "no fence, no finish");
+
+        let act = review_run(false).await;
+        file_receipt(&act, "call_read_acme_feed", "http_request").await;
+        let outcome = tool_for(&act)
+            .call_with_execution_context(&lead_args(&act, act_fields(&act)), None, fenced(&act))
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("ACT committed"));
+        assert!(outcome.finish.is_none(), "an ACT review goes on");
     }
 
     /// A learning note whose receipt ids are omitted cites the decision's

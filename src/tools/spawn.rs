@@ -828,15 +828,21 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        Ok(reported(
-            format!(
-                "Sub-agent spawned in background for mission: \"{}\". \
-                 The result will be delivered through the parent session when it completes.",
-                args.mission
-            ),
-            SourceTrust::Trusted,
-        ))
+        Ok(background_spawn_outcome(&args.mission))
     }
+}
+
+/// A sub-agent now running in the background: the turn hands off to it, and
+/// its result reaches the parent session when it completes.
+fn background_spawn_outcome(mission: &str) -> ToolCallOutcome {
+    reported(
+        format!(
+            "Sub-agent spawned in background for mission: \"{mission}\". \
+             The result will be delivered through the parent session when it completes."
+        ),
+        SourceTrust::Trusted,
+    )
+    .handed_to_background()
 }
 
 impl crate::traits::ToolSemantics for SpawnAgentTool {
@@ -974,6 +980,25 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{NotificationStore, StateStore};
     use std::sync::Arc;
+
+    /// A background spawn ends the turn from the tool's typed outcome, not
+    /// from its wording: the finish and the handoff fact are set whatever
+    /// the message says.
+    #[test]
+    fn background_spawn_hands_the_turn_off() {
+        let outcome = background_spawn_outcome("Summarize the synthetic report");
+        assert!(outcome.metadata.background_handoff);
+        assert!(
+            !outcome.metadata.background_started,
+            "a sub-agent is not a tracked process launch"
+        );
+        let finish = outcome.finish.expect("the turn hands off");
+        assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Partial);
+        assert_eq!(
+            finish.reply, None,
+            "the dispatcher writes the handoff reply"
+        );
+    }
 
     #[test]
     fn truncate_utf8_ascii() {
