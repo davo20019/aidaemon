@@ -2143,7 +2143,26 @@ impl Tool for HttpRequestTool {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::traits::ToolSemantics for HttpRequestTool {
+    /// H7: a trusted scheduled session or a mandate run (whose exact action
+    /// grant the dispatcher checks) needs no card; otherwise a GET, HEAD or
+    /// OPTIONS without a body or override header runs and anything else
+    /// asks, High risk.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if facts.trusted_session || facts.mandate_preapproved {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        match Self::owner_approval_request(call.arguments) {
+            Some(request) => crate::traits::OwnerApprovalNeed::Ask(request),
+            None => crate::traits::OwnerApprovalNeed::NotNeeded,
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

@@ -86,11 +86,21 @@ impl SpecialistKind {
 #[async_trait]
 pub trait Tool: ToolSemantics {
     fn name(&self) -> &str;
-    /// The concrete tool, for daemon wiring that needs it (the kernel's
-    /// approval rules find the terminal's approval ladder this way). `None`
-    /// for tools nothing downcasts.
-    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+    /// The permission mode the owner's cards for this tool are sent with
+    /// (it picks the buttons offered). `None`: the default, Cautious.
+    fn approval_card_mode(&self) -> Option<crate::tools::command_risk::PermissionMode> {
         None
+    }
+    /// Apply the owner's answer to a card asked for `call` (from
+    /// [`ToolSemantics::owner_approval_request`]) to the tool's own grant
+    /// stores. `None`: the card timed out or never reached the owner. The
+    /// default keeps nothing; the kernel's session grants are separate.
+    async fn record_owner_answer(
+        &self,
+        _call: &ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+        _response: Option<crate::types::ApprovalResponse>,
+    ) {
     }
     fn description(&self) -> &str;
     /// Returns the OpenAI-format function schema as a JSON Value.

@@ -82,6 +82,22 @@ pub enum ToolRole {
     Universal,
 }
 
+/// Typed facts about how the dispatcher and the engine treat a tool. A tool
+/// states them about itself; nothing keys on its name. Several can hold for
+/// one tool, so they are flags beside [`ToolRole`] (which scopes tools by
+/// agent role) rather than more roles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolDispatchFacts {
+    /// The kernel's approval rules judge this tool's calls in the canonical
+    /// form the dispatcher executes, and the dispatcher then runs each call
+    /// exactly as judged (the terminal).
+    pub runs_as_judged: bool,
+    /// The tool keeps the owner's answers to its cards in its own grant
+    /// stores, consulted by its own ladder (the terminal's command
+    /// prefixes), instead of the kernel's session grants.
+    pub keeps_own_grants: bool,
+}
+
 /// Safety and execution metadata for policy-driven tool selection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCapabilities {
@@ -1724,6 +1740,45 @@ pub enum ApprovalScope {
     Request { method: String, url: String },
 }
 
+/// One call as the kernel's approval rules show it to
+/// [`ToolSemantics::owner_approval_request`].
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalCall<'a> {
+    /// The arguments the dispatcher will execute (for a tool whose calls the
+    /// kernel judges in canonical form, the canonical form; otherwise the
+    /// model's own).
+    pub arguments: &'a Value,
+    /// The arguments as the model sent them, for a card about a call whose
+    /// arguments cannot be read.
+    pub as_sent: &'a Value,
+    /// The dispatcher refuses this call before it runs (an out-of-scope
+    /// target nobody may authorize), so nothing about it needs the owner.
+    pub refused: bool,
+}
+
+impl<'a> ApprovalCall<'a> {
+    /// A call the dispatcher runs as the model sent it.
+    pub fn as_sent(arguments: &'a Value) -> Self {
+        Self {
+            arguments,
+            as_sent: arguments,
+            refused: false,
+        }
+    }
+}
+
+/// What a tool says about the owner's approval for one call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnerApprovalNeed {
+    /// The tool has no opinion: the approval policy's allow rules and mode
+    /// decide.
+    Unjudged,
+    /// The tool judged the call and it needs no approval.
+    NotNeeded,
+    /// Ask the owner with this request (unless a grant covers it).
+    Ask(aidaemon_core::OwnerApprovalRequest),
+}
+
 /// The dispatcher's facts about one tool call, passed to the tool beside its
 /// arguments.
 ///
@@ -1962,6 +2017,12 @@ pub trait ToolSemantics: Send + Sync {
         ToolRole::Action
     }
 
+    /// How the dispatcher and the engine treat this tool. Default: nothing
+    /// special.
+    fn dispatch_facts(&self) -> ToolDispatchFacts {
+        ToolDispatchFacts::default()
+    }
+
     /// Capability metadata used by the execution policy and risk gate.
     /// Defaults are intentionally conservative.
     fn capabilities(&self) -> ToolCapabilities {
@@ -1983,14 +2044,17 @@ pub trait ToolSemantics: Send + Sync {
         false
     }
 
-    /// The owner approval this exact call needs before it runs, built from
-    /// the dispatcher's facts for the call. The default asks for none.
-    fn owner_approval_request(
+    /// The owner approval this exact call needs before it runs, judged from
+    /// the call and the dispatcher's facts for it (never from `_` arguments).
+    /// The kernel's approval rules ask it for every call and send the card
+    /// it returns. The default has no opinion, so the approval policy's mode
+    /// decides.
+    async fn owner_approval_request(
         &self,
-        _arguments: &str,
+        _call: &ApprovalCall<'_>,
         _facts: &ToolCallContext,
-    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
-        None
+    ) -> OwnerApprovalNeed {
+        OwnerApprovalNeed::Unjudged
     }
 
     /// Machine-receipt protocol emitted by this adapter.

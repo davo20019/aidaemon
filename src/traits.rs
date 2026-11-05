@@ -81,18 +81,18 @@ pub use provider::{
 #[allow(unused_imports)]
 pub use tools::{
     default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
-    ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
+    ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
     DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope,
-    PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
     RuntimePreparationFailure, ScopeEscalation, SpecialistKind, StableObservationSubject, Tool,
     ToolAccessDenial, ToolAccessEnforcement, ToolArgumentContractViolation, ToolCallAccessManifest,
     ToolCallContext, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
     ToolCallSemantics, ToolCapabilities, ToolCollectionCompleteness, ToolCollectionObservation,
-    ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
-    ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
-    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticFacet, ToolSemanticScope,
-    ToolSemantics, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
-    TrustRoots, EGRESS_EFFECTS,
+    ToolDispatchFacts, ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects,
+    ToolObservationEvidence, ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness,
+    ToolResultContentSource, ToolResultPresentation, ToolResultProvenance, ToolRole,
+    ToolSemanticFacet, ToolSemanticScope, ToolSemantics, ToolTargetHint, ToolTargetHintKind,
+    ToolVerificationMode, TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 

@@ -4039,12 +4039,6 @@ impl TerminalTool {
         }
     }
 
-    /// The permission mode the owner's terminal cards are sent with (it
-    /// picks the buttons offered).
-    pub(crate) fn permission_mode(&self) -> PermissionMode {
-        self.permission_mode
-    }
-
     /// The owner approval a terminal call needs, for the daemon's kernel
     /// approval rules: the T8 ladder for `run` (after the hard blocks, which
     /// the tool refuses on its own), the trust-all card, or `None`. The
@@ -7183,6 +7177,18 @@ pub(crate) struct TerminalTrust {
 }
 
 impl TerminalTrust {
+    /// The facts the kernel's approval rules judge a call with: exactly
+    /// the turn's, the escalation as the dispatcher judged it.
+    fn for_approval(ctx: &ToolCallContext) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            trusted_session: ctx.trusted_session,
+            untrusted_source: ctx.untrusted_source,
+            scope_escalation: ctx.scope_escalation.clone(),
+        }
+    }
+
     fn from_execution_context(session_id: &str, ctx: &ToolCallContext) -> Self {
         Self {
             session_id: session_id.to_string(),
@@ -7776,8 +7782,20 @@ impl Tool for TerminalTool {
         "terminal"
     }
 
-    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        Some(self)
+    /// The terminal's cards go out in its configured mode (which picks the
+    /// buttons offered).
+    fn approval_card_mode(&self) -> Option<PermissionMode> {
+        Some(self.permission_mode)
+    }
+
+    async fn record_owner_answer(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+        response: Option<ApprovalResponse>,
+    ) {
+        let trust = TerminalTrust::for_approval(facts);
+        TerminalTool::record_owner_answer(self, call.arguments, &trust, response).await;
     }
 
     fn description(&self) -> &str {
@@ -7892,6 +7910,38 @@ impl crate::traits::ToolSemantics for TerminalTool {
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         validate_terminal_argument_contract(arguments)
+    }
+
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            runs_as_judged: true,
+            keeps_own_grants: true,
+            ..Default::default()
+        }
+    }
+
+    /// The T8 ladder on the call as the dispatcher will run it, with the
+    /// turn's facts. A call whose arguments cannot be read asks, Critical,
+    /// with the arguments as the model sent them; a call the dispatcher
+    /// refuses needs nobody.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        if let Some(reason) = Self::unreadable_reason(call.arguments) {
+            return OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason));
+        }
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let trust = TerminalTrust::for_approval(facts);
+        match TerminalTool::owner_approval_request(self, call.arguments, &trust).await {
+            Ok(Some(request)) => OwnerApprovalNeed::Ask(request),
+            Ok(None) => OwnerApprovalNeed::NotNeeded,
+            Err(reason) => OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason)),
+        }
     }
 
     fn capabilities(&self) -> ToolCapabilities {

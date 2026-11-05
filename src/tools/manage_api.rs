@@ -727,6 +727,20 @@ impl ManageApiTool {
         Self::probe_approval_for(&args)
     }
 
+    /// [`crate::traits::ToolSemantics::owner_approval_request`] for a call.
+    pub(crate) fn owner_approval(
+        arguments: &Value,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if facts.trusted_session || facts.mandate_preapproved {
+            return crate::traits::OwnerApprovalNeed::Unjudged;
+        }
+        match Self::probe_approval_request(arguments) {
+            Some(request) => crate::traits::OwnerApprovalNeed::Ask(request),
+            None => crate::traits::OwnerApprovalNeed::Unjudged,
+        }
+    }
+
     fn probe_approval_for(args: &ManageApiArgs) -> Option<aidaemon_core::OwnerApprovalRequest> {
         if args.action != "onboard"
             || args
@@ -906,7 +920,19 @@ impl Tool for ManageApiTool {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::traits::ToolSemantics for ManageApiTool {
+    /// The live probe's inner request is approved here, at the outer call,
+    /// and runs with a scope for exactly that request. Anything else, or a
+    /// trusted scheduled session or a mandate run, is left to the policy.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        Self::owner_approval(call.arguments, facts)
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

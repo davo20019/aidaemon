@@ -39,24 +39,22 @@ const COULD_NOT_REACH: &str = "could not reach the owner";
 
 /// The daemon's approval rules for one turn, built from the turn's facts.
 ///
-/// `http_request` keeps H7: a GET, HEAD or OPTIONS without a body (and
-/// without a method or authority override header) runs; anything else asks
-/// the owner, High risk, unless the turn is a trusted scheduled session or
-/// a mandate run (whose exact action grant the dispatcher checks).
+/// The rules hold only the turn's facts and dispatch generically: each
+/// call goes to its tool's `ToolSemantics::owner_approval_request` with a
+/// `ToolCallContext` built from these facts (never from the call's
+/// arguments). The tools own their ladders: `http_request` keeps H7,
+/// `manage_api` asks about a live probe that may POST, and the terminal
+/// runs its T8 ladder.
 ///
-/// `terminal` runs the terminal's own approval ladder (T8, in its order;
-/// see `TerminalTool::approval_ladder`) with this turn's facts, never with
-/// facts from the call's arguments. Its grants (session prefixes, persisted
-/// prefixes and capability grants in the terminal's stores) are consulted
-/// at the ladder's own rungs, so an allowlisted command still asks in a
-/// trigger session or when it escalates a capability.
-///
-/// Every other tool defers to the policy's mode (`Never`), so it runs as
-/// before.
+/// A tool whose `dispatch_facts().runs_as_judged` holds (the terminal) is
+/// judged in the canonical form the dispatcher executes, with the scope the
+/// dispatcher will check, and that judgment is recorded so the dispatcher
+/// runs the call exactly as judged. A tool with no opinion defers to the
+/// policy's mode (`Never`), so it runs as before.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AppApprovalRules {
-    /// A trusted scheduled session (never under a mandate): no card, as the
-    /// tools skipped it for `_trusted_session`.
+    /// A trusted scheduled session (never under a mandate): the tools' own
+    /// ladders skip their cards for it.
     pub trusted_session: bool,
     /// A mandate run: the dispatcher admits only calls its exact action
     /// grant covers, so the owner already approved them.
@@ -68,12 +66,37 @@ pub(crate) struct AppApprovalRules {
     /// The session was started by an automated trigger (an email, an
     /// event), not by the owner: its terminal calls always ask.
     pub untrusted_trigger_session: bool,
-    /// The turn's terminal, whose approval ladder judges its calls.
+    /// The turn's tool whose calls are judged in canonical form (the
+    /// terminal), with the turn's canonicalizer.
     pub terminal: Option<TerminalApprovals>,
+    /// The turn's tools, whose own approval requests the rules consult.
+    pub tools: ApprovalTools,
     /// The run's declines as the kernel last showed them to these rules
     /// (`HookContext::declined`, which every judged call refreshes): a
     /// child spawned from this turn starts with them.
     pub run_declines: RunDeclines,
+}
+
+/// The turn's tools as the approval rules consult them, by name.
+#[derive(Clone, Default)]
+pub(crate) struct ApprovalTools(Vec<Arc<dyn crate::traits::Tool>>);
+
+impl ApprovalTools {
+    pub(crate) fn new(tools: impl IntoIterator<Item = Arc<dyn crate::traits::Tool>>) -> Self {
+        Self(tools.into_iter().collect())
+    }
+
+    fn find(&self, name: &str) -> Option<&Arc<dyn crate::traits::Tool>> {
+        self.0.iter().find(|tool| tool.name() == name)
+    }
+}
+
+impl std::fmt::Debug for ApprovalTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|tool| tool.name().to_string()))
+            .finish()
+    }
 }
 
 /// The effects the owner declined in a run, as the kernel's hook context
@@ -249,11 +272,12 @@ impl std::fmt::Debug for TerminalApprovals {
 }
 
 impl TerminalApprovals {
-    /// The terminal among `tools`, if there is one.
+    /// The tool among `tools` whose calls the kernel judges in canonical
+    /// form (`dispatch_facts().runs_as_judged`), if there is one.
     pub(crate) fn find(tools: &[Arc<dyn crate::traits::Tool>]) -> Option<Self> {
         let tool = tools
             .iter()
-            .find(|tool| Self::downcast(tool.as_ref()).is_some())?
+            .find(|tool| tool.dispatch_facts().runs_as_judged)?
             .clone();
         Some(Self {
             tool,
@@ -279,14 +303,6 @@ impl TerminalApprovals {
         self
     }
 
-    fn downcast(tool: &dyn crate::traits::Tool) -> Option<&crate::tools::TerminalTool> {
-        tool.as_any()?.downcast_ref::<crate::tools::TerminalTool>()
-    }
-
-    fn terminal(&self) -> Option<&crate::tools::TerminalTool> {
-        Self::downcast(self.tool.as_ref())
-    }
-
     /// The call in the form the dispatcher will execute, with its scope.
     pub(crate) fn judge(&self, raw: &serde_json::Value) -> JudgedTerminal {
         match &self.canonicalize {
@@ -306,96 +322,127 @@ impl TerminalApprovals {
     fn remember(&self, run: sdk::RunId, call_id: &str, call: JudgedTerminal) {
         self.judged.insert(run, call_id, call);
     }
+}
 
-    fn permission_mode(&self) -> Option<PermissionMode> {
-        self.terminal().map(|terminal| terminal.permission_mode())
+/// The rules' decision for what a tool said about a call.
+fn rule_decision(need: crate::traits::OwnerApprovalNeed) -> RuleDecision {
+    match need {
+        crate::traits::OwnerApprovalNeed::Ask(request) => RuleDecision::Ask(request),
+        crate::traits::OwnerApprovalNeed::NotNeeded => RuleDecision::Allow,
+        crate::traits::OwnerApprovalNeed::Unjudged => RuleDecision::Defer,
     }
 }
 
 impl AppApprovalRules {
-    /// The turn's facts the terminal's ladder reads.
-    fn terminal_trust(
+    /// The dispatcher's facts for a call of this turn, with the scope
+    /// escalation the dispatcher judged for it.
+    fn call_facts(
         &self,
         escalation: Option<crate::traits::ScopeEscalation>,
-    ) -> crate::tools::terminal::TerminalTrust {
-        crate::tools::terminal::TerminalTrust {
+    ) -> crate::traits::ToolCallContext {
+        crate::traits::ToolCallContext {
             session_id: self.session_id.clone(),
-            owner: self.user_role == Some(crate::types::UserRole::Owner),
+            user_role: self.user_role,
             trusted_session: self.trusted_session,
+            mandate_preapproved: self.mandate_preapproved,
             untrusted_source: self.untrusted_trigger_session,
             scope_escalation: escalation,
+            ..Default::default()
         }
     }
 
-    /// The mode a card for `tool` is sent with: the terminal's configured
-    /// mode for its cards (as its own prompt used), Cautious otherwise.
+    /// The judged-form tool if `name` is it.
+    fn judged_tool(&self, name: &str) -> Option<&TerminalApprovals> {
+        self.terminal
+            .as_ref()
+            .filter(|approvals| approvals.tool.name() == name)
+    }
+
+    fn tool(&self, name: &str) -> Option<&Arc<dyn crate::traits::Tool>> {
+        self.judged_tool(name)
+            .map(|approvals| &approvals.tool)
+            .or_else(|| self.tools.find(name))
+    }
+
+    /// The mode a card for `tool` is sent with: the tool's own
+    /// (`approval_card_mode`), Cautious otherwise.
     pub(crate) fn card_permission_mode(&self, tool: &str) -> PermissionMode {
-        match (tool, &self.terminal) {
-            ("terminal", Some(terminal)) => terminal
-                .permission_mode()
-                .unwrap_or(PermissionMode::Cautious),
-            _ => PermissionMode::Cautious,
-        }
+        self.tool(tool)
+            .and_then(|tool| tool.approval_card_mode())
+            .unwrap_or(PermissionMode::Cautious)
+    }
+
+    /// Whether `tool` keeps the owner's answers in its own grant stores
+    /// (`dispatch_facts().keeps_own_grants`) instead of the session grants.
+    pub(crate) fn keeps_own_grants(&self, tool: &str) -> bool {
+        self.tool(tool)
+            .is_some_and(|tool| tool.dispatch_facts().keeps_own_grants)
     }
 
     /// Judge the call the dispatcher will execute (canonicalized), never
-    /// the raw one. Nothing unreadable is allowed: it asks, Critical.
-    async fn judge_terminal(&self, run: sdk::RunId, call: &sdk::ToolCall) -> RuleDecision {
-        let Some(approvals) = &self.terminal else {
-            return RuleDecision::Defer;
-        };
-        let Some(terminal) = approvals.terminal() else {
-            return RuleDecision::Defer;
-        };
+    /// the raw one, and record the judgment for the dispatcher.
+    async fn judge_canonical(
+        &self,
+        approvals: &TerminalApprovals,
+        run: sdk::RunId,
+        call: &sdk::ToolCall,
+    ) -> RuleDecision {
         let judged = approvals.judge(&call.arguments);
         approvals.remember(run, &call.id, judged.clone());
-        if let Some(reason) = crate::tools::TerminalTool::unreadable_reason(&judged.call.arguments)
-        {
-            return RuleDecision::Ask(terminal.unreadable_request(&call.arguments, &reason));
-        }
-        let escalation = match judged.scope {
+        let (refused, escalation) = match judged.scope {
             // The dispatcher refuses it before the tool runs.
-            TerminalScope::Refused(_) => return RuleDecision::Allow,
-            TerminalScope::Escalate(escalation) => Some(escalation),
-            TerminalScope::InScope => None,
+            TerminalScope::Refused(_) => (true, None),
+            TerminalScope::Escalate(escalation) => (false, Some(escalation)),
+            TerminalScope::InScope => (false, None),
         };
-        let trust = self.terminal_trust(escalation);
-        match terminal
-            .owner_approval_request(&judged.call.arguments, &trust)
-            .await
-        {
-            Ok(Some(request)) => RuleDecision::Ask(request),
-            Ok(None) => RuleDecision::Allow,
-            Err(reason) => RuleDecision::Ask(terminal.unreadable_request(&call.arguments, &reason)),
-        }
+        let approval_call = crate::traits::ApprovalCall {
+            arguments: &judged.call.arguments,
+            as_sent: &call.arguments,
+            refused,
+        };
+        rule_decision(
+            approvals
+                .tool
+                .owner_approval_request(&approval_call, &self.call_facts(escalation))
+                .await,
+        )
     }
 
-    /// Apply the owner's answer to a terminal card to the terminal's grant
-    /// stores (`None`: the card timed out or never reached the owner), for
-    /// the call as it was judged when the card was asked.
-    pub(crate) async fn record_terminal_answer(
+    /// Apply the owner's answer to a card to the tool's own grant stores
+    /// (`None`: the card timed out or never reached the owner), for the
+    /// call as it was judged when the card was asked.
+    pub(crate) async fn record_owner_answer(
         &self,
         run: sdk::RunId,
         call: &sdk::ToolCall,
         response: Option<ApprovalResponse>,
     ) {
-        let Some(approvals) = &self.terminal else {
-            return;
-        };
-        let Some(terminal) = approvals.terminal() else {
-            return;
-        };
-        let judged = approvals
-            .judged(run, &call.id)
-            .unwrap_or_else(|| approvals.judge(&call.arguments));
-        let escalation = match judged.scope {
-            TerminalScope::Escalate(escalation) => Some(escalation),
-            _ => None,
-        };
-        let trust = self.terminal_trust(escalation);
-        terminal
-            .record_owner_answer(&judged.call.arguments, &trust, response)
+        if let Some(approvals) = self.judged_tool(&call.name) {
+            let judged = approvals
+                .judged(run, &call.id)
+                .unwrap_or_else(|| approvals.judge(&call.arguments));
+            let (refused, escalation) = match judged.scope {
+                TerminalScope::Refused(_) => (true, None),
+                TerminalScope::Escalate(escalation) => (false, Some(escalation)),
+                TerminalScope::InScope => (false, None),
+            };
+            let approval_call = crate::traits::ApprovalCall {
+                arguments: &judged.call.arguments,
+                as_sent: &call.arguments,
+                refused,
+            };
+            approvals
+                .tool
+                .record_owner_answer(&approval_call, &self.call_facts(escalation), response)
+                .await;
+        } else if let Some(tool) = self.tools.find(&call.name) {
+            tool.record_owner_answer(
+                &crate::traits::ApprovalCall::as_sent(&call.arguments),
+                &self.call_facts(None),
+                response,
+            )
             .await;
+        }
     }
 }
 
@@ -408,30 +455,19 @@ impl ApprovalRules for AppApprovalRules {
         _info: &sdk::ToolInfo,
     ) -> RuleDecision {
         self.run_declines.observe(ctx.declined);
-        match call.name.as_str() {
-            "http_request" => {
-                if self.trusted_session || self.mandate_preapproved {
-                    return RuleDecision::Allow;
-                }
-                match crate::tools::HttpRequestTool::owner_approval_request(&call.arguments) {
-                    Some(request) => RuleDecision::Ask(request),
-                    None => RuleDecision::Allow,
-                }
-            }
-            // The live probe's inner request is approved here, at the outer
-            // call, and runs with a scope for exactly that request.
-            "manage_api" => {
-                if self.trusted_session || self.mandate_preapproved {
-                    return RuleDecision::Defer;
-                }
-                match crate::tools::ManageApiTool::probe_approval_request(&call.arguments) {
-                    Some(request) => RuleDecision::Ask(request),
-                    None => RuleDecision::Defer,
-                }
-            }
-            "terminal" => self.judge_terminal(ctx.run_id, call).await,
-            _ => RuleDecision::Defer,
+        if let Some(approvals) = self.judged_tool(&call.name) {
+            return self.judge_canonical(approvals, ctx.run_id, call).await;
         }
+        let Some(tool) = self.tools.find(&call.name) else {
+            return RuleDecision::Defer;
+        };
+        rule_decision(
+            tool.owner_approval_request(
+                &crate::traits::ApprovalCall::as_sent(&call.arguments),
+                &self.call_facts(None),
+            )
+            .await,
+        )
     }
 }
 
@@ -712,12 +748,12 @@ impl OwnerApprovalResolver<'_> {
             .await
         {
             Answer::Granted(response) => {
-                if tool == "terminal" {
-                    // The terminal's grants live in its own stores
-                    // (session and persisted prefixes, capability grants),
-                    // consulted at the ladder's own rungs.
+                if self.rules.keeps_own_grants(tool) {
+                    // The tool's grants live in its own stores (for the
+                    // terminal: session and persisted prefixes, capability
+                    // grants), consulted at its ladder's own rungs.
                     self.rules
-                        .record_terminal_answer(run, &interruption.call, Some(response))
+                        .record_owner_answer(run, &interruption.call, Some(response))
                         .await;
                 } else if matches!(
                     response,
@@ -730,10 +766,10 @@ impl OwnerApprovalResolver<'_> {
                 sdk::Resolution::Approve
             }
             Answer::Declined(reason) => {
-                if tool == "terminal" {
+                if self.rules.keeps_own_grants(tool) {
                     let answer = (reason == DECLINED_BY_OWNER).then_some(ApprovalResponse::Deny);
                     self.rules
-                        .record_terminal_answer(run, &interruption.call, answer)
+                        .record_owner_answer(run, &interruption.call, answer)
                         .await;
                 }
                 self.record("owner_approval_declined", tool, request, Some(&reason))
@@ -833,8 +869,47 @@ mod tests {
         }
     }
 
+    /// `manage_api`'s approval judgment without its stores (which need a
+    /// database): the same `ManageApiTool::owner_approval` the tool runs.
+    struct ManageApiApprovals;
+
+    #[async_trait]
+    impl crate::traits::ToolSemantics for ManageApiApprovals {
+        async fn owner_approval_request(
+            &self,
+            call: &crate::traits::ApprovalCall<'_>,
+            facts: &crate::traits::ToolCallContext,
+        ) -> crate::traits::OwnerApprovalNeed {
+            crate::tools::ManageApiTool::owner_approval(call.arguments, facts)
+        }
+    }
+
+    #[async_trait]
+    impl crate::traits::Tool for ManageApiApprovals {
+        fn name(&self) -> &str {
+            "manage_api"
+        }
+        fn description(&self) -> &str {
+            "manage_api approvals"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"name": "manage_api", "description": "", "parameters": {"type": "object"}})
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            anyhow::bail!("not run in these tests")
+        }
+    }
+
+    /// Rules over the turn's approval-judging tools: a real `http_request`
+    /// and `manage_api`'s judgment.
     fn rules() -> AppApprovalRules {
-        AppApprovalRules::default()
+        let http: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::HttpRequestTool::new(
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        ));
+        AppApprovalRules {
+            tools: ApprovalTools::new([http, Arc::new(ManageApiApprovals) as Arc<_>]),
+            ..AppApprovalRules::default()
+        }
     }
 
     async fn judge(rules: &AppApprovalRules, args: serde_json::Value) -> RuleDecision {
@@ -1282,7 +1357,7 @@ mod tests {
         let rules = terminal_rules(&[]).await;
         let call = sdk::ToolCall::new("c1", "terminal", run("printf first"));
         rules
-            .record_terminal_answer(
+            .record_owner_answer(
                 sdk::RunId::new(),
                 &call,
                 Some(ApprovalResponse::AllowSession),
@@ -1303,7 +1378,7 @@ mod tests {
         // A decline grants nothing.
         let other = sdk::ToolCall::new("c2", "terminal", run("seq 1 2"));
         rules
-            .record_terminal_answer(sdk::RunId::new(), &other, Some(ApprovalResponse::Deny))
+            .record_owner_answer(sdk::RunId::new(), &other, Some(ApprovalResponse::Deny))
             .await;
         assert!(matches!(
             judge_terminal(&rules, run("seq 1 2")).await,
@@ -1370,7 +1445,7 @@ mod tests {
         );
         let call = sdk::ToolCall::new("c1", "terminal", args.clone());
         rules
-            .record_terminal_answer(
+            .record_owner_answer(
                 sdk::RunId::new(),
                 &call,
                 Some(ApprovalResponse::AllowSession),

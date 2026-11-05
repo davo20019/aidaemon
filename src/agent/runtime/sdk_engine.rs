@@ -1063,6 +1063,7 @@ impl Agent {
             user_role: Some(user_role),
             untrusted_trigger_session: super::is_trigger_session(session_id),
             terminal: terminal_approvals,
+            tools: super::approvals::ApprovalTools::new(self.tools.iter().cloned()),
             run_declines: run_declines.clone(),
         };
         let rules = Arc::new(rules);

@@ -169,19 +169,18 @@ pub(super) fn unjudged_terminal_refusal() -> String {
 }
 
 /// The kernel's judgment of a dispatched call, removed from `judged`:
-/// `None` when the tool is not the terminal (whose approval ladder the
-/// kernel runs and the tool then skips), `Some(None)` when the terminal
-/// call was never judged in `run`.
+/// `None` when the tool's calls are not judged in canonical form
+/// (`dispatch_facts().runs_as_judged`, the terminal, whose approval ladder
+/// the kernel runs and the tool then skips), `Some(None)` when the call was
+/// never judged in `run`.
 pub(super) fn take_terminal_judgment(
     judged: &crate::agent::approvals::JudgedCalls,
     run: sdk::RunId,
     tool: Option<&dyn crate::traits::Tool>,
     call_id: &str,
 ) -> Option<Option<crate::agent::approvals::JudgedTerminal>> {
-    let terminal = tool
-        .and_then(|tool| tool.as_any())
-        .is_some_and(|any| any.downcast_ref::<crate::tools::TerminalTool>().is_some());
-    terminal.then(|| judged.take(run, call_id))
+    let runs_as_judged = tool.is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
+    runs_as_judged.then(|| judged.take(run, call_id))
 }
 
 /// Put a dispatched call in its canonical form: a terminal call the kernel
