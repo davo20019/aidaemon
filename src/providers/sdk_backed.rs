@@ -524,6 +524,11 @@ pub(crate) fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
             None => sdk::ProviderError::InvalidRequest(detail),
         },
         ProviderErrorKind::NotFound => sdk::ProviderError::NotFound(detail),
+        ProviderErrorKind::QuotaExhausted => sdk::ProviderError::QuotaExhausted {
+            message: detail,
+            resets_at: error.resets_at,
+            per_model: false,
+        },
         ProviderErrorKind::Timeout => {
             sdk::ProviderError::Transient(format!("request timed out: {}", error.message))
         }
@@ -565,6 +570,10 @@ pub(crate) fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
             ProviderErrorKind::Billing
         }
         sdk::ProviderError::NotFound(_) => ProviderErrorKind::NotFound,
+        sdk::ProviderError::QuotaExhausted { resets_at, .. } => {
+            out.resets_at = *resets_at;
+            ProviderErrorKind::QuotaExhausted
+        }
         sdk::ProviderError::InvalidRequest(_) | sdk::ProviderError::ContextOverflow { .. } => {
             ProviderErrorKind::BadRequest
         }
@@ -693,7 +702,15 @@ mod tests {
         );
         assert_eq!(
             route(sdk::ProviderError::Auth("HTTP 401: bad".into())),
-            Route::Fail
+            Route::Fallback
+        );
+        assert_eq!(
+            route(sdk::ProviderError::QuotaExhausted {
+                message: "HTTP 429: plan cap".into(),
+                resets_at: None,
+                per_model: false,
+            }),
+            Route::Fallback
         );
         assert_eq!(
             route(sdk::ProviderError::Billing {
@@ -722,6 +739,19 @@ mod tests {
             affordable_tokens: Some(6917),
         });
         assert_eq!(billing.affordable_tokens, Some(6917));
+        let reset =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let capped = to_daemon_error(sdk::ProviderError::QuotaExhausted {
+            message: "HTTP 429: plan cap".into(),
+            resets_at: Some(reset),
+            per_model: false,
+        });
+        assert_eq!(capped.kind, ProviderErrorKind::QuotaExhausted);
+        assert_eq!(capped.resets_at, Some(reset));
+        let back = to_sdk_error(&capped);
+        assert!(
+            matches!(back, sdk::ProviderError::QuotaExhausted { resets_at: Some(at), .. } if at == reset)
+        );
         let server = to_daemon_error(sdk::ProviderError::Transient("HTTP 503: down".into()));
         assert_eq!(server.kind, ProviderErrorKind::ServerError);
         assert_eq!(server.status, Some(503));

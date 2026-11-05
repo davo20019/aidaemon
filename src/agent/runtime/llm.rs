@@ -33,6 +33,10 @@ struct DaemonRecovery {
     provider_label: &'static str,
     /// Models attempted, in order, and whether the run left the first one.
     attempted: std::sync::Mutex<Vec<String>>,
+    /// The first used-up quota the call met: when every later model also
+    /// fails, it is the failure to report (with its reset), not the last
+    /// fallback's error.
+    quota: std::sync::Mutex<Option<aidaemon_core::ProviderError>>,
 }
 
 /// How long a billing failure is cached before the model is tried again
@@ -116,6 +120,11 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
             "LLM call failed: {}",
             daemon_error
         );
+        if matches!(error, aidaemon_core::ProviderError::QuotaExhausted { .. }) {
+            if let Ok(mut quota) = self.quota.lock() {
+                quota.get_or_insert_with(|| error.clone());
+            }
+        }
         // Too long for this model's window: retrying cannot help. Record
         // the window so the caller shrinks the request.
         if let aidaemon_core::ProviderError::ContextOverflow { limit, .. } = error {
@@ -295,7 +304,11 @@ impl Agent {
     /// - Billing: retry once with the affordable cap, then cache the failure
     ///   and move on (cached models are skipped for ten minutes);
     /// - NotFound: next model; malformed shape: one retry, then fail;
-    /// - Auth or a context overflow (recorded for the caller): fail.
+    /// - Auth or a used-up quota: the next provider (each backend's
+    ///   `QuotaGuard` fails the account's other models without a request,
+    ///   and keeps failing them until the quota resets); when every model
+    ///   fails, the quota and its reset are what is reported;
+    /// - a context overflow (recorded for the caller): fail.
     ///
     /// `pin_model` (an active computer-use task) keeps the call on `model`.
     #[allow(clippy::too_many_arguments)]
@@ -342,6 +355,7 @@ impl Agent {
             uncommitted_work: options.uncommitted_work,
             provider_label: provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind()),
             attempted: std::sync::Mutex::new(Vec::new()),
+            quota: std::sync::Mutex::new(None),
         });
         let chain = Failover::new(steps).policy(RecoveryHandle(recovery.clone()));
 
@@ -372,6 +386,10 @@ impl Agent {
             }
             Err(error) => match error.downcast::<ProviderError>() {
                 Ok(provider_err) => {
+                    let quota = recovery.quota.lock().ok().and_then(|quota| quota.clone());
+                    if let Some(quota) = quota {
+                        return Err(quota_failure(quota, provider_err));
+                    }
                     let terminal = provider_err.kind == ProviderErrorKind::Auth
                         || options.single_attempt_fail_closed
                         || crate::providers::context_overflow(&provider_err.to_string()).is_some();
@@ -389,6 +407,21 @@ impl Agent {
             },
         }
     }
+}
+
+/// The error for a call that met a used-up quota and then failed on every
+/// other model: the quota (and its reset) is what the user can act on, so it
+/// is the typed error; what the fallbacks answered follows it.
+fn quota_failure(quota: aidaemon_core::ProviderError, last: ProviderError) -> anyhow::Error {
+    let quota = crate::providers::sdk_backed::to_daemon_error(quota);
+    let mut message = quota.user_message();
+    if last.kind != ProviderErrorKind::QuotaExhausted {
+        message.push_str(&format!(
+            " The fallback providers also failed: {}",
+            last.recovery_failed_message()
+        ));
+    }
+    anyhow::Error::new(quota).context(message)
 }
 
 /// Shares one [`DaemonRecovery`] between the chain and the caller, which
@@ -643,6 +676,148 @@ mod tests {
             "expected multiple attempts, got {}",
             telemetry.attempts
         );
+    }
+
+    fn plan_cap(resets_at: std::time::SystemTime) -> ProviderError {
+        let mut error = ProviderError::from_status(429, "The usage limit has been reached");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error.resets_at = Some(resets_at);
+        error
+    }
+
+    /// A capped plan: the primary account's other models are not sent (its
+    /// guard answers for them), no backoff is spent, and another provider
+    /// answers.
+    #[tokio::test]
+    async fn a_capped_plan_moves_to_another_provider_without_waiting() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let reset = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        let primary_inner = Arc::new(ScriptedProvider::with_results(vec![
+            Err(plan_cap(reset).into()),
+            Ok(MockProvider::text_response(
+                "the capped account must not be sent",
+            )),
+        ]));
+        let primary: crate::llm_runtime::ModelBackend =
+            Arc::new(aidaemon_core::QuotaGuard::from_arc(primary_inner.clone()));
+        let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("answered by the other provider"),
+        )]));
+        let router = crate::router::Router::new(crate::config::ModelsConfig {
+            default_model: "plan-model".into(),
+            fallback_models: vec!["plan-model-small".into(), "plan-model-mini".into()],
+            ..Default::default()
+        });
+        harness.agent.llm_runtime.swap(
+            primary.clone(),
+            Some(router.clone()),
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "other-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        let started = Instant::now();
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let response = harness
+            .agent
+            .call_llm_with_recovery(
+                primary,
+                Some(router),
+                "plan-model",
+                &[],
+                &[],
+                &ChatOptions::default(),
+                &mut telemetry,
+                None,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("another provider answers");
+
+        assert_eq!(
+            response.content.as_deref(),
+            Some("answered by the other provider")
+        );
+        assert_eq!(
+            primary_inner.models_called().await,
+            vec!["plan-model".to_string()]
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(telemetry.final_model, "other-model");
+    }
+
+    /// When every other provider fails too, the plan cap and its reset are
+    /// the reported failure, and what the fallback said follows it.
+    #[tokio::test]
+    async fn a_capped_plan_is_the_reported_failure_when_fallbacks_fail() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let reset = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        let primary: crate::llm_runtime::ModelBackend =
+            Arc::new(aidaemon_core::QuotaGuard::from_arc(Arc::new(
+                ScriptedProvider::with_results(vec![Err(plan_cap(reset).into())]),
+            )));
+        let broke = Arc::new(ScriptedProvider::with_results(vec![Err(
+            ProviderError::from_status(402, "insufficient credits").into(),
+        )]));
+        harness.agent.llm_runtime.swap(
+            primary.clone(),
+            None,
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                broke as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "broke-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let error = harness
+            .agent
+            .call_llm_with_recovery(
+                primary,
+                None,
+                "plan-model",
+                &[],
+                &[],
+                &ChatOptions::default(),
+                &mut telemetry,
+                None,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect_err("every provider fails");
+
+        let typed = error
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(
+            typed.kind,
+            crate::providers::ProviderErrorKind::QuotaExhausted
+        );
+        assert_eq!(typed.resets_at, Some(reset));
+        let message = error.to_string();
+        assert!(
+            message.contains("usage limit has been reached; it resets at"),
+            "{message}"
+        );
+        assert!(
+            message.contains("fallback providers also failed"),
+            "{message}"
+        );
+        assert!(message.contains("billing"), "{message}");
     }
 
     #[tokio::test]
