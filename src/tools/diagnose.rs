@@ -2165,10 +2165,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"list_tasks"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2212,10 +2209,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"timeline","task_id":"t1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2277,10 +2271,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"t1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2395,10 +2386,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"t-replay"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2506,10 +2494,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"t1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2570,10 +2555,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"t-ctx"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2713,10 +2695,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"t1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2848,10 +2827,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"diagnose","task_id":"child-1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -2889,10 +2865,7 @@ mod tests {
         let res = tool
             .call_with(
                 r#"{"action":"timeline","task_id":"t1"}"#,
-                crate::traits::ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();

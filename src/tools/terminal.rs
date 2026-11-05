@@ -9497,10 +9497,7 @@ mod tests {
         let output = tool
             .call_with(
                 r#"{"action":"run","command":"echo semantic-ok"}"#,
-                ToolCallContext {
-                    session_id: "telegram:synthetic-owner".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("telegram:synthetic-owner"),
             )
             .await
             .unwrap();
@@ -10728,10 +10725,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                ToolCallContext {
-                    session_id: "sess_del_receipt".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_del_receipt"),
             )
             .await
             .unwrap();
@@ -10764,10 +10758,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                ToolCallContext {
-                    session_id: "sess_del_receipt".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_del_receipt"),
             )
             .await
             .unwrap();
@@ -10830,10 +10821,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo notify-meta"}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_meta".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_meta"),
             )
             .await
             .unwrap();
@@ -10872,7 +10860,7 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, ToolCallContext { session_id: "sess_service".into(), ..Default::default() })
+            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, crate::testing::call_facts("sess_service"))
             .await
             .unwrap();
         assert!(outcome.metadata.detached);
@@ -10908,10 +10896,7 @@ mod tests {
         tool.call_with_execution_context(
             &format!(r#"{{"action":"kill","pid":{pid}}}"#),
             None,
-            ToolCallContext {
-                session_id: "sess_service".into(),
-                ..Default::default()
-            },
+            crate::testing::call_facts("sess_service"),
         )
         .await
         .unwrap();
@@ -10949,10 +10934,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 5","detach":true}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_detach".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -10984,10 +10966,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"exit 3","detach":true}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_detach".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -11023,10 +11002,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo done-marker"}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_check_done".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_check_done"),
             )
             .await
             .unwrap();
@@ -11089,10 +11065,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo reap-marker"}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_reap_done".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_reap_done"),
             )
             .await
             .unwrap();
@@ -11153,10 +11126,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 30"}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_check_kill".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_check_kill"),
             )
             .await
             .unwrap();
@@ -11226,10 +11196,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                ToolCallContext {
-                    session_id: "sess_own_root".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_own_root"),
             )
             .await
             .unwrap();
@@ -11287,10 +11254,7 @@ mod tests {
             .call_with_execution_context(
                 &args.to_string(),
                 None,
-                ToolCallContext {
-                    session_id: "sess_cwd_root".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_cwd_root"),
             )
             .await
             .unwrap();
@@ -11327,10 +11291,7 @@ mod tests {
             .call_with_execution_context(
                 r#"{"action":"run","command":"sleep 2; echo no-notify-meta"}"#,
                 None,
-                ToolCallContext {
-                    session_id: "sess_meta2".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_meta2"),
             )
             .await
             .unwrap();
@@ -11756,10 +11717,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"nohup sleep 1 &"}"#,
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -11826,10 +11784,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"grep -rc \"async fn\" ."}"#,
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -11866,10 +11821,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok"}"#,
-                ToolCallContext {
-                    session_id: "sess_notify".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_notify"),
             )
             .await
             .unwrap();
@@ -11922,7 +11874,7 @@ mod tests {
         // Emit output early so a periodic ping has something NEW to report —
         // no-output commands are now intentionally quiet until completion.
         let response = tool
-            .call_with(r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok"}"#, ToolCallContext { session_id: "sess_seq".into(), ..Default::default() })
+            .call_with(r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok"}"#, crate::testing::call_facts("sess_seq"))
             .await
             .unwrap();
         assert!(
@@ -12007,10 +11959,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 3"}"#,
-                ToolCallContext {
-                    session_id: "sess_quiet".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_quiet"),
             )
             .await
             .unwrap();
@@ -12348,10 +12297,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 120"}"#,
-                ToolCallContext {
-                    session_id: "sess_reap".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_reap"),
             )
             .await
             .unwrap();
@@ -12430,7 +12376,7 @@ mod tests {
         // Emits a line roughly every 0.2s for a while — a stand-in for a dev server
         // or a scan that is genuinely making progress.
         let response = tool
-            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, ToolCallContext { session_id: "sess_stream".into(), ..Default::default() })
+            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, crate::testing::call_facts("sess_stream"))
             .await
             .unwrap();
         assert!(response.contains("Moved to background (pid="));
@@ -12523,10 +12469,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo $((40 + 2))"}"#,
-                ToolCallContext {
-                    session_id: "sess_short".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_short"),
             )
             .await
             .unwrap();
@@ -12584,10 +12527,7 @@ mod tests {
         let first = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo duplicate-result"}"#,
-                ToolCallContext {
-                    session_id: "sess_dupe_result".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
@@ -12596,10 +12536,7 @@ mod tests {
         let second = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result"}"#,
-                ToolCallContext {
-                    session_id: "sess_dupe_result".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
@@ -12673,10 +12610,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished"}"#,
-                ToolCallContext {
-                    session_id: "sess_server".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_server"),
             )
             .await
             .unwrap();
@@ -12739,10 +12673,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 10"}"#,
-                ToolCallContext {
-                    session_id: "sess_kill".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_kill"),
             )
             .await
             .unwrap();
@@ -12751,10 +12682,7 @@ mod tests {
         let kill_response = tool
             .call_with(
                 &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "sess_kill".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_kill"),
             )
             .await
             .unwrap();
@@ -12794,10 +12722,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"sleep 2; echo post-reap-ok"}"#,
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12808,10 +12733,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12924,10 +12846,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12987,10 +12906,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "sess_disown".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess_disown"),
             )
             .await
             .unwrap();
@@ -13122,10 +13038,7 @@ mod tests {
         let check = tool
             .call_with(
                 &format!(r#"{{"action":"check","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13137,10 +13050,7 @@ mod tests {
         let _ = tool
             .call_with(
                 &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await;
     }
@@ -13241,13 +13151,7 @@ mod tests {
             "command": command});
 
         let response = tool
-            .call_with(
-                &args.to_string(),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
-            )
+            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
             .await
             .unwrap();
         assert!(
@@ -13292,13 +13196,7 @@ mod tests {
             "command": command});
 
         let response = tool
-            .call_with(
-                &args.to_string(),
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
-            )
+            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
             .await
             .unwrap();
         assert!(
@@ -13537,10 +13435,7 @@ mod tests {
         let response = tool
             .call_with(
                 r#"{"action":"run","command":"echo hi","detach":true}"#,
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -13632,10 +13527,7 @@ mod tests {
         let resp = tool
             .call_with(
                 r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10"}"#,
-                ToolCallContext {
-                    session_id: "s".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s"),
             )
             .await
             .unwrap();
@@ -13655,10 +13547,7 @@ mod tests {
         let ok = tool
             .call_with(
                 r#"{"action":"run","command":"echo scoped-ok"}"#,
-                ToolCallContext {
-                    session_id: "s".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("s"),
             )
             .await
             .unwrap();

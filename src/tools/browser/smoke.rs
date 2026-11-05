@@ -86,10 +86,7 @@ async fn browser_smoke_real_chrome() {
                 "url": fixture_url,
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("navigate");
@@ -103,10 +100,7 @@ async fn browser_smoke_real_chrome() {
                 "value": "replaced",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("fill");
@@ -119,10 +113,7 @@ async fn browser_smoke_real_chrome() {
                 "selector": "#go",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("click");
@@ -137,10 +128,7 @@ async fn browser_smoke_real_chrome() {
                 "selector": "#out",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("get_text");
@@ -155,10 +143,7 @@ async fn browser_smoke_real_chrome() {
                 "action": "get_console_logs",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("get_console_logs");
@@ -173,10 +158,7 @@ async fn browser_smoke_real_chrome() {
                 "action": "screenshot",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: (session).to_string(),
-                ..Default::default()
-            },
+            crate::testing::call_facts(session),
         )
         .await
         .expect("screenshot");
@@ -242,10 +224,7 @@ html, body { margin: 0; background: #08352d; color: white }
                 "output_filename": "designed-document.pdf",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
-                session_id: "pdf-smoke".into(),
-                ..Default::default()
-            },
+            crate::testing::call_facts("pdf-smoke"),
         )
         .await
         .expect("render action");

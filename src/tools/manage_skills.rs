@@ -3763,10 +3763,7 @@ mutation CreateWidget {
                     "url":"https://example.com/openapi.json",
                     "profile":"demo"
                 }"#,
-                crate::traits::ToolCallContext {
-                    session_id: "test:owner".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();
@@ -3791,10 +3788,7 @@ mutation CreateWidget {
                     "action":"add",
                     "url":"https://example.com/skill.md"
                 }"#,
-                crate::traits::ToolCallContext {
-                    session_id: "test:owner".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();
@@ -3832,10 +3826,7 @@ mutation CreateWidget {
                     "action":"update",
                     "name":"updatable"
                 }"#,
-                crate::traits::ToolCallContext {
-                    session_id: "test:owner".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();

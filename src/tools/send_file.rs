@@ -540,14 +540,7 @@ mod tests {
         let call_tool = tool.clone();
         let call = tokio::spawn(async move {
             call_tool
-                .call_with_execution_context(
-                    &args,
-                    None,
-                    crate::traits::ToolCallContext {
-                        session_id: "sess-1".into(),
-                        ..Default::default()
-                    },
-                )
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
                 .await
         });
         // Deliver the receipt like the hub's media_listener does.
@@ -588,14 +581,7 @@ mod tests {
         let call_tool = tool.clone();
         let call = tokio::spawn(async move {
             call_tool
-                .call_with_execution_context(
-                    &args,
-                    None,
-                    crate::traits::ToolCallContext {
-                        session_id: "sess-1".into(),
-                        ..Default::default()
-                    },
-                )
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
                 .await
         });
         let mut msg = rx.recv().await.expect("media message enqueued");
@@ -635,14 +621,7 @@ mod tests {
         let args = json!({ "file_path": f.to_string_lossy()}).to_string();
         // Nobody answers the receipt (congested channel) → honest pending text.
         let outcome = tool
-            .call_with_execution_context(
-                &args,
-                None,
-                crate::traits::ToolCallContext {
-                    session_id: "sess-1".into(),
-                    ..Default::default()
-                },
-            )
+            .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
             .await
             .expect("call ok");
         let _keep_queue_alive = rx.recv().await; // message was still enqueued
@@ -688,14 +667,7 @@ mod tests {
         let call_tool = tool.clone();
         let call = tokio::spawn(async move {
             call_tool
-                .call_with_execution_context(
-                    &args,
-                    None,
-                    crate::traits::ToolCallContext {
-                        session_id: "sess-1".into(),
-                        ..Default::default()
-                    },
-                )
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
                 .await
         });
         let mut msg = rx.recv().await.expect("media message sent");
@@ -762,10 +734,7 @@ mod tests {
                 .call_with_execution_context(
                     &args,
                     None,
-                    crate::traits::ToolCallContext {
-                        session_id: "sess-resource".into(),
-                        ..Default::default()
-                    },
+                    crate::testing::call_facts("sess-resource"),
                 )
                 .await
         });
@@ -819,10 +788,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
-                crate::traits::ToolCallContext {
-                    session_id: "sess-resource".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("sess-resource"),
             )
             .await
             .expect("call");
@@ -895,13 +861,7 @@ mod tests {
         })
         .to_string();
         let out = tool
-            .call_with(
-                &args,
-                crate::traits::ToolCallContext {
-                    session_id: "s".into(),
-                    ..Default::default()
-                },
-            )
+            .call_with(&args, crate::testing::call_facts("s"))
             .await
             .expect("call ok");
         assert!(out.contains("outside allowed directories"), "got: {out}");
@@ -935,13 +895,7 @@ mod tests {
         })
         .to_string();
         let out = tool
-            .call_with(
-                &args,
-                crate::traits::ToolCallContext {
-                    session_id: "s".into(),
-                    ..Default::default()
-                },
-            )
+            .call_with(&args, crate::testing::call_facts("s"))
             .await
             .expect("call ok");
         assert!(out.contains("blocked for security"), "got: {out}");

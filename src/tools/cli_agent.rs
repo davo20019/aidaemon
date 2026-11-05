@@ -6669,10 +6669,7 @@ mod tests {
             None,
             false,
             false,
-            &crate::traits::ToolCallContext {
-                session_id: "sess1".into(),
-                ..Default::default()
-            },
+            &crate::testing::call_facts("sess1"),
         )
         .await
         .unwrap();
@@ -6753,10 +6750,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::traits::ToolCallContext {
-                    session_id: "sess1".into(),
-                    ..Default::default()
-                },
+                &crate::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -6926,10 +6920,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::traits::ToolCallContext {
-                    session_id: "sess1".into(),
-                    ..Default::default()
-                },
+                &crate::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -6956,7 +6947,7 @@ mod tests {
     async fn check_with_wrong_id_recovers_only_session_task() {
         let (tool, _db) = setup_bash_tool().await;
         let started = tool
-            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &crate::traits::ToolCallContext { session_id: "session-recover".into(), ..Default::default() })
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &crate::testing::call_facts("session-recover"))
             .await
             .unwrap();
         let real_task_id = extract_task_id_from_background_message(&started);
@@ -7032,10 +7023,7 @@ mod tests {
             None,
             false,
             false,
-            &crate::traits::ToolCallContext {
-                session_id: "session-progress".into(),
-                ..Default::default()
-            },
+            &crate::testing::call_facts("session-progress"),
         )
         .await
         .unwrap();
@@ -7320,10 +7308,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::traits::ToolCallContext {
-                    session_id: "telegram_12345".into(),
-                    ..Default::default()
-                },
+                &crate::testing::call_facts("telegram_12345"),
             )
             .await
             .unwrap();
@@ -7360,10 +7345,7 @@ mod tests {
                 None,
                 false,
                 false,
-                &crate::traits::ToolCallContext {
-                    session_id: "telegram_12345".into(),
-                    ..Default::default()
-                },
+                &crate::testing::call_facts("telegram_12345"),
             )
             .await
             .unwrap();

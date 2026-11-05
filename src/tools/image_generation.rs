@@ -1253,10 +1253,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
-                crate::traits::ToolCallContext {
-                    session_id: "slack:private-b".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("slack:private-b"),
             )
             .await
             .expect("return a structured reference error");
@@ -1303,10 +1300,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
-                crate::traits::ToolCallContext {
-                    session_id: "slack:test".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("slack:test"),
             )
             .await
             .expect("return a structured integrity error");

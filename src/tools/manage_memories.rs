@@ -3289,10 +3289,7 @@ mod tests {
                     "goal_id": "all"
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "user-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("user-session"),
             )
             .await
             .unwrap();
@@ -3345,10 +3342,7 @@ mod tests {
                     "goal_id": "all"
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "session-a".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("session-a"),
             )
             .await
             .unwrap();
@@ -3651,10 +3645,7 @@ mod tests {
                     "goal": "Learn conversational Spanish"
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3712,10 +3703,7 @@ mod tests {
                     "limit": 10
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3746,10 +3734,7 @@ mod tests {
                     "priority": "high"
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3772,10 +3757,7 @@ mod tests {
                     "priority": "ultra"
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3797,10 +3779,7 @@ mod tests {
                     "goal": "   "
                 })
                 .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    ..Default::default()
-                },
+                crate::testing::call_facts("owner-session"),
             )
             .await;
 
