@@ -120,10 +120,18 @@ async fn run_owner_turn(harness: &crate::testing::TestHarness, channel_ctx: Chan
 }
 
 async fn run_owner_turn_on(agent: &crate::agent::Agent, channel_ctx: ChannelContext) {
+    run_owner_turn_in(agent, APPROVALS_SESSION, channel_ctx).await;
+}
+
+async fn run_owner_turn_in(
+    agent: &crate::agent::Agent,
+    session_id: &str,
+    channel_ctx: ChannelContext,
+) {
     use crate::runtime_ports::AgentIngress;
     agent
         .handle_inbound_message(crate::runtime_ports::InboundMessageRequest {
-            session_id: APPROVALS_SESSION.to_string(),
+            session_id: session_id.to_string(),
             user_text: "Post the synthetic report for Alice Rivera".to_string(),
             attachments: Vec::new(),
             status_tx: None,
@@ -1057,4 +1065,100 @@ async fn declined_effect_reported_honestly() {
     let outcome = latest_task_outcome(&harness, APPROVALS_SESSION).await;
     assert_ne!(outcome, crate::events::TaskOutcome::Succeeded);
     assert_eq!(outcome, crate::events::TaskOutcome::Partial);
+}
+
+/// Ledger rows of `session` whose refusal carries `reason_code`.
+async fn ledger_refusals(
+    harness: &crate::testing::TestHarness,
+    session: &str,
+    reason_code: &str,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND event_type = 'tool_result' \
+         AND data LIKE ?",
+    )
+    .bind(session)
+    .bind(format!("%\"reason_code\":\"{reason_code}\"%"))
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap()
+}
+
+/// A terminal call that reaches the dispatcher without the kernel's
+/// judgment is refused at the gate: the refusal is returned, ledgered as
+/// `kernel_judgment_missing`, and the command never runs.
+#[tokio::test]
+async fn unjudged_terminal_call_is_refused_by_the_dispatcher() {
+    let session = format!("telegram:synthetic-unjudged-{}", uuid::Uuid::new_v4());
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run("printf synthetic-probe-ran"),
+            MockProvider::text_response("It was refused."),
+        ],
+        vec![],
+        no_assessor(&["printf"]),
+    )
+    .await;
+    crate::agent::approvals::JUDGMENT_SEAMS.lock().unwrap().insert(
+        session.clone(),
+        crate::agent::approvals::JudgmentSeam::DropJudgment,
+    );
+    run_owner_turn_in(&harness.agent, &session, ChannelContext::private("telegram")).await;
+    crate::agent::approvals::JUDGMENT_SEAMS
+        .lock()
+        .unwrap()
+        .remove(&session);
+
+    assert_eq!(approver.card_count(), 0, "the allowlisted command needs no card");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("requires approval through the agent kernel"),
+        "{results:?}"
+    );
+    assert!(!results[0].contains("synthetic-probe-ran"), "the command ran: {results:?}");
+    assert_eq!(
+        ledger_refusals(&harness, &session, "kernel_judgment_missing").await,
+        1
+    );
+}
+
+/// The dispatcher applies the scope the kernel judged the call with, not a
+/// scope check recomputed at dispatch: a call judged as refused is refused
+/// with the judged reason even though a fresh check finds it in scope.
+#[tokio::test]
+async fn dispatcher_executes_with_the_judged_scope() {
+    let session = format!("telegram:synthetic-judged-{}", uuid::Uuid::new_v4());
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run("printf synthetic-probe-ran"),
+            MockProvider::text_response("It was refused."),
+        ],
+        vec![],
+        no_assessor(&["printf"]),
+    )
+    .await;
+    crate::agent::approvals::JUDGMENT_SEAMS.lock().unwrap().insert(
+        session.clone(),
+        crate::agent::approvals::JudgmentSeam::JudgedScope(
+            crate::agent::approvals::TerminalScope::Refused(
+                "synthetic judged refusal".to_string(),
+            ),
+        ),
+    );
+    run_owner_turn_in(&harness.agent, &session, ChannelContext::private("telegram")).await;
+    crate::agent::approvals::JUDGMENT_SEAMS
+        .lock()
+        .unwrap()
+        .remove(&session);
+
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("synthetic judged refusal"), "{results:?}");
+    assert!(!results[0].contains("synthetic-probe-ran"), "the command ran: {results:?}");
+    assert_eq!(
+        ledger_refusals(&harness, &session, "controller_scope_contract_rejected").await,
+        1
+    );
 }

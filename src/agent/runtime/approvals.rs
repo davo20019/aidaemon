@@ -176,6 +176,28 @@ pub(crate) struct JudgedTerminal {
 
 type Canonicalize = dyn Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync;
 
+/// Test seams on the judgment path, by session: drop a judgment before the
+/// dispatcher takes it, or make the kernel judge a call with a given scope.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum JudgmentSeam {
+    DropJudgment,
+    JudgedScope(TerminalScope),
+}
+
+#[cfg(test)]
+pub(crate) static JUDGMENT_SEAMS: std::sync::LazyLock<Mutex<HashMap<String, JudgmentSeam>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn judgment_seam(session_id: &str) -> Option<JudgmentSeam> {
+    JUDGMENT_SEAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+}
+
 /// The canonical form of each terminal call the kernel judged, keyed by
 /// run and call id (call ids are only unique within a run, and concurrent
 /// runs share no entries): the dispatcher executes exactly these arguments.

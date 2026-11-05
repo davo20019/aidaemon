@@ -198,6 +198,11 @@ pub(super) fn canonicalize_dispatched_call(
         tool,
         &request.call_id,
     );
+    #[cfg(test)]
+    let taken = match crate::agent::approvals::judgment_seam(scope.session_id) {
+        Some(crate::agent::approvals::JudgmentSeam::DropJudgment) => taken.map(|_| None),
+        _ => taken,
+    };
     let (judged, judgment) = match taken {
         Some(Some(judged)) => {
             let check = judged.scope.as_scope_check();

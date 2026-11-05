@@ -442,6 +442,11 @@ pub(super) fn terminal_canonicalizer(
             }
             None => super::approvals::TerminalScope::InScope,
         };
+        #[cfg(test)]
+        let scope = match super::approvals::judgment_seam(&turn.session_id) {
+            Some(super::approvals::JudgmentSeam::JudgedScope(judged)) => judged,
+            _ => scope,
+        };
         super::approvals::JudgedTerminal { call, scope }
     }
 }

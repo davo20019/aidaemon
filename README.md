@@ -210,43 +210,57 @@ Some actions wait for your OK. aidaemon sends you a card in the chat that
 says what the agent wants to do, how risky it is, and anything worth
 knowing. You are asked when the agent wants to:
 
-- send an HTTP request that changes something (anything other than a plain
+- send a web request that changes something (anything other than a plain
   GET, HEAD or OPTIONS), including a live test of a new API connection;
-- run a terminal command that is not on your allowlist, or one that needs a
-  look whatever the list says: reading sensitive files such as `~/.ssh`,
-  starting something that keeps running in the background, reaching outside
-  the task's folders in a sandboxed terminal, or turning on trust-all mode;
+- run a terminal command that is not on your allowlist, unless aidaemon's
+  safety check looks at it and finds nothing risky. If the check flags it,
+  fails, takes too long or is not set up, you are asked;
+- run a terminal command that needs a look whatever the allowlist says:
+  reading sensitive files such as `~/.ssh`, starting a program that keeps
+  running in the background, running a new command detached from the task,
+  reaching outside the task's folders in a sandboxed terminal, or turning on
+  trust-all mode;
 - run any terminal command in a chat started by an automated trigger, such as
   an incoming email.
 
-Scheduled tasks you set up yourself run without cards. Before anything is
-asked, outgoing requests are checked for secrets such as API keys and tokens:
-a request carrying one is blocked, not asked about.
+Trusted sessions run their web requests and terminal commands without
+cards: scheduled goals and tasks you set up, and automated events marked as
+trusted. In exchange, they cannot start programs that keep running in the
+background. One exception: terminal commands in a chat started by an
+automated trigger are always asked about, trusted or not. An Autopilot
+mandate's web requests are not asked about either: they run only when they
+match the action you granted the mandate. Before anything is asked, outgoing
+requests are checked for secrets such as API keys and tokens: a request
+carrying one is blocked, not asked about.
 
 How to answer:
 
 - **Allow Once** runs this one action.
 - **Allow Session** also allows the same action again without asking, until
-  the daemon restarts. For a web request this covers the same request from
-  this chat and the helper agents it starts; for a terminal command, commands
-  that start the same way.
+  the daemon restarts. For a web request this covers the same method to the
+  same address, from this chat and the helper agents it starts. For a terminal command it covers
+  commands that start the same way, from any chat.
 - **Allow Always** (terminal commands) saves the command's start to your
   allowlist, so commands like it run without a card from now on.
 - **Deny** stops the action.
 
-A card offers either Allow Session or Allow Always, depending on how risky the
-action is and the terminal's permission mode. A card waits five minutes; no
-answer, or a card that could not be delivered, counts as Deny.
+Web request cards offer Allow Session. Terminal cards offer either Allow
+Session or Allow Always, depending on the terminal's permission mode and the
+command's risk (by default, Allow Session for critical commands and Allow
+Always for the rest). A card waits five minutes; no answer, or a card that
+could not be delivered, counts as Deny.
 
 A Deny holds for the rest of the task. The agent cannot get around it by
 trying another way: once you decline a POST to a site, a `curl` to that site
 from the terminal is refused too, and so is the same request from any helper
 agent the task starts. No new card is sent for these retries. If, after a
-Deny, the agent tries something whose effects cannot be worked out in advance
-(an unfamiliar script, for example), you are asked again; it is never let
-through quietly. A task in which you declined something is recorded as only
-partly done, never as a success. Your next message starts a new task, so you
-can change your mind and ask again.
+Deny, the agent tries something that sends data out or deletes, and whose
+effects cannot be worked out in advance (an unfamiliar script, for example),
+you are asked again; it is never let through quietly. A task in which you
+declined something is recorded as only partly done, never as a success. A
+message you send while the task is still running joins that task, and the
+Deny still holds. Once the task has finished, your next message starts a new
+task, so you can change your mind and ask again.
 
 ### Customize your agent
 
