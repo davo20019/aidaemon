@@ -594,6 +594,7 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
         .to_ascii_lowercase();
     let status = field("status").and_then(Value::as_u64);
     let message = format!("Codex stream failed: {message}");
+    tracing::warn!(code = %code, status = ?status, event = %event, "Codex stream failure event");
     let overloaded = code.contains("overload")
         || code == "server_error"
         || code == "service_unavailable"

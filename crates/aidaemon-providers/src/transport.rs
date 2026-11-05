@@ -85,6 +85,13 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 pub(crate) fn map_status(status: StatusCode, headers: &HeaderMap, body: &str) -> ProviderError {
     let excerpt = body_excerpt(body);
     let detail = format!("HTTP {}: {}", status.as_u16(), excerpt);
+    // Some kinds (a rate limit) keep no message, so the body is only here.
+    tracing::warn!(
+        status = status.as_u16(),
+        retry_after = ?retry_after(headers),
+        body = %excerpt,
+        "provider HTTP error"
+    );
     match status.as_u16() {
         429 => ProviderError::RateLimited {
             retry_after: retry_after(headers),
