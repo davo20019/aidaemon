@@ -1443,6 +1443,31 @@ fn interrupted_and_failed_runs_map_to_non_success_outcomes() {
     assert_eq!(task_outcome, TaskOutcome::Succeeded);
 }
 
+/// A used-up quota ends the run with its own explanation and reset, not a
+/// generic provider error.
+#[test]
+fn a_used_up_quota_reply_names_the_limit_and_its_reset() {
+    let error = sdk::ProviderError::QuotaExhausted {
+        message: "The LLM plan's usage limit has been reached; it resets at 14:05 UTC (in 2h 10m)."
+            .into(),
+        resets_at: None,
+        per_model: false,
+    };
+    let outcome = sdk::RunOutcome {
+        status: sdk::RunStatus::ProviderFailed {
+            error: error.to_string(),
+        },
+        final_text: None,
+        state: sdk::RunState::new("aidaemon", "s", "hi"),
+    };
+    let (reply, status, _) = reply_for(&outcome);
+    assert_eq!(
+        reply,
+        "I couldn't finish: The LLM plan's usage limit has been reached; it resets at 14:05 UTC (in 2h 10m)."
+    );
+    assert_eq!(status, TaskStatus::Failed);
+}
+
 /// A stopped run's reply gets the same checks as a completed one: no
 /// debug text, and no secret on a public channel.
 #[test]

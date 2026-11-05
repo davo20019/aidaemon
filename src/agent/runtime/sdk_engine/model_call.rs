@@ -497,6 +497,18 @@ impl Agent {
                     );
                     scope.context_overflowed.store(true, Ordering::Relaxed);
                 }
+                // A used-up quota stays typed: the reply names it and its
+                // reset instead of a generic provider error.
+                if let Some(quota) = error
+                    .downcast_ref::<crate::providers::ProviderError>()
+                    .filter(|e| e.kind == crate::providers::ProviderErrorKind::QuotaExhausted)
+                {
+                    return Err(sdk::ProviderError::QuotaExhausted {
+                        message: error.to_string(),
+                        resets_at: quota.resets_at,
+                        per_model: false,
+                    });
+                }
                 return Err(sdk::ProviderError::Other(error.to_string()));
             }
         };
