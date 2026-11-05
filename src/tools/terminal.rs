@@ -7268,7 +7268,6 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
         completion_notifications_enabled: false,
         transport_error: None,
         http_status: None,
-        direct_response: None,
         semantics: ToolCallSemantics::default(),
         read_file: None,
         ..Default::default()

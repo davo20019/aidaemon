@@ -90,9 +90,6 @@ const DEFAULT_MAX_TURNS: u32 = 150;
 /// agents); this only stops a wedged call from holding the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
-/// The run ended on a terminal tool result (background handoff, executor
-/// blocker, direct response) whose reply ships as is.
-const TERMINAL_REPLY_STOP: &str = "terminal tool result";
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,16 +508,6 @@ struct BudgetGoal {
     scheduled: bool,
 }
 
-impl TurnScope<'_> {
-    /// End the run before the next model call and ship `reply`.
-    fn end_with(&self, reply: String, outcome: TaskOutcome) {
-        if let Ok(mut terminal) = self.verdict.terminal_reply.lock() {
-            *terminal = Some((reply, outcome));
-        }
-        self.end_run.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Everything a dispatched call needs from the turn.
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
@@ -612,8 +599,6 @@ pub(in crate::agent) struct TurnScope<'a> {
     owned_memory_tools: &'static [&'static str],
     /// Tool calls in the latest model response (a direct response needs one).
     last_batch_size: std::sync::atomic::AtomicUsize,
-    /// Ends the run at the next turn boundary (a background handoff).
-    end_run: Arc<AtomicBool>,
     /// Skills referencing untrusted external content are active.
     restrict_untrusted_reference_tools: bool,
     untrusted_reference_skills: Vec<String>,
@@ -958,14 +943,6 @@ impl Agent {
                 });
             }
         }
-        // A background handoff ends the run before the next model call.
-        let end_run = Arc::new(AtomicBool::new(false));
-        let end_flag = end_run.clone();
-        builder = builder.stop_when(move |_: &sdk::RunSnapshot| {
-            end_flag
-                .load(Ordering::Relaxed)
-                .then(|| TERMINAL_REPLY_STOP.to_string())
-        });
         // Memory hooks run after the ledger stop, so a rejected final answer
         // never reaches a memory writer. Summarization and learning belong to
         // the turn, so they run whatever the memory plugin.
@@ -1254,7 +1231,6 @@ impl Agent {
             verdict: verdict.clone(),
             owned_memory_tools,
             last_batch_size: std::sync::atomic::AtomicUsize::new(0),
-            end_run: end_run.clone(),
             progress: std::sync::Mutex::new(
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),

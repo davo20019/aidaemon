@@ -897,83 +897,40 @@ impl Agent {
                 // (server, tunnel, watcher) that never "finishes": its useful
                 // result is its startup output, so the run continues and the
                 // model reports it. Work a tool handed to the background ends
-                // the run on its finish, unless the assessed task shape keeps
-                // independent inline work going.
-                if crate::agent::tool_execution::tool_result_indicates_background_detach(
-                    &request.name,
-                    &output,
-                    &outcome.metadata,
-                ) || outcome.metadata.background_handoff
-                {
-                    let directive = if scope.continue_inline_after_background
-                        || outcome.metadata.detached
-                    {
-                        finish = None;
-                        crate::agent::system_directives::SystemDirective::BackgroundProcessContinue
-                    } else {
+                // the run on the tool's finish, unless the assessed task
+                // shape keeps independent inline work going.
+                if outcome.metadata.background_started || outcome.metadata.background_handoff {
+                    let hands_off = finish.is_some()
+                        && !scope.continue_inline_after_background
+                        && !outcome.metadata.detached;
+                    let directive = if hands_off {
                         // With notifications on, the result follows by
                         // itself: a plain handoff, no pid or tool jargon.
                         // Without them, the ack says how to check on it.
                         let reply = if outcome.metadata.completion_notifications_enabled {
+                            scope.background_handoff.store(true, Ordering::Relaxed);
                             crate::agent::post_task::build_friendly_background_handoff(
                                 scope.user_text,
                             )
                         } else {
                             crate::agent::tool_execution::build_background_detach_ack(
-                                &request.name,
                                 &output,
                                 &outcome.metadata,
                             )
                         };
-                        match finish.as_mut() {
-                            Some(finish) => finish.reply = Some(reply),
-                            None => scope.end_with(reply, TaskOutcome::Partial),
-                        }
-                        if outcome.metadata.completion_notifications_enabled {
-                            scope.background_handoff.store(true, Ordering::Relaxed);
+                        if let Some(finish) = finish.as_mut() {
+                            finish.reply = Some(reply);
                         }
                         crate::agent::system_directives::SystemDirective::BackgroundHandoff {
                             notifications_active: outcome.metadata.completion_notifications_enabled,
                         }
+                    } else {
+                        finish = None;
+                        crate::agent::system_directives::SystemDirective::BackgroundProcessContinue
                     };
                     output = format!("{output}\n\n{}", directive.render());
                 }
                 let satisfied = !status.is_failure();
-                // An executor's typed blocker ends its run with the structured
-                // summary; the untrusted-data wrapper is removed first so
-                // reply sanitization does not empty it.
-                if satisfied && request.name == "report_blocker" && self.task_id.is_some() {
-                    scope.end_with(
-                        crate::agent::completion_checks::strip_untrusted_wrapper(&output)
-                            .to_string(),
-                        TaskOutcome::Partial,
-                    );
-                }
-                // A committed non-action mandate decision (WAIT/ASK/STOP)
-                // completes the review: read from the durable decision, the
-                // run ends without another model call.
-                if satisfied
-                    && request.name == "manage_mandates"
-                    && request.arguments.get("action").and_then(Value::as_str)
-                        == Some("record_decision")
-                    && self.mandate_execution.is_some()
-                {
-                    if let Some(summary) =
-                        crate::agent::mandate_run::committed_non_action_mandate_summary(self).await
-                    {
-                        scope.end_with(summary, TaskOutcome::Succeeded);
-                    }
-                }
-                // A tool's direct response answers a root turn's lone call.
-                if satisfied
-                    && self.depth == 0
-                    && scope.last_batch_size.load(Ordering::Relaxed) == 1
-                    && !(outcome.metadata.background_started || outcome.metadata.detached)
-                {
-                    if let Some(reply) = outcome.metadata.direct_response.clone() {
-                        scope.end_with(reply, TaskOutcome::Succeeded);
-                    }
-                }
                 // The tool's own typed finish ends the run once the batch
                 // completes. One without a reply ships the call's output, the
                 // untrusted-data wrapper removed so reply sanitization does not

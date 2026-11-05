@@ -1314,10 +1314,6 @@ pub struct ToolCallMetadata {
     /// adapters. It is persisted with the receipt and never contains secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_preflight: Option<AuthorizationPreflightRecord>,
-    /// Optional final user-facing reply. When set, the root agent may close the
-    /// turn directly from the tool result instead of running another LLM pass.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direct_response: Option<String>,
     /// The call handed the rest of the turn's work to a background job whose
     /// result reaches the session later (a launch moved to background
     /// tracking, a background sub-agent). Set with the call's finish by

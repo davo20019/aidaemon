@@ -160,8 +160,9 @@ fn finishing_call_output(outcome: &sdk::RunOutcome, tool: &str) -> Option<String
 /// they judge a run exactly as the turn does.
 #[derive(Default)]
 pub(crate) struct TurnVerdict {
-    /// The neutral handoff reply once work moved to the background.
-    pub(super) terminal_reply: std::sync::Mutex<Option<(String, TaskOutcome)>>,
+    /// The reply and outcome a used-up goal or mandate budget closes the run
+    /// with; the run itself ends through the provider port.
+    budget_stop: std::sync::Mutex<Option<(String, TaskOutcome)>>,
     /// Confirmation of the latest successful external change.
     pub(super) external_action_ack: std::sync::Mutex<Option<String>>,
     /// Set when the run must end failed despite a final answer.
@@ -175,6 +176,14 @@ pub(crate) struct TurnVerdict {
 }
 
 impl TurnVerdict {
+    /// The run ends on a used-up budget: the next model call fails with the
+    /// budget's marker, and the turn ships `reply` with `outcome`.
+    pub(super) fn record_budget_stop(&self, reply: String, outcome: TaskOutcome) {
+        if let Ok(mut stop) = self.budget_stop.lock() {
+            *stop = Some((reply, outcome));
+        }
+    }
+
     pub(crate) fn record_interrupted_answer(&self, answer: String) {
         if let Ok(mut interrupted) = self.interrupted_answer.lock() {
             *interrupted = Some(answer);
@@ -253,17 +262,8 @@ impl TurnVerdict {
             .lock()
             .ok()
             .and_then(|ack| ack.clone());
-        let terminal = self
-            .terminal_reply
-            .lock()
-            .ok()
-            .and_then(|reply| reply.clone());
-        let (reply, status, task_outcome) = match (&outcome.status, terminal) {
-            (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
-                if reason == TERMINAL_REPLY_STOP =>
-            {
-                (reply, TaskStatus::Completed, outcome)
-            }
+        let budget_stop = self.budget_stop.lock().ok().and_then(|stop| stop.clone());
+        let (reply, status, task_outcome) = match (&outcome.status, budget_stop) {
             // A budget stop ends the run through the provider port.
             (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
                 if error.contains(GOAL_BUDGET_EXHAUSTED)

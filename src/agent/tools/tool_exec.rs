@@ -62,9 +62,6 @@ fn sanitize_workspace_tool_outcome(
     grant: &WorkspaceGrant,
 ) -> crate::traits::ToolCallOutcome {
     outcome.output = sanitize_workspace_tool_text(&outcome.output, grant);
-    if let Some(response) = outcome.metadata.direct_response.as_mut() {
-        *response = sanitize_workspace_tool_text(response, grant);
-    }
     if let Some(reply) = outcome
         .finish
         .as_mut()

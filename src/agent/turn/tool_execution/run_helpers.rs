@@ -395,33 +395,14 @@ pub(in crate::agent) fn access_manifest_scope_check(
     Some(ScopeCheck::Rejected(reason))
 }
 
-pub(in crate::agent) fn tool_result_indicates_background_detach(
-    tool_name: &str,
-    result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
-) -> bool {
-    let _ = tool_name;
-    if metadata.background_started {
-        return true;
-    }
-    result_text.contains("Moved to background")
-        || result_text.contains("started in background")
-        || result_text.contains("spawned in background")
-}
-
+/// The reply for a turn a tool handed to the background without completion
+/// notifications: the tool's own first line.
 pub(in crate::agent) fn build_background_detach_ack(
-    tool_name: &str,
     result_text: &str,
     metadata: &crate::traits::ToolCallMetadata,
 ) -> String {
-    let default_prefix = match tool_name {
-        "terminal" => "The command is running in the background.",
-        "cli_agent" => "The CLI agent task is running in the background.",
-        "spawn_agent" => "The spawned sub-agent is running in the background.",
-        _ => "The task is running in the background.",
-    };
     let first_line = crate::traits::first_primary_message_line(result_text, &[])
-        .unwrap_or(default_prefix.to_string());
+        .unwrap_or_else(|| "The task is running in the background.".to_string());
     // Use structured tool metadata rather than inferring notification semantics
     // from rendered tool output text.
     let notifications_active = metadata.completion_notifications_enabled;
@@ -2268,45 +2249,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_background_detach_markers_for_supported_tools() {
-        let none = crate::traits::ToolCallMetadata::default();
-        let flagged = crate::traits::ToolCallMetadata {
-            background_started: true,
-            ..Default::default()
-        };
-        assert!(tool_result_indicates_background_detach(
-            "terminal",
-            "Process finished normally.",
-            &flagged
-        ));
-        assert!(tool_result_indicates_background_detach(
-            "terminal",
-            "Command still running after 30s. Moved to background (pid=123).",
-            &none
-        ));
-        assert!(tool_result_indicates_background_detach(
-            "cli_agent",
-            "CLI agent 'x' started in background (task_id=abc).",
-            &none
-        ));
-        assert!(tool_result_indicates_background_detach(
-            "spawn_agent",
-            "Sub-agent spawned in background for mission: \"...\"",
-            &none
-        ));
-        assert!(tool_result_indicates_background_detach(
-            "web_search",
-            "Moved to background (pid=1)",
-            &none
-        ));
-        assert!(!tool_result_indicates_background_detach(
-            "terminal",
-            "Process finished normally.",
-            &none
-        ));
-    }
-
-    #[test]
     fn builds_deterministic_background_ack_from_tool_result() {
         let with_notify = crate::traits::ToolCallMetadata {
             completion_notifications_enabled: true,
@@ -2316,7 +2258,6 @@ mod tests {
 
         // With notifications enabled — should promise automatic delivery.
         let ack = build_background_detach_ack(
-            "terminal",
             "Command still running after 30s. Moved to background (pid=123).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[SYSTEM] ...",
             &with_notify,
         );
@@ -2325,7 +2266,6 @@ mod tests {
 
         // Without notifications — should NOT promise automatic delivery.
         let ack_no_notify = build_background_detach_ack(
-            "terminal",
             "Command still running after 30s. Moved to background (pid=456).\n\nThis process is task-owned and will be auto-killed when the current task ends.",
             &without_notify,
         );
@@ -2342,14 +2282,12 @@ mod tests {
         let without_notify = crate::traits::ToolCallMetadata::default();
 
         let ack = build_background_detach_ack(
-            "terminal",
             "Command still running after 30s. Moved to background (pid=123).",
             &with_notify,
         );
         assert!(ack.contains("final result will be sent automatically"));
 
         let ack_no_notify = build_background_detach_ack(
-            "terminal",
             "Command still running after 30s. Moved to background (pid=456).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
             &without_notify,
         );

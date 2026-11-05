@@ -299,7 +299,9 @@ impl Agent {
                             "SDK engine: mandate review closed from a committed or recovered \
                              non-action decision"
                         );
-                        scope.end_with(summary, TaskOutcome::Succeeded);
+                        scope
+                            .verdict
+                            .record_budget_stop(summary, TaskOutcome::Succeeded);
                     }
                 }
                 return Err(error);
@@ -557,7 +559,7 @@ impl Agent {
                 let grace = response.tool_calls.is_empty()
                     && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
                 if !grace {
-                    scope.end_with(stop, TaskOutcome::Failed);
+                    scope.verdict.record_budget_stop(stop, TaskOutcome::Failed);
                     return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
                 }
             }

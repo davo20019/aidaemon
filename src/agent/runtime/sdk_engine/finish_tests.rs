@@ -397,3 +397,23 @@ async fn background_handoff_with_inline_work_lets_the_model_continue() {
     assert_eq!(reply, "The job is running and the rest is done.");
     assert_eq!(harness.provider.call_count().await, 2);
 }
+
+/// Only a tool's typed finish ends a run: output that merely reads like a
+/// background handoff (a page, a log line) is data, and the model answers.
+#[tokio::test]
+async fn background_phrase_in_output_does_not_end_the_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_reader", "{}"),
+        MockProvider::text_response("The log says a job moved to the background earlier."),
+    ]);
+    let reader = MockTool::new(
+        "synthetic_reader",
+        "Reads a synthetic log",
+        "Moved to background (pid=41). Worker started in background; helper spawned in background.",
+    );
+    let harness = root(provider, vec![Arc::new(reader)]).await;
+    let reply = ask(&harness, "finish-phrase", "What does the log say?").await;
+
+    assert_eq!(reply, "The log says a job moved to the background earlier.");
+    assert_eq!(harness.provider.call_count().await, 2);
+}
