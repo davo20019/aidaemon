@@ -571,13 +571,9 @@ async fn test_sdk_task_lead_commits_act_and_delegates_the_mutation() {
     .await
     .unwrap()
     .unwrap();
-    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
     harness
         .agent
-        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            crate::tools::ApprovalBroker::new(http_approval_tx),
-        )));
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))));
     // As the task-lead spawn wires it: bound to this goal and run.
     harness.agent.push_test_tool(Arc::new(
         crate::tools::ManageGoalTasksTool::new(mandate.goal_id.clone(), harness.state.clone())

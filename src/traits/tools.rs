@@ -1735,6 +1735,11 @@ pub struct ToolExecutionContext {
     /// Hard negative task contract propagated from the validated request.
     /// Open-ended adapters must prove an operation is observational before I/O.
     pub mutation_forbidden: bool,
+    /// True only when the call came through the agent kernel, whose
+    /// `ApprovalPolicy` already asked the owner where the daemon's rules
+    /// require it. A tool that needs the owner's approval refuses a call
+    /// without it rather than asking itself.
+    pub owner_approval_by_kernel: bool,
 }
 
 /// Filesystem targets a tool call declared that fall outside the compiled

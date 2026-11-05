@@ -1008,7 +1008,7 @@ async fn register_runtime_tool_by_id(
             }
         }
         RuntimeToolId::HttpRequest => {
-            let tool = Arc::new(HttpRequestTool::new(http_profiles, approval_tx));
+            let tool = Arc::new(HttpRequestTool::new(http_profiles));
             tools.push(tool.clone());
             *http_request_tool = Some(tool);
         }

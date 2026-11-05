@@ -208,6 +208,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
     });
     agent.set_sdk_engine(sdk_engine);
+    // Owner-approval cards from the kernel go out on the same channel the
+    // tools' cards use.
+    agent.owner_approvals().set_broker(approval_tx.clone());
     if let Some(memory) = crate::agent::memory_plugin::configured_plugin(
         &config.memory,
         &llm_runtime,

@@ -93,6 +93,8 @@ const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
 /// The run ended on a terminal tool result (background handoff, executor
 /// blocker, direct response) whose reply ships as is.
 const TERMINAL_REPLY_STOP: &str = "terminal tool result";
+/// Prefix of the outbound secret scan's refusals (`EgressGuard`).
+const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +112,8 @@ pub(crate) struct SdkEngineSettings {
     /// `[authority] trusted_roots`: directories whose files are the owner's
     /// own, so reading them is not untrusted content.
     pub(crate) trusted_roots: Vec<String>,
+    /// The configured API keys and tokens the outbound secret scan refuses.
+    pub(crate) outbound_secrets: super::approvals::ConfiguredSecrets,
 }
 
 impl Default for SdkEngineSettings {
@@ -120,6 +124,7 @@ impl Default for SdkEngineSettings {
             owner_default: crate::config::OwnerLevel::default(),
             task_assessment: crate::config::TaskAssessmentSetting::default(),
             trusted_roots: Vec::new(),
+            outbound_secrets: Default::default(),
         }
     }
 }
@@ -165,6 +170,7 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         owner_default: config.authority.owner_default,
         task_assessment: config.agent.task_assessment,
         trusted_roots: config.authority.trusted_roots.clone(),
+        outbound_secrets: super::approvals::ConfiguredSecrets::new(config.outbound_secret_values()),
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
     log_configured_trust_roots(&settings.trusted_roots);
@@ -607,15 +613,32 @@ impl Agent {
         let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
             // Deny hooks and resolutions on SDK turns: the authority hook,
             // whose refusals carry its fixed marker, the untrusted-content
-            // verifier (its own marker), and the same-tool limit.
+            // verifier (its own marker), the owner's declines (the kernel's
+            // marker), the outbound secret scan, and the same-tool limit.
             let authority_denial = reason.starts_with("[AUTHORITY BLOCKED]");
             let untrusted_denial = reason.starts_with(crate::agent::untrusted::UNTRUSTED_BLOCKED);
+            let owner_declined = reason.starts_with(sdk::OWNER_DECLINED);
+            let egress_blocked = reason.starts_with(EGRESS_BLOCKED);
             if authority_denial {
                 if !receipt.read_only {
                     self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
                         .await;
                 }
-            } else if !untrusted_denial {
+            } else if egress_blocked {
+                self.emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    scope.model_calls.load(Ordering::Relaxed) as usize,
+                    crate::events::DecisionType::GateTelemetry,
+                    format!("outbound secret blocked in `{}`", receipt.tool),
+                    serde_json::json!({
+                        "condition": "egress_secret_blocked",
+                        "tool": receipt.tool,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            } else if !untrusted_denial && !owner_declined {
                 self.with_harness_eval(|eval| eval.record_repetition_guard())
                     .await;
             }
@@ -630,6 +653,10 @@ impl Agent {
                     "authority_hook_denied"
                 } else if untrusted_denial {
                     "untrusted_egress_denied"
+                } else if owner_declined {
+                    "owner_approval_declined"
+                } else if egress_blocked {
+                    "egress_secret_blocked"
                 } else {
                     "kernel_hook_denied"
                 },
@@ -668,6 +695,28 @@ impl Agent {
         self.mandate_execution
             .as_ref()
             .map_or(scope.task_id, |fence| fence.worker_task_id.as_str())
+    }
+
+    /// The outbound secret scan: the SDK's secret shapes plus the daemon's
+    /// configured API keys and tokens and those of dynamically connected
+    /// bots.
+    async fn egress_guard(&self, engine: &SdkEngineSettings) -> aidaemon_policies::EgressGuard {
+        let mut guard = aidaemon_policies::EgressGuard::new();
+        for secret in engine.outbound_secrets.values() {
+            guard = guard.secret(secret.clone());
+        }
+        match self.state.get_dynamic_bots().await {
+            Ok(bots) => {
+                for bot in bots {
+                    guard = guard.secret(bot.bot_token);
+                    if let Some(app_token) = bot.app_token {
+                        guard = guard.secret(app_token);
+                    }
+                }
+            }
+            Err(error) => warn!(%error, "Could not read dynamic bots for the egress guard"),
+        }
+        guard
     }
 
     /// One turn on the SDK kernel, after turn setup built `setup`. See the
@@ -743,9 +792,11 @@ impl Agent {
         // hook denial) never reach the daemon dispatcher; the event sink hands
         // their receipts over so the run ledger records them too.
         let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
-        // The turn's resolved authority is enforced by the kernel hook, and
-        // the untrusted-content rule by `UntrustedHook` (registered last,
-        // below). The daemon dispatcher still enforces Scope itself:
+        // The turn's resolved authority is enforced by the kernel hook, the
+        // outbound secret scan by `EgressGuard`, the untrusted-content rule
+        // by `UntrustedHook` and owner approvals by `ApprovalPolicy` (all in
+        // the pinned order of `TurnHooks`, below). The daemon dispatcher
+        // still enforces Scope itself:
         // `sdk_scope_check` against the turn's filesystem grant.
         // `/readonly` sent while this turn runs narrows it: the hook and the
         // dispatcher both read the chat's live mode (a child reads its
@@ -754,17 +805,10 @@ impl Agent {
             self.state.clone(),
             self.mode_session_for(session_id),
         ));
+        let authority_hook =
+            sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone());
         let mut builder = sdk::Agent::builder("aidaemon")
-            .hook(
-                sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone()),
-            )
             .attest(sdk::Safeguard::Scope)
-            // Owner approvals and the outbound secret scan are still done by
-            // the daemon's tools (terminal, http_request) in this phase.
-            // Phase 3a Task 4 replaces these two attestations with the real
-            // `EgressGuard` and `ApprovalPolicy` hooks.
-            .attest(sdk::Safeguard::Approval)
-            .attest(sdk::Safeguard::Egress)
             .model(model.clone())
             .provider(DaemonProvider {
                 calls: calls_tx.clone(),
@@ -837,41 +881,69 @@ impl Agent {
                 .load(Ordering::Relaxed)
                 .then(|| TERMINAL_REPLY_STOP.to_string())
         });
-        builder = builder.hook(SameToolLimit {
-            read_only_tools: read_only_tool_names(self.tools.iter()),
-        });
-        builder = builder.hook(LedgerStop {
-            calls: calls_tx.clone(),
-        });
-        // After the ledger stop, so a rejected final answer never reaches a
-        // memory writer. Summarization and learning belong to the turn, so
-        // they run whatever the memory plugin.
+        // Memory hooks run after the ledger stop, so a rejected final answer
+        // never reaches a memory writer. Summarization and learning belong to
+        // the turn, so they run whatever the memory plugin.
         let owned_memory_tools = memory.owned_daemon_tools;
+        let mut memory_hooks: Vec<Arc<dyn sdk::Hook>> = Vec::new();
         if !memory_turn.mandate {
-            builder = builder.hook(crate::agent::memory_plugin::DaemonMemoryWriter::new(
-                memory_turn.clone(),
-                crate::agent::memory_plugin::WriterSettings {
-                    progressive_facts: false,
-                    summarization: self.context_window_config.enabled,
-                    learning: true,
-                },
-                self.transcript_writes.clone(),
+            memory_hooks.push(Arc::new(
+                crate::agent::memory_plugin::DaemonMemoryWriter::new(
+                    memory_turn.clone(),
+                    crate::agent::memory_plugin::WriterSettings {
+                        progressive_facts: false,
+                        summarization: self.context_window_config.enabled,
+                        learning: true,
+                    },
+                    self.transcript_writes.clone(),
+                ),
             ));
         }
-        for hook in memory.hooks {
-            builder = builder.hook_arc(hook);
-        }
+        memory_hooks.extend(memory.hooks);
         if user_role != UserRole::Public {
             for tool in memory.tools {
                 builder = builder.tool_arc(tool);
             }
         }
-        // Last, so it only interrupts calls every other hook already allows
-        // (an approval still passes the hooks after it).
-        builder = builder.hook(sdk::UntrustedHook::new(
-            crate::agent::untrusted::untrusted_mode(authority.owner_level),
-            aidaemon_policies::wrap_untrusted,
-        ));
+        // Owner approvals: the daemon's rules for this turn and the chat's
+        // grants (a child shares its parent chat's).
+        let grant_session = self
+            .approval_session_id
+            .clone()
+            .unwrap_or_else(|| session_id.to_string());
+        let mandate_run = self.mandate_execution.is_some();
+        let rules = super::approvals::AppApprovalRules {
+            trusted_session: !mandate_run
+                && self
+                    .session_trusted(channel_ctx.trusted, Some(task_id.as_str()))
+                    .await,
+            mandate_preapproved: mandate_run,
+        };
+        let approvals = self.owner_approvals.clone();
+        let approval =
+            aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
+                .with_rules(Arc::new(rules))
+                .with_grants(approvals.grants_for(&grant_session));
+        let egress = self.egress_guard(engine).await;
+        let hooks = TurnHooks {
+            authority: authority_hook,
+            same_tool: SameToolLimit {
+                read_only_tools: read_only_tool_names(self.tools.iter()),
+            },
+            ledger: LedgerStop {
+                calls: calls_tx.clone(),
+            },
+            memory: memory_hooks,
+            egress,
+            untrusted: sdk::UntrustedHook::new(
+                crate::agent::untrusted::untrusted_mode(authority.owner_level),
+                aidaemon_policies::wrap_untrusted,
+            ),
+            approval,
+        };
+        for (_, hook) in hooks.chain() {
+            builder = builder.hook_arc(hook);
+        }
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
@@ -1064,14 +1136,27 @@ impl Agent {
             .unwrap_or_default();
         // Egress the untrusted-content rule interrupts is settled by a clean
         // check that sees only this request and the proposed call.
-        let verifier = crate::agent::untrusted::UntrustedVerifier {
-            agent: self,
-            scope: &scope,
-            origin_request,
-            origin_trusted,
-            cancel: cancel.clone(),
+        // Owner approvals are asked of the owner through the approval
+        // broker.
+        let resolver = super::approvals::DaemonInterruptResolver {
+            untrusted: crate::agent::untrusted::UntrustedVerifier {
+                agent: self,
+                scope: &scope,
+                origin_request,
+                origin_trusted,
+                cancel: cancel.clone(),
+            },
+            owner: super::approvals::OwnerApprovalResolver {
+                agent: self,
+                approvals,
+                card_session: session_id,
+                grant_session,
+                emitter: &emitter,
+                task_id: &task_id,
+                cancel: cancel.clone(),
+            },
         };
-        let run = sdk_agent.run_resolving(state, cancel, &verifier);
+        let run = sdk_agent.run_resolving(state, cancel, &resolver);
         tokio::pin!(run);
         let mut in_flight = FuturesUnordered::new();
         // Ledger writes for kernel notices run apart from the run's own calls:

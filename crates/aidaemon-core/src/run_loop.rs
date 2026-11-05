@@ -101,13 +101,16 @@ impl<'a> Driver<'a> {
         else {
             return resolution;
         };
-        // A request without effects is remembered by its exact subject.
+        // A request without effects is remembered by its exact subject; a
+        // blank subject names no call, so it binds nothing.
         let call_key;
-        let effects: &[EffectKey] = if request.effects.is_empty() {
+        let effects: &[EffectKey] = if !request.effects.is_empty() {
+            &request.effects
+        } else if request.subject.trim().is_empty() {
+            &[]
+        } else {
             call_key = [EffectKey::named(EffectClass::Call, &request.subject)];
             &call_key
-        } else {
-            &request.effects
         };
         for effect in effects {
             if !self.state.declined.contains(effect) {

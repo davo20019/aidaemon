@@ -1815,12 +1815,10 @@ async fn tools_declare_their_source_class() {
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
     let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
     let roots = TrustRoots::new(&roots);
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
-    let http = crate::tools::HttpRequestTool::new(
-        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        crate::tools::ApprovalBroker::new(approval_tx),
-    );
+    let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    )));
     let mcp = crate::mcp::McpTool::new(
         "synthetic_mcp_tool".to_string(),
         serde_json::json!({"name": "synthetic_mcp_tool", "description": "x", "parameters": {}}),
@@ -2213,11 +2211,9 @@ async fn history_traces_and_skill_resources_are_untrusted() {
 #[tokio::test]
 async fn http_request_with_owner_credentials_is_egress_even_for_get() {
     use crate::traits::Tool as _;
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-    let http = crate::tools::HttpRequestTool::new(
-        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        crate::tools::ApprovalBroker::new(approval_tx),
-    );
+    let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    )));
     let with_auth =
         r#"{"method":"GET","url":"https://example.invalid","auth_profile":"synthetic"}"#;
     let without = r#"{"method":"GET","url":"https://example.invalid"}"#;
@@ -3109,6 +3105,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {
+            owner_approval_by_kernel: false,
             session_id: "telegram:synthetic-user-1",
             task_id: None,
             status_tx: None,
@@ -3397,4 +3394,74 @@ fn a_symlink_root_to_a_broad_directory_is_dropped() {
     ] {
         assert!(super::turn_trust_roots(sources).is_empty());
     }
+}
+
+/// A memory-plugin hook stand-in that does nothing.
+struct NoopMemoryHook;
+
+#[async_trait]
+impl sdk::Hook for NoopMemoryHook {}
+
+/// A tool with no effects, so an agent that has it must cover every
+/// required safeguard.
+struct NoopTool;
+
+#[async_trait]
+impl sdk::Tool for NoopTool {
+    fn spec(&self) -> sdk::ToolSpec {
+        sdk::ToolSpec {
+            name: "noop".to_string(),
+            description: "does nothing".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _arguments: Value, _ctx: &sdk::ToolContext) -> sdk::ToolResult {
+        Ok(sdk::ToolOutput::text("ok"))
+    }
+}
+
+#[test]
+fn hook_order_is_pinned() {
+    let (calls, _rx) = mpsc::channel(1);
+    let hooks = TurnHooks {
+        authority: sdk::AuthorityHook::new(sdk::Authority::full()),
+        same_tool: SameToolLimit {
+            read_only_tools: HashSet::new(),
+        },
+        ledger: LedgerStop { calls },
+        memory: vec![Arc::new(NoopMemoryHook)],
+        egress: aidaemon_policies::EgressGuard::new(),
+        untrusted: sdk::UntrustedHook::new(
+            sdk::UntrustedMode::Enforce,
+            aidaemon_policies::wrap_untrusted,
+        ),
+        approval: aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never),
+    };
+    let chain = hooks.chain();
+    let slots: Vec<HookSlot> = chain.iter().map(|(slot, _)| *slot).collect();
+    assert_eq!(
+        slots,
+        [
+            HookSlot::Authority,
+            HookSlot::SameToolLimit,
+            HookSlot::LedgerStop,
+            HookSlot::Memory,
+            HookSlot::Egress,
+            HookSlot::Untrusted,
+            HookSlot::Approval,
+        ]
+    );
+    // Approval and egress are real hooks now, not attestations: with only
+    // the dispatcher's Scope attested, an agent with a tool still builds.
+    let mut builder = sdk::Agent::builder("aidaemon")
+        .attest(sdk::Safeguard::Scope)
+        .model("mock-model")
+        .provider(sdk::testing::ScriptedProvider::new(Vec::new()))
+        .tool(NoopTool);
+    for (_, hook) in chain {
+        builder = builder.hook_arc(hook);
+    }
+    builder
+        .build()
+        .expect("every required safeguard is covered");
 }

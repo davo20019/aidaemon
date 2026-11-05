@@ -117,6 +117,8 @@ use post_task::LearningContext;
 #[cfg(feature = "computer_use")]
 mod computer_use;
 
+#[path = "runtime/approvals.rs"]
+pub(crate) mod approvals;
 #[path = "runtime/authority.rs"]
 pub(crate) mod authority;
 #[path = "turn/bootstrap/mod.rs"]
@@ -339,6 +341,9 @@ pub struct Agent {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// SDK kernel settings for this agent's turns; inherited by spawned children.
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
+    /// The owner's approval cards, grants and waiting cards; shared with
+    /// every child, so a grant in a chat covers its children's calls.
+    owner_approvals: Arc<approvals::OwnerApprovals>,
     /// Long-term memory for SDK turns (hooks, tools, owned daemon tools).
     memory: Arc<dyn memory_plugin::MemoryPlugin>,
     /// The daemon store's summarization and learning, run on every turn

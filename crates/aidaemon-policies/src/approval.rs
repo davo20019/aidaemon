@@ -315,7 +315,11 @@ fn interrupt(request: OwnerApprovalRequest, info: &ToolInfo) -> ToolDecision {
 /// The refusal for a request whose subject the owner declined in this run
 /// (recorded by the kernel as an [`EffectClass::Call`] key when the declined
 /// request declared no effects), so the identical request gets no new card.
+/// A blank subject names no call and matches nothing.
 fn declined_subject(ctx: &HookContext<'_>, request: &OwnerApprovalRequest) -> Option<ToolDecision> {
+    if request.subject.trim().is_empty() {
+        return None;
+    }
     let declined = ctx
         .declined
         .iter()
@@ -966,5 +970,24 @@ mod rules_tests {
         let (_, cards) = run_denying(&agent).await;
         assert_eq!(cards, 2);
         assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn blank_subject_is_never_a_declined_subject() {
+        // A blank subject names no call, so a blank `Call` key (from a run
+        // saved before the kernel stopped recording them) refuses nothing.
+        let declined = [EffectKey::named(EffectClass::Call, "   ")];
+        let mut blank = request();
+        blank.subject = "   ".to_string();
+        let rules = Fixed::new(RuleDecision::Ask(blank));
+        let policy = ApprovalPolicy::new(ApprovalMode::Never).with_rules(rules);
+        let info = send_info(complete(Vec::new()));
+        let decision = policy
+            .before_tool(&hook_ctx(&declined), &post(), &info)
+            .await;
+        assert!(
+            matches!(decision, ToolDecision::Interrupt { .. }),
+            "{decision:?}"
+        );
     }
 }

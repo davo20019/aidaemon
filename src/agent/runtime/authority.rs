@@ -568,6 +568,7 @@ mod tests {
         .await
         .unwrap();
         let ctx = crate::agent::tool_exec::ToolExecCtx {
+            owner_approval_by_kernel: false,
             session_id: "guest-session",
             task_id: None,
             status_tx: None,

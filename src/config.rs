@@ -4155,6 +4155,41 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// The configured API keys, tokens and passwords (static config only;
+    /// dynamically connected bots live in the state store). The kernel's
+    /// outbound secret scan refuses calls whose arguments carry one.
+    pub fn outbound_secret_values(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut providers = vec![&self.provider];
+        providers.extend(self.provider.fallbacks.iter());
+        for provider in providers {
+            values.push(provider.api_key.clone());
+            values.extend(provider.gateway_token.clone());
+        }
+        values.push(self.agent.engine.api_key.clone());
+        values.push(self.search.api_key.clone());
+        values.extend(
+            self.all_telegram_bots()
+                .into_iter()
+                .map(|bot| bot.bot_token),
+        );
+        #[cfg(feature = "discord")]
+        values.extend(self.all_discord_bots().into_iter().map(|bot| bot.bot_token));
+        #[cfg(feature = "slack")]
+        for bot in self.all_slack_bots() {
+            values.push(bot.bot_token);
+            values.push(bot.app_token);
+        }
+        if let Some(email) = &self.triggers.email {
+            values.push(email.password.clone());
+        }
+        for profile in self.http_auth.values() {
+            values.extend(profile.credential_values().into_iter().map(str::to_string));
+        }
+        values.retain(|value| !value.trim().is_empty() && value != "keychain");
+        values
+    }
+
     /// Get all Telegram bot configurations (merges legacy single + array).
     /// Legacy `[telegram]` becomes a bot named "default".
     pub fn all_telegram_bots(&self) -> Vec<TelegramBotConfig> {

@@ -136,6 +136,10 @@ pub(super) struct ToolExecCtx<'a> {
     pub tool_call_id: Option<&'a str>,
     /// Rust-side hard boundary inherited from the request contract.
     pub mutation_forbidden: bool,
+    /// The call came through the agent kernel, whose `ApprovalPolicy` asked
+    /// the owner where needed (passed on to the tool as
+    /// `ToolExecutionContext::owner_approval_by_kernel`).
+    pub owner_approval_by_kernel: bool,
     /// Exact out-of-scope filesystem targets the controller declined to
     /// reject outright. Loop-owned; the tool must obtain user authority for
     /// them before running.
@@ -619,6 +623,39 @@ impl Agent {
         }
     }
 
+    /// Whether calls of this agent's turn on `task_id` run as a trusted
+    /// scheduled session: the channel says so, or the goal or task has
+    /// scheduled provenance. Callers exclude mandate runs, whose exact
+    /// action grants are their only authority.
+    pub(in crate::agent) async fn session_trusted(
+        &self,
+        channel_trusted: bool,
+        task_id: Option<&str>,
+    ) -> bool {
+        channel_trusted
+            || if let Some(goal_id) = self.goal_id.as_deref() {
+                // Scheduled goal runs are user-confirmed automation, so treat
+                // their tool calls as trusted even when the execution context
+                // was recreated later by heartbeat/orphan dispatch.
+                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
+            } else if let Some(executor_task_id) = self.task_id.as_deref() {
+                if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
+                    goal_has_scheduled_provenance(
+                        &self.state,
+                        &task.goal_id,
+                        Some(executor_task_id),
+                    )
+                    .await
+                } else {
+                    task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
+                }
+            } else if let Some(task_id) = task_id {
+                task_has_scheduled_provenance(&self.state, Some(task_id)).await
+            } else {
+                false
+            }
+    }
+
     pub(super) async fn execute_tool_outcome(
         &self,
         name: &str,
@@ -636,33 +673,7 @@ impl Agent {
         // A mandate-authorized call must NOT inject `_trusted_session` even if
         // ChannelContext.trusted is true or scheduled provenance would ordinarily
         // authorize it; the entire expression short-circuits to false.
-        let trusted = if under_mandate {
-            false
-        } else {
-            ctx.trusted
-                || if let Some(goal_id) = self.goal_id.as_deref() {
-                    // Scheduled goal runs are user-confirmed automation, so treat
-                    // their tool calls as trusted even when the execution context
-                    // was recreated later by heartbeat/orphan dispatch.
-                    goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref())
-                        .await
-                } else if let Some(executor_task_id) = self.task_id.as_deref() {
-                    if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
-                        goal_has_scheduled_provenance(
-                            &self.state,
-                            &task.goal_id,
-                            Some(executor_task_id),
-                        )
-                        .await
-                    } else {
-                        task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
-                    }
-                } else if let Some(task_id) = task_id {
-                    task_has_scheduled_provenance(&self.state, Some(task_id)).await
-                } else {
-                    false
-                }
-        };
+        let trusted = !under_mandate && self.session_trusted(ctx.trusted, task_id).await;
         let user_role = ctx.user_role;
         let turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
 
@@ -846,6 +857,7 @@ impl Agent {
                 mandate_preapproved,
                 mandate_execution: under_mandate,
                 mutation_forbidden: ctx.mutation_forbidden,
+                owner_approval_by_kernel: ctx.owner_approval_by_kernel,
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -898,6 +910,7 @@ impl Agent {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
+                    owner_approval_by_kernel: ctx.owner_approval_by_kernel,
                 };
                 let result = tool
                     .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
@@ -949,6 +962,7 @@ impl Agent {
                     mandate_preapproved,
                     mandate_execution: under_mandate,
                     mutation_forbidden: ctx.mutation_forbidden,
+                    owner_approval_by_kernel: ctx.owner_approval_by_kernel,
                 };
                 return tool
                     .call_with_execution_context(

@@ -857,3 +857,27 @@ async fn decline_binds_a_later_call_in_the_same_batch() {
     assert_eq!(*hook.seen.lock().unwrap(), vec!["http".to_string()]);
     assert_eq!(ran.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn empty_subject_decline_binds_nothing() {
+    let mut request = owner_request(Vec::new());
+    request.subject = "  \n".to_string();
+    let hook = AskBeforeSend::new(InterruptKind::OwnerApproval(request));
+    let (a, _) = agent(hook, send_once());
+    let out = a
+        .run_resolving(
+            RunState::new("a", "s", "go"),
+            CancellationToken::new(),
+            &deny(),
+        )
+        .await
+        .unwrap();
+    // A blank subject names no call: binding it would refuse nothing
+    // useful, or (trimmed to "") match another blank-subject request.
+    assert!(out.state.declined.is_empty(), "{:?}", out.state.declined);
+    let send = &out.receipts()[0];
+    assert!(send
+        .reason
+        .as_deref()
+        .is_some_and(|r| r.starts_with(aidaemon_core::OWNER_DECLINED)));
+}

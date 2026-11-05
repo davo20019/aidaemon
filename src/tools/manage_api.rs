@@ -101,8 +101,7 @@ impl ManageApiTool {
                 approval_tx.clone(),
             ),
             manage_skills,
-            http_request: HttpRequestTool::new(profiles, approval_tx)
-                .with_oauth_gateway(oauth_gateway),
+            http_request: HttpRequestTool::new(profiles).with_oauth_gateway(oauth_gateway),
             search_backend,
         }
     }

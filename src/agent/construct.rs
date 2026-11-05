@@ -79,6 +79,17 @@ impl Agent {
         self.sdk_engine = Arc::new(settings);
     }
 
+    /// The owner's approvals for this agent's turns (and its children's).
+    pub(crate) fn owner_approvals(&self) -> Arc<super::approvals::OwnerApprovals> {
+        self.owner_approvals.clone()
+    }
+
+    /// Replace the owner's approvals (tests use a short card timeout).
+    #[cfg(test)]
+    pub(crate) fn set_owner_approvals(&mut self, approvals: Arc<super::approvals::OwnerApprovals>) {
+        self.owner_approvals = approvals;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_transcript_writes(
         &mut self,
@@ -209,6 +220,7 @@ impl Agent {
             mandate_execution: None,
             cancel_token: None,
             sdk_engine: Arc::default(),
+            owner_approvals: Arc::default(),
             memory,
             transcript_writes,
             goal_token_registry,
@@ -451,6 +463,7 @@ impl Agent {
             mandate_execution,
             cancel_token,
             sdk_engine: Arc::default(),
+            owner_approvals: Arc::default(),
             memory,
             transcript_writes,
             goal_token_registry,

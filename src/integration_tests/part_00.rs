@@ -442,13 +442,9 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     .unwrap()
     .unwrap();
 
-    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
     harness
         .agent
-        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            crate::tools::ApprovalBroker::new(http_approval_tx),
-        )));
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))));
     harness.agent.set_test_mandate_execution(
         &mandate.id,
         mandate.version,

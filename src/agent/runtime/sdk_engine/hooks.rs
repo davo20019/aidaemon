@@ -156,6 +156,50 @@ impl sdk::Hook for SameToolLimit {
     }
 }
 
+/// Where a hook sits in the turn's `before_tool` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HookSlot {
+    Authority,
+    SameToolLimit,
+    LedgerStop,
+    Memory,
+    Egress,
+    Untrusted,
+    Approval,
+}
+
+/// The turn's hooks, registered in the pinned order: authority first; the
+/// daemon's loop guard and ledger stop; memory; the outbound secret scan,
+/// so no secret reaches the untrusted-content verifier or an approval card;
+/// the untrusted-content rule; and owner approval last, so the owner is
+/// asked only about calls every other hook allows. No hook after
+/// `UntrustedHook` may rewrite a call. The kernel's decline check runs
+/// before all of them.
+pub(super) struct TurnHooks {
+    pub(super) authority: sdk::AuthorityHook,
+    pub(super) same_tool: SameToolLimit,
+    pub(super) ledger: LedgerStop,
+    pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
+    pub(super) egress: aidaemon_policies::EgressGuard,
+    pub(super) untrusted: sdk::UntrustedHook,
+    pub(super) approval: aidaemon_policies::ApprovalPolicy,
+}
+
+impl TurnHooks {
+    pub(super) fn chain(self) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
+        let mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)> = vec![
+            (HookSlot::Authority, Arc::new(self.authority)),
+            (HookSlot::SameToolLimit, Arc::new(self.same_tool)),
+            (HookSlot::LedgerStop, Arc::new(self.ledger)),
+        ];
+        chain.extend(self.memory.into_iter().map(|hook| (HookSlot::Memory, hook)));
+        chain.push((HookSlot::Egress, Arc::new(self.egress)));
+        chain.push((HookSlot::Untrusted, Arc::new(self.untrusted)));
+        chain.push((HookSlot::Approval, Arc::new(self.approval)));
+        chain
+    }
+}
+
 /// A daemon tool as the SDK sees it. It only forwards the call; the daemon
 /// dispatcher executes it on the turn's own task.
 pub(super) struct BridgedTool {
@@ -207,9 +251,19 @@ impl sdk::Tool for BridgedTool {
     }
 
     /// The declared effects as the kernel's access manifest: egress
-    /// targets as hosts, path effects as writes.
+    /// targets as hosts, path effects as writes, and the terminal's command
+    /// line (so the approval policy's catastrophic-command check sees it).
     fn access(&self, arguments: &Value) -> sdk::AccessManifest {
         let mut manifest = sdk::AccessManifest::default();
+        if self.spec.name == "terminal" {
+            if let Some(command) = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+            {
+                manifest.commands.push(command.to_string());
+            }
+        }
         for key in self.effects(arguments).keys {
             let list = match key.class {
                 sdk::EffectClass::Egress => &mut manifest.hosts,

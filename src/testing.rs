@@ -582,6 +582,55 @@ impl Channel for TestChannel {
 // TestHarness
 // ---------------------------------------------------------------------------
 
+/// One owner-approval card a [`ScriptedApprover`] received.
+#[derive(Debug, Clone)]
+pub struct SeenCard {
+    pub command: String,
+    pub session_id: String,
+    pub risk_level: RiskLevel,
+    pub warnings: Vec<String>,
+}
+
+/// Answers owner-approval cards from a script, in order: `Some(answer)`
+/// answers at once; `None` (or a script that ran out) holds the card
+/// unanswered, keeping its reply channel so a test can answer it late.
+pub struct ScriptedApprover {
+    pub cards: Arc<std::sync::Mutex<Vec<SeenCard>>>,
+    pub held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<ApprovalResponse>>>>,
+}
+
+impl ScriptedApprover {
+    /// A broker whose cards this approver answers.
+    pub fn start(script: Vec<Option<ApprovalResponse>>) -> (crate::tools::ApprovalBroker, Self) {
+        let (tx, mut rx) = mpsc::channel::<crate::tools::terminal::ApprovalRequest>(8);
+        let cards = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, kept) = (cards.clone(), held.clone());
+        tokio::spawn(async move {
+            let mut script = script.into_iter();
+            while let Some(request) = rx.recv().await {
+                seen.lock().unwrap().push(SeenCard {
+                    command: request.command.clone(),
+                    session_id: request.session_id.clone(),
+                    risk_level: request.risk_level,
+                    warnings: request.warnings.clone(),
+                });
+                match script.next().flatten() {
+                    Some(answer) => {
+                        let _ = request.response_tx.send(answer);
+                    }
+                    None => kept.lock().unwrap().push(request.response_tx),
+                }
+            }
+        });
+        (crate::tools::ApprovalBroker::new(tx), Self { cards, held })
+    }
+
+    pub fn card_count(&self) -> usize {
+        self.cards.lock().unwrap().len()
+    }
+}
+
 /// Everything needed to run integration tests against the agent.
 #[allow(dead_code)]
 pub struct TestHarness {

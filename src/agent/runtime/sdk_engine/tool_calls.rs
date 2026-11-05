@@ -407,6 +407,7 @@ impl Agent {
         // The session's mode as of now (`/readonly` can arrive mid-turn).
         let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
         let mut ctx = ToolExecCtx {
+            owner_approval_by_kernel: true,
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
             status_tx: scope.status_tx.clone(),
