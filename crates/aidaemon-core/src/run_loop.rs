@@ -11,6 +11,7 @@ use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
+use crate::approval::{InterruptKind, OWNER_DECLINED};
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
@@ -63,8 +64,8 @@ enum ModelCall {
 enum Verdict {
     Allow,
     Deny(String),
-    /// The reason, and the index of the hook that interrupted.
-    Interrupt(String, usize),
+    /// The reason, its kind, and the index of the hook that interrupted.
+    Interrupt(String, InterruptKind, usize),
 }
 
 /// A call that passed checks and policy, waiting to execute.
@@ -86,6 +87,33 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// Apply what a resolution means for the run before the pending call is
+    /// settled: an owner's denial is remembered for the rest of the run
+    /// (its effects join `declined`) and its reason is marked as the
+    /// owner's.
+    fn settle(
+        &mut self,
+        interruption: &Interruption,
+        resolution: Option<Resolution>,
+    ) -> Option<Resolution> {
+        let (InterruptKind::OwnerApproval(request), Some(Resolution::Deny { reason })) =
+            (&interruption.kind, &resolution)
+        else {
+            return resolution;
+        };
+        for effect in &request.effects {
+            if !self.state.declined.contains(effect) {
+                self.state.declined.push(effect.clone());
+            }
+        }
+        let reason = if reason.starts_with(OWNER_DECLINED) {
+            reason.clone()
+        } else {
+            format!("{OWNER_DECLINED} {reason}")
+        };
+        Some(Resolution::Deny { reason })
+    }
+
     /// Leave `on_run_end` to the caller (see `report_run_end`).
     pub(crate) fn without_run_end(mut self) -> Self {
         self.report_run_end = false;
@@ -97,6 +125,7 @@ impl<'a> Driver<'a> {
         resolution: Option<Resolution>,
     ) -> Result<RunOutcome, CoreError> {
         if let Some(pending) = self.state.pending.take() {
+            let resolution = self.settle(&pending.interruption, resolution);
             self.emit(Event::RunResumed).await?;
             let earlier: Vec<String> = pending.calls[..pending.next]
                 .iter()
@@ -342,6 +371,7 @@ impl<'a> Driver<'a> {
             let mut info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
+                effects: tool.effects(&call.arguments),
             };
 
             // Hooks must see the results of earlier calls in this batch (a
@@ -409,7 +439,7 @@ impl<'a> Driver<'a> {
                     receipt.after_untrusted = self.state.untrusted_seen;
                     track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 }
-                Verdict::Interrupt(reason, hook_index) => {
+                Verdict::Interrupt(reason, kind, hook_index) => {
                     if let Some(end) = self
                         .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
                         .await?
@@ -421,7 +451,7 @@ impl<'a> Driver<'a> {
                     // any rewrite, without consulting the hooks again.
                     let mut pending_calls = calls.to_vec();
                     pending_calls[index] = call.clone();
-                    let interruption = Interruption { call, reason };
+                    let interruption = Interruption { call, reason, kind };
                     self.state.in_flight = None;
                     self.state.pending = Some(Pending {
                         calls: pending_calls,
@@ -479,8 +509,8 @@ impl<'a> Driver<'a> {
             match hook.before_tool(&ctx, call, info).await {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
-                ToolDecision::Interrupt { reason } => {
-                    return Verdict::Interrupt(reason, hook_index)
+                ToolDecision::Interrupt { reason, kind } => {
+                    return Verdict::Interrupt(reason, kind, hook_index)
                 }
                 ToolDecision::Rewrite { arguments } => {
                     call.arguments = arguments;
@@ -494,6 +524,7 @@ impl<'a> Driver<'a> {
                         // effect and access are those of the new arguments.
                         info.annotations = tool.annotations_for(&call.arguments);
                         info.access = tool.access(&call.arguments);
+                        info.effects = tool.effects(&call.arguments);
                     }
                 }
             }
@@ -856,6 +887,7 @@ impl<'a> Driver<'a> {
             usage: self.state.usage,
             run_usage: self.state.run_usage,
             untrusted_seen: self.state.untrusted_seen,
+            declined: &self.state.declined,
         }
     }
 
@@ -960,6 +992,7 @@ pub(crate) async fn report_run_end(agent: &AgentInner, outcome: &RunOutcome) {
         usage: outcome.state.usage,
         run_usage: outcome.state.run_usage,
         untrusted_seen: outcome.state.untrusted_seen,
+        declined: &outcome.state.declined,
     };
     for hook in &agent.hooks {
         hook.on_run_end(&ctx, outcome).await;

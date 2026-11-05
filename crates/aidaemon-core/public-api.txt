@@ -76,6 +76,10 @@ pub fn aidaemon_core::testing::tool_context() -> aidaemon_core::ToolContext
 pub enum aidaemon_core::AccessLevel
 pub aidaemon_core::AccessLevel::ReadOnly
 pub aidaemon_core::AccessLevel::Write
+#[non_exhaustive] pub enum aidaemon_core::ApprovalRisk
+pub aidaemon_core::ApprovalRisk::Critical
+pub aidaemon_core::ApprovalRisk::High
+pub aidaemon_core::ApprovalRisk::Medium
 #[non_exhaustive] pub enum aidaemon_core::BuildError
 pub aidaemon_core::BuildError::DuplicateTool(alloc::string::String)
 pub aidaemon_core::BuildError::EmptyAgentId
@@ -93,6 +97,13 @@ pub aidaemon_core::CoreError::Store(aidaemon_core::StoreError)
 pub aidaemon_core::CoreError::UnsupportedRunState
 pub aidaemon_core::CoreError::UnsupportedRunState::found: u32
 pub aidaemon_core::CoreError::UnsupportedRunState::supported: u32
+#[non_exhaustive] pub enum aidaemon_core::EffectClass
+pub aidaemon_core::EffectClass::Configuration
+pub aidaemon_core::EffectClass::Credential
+pub aidaemon_core::EffectClass::Delete
+pub aidaemon_core::EffectClass::Egress
+pub aidaemon_core::EffectClass::Process
+pub aidaemon_core::EffectClass::Write
 #[non_exhaustive] pub enum aidaemon_core::Event
 pub aidaemon_core::Event::Finished
 pub aidaemon_core::Event::Finished::status: aidaemon_core::RunStatus
@@ -137,6 +148,9 @@ pub fn aidaemon_core::Image::to_url(&self) -> alloc::string::String
 pub fn aidaemon_core::Image::url(impl core::convert::Into<alloc::string::String>) -> Self
 impl core::fmt::Debug for aidaemon_core::Image
 pub fn aidaemon_core::Image::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum aidaemon_core::InterruptKind
+pub aidaemon_core::InterruptKind::OwnerApproval(aidaemon_core::OwnerApprovalRequest)
+pub aidaemon_core::InterruptKind::Untrusted
 pub enum aidaemon_core::InvocationStage
 pub aidaemon_core::InvocationStage::Dispatched
 pub aidaemon_core::InvocationStage::RejectedBeforeDispatch
@@ -234,6 +248,7 @@ pub aidaemon_core::ToolDecision::Allow
 pub aidaemon_core::ToolDecision::Deny
 pub aidaemon_core::ToolDecision::Deny::reason: alloc::string::String
 pub aidaemon_core::ToolDecision::Interrupt
+pub aidaemon_core::ToolDecision::Interrupt::kind: aidaemon_core::InterruptKind
 pub aidaemon_core::ToolDecision::Interrupt::reason: alloc::string::String
 pub aidaemon_core::ToolDecision::Rewrite
 pub aidaemon_core::ToolDecision::Rewrite::arguments: serde_json::value::Value
@@ -303,6 +318,17 @@ pub fn aidaemon_core::AuthorityHook::on_stuck<'life0, 'life1, 'life2, 'life3, 'a
 pub fn aidaemon_core::AuthorityHook::safeguards(&self) -> &'static [aidaemon_core::Safeguard]
 impl core::fmt::Debug for aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct aidaemon_core::CallEffects
+pub aidaemon_core::CallEffects::complete: bool
+pub aidaemon_core::CallEffects::keys: alloc::vec::Vec<aidaemon_core::EffectKey>
+impl aidaemon_core::CallEffects
+pub fn aidaemon_core::CallEffects::none() -> Self
+pub fn aidaemon_core::CallEffects::unknown() -> Self
+pub struct aidaemon_core::EffectKey
+pub aidaemon_core::EffectKey::class: aidaemon_core::EffectClass
+pub aidaemon_core::EffectKey::target: alloc::string::String
+impl aidaemon_core::EffectKey
+pub fn aidaemon_core::EffectKey::overlaps(&self, &aidaemon_core::EffectKey) -> bool
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self
@@ -312,12 +338,14 @@ pub fn aidaemon_core::FnTool<F, Fut>::access(&self, &serde_json::value::Value) -
 pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::FnTool<F, Fut>::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::FnTool<F, Fut>::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::FnTool<F, Fut>::timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn aidaemon_core::FnTool<F, Fut>::validate(&self, &serde_json::value::Value) -> core::result::Result<(), alloc::string::String>
 pub struct aidaemon_core::HookContext<'a>
 pub aidaemon_core::HookContext::agent_id: &'a str
+pub aidaemon_core::HookContext::declined: &'a [aidaemon_core::EffectKey]
 pub aidaemon_core::HookContext::messages: &'a [aidaemon_core::Message]
 pub aidaemon_core::HookContext::receipts: &'a [aidaemon_core::Receipt]
 pub aidaemon_core::HookContext::run_id: aidaemon_core::RunId
@@ -334,6 +362,7 @@ pub aidaemon_core::InFlight::done: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::InFlight::started: alloc::vec::Vec<alloc::string::String>
 pub struct aidaemon_core::Interruption
 pub aidaemon_core::Interruption::call: aidaemon_core::ToolCall
+pub aidaemon_core::Interruption::kind: aidaemon_core::InterruptKind
 pub aidaemon_core::Interruption::reason: alloc::string::String
 pub struct aidaemon_core::Limits
 pub aidaemon_core::Limits::max_tokens: core::option::Option<u64>
@@ -387,6 +416,12 @@ pub struct aidaemon_core::ModelResponse
 pub aidaemon_core::ModelResponse::text: alloc::string::String
 pub aidaemon_core::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::ModelResponse::usage: aidaemon_core::Usage
+pub struct aidaemon_core::OwnerApprovalRequest
+pub aidaemon_core::OwnerApprovalRequest::effects: alloc::vec::Vec<aidaemon_core::EffectKey>
+pub aidaemon_core::OwnerApprovalRequest::risk: aidaemon_core::ApprovalRisk
+pub aidaemon_core::OwnerApprovalRequest::subject: alloc::string::String
+pub aidaemon_core::OwnerApprovalRequest::summary: alloc::string::String
+pub aidaemon_core::OwnerApprovalRequest::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct aidaemon_core::Pending
 pub aidaemon_core::Pending::calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::Pending::hook_index: core::option::Option<usize>
@@ -441,6 +476,7 @@ pub aidaemon_core::RunSnapshot::turn: u32
 pub aidaemon_core::RunSnapshot::usage: aidaemon_core::Usage
 pub struct aidaemon_core::RunState
 pub aidaemon_core::RunState::agent_id: alloc::string::String
+pub aidaemon_core::RunState::declined: alloc::vec::Vec<aidaemon_core::EffectKey>
 pub aidaemon_core::RunState::elapsed_ms: u64
 pub aidaemon_core::RunState::in_flight: core::option::Option<aidaemon_core::InFlight>
 pub aidaemon_core::RunState::messages: alloc::vec::Vec<aidaemon_core::Message>
@@ -507,6 +543,7 @@ pub fn aidaemon_core::ToolError::from(serde_json::error::Error) -> Self
 pub struct aidaemon_core::ToolInfo
 pub aidaemon_core::ToolInfo::access: aidaemon_core::AccessManifest
 pub aidaemon_core::ToolInfo::annotations: aidaemon_core::ToolAnnotations
+pub aidaemon_core::ToolInfo::effects: aidaemon_core::CallEffects
 pub struct aidaemon_core::ToolOutput
 pub aidaemon_core::ToolOutput::content: alloc::string::String
 pub aidaemon_core::ToolOutput::details: serde_json::value::Value
@@ -545,6 +582,7 @@ impl aidaemon_core::Usage
 pub fn aidaemon_core::Usage::add(&mut self, aidaemon_core::Usage)
 pub fn aidaemon_core::Usage::billable_tokens(&self) -> u64
 pub const aidaemon_core::HARD_TURN_CAP: u32
+pub const aidaemon_core::OWNER_DECLINED: &str
 pub const aidaemon_core::RUN_STATE_SCHEMA: u32
 pub const aidaemon_core::UNTRUSTED_EGRESS_INTERRUPT: &str
 pub trait aidaemon_core::AuthorityCeiling: core::marker::Send + core::marker::Sync
@@ -616,6 +654,7 @@ pub fn aidaemon_core::Tool::access(&self, &serde_json::value::Value) -> aidaemon
 pub fn aidaemon_core::Tool::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Tool::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::Tool::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::Tool::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::Tool::timeout(&self) -> core::option::Option<core::time::Duration>
@@ -625,6 +664,7 @@ pub fn aidaemon_core::FnTool<F, Fut>::access(&self, &serde_json::value::Value) -
 pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::FnTool<F, Fut>::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::FnTool<F, Fut>::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::FnTool<F, Fut>::timeout(&self) -> core::option::Option<core::time::Duration>

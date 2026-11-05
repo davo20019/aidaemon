@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
-    Agent, CoreError, Event, FnTool, Hook, HookContext, Image, InvocationStage, LimitKind, Limits,
-    MemoryStore, Message, ProviderError, Receipt, ReceiptStatus, Resolution, Retry, Role,
-    RunSnapshot, RunState, RunStatus, RunStore, Safeguard, SourceTrust, StopDecision, StuckConfig,
-    StuckDecision, StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision,
-    ToolInfo, ToolOutput, ToolResult, ToolSpec, RUN_STATE_SCHEMA,
+    Agent, CoreError, Event, FnTool, Hook, HookContext, Image, InterruptKind, InvocationStage,
+    LimitKind, Limits, MemoryStore, Message, ProviderError, Receipt, ReceiptStatus, Resolution,
+    Retry, Role, RunSnapshot, RunState, RunStatus, RunStore, Safeguard, SourceTrust, StopDecision,
+    StuckConfig, StuckDecision, StuckSignal, Tool, ToolAnnotations, ToolCall, ToolContext,
+    ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec, RUN_STATE_SCHEMA,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -666,6 +666,7 @@ impl Hook for AskBeforeDestructive {
         if tool.annotations.destructive {
             ToolDecision::Interrupt {
                 reason: format!("approve {}?", call.name),
+                kind: InterruptKind::default(),
             }
         } else {
             ToolDecision::Allow
@@ -1307,6 +1308,7 @@ async fn approval_runs_the_rewritten_call_the_approver_saw() {
         ) -> ToolDecision {
             ToolDecision::Interrupt {
                 reason: "needs approval".into(),
+                kind: InterruptKind::default(),
             }
         }
     }

@@ -1083,6 +1083,7 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
         usage: Default::default(),
         run_usage: Default::default(),
         untrusted_seen: false,
+        declined: &[],
     };
     let call = sdk::ToolCall {
         id: "c8".to_string(),
@@ -1092,6 +1093,7 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
     let info = sdk::ToolInfo {
         annotations: sdk::ToolAnnotations::WRITE,
         access: Default::default(),
+        effects: sdk::CallEffects::unknown(),
     };
     let hook = SameToolLimit {
         read_only_tools: Default::default(),

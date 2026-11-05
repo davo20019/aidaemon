@@ -254,6 +254,7 @@ mod tests {
                 writes: writes.iter().map(|s| s.to_string()).collect(),
                 ..AccessManifest::default()
             },
+            effects: aidaemon_core::CallEffects::unknown(),
         }
     }
 

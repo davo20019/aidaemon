@@ -3,7 +3,9 @@
 
 use std::collections::HashSet;
 
-use aidaemon_core::{Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
+use aidaemon_core::{
+    Hook, HookContext, InterruptKind, Safeguard, ToolCall, ToolDecision, ToolInfo,
+};
 use async_trait::async_trait;
 
 use crate::shell::{catastrophic_reason, command_segments, segment_matches_prefix};
@@ -149,6 +151,8 @@ impl ApprovalPolicy {
         match why {
             Some(why) => ToolDecision::Interrupt {
                 reason: format!("approval required: {why}"),
+                // Typed as an owner approval in Phase 3a Task 2.
+                kind: InterruptKind::default(),
             },
             None => ToolDecision::Allow,
         }
@@ -183,6 +187,7 @@ mod tests {
                 commands: commands.iter().map(|c| c.to_string()).collect(),
                 ..AccessManifest::default()
             },
+            effects: aidaemon_core::CallEffects::unknown(),
         }
     }
 

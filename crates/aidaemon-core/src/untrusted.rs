@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 
+use crate::approval::InterruptKind;
 use crate::hook::{Hook, HookContext, ToolDecision};
 use crate::message::ToolCall;
 use crate::receipt::{InvocationStage, Receipt};
@@ -71,6 +72,7 @@ impl Hook for UntrustedHook {
                      read untrusted content; a clean check must confirm it.",
                     call.name
                 ),
+                kind: InterruptKind::Untrusted,
             };
         }
         ToolDecision::Allow

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::CallEffects;
 use crate::message::Image;
 use crate::provider::{ToolSpec, Usage};
 use crate::state::RunId;
@@ -103,6 +104,8 @@ impl AccessManifest {
 pub struct ToolInfo {
     pub annotations: ToolAnnotations,
     pub access: AccessManifest,
+    /// What this call does, from [`Tool::effects`].
+    pub effects: CallEffects,
 }
 
 /// Trusted, harness-provided context for one call.
@@ -248,9 +251,9 @@ pub type ToolResult = Result<ToolOutput, ToolError>;
 
 /// An LLM-callable capability. Only `spec` and `call` are required.
 ///
-/// Richer semantics (typed effects, access manifests, replay decisions like
-/// aidaemon's current `Tool` trait) belong in a separate opt-in trait so the
-/// simple case stays simple.
+/// Richer per-call semantics (annotations, access, typed effects) are
+/// optional methods with conservative defaults, so the simple case stays
+/// simple.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -300,6 +303,18 @@ pub trait Tool: Send + Sync {
     /// manifest as undeclared.
     fn access(&self, _arguments: &Value) -> AccessManifest {
         AccessManifest::default()
+    }
+
+    /// The typed effects of this call (effect class and normalized target).
+    /// The default is [`CallEffects::none`] for a call that is read-only
+    /// (per [`Tool::annotations_for`]) and [`CallEffects::unknown`]
+    /// otherwise. Recomputed after a hook rewrites the arguments.
+    fn effects(&self, arguments: &Value) -> CallEffects {
+        if self.annotations_for(arguments).read_only {
+            CallEffects::none()
+        } else {
+            CallEffects::unknown()
+        }
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;

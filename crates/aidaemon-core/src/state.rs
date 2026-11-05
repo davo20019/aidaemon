@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::approval::{EffectKey, InterruptKind};
 use crate::message::{Message, ToolCall};
 use crate::provider::Usage;
 use crate::receipt::Receipt;
@@ -46,6 +47,10 @@ pub struct Interruption {
     /// The call waiting for a decision. It has not run.
     pub call: ToolCall,
     pub reason: String,
+    /// Who the interruption waits for. State saved before kinds existed
+    /// reads as [`InterruptKind::Untrusted`].
+    #[serde(default)]
+    pub kind: InterruptKind,
 }
 
 /// The unfinished tool batch of an interrupted turn.
@@ -116,6 +121,12 @@ pub struct RunState {
     pub untrusted_seen: bool,
     #[serde(default)]
     pub(crate) stuck: StuckState,
+    /// Effects the owner declined in this run (deduplicated). The kernel
+    /// records a denied [`InterruptKind::OwnerApproval`] request's effects
+    /// here; hooks read them through [`crate::HookContext::declined`]. A new
+    /// run ([`RunState::with_user_message`]) starts with none.
+    #[serde(default)]
+    pub declined: Vec<EffectKey>,
 }
 
 impl RunState {
@@ -140,6 +151,7 @@ impl RunState {
             nudges: 0,
             untrusted_seen: false,
             stuck: StuckState::default(),
+            declined: Vec::new(),
         }
     }
 
@@ -153,7 +165,8 @@ impl RunState {
     /// Continue an earlier, finished run with a new user message (same
     /// session, new run). Session receipts and `usage` keep accumulating;
     /// per-run counters and budgets (`turn`, `tool_calls`, `run_usage`,
-    /// elapsed time) start again from zero.
+    /// elapsed time) start again from zero, and the run's
+    /// [`RunState::declined`] effects are forgotten.
     pub fn with_user_message(mut self, input: impl Into<Message>) -> Self {
         self.messages.push(input.into());
         self.run_id = RunId::new();
@@ -164,6 +177,7 @@ impl RunState {
         self.nudges = 0;
         self.in_flight = None;
         self.stuck.reset();
+        self.declined.clear();
         self
     }
 

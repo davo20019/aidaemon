@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
-    Agent, Event, FnTool, Hook, HookContext, MemoryStore, Resolution, RunState, RunStatus,
-    ToolAnnotations, ToolCall, ToolDecision, ToolInfo, ToolOutput,
+    Agent, ApprovalRisk, Event, FnTool, Hook, HookContext, InterruptKind, MemoryStore,
+    OwnerApprovalRequest, Resolution, RunState, RunStatus, ToolAnnotations, ToolCall, ToolDecision,
+    ToolInfo, ToolOutput,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -28,6 +29,13 @@ impl Hook for AskBeforeDestructive {
         if tool.annotations.destructive {
             ToolDecision::Interrupt {
                 reason: format!("`{}` is destructive; needs approval", call.name),
+                kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
+                    effects: Vec::new(),
+                    summary: format!("Run `{}`?", call.name),
+                    subject: format!("{} {}", call.name, call.arguments),
+                    risk: ApprovalRisk::High,
+                    warnings: Vec::new(),
+                }),
             }
         } else {
             ToolDecision::Allow

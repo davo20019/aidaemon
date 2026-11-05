@@ -44,6 +44,7 @@ impl Hook for AskBeforeDeploy {
         if call.name == "deploy" {
             ToolDecision::Interrupt {
                 reason: "needs approval".into(),
+                kind: aidaemon_core::InterruptKind::default(),
             }
         } else {
             ToolDecision::Allow

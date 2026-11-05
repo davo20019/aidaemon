@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::approval::{EffectKey, InterruptKind};
 use crate::message::{Message, ToolCall};
 use crate::outcome::RunOutcome;
 use crate::provider::{ModelRequest, Usage};
@@ -27,6 +28,9 @@ pub struct HookContext<'a> {
     /// The run has read untrusted content so far (see
     /// [`crate::RunState::untrusted_seen`]).
     pub untrusted_seen: bool,
+    /// Effects the owner declined earlier in this run (see
+    /// [`crate::RunState::declined`]).
+    pub declined: &'a [EffectKey],
 }
 
 impl HookContext<'_> {
@@ -56,6 +60,9 @@ pub enum ToolDecision {
     /// [`crate::Agent::resume`] continues later, in this or another process.
     Interrupt {
         reason: String,
+        /// Who the interruption waits for; resolvers settle the kinds they
+        /// own.
+        kind: InterruptKind,
     },
 }
 

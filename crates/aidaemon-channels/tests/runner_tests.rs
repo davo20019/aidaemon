@@ -40,6 +40,7 @@ impl Hook for AskBeforeDeploy {
         if call.name == "deploy" {
             ToolDecision::Interrupt {
                 reason: "deploys need a human".into(),
+                kind: aidaemon_core::InterruptKind::default(),
             }
         } else {
             ToolDecision::Allow

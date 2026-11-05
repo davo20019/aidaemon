@@ -207,6 +207,7 @@ mod tests {
                 json!({"target": "staging", "zz_notes": "x".repeat(500)}),
             ),
             reason: "deploys need a human".into(),
+            kind: aidaemon_core::InterruptKind::default(),
         };
         let text = approval_text(&interruption, 80);
         assert!(text.contains("`deploy`"));

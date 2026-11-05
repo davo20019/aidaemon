@@ -15,6 +15,7 @@
 //! and `examples/quickstart.rs` for a runnable example.
 
 mod agent;
+mod approval;
 mod authority;
 mod error;
 mod event;
@@ -38,6 +39,10 @@ pub mod conformance;
 pub mod testing;
 
 pub use agent::{Agent, AgentBuilder, InterruptResolver, Resolution};
+pub use approval::{
+    ApprovalRisk, CallEffects, EffectClass, EffectKey, InterruptKind, OwnerApprovalRequest,
+    OWNER_DECLINED,
+};
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};

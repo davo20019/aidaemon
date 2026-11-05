@@ -239,6 +239,7 @@ impl Hook for AskFirst {
     async fn before_tool(&self, _: &HookContext<'_>, _: &ToolCall, _: &ToolInfo) -> ToolDecision {
         ToolDecision::Interrupt {
             reason: "needs approval".into(),
+            kind: aidaemon_core::InterruptKind::default(),
         }
     }
 }
