@@ -312,12 +312,15 @@ impl MemoryWrites for DaemonMemoryInner {
         let snapshot = self.llm_runtime.snapshot();
         // The fast model writes the summary; the turn's model is the window
         // the history has to fit.
-        crate::memory::context_window::spawn_incremental_summarization(
-            snapshot.provider(),
-            fast_model(&snapshot, &turn.model),
-            self.state.clone(),
-            self.event_store.clone(),
-            turn.session_id.clone(),
+        let fast_model = fast_model(&snapshot, &turn.model);
+        super::conversation_compaction::compact_after_reply(
+            super::conversation_compaction::CompactionTarget {
+                runtime: self.llm_runtime.clone(),
+                fast_model: &fast_model,
+                state: self.state.clone(),
+                event_store: self.event_store.clone(),
+                session_id: &turn.session_id,
+            },
             turn.turn_id.clone(),
             self.context_window_config
                 .summarize_token_threshold_for(&turn.model),

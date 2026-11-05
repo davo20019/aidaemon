@@ -1182,6 +1182,9 @@ impl Agent {
                 learning_ctx: learning_ctx.clone(),
                 instruction_tracker: project_instruction_tracker.take(),
                 memory_recall_allowed: memory_pipeline_policy.allows_recall(),
+                conversation_summary: session_summary
+                    .clone()
+                    .filter(|_| preserve_archived_context),
                 restrict_untrusted_reference_tools: restrict_untrusted_external_reference_tools,
                 untrusted_reference_skills: active_untrusted_external_reference_skills.clone(),
                 continue_inline_after_background: turn_context

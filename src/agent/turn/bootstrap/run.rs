@@ -689,7 +689,6 @@ async fn build_isolated_mandate_bootstrap(
             channel_ctx,
             tool_defs.len(),
             None,
-            None,
             false,
             None,
         )
@@ -1555,13 +1554,14 @@ pub(in crate::agent) async fn run_bootstrap(
             .summary_recent_tokens_for(&model);
         match tokio::time::timeout(
             Duration::from_secs(30),
-            crate::memory::context_window::refresh_incremental_summarization(
-                llm_provider.clone(),
-                &compaction_model,
-                agent.state.clone(),
-                agent.event_store.clone(),
-                session_id,
-                None,
+            crate::agent::conversation_compaction::compact_now(
+                crate::agent::conversation_compaction::CompactionTarget {
+                    runtime: agent.llm_runtime.clone(),
+                    fast_model: &compaction_model,
+                    state: agent.state.clone(),
+                    event_store: agent.event_store.clone(),
+                    session_id,
+                },
                 token_threshold,
                 recent_tokens,
             ),
@@ -1570,7 +1570,7 @@ pub(in crate::agent) async fn run_bootstrap(
         {
             Ok(Ok(Some(summary))) => info!(
                 session_id,
-                last_turn_seq = summary.last_turn_seq,
+                last_turn_seq = summary.cursor,
                 "Emergency token-pressure compaction refreshed current context"
             ),
             Ok(Ok(None)) => {}
@@ -1646,7 +1646,6 @@ pub(in crate::agent) async fn run_bootstrap(
             &channel_ctx,
             tool_defs.len(),
             resume_checkpoint.as_ref(),
-            session_summary.as_ref(),
             preserve_conversation_context,
             project_instruction_scope,
         )

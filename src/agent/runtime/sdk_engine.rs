@@ -346,6 +346,9 @@ pub(in crate::agent) struct SdkTurnSetup {
         Option<crate::project_instructions::ProjectInstructionTracker>,
     /// The compiled memory policy allows recall on this turn.
     pub(in crate::agent) memory_recall_allowed: bool,
+    /// The conversation summary standing for the turns `prefix` leaves out,
+    /// on a turn that continues the conversation.
+    pub(in crate::agent) conversation_summary: Option<crate::traits::ConversationSummary>,
     /// Where calls without a directory run: the contract's execution cwd,
     /// else the request's primary project scope (a scheduled goal's bound
     /// workspace). `None` when a channel workspace grant scopes the file
@@ -698,6 +701,7 @@ impl Agent {
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
             memory_recall_allowed,
+            conversation_summary,
             known_project_dir,
             project_scope,
             explicit_workspace,
@@ -852,6 +856,13 @@ impl Agent {
                 },
                 self.transcript_writes.clone(),
             ));
+        }
+        // The summary first: notes keep their order after the task-context
+        // tail, where the summary stood before.
+        if let Some(note) =
+            crate::agent::conversation_compaction::summary_note(conversation_summary.as_ref())
+        {
+            builder = builder.hook(note);
         }
         for hook in memory.hooks {
             builder = builder.hook_arc(hook);

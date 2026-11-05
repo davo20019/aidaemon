@@ -179,7 +179,6 @@ impl Agent {
         channel_ctx: &ChannelContext,
         tools_count: usize,
         resume_checkpoint: Option<&ResumeCheckpoint>,
-        session_summary: Option<&crate::traits::ConversationSummary>,
         preserve_conversation_context: bool,
         project_instruction_scope: Option<&str>,
     ) -> anyhow::Result<(
@@ -423,9 +422,6 @@ impl Agent {
         let resume_section = (user_role == UserRole::Owner && !mandate_context)
             .then(|| resume_checkpoint.map(|checkpoint| checkpoint.render_prompt_section()))
             .flatten();
-        let session_summary = (!mandate_context && !non_owner_shared_context)
-            .then_some(session_summary)
-            .flatten();
 
         // Repository instructions are per-task and per-scope, so they belong
         // in the volatile tail rather than the session-static core. Only an
@@ -486,7 +482,6 @@ impl Agent {
             project_instructions_block.as_deref(),
             &skills_content,
             channel_ctx.sender_name.as_deref(),
-            None,
             new_request_dialogue_note,
             &date_time_str,
             resume_section.as_deref(),
@@ -495,7 +490,6 @@ impl Agent {
             project_instructions_block.as_deref(),
             &skills_content,
             channel_ctx.sender_name.as_deref(),
-            session_summary,
             &session_context_str,
             &date_time_str,
             resume_section.as_deref(),
@@ -760,7 +754,7 @@ impl Agent {
         // MemoryContext emits owner-memory affordances and a `Your Memory`
         // shell that do not belong in an externally acting mandate worker.
         let date_time_str = prompt_now.format("%A, %B %-d, %Y %H:%M UTC").to_string();
-        let tail = Self::build_context_tail(None, "", None, None, "", &date_time_str, None);
+        let tail = Self::build_context_tail(None, "", None, "", &date_time_str, None);
 
         if self.record_decision_points {
             let mut core_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1209,7 +1203,6 @@ impl Agent {
         project_instructions_block: Option<&str>,
         skills_content: &str,
         sender_name: Option<&str>,
-        session_summary: Option<&crate::traits::ConversationSummary>,
         session_context_str: &str,
         date_time_str: &str,
         resume_section: Option<&str>,
@@ -1227,24 +1220,6 @@ impl Agent {
 
         if let Some(name) = sender_name {
             tail.push_str(&format!("\n\n[Current speaker: {}]", name));
-        }
-
-        // Session summary (volatile): MOVED here from the build-stage index-1
-        // insertion (Pillar A). The summary now participates ONLY in the tail.
-        if let Some(summary) = session_summary {
-            if !summary.summary.is_empty() {
-                tail.push_str(&format!(
-                    "\n\n[Context Coverage]\nCompacted through canonical turn {} / message {}. \
-                     Recent raw turns and the immediately preceding exchange are supplied separately. \
-                     If exact wording or evidence is absent below, retrieve the canonical conversation with `search_history`; do not guess.\n\n[Compacted Conversation State]\n",
-                    summary
-                        .last_turn_seq
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "legacy".to_string()),
-                    summary.last_message_id
-                ));
-                tail.push_str(&summary.summary);
-            }
         }
 
         if !session_context_str.is_empty() {
@@ -1501,7 +1476,6 @@ mod tests {
     #[tokio::test]
     async fn new_task_prompt_omits_prior_summary_and_session_activity() {
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::ConversationSummary;
         use crate::types::{ChannelContext, UserRole};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1511,15 +1485,6 @@ mod tests {
             harness.agent.event_store().clone(),
             "new-task-session".to_string(),
         );
-        let summary = ConversationSummary {
-            session_id: "new-task-session".to_string(),
-            summary: "STALE_OUTPUT_FORMAT phase=OLD package_name=stale".to_string(),
-            message_count: 2,
-            last_message_id: "old-answer".to_string(),
-            last_turn_seq: Some(1),
-            updated_at: chrono::Utc::now(),
-        };
-
         let (_, tail, continuation_tail, _, _) = harness
             .agent
             .build_system_prompt_for_message(
@@ -1531,7 +1496,6 @@ mod tests {
                 &ChannelContext::private("synthetic-owner"),
                 0,
                 None,
-                Some(&summary),
                 false,
                 None,
             )
@@ -1542,15 +1506,17 @@ mod tests {
         assert!(!tail.contains("package_name=stale"));
         assert!(!tail.contains("Compacted Conversation State"));
         assert!(!tail.contains("Recent Session Context"));
-        assert!(continuation_tail.contains("STALE_OUTPUT_FORMAT"));
+        // A continuation turn's summary is placed by the SDK summary note
+        // (`conversation_compaction::summary_note`), never in either tail.
+        assert!(!continuation_tail.contains("Compacted Conversation State"));
     }
 
     #[tokio::test]
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{
-            ConversationSummary, Goal, Mandate, MandateAuthority, MandateObjectiveControl,
-            MandateStore, ObjectiveMetricDirection, TaskAttempt,
+            Goal, Mandate, MandateAuthority, MandateObjectiveControl, MandateStore,
+            ObjectiveMetricDirection, TaskAttempt,
         };
         use crate::types::{ChannelContext, UserRole};
 
@@ -1681,15 +1647,6 @@ mod tests {
             &attempt.id,
             &attempt,
         );
-        let now = chrono::Utc::now();
-        let summary = ConversationSummary {
-            session_id: "mandate-session".to_string(),
-            summary: "SECRET PRIOR CONVERSATION".to_string(),
-            message_count: 4,
-            last_message_id: "last-message".to_string(),
-            last_turn_seq: Some(4),
-            updated_at: now,
-        };
         let emitter = crate::events::EventEmitter::new(
             harness.agent.event_store().clone(),
             "mandate-session".to_string(),
@@ -1705,7 +1662,6 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(&summary),
                 false,
                 project_dir.path().to_str(),
             )
@@ -1837,7 +1793,6 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(&summary),
                 false,
                 project_dir.path().to_str(),
             )
@@ -1868,15 +1823,8 @@ mod tests {
     /// here we assert the date/time block and the marker.
     #[test]
     fn context_tail_carries_all_volatile_sections_and_marker() {
-        let tail = Agent::build_context_tail(
-            None,
-            "",
-            None,
-            None,
-            "",
-            "Monday, June 1, 2026 12:00 UTC",
-            None,
-        );
+        let tail =
+            Agent::build_context_tail(None, "", None, "", "Monday, June 1, 2026 12:00 UTC", None);
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
         let needle = "[Current Date & Time]";
         assert!(tail.contains(needle), "missing {needle}");
@@ -1893,7 +1841,6 @@ mod tests {
         let tail = Agent::build_context_tail(
             None,
             "",
-            None,
             None,
             "",
             "Monday, June 1, 2026 12:00 UTC",
@@ -1961,40 +1908,12 @@ mod tests {
         }
     }
 
-    /// The session summary participates in the tail (not at message index 1).
-    #[test]
-    fn context_tail_includes_session_summary() {
-        let summary = crate::traits::ConversationSummary {
-            session_id: "s".into(),
-            summary: "User likes black coffee.".into(),
-            message_count: 3,
-            last_message_id: "x".into(),
-            last_turn_seq: Some(3),
-            updated_at: chrono::Utc::now(),
-        };
-        let tail = Agent::build_context_tail(
-            None,
-            "",
-            None,
-            Some(&summary),
-            "",
-            "Monday, June 1, 2026 12:00 UTC",
-            None,
-        );
-        assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
-        assert!(tail.contains("[Context Coverage]"));
-        assert!(tail.contains("[Compacted Conversation State]"));
-        assert!(tail.contains("turn 3 / message x"));
-        assert!(tail.contains("black coffee"));
-    }
-
     #[test]
     fn context_tail_includes_scoped_project_instructions() {
         let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
         let tail = Agent::build_context_tail(
             Some(instructions),
             "",
-            None,
             None,
             "",
             "Monday, June 1, 2026 12:00 UTC",
