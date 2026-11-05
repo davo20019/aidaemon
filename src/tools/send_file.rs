@@ -1,4 +1,3 @@
-use crate::traits::ToolSemantics;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,15 +8,16 @@ use tokio::sync::mpsc;
 use crate::events::{
     Event, EventStore, EventType, ResourceInvalidatedData, ResourceRegisteredData,
 };
-use crate::execution::{active_execution_backend, BackendKind};
+use crate::execution::{BackendKind, SharedExecutionBackend};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
+    ToolMutationEffects, ToolOutcomeStatus, ToolSemantics, ToolTargetHintKind,
 };
 use crate::types::{MediaKind, MediaMessage};
 
 pub struct SendFileTool {
+    backend: SharedExecutionBackend,
     media_tx: mpsc::Sender<MediaMessage>,
     outbox_dirs: Vec<PathBuf>,
     inbox_dir: PathBuf,
@@ -32,6 +32,7 @@ const DELIVERY_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 impl SendFileTool {
     pub fn new(
+        backend: SharedExecutionBackend,
         media_tx: mpsc::Sender<MediaMessage>,
         outbox_dirs: &[String],
         inbox_dir: &str,
@@ -45,6 +46,7 @@ impl SendFileTool {
             .collect();
         let inbox_dir = PathBuf::from(shellexpand::tilde(inbox_dir).to_string());
         Self {
+            backend,
             media_tx,
             outbox_dirs,
             inbox_dir,
@@ -193,7 +195,7 @@ impl Tool for SendFileTool {
             return Ok("Error: Missing resource_id or file_path.".to_string());
         };
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let mut requested_for_delivery = file_path.to_string();
         let mut exported_from_backend = false;
         if registered_resource.is_none() && backend.kind() != BackendKind::Local {
@@ -506,8 +508,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
 
@@ -540,8 +547,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
         let call_tool = tool.clone();
@@ -574,8 +586,13 @@ mod tests {
         std::fs::write(&f, b"data").expect("write");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-            .with_receipt_timeout(std::time::Duration::from_millis(100));
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        )
+        .with_receipt_timeout(std::time::Duration::from_millis(100));
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
         // Nobody answers the receipt (congested channel) → honest pending text.
         let outcome = tool
@@ -609,8 +626,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
 
         let args = json!({
@@ -665,9 +687,14 @@ mod tests {
         register_file_resource(&store, "sess-resource", "res_exact", &artifact).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_event_store(store)
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_event_store(store)
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
         let args = json!({
             "_session_id": "sess-resource",
@@ -714,8 +741,13 @@ mod tests {
         std::fs::write(&artifact, b"%PDF-1.7 replaced").expect("replace artifact");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool =
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy()).with_event_store(store.clone());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        )
+        .with_event_store(store.clone());
         let outcome = tool
             .call_with_status_outcome(
                 &json!({
@@ -744,7 +776,12 @@ mod tests {
     #[test]
     fn send_file_schema_prefers_resource_id_without_requiring_a_path() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], "/tmp/aidaemon-inbox");
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            "/tmp/aidaemon-inbox",
+        );
         let schema = tool.schema();
         assert!(schema["parameters"]["properties"]["resource_id"].is_object());
         assert!(schema["parameters"].get("required").is_none());
@@ -780,7 +817,12 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        );
         let args = json!({
             "_session_id": "s",
             "file_path": manifest.to_string_lossy(),
@@ -806,7 +848,12 @@ mod tests {
         std::fs::write(&src, b"SECRET=1").expect("write src");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        );
 
         let args = json!({
             "_session_id": "s",

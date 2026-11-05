@@ -355,7 +355,10 @@ pub(crate) async fn init_heartbeat_coordinator(
             "tool_result_cleanup",
             Duration::from_secs(3600),
             move || async move {
-                crate::tools::result_spill::prune_spill_dir_for_backend().await;
+                crate::tools::result_spill::prune_spill_dir_for_backend(
+                    &*crate::execution::active_execution_backend(),
+                )
+                .await;
                 Ok(())
             },
         );

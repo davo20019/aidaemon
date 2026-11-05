@@ -431,6 +431,8 @@ impl DispatchResult {
 
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    /// The agent workspace; `render_pdf` is only offered on a local one.
+    execution_backend: crate::execution::SharedExecutionBackend,
     media_tx: mpsc::Sender<MediaMessage>,
     /// Shared inbox for persisting screenshots for agent vision context.
     inbox_dir: PathBuf,
@@ -549,6 +551,7 @@ impl BrowserTool {
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
         inbox_dir: impl Into<PathBuf>,
+        execution_backend: crate::execution::SharedExecutionBackend,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -568,6 +571,7 @@ impl BrowserTool {
         );
         Ok(Self {
             backend: Arc::new(backend),
+            execution_backend,
             media_tx,
             inbox_dir: inbox_dir.into(),
             sessions: BrowserSessionRegistry::new(),
@@ -592,6 +596,7 @@ impl BrowserTool {
             backend,
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
+            execution_backend: crate::execution::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
@@ -616,6 +621,7 @@ impl BrowserTool {
             backend,
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
+            execution_backend: crate::execution::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout,
@@ -1137,9 +1143,7 @@ impl BrowserTool {
     /// gives us one deterministic renderer, a hard timeout, print backgrounds,
     /// and CSS `@page` sizing in a single operation.
     async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, String> {
-        if crate::execution::active_execution_backend().kind()
-            != crate::execution::BackendKind::Local
-        {
+        if self.execution_backend.kind() != crate::execution::BackendKind::Local {
             return Err("render_pdf is only available with local execution".to_string());
         }
 
@@ -1147,7 +1151,7 @@ impl BrowserTool {
             .get("source_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
-        let source = crate::tools::fs_utils::validate_path(raw_source)
+        let source = crate::tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
             .map_err(|e| format!("Invalid source_path: {e}"))?;
         if crate::tools::fs_utils::is_sensitive_path(&source) {
             return Err("Cannot render a sensitive source path".to_string());

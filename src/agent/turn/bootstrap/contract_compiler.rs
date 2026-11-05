@@ -876,6 +876,7 @@ fn resolve_structural_path(
     workspace_anchor: Option<&std::path::Path>,
 ) -> Option<String> {
     crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        &*crate::execution::active_execution_backend(),
         raw,
         alias_roots,
         workspace_anchor,
@@ -1180,6 +1181,7 @@ fn compile_project_scope(
     };
     let workspace_anchor = bound_workspace.map(std::path::Path::new);
     let resolved = crate::tools::fs_utils::resolve_project_scope_reference_from(
+        &*crate::execution::active_execution_backend(),
         reference,
         alias_roots,
         workspace_anchor,

@@ -39,8 +39,12 @@ fn infer_open_request_scope(text: &str, alias_roots: &[String]) -> Option<ToolSe
         if token.starts_with("http://") || token.starts_with("https://") {
             return Some(ToolSemanticScope::ExternalRemote);
         }
-        if crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
-            .is_some()
+        if crate::tools::fs_utils::resolve_structural_filesystem_reference(
+            &*crate::execution::active_execution_backend(),
+            token,
+            alias_roots,
+        )
+        .is_some()
         {
             return Some(ToolSemanticScope::LocalWorkspace);
         }

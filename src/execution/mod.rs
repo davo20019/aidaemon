@@ -72,8 +72,10 @@ pub fn active_execution_backend() -> SharedExecutionBackend {
 /// Synchronous lexical normalization for policy/scope code that cannot perform
 /// backend I/O. Actual tool calls still run `resolve_path` and its confinement
 /// checks before touching the target.
-pub fn normalize_active_path_lexically(path: &str) -> anyhow::Result<BackendPath> {
-    let backend = active_execution_backend();
+pub fn normalize_path_lexically(
+    backend: &dyn ExecutionBackend,
+    path: &str,
+) -> anyhow::Result<BackendPath> {
     let expanded = if path == "~" {
         backend.home_hint().as_str().to_string()
     } else if let Some(rest) = path.strip_prefix("~/") {

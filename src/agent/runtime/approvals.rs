@@ -1065,6 +1065,7 @@ mod tests {
         drop(rx);
         let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
             crate::tools::TerminalTool::new(
+                crate::execution::active_execution_backend(),
                 allowed.iter().map(|p| p.to_string()).collect(),
                 crate::tools::ApprovalBroker::new(tx),
                 1,
@@ -1337,6 +1338,7 @@ mod tests {
         drop(rx);
         let confined: Arc<dyn crate::traits::Tool> = Arc::new(
             crate::tools::TerminalTool::new(
+                crate::execution::active_execution_backend(),
                 vec!["cat".to_string()],
                 crate::tools::ApprovalBroker::new(tx),
                 1,

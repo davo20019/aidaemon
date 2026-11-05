@@ -175,6 +175,7 @@ impl Agent {
         let spilled =
             if !result_is_err && has_fs_recovery && !keep_inline && !scope.mandate_execution {
                 crate::tools::result_spill::build_spilled_preview_for_backend(
+                    &*crate::execution::active_execution_backend(),
                     tool_name,
                     scope.session_id,
                     &result_text,

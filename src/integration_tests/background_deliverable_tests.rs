@@ -117,7 +117,7 @@ async fn make_terminal_with_hub(
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
 
     let tool = Arc::new(
-        TerminalTool::new(
+        TerminalTool::new(crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1, // 1-second initial timeout — moves long commands to background fast

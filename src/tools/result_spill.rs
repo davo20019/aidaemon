@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use crate::execution::{active_execution_backend, BackendKind, WriteMode};
+use crate::execution::{BackendKind, ExecutionBackend, WriteMode};
 
 /// Base directory for spilled tool results, under the OS temp dir
 /// (`std::env::temp_dir()` honors `TMPDIR`/`%TEMP%`, cross-platform). Spilled
@@ -26,8 +26,10 @@ pub fn spill_dir() -> Option<PathBuf> {
 /// backend: the same path `build_spilled_preview_for_backend` writes to. The
 /// spill notice tells the model to read these files, so the scope check
 /// grants a session reads of its own directory and of nothing beside it.
-pub fn session_spill_dir_for_backend(session_id: &str) -> Option<String> {
-    let backend = active_execution_backend();
+pub fn session_spill_dir_for_backend(
+    backend: &dyn ExecutionBackend,
+    session_id: &str,
+) -> Option<String> {
     if backend.kind() == BackendKind::Local {
         let dir = spill_dir()?.join(sanitize_session_id(session_id));
         return Some(dir.to_string_lossy().into_owned());
@@ -76,12 +78,12 @@ pub fn build_spilled_preview(
 /// historical OS-temp behavior; Docker/SSH store the recovery artifact inside
 /// the execution workspace so both `read_file` and `terminal` can see it.
 pub async fn build_spilled_preview_for_backend(
+    backend: &dyn ExecutionBackend,
     tool_name: &str,
     session_id: &str,
     full_text: &str,
     max_chars: usize,
 ) -> Option<String> {
-    let backend = active_execution_backend();
     if backend.kind() == BackendKind::Local {
         return build_spilled_preview(tool_name, session_id, full_text, max_chars);
     }
@@ -364,8 +366,7 @@ pub fn prune_spill_dir() {
 }
 
 /// Prune spill files from the same filesystem that stores them.
-pub async fn prune_spill_dir_for_backend() {
-    let backend = active_execution_backend();
+pub async fn prune_spill_dir_for_backend(backend: &dyn ExecutionBackend) {
     if backend.kind() == BackendKind::Local {
         prune_spill_dir();
         return;

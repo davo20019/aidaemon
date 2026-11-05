@@ -2180,8 +2180,14 @@ fn hint_matches_target(
             // The target itself, or a path under it: only a directory has
             // paths under it, so a folder-scoped item is met by work on its
             // files while a file-bound item still needs that exact file.
-            let expected = crate::execution::normalize_active_path_lexically(&target.value);
-            let actual = crate::execution::normalize_active_path_lexically(&hint.value);
+            let expected = crate::execution::normalize_path_lexically(
+                &*crate::execution::active_execution_backend(),
+                &target.value,
+            );
+            let actual = crate::execution::normalize_path_lexically(
+                &*crate::execution::active_execution_backend(),
+                &hint.value,
+            );
             expected
                 .ok()
                 .zip(actual.ok())
@@ -2192,8 +2198,14 @@ fn hint_matches_target(
                 })
         }
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::ProjectScope) => {
-            let expected = crate::execution::normalize_active_path_lexically(&target.value);
-            let root = crate::execution::normalize_active_path_lexically(&hint.value);
+            let expected = crate::execution::normalize_path_lexically(
+                &*crate::execution::active_execution_backend(),
+                &target.value,
+            );
+            let root = crate::execution::normalize_path_lexically(
+                &*crate::execution::active_execution_backend(),
+                &hint.value,
+            );
             expected.ok().zip(root.ok()).is_some_and(|(target, root)| {
                 let target = target.as_str();
                 let root = root.as_str().trim_end_matches('/');

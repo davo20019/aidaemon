@@ -883,7 +883,9 @@ async fn setup_test_agent_internal(
     // Tools — SystemInfoTool + RememberFactTool (no side effects, no approval)
     let mut tools: Vec<Arc<dyn Tool>> = if include_default_tools {
         vec![
-            Arc::new(SystemInfoTool),
+            Arc::new(SystemInfoTool::new(
+                crate::execution::active_execution_backend(),
+            )),
             Arc::new(RememberFactTool::new(
                 state.clone() as Arc<dyn crate::traits::StateStore>
             )),
@@ -1026,7 +1028,9 @@ pub async fn setup_test_agent_with_models_and_policy(
     let provider = Arc::new(provider);
 
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -1119,7 +1123,9 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let provider = Arc::new(provider);
 
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -1364,6 +1370,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     // TerminalTool in Yolo mode — auto-approves everything
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -1376,7 +1383,9 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Tools: SystemInfoTool + RememberFactTool + TerminalTool + extras
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -1519,6 +1528,7 @@ pub async fn setup_live_agent(
     });
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             crate::tools::ApprovalBroker::new(approval_tx),
             60,
@@ -1529,12 +1539,18 @@ pub async fn setup_live_agent(
         .await,
     );
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
-        Arc::new(crate::tools::ReadFileTool),
-        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(crate::tools::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        Arc::new(crate::tools::WriteFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         terminal_tool,
     ];
 

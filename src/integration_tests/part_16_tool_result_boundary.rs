@@ -210,7 +210,7 @@ async fn test_sdk_scope_check_refuses_protected_host_data() {
         MockProvider::tool_call_response("read_file", r#"{"path":"/etc/hosts"}"#),
         MockProvider::text_response("I can't read that file."),
     ]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ReadFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ReadFileTool::new(crate::execution::active_execution_backend()));
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();

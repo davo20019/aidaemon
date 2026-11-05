@@ -474,7 +474,9 @@ async fn typed_contract_rejection_requires_the_actual_tool_receipt() {
     .with_task_assessments(vec![assessment]);
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
         provider,
-        vec![Arc::new(crate::tools::ReadFileTool)],
+        vec![Arc::new(crate::tools::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        ))],
         None,
     )
     .await
@@ -1475,7 +1477,9 @@ async fn nested_project_instructions_are_injected_before_first_write_executes() 
             Arc::new(CountingLocalWriteTool {
                 calls: write_calls.clone(),
             }) as Arc<dyn Tool>,
-            Arc::new(crate::tools::ReadFileTool) as Arc<dyn Tool>,
+            Arc::new(crate::tools::ReadFileTool::new(
+                crate::execution::active_execution_backend(),
+            )) as Arc<dyn Tool>,
         ],
         None,
     )

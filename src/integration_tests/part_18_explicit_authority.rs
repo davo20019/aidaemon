@@ -46,7 +46,7 @@ async fn assessed_read_only_contract_no_longer_blocks_owner_writes() {
         MockProvider::text_response("Wrote the file."),
     ])
     .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()));
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
@@ -95,8 +95,8 @@ async fn goal_run_writes_confined_reads_free() {
         MockProvider::text_response("Goal step done."),
     ]);
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(crate::tools::WriteFileTool),
-        Arc::new(crate::tools::ReadFileTool),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
+        Arc::new(crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())),
     ];
     let mut harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, tools, None)
         .await
@@ -173,7 +173,7 @@ async fn guest_grants_unchanged() {
         ),
         MockProvider::text_response("Saved."),
     ]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()));
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
@@ -203,7 +203,7 @@ async fn guest_grants_unchanged() {
         ),
         MockProvider::text_response("Could not save."),
     ]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()));
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
@@ -325,7 +325,7 @@ async fn mandate_allowed_tools_still_restrict() {
     .unwrap();
     harness
         .agent
-        .push_test_tool(Arc::new(crate::tools::WriteFileTool));
+        .push_test_tool(Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())));
     harness.agent.set_test_mandate_execution(
         &mandate.id,
         mandate.version,
@@ -386,7 +386,7 @@ async fn readonly_blocks_writes_then_full_restores() {
         ),
         MockProvider::text_response("Wrote the file."),
     ]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()));
     let harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(provider, vec![tool])
         .await
         .unwrap();
@@ -587,7 +587,7 @@ async fn readonly_parent_child_cannot_write() {
     ]);
     let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
         Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
     ];
     let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
@@ -759,7 +759,7 @@ async fn run_owner_write_with_assessment(
         MockProvider::text_response("Wrote the file."),
     ])
     .with_task_assessments(vec![MockProvider::text_response(&assessment.to_string())]);
-    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()));
     let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
@@ -901,7 +901,7 @@ async fn readonly_mid_run_blocks_the_next_write() {
     ]);
     let state_cell = Arc::new(std::sync::OnceLock::new());
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
         Arc::new(ModeFlipProbe {
             state: state_cell.clone(),
             session: session.to_string(),
@@ -966,7 +966,7 @@ async fn readonly_mid_run_blocks_a_terminal_redirect_write() {
         .unwrap();
     let (approval_tx, _approval_rx) =
         tokio::sync::mpsc::channel::<crate::tools::terminal::ApprovalRequest>(1);
-    let terminal = crate::tools::TerminalTool::new(
+    let terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
         vec!["*".to_string()],
         crate::tools::ApprovalBroker::new(approval_tx),
         30,
@@ -1036,7 +1036,7 @@ async fn readonly_reaches_a_running_child_through_its_parent_chat() {
     ]);
     let state_cell = Arc::new(std::sync::OnceLock::new());
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
         Arc::new(ModeFlipProbe {
             state: state_cell.clone(),
             session: parent.to_string(),

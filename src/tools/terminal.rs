@@ -20,9 +20,7 @@ use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
     DecisionType, DiagnosticSeverity, EventStore, EventType,
 };
-use crate::execution::{
-    active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
-};
+use crate::execution::{BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
@@ -472,12 +470,13 @@ fn format_deliverable_paths(paths: &[PathBuf]) -> String {
 /// Uses exact write targets from the enforced process manifest. Shell source,
 /// referenced scripts, and checklist prose cannot create artifact authority.
 async fn attribute_background_deliverable(
+    backend: &SharedExecutionBackend,
     declared_write_paths: &[String],
     command_start: std::time::SystemTime,
     command_end: std::time::SystemTime,
 ) -> DeliverableAttribution {
     let ctx = crate::tools::background_deliverable::attribute_declared_deliverables_backend(
-        active_execution_backend(),
+        backend.clone(),
         declared_write_paths,
         command_start,
         command_end,
@@ -555,6 +554,7 @@ fn build_deliverable_caption(filename: &str, summary: Option<&str>) -> String {
 /// not. Returns nothing; all paths are best-effort with logging.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_attributed_background_file(
+    backend: &SharedExecutionBackend,
     path: &std::path::Path,
     session_id: &str,
     _command_summary: &str,
@@ -571,7 +571,6 @@ async fn deliver_attributed_background_file(
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let backend = active_execution_backend();
     let mut delivery_path = path.to_path_buf();
     if backend.kind() != BackendKind::Local {
         let backend_path = match backend.resolve_path(&path.to_string_lossy()).await {
@@ -3402,6 +3401,7 @@ impl TerminalTool {
     /// `_approval_tx` is unused: the owner's approval cards come from the
     /// agent kernel (`AppApprovalRules`), never from the tool.
     pub async fn new(
+        backend: SharedExecutionBackend,
         allowed_prefixes: Vec<String>,
         _approval_tx: super::ApprovalBroker,
         initial_timeout_secs: u64,
@@ -3409,7 +3409,6 @@ impl TerminalTool {
         permission_mode: PermissionMode,
         pool: SqlitePool,
     ) -> Self {
-        let backend = active_execution_backend();
         // Log permission mode on startup
         match permission_mode {
             PermissionMode::Yolo => {
@@ -5060,6 +5059,7 @@ impl TerminalTool {
                         .checked_sub(Duration::from_secs(runtime_secs))
                         .unwrap_or(command_end);
                     match attribute_background_deliverable(
+                        &self.backend,
                         &declared_write_paths,
                         command_start,
                         command_end,
@@ -5594,6 +5594,7 @@ impl TerminalTool {
                 let owner_task_id_for_notify = owner_task_id.clone();
                 let tool_call_id_for_notify = tool_call_id.map(str::to_string);
                 let event_store_for_notify = self.event_store.clone();
+                let backend_for_notify = self.backend.clone();
                 // The completion receipt terminates the same invocation whose
                 // launch receipt declared the process-state change. The
                 // launch receipt is provisional and proves nothing on its
@@ -5807,6 +5808,7 @@ impl TerminalTool {
                                             .checked_sub(started_at_for_notify.elapsed())
                                             .unwrap_or(command_end);
                                         deliverable_attribution = attribute_background_deliverable(
+                                            &backend_for_notify,
                                             &declared_write_paths_for_notify,
                                             command_start,
                                             command_end,
@@ -6066,6 +6068,7 @@ impl TerminalTool {
                                 // design targets: a command that writes only to a result file.
                                 if let DeliverableAttribution::One(path) = deliverable_attribution {
                                     deliver_attributed_background_file(
+                                        &backend_for_notify,
                                         &path,
                                         &session_for_notify,
                                         &command_summary,
@@ -7663,10 +7666,13 @@ impl TerminalAction {
 /// The typed effects of a terminal call: `check` reads a tracked process,
 /// `run` declares what its command does (see
 /// `command_effects::shell_call_effects`), anything else is undeclared.
-fn terminal_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
+fn terminal_call_effects(
+    backend: &dyn crate::execution::ExecutionBackend,
+    arguments: &str,
+) -> aidaemon_core::CallEffects {
     terminal_call_effects_on(
         arguments,
-        crate::tools::command_effects::execution_backend_is_local(),
+        crate::tools::command_effects::execution_backend_is_local(backend),
     )
 }
 
@@ -7893,7 +7899,7 @@ impl crate::traits::ToolSemantics for TerminalTool {
     }
 
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
-        terminal_call_effects(arguments)
+        terminal_call_effects(&*self.backend, arguments)
     }
 
     fn call_annotations_in(
@@ -8184,7 +8190,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_manifest_denies_undeclared_system_file_read() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8209,7 +8215,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn empty_manifest_is_fail_closed_not_ambient_access() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8248,7 +8254,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn execution_cwd_does_not_implicitly_grant_child_file_reads() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let private_child = root.path().join("private.txt");
         std::fs::write(&private_child, "NOT_AUTHORIZED").expect("private fixture");
@@ -8274,7 +8280,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_read_grant_does_not_expose_a_sibling() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed.txt");
         let sibling = root.path().join("sibling.txt");
@@ -8322,7 +8328,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_write_grant_cannot_mutate_a_sibling() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let sibling = root.path().join("sibling.txt");
@@ -8363,7 +8369,7 @@ mod tests {
     async fn manifest_grants_cannot_escape_through_an_internal_symlink() {
         use std::os::unix::fs::symlink;
 
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let outside = root.path().join("outside.txt");
@@ -8439,7 +8445,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_request_runs_the_command_unwrapped_in_the_working_dir() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request =
             host_terminal_execution_request(&backend, "npx wrangler deploy", false, Some("/tmp"))
                 .await
@@ -8661,7 +8667,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_root_cwd_preserves_compound_negative_process_result() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/bin/sh -c 'printf SYNTHETIC_BEFORE; /usr/bin/false'",
@@ -8757,7 +8763,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_uses_stdin_and_stops_after_negative_step() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -8858,7 +8864,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_run_does_not_turn_a_declared_descendant_root_into_a_directory() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("printf")
@@ -8913,7 +8919,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_prepares_future_declared_scratch_before_heredoc() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cat").await.unwrap().is_none()
         {
@@ -8966,7 +8972,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_managed_runtime_executes_through_combined_shell_flags() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9031,7 +9037,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_node_libraries_for_package_runners() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let Some(node) = backend.resolve_executable("node").await.unwrap() else {
             return;
         };
@@ -9064,7 +9070,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_read_only_command_still_gets_a_writable_managed_scratch() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.kind() != crate::execution::BackendKind::Local {
             return;
         }
@@ -9116,7 +9122,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_a_conda_prefix_by_its_marker() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         // Find any resolvable executable whose prefix carries `conda-meta`.
         let mut conda_prefix = None;
         for program in ["node", "python3", "python"] {
@@ -9156,7 +9162,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_git_its_own_config_files_only_for_git() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("git").await.unwrap().is_none() {
             return;
         }
@@ -9186,7 +9192,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_supports_local_rust_toolchain_without_home_access() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9261,7 +9267,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_project_creation_uses_exact_runtime_config_grant() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9307,7 +9313,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_lifecycle_can_create_and_remove_exact_absent_root() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9389,7 +9395,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_managed_python_can_create_run_and_remove_exact_venv_root() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("python3")
@@ -9450,6 +9456,7 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9490,6 +9497,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9514,7 +9522,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_run_undoes_a_future_root_the_runtime_created() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9536,6 +9544,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9604,7 +9613,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_preparation_failure_is_typed_and_names_the_declaration() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9623,6 +9632,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9676,6 +9686,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9719,6 +9730,7 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9762,6 +9774,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let sandboxed = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx.clone()),
             1,
@@ -9772,6 +9785,7 @@ mod tests {
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9820,6 +9834,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9880,6 +9895,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9926,6 +9942,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9994,6 +10011,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10028,6 +10046,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx.clone()),
             1,
@@ -10037,6 +10056,7 @@ mod tests {
         )
         .await;
         let sandboxed = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10157,6 +10177,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10198,6 +10219,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10235,6 +10257,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10276,6 +10299,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10322,6 +10346,7 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -10680,6 +10705,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10779,6 +10805,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10820,6 +10847,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10891,6 +10919,7 @@ mod tests {
         // A 30s foreground window: without launch-and-return, `sleep 5`
         // would run to completion and be reported synchronously.
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10957,6 +10986,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11018,6 +11048,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11077,6 +11108,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11133,6 +11165,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11188,6 +11221,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -11233,6 +11267,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11658,6 +11693,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11685,6 +11721,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11719,6 +11756,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11754,6 +11792,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11805,6 +11844,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11891,6 +11931,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12225,6 +12266,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12304,6 +12346,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12396,6 +12439,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12454,6 +12498,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12532,6 +12577,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12595,6 +12641,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12642,6 +12689,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12684,6 +12732,7 @@ mod tests {
             .unwrap();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -12743,6 +12792,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12793,6 +12843,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12858,6 +12909,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12905,6 +12957,7 @@ mod tests {
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12968,6 +13021,7 @@ mod tests {
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             2, // 2 second timeout
@@ -13025,6 +13079,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13066,6 +13121,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13162,8 +13218,16 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         // Empty permanent prefix list — only session approvals exist.
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
         std::mem::forget(db_file);
         tool
     }
@@ -13265,6 +13329,7 @@ mod tests {
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let original = "cd /Users/u/proj && npm run dev -- --port 3000";
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![original.to_string()],
             approval_tx,
             1,
@@ -13302,6 +13367,7 @@ mod tests {
         drop(approval_rx);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -13338,6 +13404,7 @@ mod tests {
         drop(approval_rx);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -13392,6 +13459,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -13440,8 +13508,16 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(4);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
         std::mem::forget(db_file);
         (tool, approval_rx)
     }
@@ -13494,7 +13570,7 @@ mod policy_dump_probe {
         };
         let command =
             std::env::var("AIDAEMON_POLICY_PROBE_CMD").unwrap_or_else(|_| "npm run build".into());
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let writes = std::env::var("AIDAEMON_POLICY_PROBE_WRITES")
             .ok()
             .map(|w| w.split(':').map(str::to_string).collect::<Vec<_>>())
@@ -13544,7 +13620,10 @@ mod call_effects_tests {
     use aidaemon_core::{CallEffects, EffectClass, EffectKey};
 
     fn run(command: &str) -> CallEffects {
-        terminal_call_effects(&serde_json::json!({"action": "run", "command": command}).to_string())
+        terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
+            &serde_json::json!({"action": "run", "command": command}).to_string(),
+        )
     }
 
     fn egress(target: &str) -> EffectKey {
@@ -13574,6 +13653,7 @@ mod call_effects_tests {
             assert!(!run(command).complete, "{command}");
         }
         let script = terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
             &serde_json::json!({"action": "run", "script": "ls\nbash run.sh"}).to_string(),
         );
         assert!(!script.complete);
@@ -13598,7 +13678,7 @@ mod call_effects_tests {
     #[test]
     fn terminal_relative_paths_resolve_against_working_dir() {
         let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
-        let effects = terminal_call_effects(
+        let effects = terminal_call_effects(&*crate::execution::active_execution_backend(),
             &serde_json::json!({"action": "run", "command": "echo x > out.txt", "working_dir": dir})
                 .to_string(),
         );
@@ -13649,7 +13729,7 @@ mod call_effects_tests {
             })
             .to_string();
             assert_eq!(
-                terminal_call_effects(&arguments),
+                terminal_call_effects(&*crate::execution::active_execution_backend(), &arguments),
                 CallEffects::unknown(),
                 "{action}"
             );
@@ -13661,7 +13741,10 @@ mod call_effects_tests {
 
     #[test]
     fn terminal_check_reads_and_other_actions_are_undeclared() {
-        let check = terminal_call_effects(r#"{"action":"check","pid":42}"#);
+        let check = terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
+            r#"{"action":"check","pid":42}"#,
+        );
         assert_eq!(check, CallEffects::none());
         for other in [
             r#"{"action":"kill","pid":42}"#,
@@ -13669,7 +13752,7 @@ mod call_effects_tests {
             "{",
         ] {
             assert_eq!(
-                terminal_call_effects(other),
+                terminal_call_effects(&*crate::execution::active_execution_backend(), other),
                 CallEffects::unknown(),
                 "{other}"
             );

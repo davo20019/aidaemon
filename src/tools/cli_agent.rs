@@ -23,8 +23,7 @@ use crate::agent::{
 };
 use crate::config::CliAgentsConfig;
 use crate::execution::{
-    active_execution_backend, BackendFileType, BackendPath, ExecutionRequest, ProcessHandle,
-    SharedExecutionBackend,
+    BackendFileType, BackendPath, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
 };
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
@@ -1057,7 +1056,10 @@ impl CliAgentTool {
         }
     }
 
-    async fn build_finished_result(agent: &RunningCliAgent) -> String {
+    async fn build_finished_result(
+        backend: &SharedExecutionBackend,
+        agent: &RunningCliAgent,
+    ) -> String {
         let elapsed = agent.started_at.elapsed().as_secs();
         let stdout_output = agent.stdout_buf.lock().await.clone();
         let display_output = agent.display_buf.lock().await.clone();
@@ -1071,7 +1073,7 @@ impl CliAgentTool {
 
         // Capture git diff for finished background tasks.
         let diff_section = if let Some(ref dir) = agent.working_dir {
-            Self::capture_git_diff(dir)
+            Self::capture_git_diff(backend, dir)
                 .await
                 .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
         } else {
@@ -1177,8 +1179,10 @@ impl CliAgentTool {
     /// Normalize a working directory for lock/key comparisons.
     /// Uses canonical paths when possible so aliases like `/repo` and `/repo/`
     /// map to the same lock key.
-    async fn normalize_working_dir(dir: &str) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
+    async fn normalize_working_dir(
+        backend: &SharedExecutionBackend,
+        dir: &str,
+    ) -> anyhow::Result<String> {
         let resolved = backend.resolve_path(dir).await?;
         Ok(backend
             .canonicalize(&resolved)
@@ -1191,10 +1195,10 @@ impl CliAgentTool {
     /// working directory, a write target may not exist yet; canonicalization
     /// is therefore best-effort after backend policy resolution.
     async fn normalize_access_path(
+        backend: &SharedExecutionBackend,
         path: &str,
         working_dir: Option<&str>,
     ) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
         let path = path.trim();
         anyhow::ensure!(!path.is_empty(), "CLI access path cannot be empty");
         let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
@@ -1272,6 +1276,7 @@ impl CliAgentTool {
     }
 
     pub async fn discover(
+        backend: SharedExecutionBackend,
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
         llm_runtime: SharedLlmRuntime,
@@ -1317,7 +1322,6 @@ impl CliAgentTool {
         // Resolve launchers in parallel. This validates a nested executable in
         // `env ... agent` configurations instead of merely proving that
         // `/usr/bin/env` exists.
-        let backend = active_execution_backend();
         let resolution_futures: Vec<_> = candidates
             .iter()
             .map(|(_, command, args, _, _, _)| resolve_agent_launch(&backend, command, args))
@@ -1645,7 +1649,7 @@ impl CliAgentTool {
         };
 
         for (task_id, agent) in finished {
-            let final_result = Self::build_finished_result(&agent).await;
+            let final_result = Self::build_finished_result(&self.backend, &agent).await;
             let mut completed = self.completed.lock().await;
             completed.insert(
                 task_id.clone(),
@@ -1920,28 +1924,44 @@ impl CliAgentTool {
     }
 
     /// Capture git diff after CLI agent completes (for any exit code).
-    async fn capture_git_diff(working_dir: &str) -> Option<String> {
+    async fn capture_git_diff(
+        backend: &SharedExecutionBackend,
+        working_dir: &str,
+    ) -> Option<String> {
         let directory = BackendPath::new(working_dir);
-        let git_check =
-            crate::tools::fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&directory), 5)
-                .await
-                .ok()?;
+        let git_check = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
+            "git rev-parse --git-dir",
+            Some(&directory),
+            5,
+        )
+        .await
+        .ok()?;
         if git_check.exit_code != 0 {
             return None;
         }
 
         // Check for uncommitted changes first
-        let diff_stat =
-            crate::tools::fs_utils::run_cmd_backend("git diff --stat", Some(&directory), 10)
-                .await
-                .ok()?;
+        let diff_stat = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
+            "git diff --stat",
+            Some(&directory),
+            10,
+        )
+        .await
+        .ok()?;
         let stat_output = diff_stat.stdout;
 
         if !stat_output.trim().is_empty() {
             // There are uncommitted changes — capture them
-            let diff = crate::tools::fs_utils::run_cmd_backend("git diff", Some(&directory), 10)
-                .await
-                .ok()?;
+            let diff = crate::tools::fs_utils::run_cmd_backend(
+                backend.as_ref(),
+                "git diff",
+                Some(&directory),
+                10,
+            )
+            .await
+            .ok()?;
             let diff_text = diff.stdout;
             if !diff_text.trim().is_empty() {
                 return Some(truncate_with_note(&diff_text, MAX_DIFF_SIZE));
@@ -1950,6 +1970,7 @@ impl CliAgentTool {
 
         // No uncommitted changes — check if the agent committed something
         let log = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
             "git log -1 --stat --format=%s",
             Some(&directory),
             10,
@@ -1960,6 +1981,7 @@ impl CliAgentTool {
 
         if !log_output.trim().is_empty() {
             let committed_diff = crate::tools::fs_utils::run_cmd_backend(
+                backend.as_ref(),
                 "git diff HEAD~1..HEAD",
                 Some(&directory),
                 10,
@@ -1982,9 +2004,13 @@ impl CliAgentTool {
     /// Return the number of tracked or untracked entries in an existing Git
     /// worktree. A non-repository (or an unavailable backend) is not classified
     /// as dirty here; normal CLI-agent approval and execution policy still apply.
-    async fn dirty_worktree_entry_count(working_dir: &str) -> Option<usize> {
+    async fn dirty_worktree_entry_count(
+        backend: &SharedExecutionBackend,
+        working_dir: &str,
+    ) -> Option<usize> {
         let directory = BackendPath::new(working_dir);
         let status = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
             "git status --porcelain=v1 --untracked-files=all",
             Some(&directory),
             10,
@@ -2200,7 +2226,7 @@ impl CliAgentTool {
         }
 
         let canonical_working_dir = match working_dir {
-            Some(dir) => Some(Self::normalize_working_dir(dir).await?),
+            Some(dir) => Some(Self::normalize_working_dir(&self.backend, dir).await?),
             None => None,
         };
         let mut canonical_read_paths = Vec::new();
@@ -2208,14 +2234,18 @@ impl CliAgentTool {
             canonical_read_paths.push(working_dir.clone());
         }
         for path in read_paths {
-            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            let path =
+                Self::normalize_access_path(&self.backend, path, canonical_working_dir.as_deref())
+                    .await?;
             if !canonical_read_paths.contains(&path) {
                 canonical_read_paths.push(path);
             }
         }
         let mut canonical_write_paths = Vec::new();
         for path in write_paths {
-            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            let path =
+                Self::normalize_access_path(&self.backend, path, canonical_working_dir.as_deref())
+                    .await?;
             if !canonical_write_paths.contains(&path) {
                 canonical_write_paths.push(path);
             }
@@ -2242,7 +2272,8 @@ impl CliAgentTool {
         // pre-existing work to the child. Read-only runs never need a diff.
         let diff_capture_working_dir = if workspace_mode == CliWorkspaceMode::ReadWrite {
             if let Some(dir) = canonical_working_dir.as_deref() {
-                (Self::dirty_worktree_entry_count(dir).await == Some(0)).then(|| dir.to_string())
+                (Self::dirty_worktree_entry_count(&self.backend, dir).await == Some(0))
+                    .then(|| dir.to_string())
             } else {
                 None
             }
@@ -2522,6 +2553,7 @@ impl CliAgentTool {
         let task_id_for_notify = task_id.clone();
         let delegated_task_id_for_completion = delegated_task_id_owned.clone();
         let should_notify_for_task = Arc::clone(&should_notify);
+        let backend_for_completion = self.backend.clone();
         let slot_permit_for_task = slot_permit;
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;
@@ -2860,7 +2892,7 @@ impl CliAgentTool {
                     let status_word = if success { "completed" } else { "failed" };
                     let notification_summary: String = persisted_output.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
-                        CliAgentTool::capture_git_diff(dir)
+                        CliAgentTool::capture_git_diff(&backend_for_completion, dir)
                             .await
                             .map(|diff| format!("\n\n{}", diff))
                     } else {
@@ -3237,7 +3269,7 @@ impl CliAgentTool {
 
                 // Capture git diff
                 let diff_section = if let Some(ref dir) = working_dir_owned {
-                    Self::capture_git_diff(dir)
+                    Self::capture_git_diff(&self.backend, dir)
                         .await
                         .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
                 } else {
@@ -3500,7 +3532,7 @@ impl CliAgentTool {
         let is_running = !agent.finished.load(Ordering::Acquire);
 
         if !is_running {
-            Ok(Self::build_finished_result(agent).await)
+            Ok(Self::build_finished_result(&self.backend, agent).await)
         } else {
             Ok(format!(
                 "CLI agent '{}' still running ({}s elapsed, pid={}).\n\
@@ -4553,9 +4585,10 @@ impl CliAgentTool {
                                 .to_string(),
                         );
                     };
-                    if let Some(entry_count) = Self::dirty_worktree_entry_count(working_dir)
-                        .await
-                        .filter(|count| *count > 0)
+                    if let Some(entry_count) =
+                        Self::dirty_worktree_entry_count(&self.backend, working_dir)
+                            .await
+                            .filter(|count| *count > 0)
                     {
                         return Ok(format!(
                             "Blocked: unattended CLI delegation found {entry_count} pre-existing changed or untracked worktree entries. Use a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not exposed to opaque delegated mutation."
@@ -4806,6 +4839,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let expected = cwd.path().join("output.txt");
         let normalized = CliAgentTool::normalize_access_path(
+            &crate::execution::active_execution_backend(),
             "output.txt",
             Some(cwd.path().to_string_lossy().as_ref()),
         )
@@ -4993,7 +5027,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -5051,7 +5085,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -5641,7 +5675,12 @@ mod tests {
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
-        let normalized = CliAgentTool::normalize_working_dir(dir_path).await.unwrap();
+        let normalized = CliAgentTool::normalize_working_dir(
+            &crate::execution::active_execution_backend(),
+            dir_path,
+        )
+        .await
+        .unwrap();
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"echo blocked","working_dir":"{}"}}"#,
             dir_path
@@ -5670,7 +5709,12 @@ mod tests {
         let tool = Arc::new(tool);
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir = tmp_dir.path().to_string_lossy().to_string();
-        let normalized = CliAgentTool::normalize_working_dir(&dir).await.unwrap();
+        let normalized = CliAgentTool::normalize_working_dir(
+            &crate::execution::active_execution_backend(),
+            &dir,
+        )
+        .await
+        .unwrap();
 
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 15","working_dir":"{}"}}"#,
@@ -6454,6 +6498,7 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
+            crate::execution::active_execution_backend(),
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
@@ -6508,6 +6553,7 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
+            crate::execution::active_execution_backend(),
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
@@ -6559,7 +6605,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6632,7 +6678,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6799,7 +6845,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6940,7 +6986,11 @@ mod tests {
     #[tokio::test]
     async fn test_capture_git_diff_no_repo() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let result = CliAgentTool::capture_git_diff(tmp.path().to_str().unwrap()).await;
+        let result = CliAgentTool::capture_git_diff(
+            &crate::execution::active_execution_backend(),
+            tmp.path().to_str().unwrap(),
+        )
+        .await;
         assert!(result.is_none(), "Non-git directory should return None");
     }
 
@@ -7032,9 +7082,18 @@ mod tests {
         // Modify the file (uncommitted change)
         std::fs::write(tmp.path().join("file.txt"), "modified content").unwrap();
 
-        assert_eq!(CliAgentTool::dirty_worktree_entry_count(dir).await, Some(1));
+        assert_eq!(
+            CliAgentTool::dirty_worktree_entry_count(
+                &crate::execution::active_execution_backend(),
+                dir
+            )
+            .await,
+            Some(1)
+        );
 
-        let result = CliAgentTool::capture_git_diff(dir).await;
+        let result =
+            CliAgentTool::capture_git_diff(&crate::execution::active_execution_backend(), dir)
+                .await;
         assert!(result.is_some(), "Should capture uncommitted changes");
         let diff = result.unwrap();
         assert!(

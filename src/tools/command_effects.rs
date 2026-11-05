@@ -1383,8 +1383,8 @@ pub(crate) fn shell_path_effects(
 
 /// Whether the active execution backend is this machine, so paths resolve on
 /// the local disk.
-pub(crate) fn execution_backend_is_local() -> bool {
-    crate::execution::active_execution_backend().kind() == crate::execution::BackendKind::Local
+pub(crate) fn execution_backend_is_local(backend: &dyn crate::execution::ExecutionBackend) -> bool {
+    backend.kind() == crate::execution::BackendKind::Local
 }
 
 /// Effects on a remote (SSH, Docker) workspace: its paths cannot be
@@ -1404,8 +1404,11 @@ pub(crate) fn without_local_paths(mut effects: CallEffects) -> CallEffects {
 /// The effects of `write_file`/`edit_file`: a write of the path argument
 /// (or its aliases). A relative path, or any path on a remote workspace, is
 /// undeterminable here.
-pub(crate) fn file_tool_write_effects(arguments: &str) -> CallEffects {
-    if !execution_backend_is_local() {
+pub(crate) fn file_tool_write_effects(
+    backend: &dyn crate::execution::ExecutionBackend,
+    arguments: &str,
+) -> CallEffects {
+    if !execution_backend_is_local(backend) {
         return CallEffects::unknown();
     }
     let path = serde_json::from_str::<serde_json::Value>(arguments)

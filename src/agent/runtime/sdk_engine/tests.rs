@@ -1172,10 +1172,12 @@ fn scoped_runs_read_their_own_spilled_results_only() {
         ..Default::default()
     };
     let own = crate::tools::result_spill::session_spill_dir_for_backend(
+        &*crate::execution::active_execution_backend(),
         "specialist:research:synthetic-1",
     )
     .unwrap();
     let other = crate::tools::result_spill::session_spill_dir_for_backend(
+        &*crate::execution::active_execution_backend(),
         "specialist:research:synthetic-2",
     )
     .unwrap();
@@ -1829,6 +1831,7 @@ async fn bridged_terminal_access_lists_command_and_script() {
     let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -1865,6 +1868,7 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -1954,6 +1958,7 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
     let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -2015,7 +2020,7 @@ async fn tools_declare_their_source_class() {
     );
     assert_eq!(http.output_trust(url, &roots), Untrusted);
     assert_eq!(mcp.output_trust("{}", &roots), Untrusted);
-    let read = crate::tools::ReadFileTool;
+    let read = crate::tools::ReadFileTool::new(crate::execution::active_execution_backend());
     assert_eq!(
         read.output_trust(r#"{"path":"/tmp/aidaemon-test/other/x"}"#, &roots),
         Untrusted
@@ -2029,10 +2034,16 @@ async fn tools_declare_their_source_class() {
         Trusted
     );
     assert_eq!(
-        crate::tools::WriteFileTool.output_trust("{}", &roots),
+        crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())
+            .output_trust("{}", &roots),
         Trusted
     );
-    let send = crate::tools::SendFileTool::new(media_tx, &[], "/tmp/aidaemon-test/inbox");
+    let send = crate::tools::SendFileTool::new(
+        crate::execution::active_execution_backend(),
+        media_tx,
+        &[],
+        "/tmp/aidaemon-test/inbox",
+    );
     assert_eq!(send.output_trust("{}", &roots), Trusted);
 }
 
@@ -2050,7 +2061,7 @@ fn relative_reads_under_the_working_directory_are_trusted() {
         "no project scope: the cwd alone"
     );
     let roots = TrustRoots::new(&roots).with_cwd(Some(cwd));
-    let read = crate::tools::ReadFileTool;
+    let read = crate::tools::ReadFileTool::new(crate::execution::active_execution_backend());
     assert_eq!(
         read.output_trust(r#"{"path":"src/lib.rs"}"#, &roots),
         Trusted
@@ -2059,7 +2070,7 @@ fn relative_reads_under_the_working_directory_are_trusted() {
         read.output_trust(r#"{"path":"../other/x"}"#, &roots),
         Untrusted
     );
-    let search = crate::tools::SearchFilesTool;
+    let search = crate::tools::SearchFilesTool::new(crate::execution::active_execution_backend());
     assert_eq!(search.output_trust(r#"{"pattern":"x"}"#, &roots), Trusted);
     assert_eq!(
         search.output_trust(r#"{"pattern":"x","path":"src"}"#, &roots),
@@ -2116,7 +2127,8 @@ fn cwd_roots(cwd: &str) -> Vec<String> {
 fn read_trust(roots: &[String], path: &std::path::Path) -> aidaemon_core::SourceTrust {
     use crate::traits::{ToolSemantics as _, TrustRoots};
     let args = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
-    crate::tools::ReadFileTool.output_trust(&args, &TrustRoots::new(roots))
+    crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())
+        .output_trust(&args, &TrustRoots::new(roots))
 }
 
 /// The list of trust-root sources is closed: every field is named here
@@ -2281,7 +2293,9 @@ async fn a_relative_read_of_an_owner_file_does_not_taint_the_turn() {
             MockProvider::text_response("Sent."),
         ]),
         vec![
-            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(crate::tools::ReadFileTool::new(
+                crate::execution::active_execution_backend(),
+            )),
             Arc::new(SendProbe(sent.clone())),
         ],
         None,
@@ -2331,7 +2345,9 @@ async fn reading_an_ungranted_named_file_checks_the_first_egress() {
             MockProvider::text_response("Sent."),
         ]),
         vec![
-            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(crate::tools::ReadFileTool::new(
+                crate::execution::active_execution_backend(),
+            )),
             Arc::new(SendProbe(sent.clone())),
         ],
         None,
@@ -2419,13 +2435,16 @@ async fn bridged_tool_annotations_follow_call_annotations_in() {
         trust_roots: Arc::new(Vec::new()),
     };
     let send = bridge(Arc::new(crate::tools::SendFileTool::new(
+        crate::execution::active_execution_backend(),
         media_tx,
         &[],
         "/tmp/aidaemon-test/inbox",
     )));
     let args = serde_json::json!({"path": "/tmp/aidaemon-test/x.txt"});
     assert!(send.annotations_for(&args).egress);
-    let write = bridge(Arc::new(crate::tools::WriteFileTool));
+    let write = bridge(Arc::new(crate::tools::WriteFileTool::new(
+        crate::execution::active_execution_backend(),
+    )));
     let args = serde_json::json!({"path": "/tmp/aidaemon-test/x.txt", "content": "x"});
     let annotations = write.annotations_for(&args);
     assert!(!annotations.egress && !annotations.read_only);
@@ -3480,7 +3499,9 @@ async fn goal_worker_reads_then_sends(
             MockProvider::text_response("Sent."),
         ]),
         vec![
-            Arc::new(crate::tools::ReadFileTool),
+            Arc::new(crate::tools::ReadFileTool::new(
+                crate::execution::active_execution_backend(),
+            )),
             Arc::new(SendProbe(sent.clone())),
         ],
         None,
@@ -3696,6 +3717,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
             crate::tools::ApprovalBroker::new(tx),
             1,
@@ -3842,6 +3864,7 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
     drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
             crate::tools::ApprovalBroker::new(tx),
             1,
@@ -3938,6 +3961,7 @@ async fn judged_terminal_rules(
     drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
             crate::tools::ApprovalBroker::new(tx),
             1,

@@ -174,9 +174,11 @@ fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Opti
                 continue;
             };
             let host = host.strip_prefix("www.").unwrap_or(host);
-            if let Some(scope) =
-                crate::tools::fs_utils::resolve_named_project_root(host, alias_roots)
-            {
+            if let Some(scope) = crate::tools::fs_utils::resolve_named_project_root(
+                &*crate::execution::active_execution_backend(),
+                host,
+                alias_roots,
+            ) {
                 super::project_scope::push_project_scope(
                     &mut scopes,
                     scope.to_string_lossy().to_string(),

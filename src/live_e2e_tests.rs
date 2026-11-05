@@ -81,6 +81,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -92,7 +93,9 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     );
 
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -257,6 +260,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -268,7 +272,9 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     );
 
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),

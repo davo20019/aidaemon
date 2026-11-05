@@ -3,10 +3,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, ExecutionRequest, SharedExecutionBackend};
+use crate::execution::{ExecutionRequest, SharedExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
-pub struct SystemInfoTool;
+pub struct SystemInfoTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl SystemInfoTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 #[async_trait]
 impl Tool for SystemInfoTool {
@@ -32,7 +40,7 @@ impl Tool for SystemInfoTool {
     }
 
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let mut info = format!(
             "Execution target: {} ({})\nWorkspace: {}\n",
             backend.kind().as_str(),

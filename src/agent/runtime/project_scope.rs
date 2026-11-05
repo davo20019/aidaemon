@@ -68,7 +68,12 @@ fn is_likely_filename(token: &str) -> bool {
 
 #[cfg(test)]
 pub(in crate::agent) fn token_looks_like_filesystem_path(token: &str) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some()
+    crate::tools::fs_utils::resolve_structural_filesystem_reference(
+        &*crate::execution::active_execution_backend(),
+        token,
+        &[],
+    )
+    .is_some()
 }
 
 fn token_looks_like_project_scope_path(
@@ -77,6 +82,7 @@ fn token_looks_like_project_scope_path(
     workspace_anchor: Option<&Path>,
 ) -> bool {
     crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        &*crate::execution::active_execution_backend(),
         token,
         alias_roots,
         workspace_anchor,
@@ -230,7 +236,12 @@ pub(super) fn extract_project_hints_from_text(
         }
         let uri_like = raw.contains("://");
         let path_like = uri_like
-            || crate::tools::fs_utils::resolve_structural_filesystem_reference(raw, &[]).is_some();
+            || crate::tools::fs_utils::resolve_structural_filesystem_reference(
+                &*crate::execution::active_execution_backend(),
+                raw,
+                &[],
+            )
+            .is_some();
         if path_only && !path_like {
             continue;
         }
@@ -288,6 +299,7 @@ fn normalize_project_scope_path_anchored(
     workspace_anchor: Option<&Path>,
 ) -> Option<String> {
     crate::tools::fs_utils::resolve_project_scope_reference_from(
+        &*crate::execution::active_execution_backend(),
         raw_path,
         alias_roots,
         workspace_anchor,
@@ -357,6 +369,7 @@ pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
     let mut resources = Vec::new();
     for token in structural_filesystem_reference_tokens(text) {
         let Some(path) = crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+            &*crate::execution::active_execution_backend(),
             &token,
             alias_roots,
             workspace_anchor,
@@ -443,14 +456,20 @@ fn extract_project_scopes_from_text_inner(
 fn scope_looks_like_project_root(scope: &str) -> bool {
     let backend = crate::execution::active_execution_backend();
     if backend.kind() != crate::execution::BackendKind::Local {
-        let Ok(path) = crate::execution::normalize_active_path_lexically(scope) else {
+        let Ok(path) = crate::execution::normalize_path_lexically(
+            &*crate::execution::active_execution_backend(),
+            scope,
+        ) else {
             return false;
         };
         return std::path::Path::new(path.as_str())
             .starts_with(std::path::Path::new(backend.workspace_root().as_str()));
     }
 
-    let Ok(path) = crate::tools::fs_utils::validate_path(scope) else {
+    let Ok(path) = crate::tools::fs_utils::validate_path(
+        &*crate::execution::active_execution_backend(),
+        scope,
+    ) else {
         return false;
     };
     if !path.is_dir() {

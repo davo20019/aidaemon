@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, WriteMode};
+use crate::execution::WriteMode;
 use crate::traits::{
     DurableReplayDecision, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
     ToolRole, ToolTargetHintKind,
@@ -9,7 +9,15 @@ use crate::traits::{
 
 use super::fs_utils;
 
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl WriteFileTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 const MAX_CONTENT_SIZE: usize = 1024 * 1024; // 1MB
 
@@ -78,7 +86,7 @@ impl Tool for WriteFileTool {
             );
         }
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
 
         // Block sensitive paths
@@ -165,7 +173,7 @@ impl Tool for WriteFileTool {
         };
 
         let diagnostics =
-            fs_utils::post_write_diagnostics(std::path::Path::new(path.as_str())).await;
+            fs_utils::post_write_diagnostics(&*backend, std::path::Path::new(path.as_str())).await;
 
         Ok(format!(
             "{} {}\n{} bytes, {} lines{}{}",
@@ -214,7 +222,7 @@ impl crate::traits::ToolSemantics for WriteFileTool {
     /// A write of the target path (absolute; a relative path resolves where
     /// the execution backend puts it, which is not known here).
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
-        super::command_effects::file_tool_write_effects(arguments)
+        super::command_effects::file_tool_write_effects(&*self.backend, arguments)
     }
 
     fn call_annotations_in(
@@ -260,7 +268,7 @@ impl crate::traits::ToolSemantics for WriteFileTool {
             return DurableReplayDecision::Replay;
         };
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let path = match backend.resolve_path(path_str).await {
             Ok(path) => path,
             Err(error) => {
@@ -324,7 +332,7 @@ mod durable_replay_tests {
             "content": "expected content\n"
         })
         .to_string();
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
 
         assert!(matches!(
             tool.durable_replay_decision(&arguments).await,
@@ -355,7 +363,9 @@ mod durable_replay_tests {
         .to_string();
 
         assert_eq!(
-            WriteFileTool.durable_replay_decision(&arguments).await,
+            WriteFileTool::new(crate::execution::active_execution_backend())
+                .durable_replay_decision(&arguments)
+                .await,
             DurableReplayDecision::Replay
         );
     }
@@ -368,7 +378,7 @@ mod tests {
 
     #[test]
     fn git_config_targets_are_configuration_egress() {
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
         let ann = |path: &str| {
             tool.call_annotations_in(
                 &json!({"path": path}).to_string(),
@@ -384,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "write_file");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -399,12 +409,17 @@ mod tests {
         std::fs::write(&config, "title = \"a\"\n").unwrap();
         let args =
             json!({"path": config.to_str().unwrap(), "content": "title = \"b\"\n"}).to_string();
-        WriteFileTool.call(&args).await.unwrap();
-        let args = json!({"path": config.to_str().unwrap()}).to_string();
-        let read = crate::tools::read_file::ReadFileTool
+        WriteFileTool::new(crate::execution::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
+        let args = json!({"path": config.to_str().unwrap()}).to_string();
+        let read = crate::tools::read_file::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        )
+        .call(&args)
+        .await
+        .unwrap();
         assert!(read.contains("title = \"b\""), "{read}");
     }
 
@@ -415,7 +430,11 @@ mod tests {
         std::fs::write(&config, "[provider]\nname = \"synthetic\"\n").unwrap();
         let _guard = fs_utils::DaemonPathsGuard::set(vec![config.clone()]);
         let args = json!({"path": config.to_str().unwrap(), "content": "x = 1"}).to_string();
-        let err = WriteFileTool.call(&args).await.unwrap_err().to_string();
+        let err = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("sensitive"), "got: {err}");
         assert!(std::fs::read_to_string(&config)
             .unwrap()
@@ -432,7 +451,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
         assert!(result.contains("13 bytes"));
 
@@ -452,7 +474,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Updated"));
         assert!(result.contains("backup saved"));
 
@@ -475,7 +500,9 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
@@ -491,7 +518,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
     }
 
@@ -505,7 +535,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "hello");
@@ -520,14 +553,16 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Parent directory"));
     }
 
     #[test]
     fn test_write_file_capabilities_match_no_approval_tool_guidance() {
-        let caps = WriteFileTool.capabilities();
+        let caps = WriteFileTool::new(crate::execution::active_execution_backend()).capabilities();
         assert!(
             !caps.needs_approval,
             "write_file is documented as a dedicated file tool that does not require approval"
@@ -546,7 +581,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Appended"), "result was: {result}");
         // Continuation hint must tell the model how to add more.
         assert!(result.contains("mode=\"append\""), "result was: {result}");
@@ -567,7 +605,10 @@ mod tests {
             "mode": "append"
         })
         .to_string();
-        WriteFileTool.call(&args).await.unwrap();
+        WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "first\nsecond\n");
@@ -588,7 +629,9 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid mode"));
         assert!(!file_path.exists(), "invalid mode must not write the file");
@@ -603,7 +646,9 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
@@ -620,7 +665,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Updated"));
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "new");
@@ -631,7 +679,8 @@ mod tests {
         let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
         let path = format!("{dir}/notes/../acme.md");
         for key in ["path", "file_path"] {
-            let effects = WriteFileTool.call_effects(&json!({key: path}).to_string());
+            let effects = WriteFileTool::new(crate::execution::active_execution_backend())
+                .call_effects(&json!({key: path}).to_string());
             assert!(effects.complete, "{key}");
             assert_eq!(
                 effects.keys,
@@ -644,7 +693,8 @@ mod tests {
             );
         }
         // A relative path has no known working directory here.
-        let relative = WriteFileTool.call_effects(&json!({"path": "acme.md"}).to_string());
+        let relative = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call_effects(&json!({"path": "acme.md"}).to_string());
         assert_eq!(relative, aidaemon_core::CallEffects::unknown());
     }
 }

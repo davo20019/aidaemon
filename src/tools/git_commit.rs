@@ -1,14 +1,21 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::active_execution_backend;
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
 };
 
 use super::fs_utils;
 
-pub struct GitCommitTool;
+pub struct GitCommitTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl GitCommitTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 #[async_trait]
 impl Tool for GitCommitTool {
@@ -58,19 +65,21 @@ impl Tool for GitCommitTool {
                 .collect()
         });
         let path_str = args["path"].as_str().unwrap_or(".");
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let repo_dir = backend.resolve_path(path_str).await?;
 
         // Verify git repo
         let check =
-            fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&repo_dir), 5).await?;
+            fs_utils::run_cmd_backend(&*backend, "git rev-parse --git-dir", Some(&repo_dir), 5)
+                .await?;
         if check.exit_code != 0 {
             anyhow::bail!("Not a git repository: {}", path_str);
         }
 
         // Check for changes
         let status =
-            fs_utils::run_cmd_backend("git status --porcelain", Some(&repo_dir), 5).await?;
+            fs_utils::run_cmd_backend(&*backend, "git status --porcelain", Some(&repo_dir), 5)
+                .await?;
         if status.exit_code != 0 {
             anyhow::bail!("Failed to get git status: {}", status.stderr);
         }
@@ -87,13 +96,15 @@ impl Tool for GitCommitTool {
             }
             for file in specific_files {
                 let add_cmd = format!("git add -- '{}'", file.replace('\'', "'\\''"));
-                let add_result = fs_utils::run_cmd_backend(&add_cmd, Some(&repo_dir), 5).await?;
+                let add_result =
+                    fs_utils::run_cmd_backend(&*backend, &add_cmd, Some(&repo_dir), 5).await?;
                 if add_result.exit_code != 0 {
                     anyhow::bail!("Failed to stage '{}': {}", file, add_result.stderr);
                 }
             }
         } else {
-            let add_result = fs_utils::run_cmd_backend("git add -A", Some(&repo_dir), 10).await?;
+            let add_result =
+                fs_utils::run_cmd_backend(&*backend, "git add -A", Some(&repo_dir), 10).await?;
             if add_result.exit_code != 0 {
                 anyhow::bail!("Failed to stage changes: {}", add_result.stderr);
             }
@@ -102,15 +113,21 @@ impl Tool for GitCommitTool {
         // Commit
         let escaped_message = message.replace('\'', "'\\''");
         let commit_cmd = format!("git commit -m '{}'", escaped_message);
-        let commit_result = fs_utils::run_cmd_backend(&commit_cmd, Some(&repo_dir), 30).await?;
+        let commit_result =
+            fs_utils::run_cmd_backend(&*backend, &commit_cmd, Some(&repo_dir), 30).await?;
 
         if commit_result.exit_code != 0 {
             anyhow::bail!("Commit failed: {}", commit_result.stderr);
         }
 
         // Get commit hash
-        let hash_result =
-            fs_utils::run_cmd_backend("git log -1 --format='%H %h %s'", Some(&repo_dir), 5).await?;
+        let hash_result = fs_utils::run_cmd_backend(
+            &*backend,
+            "git log -1 --format='%H %h %s'",
+            Some(&repo_dir),
+            5,
+        )
+        .await?;
 
         let mut output = String::new();
         output.push_str("Commit successful!\n\n");
@@ -175,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = GitCommitTool;
+        let tool = GitCommitTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "git_commit");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -191,7 +208,9 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool.call(&args).await;
+        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
     }
 
@@ -199,19 +218,39 @@ mod tests {
     async fn test_git_commit_no_changes() {
         let dir = tempfile::tempdir().unwrap();
         // Init a git repo with an initial commit
-        fs_utils::run_cmd("git init", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.email 'test@test.com'", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.name 'Test'", Some(dir.path()), 5)
-            .await
-            .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git init",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.email 'test@test.com'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.name 'Test'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
         std::fs::write(dir.path().join("README.md"), "# Test").unwrap();
-        fs_utils::run_cmd("git add -A && git commit -m 'init'", Some(dir.path()), 5)
-            .await
-            .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git add -A && git commit -m 'init'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
 
         let args = json!({
             "message": "empty commit",
@@ -219,7 +258,9 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool.call(&args).await;
+        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No changes"));
     }
@@ -227,15 +268,30 @@ mod tests {
     #[tokio::test]
     async fn test_git_commit_success() {
         let dir = tempfile::tempdir().unwrap();
-        fs_utils::run_cmd("git init", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.email 'test@test.com'", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.name 'Test'", Some(dir.path()), 5)
-            .await
-            .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git init",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.email 'test@test.com'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.name 'Test'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
 
         std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
 
@@ -245,7 +301,10 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool.call(&args).await.unwrap();
+        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Commit successful"));
         assert!(result.contains("add file"));
     }
@@ -253,15 +312,30 @@ mod tests {
     #[tokio::test]
     async fn test_git_commit_specific_files() {
         let dir = tempfile::tempdir().unwrap();
-        fs_utils::run_cmd("git init", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.email 'test@test.com'", Some(dir.path()), 5)
-            .await
-            .unwrap();
-        fs_utils::run_cmd("git config user.name 'Test'", Some(dir.path()), 5)
-            .await
-            .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git init",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.email 'test@test.com'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
+        fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git config user.name 'Test'",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
@@ -273,13 +347,21 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool.call(&args).await.unwrap();
+        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Commit successful"));
 
         // b.txt should still be untracked
-        let status = fs_utils::run_cmd("git status --porcelain", Some(dir.path()), 5)
-            .await
-            .unwrap();
+        let status = fs_utils::run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "git status --porcelain",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
         assert!(status.stdout.contains("b.txt"));
     }
 }

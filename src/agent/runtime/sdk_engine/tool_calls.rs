@@ -47,7 +47,10 @@ pub(super) fn grant_own_spill_reads(
     manifest: &mut crate::traits::ToolCallAccessManifest,
     session_id: &str,
 ) {
-    let Some(dir) = crate::tools::result_spill::session_spill_dir_for_backend(session_id) else {
+    let Some(dir) = crate::tools::result_spill::session_spill_dir_for_backend(
+        &*crate::execution::active_execution_backend(),
+        session_id,
+    ) else {
         return;
     };
     // macOS temp paths have a `/private` canonical twin; grant both spellings.

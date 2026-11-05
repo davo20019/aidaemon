@@ -3,16 +3,22 @@ use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::execution::{
-    active_execution_backend, BackendFileType, BackendPath, SharedExecutionBackend,
-};
+use crate::execution::{BackendFileType, BackendPath, SharedExecutionBackend};
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
 
 use super::fs_utils;
 
-pub struct SearchFilesTool;
+pub struct SearchFilesTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl SearchFilesTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 const MAX_RESULTS: usize = 200;
 const DEFAULT_MAX_RESULTS: usize = 50;
@@ -78,7 +84,7 @@ impl Tool for SearchFilesTool {
             anyhow::bail!("At least one of 'pattern' (content regex) or 'glob' (filename pattern) is required");
         }
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let mut search_dir = backend.resolve_path(path_str).await?;
         if backend.metadata(&search_dir).await.is_err() {
             // Paths copy-pasted from prose or earlier tool output often carry
@@ -496,7 +502,7 @@ mod tests {
         let glob = compile_glob("*target.pdf").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root_path = backend
             .resolve_path(&root.path().to_string_lossy())
             .await
@@ -525,7 +531,7 @@ mod tests {
         let glob = compile_glob("*config.toml").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root_path = backend
             .resolve_path(&root.path().to_string_lossy())
             .await
@@ -555,7 +561,7 @@ mod tests {
         let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root_path = backend
             .resolve_path(&root.path().to_string_lossy())
             .await
@@ -593,7 +599,7 @@ mod tests {
         let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root_path = backend
             .resolve_path(&dir.path().to_string_lossy())
             .await
@@ -628,7 +634,10 @@ mod tests {
             "glob": "*zz-definitely-not-present-xyz (1).pdf"
         })
         .to_string();
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("No matches found"));
         assert!(
@@ -651,7 +660,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("safe.txt"));
         assert!(!result.contains(".env.local"));
         assert!(!result.contains("secret"));
@@ -665,7 +677,10 @@ mod tests {
             "path": dir.path().to_str().unwrap()
         })
         .to_string();
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("No matches found"));
         assert!(!result.contains("~/Downloads"));
@@ -682,7 +697,10 @@ mod tests {
 
         for glob in ["*zz-no-match-xyz.pdf", "*.rs"] {
             let args = serde_json::json!({ "glob": glob, "path": dir_str }).to_string();
-            let result = SearchFilesTool.call(&args).await.unwrap();
+            let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+                .call(&args)
+                .await
+                .unwrap();
             for bad_suffix in [")", "):"] {
                 assert!(
                     !result.contains(&format!("{}{}", dir_str, bad_suffix)),
@@ -713,12 +731,15 @@ mod tests {
                 "path": format!("{}{}", dir.path().to_str().unwrap(), suffix)
             })
             .to_string();
-            let result = SearchFilesTool.call(&args).await.unwrap_or_else(|e| {
-                panic!(
-                    "path with trailing {:?} must recover, got error: {}",
-                    suffix, e
-                )
-            });
+            let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+                .call(&args)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "path with trailing {:?} must recover, got error: {}",
+                        suffix, e
+                    )
+                });
             assert!(result.contains("hit.rs"), "got: {}", result);
         }
     }
@@ -737,13 +758,16 @@ mod tests {
             "path": paren_dir.to_str().unwrap()
         })
         .to_string();
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("hit.rs"), "got: {}", result);
     }
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = SearchFilesTool;
+        let tool = SearchFilesTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "search_files");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -784,7 +808,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("test.rs"));
         assert!(!result.contains("test.py"));
     }
@@ -801,7 +828,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("a.txt"));
         assert!(result.contains("hello world"));
         assert!(!result.contains("b.txt"));
@@ -820,7 +850,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(!result.contains("needle_in_large_file"));
         assert!(result.contains("Skipped 1 oversized file"));
     }
@@ -836,7 +869,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("No matches"));
         assert!(result.contains(dir.path().to_str().unwrap()));
     }
@@ -844,7 +880,9 @@ mod tests {
     #[tokio::test]
     async fn test_search_requires_pattern_or_glob() {
         let args = json!({"path": "/tmp"}).to_string();
-        let result = SearchFilesTool.call(&args).await;
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
     }
 
@@ -862,7 +900,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("visible.js"));
         assert!(!result.contains("hidden.js"));
     }
@@ -875,7 +916,10 @@ mod tests {
         })
         .to_string();
 
-        let result = SearchFilesTool.call(&args).await.unwrap();
+        let result = SearchFilesTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("defaulted to current directory"));
     }
 }

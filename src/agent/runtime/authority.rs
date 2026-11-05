@@ -582,7 +582,9 @@ mod tests {
     async fn guest_without_grant_still_gets_no_active_workspace_grant() {
         let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
             crate::testing::MockProvider::new(),
-            vec![std::sync::Arc::new(crate::tools::WriteFileTool)],
+            vec![std::sync::Arc::new(crate::tools::WriteFileTool::new(
+                crate::execution::active_execution_backend(),
+            ))],
             None,
         )
         .await

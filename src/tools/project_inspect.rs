@@ -3,14 +3,22 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, BackendPath, SharedExecutionBackend};
+use crate::execution::{BackendPath, SharedExecutionBackend};
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
 
 use super::fs_utils;
 
-pub struct ProjectInspectTool;
+pub struct ProjectInspectTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl ProjectInspectTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 const MAX_BATCH_PATHS: usize = 12;
 
 #[async_trait]
@@ -55,7 +63,7 @@ impl Tool for ProjectInspectTool {
         let mut reports = Vec::new();
         let mut failures = Vec::new();
         for path in &paths {
-            match inspect_project(path).await {
+            match inspect_project(self.backend.clone(), path).await {
                 Ok(report) => reports.push(report),
                 Err(err) => failures.push((path.clone(), err.to_string())),
             }
@@ -194,8 +202,10 @@ fn parse_project_paths(args: &Value) -> anyhow::Result<Vec<String>> {
     Ok(deduped)
 }
 
-async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
-    let backend = active_execution_backend();
+async fn inspect_project(
+    backend: SharedExecutionBackend,
+    path_str: &str,
+) -> anyhow::Result<String> {
     let project_dir = resolve_project_dir(backend.clone(), path_str).await?;
 
     let mut output = String::new();
@@ -391,7 +401,7 @@ async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> 
 
     // Current branch
     if let Ok(out) =
-        fs_utils::run_cmd_backend("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
+        fs_utils::run_cmd_backend(&*backend, "git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
     {
         if out.exit_code == 0 {
             info.push_str(&format!("- Branch: {}\n", out.stdout.trim()));
@@ -399,7 +409,9 @@ async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> 
     }
 
     // Status summary
-    if let Ok(out) = fs_utils::run_cmd_backend("git status --porcelain", Some(dir), 5).await {
+    if let Ok(out) =
+        fs_utils::run_cmd_backend(&*backend, "git status --porcelain", Some(dir), 5).await
+    {
         if out.exit_code == 0 {
             let lines: Vec<&str> = out.stdout.lines().collect();
             if lines.is_empty() {
@@ -412,7 +424,8 @@ async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> 
 
     // Last commit
     if let Ok(out) =
-        fs_utils::run_cmd_backend("git log -1 --format='%h %s (%cr)'", Some(dir), 5).await
+        fs_utils::run_cmd_backend(&*backend, "git log -1 --format='%h %s (%cr)'", Some(dir), 5)
+            .await
     {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             info.push_str(&format!("- Last commit: {}\n", out.stdout.trim()));
@@ -420,7 +433,7 @@ async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> 
     }
 
     // Remote
-    if let Ok(out) = fs_utils::run_cmd_backend("git remote -v", Some(dir), 5).await {
+    if let Ok(out) = fs_utils::run_cmd_backend(&*backend, "git remote -v", Some(dir), 5).await {
         if out.exit_code == 0 {
             if let Some(first_line) = out.stdout.lines().next() {
                 info.push_str(&format!("- Remote: {}\n", first_line));
@@ -496,8 +509,10 @@ mod tests {
         use aidaemon_core::SourceTrust;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
         let roots = crate::traits::TrustRoots::new(&roots_list);
-        let trust =
-            |args: serde_json::Value| ProjectInspectTool.output_trust(&args.to_string(), &roots);
+        let trust = |args: serde_json::Value| {
+            ProjectInspectTool::new(crate::execution::active_execution_backend())
+                .output_trust(&args.to_string(), &roots)
+        };
         assert_eq!(
             trust(
                 serde_json::json!({"paths": ["/tmp/aidaemon-test/project/a", "/tmp/aidaemon-test/project/b"]})
@@ -522,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = ProjectInspectTool;
+        let tool = ProjectInspectTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "project_inspect");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -565,7 +580,10 @@ mod tests {
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
 
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = ProjectInspectTool.call(&args).await.unwrap();
+        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("Rust"));
         assert!(result.contains("test-proj"));
@@ -583,7 +601,10 @@ mod tests {
         .unwrap();
 
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = ProjectInspectTool.call(&args).await.unwrap();
+        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("JavaScript"));
         assert!(result.contains("my-app"));
@@ -593,7 +614,9 @@ mod tests {
     #[tokio::test]
     async fn test_inspect_nonexistent() {
         let args = json!({"path": "/tmp/nonexistent_project_12345"}).to_string();
-        let result = ProjectInspectTool.call(&args).await;
+        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
     }
 
@@ -620,7 +643,10 @@ mod tests {
             ]
         })
         .to_string();
-        let result = ProjectInspectTool.call(&args).await.unwrap();
+        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert_eq!(result.matches("# Project: ").count(), 2);
         assert!(result.contains("alpha"));
@@ -643,7 +669,10 @@ mod tests {
             ]
         })
         .to_string();
-        let result = ProjectInspectTool.call(&args).await.unwrap();
+        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("# Project: "));
         assert!(result.contains("## Skipped paths"));

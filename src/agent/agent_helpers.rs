@@ -504,7 +504,13 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
         if token.is_empty() {
             continue;
         }
-        if crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some() {
+        if crate::tools::fs_utils::resolve_structural_filesystem_reference(
+            &*crate::execution::active_execution_backend(),
+            token,
+            &[],
+        )
+        .is_some()
+        {
             return true;
         }
     }

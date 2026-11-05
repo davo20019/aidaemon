@@ -75,15 +75,22 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
 
 fn normalize_project_dir(raw_path: &str) -> Option<String> {
     if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
-        let mut path = crate::execution::normalize_active_path_lexically(raw_path).ok()?;
+        let mut path = crate::execution::normalize_path_lexically(
+            &*crate::execution::active_execution_backend(),
+            raw_path,
+        )
+        .ok()?;
         if crate::tools::fs_utils::path_points_to_file(raw_path) {
             path = path.parent()?;
         }
         return Some(path.to_string());
     }
-    crate::tools::fs_utils::normalize_project_scope_path(raw_path)
-        .ok()
-        .map(|path| path.to_string_lossy().to_string())
+    crate::tools::fs_utils::normalize_project_scope_path(
+        &*crate::execution::active_execution_backend(),
+        raw_path,
+    )
+    .ok()
+    .map(|path| path.to_string_lossy().to_string())
 }
 
 fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
@@ -96,7 +103,11 @@ fn resolve_injected_working_dir(project_dir: &str) -> String {
     if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
         return project_dir.to_string();
     }
-    let resolved = crate::tools::fs_utils::validate_path(project_dir).ok();
+    let resolved = crate::tools::fs_utils::validate_path(
+        &*crate::execution::active_execution_backend(),
+        project_dir,
+    )
+    .ok();
     if let Some(path) = resolved {
         if !path.is_dir() {
             if let Some(parent) = path.parent() {

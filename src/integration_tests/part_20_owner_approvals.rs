@@ -81,7 +81,7 @@ async fn approvals_harness_with(
     let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
     std::mem::forget(_tool_rx);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
-        crate::tools::TerminalTool::new(
+        crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(tool_tx),
             1,
@@ -650,7 +650,7 @@ async fn terminal_harness(
     std::mem::forget(pool_file);
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
-    let mut terminal = crate::tools::TerminalTool::new(
+    let mut terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
         setup.allowed,
         crate::tools::ApprovalBroker::new(tool_tx),
         5,
@@ -870,7 +870,7 @@ async fn terminal_outside_kernel_requires_kernel_approval() {
         .unwrap();
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
-    let terminal = crate::tools::TerminalTool::new(
+    let terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
         Vec::new(),
         crate::tools::ApprovalBroker::new(tool_tx),
         5,

@@ -1892,7 +1892,7 @@ async fn test_evidence_gate_shadow_skipped_on_autonomous_tier() {
         trust_tier: "autonomous".to_string(),
         ..Default::default()
     };
-    let harness = setup_test_agent_with_policy(provider, policy, vec![Arc::new(EditFileTool)])
+    let harness = setup_test_agent_with_policy(provider, policy, vec![Arc::new(EditFileTool::new(crate::execution::active_execution_backend()))])
         .await
         .unwrap();
     harness

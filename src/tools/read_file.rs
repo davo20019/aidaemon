@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 
-use crate::execution::{
-    active_execution_backend, BackendMetadata, BackendPath, SharedExecutionBackend,
-};
+use crate::execution::{BackendMetadata, BackendPath, SharedExecutionBackend};
 use crate::traits::{
     AttachmentProvenance, MessageAttachment, ReadFileResultMetadata, ReadFileSelectionMetadata,
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
@@ -14,7 +12,15 @@ use crate::types::StatusUpdate;
 
 use super::fs_utils;
 
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl ReadFileTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 /// Per-call cap on returned content (bytes of line text). Reads that would
 /// exceed it return the first lines that fit plus a continuation hint
@@ -177,7 +183,7 @@ impl ReadFileTool {
             ));
         }
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
         let local_path = std::path::Path::new(path.as_str());
         let refused = if is_env_template(local_path) {
@@ -753,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = ReadFileTool;
+        let tool = ReadFileTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "read_file");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -765,7 +771,9 @@ mod tests {
         let file = dir.path().join(name);
         std::fs::write(&file, body).unwrap();
         let args = json!({"path": file.to_str().unwrap()}).to_string();
-        ReadFileTool.call(&args).await
+        ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
     }
 
     #[tokio::test]
@@ -776,7 +784,9 @@ mod tests {
         let key = ssh.join("id_ed25519");
         std::fs::write(&key, "synthetic-private-key-material\n").unwrap();
         let args = json!({"path": key.to_str().unwrap()}).to_string();
-        let out = ReadFileTool.call(&args).await;
+        let out = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         let text = match out {
             Ok(text) => text,
             Err(error) => error.to_string(),
@@ -813,7 +823,10 @@ mod tests {
         std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
         for (name, needle) in [("HEAD", "refs/heads/main"), ("config", "bare = false")] {
             let args = json!({"path": git.join(name).to_str().unwrap()}).to_string();
-            let text = ReadFileTool.call(&args).await.unwrap();
+            let text = ReadFileTool::new(crate::execution::active_execution_backend())
+                .call(&args)
+                .await
+                .unwrap();
             assert!(text.contains(needle), "{name}: {text}");
         }
     }
@@ -825,13 +838,22 @@ mod tests {
         std::fs::write(&own, "token = \"synthetic-secret\"\n").unwrap();
         let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
         let args = json!({"path": own.to_str().unwrap()}).to_string();
-        let text = ReadFileTool.call(&args).await.unwrap();
+        let text = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(text.contains("does not open credential or secret files"));
         assert!(!text.contains("synthetic-secret"));
         let other = dir.path().join("config.toml");
         std::fs::write(&other, "title = \"ok\"\n").unwrap();
         let args = json!({"path": other.to_str().unwrap()}).to_string();
-        assert!(ReadFileTool.call(&args).await.unwrap().contains("title"));
+        assert!(
+            ReadFileTool::new(crate::execution::active_execution_backend())
+                .call(&args)
+                .await
+                .unwrap()
+                .contains("title")
+        );
     }
 
     #[tokio::test]
@@ -841,7 +863,10 @@ mod tests {
         std::fs::create_dir(&ssh).unwrap();
         std::fs::write(ssh.join(".env.example"), "synthetic-secret\n").unwrap();
         let args = json!({"path": ssh.join(".env.example").to_str().unwrap()}).to_string();
-        let text = ReadFileTool.call(&args).await.unwrap();
+        let text = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(text.contains("does not open credential or secret files"));
         assert!(!text.contains("synthetic-secret"));
     }
@@ -857,7 +882,10 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, "line one\nline two\nline three\n").unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("line one"));
         assert!(result.contains("line two"));
         assert!(result.contains("line three"));
@@ -872,7 +900,7 @@ mod tests {
         write!(f, "line one\nline two\nline three\n").unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -902,7 +930,7 @@ mod tests {
         let args =
             json!({"path": f.path().to_str().unwrap(), "start_line": 2, "end_line": 4}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -922,7 +950,7 @@ mod tests {
         let f = tempfile::NamedTempFile::new().unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -944,7 +972,7 @@ mod tests {
         f.write_all(&[0xFF, 0xD8, 0xFF, 0x00, 0x10, 0x00]).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -958,7 +986,10 @@ mod tests {
         write!(f, "a\nb\nc\nd\ne\n").unwrap();
         let args =
             json!({"path": f.path().to_str().unwrap(), "start_line": 2, "end_line": 4}).to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("b"));
         assert!(result.contains("c"));
         assert!(result.contains("d"));
@@ -979,7 +1010,7 @@ mod tests {
         })
         .to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -997,7 +1028,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_not_found() {
         let args = json!({"path": "/tmp/nonexistent_read_file_test_12345.txt"}).to_string();
-        let result = ReadFileTool.call(&args).await;
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -1008,7 +1041,7 @@ mod tests {
         f.write_all(&[0xFF, 0xD8, 0xFF, 0x00, 0x10, 0x00]).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1035,7 +1068,7 @@ mod tests {
             .unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1053,7 +1086,7 @@ mod tests {
         let path = f.path().to_str().unwrap().to_string();
         let args = json!({"path": &path}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1080,7 +1113,7 @@ mod tests {
         write!(f, "%PDF-1.4\nplain ascii body without nulls\n").unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1095,7 +1128,7 @@ mod tests {
         f.write_all(b"PK\x03\x04docx-zip-payload").unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1119,7 +1152,7 @@ mod tests {
         f.write_all(&[0x00, 0x01, 0x02, 0x03, 0x04]).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1137,7 +1170,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[0x00, 0x01, 0x02, 0x03, 0x04]).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1151,7 +1184,9 @@ mod tests {
     async fn test_read_file_directory() {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = ReadFileTool.call(&args).await;
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("directory"));
     }
@@ -1160,7 +1195,10 @@ mod tests {
     async fn test_read_file_empty() {
         let f = tempfile::NamedTempFile::new().unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("0 lines"));
         assert!(result.contains("0 bytes"));
     }
@@ -1172,7 +1210,7 @@ mod tests {
         writeln!(f, "{}", "z".repeat(10_000)).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1197,7 +1235,7 @@ mod tests {
         let args = json!({"path": f.path().to_str().unwrap(), "start_line": 1, "end_line": 25_000})
             .to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1230,7 +1268,7 @@ mod tests {
         assert!(f.as_file().metadata().unwrap().len() > MAX_READ_CHARS as u64);
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .expect("oversized full read should auto-page, not error");
@@ -1254,7 +1292,7 @@ mod tests {
         let args =
             json!({"path": f.path().to_str().unwrap(), "tail_lines": 1_000_000_u64}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1270,7 +1308,7 @@ mod tests {
         write!(f, "alpha\nbeta\ngamma\n").unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
 
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -1377,7 +1415,10 @@ mod tests {
         let args =
             json!({"path": f.path().to_str().unwrap(), "start_line": 24998, "end_line": 25000})
                 .to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("lines 24998-25000 of 25000"));
         assert!(result.contains("24998 | line 24998"));
@@ -1394,7 +1435,10 @@ mod tests {
         assert!(f.as_file().metadata().unwrap().len() > MAX_READ_CHARS as u64);
 
         let args = json!({"path": f.path().to_str().unwrap(), "tail_lines": 3}).to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
+        let result = ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         assert!(result.contains("last 3 lines of 25000"));
         assert!(result.contains("24998 | line 24998"));

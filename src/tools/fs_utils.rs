@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::execution::{active_execution_backend, BackendKind, BackendPath, ExecutionRequest};
+use crate::execution::{BackendKind, BackendPath, ExecutionBackend, ExecutionRequest};
 use once_cell::sync::Lazy;
 
 /// Directories to skip during recursive file walks.
@@ -195,8 +195,8 @@ pub const PROJECT_ROOT_MARKERS: &[&str] = &[
 /// before giving up. This avoids expensive `find ~` searches when the user
 /// references a project by name (e.g., "blog.aidaemon.ai").
 #[allow(dead_code)]
-pub fn resolve_project_dir(path: &str) -> anyhow::Result<PathBuf> {
-    let direct = validate_path(path)?;
+pub fn resolve_project_dir(backend: &dyn ExecutionBackend, path: &str) -> anyhow::Result<PathBuf> {
+    let direct = validate_path(backend, path)?;
     if direct.exists() && direct.is_dir() {
         return Ok(direct);
     }
@@ -228,10 +228,10 @@ pub fn resolve_project_dir(path: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Resolves `~` and validates path safety. Returns canonical path.
-pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
-    if active_execution_backend().kind() != BackendKind::Local {
+pub fn validate_path(backend: &dyn ExecutionBackend, path: &str) -> anyhow::Result<PathBuf> {
+    if backend.kind() != BackendKind::Local {
         return Ok(PathBuf::from(
-            crate::execution::normalize_active_path_lexically(path)?.as_str(),
+            crate::execution::normalize_path_lexically(backend, path)?.as_str(),
         ));
     }
 
@@ -312,9 +312,12 @@ pub fn find_nearest_project_root(path: &Path) -> Option<PathBuf> {
 /// Normalize a user/tool-supplied scope path.
 /// If the path points into an existing project subtree, promote it to the nearest
 /// recognizable project root so builds/deploys can reach repo-level files.
-pub fn normalize_project_scope_path(path: &str) -> anyhow::Result<PathBuf> {
-    if active_execution_backend().kind() != BackendKind::Local {
-        let mut normalized = validate_path(path)?;
+pub fn normalize_project_scope_path(
+    backend: &dyn ExecutionBackend,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
+    if backend.kind() != BackendKind::Local {
+        let mut normalized = validate_path(backend, path)?;
         if path_points_to_file(path.trim_end_matches('/')) {
             if let Some(parent) = normalized.parent() {
                 normalized = parent.to_path_buf();
@@ -323,7 +326,7 @@ pub fn normalize_project_scope_path(path: &str) -> anyhow::Result<PathBuf> {
         return Ok(normalized);
     }
 
-    let mut normalized = validate_path(path)?;
+    let mut normalized = validate_path(backend, path)?;
     if !first_dir_component_exists(&normalized) {
         anyhow::bail!(
             "Path does not look like a real filesystem location: {}",
@@ -409,10 +412,11 @@ fn relative_reference_base(workspace_anchor: Option<&Path>) -> Option<PathBuf> {
 /// [`resolve_structural_filesystem_reference_from`] so the reference is anchored
 /// to that workspace instead.
 pub fn resolve_structural_filesystem_reference(
+    backend: &dyn ExecutionBackend,
     raw: &str,
     alias_roots: &[String],
 ) -> Option<PathBuf> {
-    resolve_structural_filesystem_reference_from(raw, alias_roots, None)
+    resolve_structural_filesystem_reference_from(backend, raw, alias_roots, None)
 }
 
 /// [`resolve_structural_filesystem_reference`] with an explicit anchor for
@@ -425,6 +429,7 @@ pub fn resolve_structural_filesystem_reference(
 /// project root may claim the reference either. Without an anchor the cwd and
 /// alias-root fallbacks apply as before.
 pub fn resolve_structural_filesystem_reference_from(
+    backend: &dyn ExecutionBackend,
     raw: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
@@ -439,11 +444,11 @@ pub fn resolve_structural_filesystem_reference_from(
         || (token.starts_with('.') && (token.contains('/') || token.contains('\\')));
     let has_separator = token.contains('/') || token.contains('\\');
 
-    if active_execution_backend().kind() != BackendKind::Local {
+    if backend.kind() != BackendKind::Local {
         if explicit {
-            return validate_path(token).ok();
+            return validate_path(backend, token).ok();
         }
-        return resolve_projects_folder_alias(token, alias_roots);
+        return resolve_projects_folder_alias(backend, token, alias_roots);
     }
 
     let base = relative_reference_base(workspace_anchor)?;
@@ -459,7 +464,7 @@ pub fn resolve_structural_filesystem_reference_from(
         return None;
     }
 
-    if let Some(alias_path) = resolve_projects_folder_alias(token, alias_roots) {
+    if let Some(alias_path) = resolve_projects_folder_alias(backend, token, alias_roots) {
         return Some(alias_path);
     }
 
@@ -480,7 +485,7 @@ pub fn resolve_structural_filesystem_reference_from(
     }
 
     for raw_root in alias_roots {
-        let Ok(root) = validate_path(raw_root) else {
+        let Ok(root) = validate_path(backend, raw_root) else {
             continue;
         };
         if !root.is_dir() || !root.join(first_component).exists() {
@@ -546,17 +551,20 @@ fn project_root_directory_entries(root: &Path) -> Vec<(String, PathBuf)> {
     entries
 }
 
-pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
-    if active_execution_backend().kind() != BackendKind::Local {
+pub fn project_search_roots(
+    backend: &dyn ExecutionBackend,
+    alias_roots: &[String],
+) -> Vec<PathBuf> {
+    if backend.kind() != BackendKind::Local {
         let mut roots = Vec::new();
         for raw_root in alias_roots {
-            if let Ok(root) = validate_path(raw_root) {
+            if let Ok(root) = validate_path(backend, raw_root) {
                 if !roots.iter().any(|existing| existing == &root) {
                     roots.push(root);
                 }
             }
         }
-        let workspace = PathBuf::from(active_execution_backend().workspace_root().as_str());
+        let workspace = PathBuf::from(backend.workspace_root().as_str());
         if !roots.iter().any(|existing| existing == &workspace) {
             roots.push(workspace);
         }
@@ -565,7 +573,7 @@ pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
 
     let mut roots = Vec::new();
     for raw_root in alias_roots {
-        let Ok(root) = validate_path(raw_root) else {
+        let Ok(root) = validate_path(backend, raw_root) else {
             continue;
         };
         push_unique_search_root(&mut roots, root);
@@ -585,7 +593,11 @@ pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
     roots
 }
 
-pub fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> Option<PathBuf> {
+pub fn resolve_projects_folder_alias(
+    backend: &dyn ExecutionBackend,
+    raw_path: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
     let trimmed = raw_path.trim();
     if token_is_absolute_like(trimmed) {
         return None;
@@ -604,14 +616,15 @@ pub fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> 
         .strip_prefix("projects/")
         .or_else(|| relative.strip_prefix("projects\\"))
         .unwrap_or("");
-    for root in project_search_roots(alias_roots) {
+    for root in project_search_roots(backend, alias_roots) {
         let candidate = if suffix.is_empty() {
             root
         } else {
             root.join(suffix.replace('\\', "/"))
         };
-        if active_execution_backend().kind() != BackendKind::Local {
-            return normalize_project_scope_path(candidate.to_string_lossy().as_ref()).ok();
+        if backend.kind() != BackendKind::Local {
+            return normalize_project_scope_path(backend, candidate.to_string_lossy().as_ref())
+                .ok();
         }
         if candidate.parent().is_some_and(|parent| parent.is_dir()) {
             return Some(candidate);
@@ -646,7 +659,11 @@ fn token_looks_like_named_project(raw: &str) -> bool {
         || token.ends_with("app")
 }
 
-pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Option<PathBuf> {
+pub fn resolve_named_project_root(
+    backend: &dyn ExecutionBackend,
+    raw_name: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
     let token = raw_name
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
         .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'))
@@ -657,8 +674,8 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
     }
 
     let target = token.to_ascii_lowercase();
-    if active_execution_backend().kind() != BackendKind::Local {
-        return project_search_roots(alias_roots)
+    if backend.kind() != BackendKind::Local {
+        return project_search_roots(backend, alias_roots)
             .into_iter()
             .find_map(|root| {
                 root.file_name()
@@ -667,10 +684,11 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
             });
     }
 
-    for root in project_search_roots(alias_roots) {
+    for root in project_search_roots(backend, alias_roots) {
         let direct = root.join(token);
         if direct.is_dir() {
-            if let Ok(normalized) = normalize_project_scope_path(direct.to_string_lossy().as_ref())
+            if let Ok(normalized) =
+                normalize_project_scope_path(backend, direct.to_string_lossy().as_ref())
             {
                 return Some(normalized);
             }
@@ -680,7 +698,9 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
             if name != target {
                 continue;
             }
-            if let Ok(normalized) = normalize_project_scope_path(path.to_string_lossy().as_ref()) {
+            if let Ok(normalized) =
+                normalize_project_scope_path(backend, path.to_string_lossy().as_ref())
+            {
                 return Some(normalized);
             }
         }
@@ -689,17 +709,20 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
 }
 
 #[cfg(test)]
-fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
-    if active_execution_backend().kind() != BackendKind::Local {
+fn explicit_project_search_roots(
+    backend: &dyn ExecutionBackend,
+    alias_roots: &[String],
+) -> Vec<PathBuf> {
+    if backend.kind() != BackendKind::Local {
         return alias_roots
             .iter()
-            .filter_map(|root| validate_path(root).ok())
+            .filter_map(|root| validate_path(backend, root).ok())
             .collect();
     }
 
     let mut roots = Vec::new();
     for raw_root in alias_roots {
-        let Ok(root) = validate_path(raw_root) else {
+        let Ok(root) = validate_path(backend, raw_root) else {
             continue;
         };
         push_unique_search_root(&mut roots, root);
@@ -709,6 +732,7 @@ fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
 
 #[cfg(test)]
 fn resolve_contextual_project_nickname_across_roots(
+    backend: &dyn ExecutionBackend,
     raw_name: &str,
     roots: Vec<PathBuf>,
 ) -> Option<PathBuf> {
@@ -728,7 +752,7 @@ fn resolve_contextual_project_nickname_across_roots(
         return None;
     }
 
-    if active_execution_backend().kind() != BackendKind::Local {
+    if backend.kind() != BackendKind::Local {
         return roots.into_iter().find(|root| {
             root.file_name()
                 .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&token))
@@ -748,7 +772,8 @@ fn resolve_contextual_project_nickname_across_roots(
             {
                 continue;
             }
-            let Ok(normalized) = normalize_project_scope_path(path.to_string_lossy().as_ref())
+            let Ok(normalized) =
+                normalize_project_scope_path(backend, path.to_string_lossy().as_ref())
             else {
                 continue;
             };
@@ -770,30 +795,40 @@ fn resolve_contextual_project_nickname_across_roots(
 
 #[cfg(test)]
 pub fn resolve_contextual_project_nickname(
+    backend: &dyn ExecutionBackend,
     raw_name: &str,
     alias_roots: &[String],
 ) -> Option<PathBuf> {
-    resolve_contextual_project_nickname_across_roots(raw_name, project_search_roots(alias_roots))
+    resolve_contextual_project_nickname_across_roots(
+        backend,
+        raw_name,
+        project_search_roots(backend, alias_roots),
+    )
 }
 
 #[cfg(test)]
 pub fn resolve_contextual_project_nickname_in_explicit_roots(
+    backend: &dyn ExecutionBackend,
     raw_name: &str,
     alias_roots: &[String],
 ) -> Option<PathBuf> {
-    let explicit_roots = explicit_project_search_roots(alias_roots);
+    let explicit_roots = explicit_project_search_roots(backend, alias_roots);
     if explicit_roots.is_empty() {
-        return resolve_contextual_project_nickname(raw_name, alias_roots);
+        return resolve_contextual_project_nickname(backend, raw_name, alias_roots);
     }
-    resolve_contextual_project_nickname_across_roots(raw_name, explicit_roots)
+    resolve_contextual_project_nickname_across_roots(backend, raw_name, explicit_roots)
 }
 
 /// Resolve a project-scope reference (path-like token or project nickname) to
 /// a project root, with relative path tokens resolved against the daemon
 /// process cwd. Task-bound callers use [`resolve_project_scope_reference_from`].
 #[cfg(test)]
-pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Option<PathBuf> {
-    resolve_project_scope_reference_from(raw, alias_roots, None)
+pub fn resolve_project_scope_reference(
+    backend: &dyn ExecutionBackend,
+    raw: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    resolve_project_scope_reference_from(backend, raw, alias_roots, None)
 }
 
 /// Resolve a project-scope reference (path-like token or project nickname) to
@@ -805,6 +840,7 @@ pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Opt
 /// rather than to whichever repository the daemon happens to run from. Without
 /// an anchor the daemon cwd is the base.
 pub fn resolve_project_scope_reference_from(
+    backend: &dyn ExecutionBackend,
     raw: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
@@ -817,8 +853,8 @@ pub fn resolve_project_scope_reference_from(
     let looks_path_like =
         token_is_absolute_like(trimmed) || trimmed.contains('/') || trimmed.contains('\\');
     if looks_path_like {
-        if active_execution_backend().kind() != BackendKind::Local {
-            return normalize_project_scope_path(trimmed).ok();
+        if backend.kind() != BackendKind::Local {
+            return normalize_project_scope_path(backend, trimmed).ok();
         }
         let path_for_resolution = if token_is_absolute_like(trimmed) {
             trimmed.to_string()
@@ -829,24 +865,24 @@ pub fn resolve_project_scope_reference_from(
                 if candidate.exists() {
                     candidate.to_string_lossy().to_string()
                 } else if let Some(alias_candidate) =
-                    resolve_projects_folder_alias(trimmed, alias_roots)
+                    resolve_projects_folder_alias(backend, trimmed, alias_roots)
                 {
                     alias_candidate.to_string_lossy().to_string()
                 } else {
                     candidate.to_string_lossy().to_string()
                 }
             } else if let Some(alias_candidate) =
-                resolve_projects_folder_alias(trimmed, alias_roots)
+                resolve_projects_folder_alias(backend, trimmed, alias_roots)
             {
                 alias_candidate.to_string_lossy().to_string()
             } else {
                 trimmed.to_string()
             }
         };
-        return normalize_project_scope_path(&path_for_resolution).ok();
+        return normalize_project_scope_path(backend, &path_for_resolution).ok();
     }
 
-    resolve_named_project_root(trimmed, alias_roots)
+    resolve_named_project_root(backend, trimmed, alias_roots)
 }
 
 /// Returns true if the path matches any sensitive pattern.
@@ -1051,26 +1087,26 @@ pub struct CommandOutput {
 
 /// Run a shell command with timeout. Returns structured output.
 pub async fn run_cmd(
+    backend: &dyn ExecutionBackend,
     cmd: &str,
     working_dir: Option<&Path>,
     timeout_secs: u64,
 ) -> anyhow::Result<CommandOutput> {
-    let backend = active_execution_backend();
     let working_dir = match working_dir {
         Some(dir) => Some(backend.resolve_path(&dir.to_string_lossy()).await?),
         None => None,
     };
-    run_cmd_backend(cmd, working_dir.as_ref(), timeout_secs).await
+    run_cmd_backend(backend, cmd, working_dir.as_ref(), timeout_secs).await
 }
 
 /// Run a command in the configured execution environment using an opaque
 /// backend path for its working directory.
 pub async fn run_cmd_backend(
+    backend: &dyn ExecutionBackend,
     cmd: &str,
     working_dir: Option<&BackendPath>,
     timeout_secs: u64,
 ) -> anyhow::Result<CommandOutput> {
-    let backend = active_execution_backend();
     let mut request = ExecutionRequest::shell(cmd);
     request.cwd = working_dir.cloned();
     let output = backend
@@ -1110,14 +1146,14 @@ pub fn is_test_file(path: &Path) -> bool {
 
 /// Validate Python syntax by running py_compile. Returns None if valid, or
 /// the error message if there's a SyntaxError. Runs with a 5-second timeout.
-pub async fn validate_python_syntax(path: &Path) -> Option<String> {
+pub async fn validate_python_syntax(backend: &dyn ExecutionBackend, path: &Path) -> Option<String> {
     if path.extension().map(|e| e == "py").unwrap_or(false) {
         let path_str = path.to_string_lossy();
         let cmd = format!(
             "python3 -c \"import py_compile; py_compile.compile('{}', doraise=True)\"",
             path_str.replace('\'', "'\\''")
         );
-        match run_cmd(&cmd, None, 5).await {
+        match run_cmd(backend, &cmd, None, 5).await {
             Ok(output) if output.exit_code != 0 => {
                 let error = if !output.stderr.is_empty() {
                     output.stderr.trim().to_string()
@@ -1151,11 +1187,11 @@ pub async fn validate_python_syntax(path: &Path) -> Option<String> {
 
 /// Build post-write diagnostics: Python syntax check + test file warning.
 /// Returns a string to append to the tool result, or empty string.
-pub async fn post_write_diagnostics(path: &Path) -> String {
+pub async fn post_write_diagnostics(backend: &dyn ExecutionBackend, path: &Path) -> String {
     let mut notes = Vec::new();
 
     // Check Python syntax
-    if let Some(syntax_err) = validate_python_syntax(path).await {
+    if let Some(syntax_err) = validate_python_syntax(backend, path).await {
         notes.push(format!(
             "\n⚠ SYNTAX ERROR detected in written file:\n{}\nFix the syntax error before proceeding.",
             syntax_err
@@ -1213,7 +1249,7 @@ mod tests {
 
     #[test]
     fn test_validate_path_home() {
-        let result = validate_path("~/test.txt");
+        let result = validate_path(&*crate::execution::active_execution_backend(), "~/test.txt");
         assert!(result.is_ok());
         let p = result.unwrap();
         assert!(p.is_absolute());
@@ -1222,24 +1258,30 @@ mod tests {
 
     #[test]
     fn test_validate_path_traversal() {
-        let result = validate_path("/tmp/../../etc/passwd");
+        let result = validate_path(
+            &*crate::execution::active_execution_backend(),
+            "/tmp/../../etc/passwd",
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_path_absolute() {
-        let result = validate_path("/tmp/test.txt");
+        let result = validate_path(
+            &*crate::execution::active_execution_backend(),
+            "/tmp/test.txt",
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_path_dot_normalized() {
         // Passing "." should resolve to cwd without trailing "/."
-        let result = validate_path(".").unwrap();
+        let result = validate_path(&*crate::execution::active_execution_backend(), ".").unwrap();
         let result_str = result.to_string_lossy();
         assert!(
             !result_str.ends_with("/."),
-            "validate_path(\".\") should not end with trailing dot, got: {}",
+            "validate_path(&*crate::execution::active_execution_backend(), \".\") should not end with trailing dot, got: {}",
             result_str
         );
         assert_eq!(result, std::env::current_dir().unwrap());
@@ -1248,11 +1290,12 @@ mod tests {
     #[test]
     fn test_validate_path_subdir_dot_normalized() {
         // "src/." should normalize to just "cwd/src"
-        let result = validate_path("src/.").unwrap();
+        let result =
+            validate_path(&*crate::execution::active_execution_backend(), "src/.").unwrap();
         let result_str = result.to_string_lossy();
         assert!(
             !result_str.ends_with("/."),
-            "validate_path(\"src/.\") should not end with trailing dot, got: {}",
+            "validate_path(&*crate::execution::active_execution_backend(), \"src/.\") should not end with trailing dot, got: {}",
             result_str
         );
     }
@@ -1294,8 +1337,11 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(root.join("package.json"), r#"{"name":"demo"}"#).unwrap();
 
-        let normalized =
-            normalize_project_scope_path(src.to_string_lossy().as_ref()).expect("normalized");
+        let normalized = normalize_project_scope_path(
+            &*crate::execution::active_execution_backend(),
+            src.to_string_lossy().as_ref(),
+        )
+        .expect("normalized");
         assert_eq!(normalized, root);
     }
 
@@ -1303,8 +1349,11 @@ mod tests {
     fn test_normalize_project_scope_path_keeps_non_project_target_dir() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("new-site");
-        let normalized =
-            normalize_project_scope_path(target.to_string_lossy().as_ref()).expect("normalized");
+        let normalized = normalize_project_scope_path(
+            &*crate::execution::active_execution_backend(),
+            target.to_string_lossy().as_ref(),
+        )
+        .expect("normalized");
         assert_eq!(normalized, target);
     }
 
@@ -1315,8 +1364,11 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
 
-        let normalized =
-            normalize_project_scope_path(target.to_string_lossy().as_ref()).expect("normalized");
+        let normalized = normalize_project_scope_path(
+            &*crate::execution::active_execution_backend(),
+            target.to_string_lossy().as_ref(),
+        )
+        .expect("normalized");
         assert_eq!(normalized, target);
     }
 
@@ -1329,6 +1381,7 @@ mod tests {
         std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
 
         let resolved = resolve_named_project_root(
+            &*crate::execution::active_execution_backend(),
             "blog.aidaemon.ai",
             &[alias_root.to_string_lossy().to_string()],
         )
@@ -1345,6 +1398,7 @@ mod tests {
         std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n").unwrap();
 
         let resolved = resolve_contextual_project_nickname_in_explicit_roots(
+            &*crate::execution::active_execution_backend(),
             "springfield",
             &[alias_root.to_string_lossy().to_string()],
         )
@@ -1361,12 +1415,20 @@ mod tests {
         std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
-        let named = resolve_project_scope_reference("blog.aidaemon.ai", &alias_roots)
-            .expect("named project");
+        let named = resolve_project_scope_reference(
+            &*crate::execution::active_execution_backend(),
+            "blog.aidaemon.ai",
+            &alias_roots,
+        )
+        .expect("named project");
         assert_eq!(named, project);
 
-        let aliased = resolve_project_scope_reference("projects/blog.aidaemon.ai", &alias_roots)
-            .expect("aliased project");
+        let aliased = resolve_project_scope_reference(
+            &*crate::execution::active_execution_backend(),
+            "projects/blog.aidaemon.ai",
+            &alias_roots,
+        )
+        .expect("aliased project");
         assert_eq!(aliased, project);
     }
 
@@ -1387,7 +1449,11 @@ mod tests {
             "alpha/beta/gamma",
         ] {
             assert_eq!(
-                resolve_structural_filesystem_reference(prose, &alias_roots),
+                resolve_structural_filesystem_reference(
+                    &*crate::execution::active_execution_backend(),
+                    prose,
+                    &alias_roots
+                ),
                 None,
                 "unanchored prose compound must not become a path: {prose}"
             );
@@ -1395,6 +1461,7 @@ mod tests {
 
         assert_eq!(
             resolve_structural_filesystem_reference(
+                &*crate::execution::active_execution_backend(),
                 "synthetic-project/src/new_module.rs",
                 &alias_roots
             ),
@@ -1404,6 +1471,7 @@ mod tests {
         let explicit_new_target = dir.path().join("not-created-yet").join("result.md");
         assert_eq!(
             resolve_structural_filesystem_reference(
+                &*crate::execution::active_execution_backend(),
                 explicit_new_target.to_string_lossy().as_ref(),
                 &alias_roots
             ),
@@ -1475,14 +1543,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_cmd_echo() {
-        let out = run_cmd("echo hello", None, 5).await.unwrap();
+        let out = run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "echo hello",
+            None,
+            5,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout.trim(), "hello");
     }
 
     #[tokio::test]
     async fn test_run_cmd_timeout() {
-        let result = run_cmd("sleep 10", None, 1).await;
+        let result = run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "sleep 10",
+            None,
+            1,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
@@ -1497,7 +1578,13 @@ mod tests {
             marker.to_string_lossy()
         );
 
-        let result = run_cmd(&cmd, None, 1).await;
+        let result = run_cmd(
+            &*crate::execution::active_execution_backend(),
+            &cmd,
+            None,
+            1,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
 
@@ -1511,7 +1598,14 @@ mod tests {
     #[tokio::test]
     async fn test_run_cmd_working_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let out = run_cmd("pwd", Some(dir.path()), 5).await.unwrap();
+        let out = run_cmd(
+            &*crate::execution::active_execution_backend(),
+            "pwd",
+            Some(dir.path()),
+            5,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.exit_code, 0);
     }
 
@@ -1548,6 +1642,7 @@ mod tests {
         );
 
         let resolved = resolve_structural_filesystem_reference_from(
+            &*crate::execution::active_execution_backend(),
             "src/content/posts",
             &[],
             Some(&workspace),
@@ -1556,8 +1651,12 @@ mod tests {
         assert_eq!(resolved, workspace.join("src/content/posts"));
         assert!(!resolved.starts_with(&cwd));
 
-        let unanchored = resolve_structural_filesystem_reference("src/content/posts", &[])
-            .expect("cwd-anchored reference resolves against the process cwd");
+        let unanchored = resolve_structural_filesystem_reference(
+            &*crate::execution::active_execution_backend(),
+            "src/content/posts",
+            &[],
+        )
+        .expect("cwd-anchored reference resolves against the process cwd");
         assert!(unanchored.starts_with(&cwd));
     }
 
@@ -1575,6 +1674,7 @@ mod tests {
 
         assert_eq!(
             resolve_structural_filesystem_reference_from(
+                &*crate::execution::active_execution_backend(),
                 "src/content/posts",
                 &alias_roots,
                 Some(&workspace)
@@ -1586,6 +1686,7 @@ mod tests {
         // target is allowed there.
         assert_eq!(
             resolve_structural_filesystem_reference_from(
+                &*crate::execution::active_execution_backend(),
                 "./src/content/posts",
                 &alias_roots,
                 Some(&workspace)
@@ -1594,6 +1695,7 @@ mod tests {
         );
         assert_eq!(
             resolve_structural_filesystem_reference_from(
+                &*crate::execution::active_execution_backend(),
                 "../escape",
                 &alias_roots,
                 Some(&workspace)
@@ -1609,17 +1711,25 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
         std::fs::create_dir_all(workspace.join("src").join("content").join("posts")).unwrap();
 
-        let scope =
-            resolve_project_scope_reference_from("src/content/posts", &[], Some(&workspace))
-                .expect("anchored project scope");
+        let scope = resolve_project_scope_reference_from(
+            &*crate::execution::active_execution_backend(),
+            "src/content/posts",
+            &[],
+            Some(&workspace),
+        )
+        .expect("anchored project scope");
         assert_eq!(scope, workspace);
 
         // Negative control: without an anchor the process cwd is the base. Only
         // the base is asserted — whether the reference is promoted to a project
         // root depends on what exists under the cwd, which varies by checkout.
         let cwd = std::env::current_dir().unwrap();
-        let unanchored = resolve_project_scope_reference("src/content/posts", &[])
-            .expect("unanchored project scope resolves against the process cwd");
+        let unanchored = resolve_project_scope_reference(
+            &*crate::execution::active_execution_backend(),
+            "src/content/posts",
+            &[],
+        )
+        .expect("unanchored project scope resolves against the process cwd");
         assert!(
             unanchored.starts_with(&cwd),
             "{unanchored:?} should be rooted in {cwd:?}"

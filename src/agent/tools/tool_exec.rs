@@ -95,10 +95,18 @@ async fn call_scoped_builtin_file_tool(
     // name in the general registry would let an injected/custom duplicate tool
     // inherit the collaborator allowlist merely by choosing the same name.
     let tool: Box<dyn crate::traits::Tool> = match name {
-        "read_file" => Box::new(crate::tools::ReadFileTool),
-        "search_files" => Box::new(crate::tools::SearchFilesTool),
-        "write_file" => Box::new(crate::tools::WriteFileTool),
-        "edit_file" => Box::new(crate::tools::EditFileTool),
+        "read_file" => Box::new(crate::tools::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        "search_files" => Box::new(crate::tools::SearchFilesTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        "write_file" => Box::new(crate::tools::WriteFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        "edit_file" => Box::new(crate::tools::EditFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         _ => anyhow::bail!("The workspace grant does not allow this tool."),
     };
     let prepared = match prepare_tool_arguments(tool.as_ref(), arguments) {

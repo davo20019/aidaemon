@@ -250,7 +250,7 @@ async fn injection_harness(
     let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
         Arc::new(InjectedPage(sentinel.to_string_lossy().into_owned())),
-        Arc::new(crate::tools::ReadFileTool),
+        Arc::new(crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())),
         Arc::new(DeleteProbe),
         Arc::new(MessageProbe(sent.clone())),
     ];
@@ -447,7 +447,7 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
     ]);
     let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(crate::tools::WriteFileTool),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
         Arc::new(TerminalProbe),
         Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
     ];
@@ -545,7 +545,7 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
         ),
         MockProvider::text_response("The child could not write."),
     ]);
-    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::tools::WriteFileTool)];
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend()))];
     let mut child = setup_test_agent_with_extra_tools_and_llm_timeout(child_provider, tools, None)
         .await
         .unwrap();
@@ -582,7 +582,7 @@ async fn guest_message_cannot_write_or_run_even_via_a_child() {
         ),
         MockProvider::text_response("Read it."),
     ]);
-    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::tools::ReadFileTool)];
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::tools::ReadFileTool::new(crate::execution::active_execution_backend()))];
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
         .await
         .unwrap();
