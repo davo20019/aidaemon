@@ -523,13 +523,13 @@ impl crate::traits::Tool for TrustProbeTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect whether the agent injected _trusted_session"
+        "Inspect whether the call is a trusted session"
     }
 
     fn schema(&self) -> serde_json::Value {
         json!({
             "name": "trust_probe",
-            "description": "Inspect whether the agent injected _trusted_session",
+            "description": "Inspect whether the call is a trusted session",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -538,11 +538,22 @@ impl crate::traits::Tool for TrustProbeTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        let trusted = args["_trusted_session"].as_bool().unwrap_or(false);
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the dispatcher calls with a context")
+    }
+
+    /// Records the dispatcher's typed trust fact for the call.
+    async fn call_with_execution_context(
+        &self,
+        _arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let trusted = facts.trusted_session;
         self.seen.lock().await.push(trusted);
-        Ok(if trusted { "trusted" } else { "untrusted" }.to_string())
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            if trusted { "trusted" } else { "untrusted" }.to_string(),
+        ))
     }
 }
 

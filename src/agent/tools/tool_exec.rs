@@ -153,12 +153,13 @@ pub(super) struct ToolExecCtx<'a> {
     /// them before running.
     pub scope_escalation: Option<&'a crate::traits::ScopeEscalation>,
     /// The turn's actual authority, taint and root request, handed to
-    /// `spawn_agent` as `_parent_authority` so a child inherits what this
-    /// turn had rather than a re-resolution at spawn time.
+    /// `spawn_agent` in its call context's extensions so a child inherits
+    /// what this turn had rather than a re-resolution at spawn time.
     pub turn_authority: Option<&'a crate::agent::authority::InheritedAuthority>,
     /// The turn's trusted roots and the cwd relative paths resolve against,
-    /// handed to `terminal` as `_trust_roots`/`_trust_cwd` so a run moved to
-    /// the background records the trust its launch was judged with.
+    /// handed to `terminal` as `ToolCallContext::trust_roots`/`trust_cwd` so
+    /// a run moved to the background records the trust its launch was
+    /// judged with.
     pub trust_roots: Option<(&'a [String], &'a str)>,
 }
 
@@ -768,10 +769,8 @@ impl Agent {
         ctx: &ToolExecCtx<'_>,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let name = name.trim();
-        let session_id = ctx.session_id;
         let task_id = ctx.task_id;
         let channel_visibility = ctx.channel_visibility;
-        let channel_id = ctx.channel_id;
         let under_mandate = self
             .validate_mandate_dispatch(name, arguments, ctx, false)
             .await?;
@@ -780,7 +779,6 @@ impl Agent {
         // authorize it; the entire expression short-circuits to false.
         let trusted = !under_mandate && self.session_trusted(ctx.trusted, task_id).await;
         let user_role = ctx.user_role;
-        let turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
 
         let active_workspace_grant = match user_role {
             UserRole::Owner => None,
@@ -820,122 +818,9 @@ impl Agent {
                         .find(|tool| tool.name() == name)
                         .map(|tool| tool.as_ref()),
                 );
-                map.insert("_session_id".to_string(), json!(session_id));
-                map.insert(
-                    "_channel_visibility".to_string(),
-                    json!(channel_visibility.to_string()),
-                );
-                if let Some(ch_id) = channel_id {
-                    map.insert("_channel_id".to_string(), json!(ch_id));
-                }
-                if let Some(tid) = task_id {
-                    map.insert("_task_id".to_string(), json!(tid));
-                }
-                if let Some(tool_call_id) = ctx.tool_call_id {
-                    map.insert("_tool_call_id".to_string(), json!(tool_call_id));
-                }
-                if let Some(ref turn_id) = turn_id {
-                    map.insert("_turn_id".to_string(), json!(turn_id));
-                }
-                // Inject explicit trust flag from ChannelContext — only trusted
-                // scheduled tasks set this. Never derived from session ID strings.
-                if trusted {
-                    map.insert("_trusted_session".to_string(), json!(true));
-                }
-                // Inject user role so tools can enforce role-based access control
-                map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
-                if name == "terminal" {
-                    if let Some((roots, cwd)) = ctx.trust_roots {
-                        map.insert("_trust_roots".to_string(), json!(roots));
-                        map.insert("_trust_cwd".to_string(), json!(cwd));
-                    }
-                }
-                if name == "spawn_agent" {
-                    if let Some(turn_authority) = ctx.turn_authority {
-                        map.insert(
-                            "_parent_authority".to_string(),
-                            serde_json::to_value(turn_authority)?,
-                        );
-                    }
-                }
-                if let Some(grant) = active_workspace_grant {
-                    map.insert(
-                        "_workspace_collaboration_root".to_string(),
-                        json!(grant.project_root),
-                    );
-                }
-                // Inject goal context for tools that need it (e.g. spawn_agent, cli_agent, terminal).
-                //
-                // `cli_agent` uses this to route async/timeout notifications to the *origin* session
-                // (goal.session_id), since internal child-agent sessions are not routable.
-                //
-                // `terminal` uses this for the same reason when commands move to background.
-                if matches!(
-                    name,
-                    "spawn_agent"
-                        | "cli_agent"
-                        | "terminal"
-                        | "manage_mandates"
-                        | "manage_goal_tasks"
-                ) {
-                    if let Some(ref gid) = self.goal_id {
-                        map.insert("_goal_id".to_string(), json!(gid));
-                    } else if matches!(name, "cli_agent" | "terminal") {
-                        // Executors typically don't carry goal_id, but do carry task_id.
-                        // Resolve goal_id via task so background notifications stay deliverable.
-                        if let Some(ref executor_task_id) = self.task_id {
-                            if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
-                                map.insert("_goal_id".to_string(), json!(task.goal_id));
-                            }
-                        }
-                    }
-                    if matches!(name, "manage_mandates" | "manage_goal_tasks") {
-                        if let Some(fence) = self.mandate_execution.as_ref() {
-                            map.insert(
-                                "_goal_run_id".to_string(),
-                                json!(fence.goal_run_id.as_str()),
-                            );
-                            map.insert(
-                                "_task_attempt_id".to_string(),
-                                json!(fence.attempt_id.as_str()),
-                            );
-                            if name == "manage_goal_tasks" {
-                                map.insert(
-                                    "_mandate_id".to_string(),
-                                    json!(fence.mandate_id.as_str()),
-                                );
-                                map.insert(
-                                    "_mandate_version".to_string(),
-                                    json!(fence.mandate_version),
-                                );
-                            }
-                        }
-                    }
-                }
-                if let Some(project_scope) = ctx.project_scope {
-                    map.insert("_project_scope".to_string(), json!(project_scope));
-                }
-                #[cfg(feature = "computer_use")]
-                if name == "computer_use" {
-                    let runtime = self.llm_runtime.snapshot();
-                    let current_model =
-                        match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await
-                        {
-                            Ok(guard) => guard.clone(),
-                            Err(_) => runtime.primary_model(),
-                        };
-                    map.insert("_model".to_string(), json!(current_model));
-                    map.insert(
-                        "_provider_kind".to_string(),
-                        json!(format!("{:?}", runtime.provider_kind())),
-                    );
-                    if let Some(router) = runtime.router() {
-                        map.insert(
-                            "_model_chain".to_string(),
-                            json!(router.all_models_ordered()),
-                        );
-                    }
-                }
+                // Every fact about the call reaches the tool as a typed
+                // `ToolCallContext` field (`call_facts`); the arguments stay
+                // the model's own, with no `_` key in them.
                 serde_json::to_string(&map)?
             }
             _ => arguments.to_string(),
@@ -1105,9 +990,9 @@ impl std::error::Error for UnknownToolError {}
 /// empty session filter that matches nothing, an empty `schedules` list that
 /// hides `schedule`). Required fields, numbers and booleans are untouched.
 /// The model's arguments as the dispatcher reads them: any `_`-prefixed key
-/// the model sent is dropped (only the dispatcher sets those, after this),
-/// and optional arguments the model left unset are dropped against the
-/// tool's schema. The kernel's terminal approval rules judge a call after
+/// the model sent is dropped (no tool reads one: the dispatcher's facts
+/// reach a tool as its typed `ToolCallContext`), and optional arguments the
+/// model left unset are dropped against the tool's schema. The kernel's terminal approval rules judge a call after
 /// this same step (`sdk_engine::tool_calls::canonicalize_call`), so the
 /// judged call is the executed one.
 pub(crate) fn strip_model_arguments(
@@ -1185,6 +1070,10 @@ mod unset_argument_tests {
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]
 mod tool_watchdog_tests;
+
+#[cfg(test)]
+#[path = "tool_call_context_tests.rs"]
+mod tool_call_context_tests;
 
 #[cfg(test)]
 mod scoped_workspace_tests {

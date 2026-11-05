@@ -716,9 +716,26 @@ impl crate::traits::Tool for GuiStandIn {
         })
     }
 
-    async fn call(&self, args: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args)?;
-        let task_id = args["_task_id"].as_str().unwrap_or_default().to_string();
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the dispatcher calls with a context")
+    }
+
+    /// Pins and flags the call's task, from the dispatcher's typed facts.
+    async fn call_with_execution_context(
+        &self,
+        _args: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(facts.task_id.unwrap_or_default())
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+#[cfg(feature = "computer_use")]
+impl GuiStandIn {
+    async fn run(&self, task_id: String) -> anyhow::Result<String> {
         let pins = crate::tools::computer_use::pin_registry::ComputerUsePinRegistry::shared();
         if self.name == "gui_click" {
             pins.pin(task_id.clone(), "synthetic-vision-model").await;

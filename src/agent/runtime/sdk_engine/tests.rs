@@ -3079,12 +3079,25 @@ impl crate::traits::Tool for SpawnRecorder {
             }
         })
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .push(serde_json::from_str(arguments)?);
-        Ok("delegated".to_string())
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the dispatcher calls with a context")
+    }
+
+    /// Records the model's arguments plus, under `parent_authority_fact`,
+    /// the parent authority the dispatcher handed over in the call facts.
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let mut recorded: serde_json::Value = serde_json::from_str(arguments)?;
+        recorded["parent_authority_fact"] =
+            serde_json::to_value(crate::agent::authority::parent_authority(&facts))?;
+        self.0.lock().unwrap().push(recorded);
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "delegated".to_string(),
+        ))
     }
 }
 
@@ -3164,8 +3177,8 @@ async fn tainted_parent_child_egress_is_verified() {
     let args = recorded.lock().unwrap().clone();
     assert_eq!(args.len(), 1, "{args:?}");
     let parent: crate::agent::authority::InheritedAuthority =
-        serde_json::from_value(args[0]["_parent_authority"].clone())
-            .unwrap_or_else(|error| panic!("_parent_authority: {error}; {args:?}"));
+        serde_json::from_value(args[0]["parent_authority_fact"].clone())
+            .unwrap_or_else(|error| panic!("parent_authority_fact: {error}; {args:?}"));
     assert!(
         parent.untrusted_context,
         "the parent read untrusted content"

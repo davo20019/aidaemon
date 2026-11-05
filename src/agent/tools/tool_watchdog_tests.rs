@@ -436,6 +436,24 @@ impl Tool for EchoSpawnAgentTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         Ok(arguments.to_string())
     }
+
+    /// Echoes the arguments and the dispatcher's typed facts.
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            json!({
+                "arguments": serde_json::from_str::<Value>(arguments)?,
+                "project_scope": facts.project_scope,
+                "session_id": facts.session_id,
+                "tool_call_id": facts.tool_call_id,
+            })
+            .to_string(),
+        ))
+    }
 }
 
 impl crate::traits::ToolSemantics for EchoSpawnAgentTool {}
@@ -568,7 +586,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
 }
 
 #[tokio::test]
-async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
+async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
@@ -586,7 +604,7 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
                 status_tx: None,
                 channel_visibility: ChannelVisibility::Private,
                 channel_id: None,
-                project_scope: Some("/Users/jordan/Library/Logs/aidaemon"),
+                project_scope: Some("/tmp/aidaemon-test/logs"),
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
@@ -601,22 +619,28 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
         .await
         .expect("spawn_agent call should succeed");
 
-    let payload: Value = serde_json::from_str(&result).expect("spawn_agent args should be JSON");
+    let payload: Value = serde_json::from_str(&result).expect("spawn_agent echo should be JSON");
     assert_eq!(
-        payload.get("_project_scope").and_then(Value::as_str),
-        Some("/Users/jordan/Library/Logs/aidaemon")
+        payload["project_scope"].as_str(),
+        Some("/tmp/aidaemon-test/logs"),
+        "the turn's scope, not the model's"
     );
     assert_eq!(
-        payload.get("mission").and_then(Value::as_str),
+        payload["arguments"]["mission"].as_str(),
         Some("delegate log analysis")
     );
+    assert_eq!(payload["session_id"].as_str(), Some("test-session"));
     assert_eq!(
-        payload.get("_session_id").and_then(Value::as_str),
-        Some("test-session")
-    );
-    assert_eq!(
-        payload.get("_tool_call_id").and_then(Value::as_str),
+        payload["tool_call_id"].as_str(),
         Some("call-parent-synthetic")
+    );
+    assert!(
+        payload["arguments"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "{payload}"
     );
 }
 

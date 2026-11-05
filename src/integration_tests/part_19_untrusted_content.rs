@@ -799,7 +799,7 @@ async fn queued_background_result(
     let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
     let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 60)
         .with_state(state.clone() as Arc<dyn crate::traits::StateStore>);
-    crate::traits::Tool::call(
+    crate::testing::call_with_facts(
         &spawn_tool,
         &json!({
             "mission": "Summarize",
@@ -809,10 +809,12 @@ async fn queued_background_result(
                 "Reply with a one-line greeting."
             },
             "background": true,
-            "_session_id": INJECTION_SESSION,
-            "_user_role": "Owner",
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            user_role: Some(crate::types::UserRole::Owner),
+            ..crate::testing::call_facts(INJECTION_SESSION)
+        },
     )
     .await
     .unwrap();

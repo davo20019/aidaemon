@@ -687,17 +687,19 @@ async fn test_background_spawn_timeout_salvages_persisted_executor_outcome() {
     let spawn_tool =
         crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0)
             .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
-    let ack = crate::traits::Tool::call(
+    let ack = crate::testing::call_with_facts(
         &spawn_tool,
         &json!({
             "mission": "Run the ddev composer update",
             "task": "Run ddev composer update",
             "task_id": task.id,
             "background": true,
-            "_session_id": "delegation-bg-salvage",
-            "_goal_id": goal.id,
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            goal_id: Some(goal.id.clone()),
+            ..crate::testing::call_facts("delegation-bg-salvage")
+        },
     )
     .await
     .unwrap();

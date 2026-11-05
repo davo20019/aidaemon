@@ -544,6 +544,16 @@ impl crate::traits::Tool for OfferedSpawnAgent {
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         crate::traits::Tool::call_with_status_outcome(self.0.as_ref(), arguments, status_tx).await
     }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        crate::traits::Tool::call_with_execution_context(self.0.as_ref(), arguments, status_tx, facts)
+            .await
+    }
 }
 
 impl crate::traits::ToolSemantics for OfferedSpawnAgent {
@@ -1128,12 +1138,25 @@ impl crate::traits::Tool for SpawnRecorder {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .push(serde_json::from_str(arguments)?);
-        Ok("delegated".to_string())
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the dispatcher calls with a context")
+    }
+
+    /// Records the model's arguments plus, under `parent_authority_fact`,
+    /// the parent authority the dispatcher handed over in the call facts.
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let mut recorded: serde_json::Value = serde_json::from_str(arguments)?;
+        recorded["parent_authority_fact"] =
+            serde_json::to_value(crate::agent::authority::parent_authority(&facts))?;
+        self.0.lock().unwrap().push(recorded);
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "delegated".to_string(),
+        ))
     }
 }
 
@@ -1149,7 +1172,7 @@ impl crate::traits::ToolSemantics for SpawnRecorder {
 
 /// Runs one read-only owner turn that calls the recording `spawn_agent` with
 /// `arguments`, then lifts the mode; returns the agent and the
-/// `_parent_authority` the dispatcher injected.
+/// parent authority the dispatcher handed over in the call facts.
 async fn spawn_under_readonly(
     session: &str,
     request: &str,
@@ -1200,8 +1223,8 @@ async fn spawn_under_readonly(
     .unwrap();
     let args = recorded.lock().unwrap().clone();
     assert_eq!(args.len(), 1, "spawn_agent ran once: {args:?}");
-    let parent = serde_json::from_value(args[0]["_parent_authority"].clone())
-        .unwrap_or_else(|error| panic!("dispatcher-injected _parent_authority: {error}; {args:?}"));
+    let parent = serde_json::from_value(args[0]["parent_authority_fact"].clone())
+        .unwrap_or_else(|error| panic!("dispatcher parent authority: {error}; {args:?}"));
     (harness, parent)
 }
 
@@ -1316,7 +1339,7 @@ impl crate::traits::ToolSemantics for UntrustedPageProbe {
     }
 }
 
-/// The real path: the dispatcher's `_parent_authority` goes through
+/// The real path: the dispatcher's parent authority goes through
 /// `SpawnAgentTool` → `run_child` → `spawn_child_inner` → `create_child_agent`,
 /// so the child that is created carries the parent turn's taint and request.
 #[tokio::test]

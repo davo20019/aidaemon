@@ -161,8 +161,8 @@ pub(in crate::agent) struct ResolvedAuthority {
 /// What a spawned child inherits from the turn that spawned it: the turn's
 /// actual authority (not a re-resolution at spawn time), the chat whose
 /// `/readonly` narrows it, the turn's taint, and the root request egress is
-/// judged against. The dispatcher injects it into `spawn_agent` as
-/// `_parent_authority`; model-supplied underscore keys are stripped first.
+/// judged against. The dispatcher hands it to `spawn_agent` in the call
+/// context's extensions ([`parent_authority`]), never as an argument.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InheritedAuthority {
     pub authority: aidaemon_core::Authority,
