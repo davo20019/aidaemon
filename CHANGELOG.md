@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A request that fails on the provider is queued again.** Since every turn moved to the SDK kernel, a turn that failed on the model provider before any tool ran was no longer queued for an automatic re-run. It is again, for a person's own request (not goal runs, sub-agents or automated triggers). After a plan's usage limit, the re-run waits until just after the stated reset, as long as that is within 12 hours, and the reply says when.
+
 - **A rejected key moves on to the fallback providers.** Authentication failures used to end the call; other configured providers are now tried.
 
 - **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.

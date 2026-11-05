@@ -56,6 +56,8 @@ pub struct MockProvider {
     /// Errors returned, in order, by the next main-loop calls before any
     /// scripted response is used.
     leading_errors: Mutex<Vec<String>>,
+    /// Typed provider errors returned, in order, before `leading_errors`.
+    leading_provider_errors: Mutex<Vec<ProviderError>>,
     /// Calls asking for one of these JSON-schema names fail (after being
     /// logged), whatever the script holds.
     failing_response_schemas: Vec<String>,
@@ -79,6 +81,7 @@ impl MockProvider {
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
             failing_response_schemas: Vec::new(),
         }
@@ -96,6 +99,7 @@ impl MockProvider {
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
             failing_response_schemas: Vec::new(),
         }
@@ -116,6 +120,7 @@ impl MockProvider {
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
             leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
             failing_response_schemas: Vec::new(),
         }
@@ -128,6 +133,13 @@ impl MockProvider {
     pub fn with_leading_errors(self, errors: Vec<&str>) -> Self {
         *self.leading_errors.try_lock().expect("fresh mock") =
             errors.into_iter().map(str::to_string).collect();
+        self
+    }
+
+    /// Fail the next main-loop calls with these typed provider errors
+    /// before any `with_leading_errors` and scripted responses.
+    pub fn with_leading_provider_errors(self, errors: Vec<ProviderError>) -> Self {
+        *self.leading_provider_errors.try_lock().expect("fresh mock") = errors;
         self
     }
 
@@ -522,6 +534,11 @@ impl MockProvider {
         }
 
         {
+            let mut typed = self.leading_provider_errors.lock().await;
+            if !typed.is_empty() {
+                return Err(typed.remove(0).into());
+            }
+            drop(typed);
             let mut errors = self.leading_errors.lock().await;
             if !errors.is_empty() {
                 let error = errors.remove(0);

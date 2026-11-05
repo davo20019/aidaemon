@@ -21,6 +21,11 @@ pub(crate) const MAX_DEFERRED_ATTEMPTS: u16 = 4;
 const BASE_DELAY_SECS: i64 = 120;
 /// Never queue more than this many distinct requests; the oldest is dropped.
 const MAX_QUEUE: usize = 20;
+/// A used-up quota is waited out only when it resets within this long; a
+/// request re-run days later would answer a question nobody is waiting on.
+const MAX_QUOTA_WAIT: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+/// Run a quota-deferred request this long after the stated reset.
+const QUOTA_RESET_SLACK_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DeferredRequest {
@@ -30,6 +35,10 @@ pub(crate) struct DeferredRequest {
     pub failed_at: String,
     pub attempts: u16,
     pub failure_kind: String,
+    /// The earliest re-run, when the failure stated it (a quota's reset);
+    /// otherwise the growing delay applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
 }
 
 impl DeferredRequest {
@@ -46,6 +55,13 @@ impl DeferredRequest {
     }
 
     pub(crate) fn due(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if let Some(not_before) = self
+            .not_before
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        {
+            return now >= not_before.with_timezone(&chrono::Utc);
+        }
         chrono::DateTime::parse_from_rfc3339(&self.failed_at)
             .map(|failed_at| {
                 (now - failed_at.with_timezone(&chrono::Utc)).num_seconds() >= self.delay_secs()
@@ -63,22 +79,61 @@ fn role_label(role: UserRole) -> &'static str {
 }
 
 /// Whether an error is a provider infrastructure failure worth waiting out.
-/// Authentication and billing failures need the owner, not time.
+/// Authentication and billing failures need the owner, not time; a used-up
+/// quota is waited out when it resets soon enough (or does not say when).
 pub(crate) fn is_deferrable_provider_failure(error: &anyhow::Error) -> Option<&'static str> {
     let provider = error.downcast_ref::<crate::providers::ProviderError>()?;
     let kind = provider.kind;
-    let waitable = matches!(
-        kind,
+    let waitable = match kind {
         crate::providers::ProviderErrorKind::RateLimit
-            | crate::providers::ProviderErrorKind::Timeout
-            | crate::providers::ProviderErrorKind::Network
-            | crate::providers::ProviderErrorKind::ServerError
-    );
+        | crate::providers::ProviderErrorKind::Timeout
+        | crate::providers::ProviderErrorKind::Network
+        | crate::providers::ProviderErrorKind::ServerError => true,
+        crate::providers::ProviderErrorKind::QuotaExhausted => {
+            provider.resets_at.is_none_or(|at| {
+                at.duration_since(std::time::SystemTime::now())
+                    .map_or(true, |left| left <= MAX_QUOTA_WAIT)
+            })
+        }
+        _ => false,
+    };
     waitable.then(|| kind_label(kind))
+}
+
+/// When a deferred re-run may start, if the failure says: just after a
+/// used-up quota's reset.
+fn not_before(error: &anyhow::Error) -> Option<String> {
+    let provider = error.downcast_ref::<crate::providers::ProviderError>()?;
+    let reset = chrono::DateTime::<chrono::Utc>::from(provider.resets_at?);
+    Some((reset + chrono::Duration::seconds(QUOTA_RESET_SLACK_SECS)).to_rfc3339())
+}
+
+/// What the user is told when their request was queued (`attempt` 0) or
+/// re-queued after another failure.
+pub(crate) fn deferral_notice(attempt: u16, error: &anyhow::Error) -> String {
+    let quota = error
+        .downcast_ref::<crate::providers::ProviderError>()
+        .filter(|e| e.kind == crate::providers::ProviderErrorKind::QuotaExhausted);
+    if let Some(quota) = quota {
+        return match quota.resets_at {
+            Some(at) => format!(
+                "The model plan's usage limit has been reached; it resets {}. I saved this request and will run it automatically after the reset, then reply here.",
+                crate::providers::describe_reset(at, std::time::SystemTime::now())
+            ),
+            None => "The model plan's usage limit has been reached. I saved this request and will retry it automatically, then reply here.".to_string(),
+        };
+    }
+    match attempt {
+        0 => "The model provider is unavailable right now. I saved this request and will retry it automatically once the provider recovers, then reply here.".to_string(),
+        attempt => format!(
+            "The model provider is still unavailable (automatic retry {attempt} of {MAX_DEFERRED_ATTEMPTS}). I will keep retrying with a longer wait and reply here when it succeeds."
+        ),
+    }
 }
 
 fn kind_label(kind: crate::providers::ProviderErrorKind) -> &'static str {
     match kind {
+        crate::providers::ProviderErrorKind::QuotaExhausted => "quota_exhausted",
         crate::providers::ProviderErrorKind::RateLimit => "rate_limit",
         crate::providers::ProviderErrorKind::Timeout => "timeout",
         crate::providers::ProviderErrorKind::Network => "network",
@@ -137,6 +192,7 @@ impl crate::agent::Agent {
             failed_at: chrono::Utc::now().to_rfc3339(),
             attempts,
             failure_kind: failure_kind.to_string(),
+            not_before: not_before(error),
         });
         while requests.len() > MAX_QUEUE {
             requests.remove(0);
@@ -214,6 +270,34 @@ impl crate::agent::Agent {
 mod tests {
     use super::*;
 
+    fn quota(resets_in: Option<std::time::Duration>) -> anyhow::Error {
+        let mut error = crate::providers::ProviderError::from_status(429, "plan cap");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error.resets_at = resets_in.map(|left| std::time::SystemTime::now() + left);
+        anyhow::Error::new(error)
+    }
+
+    #[test]
+    fn a_quota_is_waited_out_only_when_it_resets_soon() {
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            is_deferrable_provider_failure(&quota(Some(2 * hour))),
+            Some("quota_exhausted")
+        );
+        assert_eq!(
+            is_deferrable_provider_failure(&quota(None)),
+            Some("quota_exhausted")
+        );
+        assert_eq!(
+            is_deferrable_provider_failure(&quota(Some(72 * hour))),
+            None
+        );
+        assert!(not_before(&quota(Some(hour))).is_some());
+        assert!(not_before(&quota(None)).is_none());
+        assert!(deferral_notice(0, &quota(Some(hour))).contains("after the reset"));
+        assert!(deferral_notice(0, &quota(None)).contains("usage limit"));
+    }
+
     #[test]
     fn deferred_delay_grows_geometrically_and_gates_due() {
         let base = chrono::Utc::now();
@@ -224,6 +308,7 @@ mod tests {
             failed_at: base.to_rfc3339(),
             attempts: 0,
             failure_kind: "server_error".to_string(),
+            not_before: None,
         };
         assert_eq!(request.delay_secs(), 120);
         assert!(!request.due(base + chrono::Duration::seconds(60)));

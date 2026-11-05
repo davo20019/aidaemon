@@ -373,6 +373,10 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// prefix, recorded on every model call's telemetry.
     pub(in crate::agent) projected_source_message_ids: Vec<String>,
     pub(in crate::agent) projected_source_turn_ids: Vec<String>,
+    /// A run that fails on the provider before any tool call is queued for
+    /// an automatic re-run (`deferred_retry`). False for a continuation of
+    /// another task, which that task's own recovery owns.
+    pub(in crate::agent) defer_on_provider_failure: bool,
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
@@ -641,6 +645,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// window (now recorded); the call is retried once compacted.
     context_overflowed: AtomicBool,
     context_overflow_retries: std::sync::atomic::AtomicU32,
+    /// The typed error of the latest model call that failed after recovery;
+    /// the kernel keeps only its text.
+    provider_failure: std::sync::Mutex<Option<crate::providers::ProviderError>>,
     /// `send_file` dedupe keys that already succeeded in this task.
     sent_files: std::sync::Mutex<HashSet<String>>,
     /// Nested project instructions discovered just in time.
@@ -830,6 +837,7 @@ impl Agent {
             authorized_scopes,
             projected_source_message_ids,
             projected_source_turn_ids,
+            defer_on_provider_failure,
         } = setup;
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
@@ -1221,6 +1229,7 @@ impl Agent {
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             context_overflowed: AtomicBool::new(false),
+            provider_failure: std::sync::Mutex::new(None),
             context_overflow_retries: std::sync::atomic::AtomicU32::new(0),
             task_tokens: AtomicU64::new(0),
             task_budget: AtomicU64::new(task_token_budget(
@@ -1353,10 +1362,36 @@ impl Agent {
                     .lock()
                     .map(|learning| learning.tool_calls.clone())
                     .unwrap_or_default();
-                let (reply, status, task_outcome) =
+                let (mut reply, status, task_outcome) =
                     scope
                         .verdict
                         .final_reply(&outcome, &tool_calls, channel_ctx.visibility);
+                // Nothing committed: the request is a pure re-runnable input.
+                // Queue it for an automatic re-run (after a used-up quota's
+                // reset) instead of making the user resend it; a re-run that
+                // fails the same way re-queues with attempts + 1.
+                let provider_failure = scope
+                    .provider_failure
+                    .lock()
+                    .ok()
+                    .and_then(|failure| failure.clone());
+                if let (sdk::RunStatus::ProviderFailed { .. }, Some(failure), true, 0, false) = (
+                    &outcome.status,
+                    provider_failure,
+                    defer_on_provider_failure,
+                    outcome.state.tool_calls,
+                    scope.background_handoff.load(Ordering::Relaxed),
+                ) {
+                    let failure = anyhow::Error::new(failure);
+                    if let Some(attempt) = self
+                        .defer_request_for_provider_recovery(
+                            session_id, user_text, user_role, &failure,
+                        )
+                        .await
+                    {
+                        reply = crate::agent::deferred_retry::deferral_notice(attempt, &failure);
+                    }
+                }
                 let run_failure = scope.verdict.run_failure();
                 if status == TaskStatus::Completed {
                     self.reconcile_checklist_projection(&emitter, session_id, &task_id)
