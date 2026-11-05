@@ -35,7 +35,7 @@ impl Default for Redactor {
 }
 
 /// The built-in secret shapes, as `(kind, pattern)`. [`Redactor`] hides
-/// them in tool output and [`crate::egress::EgressGuard`] refuses outbound
+/// them in tool output and [`crate::EgressGuard`] refuses outbound
 /// calls that carry them; both use this one list.
 pub fn secret_patterns() -> &'static [(&'static str, Regex)] {
     static PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();

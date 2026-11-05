@@ -1,7 +1,5 @@
 //! Outbound secret scan as a `before_tool` hook.
 
-use std::sync::OnceLock;
-
 use aidaemon_core::{EffectClass, Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
 use regex::Regex;
@@ -17,9 +15,10 @@ use crate::redact::{secret_patterns, MIN_LITERAL_LEN};
 /// for the built-in secret shapes ([`crate::secret_patterns`], the list
 /// [`crate::Redactor`] uses), for patterns added with
 /// [`EgressGuard::pattern`] and for literal values added with
-/// [`EgressGuard::secret`]. In a URL the authority's port is ignored (so
-/// `127.0.0.1:8765` is not read as data) while its host labels, path, query
-/// and fragment are scanned.
+/// [`EgressGuard::secret`], and so is every object key. Text is scanned as
+/// written: no built-in shape matches a host and port such as
+/// `127.0.0.1:8765`, and a URL's userinfo, host labels, path and query are
+/// all scanned.
 #[derive(Debug, Clone)]
 pub struct EgressGuard {
     patterns: Vec<(&'static str, Regex)>,
@@ -57,14 +56,13 @@ impl EgressGuard {
     }
 
     /// The kind of the first secret found in `text`, if any.
-    pub fn find(&self, text: &str) -> Option<&'static str> {
-        let text = strip_url_ports(text);
+    fn find(&self, text: &str) -> Option<&'static str> {
         if self.literals.iter().any(|l| text.contains(l.as_str())) {
             return Some("secret");
         }
         self.patterns
             .iter()
-            .find(|(_, re)| re.is_match(&text))
+            .find(|(_, re)| re.is_match(text))
             .map(|(kind, _)| *kind)
     }
 
@@ -81,23 +79,13 @@ impl EgressGuard {
         match value {
             Value::String(text) => self.find(text),
             Value::Array(items) => items.iter().find_map(|v| self.scan(v)),
-            Value::Object(map) => map.values().find_map(|v| self.scan(v)),
+            // Keys leave the machine too (JSON body keys, header names).
+            Value::Object(map) => map
+                .iter()
+                .find_map(|(k, v)| self.find(k).or_else(|| self.scan(v))),
             _ => None,
         }
     }
-}
-
-/// `text` with the port removed from every URL authority, so a port number
-/// is never mistaken for data. Userinfo and host stay in place.
-fn strip_url_ports(text: &str) -> std::borrow::Cow<'_, str> {
-    static AUTHORITY_PORT: OnceLock<Regex> = OnceLock::new();
-    let re = AUTHORITY_PORT.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b([a-z][a-z0-9+.\-]*://(?:[^/\s?#@]*@)?(?:\[[0-9a-f:.]*\]|[^/\s?#:@\[\]]+)):[0-9]+",
-        )
-        .expect("authority pattern compiles")
-    });
-    re.replace_all(text, "$1")
 }
 
 #[async_trait]
@@ -253,12 +241,13 @@ mod tests {
 
     #[tokio::test]
     async fn egress_guard_ignores_url_port() {
-        let guard = EgressGuard::new().pattern("pin", Regex::new(r"\b\d{4}\b").unwrap());
+        // No built-in shape matches a host and port, so a local URL passes.
+        let guard = EgressGuard::new();
         let annotated = info(true, CallEffects::unknown());
         for url in [
-            "http://127.0.0.1:8765/status",
-            "https://user@h.example.invalid:8765/status",
+            "http://127.0.0.1:8765/announce",
             "curl -s http://[::1]:8765/ && echo ok",
+            "https://h.example.invalid:8443/x?page=2",
         ] {
             assert_eq!(
                 judge(&guard, &annotated, json!({ "url": url })).await,
@@ -266,7 +255,34 @@ mod tests {
                 "{url}"
             );
         }
-        // The path, query and body are still scanned.
+    }
+
+    #[tokio::test]
+    async fn egress_guard_scans_raw_urls() {
+        let annotated = info(true, CallEffects::unknown());
+        // Passwords in the userinfo are scanned as written.
+        let guard = EgressGuard::new().secret("9fA3kLmn0pQ");
+        blocked(
+            &judge(
+                &guard,
+                &annotated,
+                json!({"url": "redis://default:9fA3kLmn0pQ@h.example.invalid/0"}),
+            )
+            .await,
+            "secret",
+        );
+        let guard = EgressGuard::new().secret("12345678");
+        blocked(
+            &judge(
+                &guard,
+                &annotated,
+                json!({"url": "https://alice:12345678@h.example.invalid/"}),
+            )
+            .await,
+            "secret",
+        );
+        // Custom patterns apply to the path and query.
+        let guard = EgressGuard::new().pattern("pin", Regex::new(r"\bpin=\d{4}\b").unwrap());
         blocked(
             &judge(
                 &guard,
@@ -276,22 +292,36 @@ mod tests {
             .await,
             "pin",
         );
-        blocked(
-            &judge(
-                &guard,
-                &annotated,
-                json!({"url": "http://127.0.0.1:8765/1234"}),
-            )
-            .await,
-            "pin",
-        );
         // Host labels are scanned.
-        let guard = EgressGuard::new();
         blocked(
             &judge(
-                &guard,
+                &EgressGuard::new(),
                 &annotated,
                 json!({"url": "https://AKIAABCDEFGHIJKLMNOP.example.invalid:8443/"}),
+            )
+            .await,
+            "aws_access_key",
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_guard_scans_object_keys() {
+        let guard = EgressGuard::new();
+        let annotated = info(true, CallEffects::unknown());
+        blocked(
+            &judge(
+                &guard,
+                &annotated,
+                json!({"json": {"AKIAABCDEFGHIJKLMNOP": true}}),
+            )
+            .await,
+            "aws_access_key",
+        );
+        blocked(
+            &judge(
+                &guard,
+                &annotated,
+                json!({"a": [{"b": {"AKIAABCDEFGHIJKLMNOP": 1}}]}),
             )
             .await,
             "aws_access_key",

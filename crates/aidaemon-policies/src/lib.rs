@@ -33,8 +33,8 @@
 mod approval;
 mod completion;
 mod context_window;
-pub mod egress;
-pub mod grants;
+mod egress;
+mod grants;
 mod instructions;
 mod memory;
 mod redact;
