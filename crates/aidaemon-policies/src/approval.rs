@@ -333,12 +333,25 @@ fn declined_subject(ctx: &HookContext<'_>, request: &OwnerApprovalRequest) -> Op
     })
 }
 
-/// After a decline in this run, an egress or destructive call whose effects
-/// are not fully declared might be the declined action by another route.
+/// After a decline in this run, a call whose effects are not fully declared
+/// might be the declined action by another route: an egress or destructive
+/// one after any decline, and any non-read-only one (an opaque script that
+/// may write or delete the same path) after a declined Delete, Write,
+/// Configuration or Call.
 fn needs_reask(ctx: &HookContext<'_>, info: &ToolInfo) -> bool {
+    let declined_local = ctx.declined.iter().any(|key| {
+        matches!(
+            key.class,
+            EffectClass::Delete
+                | EffectClass::Write
+                | EffectClass::Configuration
+                | EffectClass::Call
+        )
+    });
     !ctx.declined.is_empty()
         && !info.effects.complete
-        && (info.annotations.egress
+        && ((declined_local && !info.annotations.read_only)
+            || info.annotations.egress
             || info.annotations.destructive
             || info
                 .effects
@@ -755,6 +768,68 @@ mod rules_tests {
         assert_eq!(
             never
                 .before_tool(&hook_ctx(&declined), &post(), &local)
+                .await,
+            ToolDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_writer_after_path_decline_reasks() {
+        // A sandboxed script: a plain write, neither egress nor destructive,
+        // with effects it cannot fully tell.
+        let script = ToolCall::new("c2", "terminal", json!({"command": "sh cleanup.sh"}));
+        let opaque_write = ToolInfo {
+            annotations: ToolAnnotations::WRITE,
+            access: AccessManifest::default(),
+            effects: CallEffects::unknown(),
+        };
+        let allowed = ApprovalPolicy::new(ApprovalMode::Never)
+            .allow_tool("terminal")
+            .with_rules(Fixed::new(RuleDecision::Allow));
+        for class in [
+            EffectClass::Delete,
+            EffectClass::Write,
+            EffectClass::Configuration,
+        ] {
+            let declined = [EffectKey::path(class, "/home/synthetic/project/a").unwrap()];
+            owner_request(
+                &allowed
+                    .before_tool(&hook_ctx(&declined), &script, &opaque_write)
+                    .await,
+            );
+        }
+        let declined_call = [EffectKey::named(EffectClass::Call, "deploy the site")];
+        owner_request(
+            &allowed
+                .before_tool(&hook_ctx(&declined_call), &script, &opaque_write)
+                .await,
+        );
+
+        let declined = [EffectKey::path(EffectClass::Delete, "/home/synthetic/project/a").unwrap()];
+        // A read-only call is still not re-asked.
+        let read = ToolInfo {
+            annotations: ToolAnnotations::READ_ONLY,
+            access: AccessManifest::default(),
+            effects: CallEffects::unknown(),
+        };
+        assert_eq!(
+            allowed
+                .before_tool(&hook_ctx(&declined), &script, &read)
+                .await,
+            ToolDecision::Allow
+        );
+        // Complete effects are left to the kernel's decline check.
+        let known = ToolInfo {
+            effects: complete(vec![EffectKey::path(
+                EffectClass::Write,
+                "/home/synthetic/project/b",
+            )
+            .unwrap()]),
+            ..opaque_write.clone()
+        };
+        assert_eq!(
+            allowed
+                .before_tool(&hook_ctx(&declined), &script, &known)
                 .await,
             ToolDecision::Allow
         );

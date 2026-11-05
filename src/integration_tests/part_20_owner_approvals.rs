@@ -509,6 +509,7 @@ struct TerminalSetup {
     assessments: Option<(Vec<crate::traits::ProviderResponse>, std::time::Duration)>,
     assessment_timeout: Option<std::time::Duration>,
     mode: crate::types::PermissionMode,
+    confinement: crate::types::TerminalConfinement,
 }
 
 async fn terminal_harness(
@@ -535,7 +536,8 @@ async fn terminal_harness(
         setup.mode,
         pool.clone(),
     )
-    .await;
+    .await
+    .with_confinement(setup.confinement);
     if let Some(timeout) = setup.assessment_timeout {
         terminal = terminal.with_assessment_timeout(timeout);
     }
@@ -568,6 +570,7 @@ fn no_assessor(allowed: &[&str]) -> TerminalSetup {
         assessments: None,
         assessment_timeout: None,
         mode: crate::types::PermissionMode::Default,
+        confinement: crate::types::TerminalConfinement::Host,
     }
 }
 
@@ -714,6 +717,7 @@ async fn terminal_semantic_timeout_fails_closed_to_card() {
             assessments: Some((vec![assessment], std::time::Duration::from_secs(5))),
             assessment_timeout: Some(std::time::Duration::from_millis(100)),
             mode: crate::types::PermissionMode::Default,
+            confinement: crate::types::TerminalConfinement::Host,
         },
     )
     .await;
@@ -911,6 +915,57 @@ async fn declined_terminal_call_reasks_undeterminable_retry() {
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(!results[1].contains("synthetic-opaque-ran"), "{results:?}");
     assert!(root.join("a").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same under Sandbox confinement, where an opaque script is neither
+/// egress nor destructive: after a declined delete, an allowlisted script
+/// that could do the same delete is asked about, not run.
+#[tokio::test]
+async fn declined_delete_reasks_sandboxed_opaque_script() {
+    let root = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::write(root.join("a").join("sentinel.txt"), "synthetic").unwrap();
+    std::fs::write(
+        root.join("cleanup.sh"),
+        format!(
+            "rm -rf {}\necho synthetic-cleanup-ran\n",
+            root.join("a").display()
+        ),
+    )
+    .unwrap();
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run(&format!("rm -rf {}", root.join("a").display())),
+            terminal_run(&format!("sh {}", root.join("cleanup.sh").display())),
+            MockProvider::text_response("The owner declined both."),
+        ],
+        vec![
+            Some(crate::types::ApprovalResponse::Deny),
+            Some(crate::types::ApprovalResponse::Deny),
+        ],
+        TerminalSetup {
+            confinement: crate::types::TerminalConfinement::Sandbox,
+            ..no_assessor(&["sh"])
+        },
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(
+        approver.card_count(),
+        2,
+        "the sandboxed script is asked about"
+    );
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(!results[1].contains("synthetic-cleanup-ran"), "{results:?}");
+    assert!(
+        root.join("a").join("sentinel.txt").exists(),
+        "nothing was deleted"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
