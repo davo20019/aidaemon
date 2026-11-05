@@ -466,3 +466,283 @@ async fn catastrophic_terminal_command_is_denied_by_the_kernel() {
     assert!(results[0].contains("--no-preserve-root"), "{results:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --------------------------------------------------------------------------
+// The terminal's approval ladder as the daemon's kernel rules
+// --------------------------------------------------------------------------
+
+fn terminal_run(command: &str) -> crate::traits::ProviderResponse {
+    curl_call(command)
+}
+
+/// A real terminal with `allowed` command prefixes and, when `assessments`
+/// is given, a semantic assessor answering with them after `delay` (and
+/// failing closed after `assessment_timeout`). The terminal's own broker
+/// is closed: a card the tool tried to send itself would fail at once, and
+/// only cards on the agent's (kernel) broker reach the scripted owner.
+struct TerminalSetup {
+    allowed: Vec<String>,
+    assessments: Option<(Vec<crate::traits::ProviderResponse>, std::time::Duration)>,
+    assessment_timeout: Option<std::time::Duration>,
+}
+
+async fn terminal_harness(
+    script: Vec<crate::traits::ProviderResponse>,
+    answers: Vec<Option<crate::types::ApprovalResponse>>,
+    setup: TerminalSetup,
+) -> (
+    crate::testing::TestHarness,
+    crate::testing::ScriptedApprover,
+    sqlx::SqlitePool,
+) {
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    std::mem::forget(pool_file);
+    let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
+    drop(tool_rx);
+    let mut terminal = crate::tools::TerminalTool::new(
+        setup.allowed,
+        crate::tools::ApprovalBroker::new(tool_tx),
+        5,
+        4000,
+        crate::types::PermissionMode::Default,
+        pool.clone(),
+    )
+    .await;
+    if let Some(timeout) = setup.assessment_timeout {
+        terminal = terminal.with_assessment_timeout(timeout);
+    }
+    if let Some((responses, delay)) = setup.assessments {
+        let delays = vec![delay; responses.len()];
+        let assessor = Arc::new(MockProvider::with_delayed_responses(responses, delays));
+        terminal.set_command_risk_runtime(crate::llm_runtime::SharedLlmRuntime::new(
+            assessor,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "mock-semantic-risk".to_string(),
+        ));
+    }
+    let terminal: Arc<dyn crate::traits::Tool> = Arc::new(terminal);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        vec![terminal],
+        None,
+    )
+    .await
+    .unwrap();
+    let (broker, approver) = crate::testing::ScriptedApprover::start(answers);
+    harness.agent.owner_approvals().set_broker(broker);
+    (harness, approver, pool)
+}
+
+fn no_assessor(allowed: &[&str]) -> TerminalSetup {
+    TerminalSetup {
+        allowed: allowed.iter().map(|p| p.to_string()).collect(),
+        assessments: None,
+        assessment_timeout: None,
+    }
+}
+
+#[tokio::test]
+async fn terminal_unknown_command_interrupts_for_owner() {
+    let command = "printf synthetic-unknown-ok";
+    let (harness, approver, _pool) = terminal_harness(
+        vec![terminal_run(command), MockProvider::text_response("Done.")],
+        vec![Some(crate::types::ApprovalResponse::AllowOnce)],
+        no_assessor(&[]),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "the kernel asks the owner once");
+    let card = approver.cards.lock().unwrap()[0].clone();
+    assert_eq!(card.command, command);
+    assert_eq!(card.session_id, APPROVALS_SESSION);
+    // No semantic assessor is configured: the ladder fails closed, Critical.
+    assert_eq!(
+        card.risk_level,
+        crate::tools::command_risk::RiskLevel::Critical
+    );
+    assert!(
+        card.warnings.iter().any(|w| w.contains("not configured")),
+        "{card:?}"
+    );
+    assert!(
+        card.warnings.iter().any(|w| w.starts_with("Execution target:")),
+        "{card:?}"
+    );
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("synthetic-unknown-ok"), "{results:?}");
+    assert_eq!(
+        conditions(&approval_conditions(&harness).await),
+        ["owner_approval_requested", "owner_approval_granted"]
+    );
+}
+
+#[tokio::test]
+async fn terminal_allowlisted_command_runs_without_card() {
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run("echo synthetic-allowed-ok"),
+            MockProvider::text_response("Done."),
+        ],
+        vec![],
+        no_assessor(&["echo"]),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("synthetic-allowed-ok"), "{results:?}");
+    assert!(approval_conditions(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn terminal_allow_always_persists_prefix() {
+    let (harness, approver, pool) = terminal_harness(
+        vec![
+            terminal_run("printf synthetic-first"),
+            terminal_run("printf synthetic-second"),
+            MockProvider::text_response("Done."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::AllowAlways)],
+        no_assessor(&[]),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "the persisted prefix covers the retry");
+    let results = tool_results(&harness).await;
+    assert!(results[1].contains("synthetic-second"), "{results:?}");
+    let persisted: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM terminal_backend_allowed_prefixes")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted, ["printf"]);
+}
+
+#[tokio::test]
+async fn declined_terminal_delete_blocks_find_delete_same_path() {
+    let root = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    let target = root.join("a");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("sentinel.txt"), "synthetic").unwrap();
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run(&format!("rm -rf {}", target.display())),
+            terminal_run(&format!("find {} -delete", target.display())),
+            MockProvider::text_response("The owner declined; nothing was deleted."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        no_assessor(&[]),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "the find retry gets no card");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(target.join("sentinel.txt").exists(), "nothing was deleted");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn trusted_session_terminal_no_card() {
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run("printf synthetic-trusted-ok"),
+            MockProvider::text_response("Done."),
+        ],
+        vec![],
+        no_assessor(&[]),
+    )
+    .await;
+    let mut channel_ctx = ChannelContext::private("telegram");
+    channel_ctx.trusted = true;
+    run_owner_turn(&harness, channel_ctx).await;
+
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("synthetic-trusted-ok"), "{results:?}");
+}
+
+#[tokio::test]
+async fn terminal_semantic_timeout_fails_closed_to_card() {
+    let assessment = MockProvider::text_response(
+        r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Prints a literal"]}"#,
+    );
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run("printf synthetic-slow"),
+            MockProvider::text_response("The owner declined."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        TerminalSetup {
+            allowed: Vec::new(),
+            assessments: Some((vec![assessment], std::time::Duration::from_secs(5))),
+            assessment_timeout: Some(std::time::Duration::from_millis(100)),
+        },
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "a slow assessor fails closed to a card");
+    let card = approver.cards.lock().unwrap()[0].clone();
+    assert_eq!(
+        card.risk_level,
+        crate::tools::command_risk::RiskLevel::Critical
+    );
+    assert!(
+        card.warnings
+            .iter()
+            .any(|w| w.contains("failed closed") && w.contains("timed out")),
+        "{card:?}"
+    );
+    let results = tool_results(&harness).await;
+    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+}
+
+#[tokio::test]
+async fn terminal_outside_kernel_requires_kernel_approval() {
+    use crate::traits::Tool as _;
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
+    drop(tool_rx);
+    let terminal = crate::tools::TerminalTool::new(
+        Vec::new(),
+        crate::tools::ApprovalBroker::new(tool_tx),
+        5,
+        4000,
+        crate::types::PermissionMode::Default,
+        pool,
+    )
+    .await;
+    // Trust markers in the arguments stand in for nothing.
+    let error = terminal
+        .call(
+            &json!({
+                "action": "run",
+                "command": "printf synthetic-outside",
+                "_trusted_session": true,
+                "_user_role": "Owner",
+            })
+            .to_string(),
+        )
+        .await
+        .expect_err("a command the ladder asks about is refused outside the kernel");
+    assert!(
+        error
+            .to_string()
+            .contains("requires approval through the agent kernel"),
+        "{error}"
+    );
+}

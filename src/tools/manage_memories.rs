@@ -357,8 +357,6 @@ struct ManageArgs {
     _channel_visibility: Option<String>,
     #[serde(default)]
     _channel_id: Option<String>,
-    #[serde(default)]
-    _trusted_session: bool,
 }
 
 fn manage_memories_schema() -> Value {
@@ -490,6 +488,41 @@ impl Tool for ManageMemoriesTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, false).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, false).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        exec_ctx: crate::traits::ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, exec_ctx.trusted_session).await
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+}
+
+impl ManageMemoriesTool {
+    /// Run one call; `trusted_session` comes from the dispatcher's typed
+    /// context only, never from the arguments.
+    async fn run(&self, arguments: &str, trusted_session: bool) -> anyhow::Result<String> {
         let args: ManageArgs = serde_json::from_str(arguments)?;
 
         match args.action.as_str() {
@@ -911,7 +944,7 @@ impl Tool for ManageMemoriesTool {
                                 .to_string(),
                         );
                     }
-                    ChannelVisibility::Internal if args._trusted_session => {
+                    ChannelVisibility::Internal if trusted_session => {
                         self.state.get_relevant_episodes(query, limit).await?
                     }
                     ChannelVisibility::Internal => {
@@ -2337,12 +2370,14 @@ impl Tool for ManageMemoriesTool {
         }
     }
 
-    async fn call_with_status_outcome(
+    /// A call's typed outcome; `trusted_session` comes from the
+    /// dispatcher's typed context only, never from the arguments.
+    async fn outcome(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        trusted_session: bool,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call(arguments).await?;
+        let output = self.run(arguments, trusted_session).await?;
         let trimmed = output.trim_start();
         let outcome_status = if trimmed.starts_with("Internal error:")
             || trimmed.starts_with("Invalid priority")
@@ -2362,16 +2397,6 @@ impl Tool for ManageMemoriesTool {
                 ..ToolCallMetadata::default()
             },
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
     }
 }
 
@@ -2900,6 +2925,76 @@ mod tests {
             result.contains("just now") || result.contains("ago"),
             "should include a recency label; got:\n{result}"
         );
+    }
+
+    /// Trust comes only from the dispatcher's typed context: a
+    /// `_trusted_session` argument does not widen internal recall to every
+    /// session's episodes.
+    #[tokio::test]
+    async fn trusted_session_argument_bypasses_nothing() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let concrete = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        std::mem::forget(db_file);
+        let tool = ManageMemoriesTool::new(concrete.clone() as Arc<dyn StateStore>);
+        let now = chrono::Utc::now();
+        for (session, summary) in [
+            (
+                "session-alice",
+                "Planned the Acme Corp offsite with Alice Rivera",
+            ),
+            (
+                "session-jordan",
+                "Reviewed the synthetic budget with Jordan Lee",
+            ),
+        ] {
+            let ep = crate::traits::Episode {
+                id: 0,
+                session_id: session.to_string(),
+                summary: summary.to_string(),
+                topics: None,
+                emotional_tone: None,
+                outcome: None,
+                importance: 0.7,
+                recall_count: 0,
+                last_recalled_at: None,
+                message_count: 4,
+                start_time: now,
+                end_time: now,
+                created_at: now,
+                channel_id: None,
+            };
+            concrete.insert_episode(&ep).await.unwrap();
+        }
+        let args = json!({
+            "action": "search_episodes",
+            "_session_id": "session-alice",
+            "_channel_visibility": "internal",
+            "_trusted_session": true
+        })
+        .to_string();
+        let result = tool.call(&args).await.unwrap();
+        assert!(result.contains("Acme Corp offsite"), "{result}");
+        assert!(
+            !result.contains("Jordan Lee"),
+            "an argument does not widen recall to other sessions: {result}"
+        );
+        // The dispatcher's typed trust does.
+        let ctx = crate::traits::ToolExecutionContext {
+            trusted_session: true,
+            ..Default::default()
+        };
+        let trusted = tool
+            .call_with_execution_context(&args, None, ctx)
+            .await
+            .unwrap()
+            .output;
+        assert!(trusted.contains("Jordan Lee"), "{trusted}");
     }
 
     async fn setup_state() -> Arc<dyn StateStore> {

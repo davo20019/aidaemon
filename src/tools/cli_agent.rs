@@ -3739,9 +3739,6 @@ struct CliAgentArgs {
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
-    /// Injected by the runtime for owner-authorized scheduled automation.
-    #[serde(default)]
-    _trusted_session: bool,
 }
 
 fn non_empty_prompt_field(value: Option<&str>) -> Option<String> {
@@ -4430,7 +4427,7 @@ impl Tool for CliAgentTool {
                 .as_ref()
                 .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, false)
+            .call_with_status_under_contract(arguments, status_tx, read_only_run, false, false)
             .await?;
         Ok(cli_agent_outcome(&action, output, read_only_run))
     }
@@ -4452,7 +4449,13 @@ impl Tool for CliAgentTool {
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
         let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, true)
+            .call_with_status_under_contract(
+                arguments,
+                status_tx,
+                read_only_run,
+                true,
+                exec_ctx.trusted_session,
+            )
             .await?;
         Ok(cli_agent_outcome(&action, output, read_only_run))
     }
@@ -4462,7 +4465,7 @@ impl Tool for CliAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        self.call_with_status_under_contract(arguments, status_tx, false, false)
+        self.call_with_status_under_contract(arguments, status_tx, false, false, false)
             .await
     }
 }
@@ -4525,6 +4528,8 @@ impl CliAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         read_only_run: bool,
         enforce_native_access: bool,
+        // From the dispatcher's typed context only, never the arguments.
+        trusted_session: bool,
     ) -> anyhow::Result<String> {
         let args: CliAgentArgs = serde_json::from_str(arguments)?;
 
@@ -4602,7 +4607,7 @@ impl CliAgentTool {
                 // prompt wording cannot narrow its effects. Require a concrete
                 // clean repository for every unattended run rather than trying
                 // to recognize deployment verbs or negations in prose.
-                if args._trusted_session {
+                if trusted_session {
                     let Some(working_dir) = args.working_dir.as_deref() else {
                         return Ok(
                             "Blocked: unattended CLI delegation requires an explicit working_dir so repository cleanliness can be verified."
@@ -6999,14 +7004,37 @@ mod tests {
                 "action": "run",
                 "tool": "echo",
                 "prompt": prompt,
-                "_trusted_session": true
             });
-            let result = tool.call(&args.to_string()).await.unwrap();
+            // A trusted session, as the dispatcher's typed context says
+            // (`ToolExecutionContext::trusted_session`).
+            let result = tool
+                .call_with_status_under_contract(&args.to_string(), None, false, false, true)
+                .await
+                .unwrap();
             assert!(
                 result.contains("requires an explicit working_dir"),
                 "prompt wording must not narrow an opaque unattended delegation: {result}"
             );
         }
+    }
+
+    /// Trust comes only from the dispatcher's typed context: a
+    /// `_trusted_session` argument makes the run neither trusted nor
+    /// unattended.
+    #[tokio::test]
+    async fn trusted_session_argument_bypasses_nothing() {
+        let (tool, _db) = setup_echo_tool().await;
+        let args = serde_json::json!({
+            "action": "run",
+            "tool": "echo",
+            "prompt": "Inspect the code and return a report",
+            "_trusted_session": true
+        });
+        let result = tool.call(&args.to_string()).await.unwrap();
+        assert!(
+            !result.contains("unattended CLI delegation"),
+            "an argument is not the dispatcher's trust: {result}"
+        );
     }
 
     #[tokio::test]

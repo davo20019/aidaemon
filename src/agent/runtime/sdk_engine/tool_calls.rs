@@ -9,6 +9,41 @@ use super::*;
 /// to read it there; a task scope (a goal's bound workspace) would otherwise
 /// refuse the daemon's own output. The grant is read-only and covers this
 /// session's directory alone, never another session's or the spill root.
+/// What the controller's filesystem scope check reads besides the call.
+pub(super) struct CallScopeFacts<'a> {
+    pub session_id: &'a str,
+    pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
+    pub authorized_scopes: &'a [String],
+    pub known_project_dir: Option<&'a str>,
+}
+
+/// The controller-side filesystem check of one call: protected host data
+/// and undeclared writes outside the task boundary are refused; an exact
+/// out-of-scope target a user may authorize is escalatable. Shared by the
+/// dispatcher and the kernel's terminal approval rules, so the owner is
+/// asked about exactly the escalation the dispatcher then grants.
+pub(super) fn call_scope_check(
+    tool: &dyn crate::traits::Tool,
+    arguments: &str,
+    facts: &CallScopeFacts<'_>,
+) -> Option<crate::agent::tool_execution::ScopeCheck> {
+    let mut manifest = tool
+        .prepare_invocation(arguments)
+        .map(|prepared| prepared.access_manifest)
+        .unwrap_or_else(|_| tool.call_access_manifest(arguments));
+    manifest.adapter_read_targets = tool
+        .adapter_owned_access_manifest(arguments)
+        .adapter_read_targets;
+    grant_own_spill_reads(&mut manifest, facts.session_id);
+    crate::agent::tool_execution::access_manifest_scope_check(
+        tool.name(),
+        &manifest,
+        facts.task_access,
+        facts.authorized_scopes,
+        facts.known_project_dir,
+    )
+}
+
 pub(super) fn grant_own_spill_reads(
     manifest: &mut crate::traits::ToolCallAccessManifest,
     session_id: &str,
@@ -233,25 +268,20 @@ impl Agent {
         arguments: &str,
     ) -> Option<crate::agent::tool_execution::ScopeCheck> {
         let tool = self.tools.iter().find(|tool| tool.name() == tool_name)?;
-        let mut manifest = tool
-            .prepare_invocation(arguments)
-            .map(|prepared| prepared.access_manifest)
-            .unwrap_or_else(|_| tool.call_access_manifest(arguments));
-        manifest.adapter_read_targets = tool
-            .adapter_owned_access_manifest(arguments)
-            .adapter_read_targets;
-        grant_own_spill_reads(&mut manifest, scope.session_id);
         let known = scope
             .known_project_dir
             .lock()
             .ok()
             .and_then(|known| known.clone());
-        crate::agent::tool_execution::access_manifest_scope_check(
-            tool_name,
-            &manifest,
-            scope.authority.task_access.as_ref(),
-            &scope.authorized_scopes,
-            known.as_deref(),
+        call_scope_check(
+            tool.as_ref(),
+            arguments,
+            &CallScopeFacts {
+                session_id: scope.session_id,
+                task_access: scope.authority.task_access.as_ref(),
+                authorized_scopes: &scope.authorized_scopes,
+                known_project_dir: known.as_deref(),
+            },
         )
     }
 

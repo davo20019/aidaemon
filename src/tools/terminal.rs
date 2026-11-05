@@ -898,11 +898,8 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
-    /// Permission persistence mode
-    permission_mode: PermissionMode,
     /// Host vs sandbox execution.
     confinement: crate::types::TerminalConfinement,
-    approval_tx: super::ApprovalBroker,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
     task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
@@ -942,6 +939,8 @@ pub struct TerminalTool {
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
     command_risk_runtime: OnceLock<SharedLlmRuntime>,
+    /// How long the semantic assessment may take before it fails closed.
+    assessment_timeout: Duration,
 }
 
 /// Check if a command string contains shell operators.
@@ -3397,9 +3396,11 @@ fn build_background_reengagement_followup(command_summary: &str, output: &str) -
 }
 
 impl TerminalTool {
+    /// `_approval_tx` is unused: the owner's approval cards come from the
+    /// agent kernel (`AppApprovalRules`), never from the tool.
     pub async fn new(
         allowed_prefixes: Vec<String>,
-        approval_tx: super::ApprovalBroker,
+        _approval_tx: super::ApprovalBroker,
         initial_timeout_secs: u64,
         max_output_chars: usize,
         permission_mode: PermissionMode,
@@ -3509,9 +3510,7 @@ impl TerminalTool {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
-            permission_mode,
             confinement: crate::types::TerminalConfinement::default(),
-            approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
             task_processes: Arc::new(Mutex::new(HashMap::new())),
@@ -3531,6 +3530,7 @@ impl TerminalTool {
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
             command_risk_runtime: OnceLock::new(),
+            assessment_timeout: super::semantic_command_risk::ASSESSMENT_TIMEOUT,
         }
     }
 
@@ -3576,6 +3576,14 @@ impl TerminalTool {
             self.command_risk_runtime.set(runtime).is_ok(),
             "TerminalTool::set_command_risk_runtime called more than once"
         );
+    }
+
+    /// Semantic assessments that fail closed after `timeout` instead of
+    /// fifteen seconds.
+    #[cfg(test)]
+    pub(crate) fn with_assessment_timeout(mut self, timeout: Duration) -> Self {
+        self.assessment_timeout = timeout;
+        self
     }
 
     /// Set channel hub reference for immediate background progress/completion delivery.
@@ -3711,14 +3719,314 @@ impl TerminalTool {
         }
     }
 
-    async fn request_approval(
+    /// The hard blocks a `run` meets before any approval (T2–T7, in order):
+    /// unscoped recursive grep and unbounded disk scans, large unquoted
+    /// heredocs, AppleScript UI scripting, daemonization by a non-owner or
+    /// without `detach=true`, irreversible broad deletes, and detached runs
+    /// in trusted scheduled sessions. The tool refuses these whatever the
+    /// owner said, so the kernel's rules never ask about them.
+    fn pre_approval_block(
         &self,
-        session_id: &str,
+        args: &TerminalArgs,
         command: &str,
-        risk_level: RiskLevel,
-        mut warnings: Vec<String>,
-        task_id: Option<&str>,
-    ) -> anyhow::Result<ApprovalResponse> {
+        trust: &TerminalTrust,
+    ) -> Option<String> {
+        if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
+            return Some(recursive_grep_block_message(&pattern, &path));
+        }
+        if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
+            return Some(unbounded_scan_block_message(&tool_name, &root));
+        }
+        // Soft-block large heredoc file creation: redirects to write_file
+        // which writes atomically without shell quoting issues. Allow quoted
+        // heredoc delimiters (<<'EOF' or << 'EOF') since they avoid shell
+        // expansion issues and serve as a fallback when write_file fails
+        // with JSON escaping errors on complex content.
+        if command.contains("<<") && command.len() > 500 {
+            let uses_quoted_heredoc = command.contains("<<'")
+                || command.contains("<< '")
+                || command.contains("<<\"")
+                || command.contains("<< \"");
+            if !uses_quoted_heredoc {
+                return Some(
+                    "Large heredoc file creation is unreliable through the terminal. \
+                     Use the `write_file` tool instead — it writes files atomically \
+                     and avoids shell quoting issues. If write_file fails with JSON \
+                     encoding errors, use a quoted heredoc: cat > file << 'EOF'"
+                        .to_string(),
+                );
+            }
+        }
+        // Hard-redirect AppleScript GUI automation to computer_use: the
+        // terminal path has none of its safety layer (approvals, blocked
+        // apps, action confirmation, lock detection) and System Events input
+        // fails against a locked screen exactly like synthetic input.
+        if is_system_events_ui_scripting(command) {
+            return Some(
+                "Blocked: AppleScript System Events UI scripting (click/keystroke) \
+                 through the terminal bypasses the computer_use safety layer and \
+                 cannot deliver input when the screen is locked.\n\n\
+                 Use the `computer_use` tool for GUI automation — it is \
+                 approval-gated, lock-aware, and works from screenshots and the \
+                 accessibility tree. If computer_use is unavailable or blocked \
+                 (e.g. the screen is locked), stop and tell the user what you \
+                 need instead of scripting around it."
+                    .to_string(),
+            );
+        }
+        let daemon_hits = detect_daemonization_primitives(command);
+        if !daemon_hits.is_empty() {
+            if !trust.owner {
+                return Some(format!(
+                    "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
+                    daemon_hits.join(", ")
+                ));
+            }
+            if !args.detach {
+                return Some(format!(
+                    "Blocked: daemonization primitives detected ({}). \
+                     Set `detach=true` explicitly for intentional long-lived background execution.",
+                    daemon_hits.join(", ")
+                ));
+            }
+        }
+        // Deterministic hard block for irreversible broad-path deletes.
+        if let Some(reason) = hard_block_reason(command, self.backend.workspace_root().as_str()) {
+            warn!(
+                session_id = %trust.session_id,
+                command = %command,
+                reason = %reason,
+                "Blocked dangerous irreversible command"
+            );
+            return Some(format!(
+                "{} Use scoped, non-destructive commands instead.",
+                reason
+            ));
+        }
+        if args.detach && trust.trusted_session {
+            // Intentional: trusted scheduled sessions are auto-approved, so
+            // disallow detached long-lived processes in that mode.
+            return Some(
+                "Blocked: detach=true is not allowed for trusted scheduled sessions.".to_string(),
+            );
+        }
+        None
+    }
+
+    /// The owner-approval ladder for a `run` past the hard blocks: what the
+    /// owner must approve, or `None` when it runs without asking.
+    ///
+    /// Order (load-bearing; do not reorder):
+    ///   1. capability escalation  → new authority always asks
+    ///   2. daemonization          → the owner's Critical daemonization card
+    ///   3. untrusted trigger      → external triggers always ask
+    ///   4. detach && !allowed     → novel detached commands ask
+    ///   5. trusted session        → scheduled tasks run without asking
+    ///   6. explicit allow         → a prior owner grant (session or persisted)
+    ///   7. approval floor         → protected credential path, never downgraded
+    ///   8. semantic assessment    → ask only for dangerous effects; a failure
+    ///      or a timeout fails closed to Critical
+    ///   9. no assessor configured → Critical
+    async fn approval_ladder(
+        &self,
+        args: &TerminalArgs,
+        command: &str,
+        trust: &TerminalTrust,
+    ) -> Option<LadderAsk> {
+        let daemon_hits = detect_daemonization_primitives(command);
+        let daemonization = !daemon_hits.is_empty();
+        let deterministic_approval_floor = approval_floor_reason(command);
+        let mut approval_risk = RiskLevel::High;
+        let mut approval_warnings = Vec::new();
+        if args.detach && !daemonization {
+            approval_warnings.push(
+                "Detached execution requested (process may outlive task boundaries).".to_string(),
+            );
+        }
+        // `is_allowed` checks both permanent AND session-approved prefixes.
+        let is_allowed = self.is_allowed(command).await;
+        let requested_capabilities =
+            Self::requested_capabilities(run_is_confined(self.confinement), args, trust);
+        let capability_escalation_pending = !requested_capabilities.is_empty()
+            && !trust.trusted_session
+            && !self
+                .capabilities_granted(command, &requested_capabilities)
+                .await;
+        let needs_approval = if capability_escalation_pending {
+            // Elevated capability is new authority; no command-prefix grant
+            // or dispatcher preapproval stands in for the user seeing exactly
+            // what is being requested.
+            approval_warnings.push(format!(
+                "Requests elevated capabilities beyond the task scope: {}",
+                Self::describe_capabilities(&requested_capabilities)
+            ));
+            info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
+            true
+        } else if daemonization {
+            false
+        } else if trust.untrusted_source {
+            // External triggers always need approval regardless of mode
+            approval_warnings
+                .push("Command originated from an untrusted external trigger.".to_string());
+            info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
+            true
+        } else if args.detach && !is_allowed {
+            // Allowlisted commands (permanent or session approvals) may run
+            // detached without asking again; only novel detached commands do.
+            info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
+            true
+        } else if trust.trusted_session {
+            info!(command = %command, session = %trust.session_id, "Auto-approved: trusted scheduled task");
+            false
+        } else if is_allowed {
+            info!(command = %command, "Auto-approved: explicit command grant");
+            false
+        } else if let Some(reason) = deterministic_approval_floor {
+            approval_warnings.push(reason);
+            true
+        } else if let Some(runtime) = self.command_risk_runtime.get() {
+            match assess_command(
+                runtime,
+                command,
+                &self.backend,
+                &trust.session_id,
+                self.state.as_ref(),
+                self.event_store.clone(),
+                self.assessment_timeout,
+            )
+            .await
+            {
+                Ok(semantic) => {
+                    approval_risk = semantic.risk_level;
+                    approval_warnings = semantic.warnings;
+                    if semantic.requires_approval {
+                        info!(command = %command, risk = %approval_risk, "Semantic command assessment requires owner approval");
+                        true
+                    } else {
+                        info!(command = %command, risk = %approval_risk, "Auto-approved by semantic command assessment");
+                        false
+                    }
+                }
+                Err(error) => {
+                    warn!(command = %command, %error, "Semantic command assessment failed; requesting approval");
+                    approval_risk = RiskLevel::Critical;
+                    approval_warnings.push(format!(
+                        "Semantic safety assessment unavailable; failed closed: {}",
+                        error
+                    ));
+                    true
+                }
+            }
+        } else {
+            approval_risk = RiskLevel::Critical;
+            approval_warnings
+                .push("Semantic safety assessment is not configured; failed closed.".to_string());
+            true
+        };
+
+        if daemonization {
+            // The owner's daemonization card (Critical); a capability
+            // escalation of the same run is asked on the same card.
+            let mut warnings = vec![
+                format!(
+                    "Daemonization primitives detected: {}",
+                    daemon_hits.join(", ")
+                ),
+                "Detached/background processes may survive cancellation and continue running."
+                    .to_string(),
+                "Approve only if this is intentional and necessary.".to_string(),
+            ];
+            if capability_escalation_pending {
+                warnings.extend(approval_warnings);
+            }
+            return Some(LadderAsk {
+                risk: RiskLevel::Critical,
+                warnings,
+            });
+        }
+        if !needs_approval {
+            return None;
+        }
+        // Approval history is useful context for the owner, but it never
+        // changes the decision or lowers risk.
+        if let Some(ref pool) = self.pool {
+            if let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
+                approval_warnings.push(format!(
+                    "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
+                    pattern.pattern,
+                    similarity * 100.0,
+                    pattern.approval_count,
+                    pattern.denial_count,
+                    pattern.confidence() * 100.0,
+                    pattern.is_trusted(),
+                ));
+            }
+        }
+        Some(LadderAsk {
+            risk: approval_risk,
+            warnings: approval_warnings,
+        })
+    }
+
+    /// The command a `run` call executes, if it is one.
+    fn run_command(args: &TerminalArgs) -> Option<&str> {
+        if !matches!(
+            TerminalAction::parse(&args.action),
+            TerminalAction::Run | TerminalAction::Unrecognized
+        ) {
+            return None;
+        }
+        let command = args
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let script = args
+            .script
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (command, script) {
+            (Some(command), None) => Some(command),
+            (None, Some(script)) => Some(script),
+            _ => None,
+        }
+    }
+
+    /// The owner approval a terminal call needs, for the daemon's kernel
+    /// approval rules: the T8 ladder for `run` (after the hard blocks, which
+    /// the tool refuses on its own), the trust-all card, or `None`. The
+    /// subject is the full command line, which the terminal's grants match.
+    pub(crate) async fn owner_approval_request(
+        &self,
+        arguments: &Value,
+        trust: &TerminalTrust,
+    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
+        let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
+        let (subject, ask) = match TerminalAction::parse(&args.action) {
+            TerminalAction::TrustAll => {
+                if self.allowed_prefixes.read().await.iter().any(|p| p == "*") {
+                    return None;
+                }
+                (
+                    Self::TRUST_ALL_SUBJECT.to_string(),
+                    LadderAsk {
+                        risk: RiskLevel::Critical,
+                        warnings: Self::trust_all_warnings(),
+                    },
+                )
+            }
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                let command = Self::run_command(&args)?;
+                if self.pre_approval_block(&args, command, trust).is_some() {
+                    return None;
+                }
+                let ask = self.approval_ladder(&args, command, trust).await?;
+                (command.to_string(), ask)
+            }
+            _ => return None,
+        };
+        let mut warnings = ask.warnings;
         warnings.insert(
             0,
             format!(
@@ -3729,129 +4037,134 @@ impl TerminalTool {
             ),
         );
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
             let _ = emitter
                 .emit(
                     EventType::ApprovalRequested,
                     ApprovalRequestedData {
-                        command: command.to_string(),
-                        risk_level: risk_level.to_string(),
+                        command: subject.clone(),
+                        risk_level: ask.risk.to_string(),
                         warnings: warnings.clone(),
-                        task_id: task_id.map(str::to_string),
+                        task_id: None,
                     },
                 )
                 .await;
         }
+        Some(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: subject.clone(),
+            subject,
+            risk: match ask.risk {
+                RiskLevel::Critical => aidaemon_core::ApprovalRisk::Critical,
+                RiskLevel::High => aidaemon_core::ApprovalRisk::High,
+                _ => aidaemon_core::ApprovalRisk::Medium,
+            },
+            warnings,
+        })
+    }
 
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if let Err(send_err) = self
-            .approval_tx
-            .send(ApprovalRequest {
-                command: command.to_string(),
-                session_id: session_id.to_string(),
-                risk_level,
-                warnings,
-                permission_mode: self.permission_mode,
-                response_tx,
-                kind: Default::default(),
-            })
-            .await
-        {
-            return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
-        }
-
-        // Child sessions are routed to their originating human conversation by
-        // ChannelHub, so they receive the same response window as root turns.
-        // A timeout remains fail-closed but is infrastructure state, not a user
-        // denial, and must be reported distinctly.
-        let timeout_secs = 300;
-        let response: ApprovalResponse =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx)
-                .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
-                    tracing::warn!(command, "Approval response channel closed");
-                    return Err(anyhow::anyhow!(
-                        "approval response unavailable because the channel closed"
-                    ));
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        command,
-                        timeout_secs,
-                        "Approval request timed out; action remains blocked"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "approval request timed out after {timeout_secs} seconds"
-                    ));
-                }
-            };
-
+    /// Apply the owner's answer to a terminal card the kernel asked, as the
+    /// in-tool prompt did: Allow Once only learns; Allow Session adds the
+    /// session prefix and capability grants; Allow Always persists the
+    /// prefix and the capability grants; an explicit Deny is learned as a
+    /// denial (`None`: the card timed out or never arrived). A daemonization
+    /// card grants nothing beyond the run, as before.
+    pub(crate) async fn record_owner_answer(
+        &self,
+        arguments: &Value,
+        trust: &TerminalTrust,
+        response: Option<ApprovalResponse>,
+    ) {
+        let Ok(args) = serde_json::from_value::<TerminalArgs>(arguments.clone()) else {
+            return;
+        };
+        let Some(command) = Self::run_command(&args) else {
+            return;
+        };
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
-            match response {
-                ApprovalResponse::AllowOnce => {
-                    let _ = emitter
+            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
+            let approval_type = match response {
+                Some(ApprovalResponse::AllowOnce) => Some("once"),
+                Some(ApprovalResponse::AllowSession) => Some("session"),
+                Some(ApprovalResponse::AllowAlways) => Some("always"),
+                _ => None,
+            };
+            let _ = match approval_type {
+                Some(approval_type) => {
+                    emitter
                         .emit(
                             EventType::ApprovalGranted,
                             ApprovalGrantedData {
                                 command: command.to_string(),
-                                approval_type: "once".to_string(),
-                                task_id: task_id.map(str::to_string),
+                                approval_type: approval_type.to_string(),
+                                task_id: None,
                             },
                         )
-                        .await;
+                        .await
                 }
-                ApprovalResponse::AllowSession => {
-                    let _ = emitter
-                        .emit(
-                            EventType::ApprovalGranted,
-                            ApprovalGrantedData {
-                                command: command.to_string(),
-                                approval_type: "session".to_string(),
-                                task_id: task_id.map(str::to_string),
-                            },
-                        )
-                        .await;
-                }
-                ApprovalResponse::AllowAlways => {
-                    let _ = emitter
-                        .emit(
-                            EventType::ApprovalGranted,
-                            ApprovalGrantedData {
-                                command: command.to_string(),
-                                approval_type: "always".to_string(),
-                                task_id: task_id.map(str::to_string),
-                            },
-                        )
-                        .await;
-                }
-                ApprovalResponse::Deny => {
-                    let _ = emitter
+                None => {
+                    emitter
                         .emit(
                             EventType::ApprovalDenied,
                             ApprovalDeniedData {
                                 command: command.to_string(),
-                                task_id: task_id.map(str::to_string),
+                                task_id: None,
                             },
                         )
-                        .await;
+                        .await
                 }
-            }
+            };
         }
-
-        Ok(response)
+        let requested_capabilities =
+            Self::requested_capabilities(run_is_confined(self.confinement), &args, trust);
+        let capability_escalation = !requested_capabilities.is_empty() && !trust.trusted_session;
+        if !detect_daemonization_primitives(command).is_empty() && !capability_escalation {
+            return;
+        }
+        match response {
+            Some(ApprovalResponse::AllowOnce) => {}
+            Some(ApprovalResponse::AllowSession) => {
+                // Session-only storage (cleared on restart).
+                self.add_session_prefix(command).await;
+                self.add_capability_grants(command, &requested_capabilities, false)
+                    .await;
+            }
+            Some(ApprovalResponse::AllowAlways) => {
+                self.add_prefix(command).await;
+                self.add_capability_grants(command, &requested_capabilities, true)
+                    .await;
+            }
+            Some(ApprovalResponse::Deny) => {
+                if let Some(ref pool) = self.pool {
+                    let _ = record_denial(pool, command).await;
+                }
+                return;
+            }
+            None => return,
+        }
+        if let Some(ref pool) = self.pool {
+            let _ = record_approval(pool, command).await;
+        }
     }
 
     /// Elevated capabilities a run asks for beyond its task scope, as stable
     /// grant keys: `network`, `read:<path>`, `write:<path>`.
-    fn requested_capabilities(args: &TerminalArgs) -> Vec<String> {
+    /// On the host the process already has the user's environment, network
+    /// and (non-secret) files; there is no sandbox grant to escalate.
+    /// Credential stores stay rejected upstream.
+    fn requested_capabilities(
+        confined: bool,
+        args: &TerminalArgs,
+        trust: &TerminalTrust,
+    ) -> Vec<String> {
+        if !confined {
+            return Vec::new();
+        }
         let mut capabilities = Vec::new();
         if args.network {
             capabilities.push("network".to_string());
         }
-        if let Some(escalation) = &args._scope_escalation {
+        if let Some(escalation) = &trust.scope_escalation {
             capabilities.extend(escalation.read_paths.iter().map(|p| format!("read:{p}")));
             capabilities.extend(escalation.write_paths.iter().map(|p| format!("write:{p}")));
         }
@@ -4177,8 +4490,23 @@ impl TerminalTool {
 
     /// Enable trust-all mode: auto-approve all commands without prompting.
     /// Requires user approval since this is a security-sensitive action.
-    async fn handle_trust_all(&self, session_id: &str) -> anyhow::Result<String> {
-        // Check if already in trust-all mode
+    /// The owner's card for enabling trust-all mode (asked by the kernel).
+    const TRUST_ALL_SUBJECT: &'static str = "ENABLE TRUST-ALL MODE";
+
+    fn trust_all_warnings() -> Vec<String> {
+        vec![
+            "All future commands will run without approval".to_string(),
+            "This includes dangerous commands (rm, sudo, etc.)".to_string(),
+            "Persists across restarts".to_string(),
+        ]
+    }
+
+    /// Enable trust-all mode: only with the kernel's approval (the owner
+    /// approved the card its rules asked for this call).
+    async fn handle_trust_all(
+        &self,
+        kernel_approved: Option<&crate::traits::ApprovalScope>,
+    ) -> anyhow::Result<String> {
         {
             let prefixes = self.allowed_prefixes.read().await;
             if prefixes.iter().any(|p| p == "*") {
@@ -4188,56 +4516,33 @@ impl TerminalTool {
                 );
             }
         }
-
-        // Request user approval
-        match self
-            .request_approval(
-                session_id,
-                "ENABLE TRUST-ALL MODE",
-                RiskLevel::Critical,
-                vec![
-                    "All future commands will run without approval".to_string(),
-                    "This includes dangerous commands (rm, sudo, etc.)".to_string(),
-                    "Persists across restarts".to_string(),
-                ],
-                None,
-            )
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => {
-                // Add * to allowed prefixes
-                let mut prefixes = self.allowed_prefixes.write().await;
-                if !prefixes.iter().any(|p| p == "*") {
-                    prefixes.push("*".to_string());
-                    info!("Trust-all mode enabled: all commands will be auto-approved");
-
-                    // Persist to database
-                    if let Some(ref pool) = self.pool {
-                        if let Err(e) = sqlx::query(
-                            "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                                (backend_scope, prefix) VALUES (?, '*')",
-                        )
-                        .bind(self.backend.approval_scope())
-                        .execute(pool)
-                        .await
-                        {
-                            warn!("Failed to persist trust-all mode: {}", e);
-                        }
-                    }
-                }
-                Ok(
-                    "Trust-all mode enabled. All commands will now run without approval prompts."
-                        .to_string(),
-                )
-            }
-            Ok(ApprovalResponse::Deny) => Ok(
-                "Trust-all mode was denied. Commands will continue to require approval."
-                    .to_string(),
-            ),
-            Err(e) => Ok(format!("Could not get approval for trust-all mode: {}", e)),
+        if kernel_approved != Some(&crate::traits::ApprovalScope::Call) {
+            anyhow::bail!(
+                "terminal trust_all requires approval through the agent kernel; it was called \
+                 outside an approved agent call"
+            );
         }
+        let mut prefixes = self.allowed_prefixes.write().await;
+        if !prefixes.iter().any(|p| p == "*") {
+            prefixes.push("*".to_string());
+            info!("Trust-all mode enabled: all commands will be auto-approved");
+            if let Some(ref pool) = self.pool {
+                if let Err(e) = sqlx::query(
+                    "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                        (backend_scope, prefix) VALUES (?, '*')",
+                )
+                .bind(self.backend.approval_scope())
+                .execute(pool)
+                .await
+                {
+                    warn!("Failed to persist trust-all mode: {}", e);
+                }
+            }
+        }
+        Ok(
+            "Trust-all mode enabled. All commands will now run without approval prompts."
+                .to_string(),
+        )
     }
 
     fn prune_completed_map(completed: &mut HashMap<u32, CompletedProcess>) {
@@ -6381,17 +6686,18 @@ impl TerminalTool {
 
     /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.
     ///
-    /// Approval ordering for action="run":
-    ///   1. Hard blocks (dangerous irreversible commands)  → always enforced
-    ///   2. Safety soft-blocks (heredoc, python -c, etc.) → always enforced
-    ///   3. Daemonization block / daemonization approval   → always enforced
-    ///   4. `_untrusted_source` / `_trusted_session` / allowlists / normal prompt
+    /// For action="run": the hard blocks (`pre_approval_block`) always run
+    /// here; the owner's approval ladder (`approval_ladder`) ran in the
+    /// agent kernel before a call that carries
+    /// `ToolExecutionContext::kernel_approved`, and refuses any other call
+    /// it would ask about. Trust facts come only from `exec_ctx`.
     async fn execute_terminal(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        mutation_forbidden: bool,
+        exec_ctx: &ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
+        let mutation_forbidden = exec_ctx.mutation_forbidden;
         let args: TerminalArgs = serde_json::from_str(arguments)?;
         // Keep exact paths and directory capabilities separate until the
         // sandbox request is built. The native adapter receives both as
@@ -6430,9 +6736,10 @@ impl TerminalTool {
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await?
             }
-            TerminalAction::TrustAll => {
-                ToolCallOutcome::from_output(self.handle_trust_all(&args._session_id).await?)
-            }
+            TerminalAction::TrustAll => ToolCallOutcome::from_output(
+                self.handle_trust_all(exec_ctx.kernel_approved.as_ref())
+                    .await?,
+            ),
             TerminalAction::Run | TerminalAction::Unrecognized => {
                 // "run", the default, or any other spelling
                 let command = args
@@ -6469,338 +6776,24 @@ impl TerminalTool {
                     return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command is not proven observation-only. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                 }
 
-                if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
-                    return Ok(ToolCallOutcome::blocked(recursive_grep_block_message(
-                        &pattern, &path,
-                    )));
+                let trust = TerminalTrust::from_execution_context(&args._session_id, exec_ctx);
+                if let Some(block) = self.pre_approval_block(&args, command, &trust) {
+                    return Ok(ToolCallOutcome::blocked(block));
                 }
 
-                if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
-                    return Ok(ToolCallOutcome::blocked(unbounded_scan_block_message(
-                        &tool_name, &root,
-                    )));
-                }
-
-                // Soft-block large heredoc file creation: redirects to write_file
-                // which writes atomically without shell quoting issues.
-                // Allow quoted heredoc delimiters (<<'EOF' or << 'EOF') since they
-                // avoid shell expansion issues and serve as a fallback when write_file
-                // fails with JSON escaping errors on complex content.
-                if command.contains("<<") && command.len() > 500 {
-                    let uses_quoted_heredoc = command.contains("<<'")
-                        || command.contains("<< '")
-                        || command.contains("<<\"")
-                        || command.contains("<< \"");
-                    if !uses_quoted_heredoc {
-                        return Ok(ToolCallOutcome::blocked(
-                            "Large heredoc file creation is unreliable through the terminal. \
-                             Use the `write_file` tool instead — it writes files atomically \
-                             and avoids shell quoting issues. If write_file fails with JSON \
-                             encoding errors, use a quoted heredoc: cat > file << 'EOF'"
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                // Hard-redirect AppleScript GUI automation to computer_use: the
-                // terminal path has none of its safety layer (approvals, blocked
-                // apps, action confirmation, lock detection) and System Events
-                // input fails against a locked screen exactly like synthetic input.
-                if is_system_events_ui_scripting(command) {
-                    return Ok(ToolCallOutcome::blocked(
-                        "Blocked: AppleScript System Events UI scripting (click/keystroke) \
-                         through the terminal bypasses the computer_use safety layer and \
-                         cannot deliver input when the screen is locked.\n\n\
-                         Use the `computer_use` tool for GUI automation — it is \
-                         approval-gated, lock-aware, and works from screenshots and the \
-                         accessibility tree. If computer_use is unavailable or blocked \
-                         (e.g. the screen is locked), stop and tell the user what you \
-                         need instead of scripting around it."
-                            .to_string(),
-                    ));
-                }
-
-                let daemon_hits = detect_daemonization_primitives(command);
-                let mut daemonization_approved = false;
-                if !daemon_hits.is_empty() {
-                    let is_owner = args
-                        ._user_role
-                        .as_deref()
-                        .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
-                    if !is_owner {
-                        return Ok(ToolCallOutcome::blocked(format!(
-                            "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
-                            daemon_hits.join(", ")
-                        )));
-                    }
-
-                    if !args.detach {
-                        return Ok(ToolCallOutcome::blocked(format!(
-                            "Blocked: daemonization primitives detected ({}). \
-                             Set `detach=true` explicitly for intentional long-lived background execution.",
-                            daemon_hits.join(", ")
-                        )));
-                    }
-
-                    let mut warnings = vec![
-                        format!(
-                            "Daemonization primitives detected: {}",
-                            daemon_hits.join(", ")
-                        ),
-                        "Detached/background processes may survive cancellation and continue running.".to_string(),
-                    ];
-                    warnings.push("Approve only if this is intentional and necessary.".to_string());
-
-                    match self
-                        .request_approval(
-                            &args._session_id,
-                            command,
-                            RiskLevel::Critical,
-                            warnings,
-                            args._task_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(ApprovalResponse::AllowOnce)
-                        | Ok(ApprovalResponse::AllowSession)
-                        | Ok(ApprovalResponse::AllowAlways) => {
-                            daemonization_approved = true;
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            return Ok(ToolCallOutcome::blocked(
-                                "Daemonizing command denied by owner.".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Ok(ToolCallOutcome::blocked(format!(
-                                "Could not get owner approval for daemonizing command: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-
-                let deterministic_approval_floor = approval_floor_reason(command);
-                let mut approval_risk = RiskLevel::High;
-                let mut approval_warnings = Vec::new();
-
-                // Deterministic hard block for irreversible broad-path deletes.
-                if let Some(reason) =
-                    hard_block_reason(command, self.backend.workspace_root().as_str())
+                // The owner's approval comes from the agent kernel: its
+                // `ApprovalPolicy` ran this ladder (`owner_approval_request`)
+                // before the call and asked the owner where it requires it.
+                // The tool never asks. Outside the kernel, a command the
+                // ladder would ask about is refused.
+                if exec_ctx.kernel_approved != Some(crate::traits::ApprovalScope::Call)
+                    && self.approval_ladder(&args, command, &trust).await.is_some()
                 {
-                    warn!(
-                        session_id = %args._session_id,
-                        task_id = ?args._task_id,
-                        command = %command,
-                        reason = %reason,
-                        "Blocked dangerous irreversible command"
+                    anyhow::bail!(
+                        "terminal command `{}` requires approval through the agent kernel; it \
+                         was called outside an approved agent call",
+                        truncate_str(command, 200)
                     );
-                    return Ok(ToolCallOutcome::blocked(format!(
-                        "{} Use scoped, non-destructive commands instead.",
-                        reason
-                    )));
-                }
-
-                // Check if this is a trusted session (explicitly set by ChannelContext,
-                // not derived from session ID strings — prevents session ID spoofing).
-                let is_trusted_session = args._trusted_session;
-                if args.detach && is_trusted_session {
-                    // Intentional: trusted scheduled sessions are auto-approved, so
-                    // disallow detached long-lived processes in that mode.
-                    return Ok(ToolCallOutcome::blocked(
-                        "Blocked: detach=true is not allowed for trusted scheduled sessions."
-                            .to_string(),
-                    ));
-                }
-
-                if args.detach && !daemonization_approved {
-                    approval_warnings.push(
-                        "Detached execution requested (process may outlive task boundaries)."
-                            .to_string(),
-                    );
-                }
-
-                // Determine if approval is needed.
-                // Note: is_allowed() checks both permanent AND session-approved prefixes.
-                //
-                // Ordering (enforced here; do not reorder):
-                //   1. daemonization_approved  → never re-prompt after daemonization gate
-                //   2. _untrusted_source       → external triggers always re-prompt
-                //   3. detach && !is_allowed   → novel detached commands re-prompt
-                //   4. _trusted_session        → scheduled tasks skip prompt
-                //   5. explicit allowlist      → prior owner grant
-                //   6. protected credential path → non-downgradable approval floor
-                //   7. semantic model          → approve only dangerous effects
-                //   8. classifier failure      → fail closed to approval
-                let is_allowed = self.is_allowed(command).await;
-                let confined = run_is_confined(self.confinement);
-                // On the host the process already has the user's environment,
-                // network, and (non-secret) files; there is no sandbox grant
-                // to escalate. Credential stores stay rejected upstream.
-                let requested_capabilities = if confined {
-                    Self::requested_capabilities(&args)
-                } else {
-                    Vec::new()
-                };
-                let capability_escalation_pending = !requested_capabilities.is_empty()
-                    && !is_trusted_session
-                    && !self
-                        .capabilities_granted(command, &requested_capabilities)
-                        .await;
-                let needs_approval = if capability_escalation_pending {
-                    // Elevated capability is new authority; no command-prefix
-                    // grant or dispatcher preapproval stands in for the user
-                    // seeing exactly what is being requested.
-                    approval_warnings.push(format!(
-                        "Requests elevated capabilities beyond the task scope: {}",
-                        Self::describe_capabilities(&requested_capabilities)
-                    ));
-                    info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
-                    true
-                } else if daemonization_approved {
-                    false
-                } else if args._untrusted_source {
-                    // External triggers always need approval regardless of mode
-                    approval_warnings
-                        .push("Command originated from an untrusted external trigger.".to_string());
-                    info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
-                    true
-                } else if args.detach && !is_allowed {
-                    // Allowlisted commands (permanent or session approvals)
-                    // may run detached without re-prompting; only novel
-                    // detached commands force approval.
-                    info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
-                    true
-                } else if is_trusted_session {
-                    // Trusted scheduled tasks bypass approval
-                    info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
-                    false
-                } else if is_allowed {
-                    info!(command = %command, "Auto-approved: explicit command grant");
-                    false
-                } else if let Some(reason) = deterministic_approval_floor {
-                    approval_warnings.push(reason);
-                    true
-                } else if let Some(runtime) = self.command_risk_runtime.get() {
-                    match assess_command(
-                        runtime,
-                        command,
-                        &self.backend,
-                        &args._session_id,
-                        self.state.as_ref(),
-                        self.event_store.clone(),
-                    )
-                    .await
-                    {
-                        Ok(semantic) => {
-                            approval_risk = semantic.risk_level;
-                            approval_warnings = semantic.warnings;
-                            if semantic.requires_approval {
-                                info!(
-                                    command = %command,
-                                    risk = %approval_risk,
-                                    "Semantic command assessment requires owner approval"
-                                );
-                                true
-                            } else {
-                                info!(
-                                    command = %command,
-                                    risk = %approval_risk,
-                                    "Auto-approved by semantic command assessment"
-                                );
-                                false
-                            }
-                        }
-                        Err(error) => {
-                            warn!(
-                                command = %command,
-                                %error,
-                                "Semantic command assessment failed; requesting approval"
-                            );
-                            approval_risk = RiskLevel::Critical;
-                            approval_warnings.push(format!(
-                                "Semantic safety assessment unavailable; failed closed: {}",
-                                error
-                            ));
-                            true
-                        }
-                    }
-                } else {
-                    approval_risk = RiskLevel::Critical;
-                    approval_warnings.push(
-                        "Semantic safety assessment is not configured; failed closed.".to_string(),
-                    );
-                    true
-                };
-
-                if needs_approval {
-                    // Approval history is useful context for the owner, but it
-                    // never changes the semantic decision or lowers risk.
-                    if let Some(ref pool) = self.pool {
-                        if let Ok(Some((pattern, similarity))) =
-                            find_matching_pattern(pool, command).await
-                        {
-                            approval_warnings.push(format!(
-                                "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
-                                pattern.pattern,
-                                similarity * 100.0,
-                                pattern.approval_count,
-                                pattern.denial_count,
-                                pattern.confidence() * 100.0,
-                                pattern.is_trusted(),
-                            ));
-                        }
-                    }
-                    match self
-                        .request_approval(
-                            &args._session_id,
-                            command,
-                            approval_risk,
-                            approval_warnings.clone(),
-                            args._task_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(ApprovalResponse::AllowOnce) => {
-                            // Just run this once, but still learn from it
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::AllowSession) => {
-                            // Save to session-only storage (cleared on restart)
-                            self.add_session_prefix(command).await;
-                            self.add_capability_grants(command, &requested_capabilities, false)
-                                .await;
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::AllowAlways) => {
-                            // Save to permanent storage (DB)
-                            self.add_prefix(command).await;
-                            self.add_capability_grants(command, &requested_capabilities, true)
-                                .await;
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            // Record denial for learning
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_denial(pool, command).await;
-                            }
-                            return Ok(ToolCallOutcome::blocked(
-                                "Command denied by user.".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Ok(ToolCallOutcome::blocked(format!(
-                                "Could not get approval: {}",
-                                e
-                            )));
-                        }
-                    }
                 }
 
                 // The checkpoint belongs after every command-safety and
@@ -6905,7 +6898,7 @@ impl TerminalTool {
                         tool_call_id: args._tool_call_id.as_deref(),
                         detach: args.detach,
                         network: args.network,
-                        confined,
+                        confined: run_is_confined(self.confinement),
                         status_tx,
                         launch_trust,
                     })
@@ -7082,12 +7075,6 @@ struct TerminalArgs {
     /// capability grant for the command.
     #[serde(default)]
     network: bool,
-    /// Injected by the execution loop: exact declared targets outside the
-    /// compiled task scope that the user may authorize. Never model-supplied.
-    #[serde(default)]
-    _scope_escalation: Option<crate::traits::ScopeEscalation>,
-    #[serde(default)]
-    _untrusted_source: bool,
     #[serde(default)]
     _session_id: String,
     #[serde(default)]
@@ -7098,9 +7085,6 @@ struct TerminalArgs {
     /// Injected by agent - goal context for routing background notifications.
     #[serde(default)]
     _goal_id: Option<String>,
-    /// Injected by agent for role-aware safeguards.
-    #[serde(default)]
-    _user_role: Option<String>,
     /// Injected by the dispatcher: the turn's trusted roots and the cwd
     /// relative paths resolve against, so a run moved to the background
     /// records the trust its output was judged with. Never model-supplied.
@@ -7108,10 +7092,40 @@ struct TerminalArgs {
     _trust_roots: Option<Vec<String>>,
     #[serde(default)]
     _trust_cwd: Option<String>,
-    /// Explicitly set by the agent from ChannelContext.trusted — never derived
-    /// from session ID strings. Only trusted scheduled tasks set this to true.
-    #[serde(default)]
-    _trusted_session: bool,
+}
+
+/// The turn's facts the terminal's approval ladder and hard blocks read:
+/// from the dispatcher's typed [`ToolExecutionContext`], or from the
+/// kernel's per-turn approval rules. Never from the call's arguments.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TerminalTrust {
+    pub session_id: String,
+    /// The turn's user is the owner (an unknown caller is not).
+    pub owner: bool,
+    /// A trusted scheduled session: runs without asking, never detached.
+    pub trusted_session: bool,
+    /// Started by an automated trigger: every run asks.
+    pub untrusted_source: bool,
+    /// Out-of-scope targets routed to the owner (a confined capability).
+    pub scope_escalation: Option<crate::traits::ScopeEscalation>,
+}
+
+impl TerminalTrust {
+    fn from_execution_context(session_id: &str, ctx: &ToolExecutionContext) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            trusted_session: ctx.trusted_session,
+            untrusted_source: ctx.untrusted_source,
+            scope_escalation: ctx.scope_escalation.clone().filter(|e| !e.is_empty()),
+        }
+    }
+}
+
+/// What the owner is asked to approve before a run.
+struct LadderAsk {
+    risk: RiskLevel,
+    warnings: Vec<String>,
 }
 
 fn default_action() -> String {
@@ -7688,6 +7702,10 @@ impl Tool for TerminalTool {
         "terminal"
     }
 
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command in the configured execution workspace. Novel commands are semantically assessed; only dangerous or uncertain effects require owner approval."
     }
@@ -7934,7 +7952,8 @@ impl Tool for TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, false).await
+        self.execute_terminal(arguments, status_tx, &ToolExecutionContext::default())
+            .await
     }
 
     async fn call_with_execution_context(
@@ -7943,8 +7962,7 @@ impl Tool for TerminalTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, exec_ctx.mutation_forbidden)
-            .await
+        self.execute_terminal(arguments, status_tx, &exec_ctx).await
     }
 
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
@@ -8014,6 +8032,23 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// The dispatcher's context for an owner's call the kernel approved.
+    fn kernel_owner_ctx() -> ToolExecutionContext {
+        ToolExecutionContext {
+            kernel_approved: Some(crate::traits::ApprovalScope::Call),
+            user_role: Some(crate::types::UserRole::Owner),
+            ..Default::default()
+        }
+    }
+
+    fn owner_trust() -> TerminalTrust {
+        TerminalTrust {
+            session_id: "telegram:synthetic-owner".to_string(),
+            owner: true,
+            ..TerminalTrust::default()
+        }
+    }
 
     fn semantic_runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
         SharedLlmRuntime::new(
@@ -8414,11 +8449,19 @@ mod tests {
     fn requested_capabilities_are_typed_grant_keys() {
         let args: TerminalArgs = serde_json::from_str(
             r#"{"action":"run","command":"npx wrangler deploy","network":true,
-                "_scope_escalation":{"read_paths":["/Users/alice/Library/Preferences/.wrangler"],
-                                     "write_paths":["/Users/alice/Library/Preferences/.wrangler/logs"]}}"#,
+                "_scope_escalation":{"read_paths":["/Users/alice/Library/Preferences/.spoofed"]}}"#,
         )
         .unwrap();
-        let caps = TerminalTool::requested_capabilities(&args);
+        // The escalation comes from the dispatcher's typed context; an
+        // argument naming one is ignored.
+        let trust = TerminalTrust {
+            scope_escalation: Some(crate::traits::ScopeEscalation {
+                read_paths: vec!["/Users/alice/Library/Preferences/.wrangler".to_string()],
+                write_paths: vec!["/Users/alice/Library/Preferences/.wrangler/logs".to_string()],
+            }),
+            ..TerminalTrust::default()
+        };
+        let caps = TerminalTool::requested_capabilities(true, &args, &trust);
         assert_eq!(
             caps,
             vec![
@@ -8435,7 +8478,12 @@ mod tests {
             .contains("write outside task scope: /Users/alice/Library/Preferences/.wrangler/logs"));
         let plain: TerminalArgs =
             serde_json::from_str(r#"{"action":"run","command":"ls"}"#).unwrap();
-        assert!(TerminalTool::requested_capabilities(&plain).is_empty());
+        assert!(
+            TerminalTool::requested_capabilities(true, &plain, &TerminalTrust::default())
+                .is_empty()
+        );
+        // On the host there is no sandbox grant to escalate.
+        assert!(TerminalTool::requested_capabilities(false, &args, &trust).is_empty());
     }
 
     #[test]
@@ -9338,6 +9386,44 @@ mod tests {
         assert!(writable.mutates_state());
     }
 
+    /// Trust markers in the arguments stand in for nothing: a command the
+    /// ladder asks about is refused outside the kernel whatever they say.
+    #[tokio::test]
+    async fn trust_arguments_bypass_nothing() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let args = serde_json::json!({
+            "action": "run",
+            "command": "printf synthetic-spoofed",
+            "_trusted_session": true,
+            "_user_role": "Owner",
+            "_untrusted_source": false,
+        });
+        let error = tool
+            .call(&args.to_string())
+            .await
+            .expect_err("arguments are not the dispatcher's trust");
+        assert!(
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn semantic_safe_command_runs_without_owner_approval() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -9424,7 +9510,11 @@ mod tests {
             "_session_id": "telegram:synthetic-owner",
             "_user_role": "Owner"
         });
-        let output = tool.call(&args.to_string()).await.unwrap();
+        let output = tool
+            .call_with_execution_context(&args.to_string(), None, kernel_owner_ctx())
+            .await
+            .unwrap()
+            .output;
         assert!(!output.contains("Is a directory"), "{output}");
         assert!(
             file.is_file(),
@@ -9448,7 +9538,11 @@ mod tests {
             "_session_id": "telegram:synthetic-owner",
             "_user_role": "Owner"
         });
-        let _ = tool.call(&args.to_string()).await.unwrap();
+        let _ = tool
+            .call_with_execution_context(&args.to_string(), None, kernel_owner_ctx())
+            .await
+            .unwrap()
+            .output;
         assert!(
             !failed_root.exists(),
             "runtime-created chain must be removed after the failed run"
@@ -9501,7 +9595,7 @@ mod tests {
             "_user_role": "Owner"
         });
         let outcome = tool
-            .execute_terminal(&args.to_string(), None, false)
+            .execute_terminal(&args.to_string(), None, &kernel_owner_ctx())
             .await
             .expect("typed outcome, not a transport error");
         let failure = outcome
@@ -9522,7 +9616,7 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let provider = Arc::new(MockProvider::with_responses(vec![
             MockProvider::text_response(
                 r#"{"dangerous":true,"risk_level":"high","effects":["external_mutation"],"reasons":["Pushes commits to a remote repository"]}"#,
@@ -9540,20 +9634,19 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         tool.set_command_risk_runtime(semantic_runtime(provider));
 
-        let call = tool.call(
-            r#"{"action":"run","command":"git push synthetic-remote main","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
-        );
-        let respond = async {
-            let request = approval_rx.recv().await.expect("approval request");
-            assert_eq!(request.risk_level, RiskLevel::High);
-            assert!(request
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("external_mutation")));
-            request.response_tx.send(ApprovalResponse::Deny).unwrap();
-        };
-        let (output, ()) = tokio::join!(call, respond);
-        assert!(output.unwrap().contains("denied"));
+        let args = serde_json::json!({"action":"run","command":"git push synthetic-remote main"});
+        // The kernel's rules get the card from the ladder; the tool never asks.
+        let request = tool
+            .owner_approval_request(&args, &owner_trust())
+            .await
+            .expect("a dangerous command asks the owner");
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
+        assert_eq!(request.subject, "git push synthetic-remote main");
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("external_mutation")));
+        assert!(request.warnings[0].starts_with("Execution target:"));
     }
 
     #[tokio::test]
@@ -9659,6 +9752,49 @@ mod tests {
             ),
             SourceTrust::Trusted
         );
+    }
+
+    /// Redirect forms the scan does not read structurally (read-write,
+    /// heredoc, here-string, process substitution, a numbered descriptor)
+    /// fail closed: their output is untrusted on the host.
+    #[tokio::test]
+    async fn odd_redirects_fail_closed() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        for command in [
+            "cat <> f",
+            "cat << EOF\nx\nEOF",
+            "cat <<< x",
+            "cat <(ls)",
+            "cat 3< ~/x",
+        ] {
+            let args = serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Untrusted,
+                "{command}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12767,12 +12903,16 @@ mod tests {
         });
 
         let start = Instant::now();
+        // The owner approved the daemonization card in the kernel.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true,"_session_id":"s1"}"#,
+                None,
+                kernel_owner_ctx(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         let elapsed = start.elapsed();
 
         // Should return promptly (within the timeout + small margin) rather than
@@ -13126,17 +13266,27 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
-        let response = tool
-            .call(
-                r#"{"action":"run","command":"echo hi","detach":true,"_untrusted_source":true,"_session_id":"s1","_user_role":"Owner"}"#,
-            )
+        let args = serde_json::json!({"action":"run","command":"echo hi","detach":true});
+        let trust = TerminalTrust {
+            untrusted_source: true,
+            ..owner_trust()
+        };
+        let request = tool
+            .owner_approval_request(&args, &trust)
             .await
-            .unwrap();
+            .expect("untrusted-source command must ask even when allowlisted");
         assert!(
-            response.contains("Could not get approval"),
-            "untrusted-source command must force approval even when allowlisted, got: {}",
-            response
+            request
+                .warnings
+                .iter()
+                .any(|w| w.contains("untrusted external trigger")),
+            "{request:?}"
         );
+        // The same command from the owner runs without asking.
+        assert!(tool
+            .owner_approval_request(&args, &owner_trust())
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -13212,38 +13362,31 @@ mod tests {
     }
 
     /// The dispatcher-owned execution-context path must not weaken approval:
-    /// a `run` with `_untrusted_source=true` still reaches the approval channel.
+    /// an untrusted-source `run` without the kernel's approval is refused.
     #[tokio::test]
     async fn untrusted_source_run_via_execution_context_still_prompts() {
-        // Tool with an OPEN approval channel. We answer on a background task so
-        // the call can complete; we then verify the request was received.
-        let (tool, mut approval_rx) = make_tool_with_open_approval_channel().await;
+        let (tool, _approval_rx) = make_tool_with_open_approval_channel().await;
 
-        // Answer the approval request from a background task so the tool call
-        // can complete without blocking forever.
-        tokio::spawn(async move {
-            if let Some(req) = approval_rx.recv().await {
-                // Deny it — we only care that the request WAS sent, not the outcome.
-                let _ = req.response_tx.send(ApprovalResponse::Deny);
-            }
-        });
-
-        // The untrusted-source branch forces needs_approval=true, so an approval
-        // request MUST be sent to the channel.
-        let result = tool
+        // The untrusted-source rung asks, so outside the kernel the call is
+        // refused; the dispatcher's typed fact, not an argument, says so.
+        let ctx = ToolExecutionContext {
+            untrusted_source: true,
+            user_role: Some(crate::types::UserRole::Owner),
+            ..Default::default()
+        };
+        let error = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"echo ordinary-unsafe","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"echo ordinary-unsafe","_session_id":"p25-sess"}"#,
                 None,
-                ToolExecutionContext::default(),
+                ctx,
             )
             .await
-            .expect("call should complete (denied, not error)");
-
+            .expect_err("an untrusted-source run needs the kernel's approval");
         assert!(
-            result.output.contains("denied") || result.output.contains("Deny"),
-            "ordinary unsafe command must have gone through the approval gate \
-             (expected denial message), got: {}",
-            result.output
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
         );
     }
 }

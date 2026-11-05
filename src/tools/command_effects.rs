@@ -2835,6 +2835,14 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 mod tests {
     use super::*;
 
+    /// `xargs` takes its operands from stdin, which no argument names: the
+    /// paths it reads cannot be determined, even with a readable redirect.
+    #[test]
+    fn xargs_path_operands_are_undeterminable() {
+        assert_eq!(path_operands("xargs cat < list.txt"), None);
+        assert_eq!(path_operands("cat list.txt | xargs cat"), None);
+    }
+
     #[test]
     fn local_work_and_delete_targets_are_typed_by_structure() {
         for local in [

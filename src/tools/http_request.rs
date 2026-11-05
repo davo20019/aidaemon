@@ -3217,6 +3217,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -3251,6 +3252,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -3293,6 +3295,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -3379,6 +3382,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -3422,6 +3426,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             ),
         )
@@ -3477,6 +3482,7 @@ mod tests {
                     mandate_execution: true,
                     mutation_forbidden: false,
                     kernel_approved: None,
+                    ..Default::default()
                 },
             ),
         )

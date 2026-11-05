@@ -504,7 +504,7 @@ pub(in crate::agent) struct TurnScope<'a> {
     continue_inline_after_background: bool,
     /// Where calls without a directory run; refined by the model's own
     /// explicit directories (see `SdkTurnSetup::known_project_dir`).
-    known_project_dir: std::sync::Mutex<Option<String>>,
+    known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
@@ -912,6 +912,41 @@ impl Agent {
         let grant_session =
             super::approvals::grant_session(self.approval_session_id.as_deref(), session_id);
         let mandate_run = self.mandate_execution.is_some();
+        // The terminal's ladder sees a call's capability escalation the way
+        // the dispatcher's scope check will (same facts, same known
+        // project directory as it is refined during the run).
+        let known_project_dir = Arc::new(std::sync::Mutex::new(known_project_dir));
+        let terminal_approvals =
+            super::approvals::TerminalApprovals::find(&self.tools).map(|terminal| {
+                let tool = terminal.tool();
+                let known = known_project_dir.clone();
+                let session = session_id.to_string();
+                let task_access = authority.task_access.clone();
+                let scopes = authorized_scopes.clone();
+                terminal.with_scope(move |arguments| {
+                    let known = known.lock().ok().and_then(|known| known.clone());
+                    let facts = tool_calls::CallScopeFacts {
+                        session_id: &session,
+                        task_access: task_access.as_ref(),
+                        authorized_scopes: &scopes,
+                        known_project_dir: known.as_deref(),
+                    };
+                    match tool_calls::call_scope_check(
+                        tool.as_ref(),
+                        &arguments.to_string(),
+                        &facts,
+                    ) {
+                        Some(crate::agent::tool_execution::ScopeCheck::Escalatable {
+                            escalation,
+                            ..
+                        }) => super::approvals::TerminalScope::Escalate(escalation),
+                        Some(crate::agent::tool_execution::ScopeCheck::Rejected(_)) => {
+                            super::approvals::TerminalScope::Refused
+                        }
+                        None => super::approvals::TerminalScope::InScope,
+                    }
+                })
+            });
         let rules = super::approvals::AppApprovalRules {
             trusted_session: !mandate_run
                 && self
@@ -921,11 +956,13 @@ impl Agent {
             session_id: session_id.to_string(),
             user_role: Some(user_role),
             untrusted_trigger_session: super::is_trigger_session(session_id),
+            terminal: terminal_approvals,
         };
+        let rules = Arc::new(rules);
         let approvals = self.owner_approvals.clone();
         let approval =
             aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
-                .with_rules(Arc::new(rules))
+                .with_rules(rules.clone())
                 .with_grants(approvals.grants_for(&grant_session));
         let secrets = self.configured_secret_literals(engine).await;
         let egress = secrets
@@ -1079,7 +1116,7 @@ impl Agent {
             thinking_truncations: std::sync::atomic::AtomicU8::new(0),
             raised_output_tokens: std::sync::atomic::AtomicU32::new(0),
             continue_inline_after_background,
-            known_project_dir: std::sync::Mutex::new(known_project_dir),
+            known_project_dir: known_project_dir.clone(),
             project_scope,
             authority: &authority,
             ceiling: ceiling.clone(),
@@ -1163,6 +1200,7 @@ impl Agent {
             owner: super::approvals::OwnerApprovalResolver {
                 agent: self,
                 approvals,
+                rules,
                 card_session: session_id,
                 grant_session,
                 emitter: &emitter,

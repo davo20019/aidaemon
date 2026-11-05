@@ -1731,7 +1731,11 @@ pub enum ApprovalScope {
 ///
 /// This is a Rust-side control-plane type — it is NEVER serialized, never appears
 /// in model-visible JSON, tool schemas, logs, or persisted tool arguments.
-/// Do NOT add fields here that duplicate information already in the enriched args.
+/// Trust and approval facts belong here, not in the enriched args: a tool
+/// reads them from this context only (`trusted_session`, `user_role`,
+/// `untrusted_source`, `scope_escalation`, `kernel_approved`). The
+/// `_trusted_session` and `_user_role` arguments the dispatcher still adds
+/// remain for tools not yet moved off them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     /// True only after the final common dispatcher revalidated an exact,
@@ -1753,6 +1757,19 @@ pub struct ToolExecutionContext {
     /// outer call makes. A tool that needs the owner's approval refuses a
     /// call without a matching scope rather than asking itself.
     pub kernel_approved: Option<ApprovalScope>,
+    /// The turn is a trusted scheduled session (never one under a mandate),
+    /// set only by the dispatcher from the channel context and the goal's
+    /// provenance. Tools read trust here, never from their arguments.
+    pub trusted_session: bool,
+    /// The role of the turn's user, set only by the dispatcher (`None`
+    /// outside it: an unknown caller is not the owner).
+    pub user_role: Option<crate::types::UserRole>,
+    /// The session was started by an automated trigger (an email, an
+    /// event), not by the owner. Set only by the dispatcher.
+    pub untrusted_source: bool,
+    /// Exact out-of-scope targets the controller routed to the owner's
+    /// approval instead of refusing them. Set only by the dispatcher.
+    pub scope_escalation: Option<ScopeEscalation>,
 }
 
 /// Filesystem targets a tool call declared that fall outside the compiled
@@ -1812,6 +1829,12 @@ impl ToolArgumentContractViolation {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    /// The concrete tool, for daemon wiring that needs it (the kernel's
+    /// approval rules find the terminal's approval ladder this way). `None`
+    /// for tools nothing downcasts.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
     fn description(&self) -> &str;
     /// Returns the OpenAI-format function schema as a JSON Value.
     fn schema(&self) -> Value;

@@ -42,8 +42,17 @@ const COULD_NOT_REACH: &str = "could not reach the owner";
 /// `http_request` keeps H7: a GET, HEAD or OPTIONS without a body (and
 /// without a method or authority override header) runs; anything else asks
 /// the owner, High risk, unless the turn is a trusted scheduled session or
-/// a mandate run (whose exact action grant the dispatcher checks). Every
-/// other tool defers to the policy's mode (`Never`), so it runs as before.
+/// a mandate run (whose exact action grant the dispatcher checks).
+///
+/// `terminal` runs the terminal's own approval ladder (T8, in its order;
+/// see `TerminalTool::approval_ladder`) with this turn's facts, never with
+/// facts from the call's arguments. Its grants (session prefixes, persisted
+/// prefixes and capability grants in the terminal's stores) are consulted
+/// at the ladder's own rungs, so an allowlisted command still asks in a
+/// trigger session or when it escalates a capability.
+///
+/// Every other tool defers to the policy's mode (`Never`), so it runs as
+/// before.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AppApprovalRules {
     /// A trusted scheduled session (never under a mandate): no card, as the
@@ -52,17 +61,146 @@ pub(crate) struct AppApprovalRules {
     /// A mandate run: the dispatcher admits only calls its exact action
     /// grant covers, so the owner already approved them.
     pub mandate_preapproved: bool,
-    /// The turn's session. With the two facts below, the terminal's
-    /// approval ladder needs it (Task 5); http_request does not.
-    #[allow(dead_code)]
+    /// The turn's session.
     pub session_id: String,
     /// The role of the turn's user (`None` when unknown).
-    #[allow(dead_code)]
     pub user_role: Option<crate::types::UserRole>,
     /// The session was started by an automated trigger (an email, an
     /// event), not by the owner: its terminal calls always ask.
-    #[allow(dead_code)]
     pub untrusted_trigger_session: bool,
+    /// The turn's terminal, whose approval ladder judges its calls.
+    pub terminal: Option<TerminalApprovals>,
+}
+
+/// How the controller's filesystem scope check sees a terminal call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalScope {
+    InScope,
+    /// Exact out-of-scope targets the owner may authorize (a confined
+    /// capability escalation).
+    Escalate(crate::traits::ScopeEscalation),
+    /// The dispatcher refuses the call; nobody is asked.
+    Refused,
+}
+
+type ScopeOf = dyn Fn(&serde_json::Value) -> TerminalScope + Send + Sync;
+
+/// The terminal whose approval ladder the kernel's rules run, and the
+/// turn's scope check of a call (for a confined capability escalation).
+#[derive(Clone)]
+pub(crate) struct TerminalApprovals {
+    tool: Arc<dyn crate::traits::Tool>,
+    scope: Option<Arc<ScopeOf>>,
+}
+
+impl std::fmt::Debug for TerminalApprovals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalApprovals")
+            .field("scope", &self.scope.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TerminalApprovals {
+    /// The terminal among `tools`, if there is one.
+    pub(crate) fn find(tools: &[Arc<dyn crate::traits::Tool>]) -> Option<Self> {
+        let tool = tools
+            .iter()
+            .find(|tool| Self::downcast(tool.as_ref()).is_some())?
+            .clone();
+        Some(Self { tool, scope: None })
+    }
+
+    /// The terminal tool itself.
+    pub(crate) fn tool(&self) -> Arc<dyn crate::traits::Tool> {
+        self.tool.clone()
+    }
+
+    /// Judge capability escalations with the turn's scope check.
+    pub(crate) fn with_scope(
+        mut self,
+        scope: impl Fn(&serde_json::Value) -> TerminalScope + Send + Sync + 'static,
+    ) -> Self {
+        self.scope = Some(Arc::new(scope));
+        self
+    }
+
+    fn downcast(tool: &dyn crate::traits::Tool) -> Option<&crate::tools::TerminalTool> {
+        tool.as_any()?.downcast_ref::<crate::tools::TerminalTool>()
+    }
+
+    fn terminal(&self) -> Option<&crate::tools::TerminalTool> {
+        Self::downcast(self.tool.as_ref())
+    }
+
+    fn scope(&self, arguments: &serde_json::Value) -> TerminalScope {
+        match &self.scope {
+            Some(scope) => scope(arguments),
+            None => TerminalScope::InScope,
+        }
+    }
+}
+
+impl AppApprovalRules {
+    /// The turn's facts the terminal's ladder reads.
+    fn terminal_trust(
+        &self,
+        escalation: Option<crate::traits::ScopeEscalation>,
+    ) -> crate::tools::terminal::TerminalTrust {
+        crate::tools::terminal::TerminalTrust {
+            session_id: self.session_id.clone(),
+            owner: self.user_role == Some(crate::types::UserRole::Owner),
+            trusted_session: self.trusted_session,
+            untrusted_source: self.untrusted_trigger_session,
+            scope_escalation: escalation,
+        }
+    }
+
+    async fn judge_terminal(&self, call: &sdk::ToolCall) -> RuleDecision {
+        let Some(approvals) = &self.terminal else {
+            return RuleDecision::Defer;
+        };
+        let Some(terminal) = approvals.terminal() else {
+            return RuleDecision::Defer;
+        };
+        let escalation = match approvals.scope(&call.arguments) {
+            // The dispatcher refuses it before the tool runs.
+            TerminalScope::Refused => return RuleDecision::Allow,
+            TerminalScope::Escalate(escalation) => Some(escalation),
+            TerminalScope::InScope => None,
+        };
+        let trust = self.terminal_trust(escalation);
+        match terminal
+            .owner_approval_request(&call.arguments, &trust)
+            .await
+        {
+            Some(request) => RuleDecision::Ask(request),
+            None => RuleDecision::Allow,
+        }
+    }
+
+    /// Apply the owner's answer to a terminal card to the terminal's grant
+    /// stores (`None`: the card timed out or never reached the owner).
+    pub(crate) async fn record_terminal_answer(
+        &self,
+        call: &sdk::ToolCall,
+        response: Option<ApprovalResponse>,
+    ) {
+        let Some(approvals) = &self.terminal else {
+            return;
+        };
+        let Some(terminal) = approvals.terminal() else {
+            return;
+        };
+        let escalation = match approvals.scope(&call.arguments) {
+            TerminalScope::Escalate(escalation) => Some(escalation),
+            _ => None,
+        };
+        let trust = self.terminal_trust(escalation);
+        terminal
+            .record_owner_answer(&call.arguments, &trust, response)
+            .await;
+    }
 }
 
 #[async_trait]
@@ -94,6 +232,7 @@ impl ApprovalRules for AppApprovalRules {
                     None => RuleDecision::Defer,
                 }
             }
+            "terminal" => self.judge_terminal(call).await,
             _ => RuleDecision::Defer,
         }
     }
@@ -312,6 +451,8 @@ impl std::fmt::Debug for ConfiguredSecrets {
 pub(in crate::agent) struct OwnerApprovalResolver<'a> {
     pub agent: &'a Agent,
     pub approvals: Arc<OwnerApprovals>,
+    /// The turn's rules: a terminal answer goes to the terminal's grants.
+    pub rules: Arc<AppApprovalRules>,
     /// Where the card goes (the turn's session; a child's card is routed
     /// to its parent chat by the hub).
     pub card_session: &'a str,
@@ -367,7 +508,14 @@ impl OwnerApprovalResolver<'_> {
             .await
         {
             Answer::Granted(response) => {
-                if matches!(
+                if tool == "terminal" {
+                    // The terminal's grants live in its own stores
+                    // (session and persisted prefixes, capability grants),
+                    // consulted at the ladder's own rungs.
+                    self.rules
+                        .record_terminal_answer(&interruption.call, Some(response))
+                        .await;
+                } else if matches!(
                     response,
                     ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways
                 ) {
@@ -378,6 +526,12 @@ impl OwnerApprovalResolver<'_> {
                 sdk::Resolution::Approve
             }
             Answer::Declined(reason) => {
+                if tool == "terminal" {
+                    let answer = (reason == DECLINED_BY_OWNER).then_some(ApprovalResponse::Deny);
+                    self.rules
+                        .record_terminal_answer(&interruption.call, answer)
+                        .await;
+                }
                 self.record("owner_approval_declined", tool, request, Some(&reason))
                     .await;
                 sdk::Resolution::Deny { reason }
@@ -657,6 +811,263 @@ mod tests {
             trusted.judge(&hook_ctx(), &call, &tool_info()).await,
             RuleDecision::Defer
         );
+    }
+
+    /// Rules over a real terminal with `allowed` prefixes and no semantic
+    /// assessor (an unknown command then fails closed to a Critical ask).
+    async fn terminal_rules(allowed: &[&str]) -> AppApprovalRules {
+        let pool_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+            .await
+            .unwrap();
+        std::mem::forget(pool_file);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
+            crate::tools::TerminalTool::new(
+                allowed.iter().map(|p| p.to_string()).collect(),
+                crate::tools::ApprovalBroker::new(tx),
+                1,
+                1000,
+                crate::types::PermissionMode::Default,
+                pool,
+            )
+            .await,
+        );
+        AppApprovalRules {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            user_role: Some(crate::types::UserRole::Owner),
+            terminal: TerminalApprovals::find(&[terminal]),
+            ..rules()
+        }
+    }
+
+    async fn judge_terminal(rules: &AppApprovalRules, args: serde_json::Value) -> RuleDecision {
+        let call = sdk::ToolCall::new("c1", "terminal", args);
+        rules.judge(&hook_ctx(), &call, &tool_info()).await
+    }
+
+    fn run(command: &str) -> serde_json::Value {
+        json!({"action": "run", "command": command})
+    }
+
+    fn asks_with(decision: &RuleDecision, warning: &str) -> bool {
+        matches!(decision, RuleDecision::Ask(request)
+            if request.warnings.iter().any(|w| w.contains(warning)))
+    }
+
+    /// The T8 ladder, in order: an untrusted trigger asks before the
+    /// trusted-session and explicit-allow rungs; a trusted session and an
+    /// explicit allow both come before the approval floor; an unknown
+    /// command with no assessor fails closed, Critical.
+    #[tokio::test]
+    async fn terminal_ladder_keeps_its_order() {
+        let base = terminal_rules(&["echo", "cat"]).await;
+        let trusted = AppApprovalRules {
+            trusted_session: true,
+            ..base.clone()
+        };
+        let trigger = AppApprovalRules {
+            untrusted_trigger_session: true,
+            ..trusted.clone()
+        };
+        // Explicit allow.
+        assert_eq!(
+            judge_terminal(&base, run("echo hi")).await,
+            RuleDecision::Allow
+        );
+        // Untrusted trigger beats both the trusted session and the allowlist.
+        let asked = judge_terminal(&trigger, run("echo hi")).await;
+        assert!(asks_with(&asked, "untrusted external trigger"), "{asked:?}");
+        // A trusted session runs an unknown command without asking.
+        assert_eq!(
+            judge_terminal(&trusted, run("printf synthetic")).await,
+            RuleDecision::Allow
+        );
+        // The explicit allow precedes the approval floor (as before).
+        assert_eq!(
+            judge_terminal(&base, run("cat ~/.ssh/config")).await,
+            RuleDecision::Allow
+        );
+        // The floor asks for a credential path that no grant covers.
+        let floor = judge_terminal(&base, run("head ~/.ssh/config")).await;
+        assert!(matches!(floor, RuleDecision::Ask(_)), "{floor:?}");
+        // Unknown command, no assessor: Critical, failed closed.
+        let unknown = judge_terminal(&base, run("printf synthetic")).await;
+        let RuleDecision::Ask(request) = &unknown else {
+            panic!("{unknown:?}");
+        };
+        assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
+        assert_eq!(request.subject, "printf synthetic");
+        assert!(asks_with(&unknown, "not configured"), "{unknown:?}");
+        // A novel detached command asks; an allowlisted one does not.
+        let detached = json!({"action": "run", "command": "printf x", "detach": true});
+        assert!(matches!(
+            judge_terminal(&base, detached).await,
+            RuleDecision::Ask(_)
+        ));
+        let allowed_detached = json!({"action": "run", "command": "echo x", "detach": true});
+        assert_eq!(
+            judge_terminal(&base, allowed_detached).await,
+            RuleDecision::Allow
+        );
+    }
+
+    /// Daemonization: the owner gets a Critical card; a non-owner's call or
+    /// one without `detach=true` is refused by the tool's hard block, so the
+    /// rules never ask about it.
+    #[tokio::test]
+    async fn terminal_daemonization_asks_the_owner_critical() {
+        let owner = terminal_rules(&["*"]).await;
+        let detached = json!({"action": "run", "command": "nohup sleep 1 &", "detach": true});
+        let RuleDecision::Ask(request) = judge_terminal(&owner, detached.clone()).await else {
+            panic!("the owner is asked even under trust-all");
+        };
+        assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
+        assert!(request
+            .warnings
+            .iter()
+            .any(|w| w.contains("Daemonization primitives detected")));
+        let guest = AppApprovalRules {
+            user_role: Some(crate::types::UserRole::Guest),
+            ..owner.clone()
+        };
+        assert_eq!(judge_terminal(&guest, detached).await, RuleDecision::Allow);
+        let attached = json!({"action": "run", "command": "nohup sleep 1 &"});
+        assert_eq!(judge_terminal(&owner, attached).await, RuleDecision::Allow);
+    }
+
+    /// Trust markers in a terminal call's arguments change nothing: the
+    /// rules read the turn's facts only.
+    #[tokio::test]
+    async fn terminal_trust_arguments_bypass_nothing() {
+        let rules = terminal_rules(&[]).await;
+        let spoofed = json!({
+            "action": "run",
+            "command": "printf synthetic",
+            "_trusted_session": true,
+            "_user_role": "Owner",
+        });
+        assert!(matches!(
+            judge_terminal(&rules, spoofed).await,
+            RuleDecision::Ask(_)
+        ));
+    }
+
+    /// Enabling trust-all always asks, Critical (until it is on).
+    #[tokio::test]
+    async fn terminal_trust_all_asks_critical() {
+        let trusted = AppApprovalRules {
+            trusted_session: true,
+            ..terminal_rules(&[]).await
+        };
+        let RuleDecision::Ask(request) =
+            judge_terminal(&trusted, json!({"action": "trust_all"})).await
+        else {
+            panic!("trust_all must ask");
+        };
+        assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
+        assert_eq!(request.subject, "ENABLE TRUST-ALL MODE");
+        let on = terminal_rules(&["*"]).await;
+        assert_eq!(
+            judge_terminal(&on, json!({"action": "trust_all"})).await,
+            RuleDecision::Allow
+        );
+    }
+
+    /// Allow Session adds the session prefix, as the in-tool prompt did:
+    /// the next call runs without a card, but a trigger session still asks.
+    #[tokio::test]
+    async fn terminal_allow_session_adds_the_session_prefix() {
+        let rules = terminal_rules(&[]).await;
+        let call = sdk::ToolCall::new("c1", "terminal", run("printf first"));
+        rules
+            .record_terminal_answer(&call, Some(ApprovalResponse::AllowSession))
+            .await;
+        assert_eq!(
+            judge_terminal(&rules, run("printf second")).await,
+            RuleDecision::Allow
+        );
+        let trigger = AppApprovalRules {
+            untrusted_trigger_session: true,
+            ..rules.clone()
+        };
+        assert!(matches!(
+            judge_terminal(&trigger, run("printf second")).await,
+            RuleDecision::Ask(_)
+        ));
+        // A decline grants nothing.
+        let other = sdk::ToolCall::new("c2", "terminal", run("seq 1 2"));
+        rules
+            .record_terminal_answer(&other, Some(ApprovalResponse::Deny))
+            .await;
+        assert!(matches!(
+            judge_terminal(&rules, run("seq 1 2")).await,
+            RuleDecision::Ask(_)
+        ));
+    }
+
+    /// The dispatcher refuses an out-of-scope call it cannot escalate, so
+    /// the rules do not ask about it; on a confined terminal an escalatable
+    /// target is asked about even for an allowlisted command, and an Allow
+    /// Session grants that capability for the command.
+    #[tokio::test]
+    async fn terminal_scope_check_shapes_the_ask() {
+        let refused = AppApprovalRules {
+            terminal: terminal_rules(&["echo"])
+                .await
+                .terminal
+                .map(|t| t.with_scope(|_| TerminalScope::Refused)),
+            ..terminal_rules(&[]).await
+        };
+        assert_eq!(
+            judge_terminal(&refused, run("printf synthetic")).await,
+            RuleDecision::Allow
+        );
+
+        let pool_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+            .await
+            .unwrap();
+        std::mem::forget(pool_file);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let confined: Arc<dyn crate::traits::Tool> = Arc::new(
+            crate::tools::TerminalTool::new(
+                vec!["cat".to_string()],
+                crate::tools::ApprovalBroker::new(tx),
+                1,
+                1000,
+                crate::types::PermissionMode::Default,
+                pool,
+            )
+            .await
+            .with_confinement(crate::types::TerminalConfinement::Sandbox),
+        );
+        let escalation = crate::traits::ScopeEscalation {
+            read_paths: vec!["/tmp/aidaemon-test/sibling/notes.txt".to_string()],
+            write_paths: Vec::new(),
+        };
+        let scoped = escalation.clone();
+        let rules = AppApprovalRules {
+            terminal: TerminalApprovals::find(&[confined])
+                .map(|t| t.with_scope(move |_| TerminalScope::Escalate(scoped.clone()))),
+            ..terminal_rules(&[]).await
+        };
+        let args = run("cat /tmp/aidaemon-test/sibling/notes.txt");
+        let asked = judge_terminal(&rules, args.clone()).await;
+        assert!(
+            asks_with(
+                &asked,
+                "read outside task scope: /tmp/aidaemon-test/sibling/notes.txt"
+            ),
+            "{asked:?}"
+        );
+        let call = sdk::ToolCall::new("c1", "terminal", args.clone());
+        rules
+            .record_terminal_answer(&call, Some(ApprovalResponse::AllowSession))
+            .await;
+        assert_eq!(judge_terminal(&rules, args).await, RuleDecision::Allow);
     }
 
     #[test]

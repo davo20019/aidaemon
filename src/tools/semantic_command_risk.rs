@@ -21,7 +21,7 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::traits::{ChatOptions, ModelProvider, StateStore};
 use crate::types::RiskLevel;
 
-const ASSESSMENT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const ASSESSMENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_OUTPUT_TOKENS: u32 = 320;
 const MAX_REFERENCED_FILES: usize = 3;
 const MAX_REFERENCED_FILE_CHARS: usize = 8_000;
@@ -328,6 +328,7 @@ pub(crate) async fn assess_command(
     session_id: &str,
     state: Option<&Arc<dyn StateStore>>,
     event_store: Option<Arc<EventStore>>,
+    timeout_after: Duration,
 ) -> anyhow::Result<SemanticCommandAssessment> {
     let referenced_files = referenced_file_context(backend, command).await;
     let messages = classifier_messages(
@@ -354,7 +355,7 @@ pub(crate) async fn assess_command(
     };
     let started = Instant::now();
     let response = timeout(
-        ASSESSMENT_TIMEOUT,
+        timeout_after,
         provider.chat_with_options(&model, &messages, &[], &options),
     )
     .await

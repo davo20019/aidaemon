@@ -675,6 +675,10 @@ impl Agent {
         // authorize it; the entire expression short-circuits to false.
         let trusted = !under_mandate && self.session_trusted(ctx.trusted, task_id).await;
         let user_role = ctx.user_role;
+        // The turn's trust facts reach tools only through the typed
+        // execution context; arguments never carry them.
+        let untrusted_source = is_trigger_session(session_id);
+        let scope_escalation = ctx.scope_escalation.filter(|e| !e.is_empty()).cloned();
         let turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
 
         let active_workspace_grant = match user_role {
@@ -727,19 +731,10 @@ impl Agent {
                 if let Some(ref turn_id) = turn_id {
                     map.insert("_turn_id".to_string(), json!(turn_id));
                 }
-                // Mark as untrusted if this session originated from an automated
-                // trigger (e.g., email) rather than direct user interaction.
-                // This forces tools like terminal to require explicit approval.
-                if is_trigger_session(session_id) {
-                    map.insert("_untrusted_source".to_string(), json!(true));
-                }
                 // Inject explicit trust flag from ChannelContext — only trusted
                 // scheduled tasks set this. Never derived from session ID strings.
                 if trusted {
                     map.insert("_trusted_session".to_string(), json!(true));
-                }
-                if let Some(escalation) = ctx.scope_escalation.filter(|e| !e.is_empty()) {
-                    map.insert("_scope_escalation".to_string(), json!(escalation));
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
@@ -860,6 +855,10 @@ impl Agent {
                 kernel_approved: ctx
                     .owner_approval_by_kernel
                     .then_some(crate::traits::ApprovalScope::Call),
+                trusted_session: trusted,
+                user_role: Some(user_role),
+                untrusted_source,
+                scope_escalation: scope_escalation.clone(),
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -915,6 +914,10 @@ impl Agent {
                     kernel_approved: ctx
                         .owner_approval_by_kernel
                         .then_some(crate::traits::ApprovalScope::Call),
+                    trusted_session: trusted,
+                    user_role: Some(user_role),
+                    untrusted_source,
+                    scope_escalation: scope_escalation.clone(),
                 };
                 let result = tool
                     .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
@@ -969,6 +972,10 @@ impl Agent {
                     kernel_approved: ctx
                         .owner_approval_by_kernel
                         .then_some(crate::traits::ApprovalScope::Call),
+                    trusted_session: trusted,
+                    user_role: Some(user_role),
+                    untrusted_source,
+                    scope_escalation: scope_escalation.clone(),
                 };
                 return tool
                     .call_with_execution_context(
