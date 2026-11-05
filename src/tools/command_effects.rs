@@ -1499,6 +1499,128 @@ impl ShellAnalysis {
     }
 }
 
+/// `command` without the text the shell does not execute as commands:
+/// heredoc bodies (from the line after `<<WORD` up to the line `WORD`, with
+/// leading tabs stripped for `<<-`), comments (an unquoted `#` at the start
+/// of a word, up to the end of the line), and newlines inside quotes, which
+/// become NUL so a quoted string never splits into command lines (and a NUL
+/// makes any key from that word fail its check). The `<<` itself stays, so
+/// the scan still treats the line as opaque, and the heredoc's own redirect
+/// target is still read.
+fn executed_text(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let (mut in_single, mut in_double) = (false, false);
+    // Heredocs opened on the current line: (delimiter, strip leading tabs).
+    let mut pending: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_single || in_double {
+            if c == '\n' {
+                out.push('\0');
+            } else {
+                out.push(c);
+                if c == '\\' && in_double {
+                    if let Some(&next) = chars.get(i + 1) {
+                        out.push(if next == '\n' { '\0' } else { next });
+                        i += 1;
+                    }
+                } else if (c == '\'' && in_single) || (c == '"' && in_double) {
+                    in_single = false;
+                    in_double = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
+                    i += 1;
+                }
+            }
+            '\'' => {
+                in_single = true;
+                out.push(c);
+            }
+            '"' => {
+                in_double = true;
+                out.push(c);
+            }
+            '#' if out
+                .chars()
+                .last()
+                .is_none_or(|p| p.is_whitespace() || matches!(p, ';' | '|' | '&' | '(' | ')')) =>
+            {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                out.push_str("<<");
+                let mut j = i + 2;
+                let strip_tabs = chars.get(j) == Some(&'-');
+                if strip_tabs {
+                    out.push('-');
+                    j += 1;
+                }
+                while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    out.push(chars[j]);
+                    j += 1;
+                }
+                let mut delimiter = String::new();
+                while let Some(&d) = chars.get(j) {
+                    if d.is_whitespace() || matches!(d, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+                        break;
+                    }
+                    out.push(d);
+                    if !matches!(d, '\'' | '"' | '\\') {
+                        delimiter.push(d);
+                    }
+                    j += 1;
+                }
+                pending.push((delimiter, strip_tabs));
+                i = j;
+                continue;
+            }
+            '\n' => {
+                out.push('\n');
+                // Skip each pending heredoc's body and its delimiter line.
+                for (delimiter, strip_tabs) in std::mem::take(&mut pending) {
+                    loop {
+                        i += 1;
+                        if i >= chars.len() {
+                            break;
+                        }
+                        let end = chars[i..]
+                            .iter()
+                            .position(|c| *c == '\n')
+                            .map_or(chars.len(), |offset| i + offset);
+                        let line: String = chars[i..end].iter().collect();
+                        let line = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line.as_str()
+                        };
+                        let done = line == delimiter;
+                        i = end;
+                        if done {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
 fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
     let mut out = ShellAnalysis {
         keys: Vec::new(),
@@ -1517,7 +1639,9 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
         out.unresolved();
     }
     let cwd = cwd.filter(|_| !changes_directory);
-    for line in command.replace("\\\n", " ").split('\n') {
+    // Only text the shell executes yields keys: heredoc bodies, comments
+    // and the inside of multi-line quoted strings are dropped first.
+    for line in executed_text(&command.replace("\\\n", " ")).split('\n') {
         let scanned = scan(line);
         // Substitutions, groupings, heredocs and comments hide commands.
         if scanned.unsafe_syntax {
@@ -3601,6 +3725,30 @@ mod tests {
             ("echo {a,b} > /tmp/aidaemon-test/f", Incomplete),
             ("echo * > /tmp/aidaemon-test/f", Incomplete),
             ("curl -H \"X: $TOKEN\" https://a.example.invalid/", Incomplete),
+            // Text the shell never executes yields no keys: heredoc bodies,
+            // comments, and newlines inside quoted strings.
+            (
+                "cat <<'EOF'\ncurl https://a.example.invalid/\nEOF",
+                Exact(vec![]),
+            ),
+            (
+                "cat <<EOF > /tmp/aidaemon-test/f\nrm -rf /tmp/aidaemon-test/keep\nEOF",
+                Exact(vec![write("/tmp/aidaemon-test/f")]),
+            ),
+            (
+                "cat <<-EOF\n\tcurl https://a.example.invalid/\n\tEOF\ncurl https://b.example.invalid/",
+                Exact(vec![egress("b.example.invalid:443")]),
+            ),
+            ("echo x # ; rm -rf /tmp/aidaemon-test/w/keep", Exact(vec![])),
+            ("echo x #\ncurl https://b.example.invalid/", Exact(vec![egress("b.example.invalid:443")])),
+            (
+                "echo \"a\nrm -rf /tmp/aidaemon-test/keep\ncurl https://a.example.invalid/\"",
+                Exact(vec![]),
+            ),
+            (
+                "echo 'a\ncurl https://a.example.invalid/ > /tmp/aidaemon-test/f'",
+                Exact(vec![]),
+            ),
             // N1: `>&WORD` is a file unless WORD is a descriptor.
             ("echo hi >&1file", Exact(vec![write("/tmp/aidaemon-test/w/1file")])),
             ("echo hi >&2", Exact(vec![])),
